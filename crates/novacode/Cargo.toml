@@ -10,8 +10,8 @@ workspace = true
 [dependencies]
 novacode-base.workspace = true
 novacode-core.workspace = true
-novacode-tools.workspace = true
 novacode-tui.workspace = true
+novacode-tools.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 novacode-ai.workspace = true

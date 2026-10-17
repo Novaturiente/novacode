@@ -1,0 +1,12 @@
+ › explain
+
+ ∴ thinking… · 3 words
+ The loop has **three
+
+
+
+ ⏵ queued: use tests
+╭────────────────────────────────────────────────╮
+│                                                │
+╰────────────────────────────────────────────────╯
+ ⠋ writing               claude/opus  proj ⎇ main

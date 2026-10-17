@@ -15,9 +15,10 @@ use novacode_core::trust::{self, TrustStore};
 use novacode_tools::LocalEnv;
 use novacode_types::{AgentEvent, Message, StopReason};
 use std::io::{IsTerminal, Read, Write};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 #[derive(Parser)]
 #[command(name = "novacode", version, about = "An agent harness")]
@@ -129,20 +130,18 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         }
         None => {}
     }
-    let Some(mut prompt) = cli.print else {
-        eprintln!(
-            "novacode {}: interactive mode arrives in M4; use -p PROMPT",
-            env!("CARGO_PKG_VERSION")
-        );
-        return Ok(ExitCode::from(2));
-    };
+    let mut prompt = cli.print;
     let stdin = std::io::stdin();
-    if !stdin.is_terminal() {
-        let mut piped = String::new();
-        stdin.lock().read_to_string(&mut piped)?;
-        if !piped.trim().is_empty() {
-            prompt = format!("{prompt}\n\n{piped}");
+    if let Some(p) = &mut prompt {
+        if !stdin.is_terminal() {
+            let mut piped = String::new();
+            stdin.lock().read_to_string(&mut piped)?;
+            if !piped.trim().is_empty() {
+                *p = format!("{p}\n\n{piped}");
+            }
         }
+    } else if !stdin.is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("interactive mode needs a terminal; use -p PROMPT for pipes and scripts");
     }
 
     let cwd = std::env::current_dir()?;
@@ -218,6 +217,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     } else {
         Store::create(&paths, &cwd, cli.no_session)
     };
+    let window_tokens = settings.get("contextWindow").unwrap_or(200_000);
     let cfg = Config {
         cwd: cwd.clone(),
         provider: provider.to_string(),
@@ -225,7 +225,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         max_tokens: settings.get("maxTokens").unwrap_or(16_384),
         cache,
         // shortcut: fixed window until the model catalog (M5, L2.10).
-        window_tokens: settings.get("contextWindow").unwrap_or(200_000),
+        window_tokens,
         spill_dir: paths.home().join("spill"),
         redactor: {
             let auth_path = paths.home().join("auth.json");
@@ -237,7 +237,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         },
     };
     let tools = novacode_tools::builtins(false);
-    // Print mode has nobody to approve: asks become refusals, risky commands need a justification.
+    // No approver yet: asks become refusals and risky commands need a justification (the TUI card is M4b).
     let agent = Agent::new(
         Arc::new(Anthropic::new(auth, trace)),
         tools,
@@ -246,6 +246,9 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         Arc::new(LocalEnv),
     )
     .with_policy(policy);
+    let Some(prompt) = prompt else {
+        return interactive(agent, &model, &cwd, window_tokens).await;
+    };
     let (handle, task) = agent::spawn(agent);
     let mut events = handle.subscribe();
     let on_ctrl_c = handle.clone();
@@ -302,6 +305,75 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             eprintln!("novacode: {kind:?}: {}", msg.error_message.unwrap_or_default());
             ExitCode::from(1)
         }
+    })
+}
+
+/// Fullscreen TUI (L9) on the same session handle as print mode.
+async fn interactive(agent: Agent, model: &str, cwd: &Path, window_tokens: u64) -> anyhow::Result<ExitCode> {
+    use novacode_tui::Cmd;
+    let history = agent.store.projection();
+    let id = agent.store.id().to_string();
+    let (handle, task) = agent::spawn(agent);
+    let (etx, erx) = mpsc::unbounded_channel();
+    let mut events = handle.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(e) => {
+                    if etx.send(e).is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => tracing::warn!(n, "ui missed events"),
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    let (ctx, mut crx) = mpsc::unbounded_channel();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        while let Some(c) = crx.recv().await {
+            match c {
+                Cmd::Prompt(t) => h.prompt(t),
+                Cmd::Steer(t) => h.steer(t),
+                Cmd::Abort => h.abort(),
+                Cmd::Quit => break,
+            }
+        }
+    });
+    let init = novacode_tui::Init {
+        model: model.into(),
+        cwd: cwd.display().to_string(),
+        branch: git_branch(cwd),
+        window_tokens,
+        history,
+    };
+    let res = novacode_tui::run(init, erx, ctx).await;
+    handle.abort();
+    handle.shutdown();
+    let agent = task.await?;
+    res?;
+    if agent.store.path().is_some_and(|p| p.exists()) {
+        eprintln!("resume with: novacode -r {}", &id[..id.len().min(13)]);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Current branch (or short HEAD) from `.git`, worktrees included. No git process.
+fn git_branch(cwd: &Path) -> Option<String> {
+    let dot = cwd.ancestors().map(|d| d.join(".git")).find(|p| p.exists())?;
+    let dir = if dot.is_file() {
+        let s = std::fs::read_to_string(&dot).ok()?;
+        let g = std::path::PathBuf::from(s.trim().strip_prefix("gitdir: ")?);
+        if g.is_absolute() { g } else { dot.parent()?.join(g) }
+    } else {
+        dot
+    };
+    let head = std::fs::read_to_string(dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    Some(match head.strip_prefix("ref: refs/heads/") {
+        Some(b) => b.to_string(),
+        None => head.chars().take(8).collect(),
     })
 }
 
