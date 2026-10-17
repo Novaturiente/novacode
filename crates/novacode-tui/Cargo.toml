@@ -1,0 +1,11 @@
+[package]
+name = "novacode-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+novacode-types.workspace = true

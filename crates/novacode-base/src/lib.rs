@@ -1,0 +1,11 @@
+//! Shared foundations (L0): paths, storage, settings, ids, logging.
+
+pub mod logging;
+pub mod paths;
+pub mod settings;
+pub mod storage;
+
+/// New time-sortable id (UUIDv7, L0.8).
+pub fn new_id() -> uuid::Uuid {
+    uuid::Uuid::now_v7()
+}

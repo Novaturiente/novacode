@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+novacode-base = { path = "crates/novacode-base" }
+novacode-types = { path = "crates/novacode-types" }
+novacode-ai = { path = "crates/novacode-ai" }
+novacode-tools = { path = "crates/novacode-tools" }
+novacode-script = { path = "crates/novacode-script" }
+novacode-core = { path = "crates/novacode-core" }
+novacode-tui = { path = "crates/novacode-tui" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+uuid = { version = "1", features = ["v7", "serde"] }
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
