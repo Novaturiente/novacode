@@ -1,0 +1,16 @@
+ › fix the failing test
+ ▸ 2 tool calls · 1 failed
+          ╭ Model ───────────────────────────────╮
+ Fixed: th│ › type to filter                     │h 2.
+          │ ▸ opus                               │
+ • tests p│   sonnet                             │
+ · model →│                                      │starts
+   over: ~│                                      │
+          │                                      │
+          ╰──────────────────────────────────────╯
+
+
+╭──────────────────────────────────────────────────────────╮
+│                                                          │
+╰──────────────────────────────────────────────────────────╯
+ ● ready  lo… ctx 16%  cache 97%  claude/haiku  proj ⎇ main

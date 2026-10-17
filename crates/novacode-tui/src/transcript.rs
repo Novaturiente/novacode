@@ -143,6 +143,33 @@ impl Transcript {
         }
     }
 
+    fn items(&self) -> impl Iterator<Item = &Item> {
+        self.turns.iter().rev().flat_map(|t| t.items.iter().rev())
+    }
+
+    /// The newest tool call: (title, full output), for the pager.
+    pub fn last_tool(&self) -> Option<(String, String)> {
+        self.items().find_map(|i| match i {
+            Item::Tool(t) => Some((format!("{} {}", t.name, summary(&t.name, &t.args)), t.output.clone())),
+            _ => None,
+        })
+    }
+
+    /// Text of the newest assistant reply.
+    pub fn last_reply(&self) -> Option<String> {
+        self.items().find_map(|i| match i {
+            Item::Assistant(b) => {
+                let text: Vec<&str> = b
+                    .iter()
+                    .filter(|(k, _)| *k == BlockKind::Text)
+                    .map(|(_, t)| t.as_str())
+                    .collect();
+                (!text.is_empty()).then(|| text.join("\n\n"))
+            }
+            _ => None,
+        })
+    }
+
     pub fn on_stream(&mut self, ev: &StreamEvent) {
         let live = self.live.get_or_insert_with(Vec::new);
         match ev {
@@ -361,7 +388,7 @@ fn lay_turn(turn: &Turn, width: usize, t: &Theme) -> Layout {
                 lines.extend(wrap::wrap(
                     vec![Span::styled(sanitize(text), st)],
                     width,
-                    &[Span::styled("! ", st)],
+                    &[Span::styled(if *error { "! " } else { "· " }, st)],
                     &[Span::raw("  ")],
                 ));
             }
@@ -479,7 +506,10 @@ fn lay_tool(tool: &Tool, width: usize, t: &Theme) -> Vec<Line<'static>> {
             (&all[..n], 0, all.len() - n)
         }
         "read" if !tool.is_error => {
-            lines.push(Line::styled(format!("  {} line{}", all.len(), if all.len() == 1 { "" } else { "s" }), t.dim));
+            lines.push(Line::styled(
+                format!("  {} line{}", all.len(), if all.len() == 1 { "" } else { "s" }),
+                t.dim,
+            ));
             return lines;
         }
         _ => {

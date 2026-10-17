@@ -71,6 +71,8 @@ struct Shared {
     cancel: Mutex<Option<CancellationToken>>,
     notify: Notify,
     closed: Mutex<bool>,
+    /// Model id to switch to at the start of the next run (same provider).
+    next_model: Mutex<Option<String>>,
 }
 
 impl Agent {
@@ -205,6 +207,17 @@ impl Agent {
 
     /// Run until the model stops and nothing is queued.
     pub async fn run(&mut self) {
+        let next = self.shared.next_model.lock().unwrap().take();
+        if let Some(m) = next
+            && m != self.cfg.model
+        {
+            // Recorded in the session (L2.11); the next request is a full cache miss.
+            self.cfg.model = m;
+            self.add(EntryKind::ModelChange {
+                provider: self.cfg.provider.clone(),
+                model: self.cfg.model.clone(),
+            });
+        }
         let cancel = CancellationToken::new();
         *self.shared.cancel.lock().unwrap() = Some(cancel.clone());
         self.emit(AgentEvent::AgentStart);
@@ -523,6 +536,10 @@ impl SessionHandle {
         if let Some(c) = self.shared.cancel.lock().unwrap().as_ref() {
             c.cancel();
         }
+    }
+    /// Switch model (same provider) from the next run on.
+    pub fn set_model(&self, model: impl Into<String>) {
+        *self.shared.next_model.lock().unwrap() = Some(model.into());
     }
     /// Stop after the current run; the owner task then returns the agent.
     pub fn shutdown(&self) {

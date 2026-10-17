@@ -1357,6 +1357,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures-util",
  "novacode-ai",
  "novacode-base",
  "novacode-core",

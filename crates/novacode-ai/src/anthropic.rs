@@ -77,24 +77,58 @@ impl Anthropic {
         self
     }
 
-    fn http_request(&self, body: &[u8]) -> reqwest::RequestBuilder {
+    /// Model ids this login or key can use, newest first (the live list, L2.10).
+    pub async fn list_models(&self) -> Result<Vec<String>, String> {
         let oauth = matches!(self.auth, Auth::OAuth { .. });
-        let url = format!("{}/v1/messages{}", self.base_url, if oauth { "?beta=true" } else { "" });
-        let r = self
-            .http
-            .post(url)
-            .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream");
-        let r = match &self.auth {
+        let url = format!(
+            "{}/v1/models?limit=100{}",
+            self.base_url,
+            if oauth { "&beta=true" } else { "" }
+        );
+        let resp = self
+            .authed(self.http.get(url))
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        let body: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            return Err(format!(
+                "HTTP {status}: {}",
+                body["error"]["message"].as_str().unwrap_or("")
+            ));
+        }
+        Ok(body["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m["id"].as_str().map(String::from))
+            .collect())
+    }
+
+    fn authed(&self, r: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let r = r.header("anthropic-version", API_VERSION);
+        match &self.auth {
             Auth::ApiKey(k) => r.header("x-api-key", k),
             Auth::OAuth { access_token, profile } => r
                 .bearer_auth(access_token)
                 .header("anthropic-beta", &profile.betas)
                 .header("user-agent", &profile.user_agent)
                 .header("x-app", "cli"),
-        };
-        r.body(body.to_vec())
+        }
+    }
+
+    fn http_request(&self, body: &[u8]) -> reqwest::RequestBuilder {
+        let oauth = matches!(self.auth, Auth::OAuth { .. });
+        let url = format!("{}/v1/messages{}", self.base_url, if oauth { "?beta=true" } else { "" });
+        let r = self
+            .http
+            .post(url)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream");
+        self.authed(r).body(body.to_vec())
     }
 }
 

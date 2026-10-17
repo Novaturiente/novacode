@@ -67,7 +67,7 @@ pub fn has_project_config(dir: &Path) -> bool {
 }
 
 /// Resolve trust without a UI: `--trust` wins, then a stored decision; otherwise untrusted.
-/// shortcut: the interactive 4-choice prompt arrives with the TUI (M4).
+/// The interactive 4-choice prompt lives in the binary (it needs the TUI).
 pub fn resolve(store: &TrustStore, dir: &Path, cli_trust: bool) -> bool {
     cli_trust || store.decision(dir).unwrap_or(false)
 }

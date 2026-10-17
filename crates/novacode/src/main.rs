@@ -2,25 +2,30 @@
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
+use futures_util::future::BoxFuture;
 use novacode_ai::adapter::CacheRetention;
 use novacode_ai::anthropic::{Anthropic, Auth, OAuthProfile};
 use novacode_ai::auth::{self, AuthStore, DEFAULT_ACCOUNT, claude};
 use novacode_ai::trace::Trace;
 use novacode_base::redact::Redactor;
-use novacode_base::{logging, new_id, paths::Paths, settings::Settings};
+use novacode_base::{logging, new_id, paths::Paths, settings, settings::Settings};
 use novacode_core::agent::{self, Agent, Config};
-use novacode_core::policy::{Mode, Permissions, Policy};
+use novacode_core::policy::{Approval, ApprovalRequest, Approver, Mode, Permissions, Policy};
 use novacode_core::session::{self, Store};
 use novacode_core::trust::{self, TrustStore};
 use novacode_tools::LocalEnv;
+use novacode_tui::dialog::{Answer, ApproveReq, PickItem};
+use novacode_tui::keys::Keymap;
+use novacode_tui::{Cmd, Exit, UiEvent};
 use novacode_types::{AgentEvent, Message, StopReason};
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(name = "novacode", version, about = "An agent harness")]
 struct Cli {
     /// Print mode: send PROMPT, print the final answer to stdout, exit.
@@ -57,7 +62,7 @@ struct Cli {
     command: Option<Command>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Command {
     /// Log in to a subscription provider (claude).
     Login { provider: String },
@@ -101,11 +106,11 @@ fn fail(e: anyhow::Error) -> ExitCode {
 }
 
 async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
-    let store = AuthStore::new(paths.home().join("auth.json"));
+    let auth_store = AuthStore::new(paths.home().join("auth.json"));
     match cli.command {
-        Some(Command::Login { provider }) => return login(&store, &provider).await,
+        Some(Command::Login { provider }) => return login(&auth_store, &provider).await,
         Some(Command::Logout { provider }) => {
-            let had = store.remove(&provider).await?;
+            let had = auth_store.remove(&provider).await?;
             eprintln!(
                 "{}",
                 if had {
@@ -130,7 +135,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         }
         None => {}
     }
-    let mut prompt = cli.print;
+    let mut prompt = cli.print.clone();
     let stdin = std::io::stdin();
     if let Some(p) = &mut prompt {
         if !stdin.is_terminal() {
@@ -143,112 +148,163 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     } else if !stdin.is_terminal() || !std::io::stdout().is_terminal() {
         bail!("interactive mode needs a terminal; use -p PROMPT for pipes and scripts");
     }
+    let interactive = prompt.is_none();
 
     let cwd = std::env::current_dir()?;
-    let trusted = trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &cwd, cli.trust);
+    let trust_store = TrustStore::new(paths.home().join("trust.json"));
+    let mut trusted = trust::resolve(&trust_store, &cwd, cli.trust);
     if !trusted && trust::has_project_config(&cwd) {
-        eprintln!("note: this folder's project config is ignored (not trusted). Run `novacode trust` or pass --trust.");
+        if interactive && trust_store.decision(&cwd).is_none() {
+            trusted = ask_trust(&trust_store, &cwd)?;
+        } else {
+            eprintln!(
+                "note: this folder's project config is ignored (not trusted). Run `novacode trust` or pass --trust."
+            );
+        }
     }
     let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
-    let perms: Permissions = settings.get("permissions").unwrap_or_default();
-    let mut policy = Policy::new(
-        perms,
-        std::env::var_os("HOME").map(Into::into).unwrap_or_default(),
-        Some(paths.settings()),
-    );
-    if let Some(m) = cli.mode {
-        policy = policy.with_mode(m);
-    }
-    if let Some(p) = &cli.profile {
-        policy = policy.with_profile(p).map_err(anyhow::Error::msg)?;
-    }
-    let model = cli
-        .model
-        .or_else(|| settings.get::<String>("model"))
-        .context("no model: pass -m provider/model or set \"model\" in settings")?;
-    let (provider, model_id) = model
-        .split_once('/')
-        .context("model must be provider/model, e.g. claude/claude-opus-5-5")?;
-
-    let mut api_key: Option<String> = None;
-    let auth = match provider {
-        claude::PROVIDER => {
-            let d = OAuthProfile::default();
-            let get = |k: &str, def: String| settings.get::<String>(&format!("providers.claude.{k}")).unwrap_or(def);
-            let profile = OAuthProfile {
-                user_agent: get("userAgent", d.user_agent),
-                betas: get("betas", d.betas),
-                billing_header: get("billingHeader", d.billing_header),
-                identity: get("identity", d.identity),
-            };
-            Auth::OAuth {
-                access_token: store.access_token(claude::PROVIDER, DEFAULT_ACCOUNT).await?,
-                profile,
-            }
-        }
-        "anthropic" => {
-            let raw = settings
-                .get::<String>("providers.anthropic.apiKey")
-                .unwrap_or_else(|| "$ANTHROPIC_API_KEY".into());
-            let key = auth::resolve_key(&raw)?;
-            api_key = Some(key.clone());
-            Auth::ApiKey(key)
-        }
-        other => bail!("unknown provider `{other}` (M1 supports claude, anthropic)"),
+    let model = match cli.model.clone().or_else(|| settings.get::<String>("model")) {
+        Some(m) => m,
+        None if interactive => onboard(&paths, &auth_store, &settings).await?,
+        None => bail!("no model: pass -m provider/model or set \"model\" in settings"),
     };
-    let trace = cli.trace.then(|| Trace {
-        path: paths.logs().join(format!("trace-{}.jsonl", new_id())),
-    });
-    if let Some(t) = &trace {
-        eprintln!("trace: {}", t.path.display());
-    }
-    let cache = match settings.get::<String>("cacheRetention").as_deref() {
-        Some("long") => CacheRetention::Long,
-        _ => CacheRetention::Short,
+    let ctx = Ctx {
+        paths,
+        cwd,
+        settings,
+        auth: auth_store,
+        cli,
     };
-    let store = if let Some(prefix) = &cli.resume {
-        Store::open(&session::find(&paths, &cwd, prefix)?)?
-    } else if cli.r#continue {
-        let last = session::list(&paths, &cwd)
+    let store = if let Some(prefix) = &ctx.cli.resume {
+        Store::open(&session::find(&ctx.paths, &ctx.cwd, prefix)?)?
+    } else if ctx.cli.r#continue {
+        let last = session::list(&ctx.paths, &ctx.cwd)
             .into_iter()
             .next()
             .context("no earlier session in this folder")?;
         Store::open(&last)?
     } else {
-        Store::create(&paths, &cwd, cli.no_session)
+        Store::create(&ctx.paths, &ctx.cwd, ctx.cli.no_session)
     };
-    let window_tokens = settings.get("contextWindow").unwrap_or(200_000);
-    let cfg = Config {
-        cwd: cwd.clone(),
-        provider: provider.to_string(),
-        model: model_id.to_string(),
-        max_tokens: settings.get("maxTokens").unwrap_or(16_384),
-        cache,
-        // shortcut: fixed window until the model catalog (M5, L2.10).
-        window_tokens,
-        spill_dir: paths.home().join("spill"),
-        redactor: {
-            let auth_path = paths.home().join("auth.json");
-            Redactor::new(move || {
-                let mut s = AuthStore::new(auth_path.clone()).secrets();
-                s.extend(api_key.clone().map(|k| (k, "API key".to_string())));
-                s
-            })
-        },
-    };
-    let tools = novacode_tools::builtins(false);
-    // No approver yet: asks become refusals and risky commands need a justification (the TUI card is M4b).
-    let agent = Agent::new(
-        Arc::new(Anthropic::new(auth, trace)),
-        tools,
-        store,
-        cfg,
-        Arc::new(LocalEnv),
-    )
-    .with_policy(policy);
-    let Some(prompt) = prompt else {
-        return interactive(agent, &model, &cwd, window_tokens).await;
-    };
+    match prompt {
+        None => interactive_loop(&ctx, store, model).await,
+        Some(prompt) => {
+            // Nobody to approve: asks become refusals, risky commands need a justification.
+            let (agent, _) = ctx.agent(store, &model, None).await?;
+            print_mode(agent, prompt, ctx.cli.verbose).await
+        }
+    }
+}
+
+/// Everything needed to build an agent for a session.
+struct Ctx {
+    paths: Paths,
+    cwd: std::path::PathBuf,
+    settings: Settings,
+    auth: AuthStore,
+    cli: Cli,
+}
+
+impl Ctx {
+    async fn auth(&self, provider: &str) -> anyhow::Result<(Auth, Option<String>)> {
+        let s = &self.settings;
+        Ok(match provider {
+            claude::PROVIDER => {
+                let d = OAuthProfile::default();
+                let get = |k: &str, def: String| s.get::<String>(&format!("providers.claude.{k}")).unwrap_or(def);
+                let profile = OAuthProfile {
+                    user_agent: get("userAgent", d.user_agent),
+                    betas: get("betas", d.betas),
+                    billing_header: get("billingHeader", d.billing_header),
+                    identity: get("identity", d.identity),
+                };
+                let access_token = self.auth.access_token(claude::PROVIDER, DEFAULT_ACCOUNT).await?;
+                (Auth::OAuth { access_token, profile }, None)
+            }
+            "anthropic" => {
+                let raw = s
+                    .get::<String>("providers.anthropic.apiKey")
+                    .unwrap_or_else(|| "$ANTHROPIC_API_KEY".into());
+                let key = auth::resolve_key(&raw)?;
+                (Auth::ApiKey(key.clone()), Some(key))
+            }
+            other => bail!("unknown provider `{other}` (M1 supports claude, anthropic)"),
+        })
+    }
+
+    async fn agent(
+        &self,
+        store: Store,
+        model: &str,
+        approver: Option<Arc<dyn Approver>>,
+    ) -> anyhow::Result<(Agent, Arc<Anthropic>)> {
+        let (provider, model_id) = model
+            .split_once('/')
+            .context("model must be provider/model, e.g. claude/claude-opus-5-5")?;
+        let (auth, api_key) = self.auth(provider).await?;
+        let trace = self.cli.trace.then(|| Trace {
+            path: self.paths.logs().join(format!("trace-{}.jsonl", new_id())),
+        });
+        if let Some(t) = &trace
+            && approver.is_none()
+        {
+            eprintln!("trace: {}", t.path.display());
+        }
+        let s = &self.settings;
+        let perms: Permissions = s.get("permissions").unwrap_or_default();
+        let mut policy = Policy::new(
+            perms,
+            std::env::var_os("HOME").map(Into::into).unwrap_or_default(),
+            Some(self.paths.settings()),
+        );
+        if let Some(m) = self.cli.mode {
+            policy = policy.with_mode(m);
+        }
+        if let Some(p) = &self.cli.profile {
+            policy = policy.with_profile(p).map_err(anyhow::Error::msg)?;
+        }
+        let cfg = Config {
+            cwd: self.cwd.clone(),
+            provider: provider.to_string(),
+            model: model_id.to_string(),
+            max_tokens: s.get("maxTokens").unwrap_or(16_384),
+            cache: match s.get::<String>("cacheRetention").as_deref() {
+                Some("long") => CacheRetention::Long,
+                _ => CacheRetention::Short,
+            },
+            // shortcut: fixed window until the model catalog (M5, L2.10).
+            window_tokens: self.window_tokens(),
+            spill_dir: self.paths.home().join("spill"),
+            redactor: {
+                let auth_path = self.paths.home().join("auth.json");
+                Redactor::new(move || {
+                    let mut s = AuthStore::new(auth_path.clone()).secrets();
+                    s.extend(api_key.clone().map(|k| (k, "API key".to_string())));
+                    s
+                })
+            },
+        };
+        let adapter = Arc::new(Anthropic::new(auth, trace));
+        let mut agent = Agent::new(
+            adapter.clone(),
+            novacode_tools::builtins(false),
+            store,
+            cfg,
+            Arc::new(LocalEnv),
+        )
+        .with_policy(policy);
+        if let Some(a) = approver {
+            agent = agent.with_approver(a);
+        }
+        Ok((agent, adapter))
+    }
+
+    fn window_tokens(&self) -> u64 {
+        self.settings.get("contextWindow").unwrap_or(200_000)
+    }
+}
+
+async fn print_mode(agent: Agent, prompt: String, verbose: bool) -> anyhow::Result<ExitCode> {
     let (handle, task) = agent::spawn(agent);
     let mut events = handle.subscribe();
     let on_ctrl_c = handle.clone();
@@ -263,7 +319,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     let stop = loop {
         match events.recv().await {
             Ok(AgentEvent::Message(Message::Assistant(m))) => last = Some(m),
-            Ok(AgentEvent::ToolStart { call }) if cli.verbose => eprintln!("tool {} {}", call.name, call.arguments),
+            Ok(AgentEvent::ToolStart { call }) if verbose => eprintln!("tool {} {}", call.name, call.arguments),
             Ok(AgentEvent::Retry {
                 attempt,
                 delay_ms,
@@ -287,7 +343,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         writeln!(out, "{text}")?;
         out.flush()?;
     }
-    if cli.verbose {
+    if verbose {
         let u = msg.usage;
         eprintln!(
             "stop={:?} input={} output={} cache_read={} cache_write={}",
@@ -308,55 +364,312 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     })
 }
 
-/// Fullscreen TUI (L9) on the same session handle as print mode.
-async fn interactive(agent: Agent, model: &str, cwd: &Path, window_tokens: u64) -> anyhow::Result<ExitCode> {
-    use novacode_tui::Cmd;
-    let history = agent.store.projection();
-    let id = agent.store.id().to_string();
-    let (handle, task) = agent::spawn(agent);
-    let (etx, erx) = mpsc::unbounded_channel();
-    let mut events = handle.subscribe();
-    tokio::spawn(async move {
-        loop {
-            match events.recv().await {
-                Ok(e) => {
-                    if etx.send(e).is_err() {
-                        break;
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => tracing::warn!(n, "ui missed events"),
-                Err(broadcast::error::RecvError::Closed) => break,
+/// Sends approval questions to the TUI and waits for the answer (L6.1).
+struct TuiApprover(mpsc::UnboundedSender<UiEvent>);
+
+impl Approver for TuiApprover {
+    fn approve(&self, req: ApprovalRequest) -> BoxFuture<'_, Approval> {
+        Box::pin(async move {
+            let (tx, rx) = oneshot::channel();
+            let detail = match req.args.get("command").or_else(|| req.args.get("path")) {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                _ => req.args.to_string(),
+            };
+            let card = ApproveReq {
+                tool: req.tool,
+                detail,
+                reason: req.reason,
+                rule: req.rule,
+                risky: req.risky,
+                reply: tx,
+            };
+            if self.0.send(UiEvent::Approve(card)).is_err() {
+                return Approval::Deny(None);
             }
-        }
-    });
-    let (ctx, mut crx) = mpsc::unbounded_channel();
-    let h = handle.clone();
-    tokio::spawn(async move {
-        while let Some(c) = crx.recv().await {
-            match c {
-                Cmd::Prompt(t) => h.prompt(t),
-                Cmd::Steer(t) => h.steer(t),
-                Cmd::Abort => h.abort(),
-                Cmd::Quit => break,
+            match rx.await {
+                Ok(Answer::Once) => Approval::Once,
+                Ok(Answer::Session) => Approval::Session,
+                Ok(Answer::Always) => Approval::Always,
+                Ok(Answer::Deny(why)) => Approval::Deny(why),
+                Err(_) => Approval::Deny(None),
             }
-        }
-    });
-    let init = novacode_tui::Init {
-        model: model.into(),
-        cwd: cwd.display().to_string(),
-        branch: git_branch(cwd),
-        window_tokens,
-        history,
-    };
-    let res = novacode_tui::run(init, erx, ctx).await;
-    handle.abort();
-    handle.shutdown();
-    let agent = task.await?;
-    res?;
-    if agent.store.path().is_some_and(|p| p.exists()) {
-        eprintln!("resume with: novacode -r {}", &id[..id.len().min(13)]);
+        })
     }
-    Ok(ExitCode::SUCCESS)
+}
+
+fn load_keymap(paths: &Paths) -> (Keymap, Vec<String>) {
+    let path = paths.home().join("keybindings.json");
+    let map = match std::fs::read_to_string(&path) {
+        Ok(s) => match serde_json::from_str::<BTreeMap<String, serde_json::Value>>(&s) {
+            Ok(m) => m,
+            Err(e) => {
+                let (km, _) = Keymap::new(&BTreeMap::new());
+                return (
+                    km,
+                    vec![format!(
+                        "{} is not valid JSON ({e}); using default keys",
+                        path.display()
+                    )],
+                );
+            }
+        },
+        Err(_) => BTreeMap::new(),
+    };
+    Keymap::new(&map)
+}
+
+fn ago(t: std::time::SystemTime) -> String {
+    let s = t.elapsed().map_or(0, |d| d.as_secs());
+    match s {
+        s if s < 60 => "just now".into(),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
+    }
+}
+
+/// The TUI, one session at a time; /resume and /new swap the session in place.
+async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> anyhow::Result<ExitCode> {
+    let mut notices = Vec::new();
+    loop {
+        let (ui_tx, ui_rx) = mpsc::unbounded_channel();
+        let approver: Arc<dyn Approver> = Arc::new(TuiApprover(ui_tx.clone()));
+        let (agent, adapter) = ctx.agent(store, &model, Some(approver)).await?;
+        let history = agent.store.projection();
+        let id = agent.store.id().to_string();
+        let (handle, task) = agent::spawn(agent);
+        let (etx, erx) = mpsc::unbounded_channel();
+        let mut events = handle.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(e) => {
+                        if etx.send(e).is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => tracing::warn!(n, "ui missed events"),
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        let (ctx_tx, mut crx) = mpsc::unbounded_channel();
+        let h = handle.clone();
+        let current = Arc::new(std::sync::Mutex::new(model.clone()));
+        let cur = current.clone();
+        let (paths, cwd, this_id) = (ctx.paths.clone(), ctx.cwd.clone(), id.clone());
+        tokio::spawn(async move {
+            while let Some(c) = crx.recv().await {
+                match c {
+                    Cmd::Prompt(t) => h.prompt(t),
+                    Cmd::Steer(t) => h.steer(t),
+                    Cmd::Abort => h.abort(),
+                    Cmd::SetModel(m) => {
+                        let mut cur = cur.lock().unwrap();
+                        let provider = cur.split_once('/').map_or("", |(p, _)| p).to_string();
+                        *cur = format!("{provider}/{m}");
+                        h.set_model(m);
+                    }
+                    Cmd::ListModels => {
+                        let (adapter, tx, cur) = (adapter.clone(), ui_tx.clone(), cur.lock().unwrap().clone());
+                        tokio::spawn(async move {
+                            let provider = cur.split_once('/').map_or("", |(p, _)| p).to_string();
+                            let r = adapter.list_models().await.map(|ids| {
+                                ids.into_iter()
+                                    .map(|id| {
+                                        let value = format!("{provider}/{id}");
+                                        PickItem {
+                                            detail: if value == cur { "current".into() } else { String::new() },
+                                            label: id,
+                                            value,
+                                        }
+                                    })
+                                    .collect()
+                            });
+                            let _ = tx.send(UiEvent::Models(r));
+                        });
+                    }
+                    Cmd::ListSessions => {
+                        let items = session::list(&paths, &cwd)
+                            .iter()
+                            .filter_map(|p| session::summary(p))
+                            .filter(|s| s.id != this_id && s.prompts > 0)
+                            .map(|s| PickItem {
+                                label: if s.title.is_empty() {
+                                    s.id.clone()
+                                } else {
+                                    s.title.clone()
+                                },
+                                detail: format!(
+                                    "{} prompt{} · {}",
+                                    s.prompts,
+                                    if s.prompts == 1 { "" } else { "s" },
+                                    ago(s.modified)
+                                ),
+                                value: s.path.display().to_string(),
+                            })
+                            .collect();
+                        let _ = ui_tx.send(UiEvent::Sessions(items));
+                    }
+                    Cmd::Quit => break,
+                }
+            }
+        });
+        let init = novacode_tui::Init {
+            model: model.clone(),
+            cwd: ctx.cwd.display().to_string(),
+            branch: git_branch(&ctx.cwd),
+            window_tokens: ctx.window_tokens(),
+            history,
+            keymap: {
+                let (km, warn) = load_keymap(&ctx.paths);
+                notices.extend(warn);
+                km
+            },
+            collapse_turns: ctx.settings.get("ui.turnCollapse").unwrap_or(true),
+            notices: std::mem::take(&mut notices),
+        };
+        let res = novacode_tui::run(init, erx, ui_rx, ctx_tx).await;
+        handle.abort();
+        handle.shutdown();
+        let agent = task.await?;
+        model = current.lock().unwrap().clone();
+        let prev = agent.store.path().map(Path::to_path_buf);
+        drop(agent);
+        let next = match res? {
+            Exit::Quit => {
+                if prev.as_ref().is_some_and(|p| p.exists()) {
+                    eprintln!("resume with: novacode -r {}", &id[..id.len().min(13)]);
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            Exit::New => Ok(Store::create(&ctx.paths, &ctx.cwd, ctx.cli.no_session)),
+            Exit::Resume(path) => Store::open(Path::new(&path)),
+        };
+        store = match next {
+            Ok(s) => s,
+            Err(e) => {
+                notices.push(format!("could not open that session: {e}"));
+                match prev.filter(|p| p.exists()) {
+                    Some(p) => Store::open(&p)?,
+                    None => Store::create(&ctx.paths, &ctx.cwd, ctx.cli.no_session),
+                }
+            }
+        };
+    }
+}
+
+/// L6.3: four choices, asked once per folder that has project config.
+fn ask_trust(store: &TrustStore, cwd: &Path) -> anyhow::Result<bool> {
+    let parent = cwd.parent().unwrap_or(cwd).to_path_buf();
+    let item = |label: String, value: &str| PickItem {
+        label,
+        detail: String::new(),
+        value: value.into(),
+    };
+    let body = [
+        format!(
+            "{} has project config (.novacode/settings.json, extensions, MCP, hooks or skills).",
+            cwd.display()
+        ),
+        "Trusting it lets that config change settings and run code. AGENTS.md and CLAUDE.md load either way.".into(),
+    ];
+    let pick = novacode_tui::prompt::select(
+        "Trust this folder?",
+        &body,
+        vec![
+            item("Trust this folder".into(), "this"),
+            item(format!("Trust the parent folder {}", parent.display()), "parent"),
+            item("Trust for this session only".into(), "session"),
+            item("Don't trust".into(), "never"),
+        ],
+    )?;
+    Ok(match pick.as_deref() {
+        Some("this") => {
+            store.set(cwd, true)?;
+            true
+        }
+        Some("parent") => {
+            store.set(&parent, true)?;
+            true
+        }
+        Some("session") => true,
+        Some("never") => {
+            store.set(cwd, false)?;
+            false
+        }
+        _ => false,
+    })
+}
+
+/// L11.6 first run: connect (subscription first), pick a model, save it.
+async fn onboard(paths: &Paths, auth_store: &AuthStore, settings: &Settings) -> anyhow::Result<String> {
+    let logged_in = auth_store.has(claude::PROVIDER);
+    let env_key = std::env::var("ANTHROPIC_API_KEY").is_ok();
+    let item = |label: &str, detail: &str, value: &str| PickItem {
+        label: label.into(),
+        detail: detail.into(),
+        value: value.into(),
+    };
+    let body = ["Welcome to novacode. How should it reach a model? (More providers arrive in M5.)".to_string()];
+    let provider = novacode_tui::prompt::select(
+        "Connect",
+        &body,
+        vec![
+            item(
+                "Claude Pro/Max subscription",
+                if logged_in {
+                    "logged in"
+                } else {
+                    "log in with your browser"
+                },
+                claude::PROVIDER,
+            ),
+            item(
+                "Anthropic API key",
+                if env_key {
+                    "found ANTHROPIC_API_KEY"
+                } else {
+                    "set ANTHROPIC_API_KEY first"
+                },
+                "anthropic",
+            ),
+        ],
+    )?
+    .context("setup cancelled; run novacode again, or pass -m provider/model")?;
+    match provider.as_str() {
+        claude::PROVIDER if !logged_in => {
+            login(auth_store, claude::PROVIDER).await?;
+        }
+        "anthropic" if !env_key && settings.get::<String>("providers.anthropic.apiKey").is_none() => {
+            bail!("set ANTHROPIC_API_KEY (or providers.anthropic.apiKey in settings) and run novacode again")
+        }
+        _ => {}
+    }
+    let ctx_auth = match provider.as_str() {
+        claude::PROVIDER => Auth::OAuth {
+            access_token: auth_store.access_token(claude::PROVIDER, DEFAULT_ACCOUNT).await?,
+            profile: OAuthProfile::default(),
+        },
+        _ => Auth::ApiKey(auth::resolve_key(
+            &settings
+                .get::<String>("providers.anthropic.apiKey")
+                .unwrap_or_else(|| "$ANTHROPIC_API_KEY".into()),
+        )?),
+    };
+    let ids = Anthropic::new(ctx_auth, None)
+        .list_models()
+        .await
+        .map_err(|e| anyhow::anyhow!("could not list models: {e}. Pass -m {provider}/<model> instead."))?;
+    let items = ids
+        .into_iter()
+        .map(|id| item(&id, "", &format!("{provider}/{id}")))
+        .collect();
+    let body = ["Pick a default model. It is saved to settings.json; /model changes it later.".to_string()];
+    let model = novacode_tui::prompt::select("Model", &body, items)?.context("setup cancelled")?;
+    settings::set(&paths.settings(), "model", &serde_json::Value::from(model.clone()))?;
+    eprintln!("saved \"model\": \"{model}\" to {}", paths.settings().display());
+    Ok(model)
 }
 
 /// Current branch (or short HEAD) from `.git`, worktrees included. No git process.

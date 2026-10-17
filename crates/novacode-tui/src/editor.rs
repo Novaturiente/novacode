@@ -1,7 +1,7 @@
 //! The prompt editor (L9.5): multiline with soft wrap, grapheme and word
 //! moves, kill ring, undo, history and collapsed paste markers.
-// shortcut: no Ctrl+R search, @file or slash completion, $EDITOR (M4b).
 
+use crate::keys::{A, Keymap, Scope};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -22,6 +22,10 @@ pub struct Editor {
     history: Vec<String>,
     /// Position while browsing history, and the draft it replaced.
     hist: Option<(usize, String)>,
+    /// Ctrl+R: query, matched history index, draft to restore on Esc.
+    search: Option<(String, Option<usize>, String)>,
+    /// The last yank's range and kill-ring index, for yank-pop.
+    yanked: Option<(usize, usize, usize)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -266,33 +270,120 @@ impl Editor {
         out
     }
 
-    pub fn handle_key(&mut self, k: KeyEvent, width: usize) -> Action {
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = k.modifiers.contains(KeyModifiers::ALT);
-        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
-        if !matches!(k.code, KeyCode::Up | KeyCode::Down) {
+    /// Replace the whole text (from `$EDITOR` or a picked history entry).
+    pub fn set_text(&mut self, s: &str) {
+        self.save(EditKind::Other);
+        self.text = s.to_string();
+        self.cursor = self.text.len();
+    }
+
+    /// Take the text for sending (paste markers expanded, added to history). `None` if blank.
+    pub fn take(&mut self) -> Option<String> {
+        (!self.text.trim().is_empty()).then(|| self.submit_text())
+    }
+
+    pub fn searching(&self) -> bool {
+        self.search.is_some()
+    }
+
+    /// Ctrl+R: start a reverse history search, or jump to the next older match.
+    pub fn search_history(&mut self) {
+        match &mut self.search {
+            None => self.search = Some((String::new(), None, self.text.clone())),
+            Some((q, at, _)) => {
+                let q = q.clone();
+                let from = at.unwrap_or(self.history.len());
+                *at = self.history[..from].iter().rposition(|h| h.contains(&q)).or(*at);
+            }
+        }
+        self.show_match();
+    }
+
+    fn show_match(&mut self) {
+        if let Some((_, Some(i), _)) = &self.search {
+            self.text = self.history[*i].clone();
+            self.cursor = self.text.len();
+        }
+    }
+
+    fn search_key(&mut self, k: KeyEvent) {
+        let Some((q, at, draft)) = &mut self.search else { return };
+        match k.code {
+            KeyCode::Esc => {
+                self.text = std::mem::take(draft);
+                self.cursor = self.text.len();
+                self.search = None;
+            }
+            KeyCode::Char('g') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.text = std::mem::take(draft);
+                self.cursor = self.text.len();
+                self.search = None;
+            }
+            KeyCode::Backspace => {
+                q.pop();
+                *at = self.history.iter().rposition(|h| h.contains(q.as_str()));
+                self.show_match();
+            }
+            KeyCode::Char(c) if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                q.push(c);
+                *at = self.history.iter().rposition(|h| h.contains(q.as_str()));
+                self.show_match();
+            }
+            // Anything else accepts the match and is handled normally.
+            _ => self.search = None,
+        }
+    }
+
+    /// The search prompt shown above the editor, if searching.
+    pub fn search_prompt(&self) -> Option<String> {
+        self.search.as_ref().map(|(q, at, _)| {
+            let state = if at.is_some() || q.is_empty() {
+                ""
+            } else {
+                " (no match)"
+            };
+            format!("history search: {q}{state}   Ctrl+R older · Enter use · Esc cancel")
+        })
+    }
+
+    /// `a` is the bound action for `k`, if any (see [`Keymap::lookup`]).
+    pub fn handle(&mut self, a: Option<A>, k: KeyEvent, width: usize) -> Action {
+        if self.search.is_some() {
+            // Enter only accepts the match; it doesn't send.
+            if k.code == KeyCode::Enter {
+                self.search = None;
+                return Action::None;
+            }
+            let cancel =
+                k.code == KeyCode::Esc || (k.code == KeyCode::Char('g') && k.modifiers.contains(KeyModifiers::CONTROL));
+            self.search_key(k);
+            // Still searching, or cancelled: done. Any other key accepted the match and runs below.
+            if self.search.is_some() || cancel {
+                return Action::None;
+            }
+        }
+        if !matches!(a, Some(A::CursorUp | A::CursorDown)) {
             self.hist = None;
         }
-        match k.code {
-            KeyCode::Enter if shift || ctrl => self.insert("\n"),
-            KeyCode::Enter if alt => {
-                if !self.text.trim().is_empty() {
-                    return Action::FollowUp(self.submit_text());
+        if a != Some(A::YankPop) && a != Some(A::Yank) {
+            self.yanked = None;
+        }
+        match a {
+            Some(A::NewLine) => self.insert("\n"),
+            Some(A::Submit) => {
+                if let Some(t) = self.take() {
+                    return Action::Submit(t);
                 }
             }
-            KeyCode::Enter => {
-                if !self.text.trim().is_empty() {
-                    return Action::Submit(self.submit_text());
-                }
-            }
-            KeyCode::Char('j') if ctrl => self.insert("\n"),
-            KeyCode::Char('a') if ctrl => self.cursor = self.line_start(),
-            KeyCode::Char('e') if ctrl => self.cursor = self.line_end(),
-            KeyCode::Char('b') if ctrl => self.cursor = self.prev(self.cursor),
-            KeyCode::Char('f') if ctrl => self.cursor = self.next(self.cursor),
-            KeyCode::Char('b') if alt => self.cursor = self.word_left(self.cursor),
-            KeyCode::Char('f') if alt => self.cursor = self.word_right(self.cursor),
-            KeyCode::Char('k') if ctrl => {
+            Some(A::LineStart) => self.cursor = self.line_start(),
+            Some(A::LineEnd) => self.cursor = self.line_end(),
+            Some(A::CursorLeft) => self.cursor = self.prev(self.cursor),
+            Some(A::CursorRight) => self.cursor = self.next(self.cursor),
+            Some(A::WordLeft) => self.cursor = self.word_left(self.cursor),
+            Some(A::WordRight) => self.cursor = self.word_right(self.cursor),
+            Some(A::CursorUp) => self.vertical(true, width),
+            Some(A::CursorDown) => self.vertical(false, width),
+            Some(A::DeleteToLineEnd) => {
                 let end = self.line_end();
                 let end = if end == self.cursor && end < self.text.len() {
                     end + 1
@@ -301,47 +392,60 @@ impl Editor {
                 };
                 self.delete(self.cursor, end, true);
             }
-            KeyCode::Char('u') if ctrl => self.delete(self.line_start(), self.cursor, true),
-            KeyCode::Char('w') if ctrl => self.delete(self.word_left(self.cursor), self.cursor, true),
-            KeyCode::Backspace if alt || ctrl => self.delete(self.word_left(self.cursor), self.cursor, true),
-            KeyCode::Char('d') if alt => self.delete(self.cursor, self.word_right(self.cursor), true),
-            KeyCode::Char('y') if ctrl => {
+            Some(A::DeleteToLineStart) => self.delete(self.line_start(), self.cursor, true),
+            Some(A::DeleteWordBack) => self.delete(self.word_left(self.cursor), self.cursor, true),
+            Some(A::DeleteWordForward) => self.delete(self.cursor, self.word_right(self.cursor), true),
+            Some(A::DeleteBack) => match self.marker_before() {
+                Some(start) => self.delete(start, self.cursor, false),
+                None => self.delete(self.prev(self.cursor), self.cursor, false),
+            },
+            Some(A::DeleteForward) => self.delete(self.cursor, self.next(self.cursor), false),
+            Some(A::Yank) => {
                 if let Some(s) = self.kill.last().cloned() {
                     self.save(EditKind::Other);
                     self.text.insert_str(self.cursor, &s);
+                    self.yanked = Some((self.cursor, self.cursor + s.len(), self.kill.len() - 1));
                     self.cursor += s.len();
                 }
             }
-            KeyCode::Char('_') | KeyCode::Char('-') if ctrl => {
+            Some(A::YankPop) => {
+                if let Some((start, end, i)) = self.yanked
+                    && self.kill.len() > 1
+                {
+                    let j = if i == 0 { self.kill.len() - 1 } else { i - 1 };
+                    let s = self.kill[j].clone();
+                    self.text.replace_range(start..end, &s);
+                    self.cursor = start + s.len();
+                    self.yanked = Some((start, self.cursor, j));
+                }
+            }
+            Some(A::Undo) => {
                 if let Some((t, c)) = self.undo.pop() {
                     self.text = t;
                     self.cursor = c.min(self.text.len());
                     self.last_edit = None;
                 }
             }
-            KeyCode::Char(c) if !ctrl => {
-                let mut b = [0; 4];
-                self.insert(c.encode_utf8(&mut b));
+            Some(_) => {}
+            None => {
+                if let KeyCode::Char(c) = k.code
+                    && !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    let mut b = [0; 4];
+                    self.insert(c.encode_utf8(&mut b));
+                }
             }
-            KeyCode::Backspace => match self.marker_before() {
-                Some(start) => self.delete(start, self.cursor, false),
-                None => self.delete(self.prev(self.cursor), self.cursor, false),
-            },
-            KeyCode::Delete => self.delete(self.cursor, self.next(self.cursor), false),
-            KeyCode::Left if ctrl || alt => self.cursor = self.word_left(self.cursor),
-            KeyCode::Right if ctrl || alt => self.cursor = self.word_right(self.cursor),
-            KeyCode::Left => self.cursor = self.prev(self.cursor),
-            KeyCode::Right => self.cursor = self.next(self.cursor),
-            KeyCode::Home => self.cursor = self.line_start(),
-            KeyCode::End => self.cursor = self.line_end(),
-            KeyCode::Up => self.vertical(true, width),
-            KeyCode::Down => self.vertical(false, width),
-            _ => {}
         }
-        if !matches!(k.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete) || ctrl || alt {
+        if !matches!(a, None | Some(A::DeleteBack | A::DeleteForward)) {
             self.last_edit = None;
         }
         Action::None
+    }
+
+    /// Raw key with the default keymap (tests, simple callers).
+    pub fn handle_key(&mut self, k: KeyEvent, width: usize) -> Action {
+        let a = Keymap::default().lookup(&k, &[Scope::Editor]);
+        self.handle(a, k, width)
     }
 
     /// Visible rows (at most `max`) and the cursor (row, col) inside them.

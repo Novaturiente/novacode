@@ -294,6 +294,49 @@ pub fn list(paths: &Paths, cwd: &Path) -> Vec<PathBuf> {
     files.into_iter().map(|(_, p)| p).collect()
 }
 
+/// What the session picker shows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Summary {
+    pub path: PathBuf,
+    pub id: String,
+    /// Session name, else the first prompt.
+    pub title: String,
+    pub prompts: usize,
+    pub modified: SystemTime,
+}
+
+/// Read a session file without opening (locking) it.
+pub fn summary(path: &Path) -> Option<Summary> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    let header: Header = serde_json::from_str(lines.next()?).ok()?;
+    let (mut name, mut first, mut prompts) = (None, None, 0);
+    for l in lines {
+        match serde_json::from_str::<Entry>(l).map(|e| e.kind) {
+            Ok(EntryKind::SessionInfo { name: n }) => name = Some(n),
+            Ok(EntryKind::Message {
+                message: Message::User { content },
+            }) => {
+                prompts += 1;
+                if first.is_none() {
+                    first = content.iter().find_map(|b| match b {
+                        Block::Text { text, .. } => Some(text.lines().next().unwrap_or("").to_string()),
+                        _ => None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(Summary {
+        path: path.to_path_buf(),
+        id: header.id,
+        title: name.or(first).unwrap_or_default(),
+        prompts,
+        modified: std::fs::metadata(path).ok()?.modified().ok()?,
+    })
+}
+
 /// Find a session by id prefix: this cwd first, then every cwd.
 pub fn find(paths: &Paths, cwd: &Path, prefix: &str) -> Result<PathBuf, StoreError> {
     let hit = |dir: &Path| -> Option<PathBuf> {

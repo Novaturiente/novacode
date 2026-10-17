@@ -3,7 +3,8 @@
 //! `UPDATE_SNAPSHOTS=1 cargo test -p novacode-tui` rewrites them.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use novacode_tui::{App, Cmd, Init};
+use novacode_tui::dialog::{Answer, ApproveReq, PickItem};
+use novacode_tui::{App, Cmd, Exit, Init, UiEvent};
 use novacode_types::*;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -18,6 +19,9 @@ fn app(history: Vec<Message>) -> (App, mpsc::UnboundedReceiver<Cmd>) {
         branch: Some("main".into()),
         window_tokens: 200_000,
         history,
+        keymap: Default::default(),
+        collapse_turns: true,
+        notices: vec![],
     };
     (App::new(init, tx), rx)
 }
@@ -246,7 +250,101 @@ fn interrupted_notice_survives_collapse() {
     a.on_agent(AgentEvent::Settled);
     let s = screen(&mut a, 40, 8);
     assert!(
-        s.contains("▸ 1 tool call · 1 failed") && s.contains("! interrupted"),
+        s.contains("▸ 1 tool call · 1 failed") && s.contains("· interrupted"),
         "{s}"
     );
+}
+
+fn key(a: &mut App, code: KeyCode, m: KeyModifiers) {
+    a.on_key(KeyEvent::new(code, m));
+}
+
+#[test]
+fn approval_card_blocks_input_and_answers() {
+    let (mut a, _rx) = app(vec![]);
+    a.on_agent(AgentEvent::AgentStart);
+    a.on_agent(AgentEvent::Message(Message::user("clean")));
+    let (tx, mut reply) = tokio::sync::oneshot::channel();
+    a.on_ui(UiEvent::Approve(ApproveReq {
+        tool: "bash".into(),
+        detail: "rm -rf target".into(),
+        reason: "rm -r deletes files".into(),
+        rule: "rm -rf target".into(),
+        risky: true,
+        reply: tx,
+    }));
+    snapshot("approval", &screen(&mut a, 60, 14));
+    // Typing goes to the card, not the editor.
+    key(&mut a, KeyCode::Char('x'), KeyModifiers::NONE);
+    assert!(a.editor.is_empty());
+    key(&mut a, KeyCode::Char('a'), KeyModifiers::NONE);
+    assert_eq!(reply.try_recv().unwrap(), Answer::Session);
+    let s = screen(&mut a, 60, 14);
+    assert!(s.contains("allowed for this session: bash rm -rf target"), "{s}");
+}
+
+#[test]
+fn slash_commands_pickers_and_pager() {
+    let (mut a, mut rx) = app(vec![]);
+    run_events(&mut a);
+    for c in "/model claude/haiku".chars() {
+        key(&mut a, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(rx.try_recv().unwrap(), Cmd::SetModel("haiku".into()));
+    assert!(screen(&mut a, 60, 30).contains("model → haiku"));
+    // Ctrl+L asks for models; the picker filters and picks.
+    key(&mut a, KeyCode::Char('l'), KeyModifiers::CONTROL);
+    assert_eq!(rx.try_recv().unwrap(), Cmd::ListModels);
+    let items = ["opus", "sonnet"]
+        .map(|m| PickItem {
+            label: m.into(),
+            detail: String::new(),
+            value: format!("claude/{m}"),
+        })
+        .to_vec();
+    a.on_ui(UiEvent::Models(Ok(items)));
+    snapshot("model_picker", &screen(&mut a, 60, 16));
+    key(&mut a, KeyCode::Char('s'), KeyModifiers::NONE);
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(rx.try_recv().unwrap(), Cmd::SetModel("sonnet".into()));
+    // Ctrl+O shows the last tool's full output; Esc closes.
+    key(&mut a, KeyCode::Char('o'), KeyModifiers::CONTROL);
+    assert!(screen(&mut a, 60, 16).contains("12+ assert_eq!(2, 2);"));
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    // Alt+/ lists keys, filterable.
+    key(&mut a, KeyCode::Char('/'), KeyModifiers::ALT);
+    for c in "model".chars() {
+        key(&mut a, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    let s = screen(&mut a, 80, 16);
+    assert!(s.contains("app.model.select") && !s.contains("app.exit"), "{s}");
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    // /resume asks for sessions; picking one exits to switch.
+    for c in "/resume".chars() {
+        key(&mut a, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(rx.try_recv().unwrap(), Cmd::ListSessions);
+    a.on_ui(UiEvent::Sessions(vec![PickItem {
+        label: "old work".into(),
+        detail: "3 prompts".into(),
+        value: "/s/1.jsonl".into(),
+    }]));
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(a.exit, Some(Exit::Resume("/s/1.jsonl".into())));
+}
+
+#[test]
+fn history_search() {
+    let (mut a, mut rx) = app(vec![Message::user("cargo test -p core"), Message::user("git status")]);
+    key(&mut a, KeyCode::Char('r'), KeyModifiers::CONTROL);
+    for c in "carg".chars() {
+        key(&mut a, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    assert_eq!(a.editor.text(), "cargo test -p core");
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(rx.try_recv().is_err(), "Enter accepts the match, it doesn't send");
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(rx.try_recv().unwrap(), Cmd::Prompt("cargo test -p core".into()));
 }

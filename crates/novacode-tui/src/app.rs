@@ -1,17 +1,20 @@
 //! App state, input handling and drawing. Talks to the session only through
-//! [`AgentEvent`]s in and [`Cmd`]s out, so the same UI can later sit on an
-//! attach socket (L8.13).
+//! [`AgentEvent`]s and [`UiEvent`]s in and [`Cmd`]s out, so the same UI can
+//! later sit on an attach socket (L8.13).
 
+use crate::dialog::{self, Answer, ApprovalCard, ApproveReq, Pager, PickItem, Picked, Picker};
 use crate::editor::{Action, Editor};
+use crate::keys::{A, Keymap, Scope};
 use crate::theme::Theme;
 use crate::transcript::{Transcript, View};
 use crate::wrap;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use novacode_types::{AgentEvent, BlockKind, Message, StopReason, StreamEvent, Usage};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 use unicode_segmentation::UnicodeSegmentation;
@@ -22,6 +25,16 @@ const WHEEL: isize = 3;
 const DOUBLE_PRESS: Duration = Duration::from_millis(500);
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Slash commands typed in the editor (L8.9 registry arrives in M8).
+pub const COMMANDS: &[(&str, &str)] = &[
+    ("/model", "pick a model, or /model <id>"),
+    ("/resume", "resume another session in this folder"),
+    ("/new", "start a new session"),
+    ("/keys", "show keybindings"),
+    ("/copy", "copy the last reply"),
+    ("/quit", "quit"),
+];
+
 /// What the UI knows at start.
 pub struct Init {
     /// `provider/model`.
@@ -31,6 +44,11 @@ pub struct Init {
     pub window_tokens: u64,
     /// Messages of a resumed session.
     pub history: Vec<Message>,
+    pub keymap: Keymap,
+    /// Fold finished turns (L9.8, setting `ui.turnCollapse`).
+    pub collapse_turns: bool,
+    /// Startup warnings (bad keybindings, settings).
+    pub notices: Vec<String>,
 }
 
 /// What the UI asks of the session.
@@ -40,7 +58,28 @@ pub enum Cmd {
     /// Delivered before the next model call of the running turn (L3.7).
     Steer(String),
     Abort,
+    /// Model id (same provider), from the next run on.
+    SetModel(String),
+    ListModels,
+    ListSessions,
     Quit,
+}
+
+/// Things the host tells the UI besides agent events.
+pub enum UiEvent {
+    Approve(ApproveReq),
+    Models(Result<Vec<PickItem>, String>),
+    Sessions(Vec<PickItem>),
+    Notice { text: String, error: bool },
+}
+
+/// Why the UI stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Exit {
+    Quit,
+    /// Session id or path picked in /resume.
+    Resume(String),
+    New,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -55,10 +94,17 @@ struct Shown {
     area: Rect,
 }
 
+enum Overlay {
+    Models(Picker),
+    Sessions(Picker),
+    Pager(Pager),
+}
+
 pub struct App {
     pub theme: Theme,
     pub tr: Transcript,
     pub editor: Editor,
+    pub keymap: Keymap,
     tx: UnboundedSender<Cmd>,
     init: Init,
     pub busy: bool,
@@ -75,34 +121,53 @@ pub struct App {
     last_ctrl_c: Option<Instant>,
     last_esc: Option<Instant>,
     editor_width: usize,
+    approvals: VecDeque<ApprovalCard>,
+    overlay: Option<Overlay>,
     pub dirty: bool,
-    pub quit: bool,
+    pub exit: Option<Exit>,
     pub suspend: bool,
-    pub clear: bool,
+    /// Open `$EDITOR` on the prompt (needs the terminal, so the loop does it).
+    pub external_editor: bool,
+}
+
+fn text_of(content: &[novacode_types::Block]) -> String {
+    content
+        .iter()
+        .filter_map(|b| match b {
+            novacode_types::Block::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 impl App {
     pub fn new(mut init: Init, tx: UnboundedSender<Cmd>) -> Self {
-        let mut tr = Transcript::default();
+        let mut tr = Transcript {
+            expand_all: !init.collapse_turns,
+            ..Default::default()
+        };
         let mut history = Vec::new();
         let mut usage = None;
         for m in std::mem::take(&mut init.history) {
             if let Message::User { content } = &m {
-                history.extend(content.iter().find_map(|b| match b {
-                    novacode_types::Block::Text { text, .. } => Some(text.clone()),
-                    _ => None,
-                }));
+                history.push(text_of(content));
             }
-            if let Message::Assistant(a) = &m {
+            if let Message::Assistant(a) = &m
+                && a.usage.prompt_total() > 0
+            {
                 usage = Some(a.usage);
             }
             tr.on_message(&m);
+        }
+        for n in std::mem::take(&mut init.notices) {
+            tr.notice(n, true);
         }
         tr.settle();
         Self {
             theme: Theme::default(),
             tr,
             editor: Editor::with_history(history),
+            keymap: std::mem::take(&mut init.keymap),
             tx,
             init,
             busy: false,
@@ -117,21 +182,35 @@ impl App {
             last_ctrl_c: None,
             last_esc: None,
             editor_width: 80,
+            approvals: VecDeque::new(),
+            overlay: None,
             dirty: true,
-            quit: false,
+            exit: None,
             suspend: false,
-            clear: false,
+            external_editor: false,
         }
     }
 
     fn send(&mut self, c: Cmd) {
         if self.tx.send(c).is_err() {
-            self.quit = true;
+            self.exit = Some(Exit::Quit);
         }
     }
 
     fn flash(&mut self, s: impl Into<String>) {
         self.flash = Some((s.into(), Instant::now()));
+    }
+
+    pub fn on_ui(&mut self, ev: UiEvent) {
+        self.dirty = true;
+        match ev {
+            UiEvent::Approve(req) => self.approvals.push_back(ApprovalCard::new(req)),
+            UiEvent::Models(Ok(items)) => self.overlay = Some(Overlay::Models(Picker::new("Model", items))),
+            UiEvent::Models(Err(e)) => self.tr.notice(format!("could not list models: {e}"), true),
+            UiEvent::Sessions(items) if items.is_empty() => self.flash("no other sessions in this folder"),
+            UiEvent::Sessions(items) => self.overlay = Some(Overlay::Sessions(Picker::new("Resume session", items))),
+            UiEvent::Notice { text, error } => self.tr.notice(text, error),
+        }
     }
 
     pub fn on_agent(&mut self, ev: AgentEvent) {
@@ -154,13 +233,7 @@ impl App {
             }
             AgentEvent::Message(m) => {
                 if let Message::User { content } = &m {
-                    let text: String = content
-                        .iter()
-                        .filter_map(|b| match b {
-                            novacode_types::Block::Text { text, .. } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect();
+                    let text = text_of(content);
                     if let Some(i) = self.pending.iter().position(|p| *p == text) {
                         self.pending.remove(i);
                     }
@@ -207,35 +280,88 @@ impl App {
         self.dirty = true;
         match ev {
             Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
-            Event::Paste(s) => self.editor.paste(&s),
-            Event::Mouse(m) => self.on_mouse(m),
+            Event::Paste(s) if self.approvals.is_empty() && self.overlay.is_none() => self.editor.paste(&s),
+            Event::Mouse(m) if self.overlay.is_none() => self.on_mouse(m),
             _ => {}
         }
     }
 
+    fn answer(&mut self, ans: Answer) {
+        let Some(card) = self.approvals.pop_front() else { return };
+        let r = &card.req;
+        let what = format!("{} {}", r.tool, r.detail.lines().next().unwrap_or(""));
+        // Kept in the transcript so the decision stays visible, even in collapsed turns (C5).
+        let (text, error) = match &ans {
+            Answer::Once => (format!("allowed once: {what}"), false),
+            Answer::Session => (format!("allowed for this session: {what}"), false),
+            Answer::Always => (format!("always allowed: {}", r.rule), false),
+            Answer::Deny(Some(why)) => (format!("denied: {what} — {why}"), true),
+            Answer::Deny(None) => (format!("denied: {what}"), true),
+        };
+        self.tr.notice(text, error);
+        let _ = card.req.reply.send(ans);
+    }
+
     pub fn on_key(&mut self, k: KeyEvent) {
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = k.modifiers.contains(KeyModifiers::ALT);
         let now = Instant::now();
         self.selection = None;
-        match k.code {
-            KeyCode::Char('c') if ctrl => {
+        if let Some(card) = self.approvals.front_mut() {
+            if let Some(ans) = card.handle(k) {
+                self.answer(ans);
+            }
+            return;
+        }
+        if let Some(o) = &mut self.overlay {
+            let page = self.shown.as_ref().map_or(10, |s| s.area.height as usize);
+            match o {
+                Overlay::Pager(p) => {
+                    if p.handle(k, page) {
+                        self.overlay = None;
+                    }
+                }
+                Overlay::Models(p) | Overlay::Sessions(p) => match p.handle(k, &self.keymap) {
+                    Picked::Pending => {}
+                    Picked::Cancel => self.overlay = None,
+                    Picked::Value(v) => {
+                        let models = matches!(o, Overlay::Models(_));
+                        self.overlay = None;
+                        if models {
+                            self.set_model(&v);
+                        } else {
+                            self.exit = Some(Exit::Resume(v));
+                        }
+                    }
+                },
+            }
+            return;
+        }
+        let scopes: &[Scope] = if self.editor.searching() {
+            &[Scope::Editor]
+        } else {
+            &[Scope::App, Scope::Scroll, Scope::Editor]
+        };
+        let mut a = self.keymap.lookup(&k, scopes);
+        // Ctrl+D quits only on an empty editor; otherwise it deletes forward.
+        if a == Some(A::Exit) && !self.editor.is_empty() {
+            a = self.keymap.lookup(&k, &[Scope::Editor]);
+        }
+        match a {
+            Some(A::Clear) => {
                 if !self.editor.is_empty() {
                     self.editor.clear();
                 } else if self.busy {
                     self.send(Cmd::Abort);
                 } else if self.last_ctrl_c.is_some_and(|t| now - t < Duration::from_secs(1)) {
-                    self.quit = true;
+                    self.exit = Some(Exit::Quit);
                 } else {
-                    self.flash("press Ctrl+C again to quit");
+                    self.flash(format!("press {} again to quit", self.keymap.keys(A::Clear)));
                 }
                 self.last_ctrl_c = Some(now);
             }
-            KeyCode::Char('d') if ctrl && self.editor.is_empty() => self.quit = true,
-            KeyCode::Char('z') if ctrl => self.suspend = true,
-            KeyCode::Char('l') if ctrl => self.clear = true,
-            KeyCode::Char('o') if alt => self.tr.toggle_all(),
-            KeyCode::Esc => {
+            Some(A::Exit) => self.exit = Some(Exit::Quit),
+            Some(A::Suspend) => self.suspend = true,
+            Some(A::TurnsToggle) => self.tr.toggle_all(),
+            Some(A::Interrupt) => {
                 if self.busy {
                     self.send(Cmd::Abort);
                 } else if self.last_esc.is_some_and(|t| now - t < DOUBLE_PRESS) {
@@ -243,25 +369,101 @@ impl App {
                 }
                 self.last_esc = Some(now);
             }
-            KeyCode::PageUp => self.scroll_by(-(self.page() as isize)),
-            KeyCode::PageDown => self.scroll_by(self.page() as isize),
-            KeyCode::Home if ctrl => self.scroll_by(isize::MIN / 2),
-            KeyCode::End if ctrl => self.anchor = None,
-            _ => match self.editor.handle_key(k, self.editor_width) {
-                Action::None => {}
-                Action::Submit(text) => self.submit(text, true),
-                Action::FollowUp(text) => self.submit(text, false),
+            Some(A::ModelSelect) => self.list_models(),
+            Some(A::SessionResume) => self.send(Cmd::ListSessions),
+            Some(A::SessionNew) => self.exit = Some(Exit::New),
+            Some(A::ToolsExpand) => match self.tr.last_tool() {
+                Some((title, out)) => self.overlay = Some(Overlay::Pager(Pager::new(title, &out, &self.theme))),
+                None => self.flash("no tool output yet"),
             },
+            Some(A::KeysHelp) => self.overlay = Some(Overlay::Pager(Pager::keys_help(&self.keymap, &self.theme))),
+            Some(A::MessageCopy) => self.copy_reply(),
+            Some(A::ExternalEditor) => self.external_editor = true,
+            Some(A::HistorySearch) => self.editor.search_history(),
+            Some(A::FollowUp) => {
+                if let Some(t) = self.editor.take() {
+                    self.submit(t, false);
+                }
+            }
+            Some(A::PageUp) => self.scroll_by(-(self.page() as isize)),
+            Some(A::PageDown) => self.scroll_by(self.page() as isize),
+            Some(A::Top) => self.scroll_by(isize::MIN / 2),
+            Some(A::Bottom) => self.anchor = None,
+            Some(A::PrevPrompt) => self.jump_prompt(-1),
+            Some(A::NextPrompt) => self.jump_prompt(1),
+            // shortcut: transcript search (L9.9) lands with M4b2.
+            Some(A::Search) => self.flash("transcript search arrives in M4b2"),
+            a => {
+                if let Action::Submit(text) = self.editor.handle(a, k, self.editor_width) {
+                    self.submit(text, true);
+                }
+            }
+        }
+    }
+
+    fn list_models(&mut self) {
+        self.flash("loading models…");
+        self.send(Cmd::ListModels);
+    }
+
+    fn set_model(&mut self, model: &str) {
+        let (provider, id) = match model.split_once('/') {
+            Some((p, m)) => (p.to_string(), m.to_string()),
+            None => (
+                self.init.model.split_once('/').map_or("", |(p, _)| p).to_string(),
+                model.to_string(),
+            ),
+        };
+        let current = self.init.model.split_once('/').map_or("", |(p, _)| p);
+        if provider != current {
+            self.tr.notice(
+                format!("switching provider mid-session arrives in M5; restart with -m {provider}/{id}"),
+                true,
+            );
+            return;
+        }
+        self.init.model = format!("{provider}/{id}");
+        // L1.7: a model change re-sends the whole prompt uncached; say so, never block.
+        let est = self.usage.map_or(0, |u| u.prompt_total());
+        let note = if est > 0 {
+            format!(
+                "model → {id} from the next message (the cache starts over: ~{}k tokens re-sent)",
+                est / 1000
+            )
+        } else {
+            format!("model → {id}")
+        };
+        self.tr.notice(note, false);
+        self.send(Cmd::SetModel(id));
+    }
+
+    fn copy_reply(&mut self) {
+        match self.tr.last_reply() {
+            Some(t) => {
+                crate::term::copy(&t);
+                self.flash(format!("copied the last reply ({} chars)", t.chars().count()));
+            }
+            None => self.flash("no reply to copy"),
         }
     }
 
     fn submit(&mut self, text: String, steer: bool) {
-        match text.trim() {
-            "/quit" | "/exit" => {
-                self.quit = true;
-                return;
+        let mut words = text.trim().splitn(2, char::is_whitespace);
+        let (cmd, arg) = (words.next().unwrap_or(""), words.next().map(str::trim).unwrap_or(""));
+        if COMMANDS.iter().any(|(c, _)| *c == cmd) || cmd == "/exit" || cmd == "/help" {
+            match cmd {
+                "/quit" | "/exit" => self.exit = Some(Exit::Quit),
+                "/model" if !arg.is_empty() => self.set_model(arg),
+                "/model" => self.list_models(),
+                "/resume" => self.send(Cmd::ListSessions),
+                "/new" => self.exit = Some(Exit::New),
+                "/keys" | "/help" => {
+                    self.overlay = Some(Overlay::Pager(Pager::keys_help(&self.keymap, &self.theme)));
+                }
+                "/copy" => self.copy_reply(),
+                _ => {}
             }
-            _ => {}
+            return;
         }
         self.anchor = None;
         if self.busy {
@@ -277,6 +479,26 @@ impl App {
             .as_ref()
             .map_or(10, |s| s.area.height.saturating_sub(2) as usize)
             .max(1)
+    }
+
+    fn top_turn(&self) -> Option<(usize, &Shown)> {
+        let s = self.shown.as_ref()?;
+        Some((s.view.starts.partition_point(|&st| st <= s.top).saturating_sub(1), s))
+    }
+
+    fn jump_prompt(&mut self, dir: isize) {
+        let Some((turn, s)) = self.top_turn() else { return };
+        let at_start = s.view.starts.get(turn) == Some(&s.top);
+        let target = match dir {
+            d if d < 0 && at_start => turn.checked_sub(1),
+            d if d < 0 => Some(turn),
+            _ => (turn + 1 < s.view.starts.len()).then_some(turn + 1),
+        };
+        match target {
+            Some(t) => self.anchor = Some((t, 0)),
+            None if dir > 0 => self.anchor = None,
+            None => {}
+        }
     }
 
     fn scroll_by(&mut self, delta: isize) {
@@ -359,10 +581,36 @@ impl App {
         let inner_w = area.width.saturating_sub(2) as usize;
         self.editor_width = inner_w;
         let ed_rows = self.editor.height(inner_w).clamp(1, EDITOR_MAX_ROWS);
-        let pending = self.pending.len().min(3) as u16;
-        let [main, pend, ed, status] = Layout::vertical([
+        let mut notes: Vec<Line> = self
+            .pending
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .map(|p| {
+                wrap::truncate(
+                    vec![Span::styled(
+                        format!(" ⏵ queued: {}", p.lines().next().unwrap_or("")),
+                        self.theme.dim,
+                    )],
+                    area.width as usize,
+                )
+            })
+            .collect();
+        if let Some(s) = self.editor.search_prompt() {
+            notes.push(wrap::truncate(
+                vec![Span::styled(format!(" {s}"), self.theme.warn)],
+                area.width as usize,
+            ));
+        }
+        let card_h = self
+            .approvals
+            .front()
+            .map_or(0, |c| c.height(area.width).min(area.height / 2));
+        let [main, card, pend, ed, status] = Layout::vertical([
             Constraint::Min(1),
-            Constraint::Length(pending),
+            Constraint::Length(card_h),
+            Constraint::Length(notes.len() as u16),
             Constraint::Length(ed_rows as u16 + 2),
             Constraint::Length(1),
         ])
@@ -374,24 +622,7 @@ impl App {
         };
         self.draw_transcript(f, main);
         let t = &self.theme;
-
-        let lines: Vec<Line> = self
-            .pending
-            .iter()
-            .rev()
-            .take(3)
-            .rev()
-            .map(|p| {
-                wrap::truncate(
-                    vec![Span::styled(
-                        format!(" ⏵ queued: {}", p.lines().next().unwrap_or("")),
-                        t.dim,
-                    )],
-                    area.width as usize,
-                )
-            })
-            .collect();
-        f.render_widget(Paragraph::new(lines), pend);
+        f.render_widget(Paragraph::new(notes), pend);
 
         let (rows, (cr, cc)) = self.editor.view(inner_w, ed_rows);
         let block = Block::bordered()
@@ -400,10 +631,21 @@ impl App {
         let inner = block.inner(ed);
         let text: Vec<Line> = rows.into_iter().map(|r| Line::styled(r, t.text)).collect();
         f.render_widget(Paragraph::new(text).block(block), ed);
-        f.set_cursor_position(Position::new(inner.x + cc, inner.y + cr));
-
+        if self.approvals.is_empty() && self.overlay.is_none() {
+            f.set_cursor_position(Position::new(inner.x + cc, inner.y + cr));
+        }
+        if let Some(c) = self.approvals.front() {
+            c.render(f, card, t);
+        }
         let st = self.status_line(area.width as usize);
         f.render_widget(Paragraph::new(st), status);
+
+        let t = &self.theme;
+        match &self.overlay {
+            Some(Overlay::Models(p) | Overlay::Sessions(p)) => p.render(f, dialog::centered(main, 70, 70, 20), t),
+            Some(Overlay::Pager(p)) => p.render(f, dialog::centered(main, 90, 90, main.height), t),
+            None => {}
+        }
     }
 
     fn draw_transcript(&mut self, f: &mut Frame, area: Rect) {
@@ -446,7 +688,10 @@ impl App {
     fn status_line(&mut self, width: usize) -> Line<'static> {
         let t = &self.theme;
         let mut left = Vec::new();
-        if self.busy {
+        if !self.approvals.is_empty() {
+            left.push(Span::styled(" ? ", t.warn));
+            left.push(Span::styled("waiting for your approval", t.warn));
+        } else if self.busy {
             left.push(Span::styled(
                 format!(" {} ", SPINNER[self.spinner % SPINNER.len()]),
                 t.accent,
@@ -464,7 +709,10 @@ impl App {
             }
         }
         if self.anchor.is_some() {
-            left.push(Span::styled("  ↓ scrolled (Ctrl+End)", t.dim));
+            left.push(Span::styled(
+                format!("  ↓ scrolled ({})", self.keymap.keys(A::Bottom)),
+                t.dim,
+            ));
         }
         let mut right = Vec::new();
         if let Some(u) = self.usage {

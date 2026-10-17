@@ -75,6 +75,31 @@ pub fn suspend(t: &mut Term) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Ctrl+G: edit `text` in `$VISUAL`/`$EDITOR` (default `vi`). `None` if unchanged.
+pub fn external_editor(t: &mut Term, text: &str) -> std::io::Result<Option<String>> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".into());
+    let path = std::env::temp_dir().join(format!("novacode-prompt-{}.md", std::process::id()));
+    std::fs::write(&path, text)?;
+    restore();
+    // Through sh, so `EDITOR="code --wait"` works; the path is passed as $1, never spliced.
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("sh")
+        .arg(&path)
+        .status();
+    *t = enter()?;
+    let out = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    if !status?.success() {
+        return Ok(None);
+    }
+    let new = out?.trim_end_matches('\n').to_string();
+    Ok((new != text).then_some(new))
+}
+
 /// Copy to the clipboard: OSC 52 (works over SSH and in tmux with
 /// set-clipboard on), plus wl-copy when on Wayland.
 pub fn copy(text: &str) {
