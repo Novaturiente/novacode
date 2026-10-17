@@ -13,3 +13,9 @@ novacode-core.workspace = true
 novacode-tui.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+novacode-ai.workspace = true
+novacode-types.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+tokio-util.workspace = true

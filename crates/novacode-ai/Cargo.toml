@@ -10,3 +10,17 @@ workspace = true
 [dependencies]
 novacode-types.workspace = true
 novacode-base.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.3"
+
+[dev-dependencies]
+tempfile.workspace = true
