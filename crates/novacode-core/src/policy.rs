@@ -1,0 +1,537 @@
+//! Permissions (L6.1), the risk gate's verdicts (L6.2) and tool profiles
+//! (L6.4). Checked in the tool pipeline for every call, so no call path can
+//! skip it.
+//!
+//! Order: profile → deny rules → risk gate → read-only mode → allow rules →
+//! ask rules → ask mode → allow. Catastrophic commands and protected commands
+//! are refused before any allow rule is looked at.
+
+use crate::risk::{self, Level};
+use futures_util::future::BoxFuture;
+use novacode_base::settings;
+use serde::Deserialize;
+use serde_json::Value;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Mode {
+    /// Everything runs unless the risk gate stops it (default).
+    #[default]
+    Auto,
+    /// The user approves edits and non-read-only bash.
+    Ask,
+    /// No edits; bash only for read-only commands (plan mode).
+    ReadOnly,
+}
+
+/// `permissions` in global settings (never project settings, L0.6).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Permissions {
+    pub mode: Mode,
+    pub allow: Vec<String>,
+    pub ask: Vec<String>,
+    pub deny: Vec<String>,
+    pub protected: Protected,
+    pub profiles: BTreeMap<String, Profile>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Protected {
+    /// Command names that never run, e.g. `sudo`.
+    pub commands: Vec<String>,
+    /// Paths treated like credentials by the risk gate.
+    pub paths: Vec<String>,
+}
+
+/// A named tool set (L6.4), e.g. `scout = read, grep, find, ls`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Profile {
+    /// Only these tools; `None` = all.
+    pub tools: Option<Vec<String>>,
+    pub deny: Vec<String>,
+}
+
+/// `Tool` or `Tool(pattern)`. Bash patterns match a simple command exactly, or
+/// by prefix with a trailing `:*`; other tools glob-match their `path` argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rule {
+    tool: String,
+    pattern: Option<String>,
+}
+
+impl Rule {
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        let (tool, pattern) = match s.split_once('(') {
+            Some((t, rest)) => (t, Some(rest.strip_suffix(')')?.to_string())),
+            None => (s, None),
+        };
+        (!tool.is_empty()).then(|| Self {
+            tool: tool.to_lowercase(),
+            pattern,
+        })
+    }
+
+    fn matches_tool(&self, tool: &str) -> bool {
+        self.tool == "*" || self.tool == tool.to_lowercase()
+    }
+
+    fn matches_command(&self, segment: &str) -> bool {
+        match self.pattern.as_deref() {
+            None | Some("*") => true,
+            Some(p) => match p.strip_suffix(":*") {
+                Some(prefix) => segment == prefix || segment.starts_with(&format!("{prefix} ")),
+                None => segment == p,
+            },
+        }
+    }
+
+    fn matches_path(&self, raw: Option<&str>, abs: Option<&Path>) -> bool {
+        let Some(p) = self.pattern.as_deref() else { return true };
+        let Ok(glob) = globset::Glob::new(p) else { return false };
+        let m = glob.compile_matcher();
+        raw.is_some_and(|r| m.is_match(r)) || abs.is_some_and(|a| m.is_match(a))
+    }
+}
+
+impl std::fmt::Display for Rule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut name = self.tool.clone();
+        if let Some(c) = name.get_mut(0..1) {
+            c.make_ascii_uppercase();
+        }
+        match &self.pattern {
+            Some(p) => write!(f, "{name}({p})"),
+            None => f.write_str(&name),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    Allow,
+    /// Needs the user. `rule` is what "always allow" would save; `risky` = held by the risk gate.
+    Ask {
+        reason: String,
+        rule: String,
+        risky: bool,
+    },
+    /// Refused; the text goes to the model as the tool result.
+    Deny(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovalRequest {
+    pub tool: String,
+    pub args: Value,
+    pub reason: String,
+    /// The rule shown on the card and saved by [`Approval::Always`].
+    pub rule: String,
+    pub risky: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Approval {
+    Once,
+    Session,
+    /// Save `rule` to global settings. For risk-gated commands this acts like `Session`.
+    Always,
+    Deny(Option<String>),
+}
+
+/// Whoever answers approval cards: the TUI (M4), an RPC client, a parent agent.
+pub trait Approver: Send + Sync {
+    fn approve(&self, req: ApprovalRequest) -> BoxFuture<'_, Approval>;
+}
+
+const MUTATING: &[&str] = &["write", "edit", "apply_patch"];
+const FILE_TOOLS: &[&str] = &["read", "write", "edit", "grep", "find", "ls"];
+/// A justification shorter than this is a blind retry, not a reason.
+const MIN_JUSTIFICATION: usize = 12;
+
+#[derive(Debug)]
+pub struct Policy {
+    perms: Permissions,
+    allow: Vec<Rule>,
+    ask: Vec<Rule>,
+    deny: Vec<Rule>,
+    profile: Profile,
+    home: PathBuf,
+    /// Global settings file, for "always allow".
+    global_settings: Option<PathBuf>,
+    session_allow: Mutex<Vec<Rule>>,
+    /// Risk-gated commands the user approved for this session, verbatim.
+    session_commands: Mutex<HashSet<String>>,
+}
+
+fn rules(list: &[String]) -> Vec<Rule> {
+    list.iter()
+        .filter_map(|s| {
+            let r = Rule::parse(s);
+            if r.is_none() {
+                tracing::warn!(rule = %s, "ignoring malformed permission rule");
+            }
+            r
+        })
+        .collect()
+}
+
+impl Policy {
+    pub fn new(perms: Permissions, home: PathBuf, global_settings: Option<PathBuf>) -> Self {
+        Self {
+            allow: rules(&perms.allow),
+            ask: rules(&perms.ask),
+            deny: rules(&perms.deny),
+            perms,
+            profile: Profile::default(),
+            home,
+            global_settings,
+            session_allow: Mutex::default(),
+            session_commands: Mutex::default(),
+        }
+    }
+
+    /// Restrict to a named profile (subagents, `--profile`). Unknown names are an error.
+    pub fn with_profile(mut self, name: &str) -> Result<Self, String> {
+        let p = builtin_profile(name)
+            .or_else(|| self.perms.profiles.get(name).cloned())
+            .ok_or_else(|| format!("unknown profile `{name}`"))?;
+        self.profile = p;
+        Ok(self)
+    }
+
+    pub fn with_mode(mut self, mode: Mode) -> Self {
+        self.perms.mode = mode;
+        self
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.perms.mode
+    }
+
+    /// `interactive` = an approver can ask the user right now.
+    pub fn check(&self, tool: &str, args: &Value, cwd: &Path, interactive: bool) -> Verdict {
+        let lower = tool.to_lowercase();
+        if let Some(only) = &self.profile.tools
+            && !only.iter().any(|t| t.eq_ignore_ascii_case(tool))
+        {
+            return Verdict::Deny(format!("The `{tool}` tool is not available to this agent."));
+        }
+        if self.profile.deny.iter().any(|t| t.eq_ignore_ascii_case(tool)) {
+            return Verdict::Deny(format!("The `{tool}` tool is not available to this agent."));
+        }
+
+        let command = (lower == "bash").then(|| args.get("command").and_then(Value::as_str).unwrap_or(""));
+        let segments = command.map(|c| risk::segments(c).unwrap_or_else(|| vec![c.to_string()]));
+        let raw_path = args.get("path").and_then(Value::as_str);
+        let abs_path = raw_path.map(|p| expand(p, cwd, &self.home));
+        let matches = |r: &Rule, all: bool| -> bool {
+            if !r.matches_tool(tool) {
+                return false;
+            }
+            match &segments {
+                Some(segs) if all => !segs.is_empty() && segs.iter().all(|s| r.matches_command(s)),
+                Some(segs) => segs.iter().any(|s| r.matches_command(s)),
+                None if FILE_TOOLS.contains(&lower.as_str()) => r.matches_path(raw_path, abs_path.as_deref()),
+                None => r.pattern.is_none(),
+            }
+        };
+
+        if let Some(r) = self.deny.iter().find(|r| matches(r, false)) {
+            return Verdict::Deny(format!("Denied by the permission rule `{r}`."));
+        }
+
+        let mut read_only_bash = false;
+        if let (Some(command), Some(segs)) = (command, &segments) {
+            for s in segs {
+                let name = s.split_whitespace().next().unwrap_or("");
+                let name = name.rsplit('/').next().unwrap_or(name);
+                if self.perms.protected.commands.iter().any(|c| c == name)
+                    || s.split_whitespace()
+                        .any(|w| self.perms.protected.commands.iter().any(|c| c == w))
+                {
+                    return Verdict::Deny(format!(
+                        "`{name}` is a protected command in your settings and never runs."
+                    ));
+                }
+            }
+            let ctx = risk::Ctx {
+                cwd,
+                home: &self.home,
+                protected: &self.perms.protected.paths,
+            };
+            let r = risk::classify(command, &ctx);
+            match r.level {
+                Level::Catastrophic => {
+                    return Verdict::Deny(format!(
+                        "Refused by the safety check: this command {}. It can never run from novacode. Do it another way, or ask the user to run it themselves.",
+                        r.reason.trim_start_matches("rm ")
+                    ));
+                }
+                Level::Confirm => {
+                    if interactive {
+                        // The user already approved this exact command; don't ask twice.
+                        if self.session_commands.lock().unwrap().contains(command) {
+                            return Verdict::Allow;
+                        }
+                        return Verdict::Ask {
+                            reason: r.reason,
+                            rule: command.to_string(),
+                            risky: true,
+                        };
+                    } else {
+                        let why = args.get("justification").and_then(Value::as_str).unwrap_or("").trim();
+                        if why.len() < MIN_JUSTIFICATION {
+                            return Verdict::Deny(format!(
+                                "Held by the safety check: {}. Nobody is here to approve it. If it is really needed, call bash again with the same command and a `justification` field saying why it is safe. Otherwise do it a safer way.",
+                                r.reason
+                            ));
+                        }
+                        tracing::info!(
+                            command,
+                            justification = why,
+                            "risk-gated command run with justification"
+                        );
+                    }
+                }
+                Level::Safe => read_only_bash = true,
+                Level::Low => {}
+            }
+        }
+
+        if self.perms.mode == Mode::ReadOnly {
+            if MUTATING.contains(&lower.as_str()) {
+                return Verdict::Deny(format!("Read-only mode: `{tool}` can't change files now."));
+            }
+            if command.is_some() && !read_only_bash {
+                return Verdict::Deny(
+                    "Read-only mode: only read-only shell commands run now (ls, cat, grep, git status, …).".into(),
+                );
+            }
+        }
+
+        let session = self.session_allow.lock().unwrap();
+        if self.allow.iter().chain(session.iter()).any(|r| matches(r, true)) {
+            return Verdict::Allow;
+        }
+        drop(session);
+
+        let ask = |reason: String| Verdict::Ask {
+            reason,
+            rule: suggest_rule(tool, command, raw_path),
+            risky: false,
+        };
+        if let Some(r) = self.ask.iter().find(|r| matches(r, false)) {
+            return ask(format!("matches the ask rule `{r}`"));
+        }
+        if self.perms.mode == Mode::Ask
+            && (MUTATING.contains(&lower.as_str()) || (command.is_some() && !read_only_bash))
+        {
+            return ask(format!("ask mode: `{tool}` changes things"));
+        }
+        Verdict::Allow
+    }
+
+    /// Remember an approval for the rest of the session, or in global settings.
+    pub fn record(&self, req: &ApprovalRequest, a: &Approval) {
+        match a {
+            Approval::Session | Approval::Always if req.risky => {
+                self.session_commands.lock().unwrap().insert(req.rule.clone());
+            }
+            Approval::Session => self.session_allow.lock().unwrap().extend(Rule::parse(&req.rule)),
+            Approval::Always => {
+                self.session_allow.lock().unwrap().extend(Rule::parse(&req.rule));
+                if let Some(path) = &self.global_settings {
+                    let mut list = self.perms.allow.clone();
+                    if !list.contains(&req.rule) {
+                        list.push(req.rule.clone());
+                    }
+                    if let Err(e) = settings::set(path, "permissions.allow", &Value::from(list)) {
+                        tracing::warn!(error = %e, "could not save the allow rule");
+                    }
+                }
+            }
+            Approval::Once | Approval::Deny(_) => {}
+        }
+    }
+}
+
+/// Built-in profiles; settings can define more under `permissions.profiles`.
+fn builtin_profile(name: &str) -> Option<Profile> {
+    let tools = |t: &[&str]| Profile {
+        tools: Some(t.iter().map(|s| s.to_string()).collect()),
+        deny: Vec::new(),
+    };
+    match name {
+        "scout" | "reviewer" => Some(tools(&["read", "grep", "find", "ls"])),
+        _ => None,
+    }
+}
+
+/// What "always allow" would save: `Bash(<first two words>:*)` or `Edit(<path>)`.
+fn suggest_rule(tool: &str, command: Option<&str>, path: Option<&str>) -> String {
+    let mut name = tool.to_lowercase();
+    if let Some(c) = name.get_mut(0..1) {
+        c.make_ascii_uppercase();
+    }
+    match (command, path) {
+        (Some(c), _) => {
+            let words: Vec<&str> = c.split_whitespace().take(2).collect();
+            format!("{name}({}:*)", words.join(" "))
+        }
+        (None, Some(p)) => format!("{name}({p})"),
+        _ => name,
+    }
+}
+
+fn expand(p: &str, cwd: &Path, home: &Path) -> PathBuf {
+    match p.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => cwd.join(p),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn policy(v: Value) -> Policy {
+        Policy::new(serde_json::from_value(v).unwrap(), "/home/u".into(), None)
+    }
+    fn bash(c: &str) -> Value {
+        json!({ "command": c })
+    }
+    const CWD: &str = "/home/u/proj";
+    fn check(p: &Policy, tool: &str, args: Value, interactive: bool) -> Verdict {
+        p.check(tool, &args, Path::new(CWD), interactive)
+    }
+    fn denied(v: &Verdict) -> bool {
+        matches!(v, Verdict::Deny(_))
+    }
+
+    #[test]
+    fn auto_mode_and_the_risk_gate() {
+        let p = policy(json!({ "allow": ["Bash(rm:*)"] }));
+        assert_eq!(check(&p, "bash", bash("cargo test"), false), Verdict::Allow);
+        // An allow rule can't unlock a catastrophic command.
+        assert!(denied(&check(&p, "bash", bash("rm -rf ~"), true)));
+        // Confirm: asks a present user, needs a justification headless.
+        assert!(matches!(
+            check(&p, "bash", bash("rm -rf target"), true),
+            Verdict::Ask { risky: true, .. }
+        ));
+        assert!(denied(&check(&p, "bash", bash("rm -rf target"), false)));
+        let justified = json!({ "command": "rm -rf target", "justification": "stale build output, rebuilt next" });
+        assert_eq!(check(&p, "bash", justified, false), Verdict::Allow);
+        let blind = json!({ "command": "rm -rf target", "justification": "ok" });
+        assert!(denied(&check(&p, "bash", blind, false)));
+    }
+
+    #[test]
+    fn rules_profiles_and_modes() {
+        let p = policy(json!({
+            "deny": ["Bash(git push:*)", "Read(**/.env)"],
+            "ask": ["Edit(src/**)"],
+            "protected": { "commands": ["sudo"] },
+        }));
+        assert!(denied(&check(
+            &p,
+            "bash",
+            bash("git add . && git push origin main"),
+            false
+        )));
+        assert!(denied(&check(&p, "Bash", bash("ls; sudo ls"), true)));
+        assert!(denied(&check(&p, "read", json!({"path": "a/.env"}), false)));
+        assert!(matches!(
+            check(&p, "edit", json!({"path": "src/main.rs"}), true),
+            Verdict::Ask { .. }
+        ));
+        assert_eq!(check(&p, "edit", json!({"path": "docs/x.md"}), true), Verdict::Allow);
+
+        let ro = policy(json!({})).with_mode(Mode::ReadOnly);
+        assert!(denied(&check(&ro, "write", json!({"path": "a"}), true)));
+        assert_eq!(check(&ro, "bash", bash("git status && ls"), true), Verdict::Allow);
+        assert!(denied(&check(&ro, "bash", bash("cargo build"), true)));
+
+        let ask = policy(json!({ "allow": ["Bash(cargo test:*)"] })).with_mode(Mode::Ask);
+        assert_eq!(check(&ask, "bash", bash("cargo test -p x"), true), Verdict::Allow);
+        assert_eq!(check(&ask, "read", json!({"path": "a"}), true), Verdict::Allow);
+        // Compound: every part must be allowed.
+        let Verdict::Ask { rule, .. } = check(&ask, "bash", bash("cargo test && cargo build --release"), true) else {
+            panic!()
+        };
+        assert_eq!(rule, "Bash(cargo test:*)");
+
+        let scout = policy(json!({})).with_profile("scout").unwrap();
+        assert!(denied(&check(&scout, "bash", bash("ls"), true)));
+        assert_eq!(check(&scout, "grep", json!({"pattern": "x"}), true), Verdict::Allow);
+        assert!(policy(json!({})).with_profile("nope").is_err());
+    }
+
+    #[test]
+    fn approvals_are_remembered() {
+        let p = policy(json!({})).with_mode(Mode::Ask);
+        let Verdict::Ask { rule, reason, risky } = check(&p, "bash", bash("npm run build"), true) else {
+            panic!()
+        };
+        let req = ApprovalRequest {
+            tool: "bash".into(),
+            args: bash("npm run build"),
+            reason,
+            rule,
+            risky,
+        };
+        p.record(&req, &Approval::Session);
+        assert_eq!(check(&p, "bash", bash("npm run build -- --prod"), true), Verdict::Allow);
+
+        let Verdict::Ask { rule, reason, risky } = check(&p, "bash", bash("git reset --hard"), true) else {
+            panic!()
+        };
+        let req = ApprovalRequest {
+            tool: "bash".into(),
+            args: bash("git reset --hard"),
+            reason,
+            rule,
+            risky,
+        };
+        p.record(&req, &Approval::Always);
+        assert_eq!(check(&p, "bash", bash("git reset --hard"), true), Verdict::Allow);
+        // Only that exact command, not a broad rule.
+        assert!(matches!(
+            check(&p, "bash", bash("git reset --hard HEAD~5"), true),
+            Verdict::Ask { .. }
+        ));
+    }
+
+    #[test]
+    fn always_saves_to_global_settings() {
+        let d = tempfile::tempdir().unwrap();
+        let g = d.path().join("settings.json");
+        std::fs::write(&g, "{\n  // keep me\n  \"permissions\": { \"allow\": [\"Read\"] }\n}\n").unwrap();
+        let p = Policy::new(
+            serde_json::from_value(json!({ "allow": ["Read"] })).unwrap(),
+            "/home/u".into(),
+            Some(g.clone()),
+        );
+        let req = ApprovalRequest {
+            tool: "bash".into(),
+            args: bash("make all"),
+            reason: String::new(),
+            rule: "Bash(make all:*)".into(),
+            risky: false,
+        };
+        p.record(&req, &Approval::Always);
+        let text = std::fs::read_to_string(&g).unwrap();
+        assert!(
+            text.contains("// keep me") && text.contains("Bash(make all:*)"),
+            "{text}"
+        );
+    }
+}

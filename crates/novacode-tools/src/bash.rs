@@ -24,6 +24,8 @@ struct Args {
     timeout: Option<u64>,
     /// One short sentence on why you run this; shown to the user.
     intent: Option<String>,
+    /// Only when the safety check asks for it: why this destructive command is needed and safe.
+    justification: Option<String>,
 }
 
 impl Tool for Bash {
@@ -45,7 +47,7 @@ impl Tool for Bash {
                 Ok(a) => a,
                 Err(e) => return e,
             };
-            let _ = a.intent; // shown by the UI from the call arguments
+            let _ = (a.intent, a.justification); // read by the UI and the policy from the call arguments
             let secs = a.timeout.unwrap_or(DEFAULT_TIMEOUT).clamp(1, MAX_TIMEOUT);
             let spec = ExecSpec {
                 command: a.command,

@@ -44,6 +44,7 @@ fn cfg(cwd: &Path, home: &Path) -> Config {
         cache: CacheRetention::Short,
         window_tokens: 200_000,
         spill_dir: home.join("spill"),
+        redactor: Default::default(),
     }
 }
 
@@ -289,4 +290,111 @@ async fn cut_off_and_empty_replies_are_nudged_within_caps() {
     }));
     let last = faux.requests.lock().unwrap()[2].messages.last().cloned().unwrap();
     assert!(format!("{last:?}").contains("<system-reminder>"));
+}
+
+/// Approves everything for the session and counts the cards.
+struct Yes(std::sync::Mutex<Vec<String>>);
+impl novacode_core::policy::Approver for Yes {
+    fn approve(
+        &self,
+        req: novacode_core::policy::ApprovalRequest,
+    ) -> futures_util::future::BoxFuture<'_, novacode_core::policy::Approval> {
+        self.0.lock().unwrap().push(req.rule);
+        Box::pin(async { novacode_core::policy::Approval::Session })
+    }
+}
+
+fn result_text(m: &Message) -> String {
+    match m {
+        Message::ToolResult { content, .. } => content
+            .iter()
+            .filter_map(|b| match b {
+                Block::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => String::new(),
+    }
+}
+
+/// M3 check: the policy runs inside the loop for every call; nothing reaches a tool unchecked.
+#[tokio::test]
+async fn policy_gates_every_call_in_the_loop() {
+    use novacode_core::policy::{Permissions, Policy};
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir(work.path().join("target")).unwrap();
+    std::fs::write(work.path().join("cfg.txt"), "token=SECRET-TOKEN-123456\n").unwrap();
+    let faux = Faux::new([
+        tools_reply(vec![
+            call("a", "bash", json!({"command": "rm -rf ~"})),
+            call("b", "bash", json!({"command": "rm -rf target"})),
+            call("c", "bash", json!({"command": "git push origin main"})),
+            call("d", "read", json!({"path": "cfg.txt"})),
+        ]),
+        tools_reply(vec![call(
+            "e",
+            "bash",
+            json!({"command": "rm -rf target", "justification": "build output, cargo recreates it"}),
+        )]),
+        FauxReply::text("done"),
+    ]);
+    let perms: Permissions = serde_json::from_value(json!({ "deny": ["Bash(git push:*)"] })).unwrap();
+    let mut c = cfg(work.path(), home.path());
+    c.redactor = novacode_base::redact::Redactor::new(|| vec![("SECRET-TOKEN-123456".into(), "claude login".into())]);
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        novacode_tools::builtins(false),
+        Store::create(&Paths::new(home.path()), work.path(), true),
+        c,
+        Arc::new(LocalEnv),
+    )
+    .with_policy(Policy::new(perms, home.path().into(), None));
+    let (_a, _events) = drive(agent, &["clean up"]).await;
+
+    let reqs = faux.requests.lock().unwrap();
+    let r: Vec<String> = reqs[1].messages.iter().rev().take(4).rev().map(result_text).collect();
+    assert!(r[0].contains("can never run"), "{}", r[0]);
+    // Held, not run: the result is the refusal, not bash output.
+    assert!(
+        r[1].contains("Held by the safety check") && r[1].contains("justification"),
+        "{}",
+        r[1]
+    );
+    assert!(r[2].contains("git push"), "{}", r[2]);
+    assert!(
+        r[3].contains("[redacted: claude login]") && !r[3].contains("SECRET-TOKEN"),
+        "{}",
+        r[3]
+    );
+    // With a justification the held command runs (headless).
+    assert!(!work.path().join("target").exists());
+}
+
+#[tokio::test]
+async fn ask_mode_uses_the_approver_once_per_rule() {
+    use novacode_core::policy::{Mode, Permissions, Policy};
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let faux = Faux::new([
+        tools_reply(vec![call("a", "bash", json!({"command": "touch one"}))]),
+        tools_reply(vec![call("b", "bash", json!({"command": "touch two"}))]),
+        FauxReply::text("ok"),
+    ]);
+    let yes = Arc::new(Yes(Default::default()));
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        novacode_tools::builtins(false),
+        Store::create(&Paths::new(home.path()), work.path(), true),
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_policy(Policy::new(Permissions::default(), home.path().into(), None).with_mode(Mode::Ask))
+    .with_approver(yes.clone());
+    drive(agent, &["make files"]).await;
+    assert!(work.path().join("one").exists() && work.path().join("two").exists());
+    assert_eq!(
+        *yes.0.lock().unwrap(),
+        vec!["Bash(touch one:*)".to_string(), "Bash(touch two:*)".to_string()]
+    );
 }

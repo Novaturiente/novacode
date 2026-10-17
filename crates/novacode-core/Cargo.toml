@@ -20,6 +20,7 @@ tracing.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures-util.workspace = true
+globset = "0.4"
 
 [dev-dependencies]
 novacode-base.workspace = true

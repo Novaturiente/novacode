@@ -99,6 +99,22 @@ impl AuthStore {
         Ok(had)
     }
 
+    /// Every stored token with a label, for masking tool output (L6.6). Read errors give none.
+    pub fn secrets(&self) -> Vec<(String, String)> {
+        let Ok(f) = self.read() else { return Vec::new() };
+        f.providers
+            .iter()
+            .flat_map(|(p, accounts)| {
+                accounts.values().flat_map(move |c| {
+                    [
+                        (c.access.clone(), format!("{p} login")),
+                        (c.refresh.clone(), format!("{p} login")),
+                    ]
+                })
+            })
+            .collect()
+    }
+
     pub fn has(&self, provider: &str) -> bool {
         self.read()
             .map(|f| f.providers.get(provider).is_some_and(|a| !a.is_empty()))

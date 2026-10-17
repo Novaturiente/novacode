@@ -979,6 +979,7 @@ name = "novacode-core"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "globset",
  "novacode-ai",
  "novacode-base",
  "novacode-script",

@@ -2,6 +2,7 @@
 
 pub mod logging;
 pub mod paths;
+pub mod redact;
 pub mod settings;
 pub mod storage;
 

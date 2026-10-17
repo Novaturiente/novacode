@@ -1,6 +1,9 @@
 //! The tool pipeline (L3.2): lookup with a name suggestion, argument repair
-//! and lenient coercion, execute, guard the output once. Every call path uses it.
-// shortcut: no before_tool/after_tool hooks or policy yet; they slot in between lookup and execute (M3 policy, M10 hooks).
+//! and lenient coercion, permission check (the agent's preflight, L6.1),
+//! execute, guard and redact the output once. Every call path uses it.
+// shortcut: no before_tool/after_tool hooks yet; they slot in next to the permission check (M10).
+
+use novacode_base::redact::Redactor;
 
 use novacode_tools::guard::{self, ACCEPT_LARGE, Budget};
 use novacode_tools::{Tool, ToolCtx, ToolOutput};
@@ -118,10 +121,15 @@ pub async fn run(
     ctx: &ToolCtx,
     spill: &Path,
     budget: Budget,
+    redactor: &Redactor,
 ) -> ToolOutput {
     let mut out = tool.execute(args, ctx).await;
     for b in &mut out.content {
         if let novacode_types::Block::Text { text, .. } = b {
+            // Redact before the spill file is written, so secrets never land there either.
+            if let Some(clean) = redactor.apply(text) {
+                *text = clean;
+            }
             let cut = guard::truncate(text, tool.keep(), spill);
             *text = match guard::check_budget(&cut, budget, accept) {
                 Ok(t) => t,

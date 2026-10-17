@@ -6,9 +6,12 @@ use novacode_ai::adapter::CacheRetention;
 use novacode_ai::anthropic::{Anthropic, Auth, OAuthProfile};
 use novacode_ai::auth::{self, AuthStore, DEFAULT_ACCOUNT, claude};
 use novacode_ai::trace::Trace;
+use novacode_base::redact::Redactor;
 use novacode_base::{logging, new_id, paths::Paths, settings::Settings};
 use novacode_core::agent::{self, Agent, Config};
+use novacode_core::policy::{Mode, Permissions, Policy};
 use novacode_core::session::{self, Store};
+use novacode_core::trust::{self, TrustStore};
 use novacode_tools::LocalEnv;
 use novacode_types::{AgentEvent, Message, StopReason};
 use std::io::{IsTerminal, Read, Write};
@@ -40,6 +43,15 @@ struct Cli {
     /// Don't save this session.
     #[arg(long)]
     no_session: bool,
+    /// Permission mode for this session: auto, ask or read-only (L6.1).
+    #[arg(long, value_parser = parse_mode)]
+    mode: Option<Mode>,
+    /// Restrict tools to a named profile, e.g. scout (L6.4).
+    #[arg(long)]
+    profile: Option<String>,
+    /// Trust this folder's project config for this run only (L6.3).
+    #[arg(long)]
+    trust: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -50,6 +62,16 @@ enum Command {
     Login { provider: String },
     /// Remove a stored login.
     Logout { provider: String },
+    /// Trust a folder's project config (default: the current folder); --revoke to distrust it.
+    Trust {
+        path: Option<std::path::PathBuf>,
+        #[arg(long)]
+        revoke: bool,
+    },
+}
+
+fn parse_mode(s: &str) -> Result<Mode, String> {
+    serde_json::from_value(serde_json::Value::from(s)).map_err(|_| format!("`{s}`: use auto, ask or read-only"))
 }
 
 fn main() -> ExitCode {
@@ -93,6 +115,18 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             );
             return Ok(ExitCode::SUCCESS);
         }
+        Some(Command::Trust { path, revoke }) => {
+            let dir = std::fs::canonicalize(path.unwrap_or(std::env::current_dir()?))?;
+            let trust = TrustStore::new(paths.home().join("trust.json"));
+            if revoke {
+                trust.set(&dir, false)?;
+                eprintln!("distrusted {} (its project config won't load)", dir.display());
+            } else {
+                trust.set(&dir, true)?;
+                eprintln!("trusted {} and the folders below it", dir.display());
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
         None => {}
     }
     let Some(mut prompt) = cli.print else {
@@ -112,8 +146,23 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     }
 
     let cwd = std::env::current_dir()?;
-    // shortcut: project settings stay off until project trust lands (M3, L6.3).
-    let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), false);
+    let trusted = trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &cwd, cli.trust);
+    if !trusted && trust::has_project_config(&cwd) {
+        eprintln!("note: this folder's project config is ignored (not trusted). Run `novacode trust` or pass --trust.");
+    }
+    let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
+    let perms: Permissions = settings.get("permissions").unwrap_or_default();
+    let mut policy = Policy::new(
+        perms,
+        std::env::var_os("HOME").map(Into::into).unwrap_or_default(),
+        Some(paths.settings()),
+    );
+    if let Some(m) = cli.mode {
+        policy = policy.with_mode(m);
+    }
+    if let Some(p) = &cli.profile {
+        policy = policy.with_profile(p).map_err(anyhow::Error::msg)?;
+    }
     let model = cli
         .model
         .or_else(|| settings.get::<String>("model"))
@@ -122,6 +171,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         .split_once('/')
         .context("model must be provider/model, e.g. claude/claude-opus-5-5")?;
 
+    let mut api_key: Option<String> = None;
     let auth = match provider {
         claude::PROVIDER => {
             let d = OAuthProfile::default();
@@ -141,7 +191,9 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             let raw = settings
                 .get::<String>("providers.anthropic.apiKey")
                 .unwrap_or_else(|| "$ANTHROPIC_API_KEY".into());
-            Auth::ApiKey(auth::resolve_key(&raw)?)
+            let key = auth::resolve_key(&raw)?;
+            api_key = Some(key.clone());
+            Auth::ApiKey(key)
         }
         other => bail!("unknown provider `{other}` (M1 supports claude, anthropic)"),
     };
@@ -175,15 +227,25 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         // shortcut: fixed window until the model catalog (M5, L2.10).
         window_tokens: settings.get("contextWindow").unwrap_or(200_000),
         spill_dir: paths.home().join("spill"),
+        redactor: {
+            let auth_path = paths.home().join("auth.json");
+            Redactor::new(move || {
+                let mut s = AuthStore::new(auth_path.clone()).secrets();
+                s.extend(api_key.clone().map(|k| (k, "API key".to_string())));
+                s
+            })
+        },
     };
     let tools = novacode_tools::builtins(false);
+    // Print mode has nobody to approve: asks become refusals, risky commands need a justification.
     let agent = Agent::new(
         Arc::new(Anthropic::new(auth, trace)),
         tools,
         store,
         cfg,
         Arc::new(LocalEnv),
-    );
+    )
+    .with_policy(policy);
     let (handle, task) = agent::spawn(agent);
     let mut events = handle.subscribe();
     let on_ctrl_c = handle.clone();

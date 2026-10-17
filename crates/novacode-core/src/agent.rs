@@ -6,10 +6,12 @@
 //! session entry plus an event.
 
 use crate::pipeline::{self, Prepared};
+use crate::policy::{Approval, ApprovalRequest, Approver, Permissions, Policy, Verdict};
 use crate::recovery::{Nudge, Recovery};
 use crate::session::{EntryKind, Store};
 use novacode_ai::adapter::{Adapter, CacheRetention, Request};
 use novacode_ai::retry;
+use novacode_base::redact::Redactor;
 use novacode_tools::guard::Budget;
 use novacode_tools::{ExecutionEnv, FileState, Tool, ToolCtx, ToolOutput};
 use novacode_types::{
@@ -35,6 +37,8 @@ pub struct Config {
     pub window_tokens: u64,
     /// Where cut tool output is spilled in full.
     pub spill_dir: PathBuf,
+    /// Masks novacode's own secrets in tool output (L6.6).
+    pub redactor: Redactor,
 }
 
 pub struct Agent {
@@ -49,6 +53,9 @@ pub struct Agent {
     events: broadcast::Sender<AgentEvent>,
     shared: Arc<Shared>,
     last_usage: Usage,
+    policy: Arc<Policy>,
+    /// `None` = nobody to ask (print mode, headless): asks become refusals or justifications.
+    approver: Option<Arc<dyn Approver>>,
 }
 
 #[derive(Default)]
@@ -95,6 +102,7 @@ impl Agent {
             })
             .collect();
         let (events, _) = broadcast::channel(EVENT_BUFFER);
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
         Self {
             adapter,
             tools,
@@ -106,6 +114,51 @@ impl Agent {
             events,
             shared: Arc::default(),
             last_usage: Usage::default(),
+            policy: Arc::new(Policy::new(Permissions::default(), home, None)),
+            approver: None,
+        }
+    }
+
+    pub fn with_policy(mut self, policy: Policy) -> Self {
+        self.policy = Arc::new(policy);
+        self
+    }
+
+    pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
+        self.approver = Some(approver);
+        self
+    }
+
+    /// Permission check for one prepared call (L6.1). `None` = run it; `Some` = the refusal to return.
+    async fn authorize(&self, call: &ToolCall, args: &serde_json::Value) -> Option<ToolOutput> {
+        let verdict = self
+            .policy
+            .check(&call.name, args, &self.cfg.cwd, self.approver.is_some());
+        let (reason, rule, risky) = match verdict {
+            Verdict::Allow => return None,
+            Verdict::Deny(why) => return Some(ToolOutput::error(why)),
+            Verdict::Ask { reason, rule, risky } => (reason, rule, risky),
+        };
+        let Some(approver) = &self.approver else {
+            return Some(ToolOutput::error(format!(
+                "Not run: this needs the user's approval ({reason}) and nobody can approve it here. Add an allow rule or run interactively."
+            )));
+        };
+        let req = ApprovalRequest {
+            tool: call.name.clone(),
+            args: args.clone(),
+            reason,
+            rule,
+            risky,
+        };
+        let answer = approver.approve(req.clone()).await;
+        self.policy.record(&req, &answer);
+        match answer {
+            Approval::Deny(why) => Some(ToolOutput::error(match why {
+                Some(w) if !w.trim().is_empty() => format!("The user declined this call: {w}"),
+                _ => "The user declined this call.".into(),
+            })),
+            _ => None,
         }
     }
 
@@ -310,14 +363,23 @@ impl Agent {
     /// (or sequential if any tool asks), results appended in source order.
     /// Returns true when every call was rejected before running.
     async fn run_tools(&mut self, calls: Vec<ToolCall>, cancel: &CancellationToken) -> bool {
-        let prepared: Vec<(ToolCall, Prepared)> = calls
+        let mut prepared: Vec<(ToolCall, Prepared)> = calls
             .into_iter()
             .map(|c| {
                 let p = pipeline::prepare(&self.tools, &c);
                 (c, p)
             })
             .collect();
+        // Malformed calls count toward the cap (L3.4); permission refusals don't.
         let all_rejected = prepared.iter().all(|(_, p)| matches!(p, Prepared::Rejected(_)));
+        // Permissions are part of the sequential preflight (L3.3, L6.1); approvals are asked one at a time.
+        for (call, p) in &mut prepared {
+            if let Prepared::Ready(_, args, _) = p
+                && let Some(refusal) = self.authorize(call, args).await
+            {
+                *p = Prepared::Rejected(refusal);
+            }
+        }
         let sequential = prepared
             .iter()
             .any(|(_, p)| matches!(p, Prepared::Ready(t, ..) if t.sequential()));
@@ -335,6 +397,7 @@ impl Agent {
         };
         let one = |call: &ToolCall, p: &Prepared| {
             let events = self.events.clone();
+            let redactor = self.cfg.redactor.clone();
             let spill = self
                 .cfg
                 .spill_dir
@@ -364,7 +427,7 @@ impl Agent {
                                 });
                             }
                         });
-                        pipeline::run(tool.as_ref(), args, accept, &ctx, &spill, budget).await
+                        pipeline::run(tool.as_ref(), args, accept, &ctx, &spill, budget, &redactor).await
                     }
                 };
                 let duration_ms = t0.elapsed().as_millis() as u64;
