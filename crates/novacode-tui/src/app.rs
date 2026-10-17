@@ -9,7 +9,7 @@ use crate::theme::Theme;
 use crate::transcript::{Thinking, Transcript, View};
 use crate::wrap;
 use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
-use novacode_types::{AgentEvent, BlockKind, Message, StopReason, StreamEvent, Usage};
+use novacode_types::{AgentEvent, BlockKind, Message, StopReason, StreamEvent, ThinkingLevel, Usage};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
@@ -31,6 +31,7 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 /// Slash commands typed in the editor (L8.9 registry arrives in M8).
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/model", "pick a model, or /model <id>"),
+    ("/thinking", "pick a thinking level, or /thinking <level>"),
     ("/resume", "resume another session in this folder"),
     ("/new", "start a new session"),
     ("/keys", "show keybindings"),
@@ -55,6 +56,8 @@ pub struct Init {
     pub theme: Theme,
     /// Setting `ui.thinking`: collapsed, full or hidden.
     pub thinking: Thinking,
+    /// Thinking level in use (L2.16).
+    pub level: ThinkingLevel,
 }
 
 /// What the UI asks of the session.
@@ -66,6 +69,8 @@ pub enum Cmd {
     Abort,
     /// Model id (same provider), from the next run on.
     SetModel(String),
+    /// From the next message on; the host answers with [`UiEvent::Thinking`].
+    SetThinking(ThinkingLevel),
     ListModels,
     ListSessions,
     Quit,
@@ -76,7 +81,15 @@ pub enum UiEvent {
     Approve(ApproveReq),
     Models(Result<Vec<PickItem>, String>),
     Sessions(Vec<PickItem>),
-    Notice { text: String, error: bool },
+    Notice {
+        text: String,
+        error: bool,
+    },
+    /// The level actually used (clamped to what the model supports), and a note.
+    Thinking {
+        level: ThinkingLevel,
+        note: String,
+    },
 }
 
 /// Why the UI stopped.
@@ -118,6 +131,7 @@ struct Search {
 
 enum Overlay {
     Models(Picker),
+    Thinking(Picker),
     Sessions(Picker),
     Pager(Pager),
 }
@@ -239,6 +253,10 @@ impl App {
             UiEvent::Sessions(items) if items.is_empty() => self.flash("no other sessions in this folder"),
             UiEvent::Sessions(items) => self.overlay = Some(Overlay::Sessions(Picker::new("Resume session", items))),
             UiEvent::Notice { text, error } => self.tr.notice(text, error),
+            UiEvent::Thinking { level, note } => {
+                self.init.level = level;
+                self.tr.notice(note, false);
+            }
         }
     }
 
@@ -348,16 +366,15 @@ impl App {
                         self.overlay = None;
                     }
                 }
-                Overlay::Models(p) | Overlay::Sessions(p) => match p.handle(k, &self.keymap) {
+                Overlay::Models(p) | Overlay::Sessions(p) | Overlay::Thinking(p) => match p.handle(k, &self.keymap) {
                     Picked::Pending => {}
                     Picked::Cancel => self.overlay = None,
                     Picked::Value(v) => {
-                        let models = matches!(o, Overlay::Models(_));
-                        self.overlay = None;
-                        if models {
-                            self.set_model(&v);
-                        } else {
-                            self.exit = Some(Exit::Resume(v));
+                        let o = self.overlay.take();
+                        match o {
+                            Some(Overlay::Models(_)) => self.set_model(&v),
+                            Some(Overlay::Thinking(_)) => self.set_thinking(&v),
+                            _ => self.exit = Some(Exit::Resume(v)),
                         }
                     }
                 },
@@ -433,6 +450,11 @@ impl App {
                     at: None,
                 })
             }
+            Some(A::ThinkingCycle) => {
+                let all = ThinkingLevel::ALL;
+                let i = all.iter().position(|l| *l == self.init.level).unwrap_or(0);
+                self.send(Cmd::SetThinking(all[(i + 1) % all.len()]));
+            }
             Some(A::ThinkingToggle) => {
                 let next = if self.tr.thinking == Thinking::Full {
                     Thinking::Collapsed
@@ -489,6 +511,8 @@ impl App {
                 .filter(|(c, _)| c.starts_with(token))
                 .map(|(c, d)| (c.to_string(), format!("{c} "), d.to_string()))
                 .collect()
+        } else if let Some(items) = token.strip_prefix('@').and_then(|q| browse(&self.init.cwd, q)) {
+            items
         } else if let Some(q) = token.strip_prefix('@') {
             let files = self.files.get_or_insert_with(|| list_files(&self.init.cwd));
             let mut hits: Vec<(usize, &String)> = files
@@ -504,7 +528,14 @@ impl App {
             hits.sort();
             hits.into_iter()
                 .take(50)
-                .map(|(_, f)| (f.clone(), format!("@{f} "), String::new()))
+                // A folder keeps the popup open so you can go on into it.
+                .map(|(_, f)| {
+                    (
+                        f.clone(),
+                        format!("@{f}{}", if f.ends_with('/') { "" } else { " " }),
+                        String::new(),
+                    )
+                })
                 .collect()
         } else {
             Vec::new()
@@ -619,6 +650,31 @@ impl App {
         self.send(Cmd::SetModel(id));
     }
 
+    fn pick_thinking(&mut self) {
+        let items = ThinkingLevel::ALL
+            .iter()
+            .map(|l| PickItem {
+                label: l.as_str().into(),
+                value: l.as_str().into(),
+                detail: if *l == self.init.level {
+                    "current".into()
+                } else {
+                    String::new()
+                },
+            })
+            .collect();
+        self.overlay = Some(Overlay::Thinking(Picker::new("Thinking level", items)));
+    }
+
+    fn set_thinking(&mut self, s: &str) {
+        match ThinkingLevel::parse(s) {
+            Some(l) => self.send(Cmd::SetThinking(l)),
+            None => self.flash(format!(
+                "unknown level `{s}`: off, minimal, low, medium, high, xhigh, max"
+            )),
+        }
+    }
+
     fn copy_reply(&mut self) {
         match self.tr.last_reply() {
             Some(t) => {
@@ -637,6 +693,8 @@ impl App {
                 "/quit" | "/exit" => self.exit = Some(Exit::Quit),
                 "/model" if !arg.is_empty() => self.set_model(arg),
                 "/model" => self.list_models(),
+                "/thinking" if !arg.is_empty() => self.set_thinking(arg),
+                "/thinking" => self.pick_thinking(),
                 "/resume" => self.send(Cmd::ListSessions),
                 "/new" => self.exit = Some(Exit::New),
                 "/keys" | "/help" => {
@@ -867,7 +925,9 @@ impl App {
 
         let t = &self.theme;
         match &self.overlay {
-            Some(Overlay::Models(p) | Overlay::Sessions(p)) => p.render(f, dialog::centered(main, 70, 70, 20), t),
+            Some(Overlay::Models(p) | Overlay::Sessions(p) | Overlay::Thinking(p)) => {
+                p.render(f, dialog::centered(main, 70, 70, 20), t)
+            }
             Some(Overlay::Pager(p)) => p.render(f, dialog::centered(main, 90, 90, main.height), t),
             None => {}
         }
@@ -978,6 +1038,7 @@ impl App {
             right.push(Span::raw("  "));
         }
         right.push(Span::styled(self.init.model.clone(), t.accent));
+        right.push(Span::styled(format!(" · {}", self.init.level.as_str()), t.dim));
         let dir = std::path::Path::new(&self.init.cwd)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -1022,4 +1083,43 @@ fn list_files(cwd: &str) -> Vec<String> {
         .collect();
     out.sort();
     out
+}
+
+/// `@~/…`, `@/…`, `@../…`, `@./…`: list one folder, inside or outside the
+/// project (pi style). `None` = not such a path; use the project-wide search.
+fn browse(cwd: &str, q: &str) -> Option<Vec<(String, String, String)>> {
+    let q = match q {
+        "~" => "~/",
+        ".." => "../",
+        q if q.starts_with('/') || q.starts_with("~/") || q.starts_with("../") || q.starts_with("./") => q,
+        _ => return None,
+    };
+    let (base, name) = q.split_at(q.rfind('/')? + 1);
+    let dir = match base.strip_prefix("~/") {
+        Some(rest) => std::path::PathBuf::from(std::env::var_os("HOME")?).join(rest),
+        None => std::path::Path::new(cwd).join(base),
+    };
+    let name = name.to_lowercase();
+    let mut hits: Vec<(bool, String)> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            // Hidden entries only when asked for with a leading dot.
+            let wanted = n.to_lowercase().starts_with(&name) && (!n.starts_with('.') || name.starts_with('.'));
+            // `metadata` follows symlinks, so a link to a folder counts as a folder.
+            wanted.then(|| (!std::fs::metadata(e.path()).is_ok_and(|m| m.is_dir()), n))
+        })
+        .collect();
+    hits.sort(); // folders first, then by name
+    Some(
+        hits.into_iter()
+            .take(200)
+            .map(|(file, n)| {
+                let tail = if file { " " } else { "/" };
+                let label = if file { n.clone() } else { format!("{n}/") };
+                (label, format!("@{base}{n}{tail}"), String::new())
+            })
+            .collect(),
+    )
 }

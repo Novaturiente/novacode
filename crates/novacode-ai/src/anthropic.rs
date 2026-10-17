@@ -7,7 +7,7 @@ use crate::retry;
 use crate::sse::SseParser;
 use crate::trace::Trace;
 use futures_util::StreamExt;
-use novacode_types::{Block, BlockKind, ErrorKind, Message, StopReason, StreamEvent, Usage};
+use novacode_types::{Block, BlockKind, ErrorKind, Message, StopReason, StreamEvent, ThinkingLevel, Usage};
 use serde_json::{Map, Value, json};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -86,7 +86,7 @@ impl Anthropic {
             if oauth { "&beta=true" } else { "" }
         );
         let resp = self
-            .authed(self.http.get(url))
+            .authed(self.http.get(url), &[])
             .timeout(Duration::from_secs(20))
             .send()
             .await
@@ -108,19 +108,28 @@ impl Anthropic {
             .collect())
     }
 
-    fn authed(&self, r: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn authed(&self, r: reqwest::RequestBuilder, extra_betas: &[&str]) -> reqwest::RequestBuilder {
         let r = r.header("anthropic-version", API_VERSION);
+        let mut betas: Vec<&str> = match &self.auth {
+            Auth::OAuth { profile, .. } => profile.betas.split(',').collect(),
+            Auth::ApiKey(_) => Vec::new(),
+        };
+        betas.extend(extra_betas);
+        let r = if betas.is_empty() {
+            r
+        } else {
+            r.header("anthropic-beta", betas.join(","))
+        };
         match &self.auth {
             Auth::ApiKey(k) => r.header("x-api-key", k),
             Auth::OAuth { access_token, profile } => r
                 .bearer_auth(access_token)
-                .header("anthropic-beta", &profile.betas)
                 .header("user-agent", &profile.user_agent)
                 .header("x-app", "cli"),
         }
     }
 
-    fn http_request(&self, body: &[u8]) -> reqwest::RequestBuilder {
+    fn http_request(&self, body: &[u8], extra_betas: &[&str]) -> reqwest::RequestBuilder {
         let oauth = matches!(self.auth, Auth::OAuth { .. });
         let url = format!("{}/v1/messages{}", self.base_url, if oauth { "?beta=true" } else { "" });
         let r = self
@@ -128,7 +137,7 @@ impl Anthropic {
             .post(url)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream");
-        self.authed(r).body(body.to_vec())
+        self.authed(r, extra_betas).body(body.to_vec())
     }
 }
 
@@ -140,10 +149,21 @@ impl Adapter for Anthropic {
             Auth::ApiKey(_) => None,
         };
         let body = serde_json::to_vec(&build_body(&req, oauth_profile.as_ref())).unwrap_or_default();
-        let request = self.http_request(&body);
+        let effort = in_conversation_effort(&req.model, req.thinking);
+        // Mid-conversation effort needs these two betas (as pi sends them).
+        let betas: &[&str] = if effort.is_some() {
+            &[
+                "mid-conversation-output-config-2026-07-01",
+                "thinking-binding-controls-2026-08-01",
+            ]
+        } else {
+            &[]
+        };
+        let request = self.http_request(&body, betas);
         let trace = self.trace.clone();
         tokio::spawn(async move {
             let mut b = Builder::new(tx, PROVIDER, &req.model);
+            b.thinking_level = effort;
             if let Some(t) = &trace {
                 t.request(&request, &body);
             }
@@ -355,6 +375,105 @@ fn error_kind(etype: &str, msg: &str) -> ErrorKind {
 
 // ---------- request body ----------
 
+/// How a Claude model takes a thinking level (L2.16).
+// shortcut: decided from the model id (pi's generator rules) until the model catalog carries it (M5, L2.10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingStyle {
+    /// Claude 3.x before 3.7: no thinking.
+    None,
+    /// `thinking: enabled` with a token budget (3.7, 4.0–4.5).
+    Budget,
+    /// `thinking: adaptive` plus a top-level effort.
+    Adaptive,
+    /// Adaptive, with the effort sent as system messages inside the conversation,
+    /// so a level change keeps the cache.
+    Managed,
+}
+
+fn base_id(model: &str) -> String {
+    let id = model.to_lowercase();
+    // Drop a dated snapshot suffix (`-20260723`).
+    match id.rsplit_once('-') {
+        Some((head, date)) if date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) => head.to_string(),
+        _ => id,
+    }
+}
+
+pub fn thinking_style(model: &str) -> ThinkingStyle {
+    let id = base_id(model).replace('.', "-");
+    let managed = [
+        "claude-opus-5",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+        "claude-fable-5-1",
+        "claude-mythos-5-1",
+    ];
+    let adaptive = [
+        "opus-4-6",
+        "opus-4-7",
+        "opus-4-8",
+        "opus-5",
+        "sonnet-4-6",
+        "sonnet-5",
+        "haiku-5",
+        "fable-5",
+        "mythos-5",
+    ];
+    if managed.contains(&id.as_str()) {
+        ThinkingStyle::Managed
+    } else if adaptive.iter().any(|a| id.contains(a)) {
+        ThinkingStyle::Adaptive
+    } else if id.starts_with("claude-3-") && !id.starts_with("claude-3-7") || id.starts_with("claude-2") {
+        ThinkingStyle::None
+    } else {
+        ThinkingStyle::Budget
+    }
+}
+
+/// The nearest level `model` supports.
+pub fn clamp_thinking(model: &str, level: ThinkingLevel) -> ThinkingLevel {
+    use ThinkingLevel::*;
+    let id = base_id(model).replace('.', "-");
+    let style = thinking_style(model);
+    match (style, level) {
+        (ThinkingStyle::None, _) => Off,
+        (ThinkingStyle::Budget, Xhigh | Max) => High,
+        (ThinkingStyle::Budget, l) => l,
+        (_, Off) => {
+            // Opus 5.5, Sonnet 5.5, Fable and Mythos reject `thinking: disabled`.
+            let can_off = match style {
+                ThinkingStyle::Managed => id == "claude-opus-5" || id == "claude-haiku-5-5",
+                _ => !id.contains("fable-5") && !id.contains("mythos-5"),
+            };
+            if can_off { Off } else { Low }
+        }
+        (_, Minimal) => Low,
+        (_, Xhigh) => {
+            let has = ["opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "haiku-5", "fable-5"];
+            if has.iter().any(|h| id.contains(h)) {
+                Xhigh
+            } else {
+                High
+            }
+        }
+        (_, l) => l,
+    }
+}
+
+fn effort_name(l: ThinkingLevel) -> &'static str {
+    match l {
+        ThinkingLevel::Off | ThinkingLevel::Minimal => "low",
+        l => l.as_str(),
+    }
+}
+
+/// The effort sent inside the conversation, when `model` takes it that way.
+pub fn in_conversation_effort(model: &str, level: Option<ThinkingLevel>) -> Option<String> {
+    let l = clamp_thinking(model, level?);
+    (thinking_style(model) == ThinkingStyle::Managed && l != ThinkingLevel::Off).then(|| effort_name(l).to_string())
+}
+
 /// Build the JSON body. Pure and deterministic (L1.7 rule 3): same request, same bytes.
 pub fn build_body(req: &Request, oauth: Option<&OAuthProfile>) -> Value {
     let cache = match req.cache {
@@ -374,13 +493,30 @@ pub fn build_body(req: &Request, oauth: Option<&OAuthProfile>) -> Value {
             system.push(json!({ "type": "text", "text": text }));
         }
     }
-    let mut messages = convert_messages(&req.messages);
+    let (mut messages, levels) = convert_messages(&req.messages);
     let tools: Vec<Value> = req
         .tools
         .iter()
         .map(|t| json!({ "name": t.name, "description": t.description, "input_schema": t.schema }))
         .collect();
     place_cache_markers(&mut system, &mut messages, &cache);
+    let level = req.thinking.map(|l| clamp_thinking(&req.model, l));
+    let style = thinking_style(&req.model);
+    // Mid-conversation effort (after the cache markers, so they stay on real messages):
+    // each reply's effort goes before it and the active one goes last, so changing the
+    // level only appends and the cached prefix survives.
+    if let Some(effort) = in_conversation_effort(&req.model, req.thinking) {
+        let marker = |e: &str| json!({ "role": "system", "content": [], "output_config": { "effort": e } });
+        let mut with = Vec::with_capacity(messages.len() * 2);
+        for (m, l) in messages.into_iter().zip(levels) {
+            if let Some(l) = l {
+                with.push(marker(&l));
+            }
+            with.push(m);
+        }
+        with.push(marker(&effort));
+        messages = with;
+    }
     let mut tools = tools;
     if system.is_empty()
         && let Some(last) = tools.last_mut()
@@ -390,7 +526,41 @@ pub fn build_body(req: &Request, oauth: Option<&OAuthProfile>) -> Value {
 
     let mut body = Map::new();
     body.insert("model".into(), json!(req.model));
-    body.insert("max_tokens".into(), json!(req.max_tokens));
+    let mut max_tokens = req.max_tokens;
+    match (style, level) {
+        (_, None) | (ThinkingStyle::None, _) | (ThinkingStyle::Budget, Some(ThinkingLevel::Off)) => {}
+        (_, Some(ThinkingLevel::Off)) => {
+            body.insert("thinking".into(), json!({ "type": "disabled" }));
+        }
+        (ThinkingStyle::Budget, Some(l)) => {
+            let budget = match l {
+                ThinkingLevel::Minimal => 1024,
+                ThinkingLevel::Low => 2048,
+                ThinkingLevel::Medium => 8192,
+                _ => 16_384,
+            };
+            // The budget is part of max_tokens; keep the answer's room (pi's rule).
+            max_tokens += budget;
+            body.insert("thinking".into(), json!({ "type": "enabled", "budget_tokens": budget }));
+        }
+        (ThinkingStyle::Adaptive, Some(l)) => {
+            body.insert(
+                "thinking".into(),
+                json!({ "type": "adaptive", "display": "summarized" }),
+            );
+            body.insert("output_config".into(), json!({ "effort": effort_name(l) }));
+        }
+        (ThinkingStyle::Managed, Some(_)) => {
+            // The real effort travels in the messages; this top-level value stays fixed.
+            body.insert(
+                "thinking".into(),
+                json!({ "type": "adaptive", "display": "summarized",
+                        "block_binding": { "prefix_mismatch_behavior": "drop_block" } }),
+            );
+            body.insert("output_config".into(), json!({ "effort": "high" }));
+        }
+    }
+    body.insert("max_tokens".into(), json!(max_tokens));
     if !system.is_empty() {
         body.insert("system".into(), Value::Array(system));
     }
@@ -425,9 +595,11 @@ fn place_cache_markers(system: &mut [Value], messages: &mut [Value], cache: &Val
     }
 }
 
-fn convert_messages(messages: &[Message]) -> Vec<Value> {
+/// Wire messages, plus the recorded effort of each assistant one (for mid-conversation effort).
+fn convert_messages(messages: &[Message]) -> (Vec<Value>, Vec<Option<String>>) {
     let mut out: Vec<Value> = Vec::new();
-    let mut push = |role: &str, blocks: Vec<Value>| {
+    let mut levels: Vec<Option<String>> = Vec::new();
+    let mut push = |role: &str, blocks: Vec<Value>, level: Option<&String>| {
         if blocks.is_empty() {
             return;
         }
@@ -440,16 +612,18 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
             return;
         }
         out.push(json!({ "role": role, "content": blocks }));
+        levels.push(level.cloned());
     };
     for m in messages {
         match m {
             Message::System { .. } | Message::Custom { .. } => {}
-            Message::User { content } => push("user", content.iter().filter_map(user_block).collect()),
+            Message::User { content } => push("user", content.iter().filter_map(user_block).collect(), None),
             Message::Assistant(a) => {
                 let same = a.provider == PROVIDER;
                 push(
                     "assistant",
                     a.content.iter().filter_map(|b| assistant_block(b, same)).collect(),
+                    a.thinking_level.as_ref().filter(|_| same),
                 )
             }
             Message::ToolResult {
@@ -466,11 +640,11 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                 if *is_error {
                     r["is_error"] = json!(true);
                 }
-                push("user", vec![r]);
+                push("user", vec![r], None);
             }
         }
     }
-    out
+    (out, levels)
 }
 
 fn user_block(b: &Block) -> Option<Value> {
@@ -515,6 +689,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             cache: CacheRetention::Short,
+            thinking: None,
         }
     }
 
@@ -527,7 +702,65 @@ mod tests {
             model: "claude-x".into(),
             response_id: None,
             error_message: None,
+            thinking_level: None,
         })
+    }
+
+    #[test]
+    fn thinking_levels_per_model() {
+        use ThinkingLevel::*;
+        assert_eq!(thinking_style("claude-opus-5-5"), ThinkingStyle::Managed);
+        assert_eq!(thinking_style("claude-opus-4-8-20260101"), ThinkingStyle::Adaptive);
+        assert_eq!(thinking_style("claude-sonnet-4-5"), ThinkingStyle::Budget);
+        assert_eq!(thinking_style("claude-3-5-haiku"), ThinkingStyle::None);
+        assert_eq!(clamp_thinking("claude-opus-5-5", Off), Low);
+        assert_eq!(clamp_thinking("claude-haiku-5-5", Off), Off);
+        assert_eq!(clamp_thinking("claude-opus-4-6", Xhigh), High);
+        assert_eq!(clamp_thinking("claude-sonnet-4-5", Max), High);
+
+        let mut r = req(vec![Message::user("a")]);
+        r.model = "claude-sonnet-4-5".into();
+        r.thinking = Some(Medium);
+        let b = build_body(&r, None);
+        assert_eq!(b["thinking"], json!({ "type": "enabled", "budget_tokens": 8192 }));
+        assert_eq!(b["max_tokens"], json!(100 + 8192));
+        r.model = "claude-opus-4-8".into();
+        let b = build_body(&r, None);
+        assert_eq!(b["output_config"], json!({ "effort": "medium" }));
+    }
+
+    #[test]
+    fn mid_conversation_effort_only_appends() {
+        let mut first = req(vec![Message::user("a")]);
+        first.model = "claude-opus-5-5".into();
+        first.thinking = Some(ThinkingLevel::High);
+        let b1 = build_body(&first, None);
+        let m1 = b1["messages"].as_array().unwrap();
+        assert_eq!(m1.last().unwrap()["output_config"], json!({ "effort": "high" }));
+
+        // The reply records its effort; the next turn switches to low.
+        let mut reply = AssistantMessage {
+            content: vec![Block::text("b")],
+            stop: StopReason::Stop,
+            usage: Usage::default(),
+            provider: PROVIDER.into(),
+            model: "claude-opus-5-5".into(),
+            response_id: None,
+            error_message: None,
+            thinking_level: None,
+        };
+        reply.thinking_level = in_conversation_effort(&first.model, first.thinking);
+        let mut second = first.clone();
+        second.messages.extend([Message::Assistant(reply), Message::user("c")]);
+        second.thinking = Some(ThinkingLevel::Low);
+        let b2 = build_body(&second, None);
+        let m2 = b2["messages"].as_array().unwrap();
+        let roles: Vec<&str> = m2.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "system", "assistant", "user", "system"]);
+        assert_eq!(m2[1], m1[1], "the old effort marker is unchanged");
+        assert_eq!(m2[4]["output_config"], json!({ "effort": "low" }));
+        assert_eq!(b2["output_config"], b1["output_config"], "top level never changes");
+        assert_eq!(b2["thinking"], b1["thinking"]);
     }
 
     #[test]

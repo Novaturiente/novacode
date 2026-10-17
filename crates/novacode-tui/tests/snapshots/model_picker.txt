@@ -1,16 +1,16 @@
- › fix the failing test
- ▸ 2 tool calls · 1 failed
-          ╭ Model ───────────────────────────────╮
- Fixed: th│ › type to filter                     │h 2.
+ ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+ ┃ fix the failing test                                   ┃
+ ┗━━━━━━━━╭ Model ───────────────────────────────╮━━━━━━━━┛
+ ▸ 2 tool │ › type to filter                     │
           │ ▸ opus                               │
- • tests p│   sonnet                             │
- · model →│                                      │starts
-   over: ~│                                      │
+ Fixed: th│   sonnet                             │h 2.
           │                                      │
-          ╰──────────────────────────────────────╯
+ • tests p│                                      │
+ · model →│                                      │starts
+   over: ~╰──────────────────────────────────────╯
 
 
 ╭──────────────────────────────────────────────────────────╮
 │                                                          │
 ╰──────────────────────────────────────────────────────────╯
- ● ready  lo… ctx 16%  cache 97%  claude/haiku  proj ⎇ main
+ ● ready  … ctx 16%  cache 97%  claude/haiku · medium  proj

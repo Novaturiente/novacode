@@ -43,6 +43,7 @@ fn cfg(cwd: &Path, home: &Path) -> Config {
         max_tokens: 1000,
         cache: CacheRetention::Short,
         window_tokens: 200_000,
+        thinking: Default::default(),
         spill_dir: home.join("spill"),
         redactor: Default::default(),
     }

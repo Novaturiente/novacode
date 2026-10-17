@@ -15,7 +15,8 @@ use novacode_base::redact::Redactor;
 use novacode_tools::guard::Budget;
 use novacode_tools::{ExecutionEnv, FileState, Tool, ToolCtx, ToolOutput};
 use novacode_types::{
-    AgentEvent, AssistantMessage, Block, ErrorKind, Message, StopReason, StreamEvent, ToolCall, ToolDef, Usage,
+    AgentEvent, AssistantMessage, Block, ErrorKind, Message, StopReason, StreamEvent, ThinkingLevel, ToolCall, ToolDef,
+    Usage,
 };
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -35,6 +36,7 @@ pub struct Config {
     pub max_tokens: u32,
     pub cache: CacheRetention,
     pub window_tokens: u64,
+    pub thinking: ThinkingLevel,
     /// Where cut tool output is spilled in full.
     pub spill_dir: PathBuf,
     /// Masks novacode's own secrets in tool output (L6.6).
@@ -73,6 +75,7 @@ struct Shared {
     closed: Mutex<bool>,
     /// Model id to switch to at the start of the next run (same provider).
     next_model: Mutex<Option<String>>,
+    next_thinking: Mutex<Option<ThinkingLevel>>,
 }
 
 impl Agent {
@@ -94,6 +97,9 @@ impl Agent {
                 provider: cfg.provider.clone(),
                 model: cfg.model.clone(),
             }));
+        }
+        if store.last_thinking() != Some(cfg.thinking) {
+            log_err(store.append(EntryKind::ThinkingChange { level: cfg.thinking }));
         }
         let defs = tools
             .iter()
@@ -119,6 +125,10 @@ impl Agent {
             policy: Arc::new(Policy::new(Permissions::default(), home, None)),
             approver: None,
         }
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.cfg
     }
 
     pub fn with_policy(mut self, policy: Policy) -> Self {
@@ -217,6 +227,13 @@ impl Agent {
                 provider: self.cfg.provider.clone(),
                 model: self.cfg.model.clone(),
             });
+        }
+        let next = self.shared.next_thinking.lock().unwrap().take();
+        if let Some(level) = next
+            && level != self.cfg.thinking
+        {
+            self.cfg.thinking = level;
+            self.add(EntryKind::ThinkingChange { level });
         }
         let cancel = CancellationToken::new();
         *self.shared.cancel.lock().unwrap() = Some(cancel.clone());
@@ -324,6 +341,7 @@ impl Agent {
                 tools: self.defs.clone(),
                 max_tokens: self.cfg.max_tokens,
                 cache: self.cfg.cache,
+                thinking: Some(self.cfg.thinking),
             };
             let mut rx = self.adapter.stream(req, cancel.child_token());
             let mut fin = None;
@@ -501,6 +519,7 @@ fn failed(cfg: &Config, kind: ErrorKind, msg: &str) -> AssistantMessage {
         model: cfg.model.clone(),
         response_id: None,
         error_message: Some(msg.into()),
+        thinking_level: None,
     }
 }
 
@@ -540,6 +559,10 @@ impl SessionHandle {
     /// Switch model (same provider) from the next run on.
     pub fn set_model(&self, model: impl Into<String>) {
         *self.shared.next_model.lock().unwrap() = Some(model.into());
+    }
+    /// Thinking level from the next run on (L2.16).
+    pub fn set_thinking(&self, level: ThinkingLevel) {
+        *self.shared.next_thinking.lock().unwrap() = Some(level);
     }
     /// Stop after the current run; the owner task then returns the agent.
     pub fn shutdown(&self) {

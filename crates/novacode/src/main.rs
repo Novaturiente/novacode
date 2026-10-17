@@ -17,7 +17,7 @@ use novacode_tools::LocalEnv;
 use novacode_tui::dialog::{Answer, ApproveReq, PickItem};
 use novacode_tui::keys::Keymap;
 use novacode_tui::{Cmd, Exit, UiEvent};
-use novacode_types::{AgentEvent, Message, StopReason};
+use novacode_types::{AgentEvent, Message, StopReason, ThinkingLevel};
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
@@ -238,9 +238,19 @@ impl Ctx {
         model: &str,
         approver: Option<Arc<dyn Approver>>,
     ) -> anyhow::Result<(Agent, Arc<Anthropic>)> {
+        let (model, level) = split_level(model);
         let (provider, model_id) = model
             .split_once('/')
             .context("model must be provider/model, e.g. claude/claude-opus-5-5")?;
+        // `model:level` wins, then the session's own level (resume), then settings.
+        let level = level
+            .or(store.last_thinking())
+            .or_else(|| {
+                self.settings
+                    .get::<String>("thinking")
+                    .and_then(|l| ThinkingLevel::parse(&l))
+            })
+            .unwrap_or_default();
         let (auth, api_key) = self.auth(provider).await?;
         let trace = self.cli.trace.then(|| Trace {
             path: self.paths.logs().join(format!("trace-{}.jsonl", new_id())),
@@ -274,6 +284,7 @@ impl Ctx {
             },
             // shortcut: fixed window until the model catalog (M5, L2.10).
             window_tokens: self.window_tokens(),
+            thinking: novacode_ai::anthropic::clamp_thinking(model_id, level),
             spill_dir: self.paths.home().join("spill"),
             redactor: {
                 let auth_path = self.paths.home().join("auth.json");
@@ -436,6 +447,7 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
         let approver: Arc<dyn Approver> = Arc::new(TuiApprover(ui_tx.clone()));
         let (agent, adapter) = ctx.agent(store, &model, Some(approver)).await?;
         let history = agent.store.projection();
+        let level = agent.config().thinking;
         let id = agent.store.id().to_string();
         let (handle, task) = agent::spawn(agent);
         let (etx, erx) = mpsc::unbounded_channel();
@@ -469,6 +481,25 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
                         let provider = cur.split_once('/').map_or("", |(p, _)| p).to_string();
                         *cur = format!("{provider}/{m}");
                         h.set_model(m);
+                    }
+                    Cmd::SetThinking(l) => {
+                        let cur = cur.lock().unwrap().clone();
+                        let id = split_level(&cur).0.split_once('/').map_or("", |(_, m)| m).to_string();
+                        let level = novacode_ai::anthropic::clamp_thinking(&id, l);
+                        h.set_thinking(level);
+                        let mut note = format!("thinking → {} from the next message", level.as_str());
+                        if level != l {
+                            note += &format!(" ({id} has no `{}`)", l.as_str());
+                        }
+                        // L1.7: say what the change costs, never block.
+                        note += if novacode_ai::anthropic::thinking_style(&id)
+                            == novacode_ai::anthropic::ThinkingStyle::Managed
+                        {
+                            "; the cache is kept"
+                        } else {
+                            "; the cache starts over"
+                        };
+                        let _ = ui_tx.send(UiEvent::Thinking { level, note });
                     }
                     Cmd::ListModels => {
                         let (adapter, tx, cur) = (adapter.clone(), ui_tx.clone(), cur.lock().unwrap().clone());
@@ -527,6 +558,7 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
                 km
             },
             collapse_turns: ctx.settings.get("ui.turnCollapse").unwrap_or(true),
+            level,
             thinking: novacode_tui::transcript::Thinking::parse(
                 &ctx.settings.get::<String>("ui.thinking").unwrap_or_default(),
             ),
@@ -719,4 +751,12 @@ async fn login(store: &AuthStore, provider: &str) -> anyhow::Result<ExitCode> {
     store.put(claude::PROVIDER, DEFAULT_ACCOUNT, cred).await?;
     eprintln!("logged in to claude");
     Ok(ExitCode::SUCCESS)
+}
+
+/// `provider/model:level` → (`provider/model`, level). A suffix that isn't a level stays part of the id.
+fn split_level(model: &str) -> (&str, Option<ThinkingLevel>) {
+    match model.rsplit_once(':') {
+        Some((m, l)) if ThinkingLevel::parse(l).is_some() => (m, ThinkingLevel::parse(l)),
+        _ => (model, None),
+    }
 }

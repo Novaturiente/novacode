@@ -439,15 +439,7 @@ fn lay_turn(turn: &Turn, width: usize, t: &Theme, thinking: Thinking) -> Layout 
                 if !lines.is_empty() || !matches!(turn.items.first(), Some(Item::User(_))) {
                     lines.push(Line::default());
                 }
-                let body: Vec<Span<'static>> = vec![Span::styled(sanitize(text), t.text)];
-                for (i, para) in split_lines(body).into_iter().enumerate() {
-                    let first = if i == 0 {
-                        Span::styled("› ", t.user)
-                    } else {
-                        Span::raw("  ")
-                    };
-                    lines.extend(wrap::wrap(para, width, &[first], &[Span::raw("  ")]));
-                }
+                lines.extend(user_box(text, width, t));
             }
             Item::Assistant(blocks) => {
                 let only_reply = collapsed && Some(idx) == final_reply;
@@ -476,6 +468,29 @@ fn lay_turn(turn: &Turn, width: usize, t: &Theme, thinking: Thinking) -> Layout 
         lines,
         toggles,
     }
+}
+
+/// A prompt in a heavy box, so the start of each turn stands out when scrolling
+/// (like the user's pi `rounded-boxes` extension).
+fn user_box(text: &str, width: usize, t: &Theme) -> Vec<Line<'static>> {
+    let inner = width.saturating_sub(4).max(1);
+    let body: Vec<Span<'static>> = vec![Span::styled(sanitize(text), t.text)];
+    let mut rows = Vec::new();
+    for para in split_lines(body) {
+        rows.extend(wrap::wrap(para, inner, &[], &[]));
+    }
+    let rule = "━".repeat(width.saturating_sub(2));
+    let mut out = vec![Line::styled(format!("┏{rule}┓"), t.user)];
+    for row in rows {
+        let pad = inner.saturating_sub(row.width());
+        let mut spans = vec![Span::styled("┃ ", t.user)];
+        spans.extend(row.spans);
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(" ┃", t.user));
+        out.push(Line::from(spans));
+    }
+    out.push(Line::styled(format!("┗{rule}┛"), t.user));
+    out
 }
 
 fn split_lines(spans: Vec<Span<'static>>) -> Vec<Vec<Span<'static>>> {

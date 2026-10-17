@@ -1,4 +1,6 @@
- › fix the failing test
+ ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+ ┃ fix the failing test                                   ┃
+ ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
  ▾ 2 tool calls · 1 failed
 
  ∴ thought · 6 words
@@ -22,9 +24,7 @@
  • tests pass now
 
 
-
-
 ╭──────────────────────────────────────────────────────────╮
 │                                                          │
 ╰──────────────────────────────────────────────────────────╯
- ● ready       ctx 16%  cache 97%  claude/opus  proj ⎇ main
+ ● ready     ctx 16%  cache 97%  claude/opus · medium  proj

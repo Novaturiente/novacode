@@ -2,7 +2,8 @@
 
 use crate::json::parse_tool_args;
 use novacode_types::{
-    AssistantMessage, Block, BlockKind, ErrorKind, Message, Replay, StopReason, StreamEvent, ToolCall, ToolDef, Usage,
+    AssistantMessage, Block, BlockKind, ErrorKind, Message, Replay, StopReason, StreamEvent, ThinkingLevel, ToolCall,
+    ToolDef, Usage,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -25,6 +26,8 @@ pub struct Request {
     pub tools: Vec<ToolDef>,
     pub max_tokens: u32,
     pub cache: CacheRetention,
+    /// `None` = send no thinking setting (the model's default).
+    pub thinking: Option<ThinkingLevel>,
 }
 
 /// One wire protocol. Stateless per call: `stream` never fails, it reports
@@ -59,6 +62,8 @@ pub struct Builder {
     pub response_id: Option<String>,
     /// Set once any content was streamed; providers retry only before this (L2.1).
     pub started: bool,
+    /// Stamped on the final message (see [`AssistantMessage::thinking_level`]).
+    pub thinking_level: Option<String>,
 }
 
 impl Builder {
@@ -72,6 +77,7 @@ impl Builder {
             usage: Usage::default(),
             response_id: None,
             started: false,
+            thinking_level: None,
         }
     }
 
@@ -225,6 +231,7 @@ impl Builder {
             model: self.model.clone(),
             response_id: self.response_id.clone(),
             error_message,
+            thinking_level: self.thinking_level.clone(),
         }
     }
 
@@ -259,5 +266,6 @@ pub async fn collect(mut rx: mpsc::Receiver<StreamEvent>) -> AssistantMessage {
         model: String::new(),
         response_id: None,
         error_message: Some("stream ended without a final event".into()),
+        thinking_level: None,
     }
 }

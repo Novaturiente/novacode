@@ -1,4 +1,6 @@
- › fix the failing test
+ ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+ ┃ fix the failing test                                   ┃
+ ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
  ▸ 2 tool calls · 1 failed
 
  Fixed: the assertion in src/lib.rs compared 1 with 2.
@@ -8,9 +10,7 @@
 
 
 
-
-
 ╭──────────────────────────────────────────────────────────╮
 │                                                          │
 ╰──────────────────────────────────────────────────────────╯
- ● ready       ctx 16%  cache 97%  claude/opus  proj ⎇ main
+ ● ready     ctx 16%  cache 97%  claude/opus · medium  proj

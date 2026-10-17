@@ -127,6 +127,49 @@ impl Usage {
     }
 }
 
+/// How hard the model thinks (L2.16): pi's seven levels. Adapters clamp a
+/// level to the nearest one the model supports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingLevel {
+    Off,
+    Minimal,
+    Low,
+    #[default]
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ThinkingLevel {
+    pub const ALL: [Self; 7] = [
+        Self::Off,
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Xhigh,
+        Self::Max,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|l| l.as_str() == s)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssistantMessage {
     pub content: Vec<Block>,
@@ -140,6 +183,10 @@ pub struct AssistantMessage {
     /// Human-readable error text when `stop` is `Error`/`Aborted`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Provider effort value this reply was made with, for adapters that resend it
+    /// inside the conversation (Anthropic mid-conversation effort, L2.16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
 }
 
 impl AssistantMessage {

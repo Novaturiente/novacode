@@ -96,6 +96,7 @@ mod tests {
 
     fn req() -> Request {
         Request {
+            thinking: None,
             model: "m".into(),
             messages: vec![Message::user("hi")],
             tools: vec![],

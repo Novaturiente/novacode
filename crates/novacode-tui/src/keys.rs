@@ -50,6 +50,7 @@ pub enum A {
     KeysHelp,
     HistorySearch,
     ThinkingToggle,
+    ThinkingCycle,
     PageUp,
     PageDown,
     Top,
@@ -95,6 +96,7 @@ defs! {
     KeysHelp, "app.keys.help", App, ["alt+/"], "Show keybindings";
     HistorySearch, "app.history.search", App, ["ctrl+r"], "Search prompt history";
     ThinkingToggle, "app.thinking.toggle", App, ["ctrl+t"], "Show or fold thinking";
+    ThinkingCycle, "app.thinking.cycle", App, ["shift+tab"], "Next thinking level";
     PageUp, "tui.altScreen.pageUp", Scroll, ["pageUp"], "Scroll up a page";
     PageDown, "tui.altScreen.pageDown", Scroll, ["pageDown"], "Scroll down a page";
     Top, "tui.altScreen.top", Scroll, ["ctrl+home"], "Scroll to the top";

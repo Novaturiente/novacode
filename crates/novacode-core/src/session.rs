@@ -40,6 +40,9 @@ pub enum EntryKind {
         provider: String,
         model: String,
     },
+    ThinkingChange {
+        level: novacode_types::ThinkingLevel,
+    },
     SessionInfo {
         name: String,
     },
@@ -271,6 +274,14 @@ impl Store {
         out
     }
 
+    /// Last recorded thinking level.
+    pub fn last_thinking(&self) -> Option<novacode_types::ThinkingLevel> {
+        self.entries.iter().rev().find_map(|e| match &e.kind {
+            EntryKind::ThinkingChange { level } => Some(*level),
+            _ => None,
+        })
+    }
+
     /// Last recorded model, as (provider, model).
     pub fn last_model(&self) -> Option<(String, String)> {
         self.entries.iter().rev().find_map(|e| match &e.kind {
@@ -376,6 +387,7 @@ mod tests {
                 model: "m".into(),
                 response_id: None,
                 error_message: None,
+                thinking_level: None,
             }),
         }
     }

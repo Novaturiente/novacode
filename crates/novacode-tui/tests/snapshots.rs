@@ -24,6 +24,7 @@ fn app(history: Vec<Message>) -> (App, mpsc::UnboundedReceiver<Cmd>) {
         notices: vec![],
         theme: Default::default(),
         thinking: Default::default(),
+        level: Default::default(),
     };
     (App::new(init, tx), rx)
 }
@@ -67,6 +68,7 @@ fn assistant(content: Vec<Block>, stop: StopReason) -> Message {
         model: "opus".into(),
         response_id: None,
         error_message: None,
+        thinking_level: None,
     })
 }
 
@@ -397,9 +399,23 @@ fn file_completion_in_a_real_folder() {
             notices: vec![],
             theme: Default::default(),
             thinking: Default::default(),
+            level: Default::default(),
         },
         tx,
     );
+    // Outside the project: `@../` lists the parent folder, filtered by the typed prefix.
+    let sibling = d.file_name().unwrap().to_string_lossy().into_owned();
+    typ(&mut a, &format!("@../{sibling}"));
+    assert!(screen(&mut a, 80, 12).contains(&format!("{sibling}/")));
+    a.editor.clear();
+    typ(&mut a, "@./sr");
+    key(&mut a, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(a.editor.text(), "@./src/");
+    assert!(
+        screen(&mut a, 60, 12).contains("▸ main.rs"),
+        "a folder opens straight away"
+    );
+    a.editor.clear();
     typ(&mut a, "see @mai");
     assert!(screen(&mut a, 60, 12).contains("▸ src/main.rs"));
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
@@ -449,4 +465,27 @@ fn stream_pacer_reveals_gradually() {
         frames += 1;
     }
     assert!((5..60).contains(&frames), "caught up in {frames} frames");
+}
+
+#[test]
+fn thinking_level_cycle_and_picker() {
+    let (mut a, mut rx) = app(vec![]);
+    key(&mut a, KeyCode::BackTab, KeyModifiers::SHIFT);
+    assert_eq!(rx.try_recv().unwrap(), Cmd::SetThinking(ThinkingLevel::High));
+    // The host answers with the level it really uses.
+    a.on_ui(UiEvent::Thinking {
+        level: ThinkingLevel::High,
+        note: "thinking → high from the next message; the cache is kept".into(),
+    });
+    let s = screen(&mut a, 70, 12);
+    assert!(
+        s.contains("claude/opus · high") && s.contains("the cache is kept"),
+        "{s}"
+    );
+    typ(&mut a, "/thinking");
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(screen(&mut a, 70, 16).contains("Thinking level"));
+    typ(&mut a, "xh");
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(rx.try_recv().unwrap(), Cmd::SetThinking(ThinkingLevel::Xhigh));
 }
