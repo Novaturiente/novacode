@@ -16,6 +16,43 @@ pub type Term = Terminal<CrosstermBackend<Stdout>>;
 
 static KITTY: AtomicBool = AtomicBool::new(false);
 
+/// Is the terminal background dark? Asks with OSC 11 (150 ms timeout), then
+/// falls back to `COLORFGBG`. Call before [`enter`]; `None` = unknown.
+pub fn query_background() -> Option<bool> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::io::Read;
+    use std::os::fd::AsFd;
+    let from_env = || {
+        let v = std::env::var("COLORFGBG").ok()?;
+        let bg: u8 = v.rsplit(';').next()?.parse().ok()?;
+        Some(!matches!(bg, 7 | 15))
+    };
+    if terminal::enable_raw_mode().is_err() {
+        return from_env();
+    }
+    let mut out = stdout();
+    let _ = write!(out, "\x1b]11;?\x07");
+    let _ = out.flush();
+    let stdin = std::io::stdin();
+    let mut reply = Vec::new();
+    let mut buf = [0u8; 64];
+    while reply.len() < 256 {
+        let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
+        if !matches!(poll(&mut fds, PollTimeout::from(150u16)), Ok(n) if n > 0) {
+            break;
+        }
+        match stdin.lock().read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => reply.extend_from_slice(&buf[..n]),
+        }
+        if reply.ends_with(b"\x07") || reply.ends_with(b"\x1b\\") {
+            break;
+        }
+    }
+    let _ = terminal::disable_raw_mode();
+    crate::theme::dark_from_osc11(&String::from_utf8_lossy(&reply)).or_else(from_env)
+}
+
 pub fn enter() -> std::io::Result<Term> {
     terminal::enable_raw_mode()?;
     let mut out = stdout();

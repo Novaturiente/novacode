@@ -4,6 +4,8 @@
 pub mod app;
 pub mod dialog;
 pub mod editor;
+#[cfg(feature = "highlight")]
+pub mod highlight;
 pub mod keys;
 pub mod markdown;
 pub mod prompt;
@@ -59,6 +61,8 @@ pub async fn run(
         }
         if app.dirty {
             if last_draw.elapsed() >= FRAME {
+                // One pacer step per drawn frame (L9.7).
+                let behind = app.pace();
                 // L9.3: a panic while drawing is reported, not fatal.
                 match std::panic::catch_unwind(AssertUnwindSafe(|| t.draw(|f| app.draw(f)).map(|_| ()))) {
                     Ok(Ok(())) => {}
@@ -69,8 +73,9 @@ pub async fn run(
                     }
                 }
                 last_draw = Instant::now();
-                app.dirty = false;
-                deadline = None;
+                // Text still held back: draw again next frame.
+                app.dirty = behind;
+                deadline = behind.then(|| tokio::time::Instant::from_std(last_draw + FRAME));
             } else {
                 deadline = Some(tokio::time::Instant::from_std(last_draw + FRAME));
             }

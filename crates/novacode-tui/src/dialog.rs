@@ -33,7 +33,7 @@ pub struct Picker {
 }
 
 /// Lower is better; `None` = not a subsequence.
-fn fuzzy(hay: &str, needle: &str) -> Option<usize> {
+pub fn fuzzy(hay: &str, needle: &str) -> Option<usize> {
     let hay = hay.to_lowercase();
     let mut score = 0;
     let mut last = None;

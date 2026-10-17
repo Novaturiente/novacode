@@ -527,6 +527,16 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
                 km
             },
             collapse_turns: ctx.settings.get("ui.turnCollapse").unwrap_or(true),
+            thinking: novacode_tui::transcript::Thinking::parse(
+                &ctx.settings.get::<String>("ui.thinking").unwrap_or_default(),
+            ),
+            theme: {
+                let name = ctx.settings.get::<String>("ui.theme").unwrap_or_else(|| "auto".into());
+                let dark = (name == "auto").then(novacode_tui::term::query_background).flatten();
+                let (t, warn) = novacode_tui::theme::Theme::load(&name, &ctx.paths.home().join("themes"), dark);
+                notices.extend(warn);
+                t
+            },
             notices: std::mem::take(&mut notices),
         };
         let res = novacode_tui::run(init, erx, ui_rx, ctx_tx).await;

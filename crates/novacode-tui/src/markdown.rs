@@ -1,5 +1,4 @@
 //! Markdown to wrapped, styled lines (L9.6) with pulldown-cmark.
-// shortcut: code blocks are one colour; syntect highlighting comes behind the `highlight` feature (M4b).
 
 use crate::theme::Theme;
 use crate::wrap::{self, sanitize};
@@ -8,9 +7,12 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-pub fn render(md: &str, width: usize, t: &Theme) -> Vec<Line<'static>> {
+/// `highlight`: colour code blocks (off while streaming, so it never runs per frame).
+pub fn render(md: &str, width: usize, t: &Theme, highlight: bool) -> Vec<Line<'static>> {
     let mut r = R {
         t,
+        highlight,
+        lang: String::new(),
         width,
         out: Vec::new(),
         cur: Vec::new(),
@@ -49,6 +51,8 @@ struct Table {
 
 struct R<'a> {
     t: &'a Theme,
+    highlight: bool,
+    lang: String,
     width: usize,
     out: Vec<Line<'static>>,
     cur: Vec<Span<'static>>,
@@ -143,9 +147,11 @@ impl R<'_> {
                 Tag::CodeBlock(kind) => {
                     self.flush();
                     self.gap();
+                    self.lang.clear();
                     if let CodeBlockKind::Fenced(lang) = kind
                         && !lang.is_empty()
                     {
+                        self.lang = lang.to_string();
                         let (first, _) = self.prefixes();
                         let mut l = first;
                         l.push(Span::styled(format!("  {lang}"), t.dim));
@@ -206,19 +212,20 @@ impl R<'_> {
                     self.styles.pop();
                 }
                 TagEnd::CodeBlock => {
-                    let code = self.code.take().unwrap_or_default();
+                    let code = sanitize(&self.code.take().unwrap_or_default());
+                    let code = code.trim_end_matches('\n');
                     let (_, rest) = self.prefixes();
-                    for line in sanitize(&code).trim_end_matches('\n').split('\n') {
-                        let mut first = rest.clone();
-                        first.push(Span::styled("▏ ", t.border));
-                        let mut cont = rest.clone();
-                        cont.push(Span::styled("▏ ", t.border));
-                        self.out.extend(wrap::wrap(
-                            vec![Span::styled(line.to_string(), t.code_block)],
-                            self.width,
-                            &first,
-                            &cont,
-                        ));
+                    let mut bar = rest.clone();
+                    bar.push(Span::styled("▏ ", t.border));
+                    let colored = self.colored(code);
+                    let plain = || {
+                        code.split('\n')
+                            .map(|l| vec![Span::styled(l.to_string(), t.code_block)])
+                            .collect()
+                    };
+                    let lines: Vec<Vec<Span<'static>>> = colored.unwrap_or_else(plain);
+                    for spans in lines {
+                        self.out.extend(wrap::wrap(spans, self.width, &bar, &bar));
                     }
                 }
                 TagEnd::List(_) => {
@@ -282,6 +289,20 @@ impl R<'_> {
         }
     }
 
+    #[cfg(feature = "highlight")]
+    fn colored(&self, code: &str) -> Option<Vec<Vec<Span<'static>>>> {
+        if !self.highlight || self.lang.is_empty() {
+            return None;
+        }
+        crate::highlight::lines(code, &self.lang, &self.t.syntax, self.t.ansi256)
+    }
+
+    #[cfg(not(feature = "highlight"))]
+    fn colored(&self, _code: &str) -> Option<Vec<Vec<Span<'static>>>> {
+        let _ = (self.highlight, &self.lang); // built without the `highlight` feature
+        None
+    }
+
     fn table_lines(&mut self, rows: Vec<Vec<String>>) {
         let t = self.t;
         let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
@@ -330,7 +351,7 @@ mod tests {
     use super::*;
 
     fn md(s: &str, w: usize) -> Vec<String> {
-        render(s, w, &Theme::default()).iter().map(wrap::plain).collect()
+        render(s, w, &Theme::default(), true).iter().map(wrap::plain).collect()
     }
 
     #[test]

@@ -1,0 +1,26 @@
+{
+  "name": "catppuccin-mocha",
+  "dark": true,
+  "syntax": "base16-ocean.dark",
+  "tokens": {
+    "text": "#cdd6f4",
+    "dim": "#7f849c",
+    "accent": "#cba6f7",
+    "user": { "fg": "#89b4fa", "bold": true },
+    "heading": { "fg": "#f5c2e7", "bold": true },
+    "code": "#fab387",
+    "code_block": "#a6e3a1",
+    "link": { "fg": "#74c7ec", "underline": true },
+    "quote": { "fg": "#9399b2", "italic": true },
+    "thinking": { "fg": "#9399b2", "italic": true },
+    "ok": "#a6e3a1",
+    "warn": "#f9e2af",
+    "error": "#f38ba8",
+    "add": "#a6e3a1",
+    "del": "#f38ba8",
+    "border": "#585b70",
+    "selection": { "bg": "#45475a" },
+    "toggle": "#94e2d5",
+    "match": { "bg": "#f9e2af", "fg": "#1e1e2e" }
+  }
+}

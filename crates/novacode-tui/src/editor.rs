@@ -270,6 +270,17 @@ impl Editor {
         out
     }
 
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Replace `start..cursor` with `s` (completion).
+    pub fn complete(&mut self, start: usize, s: &str) {
+        self.save(EditKind::Other);
+        self.text.replace_range(start..self.cursor, s);
+        self.cursor = start + s.len();
+    }
+
     /// Replace the whole text (from `$EDITOR` or a picked history entry).
     pub fn set_text(&mut self, s: &str) {
         self.save(EditKind::Other);

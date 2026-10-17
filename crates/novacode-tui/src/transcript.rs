@@ -75,6 +75,29 @@ pub struct Transcript {
     pub live: Option<Vec<(BlockKind, String)>>,
     /// Default for finished turns; Alt+O flips it.
     pub expand_all: bool,
+    pub thinking: Thinking,
+    /// Stream pacer (L9.7): bytes of each live block shown so far.
+    pub(crate) live_shown: Vec<usize>,
+}
+
+/// How thinking blocks show (L9.7, setting `ui.thinking`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Thinking {
+    /// One line with a word count.
+    #[default]
+    Collapsed,
+    Full,
+    Hidden,
+}
+
+impl Thinking {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "full" => Self::Full,
+            "hidden" => Self::Hidden,
+            _ => Self::Collapsed,
+        }
+    }
 }
 
 /// The laid-out transcript for one frame.
@@ -186,7 +209,10 @@ impl Transcript {
                     b.1.push_str(text);
                 }
             }
-            StreamEvent::RetryRollback => self.live = None,
+            StreamEvent::RetryRollback => {
+                self.live = None;
+                self.live_shown.clear();
+            }
             _ => {}
         }
     }
@@ -209,6 +235,7 @@ impl Transcript {
             }
             Message::Assistant(a) => {
                 self.live = None;
+                self.live_shown.clear();
                 let blocks: Vec<(BlockKind, String)> = a
                     .content
                     .iter()
@@ -278,8 +305,57 @@ impl Transcript {
         }
     }
 
+    pub fn set_thinking(&mut self, th: Thinking) {
+        self.thinking = th;
+        for t in &mut self.turns {
+            t.touch();
+        }
+    }
+
+    /// Reveal a bit more of the live text; `true` while some is still held back.
+    /// The step grows with the backlog, so the display never falls far behind.
+    pub fn pace(&mut self) -> bool {
+        let Some(live) = &self.live else { return false };
+        self.live_shown.resize(live.len(), 0);
+        let mut behind = false;
+        for (i, (kind, text)) in live.iter().enumerate() {
+            let shown = &mut self.live_shown[i];
+            if *kind != BlockKind::Text {
+                *shown = text.len();
+                continue;
+            }
+            let backlog = text.len() - (*shown).min(text.len());
+            let mut next = (*shown + (backlog / 8).max(3)).min(text.len());
+            while !text.is_char_boundary(next) {
+                next += 1;
+            }
+            *shown = next;
+            behind |= next < text.len();
+        }
+        behind
+    }
+
+    fn live_view(&self) -> Option<Vec<(BlockKind, String)>> {
+        let live = self.live.as_ref()?;
+        Some(
+            live.iter()
+                .enumerate()
+                .map(|(i, (k, t))| {
+                    // Only text is paced; thinking shows its word count straight away.
+                    let n = match k {
+                        BlockKind::Text => self.live_shown.get(i).copied().unwrap_or(0).min(t.len()),
+                        _ => t.len(),
+                    };
+                    (*k, t[..n].to_string())
+                })
+                .collect(),
+        )
+    }
+
     /// Lay out every turn for `width`, reusing cached finished turns.
     pub fn layout(&mut self, width: usize, theme: &Theme) -> View {
+        let thinking = self.thinking;
+        let live = self.live_view();
         let mut v = View {
             lines: Vec::new(),
             starts: Vec::new(),
@@ -292,7 +368,7 @@ impl Transcript {
                 .as_ref()
                 .is_some_and(|c| c.width == width && c.expanded == turn.expanded);
             if !fresh {
-                turn.cache = Some(lay_turn(turn, width, theme));
+                turn.cache = Some(lay_turn(turn, width, theme, thinking));
             }
             let c = turn.cache.as_ref().unwrap();
             if i > 0 {
@@ -302,15 +378,15 @@ impl Transcript {
             v.toggles.extend(c.toggles.iter().map(|o| (v.lines.len() + o, i)));
             v.lines.extend(c.lines.iter().cloned());
             if i == last
-                && let Some(live) = &self.live
+                && let Some(live) = &live
             {
-                v.lines.extend(lay_assistant(live, width, theme, true));
+                v.lines.extend(lay_assistant(live, width, theme, true, thinking));
             }
         }
         if self.turns.is_empty()
-            && let Some(live) = &self.live
+            && let Some(live) = &live
         {
-            v.lines.extend(lay_assistant(live, width, theme, true));
+            v.lines.extend(lay_assistant(live, width, theme, true, thinking));
         }
         v
     }
@@ -328,7 +404,7 @@ fn text_of(content: &[Block]) -> String {
         .join("\n")
 }
 
-fn lay_turn(turn: &Turn, width: usize, t: &Theme) -> Layout {
+fn lay_turn(turn: &Turn, width: usize, t: &Theme, thinking: Thinking) -> Layout {
     let mut lines = Vec::new();
     let mut toggles = Vec::new();
     let collapsed = turn.collapsed();
@@ -380,7 +456,7 @@ fn lay_turn(turn: &Turn, width: usize, t: &Theme) -> Layout {
                     .filter(|(k, _)| !only_reply || *k == BlockKind::Text)
                     .cloned()
                     .collect();
-                lines.extend(lay_assistant(&blocks, width, t, false));
+                lines.extend(lay_assistant(&blocks, width, t, false, thinking));
             }
             Item::Tool(tool) => lines.extend(lay_tool(tool, width, t)),
             Item::Notice { text, error } => {
@@ -415,17 +491,32 @@ fn split_lines(spans: Vec<Span<'static>>) -> Vec<Vec<Span<'static>>> {
     out
 }
 
-fn lay_assistant(blocks: &[(BlockKind, String)], width: usize, t: &Theme, live: bool) -> Vec<Line<'static>> {
+fn lay_assistant(
+    blocks: &[(BlockKind, String)],
+    width: usize,
+    t: &Theme,
+    live: bool,
+    thinking: Thinking,
+) -> Vec<Line<'static>> {
     let mut lines = vec![Line::default()];
     for (kind, text) in blocks {
         match kind {
-            // L9.7: thinking shows as one collapsed line.
+            BlockKind::Thinking if thinking == Thinking::Hidden => {}
+            BlockKind::Thinking if thinking == Thinking::Full => {
+                lines.extend(wrap::wrap(
+                    vec![Span::styled(sanitize(text.trim()), t.thinking)],
+                    width,
+                    &[Span::styled("∴ ", t.thinking)],
+                    &[Span::raw("  ")],
+                ));
+            }
+            // L9.7: by default thinking shows as one collapsed line.
             BlockKind::Thinking => {
                 let words = text.split_whitespace().count();
                 let label = if live { "thinking…" } else { "thought" };
                 lines.push(Line::styled(format!("∴ {label} · {words} words"), t.thinking));
             }
-            BlockKind::Text => lines.extend(markdown::render(text, width, t)),
+            BlockKind::Text => lines.extend(markdown::render(text, width, t, !live)),
             _ => {}
         }
     }

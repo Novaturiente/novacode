@@ -22,6 +22,8 @@ fn app(history: Vec<Message>) -> (App, mpsc::UnboundedReceiver<Cmd>) {
         keymap: Default::default(),
         collapse_turns: true,
         notices: vec![],
+        theme: Default::default(),
+        thinking: Default::default(),
     };
     (App::new(init, tx), rx)
 }
@@ -214,6 +216,8 @@ fn streaming_and_steering() {
     }
     a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(rx.try_recv().unwrap(), Cmd::Steer("use tests".into()));
+    // The run loop steps the pacer once per frame.
+    while a.pace() {}
     snapshot("streaming", &screen(&mut a, 50, 12));
     // Esc while busy aborts.
     a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -347,4 +351,102 @@ fn history_search() {
     assert!(rx.try_recv().is_err(), "Enter accepts the match, it doesn't send");
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(rx.try_recv().unwrap(), Cmd::Prompt("cargo test -p core".into()));
+}
+
+fn typ(a: &mut App, s: &str) {
+    for c in s.chars() {
+        key(a, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+}
+
+#[test]
+fn slash_and_file_completion() {
+    let (mut a, mut rx) = app(vec![]);
+    typ(&mut a, "/mo");
+    assert!(screen(&mut a, 60, 12).contains("▸ /model"));
+    key(&mut a, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(a.editor.text(), "/model ");
+    a.editor.clear();
+    // @file completion lists this crate's files (cwd = /home/u/proj doesn't exist → no popup).
+    typ(&mut a, "look at @zzz");
+    assert!(!screen(&mut a, 60, 12).contains("▸"));
+    // Enter on a complete command sends it.
+    a.editor.clear();
+    typ(&mut a, "/new");
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(a.exit, Some(Exit::New));
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn file_completion_in_a_real_folder() {
+    let d = tempfile_dir();
+    std::fs::create_dir_all(d.join("src")).unwrap();
+    std::fs::write(d.join("src/main.rs"), "").unwrap();
+    std::fs::write(d.join("README.md"), "").unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut a = App::new(
+        Init {
+            model: "claude/opus".into(),
+            cwd: d.display().to_string(),
+            branch: None,
+            window_tokens: 200_000,
+            history: vec![],
+            keymap: Default::default(),
+            collapse_turns: true,
+            notices: vec![],
+            theme: Default::default(),
+            thinking: Default::default(),
+        },
+        tx,
+    );
+    typ(&mut a, "see @mai");
+    assert!(screen(&mut a, 60, 12).contains("▸ src/main.rs"));
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(a.editor.text(), "see @src/main.rs ");
+}
+
+fn tempfile_dir() -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("nc-tui-{}-{}", std::process::id(), line!()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+#[test]
+fn transcript_search_and_thinking_toggle() {
+    let (mut a, _rx) = app(vec![]);
+    run_events(&mut a);
+    screen(&mut a, 60, 30);
+    key(&mut a, KeyCode::Char('f'), KeyModifiers::CONTROL);
+    typ(&mut a, "tests pass");
+    let s = screen(&mut a, 60, 30);
+    assert!(s.contains("search: tests pass  1/1"), "{s}");
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    // Ctrl+T shows thinking in full (the turn must be expanded to see it).
+    key(&mut a, KeyCode::Char('o'), KeyModifiers::ALT);
+    key(&mut a, KeyCode::Char('t'), KeyModifiers::CONTROL);
+    assert!(screen(&mut a, 60, 30).contains("∴ look at the test output first"));
+}
+
+#[test]
+fn stream_pacer_reveals_gradually() {
+    let (mut a, _rx) = app(vec![]);
+    a.on_agent(AgentEvent::AgentStart);
+    a.on_agent(AgentEvent::Message(Message::user("go")));
+    a.on_agent(AgentEvent::Stream(StreamEvent::BlockStart {
+        index: 0,
+        kind: BlockKind::Text,
+        name: None,
+    }));
+    a.on_agent(AgentEvent::Stream(StreamEvent::Delta {
+        index: 0,
+        text: "word ".repeat(200),
+    }));
+    assert!(a.pace(), "1000 chars can't all show in one frame");
+    let mut frames = 1;
+    while a.pace() {
+        frames += 1;
+    }
+    assert!((5..60).contains(&frames), "caught up in {frames} frames");
 }

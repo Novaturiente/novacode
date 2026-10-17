@@ -1,0 +1,26 @@
+{
+  "name": "catppuccin-latte",
+  "dark": false,
+  "syntax": "InspiredGitHub",
+  "tokens": {
+    "text": "#4c4f69",
+    "dim": "#8c8fa1",
+    "accent": "#8839ef",
+    "user": { "fg": "#1e66f5", "bold": true },
+    "heading": { "fg": "#ea76cb", "bold": true },
+    "code": "#fe640b",
+    "code_block": "#40a02b",
+    "link": { "fg": "#209fb5", "underline": true },
+    "quote": { "fg": "#7c7f93", "italic": true },
+    "thinking": { "fg": "#7c7f93", "italic": true },
+    "ok": "#40a02b",
+    "warn": "#df8e1d",
+    "error": "#d20f39",
+    "add": "#40a02b",
+    "del": "#d20f39",
+    "border": "#acb0be",
+    "selection": { "bg": "#ccd0da" },
+    "toggle": "#179299",
+    "match": { "bg": "#df8e1d", "fg": "#eff1f5" }
+  }
+}

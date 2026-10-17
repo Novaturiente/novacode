@@ -6,7 +6,7 @@ use crate::dialog::{self, Answer, ApprovalCard, ApproveReq, Pager, PickItem, Pic
 use crate::editor::{Action, Editor};
 use crate::keys::{A, Keymap, Scope};
 use crate::theme::Theme;
-use crate::transcript::{Transcript, View};
+use crate::transcript::{Thinking, Transcript, View};
 use crate::wrap;
 use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use novacode_types::{AgentEvent, BlockKind, Message, StopReason, StreamEvent, Usage};
@@ -23,6 +23,9 @@ use unicode_width::UnicodeWidthStr;
 const EDITOR_MAX_ROWS: usize = 10;
 const WHEEL: isize = 3;
 const DOUBLE_PRESS: Duration = Duration::from_millis(500);
+const COMPLETE_ROWS: usize = 8;
+/// Files listed for `@` completion; bigger trees are cut.
+const FILE_CAP: usize = 20_000;
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Slash commands typed in the editor (L8.9 registry arrives in M8).
@@ -49,6 +52,9 @@ pub struct Init {
     pub collapse_turns: bool,
     /// Startup warnings (bad keybindings, settings).
     pub notices: Vec<String>,
+    pub theme: Theme,
+    /// Setting `ui.thinking`: collapsed, full or hidden.
+    pub thinking: Thinking,
 }
 
 /// What the UI asks of the session.
@@ -94,6 +100,22 @@ struct Shown {
     area: Rect,
 }
 
+/// Popup under the cursor: `@file` or a slash command (L9.5).
+struct Completion {
+    /// Byte where the completed token starts.
+    start: usize,
+    /// (label, text to insert, detail).
+    items: Vec<(String, String, String)>,
+    sel: usize,
+}
+
+/// Transcript search (L9.9).
+struct Search {
+    query: String,
+    /// Absolute view line of the current match.
+    at: Option<usize>,
+}
+
 enum Overlay {
     Models(Picker),
     Sessions(Picker),
@@ -123,6 +145,9 @@ pub struct App {
     editor_width: usize,
     approvals: VecDeque<ApprovalCard>,
     overlay: Option<Overlay>,
+    completion: Option<Completion>,
+    files: Option<Vec<String>>,
+    search: Option<Search>,
     pub dirty: bool,
     pub exit: Option<Exit>,
     pub suspend: bool,
@@ -144,6 +169,7 @@ impl App {
     pub fn new(mut init: Init, tx: UnboundedSender<Cmd>) -> Self {
         let mut tr = Transcript {
             expand_all: !init.collapse_turns,
+            thinking: init.thinking,
             ..Default::default()
         };
         let mut history = Vec::new();
@@ -164,7 +190,7 @@ impl App {
         }
         tr.settle();
         Self {
-            theme: Theme::default(),
+            theme: std::mem::take(&mut init.theme),
             tr,
             editor: Editor::with_history(history),
             keymap: std::mem::take(&mut init.keymap),
@@ -184,6 +210,9 @@ impl App {
             editor_width: 80,
             approvals: VecDeque::new(),
             overlay: None,
+            completion: None,
+            files: None,
+            search: None,
             dirty: true,
             exit: None,
             suspend: false,
@@ -335,6 +364,13 @@ impl App {
             }
             return;
         }
+        if self.search.is_some() {
+            self.search_key(k);
+            return;
+        }
+        if self.completion.is_some() && self.completion_key(k) {
+            return;
+        }
         let scopes: &[Scope] = if self.editor.searching() {
             &[Scope::Editor]
         } else {
@@ -391,14 +427,160 @@ impl App {
             Some(A::Bottom) => self.anchor = None,
             Some(A::PrevPrompt) => self.jump_prompt(-1),
             Some(A::NextPrompt) => self.jump_prompt(1),
-            // shortcut: transcript search (L9.9) lands with M4b2.
-            Some(A::Search) => self.flash("transcript search arrives in M4b2"),
+            Some(A::Search) => {
+                self.search = Some(Search {
+                    query: String::new(),
+                    at: None,
+                })
+            }
+            Some(A::ThinkingToggle) => {
+                let next = if self.tr.thinking == Thinking::Full {
+                    Thinking::Collapsed
+                } else {
+                    Thinking::Full
+                };
+                self.tr.set_thinking(next);
+            }
             a => {
                 if let Action::Submit(text) = self.editor.handle(a, k, self.editor_width) {
+                    self.completion = None;
                     self.submit(text, true);
+                } else {
+                    self.update_completion();
                 }
             }
         }
+    }
+
+    /// Keys while the completion popup is open; `false` = not used, handle normally.
+    fn completion_key(&mut self, k: KeyEvent) -> bool {
+        use crossterm::event::KeyCode;
+        let Some(c) = &mut self.completion else { return false };
+        let n = c.items.len();
+        match k.code {
+            KeyCode::Up => c.sel = (c.sel + n - 1) % n,
+            KeyCode::Down => c.sel = (c.sel + 1) % n,
+            KeyCode::Esc => self.completion = None,
+            _ => {
+                let (start, insert) = (c.start, c.items[c.sel].1.clone());
+                let token = &self.editor.text()[start..self.editor.cursor()];
+                match self.keymap.lookup(&k, &[Scope::Editor]) {
+                    Some(A::Tab) => {}
+                    // Enter completes, unless the token is already complete (then it sends).
+                    Some(A::Submit) if insert.trim_end() != token => {}
+                    _ => return false,
+                }
+                self.editor.complete(start, &insert);
+                self.completion = None;
+                self.update_completion();
+            }
+        }
+        true
+    }
+
+    fn update_completion(&mut self) {
+        let text = self.editor.text();
+        let before = &text[..self.editor.cursor()];
+        let start = before.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+        let token = &before[start..];
+        let items: Vec<(String, String, String)> = if start == 0 && token.starts_with('/') {
+            COMMANDS
+                .iter()
+                .filter(|(c, _)| c.starts_with(token))
+                .map(|(c, d)| (c.to_string(), format!("{c} "), d.to_string()))
+                .collect()
+        } else if let Some(q) = token.strip_prefix('@') {
+            let files = self.files.get_or_insert_with(|| list_files(&self.init.cwd));
+            let mut hits: Vec<(usize, &String)> = files
+                .iter()
+                .filter_map(|f| {
+                    let base = f.trim_end_matches('/').rsplit('/').next().unwrap_or(f);
+                    // A hit in the file name ranks above a hit spread over the path.
+                    dialog::fuzzy(base, q)
+                        .or_else(|| dialog::fuzzy(f, q).map(|s| s + 1000))
+                        .map(|s| (s * 1000 + f.len(), f))
+                })
+                .collect();
+            hits.sort();
+            hits.into_iter()
+                .take(50)
+                .map(|(_, f)| (f.clone(), format!("@{f} "), String::new()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let done = items.len() == 1 && items[0].1.trim_end() == token;
+        self.completion = (!items.is_empty() && !done).then_some(Completion { start, items, sel: 0 });
+    }
+
+    fn search_key(&mut self, k: KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let Some(s) = &mut self.search else { return };
+        let older = match k.code {
+            KeyCode::Esc => {
+                self.search = None;
+                return;
+            }
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.search = None;
+                return;
+            }
+            KeyCode::Enter if k.modifiers.contains(KeyModifiers::SHIFT) => false,
+            KeyCode::Enter | KeyCode::Up => true,
+            KeyCode::Down => false,
+            KeyCode::Char('g') if k.modifiers.contains(KeyModifiers::CONTROL) => true,
+            KeyCode::Backspace => {
+                s.query.pop();
+                s.at = None;
+                true
+            }
+            KeyCode::Char(c) if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                s.query.push(c);
+                s.at = None;
+                true
+            }
+            _ => return,
+        };
+        self.search_step(older);
+    }
+
+    fn hits(&self) -> Vec<usize> {
+        let (Some(s), Some(sh)) = (&self.search, &self.shown) else {
+            return Vec::new();
+        };
+        if s.query.is_empty() {
+            return Vec::new();
+        }
+        let q = s.query.to_lowercase();
+        sh.view
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| wrap::plain(l).to_lowercase().contains(&q))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Move to the next older (up) or newer match and scroll it into the middle.
+    fn search_step(&mut self, older: bool) {
+        let hits = self.hits();
+        let Some(s) = &mut self.search else { return };
+        let next = match s.at {
+            None => hits.last().copied(),
+            Some(at) if older => hits.iter().rev().find(|&&h| h < at).copied().or(Some(at)),
+            Some(at) => hits.iter().find(|&&h| h > at).copied().or(Some(at)),
+        };
+        s.at = next.filter(|_| !hits.is_empty());
+        if let (Some(line), Some(sh)) = (s.at, &self.shown) {
+            let top = line.saturating_sub(sh.area.height as usize / 2);
+            let delta = top as isize - sh.top as isize;
+            self.scroll_by(delta);
+        }
+    }
+
+    /// Stream pacer step; `true` = more text is waiting, draw again next frame.
+    pub fn pace(&mut self) -> bool {
+        self.tr.pace()
     }
 
     fn list_models(&mut self) {
@@ -597,6 +779,22 @@ impl App {
                 )
             })
             .collect();
+        if let Some(s) = &self.search {
+            let hits = self.hits();
+            let pos =
+                s.at.and_then(|a| hits.iter().position(|&h| h == a))
+                    .map_or(0, |p| p + 1);
+            let line = format!(
+                " search: {}  {}/{}   Enter older · Shift+Enter newer · Esc close",
+                s.query,
+                pos,
+                hits.len()
+            );
+            notes.push(wrap::truncate(
+                vec![Span::styled(line, self.theme.warn)],
+                area.width as usize,
+            ));
+        }
         if let Some(s) = self.editor.search_prompt() {
             notes.push(wrap::truncate(
                 vec![Span::styled(format!(" {s}"), self.theme.warn)],
@@ -607,9 +805,14 @@ impl App {
             .approvals
             .front()
             .map_or(0, |c| c.height(area.width).min(area.height / 2));
-        let [main, card, pend, ed, status] = Layout::vertical([
+        let comp_h = self
+            .completion
+            .as_ref()
+            .map_or(0, |c| c.items.len().min(COMPLETE_ROWS) as u16);
+        let [main, card, comp, pend, ed, status] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(card_h),
+            Constraint::Length(comp_h),
             Constraint::Length(notes.len() as u16),
             Constraint::Length(ed_rows as u16 + 2),
             Constraint::Length(1),
@@ -623,6 +826,28 @@ impl App {
         self.draw_transcript(f, main);
         let t = &self.theme;
         f.render_widget(Paragraph::new(notes), pend);
+        if let Some(c) = &self.completion {
+            let first = (c.sel + 1).saturating_sub(COMPLETE_ROWS);
+            let lines: Vec<Line> = c
+                .items
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take(COMPLETE_ROWS)
+                .map(|(i, (label, _, detail))| {
+                    let sel = i == c.sel;
+                    wrap::truncate(
+                        vec![
+                            Span::styled(if sel { " ▸ " } else { "   " }, t.accent),
+                            Span::styled(label.clone(), if sel { t.accent } else { t.text }),
+                            Span::styled(format!("  {detail}"), t.dim),
+                        ],
+                        area.width as usize,
+                    )
+                })
+                .collect();
+            f.render_widget(Paragraph::new(lines), comp);
+        }
 
         let (rows, (cr, cc)) = self.editor.view(inner_w, ed_rows);
         let block = Block::bordered()
@@ -665,6 +890,27 @@ impl App {
         }
         let visible: Vec<Line> = view.lines[top..(top + h).min(view.lines.len())].to_vec();
         f.render_widget(Paragraph::new(visible), area);
+        if let Some(s) = self.search.as_ref().filter(|s| !s.query.is_empty()) {
+            let q = s.query.to_lowercase();
+            let buf = f.buffer_mut();
+            for row in 0..area.height {
+                let n = top + row as usize;
+                let Some(line) = view.lines.get(n) else { break };
+                let plain = wrap::plain(line).to_lowercase();
+                let Some(byte) = plain.find(&q) else { continue };
+                let col = plain[..byte].width() as u16;
+                let st = if s.at == Some(n) {
+                    self.theme.matched
+                } else {
+                    self.theme.selection
+                };
+                for c in col..(col + q.width() as u16).min(area.width) {
+                    if let Some(cell) = buf.cell_mut(Position::new(area.x + c, area.y + row)) {
+                        cell.set_style(st);
+                    }
+                }
+            }
+        }
         if let Some((a, b)) = self.selection {
             let (a, b) = (a.min(b), a.max(b));
             let buf = f.buffer_mut();
@@ -753,4 +999,27 @@ impl App {
         spans.extend(right);
         Line::from(spans)
     }
+}
+
+/// Files and folders under `cwd` for `@` completion, respecting .gitignore.
+fn list_files(cwd: &str) -> Vec<String> {
+    let root = std::path::Path::new(cwd);
+    let mut out: Vec<String> = ignore::WalkBuilder::new(root)
+        .build()
+        .flatten()
+        .filter_map(|e| {
+            let rel = e.path().strip_prefix(root).ok()?.to_string_lossy().into_owned();
+            if rel.is_empty() {
+                return None;
+            }
+            Some(if e.file_type()?.is_dir() {
+                format!("{rel}/")
+            } else {
+                rel
+            })
+        })
+        .take(FILE_CAP)
+        .collect();
+    out.sort();
+    out
 }
