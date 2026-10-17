@@ -153,6 +153,26 @@ pub fn lock(path: &Path) -> io::Result<FileLock> {
     Ok(FileLock { _file: file })
 }
 
+/// Like [`lock`] but returns `None` at once when another holder has it.
+pub fn try_lock(path: &Path) -> io::Result<Option<FileLock>> {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".lock");
+    let lock_path = PathBuf::from(s);
+    if let Some(dir) = lock_path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(FileLock { _file: file })),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

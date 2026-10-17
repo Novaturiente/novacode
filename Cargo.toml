@@ -22,7 +22,7 @@ anyhow = "1"
 tracing = "0.1"
 uuid = { version = "1", features = ["v7", "serde"] }
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "io-util", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "io-util", "process", "fs"] }
 tokio-util = "0.7"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }

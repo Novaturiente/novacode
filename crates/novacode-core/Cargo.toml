@@ -13,3 +13,14 @@ novacode-base.workspace = true
 novacode-ai.workspace = true
 novacode-tools.workspace = true
 novacode-script.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
+novacode-base.workspace = true
+tempfile.workspace = true

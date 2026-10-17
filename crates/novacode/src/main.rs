@@ -1,16 +1,20 @@
-//! novacode binary: CLI, print mode (L8.3, L8.4). M1: no tools, no session yet.
+//! novacode binary: CLI, print mode (L8.3, L8.4). M2: agent loop with tools and saved sessions.
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
-use novacode_ai::adapter::{Adapter, CacheRetention, Request, collect};
+use novacode_ai::adapter::CacheRetention;
 use novacode_ai::anthropic::{Anthropic, Auth, OAuthProfile};
 use novacode_ai::auth::{self, AuthStore, DEFAULT_ACCOUNT, claude};
 use novacode_ai::trace::Trace;
 use novacode_base::{logging, new_id, paths::Paths, settings::Settings};
-use novacode_types::{Message, StopReason};
+use novacode_core::agent::{self, Agent, Config};
+use novacode_core::session::{self, Store};
+use novacode_tools::LocalEnv;
+use novacode_types::{AgentEvent, Message, StopReason};
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
-use tokio_util::sync::CancellationToken;
+use std::sync::Arc;
+use tokio::sync::broadcast;
 
 #[derive(Parser)]
 #[command(name = "novacode", version, about = "An agent harness")]
@@ -24,9 +28,18 @@ struct Cli {
     /// Record the raw request and stream (redacted) to <home>/logs/trace-<id>.jsonl.
     #[arg(long)]
     trace: bool,
-    /// Report stop reason and token/cache usage on stderr.
+    /// Report tool calls, stop reason, token/cache usage and the session file on stderr.
     #[arg(short, long)]
     verbose: bool,
+    /// Continue the most recent session in this folder.
+    #[arg(short, long)]
+    r#continue: bool,
+    /// Resume a session by id prefix.
+    #[arg(short, long, value_name = "ID")]
+    resume: Option<String>,
+    /// Don't save this session.
+    #[arg(long)]
+    no_session: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -142,23 +155,67 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         Some("long") => CacheRetention::Long,
         _ => CacheRetention::Short,
     };
-    let req = Request {
+    let store = if let Some(prefix) = &cli.resume {
+        Store::open(&session::find(&paths, &cwd, prefix)?)?
+    } else if cli.r#continue {
+        let last = session::list(&paths, &cwd)
+            .into_iter()
+            .next()
+            .context("no earlier session in this folder")?;
+        Store::open(&last)?
+    } else {
+        Store::create(&paths, &cwd, cli.no_session)
+    };
+    let cfg = Config {
+        cwd: cwd.clone(),
+        provider: provider.to_string(),
         model: model_id.to_string(),
-        messages: vec![Message::user(prompt)],
-        tools: vec![],
         max_tokens: settings.get("maxTokens").unwrap_or(16_384),
         cache,
+        // shortcut: fixed window until the model catalog (M5, L2.10).
+        window_tokens: settings.get("contextWindow").unwrap_or(200_000),
+        spill_dir: paths.home().join("spill"),
     };
-
-    let cancel = CancellationToken::new();
-    let on_ctrl_c = cancel.clone();
+    let tools = novacode_tools::builtins(false);
+    let agent = Agent::new(
+        Arc::new(Anthropic::new(auth, trace)),
+        tools,
+        store,
+        cfg,
+        Arc::new(LocalEnv),
+    );
+    let (handle, task) = agent::spawn(agent);
+    let mut events = handle.subscribe();
+    let on_ctrl_c = handle.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            on_ctrl_c.cancel();
+            on_ctrl_c.abort();
         }
     });
-    let msg = collect(Anthropic::new(auth, trace).stream(req, cancel)).await;
-    tracing::info!(stop = ?msg.stop, usage = ?msg.usage, "print mode done");
+    handle.prompt(prompt);
+    // stdout gets only the final answer (L8.4); progress goes to stderr with -v.
+    let mut last = None;
+    let stop = loop {
+        match events.recv().await {
+            Ok(AgentEvent::Message(Message::Assistant(m))) => last = Some(m),
+            Ok(AgentEvent::ToolStart { call }) if cli.verbose => eprintln!("tool {} {}", call.name, call.arguments),
+            Ok(AgentEvent::Retry {
+                attempt,
+                delay_ms,
+                message,
+                ..
+            }) => {
+                eprintln!("retry {attempt} in {delay_ms}ms: {message}")
+            }
+            Ok(AgentEvent::AgentEnd { stop }) => break stop,
+            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => bail!("session ended unexpectedly"),
+        }
+    };
+    handle.shutdown();
+    let agent = task.await?;
+    let msg = last.context("no reply")?;
+    tracing::info!(stop = ?stop, usage = ?msg.usage, "print mode done");
     let text = msg.text();
     if !text.is_empty() {
         let mut out = std::io::stdout().lock();
@@ -169,10 +226,14 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         let u = msg.usage;
         eprintln!(
             "stop={:?} input={} output={} cache_read={} cache_write={}",
-            msg.stop, u.input, u.output, u.cache_read, u.cache_write
+            stop, u.input, u.output, u.cache_read, u.cache_write
         );
+        match agent.store.path() {
+            Some(p) => eprintln!("session: {}", p.display()),
+            None => eprintln!("session: not saved"),
+        }
     }
-    Ok(match msg.stop {
+    Ok(match stop {
         StopReason::Stop | StopReason::ToolUse | StopReason::Length => ExitCode::SUCCESS,
         StopReason::Aborted => ExitCode::from(130),
         StopReason::Error { kind } => {

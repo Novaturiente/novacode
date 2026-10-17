@@ -237,6 +237,43 @@ pub enum StreamEvent {
     Error(AssistantMessage),
 }
 
+/// Loop → consumers (L1.5). One stream feeds TUI, print, JSON, RPC and attach.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentEvent {
+    AgentStart,
+    TurnStart,
+    /// Live model output for the message being streamed.
+    Stream(StreamEvent),
+    /// A message was appended to the session (user, assistant, tool result, reminder).
+    Message(Message),
+    ToolStart {
+        call: ToolCall,
+    },
+    ToolUpdate {
+        call_id: String,
+        text: String,
+    },
+    ToolEnd {
+        call_id: String,
+        is_error: bool,
+        duration_ms: u64,
+    },
+    /// A failed model call will be retried after `delay_ms`.
+    Retry {
+        attempt: u32,
+        delay_ms: u64,
+        error: ErrorKind,
+        message: String,
+    },
+    /// The loop stopped. `stop` is the last assistant message's stop reason.
+    AgentEnd {
+        stop: StopReason,
+    },
+    /// Stopped and nothing is queued (L3.10).
+    Settled,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
