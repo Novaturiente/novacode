@@ -932,3 +932,47 @@ async fn rewind_restores_files_of_a_prompt() {
     checkpoint::undo(&agent.store, &repo, &r.undo).unwrap();
     assert_eq!(std::fs::read_to_string(w.join("a.txt")).unwrap(), "three\n");
 }
+
+/// L5.17: a deferred tool is refused until found, then runs through `call`
+/// (non-native model) with the real tool name in the pipeline.
+#[tokio::test]
+async fn deferred_tools_run_through_call() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(work.path().join("notes.txt"), "deferred hello").unwrap();
+    let faux = Faux::new([
+        tools_reply(vec![call("a", "read", json!({"path": "notes.txt"}))]),
+        tools_reply(vec![call(
+            "b",
+            "call",
+            json!({"name": "read", "arguments": {"path": "notes.txt"}}),
+        )]),
+        FauxReply::text("done"),
+    ]);
+    let all = novacode_tools::builtins(false);
+    let (listed, deferred): (Vec<_>, Vec<_>) = all.into_iter().partition(|t| t.name() != "read");
+    let mut listed = listed;
+    listed.push(Arc::new(novacode_tools::toolsearch::Call));
+    let store = Store::create(&Paths::new(home.path()), work.path(), true);
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        listed,
+        store,
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_deferred(deferred);
+    let (agent, _) = drive(agent, &["read it"]).await;
+    let results: Vec<String> = agent
+        .store
+        .projection()
+        .iter()
+        .filter(|m| matches!(m, Message::ToolResult { .. }))
+        .map(result_text)
+        .collect();
+    assert!(results[0].contains("find it with tool_search"), "{results:?}");
+    assert!(results[1].contains("deferred hello"), "{results:?}");
+    // The request never declared `read`.
+    let req = faux.requests.lock().unwrap().clone();
+    assert!(req[0].tools.iter().all(|t| t.name != "read"));
+}

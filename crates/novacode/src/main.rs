@@ -617,12 +617,23 @@ impl Ctx {
                 file: file.to_path_buf(),
             }));
         }
-        let tools = novacode_tools::listed(all, |name| self.settings.get(&format!("tools.{name}.exposure")));
+        let (mut tools, deferred) =
+            novacode_tools::exposed(all, |name| self.settings.get(&format!("tools.{name}.exposure")));
+        // Deferred tools (L5.17): found by tool_search, run in-line once announced or through `call`.
+        if !deferred.is_empty() {
+            let defs = deferred
+                .iter()
+                .map(|t| novacode_core::pipeline::def(t.as_ref()))
+                .collect();
+            tools.push(Arc::new(novacode_tools::toolsearch::ToolSearch { tools: defs }));
+            tools.push(Arc::new(novacode_tools::toolsearch::Call));
+        }
         let window = cfg.window_tokens;
         let worker = memory_on.then(|| self.memory_worker(&route, adapter.clone()));
         let mut agent = Agent::new(adapter, tools, store, cfg, Arc::new(LocalEnv))
             .with_policy(policy)
-            .with_quirks(self.quirks.clone());
+            .with_quirks(self.quirks.clone())
+            .with_deferred(deferred);
         if s.get("checkpoints.enabled").unwrap_or(true)
             && agent.store.path().is_some()
             && let Some(repo) = novacode_core::checkpoint::resolve(&self.cwd, self.paths.home())

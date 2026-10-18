@@ -43,6 +43,11 @@ pub trait Adapter: Send + Sync {
     fn warm_ttl(&self, _req: &Request) -> Option<std::time::Duration> {
         None
     }
+    /// The model takes tool definitions in-line mid-conversation (L4.8), so a found
+    /// tool is announced instead of changing the request's tool list.
+    fn native_tool_changes(&self, _model: &str) -> bool {
+        false
+    }
     /// Model ids this account can use right now (the live list, L2.10).
     fn list_models(&self) -> futures_util::future::BoxFuture<'_, Result<Vec<String>, String>> {
         Box::pin(async { Err("this provider has no model list".to_string()) })

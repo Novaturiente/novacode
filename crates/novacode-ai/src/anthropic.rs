@@ -166,6 +166,10 @@ impl Anthropic {
 }
 
 impl Adapter for Anthropic {
+    fn native_tool_changes(&self, model: &str) -> bool {
+        native_tool_changes(&self.provider, model)
+    }
+
     fn warm_ttl(&self, req: &Request) -> Option<std::time::Duration> {
         // A thinking budget would be spent on the replay (pi skips these too).
         let budget = thinking_style(&req.model) == ThinkingStyle::Budget
@@ -184,15 +188,17 @@ impl Adapter for Anthropic {
         let body = serde_json::to_vec(&build_body(&req, oauth_profile.as_ref(), &self.provider)).unwrap_or_default();
         let effort = in_conversation_effort(&req.model, req.thinking);
         // Mid-conversation effort needs these two betas (as pi sends them).
-        let betas: &[&str] = if effort.is_some() {
-            &[
+        let mut betas: Vec<&str> = Vec::new();
+        if effort.is_some() {
+            betas.extend([
                 "mid-conversation-output-config-2026-07-01",
                 "thinking-binding-controls-2026-08-01",
-            ]
-        } else {
-            &[]
-        };
-        let request = self.http_request(&body, betas);
+            ]);
+        }
+        if native_tool_changes(&self.provider, &req.model) && !req.tools.is_empty() {
+            betas.push("inline-tools-2026-09-15");
+        }
+        let request = self.http_request(&body, &betas);
         let (mut b, rx) = http::channel(&self.provider, &req.model);
         b.thinking_level = effort;
         http::drive(b, rx, request, body, self.trace.clone(), cancel, State::default)
@@ -353,6 +359,24 @@ pub enum ThinkingStyle {
     Managed,
 }
 
+/// Models that take tool changes inside the conversation (`tool_addition` blocks,
+/// L4.8): the same list as mid-conversation system messages, on Anthropic itself.
+pub fn native_tool_changes(ns: &str, model: &str) -> bool {
+    (ns == "claude" || ns == "anthropic") && mid_convo_system(model)
+}
+
+/// Declared from the first request on native-tool-change models (pi, measured):
+/// Anthropic adds hidden scaffolding for in-conversation tool changes, and keeping
+/// it in the cached prefix stops the first added tool from missing the cache.
+fn deferred_placeholder() -> Value {
+    json!({
+        "name": "__novacode_deferred_placeholder__",
+        "description": "Reserved placeholder. Never available. Never call this.",
+        "input_schema": { "type": "object", "properties": {}, "required": [] },
+        "defer_loading": true,
+    })
+}
+
 /// Models that take `system` messages inside the conversation (pi's verified list).
 fn mid_convo_system(model: &str) -> bool {
     let id = base_id(model).replace('.', "-");
@@ -511,6 +535,9 @@ pub fn build_body(req: &Request, oauth: Option<&OAuthProfile>, ns: &str) -> Valu
     {
         last["cache_control"] = cache.clone();
     }
+    if native_tool_changes(ns, &req.model) && !tools.is_empty() {
+        tools.push(deferred_placeholder());
+    }
 
     let mut body = Map::new();
     body.insert("model".into(), json!(req.model));
@@ -608,20 +635,39 @@ fn convert_messages(messages: &[Message], ns: &str, native_system: bool) -> (Vec
     let reminder = |t: &str| json!({ "type": "text", "text": format!("<system-reminder>\n{t}\n</system-reminder>") });
     // A native system message must follow a user message: deltas wait for the next one.
     let mut held: Vec<Value> = Vec::new();
+    // The last wire turn is a user one (prompt or tool_result), so a system turn may follow.
+    let mut after_user = false;
     for m in &messages[lead..] {
         match m {
             Message::System { text } if text.is_empty() => {}
             Message::System { text } if native_system => held.push(json!({ "type": "text", "text": text })),
             // Older models: the delta rides in the conversation as a reminder.
             Message::System { text } => push("user", vec![reminder(text)], None),
+            // Tools found by tool_search (L5.17): defined by value, so the request's
+            // tool list (and the cached prefix) never changes.
+            Message::Custom { kind, data } if kind == "tools_added" && native_system => {
+                for d in data["tools"].as_array().into_iter().flatten() {
+                    held.push(
+                        json!({ "type": "tool_addition", "tool": { "type": "tool_definition", "definition": {
+                        "name": d["name"], "description": d["description"], "input_schema": d["schema"] } } }),
+                    );
+                }
+            }
             Message::Custom { .. } => {}
             Message::User { content } => {
                 push("user", content.iter().filter_map(user_block).collect(), None);
+                after_user = true;
                 if !held.is_empty() {
                     push("system", std::mem::take(&mut held), None);
                 }
             }
             Message::Assistant(a) => {
+                // Held blocks go before the next reply too (pi): after a tool_result,
+                // never between a tool_use and its result.
+                if !held.is_empty() && after_user {
+                    push("system", std::mem::take(&mut held), None);
+                }
+                after_user = false;
                 let same = a.provider == ns;
                 push(
                     "assistant",
@@ -644,14 +690,16 @@ fn convert_messages(messages: &[Message], ns: &str, native_system: bool) -> (Vec
                     r["is_error"] = json!(true);
                 }
                 push("user", vec![r], None);
+                after_user = true;
             }
         }
     }
+    // Tool additions at the end follow a tool_result (a user turn): send them as is.
+    if held.iter().any(|b| b["type"] == "tool_addition") && after_user {
+        push("system", std::mem::take(&mut held), None);
+    }
     // Nothing followed: keep the text as a reminder rather than lose it.
-    let left: Vec<Value> = held
-        .iter()
-        .map(|b| reminder(b["text"].as_str().unwrap_or_default()))
-        .collect();
+    let left: Vec<Value> = held.iter().filter_map(|b| b["text"].as_str()).map(reminder).collect();
     push("user", left, None);
     (out, levels)
 }
@@ -776,6 +824,92 @@ mod tests {
         r.model = "claude-opus-4-8".into();
         let b = build_body(&r, None, PROVIDER);
         assert_eq!(b["output_config"], json!({ "effort": "medium" }));
+    }
+
+    #[test]
+    fn tool_additions_keep_the_tool_list_and_prefix() {
+        let t = |n: &str| ToolDef {
+            name: n.into(),
+            description: "d".into(),
+            schema: json!({"type": "object"}),
+        };
+        let mut first = req(vec![Message::user("find a fetch tool")]);
+        first.model = "claude-opus-5-5".into();
+        first.tools = vec![t("read"), t("tool_search")];
+        let b1 = build_body(&first, None, PROVIDER);
+        let tools1 = b1["tools"].as_array().unwrap();
+        assert_eq!(
+            tools1.last().unwrap()["defer_loading"],
+            json!(true),
+            "placeholder from the first request"
+        );
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "tool_search".into(),
+            arguments: json!({"query": "fetch"}),
+            arguments_error: None,
+            replay: None,
+        };
+        let reply = AssistantMessage {
+            content: vec![Block::ToolCall(call)],
+            stop: StopReason::ToolUse,
+            usage: Usage::default(),
+            provider: PROVIDER.into(),
+            model: first.model.clone(),
+            response_id: None,
+            error_message: None,
+            thinking_level: None,
+        };
+        let mut second = first.clone();
+        second.messages.extend([
+            Message::Assistant(reply),
+            Message::ToolResult {
+                call_id: "c1".into(),
+                tool_name: "tool_search".into(),
+                content: vec![Block::text("found web_fetch")],
+                is_error: false,
+                details: None,
+            },
+            Message::Custom {
+                kind: "tools_added".into(),
+                data: json!({"tools": [t("web_fetch")]}),
+            },
+        ]);
+        let b2 = build_body(&second, None, PROVIDER);
+        let strip = |v: &Value| {
+            let mut v = v.clone();
+            // Cache markers slide with the end; compare the content.
+            fn walk(v: &mut Value) {
+                match v {
+                    Value::Object(m) => {
+                        m.remove("cache_control");
+                        m.values_mut().for_each(walk);
+                    }
+                    Value::Array(a) => a.iter_mut().for_each(walk),
+                    _ => {}
+                }
+            }
+            walk(&mut v);
+            v
+        };
+        assert_eq!(strip(&b2["tools"]), strip(&b1["tools"]), "the tool list never changes");
+        assert_eq!(strip(&b2["system"]), strip(&b1["system"]));
+        let m2 = b2["messages"].as_array().unwrap();
+        assert_eq!(strip(&m2[0]), strip(&b1["messages"][0]), "earlier messages unchanged");
+        let roles: Vec<&str> = m2.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "assistant", "user", "system"]);
+        assert_eq!(m2[3]["content"][0]["type"], "tool_addition");
+        assert_eq!(m2[3]["content"][0]["tool"]["definition"]["name"], "web_fetch");
+        // Older models never get the placeholder.
+        let mut old = first.clone();
+        old.model = "claude-sonnet-4-5".into();
+        assert!(
+            build_body(&old, None, PROVIDER)["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t.get("defer_loading").is_none())
+        );
     }
 
     #[test]

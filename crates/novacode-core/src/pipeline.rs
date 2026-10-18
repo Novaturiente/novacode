@@ -46,6 +46,15 @@ pub fn prepare(tools: &[Arc<dyn Tool>], call: &ToolCall) -> Prepared {
 }
 
 /// Schema sent to the model: the tool's own, plus `accept_large_output` where it applies.
+/// The definition sent to a model: name, description, schema (with the guard field).
+pub fn def(tool: &dyn Tool) -> novacode_types::ToolDef {
+    novacode_types::ToolDef {
+        name: tool.name().into(),
+        description: tool.description().into(),
+        schema: schema(tool),
+    }
+}
+
 pub fn schema(tool: &dyn Tool) -> Value {
     let mut s = tool.schema();
     if tool.large_output()

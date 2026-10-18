@@ -12,6 +12,7 @@ pub mod process;
 pub mod read;
 pub mod search;
 pub mod todo;
+pub mod toolsearch;
 pub mod worktree;
 pub mod write;
 
@@ -67,14 +68,22 @@ pub enum Exposure {
     Hidden,
 }
 
-/// The tools the model may call directly. The rest stay out of the request, so
-/// their declarations cost no tokens.
-// shortcut: non-listed tools are dropped; keep them for codemode/tool_search when those land (M9, M10).
-pub fn listed(tools: Vec<Arc<dyn Tool>>, overrides: impl Fn(&str) -> Option<Exposure>) -> Vec<Arc<dyn Tool>> {
-    tools
-        .into_iter()
-        .filter(|t| overrides(t.name()).unwrap_or(t.exposure()) == Exposure::Listed)
-        .collect()
+pub type Tools = Vec<Arc<dyn Tool>>;
+
+/// Split by exposure: (listed, deferred). Listed ones go in the request; deferred
+/// ones are found with `tool_search` (L5.17), so their declarations cost no tokens.
+// shortcut: codemode-only tools are dropped until codemode lands (M10).
+pub fn exposed(tools: Vec<Arc<dyn Tool>>, overrides: impl Fn(&str) -> Option<Exposure>) -> (Tools, Tools) {
+    let mut listed = Vec::new();
+    let mut deferred = Vec::new();
+    for t in tools {
+        match overrides(t.name()).unwrap_or(t.exposure()) {
+            Exposure::Listed => listed.push(t),
+            Exposure::Deferred => deferred.push(t),
+            Exposure::CodemodeOnly | Exposure::Hidden => {}
+        }
+    }
+    (listed, deferred)
 }
 
 /// Which end of a long output to keep (L5.3).
@@ -96,6 +105,8 @@ pub struct ToolCtx {
     pub session_id: String,
     /// The session's process manager (L5.11); bash hands timed-out commands to it.
     pub processes: Option<Arc<process::ProcessManager>>,
+    /// The model takes tool changes in-line (L4.8): found tools are called directly.
+    pub native_tools: bool,
 }
 
 impl ToolCtx {
@@ -210,6 +221,7 @@ pub(crate) mod testutil {
             files: Arc::new(FileState::default()),
             session_id: "test".into(),
             processes: None,
+            native_tools: false,
         }
     }
 
@@ -244,16 +256,18 @@ mod exposure_tests {
     fn settings_override_the_declared_exposure() {
         let names = |t: Vec<Arc<dyn Tool>>| t.iter().map(|t| t.name().to_string()).collect::<Vec<_>>();
         assert_eq!(
-            names(listed(builtins(false), |_| None)).len(),
+            names(exposed(builtins(false), |_| None).0).len(),
             7,
             "built-ins are listed by default"
         );
-        let got = names(listed(builtins(false), |n| match n {
+        let (listed, deferred) = exposed(builtins(false), |n| match n {
             "ls" => Some(Exposure::Hidden),
             "find" => Some(Exposure::CodemodeOnly),
+            "grep" => Some(Exposure::Deferred),
             _ => None,
-        }));
-        assert_eq!(got, ["read", "write", "edit", "bash", "grep"]);
+        });
+        assert_eq!(names(listed), ["read", "write", "edit", "bash"]);
+        assert_eq!(names(deferred), ["grep"]);
         let e: Exposure = serde_json::from_value(serde_json::json!("codemode-only")).unwrap();
         assert_eq!(e, Exposure::CodemodeOnly);
     }

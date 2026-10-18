@@ -94,6 +94,17 @@ pub struct Agent {
     pending_cp: Option<tokio::task::JoinHandle<crate::checkpoint::Snapshot>>,
     /// Long-running commands (L5.11); dropping the agent kills them.
     processes: Option<Arc<novacode_tools::process::ProcessManager>>,
+    /// Found through `tool_search`, never in the request (L5.17).
+    deferred: Vec<Arc<dyn Tool>>,
+}
+
+/// Where a model's tool call goes (L5.17).
+enum Resolved {
+    Listed(ToolCall),
+    /// Through `call`, or announced in-line.
+    Deferred(ToolCall),
+    /// Deferred and not found yet.
+    Locked(ToolCall),
 }
 
 struct Memory {
@@ -222,14 +233,7 @@ impl Agent {
         if store.last_thinking() != Some(cfg.thinking) {
             log_err(store.append(EntryKind::ThinkingChange { level: cfg.thinking }));
         }
-        let defs: Vec<ToolDef> = tools
-            .iter()
-            .map(|t| ToolDef {
-                name: t.name().into(),
-                description: t.description().into(),
-                schema: pipeline::schema(t.as_ref()),
-            })
-            .collect();
+        let defs: Vec<ToolDef> = tools.iter().map(|t| pipeline::def(t.as_ref())).collect();
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
         // Compacted after the last reply (e.g. at the end of a `-p` run): the next miss is expected.
@@ -283,6 +287,7 @@ impl Agent {
             compacted,
             checkpoints: None,
             processes: None,
+            deferred: Vec::new(),
             pending_cp: None,
         };
         agent.update_report();
@@ -387,6 +392,55 @@ impl Agent {
     }
 
     /// Take a file checkpoint at the start of every run (L4.15).
+    /// Tools found through `tool_search` and run directly (once announced) or via `call`.
+    pub fn with_deferred(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.deferred = tools;
+        self
+    }
+
+    /// Deferred tools announced in-line on this branch (L4.8).
+    fn activated(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        for m in self.store.projection() {
+            if let Message::Custom { kind, data } = &m
+                && kind == "tools_added"
+            {
+                v.extend(
+                    data["tools"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|t| t["name"].as_str().map(String::from)),
+                );
+            }
+        }
+        v
+    }
+
+    /// `call{name, arguments}` → the real call (same id), so the pipeline and
+    /// permissions see the actual tool. Deferred tools run only via `call` or once announced.
+    fn resolve_call(&self, c: ToolCall, activated: &[String]) -> Resolved {
+        if c.name == "call" && !self.deferred.is_empty() {
+            let name = c.arguments["name"].as_str().unwrap_or_default().to_string();
+            let arguments = c
+                .arguments
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            return Resolved::Deferred(ToolCall {
+                name,
+                arguments,
+                arguments_error: None,
+                ..c
+            });
+        }
+        match self.deferred.iter().any(|t| t.name() == c.name) {
+            false => Resolved::Listed(c),
+            true if activated.contains(&c.name) => Resolved::Deferred(c),
+            true => Resolved::Locked(c),
+        }
+    }
+
     /// Give bash and the `process` tool a process manager (L5.11).
     pub fn with_processes(mut self, pm: Arc<novacode_tools::process::ProcessManager>) -> Self {
         self.processes = Some(pm);
@@ -1068,11 +1122,27 @@ impl Agent {
     /// (or sequential if any tool asks), results appended in source order.
     /// Returns true when every call was rejected before running.
     async fn run_tools(&mut self, calls: Vec<ToolCall>, cancel: &CancellationToken) -> bool {
+        let activated = if self.deferred.is_empty() {
+            vec![]
+        } else {
+            self.activated()
+        };
+        let all: Vec<Arc<dyn Tool>> = self.tools.iter().chain(&self.deferred).cloned().collect();
         let mut prepared: Vec<(ToolCall, Prepared)> = calls
             .into_iter()
-            .map(|c| {
-                let p = pipeline::prepare(&self.tools, &c);
-                (c, p)
+            .map(|c| match self.resolve_call(c, &activated) {
+                Resolved::Deferred(c) => {
+                    let p = pipeline::prepare(&all, &c);
+                    (c, p)
+                }
+                Resolved::Listed(c) => {
+                    let p = pipeline::prepare(&self.tools, &c);
+                    (c, p)
+                }
+                Resolved::Locked(c) => {
+                    let msg = format!("`{}` isn't available yet: find it with tool_search first", c.name);
+                    (c, Prepared::Rejected(ToolOutput::error(msg)))
+                }
             })
             .collect();
         // Malformed calls count toward the cap (L3.4); permission refusals don't.
@@ -1103,6 +1173,7 @@ impl Agent {
             files: self.files.clone(),
             session_id: self.store.id().to_string(),
             processes: self.processes.clone(),
+            native_tools: self.adapter.native_tool_changes(&self.cfg.model),
         };
         let one = |call: &ToolCall, p: &Prepared| {
             let events = self.events.clone();
@@ -1157,7 +1228,13 @@ impl Agent {
         } else {
             futures_util::future::join_all(prepared.iter().map(|(c, p)| one(c, p))).await
         };
+        let mut found: Vec<String> = Vec::new();
         for (call, out) in results {
+            if call.name == "tool_search"
+                && let Some(names) = out.details.as_ref().and_then(|d| d["activate"].as_array())
+            {
+                found.extend(names.iter().filter_map(|n| n.as_str().map(String::from)));
+            }
             let new_cwd = out
                 .details
                 .as_ref()
@@ -1174,6 +1251,23 @@ impl Agent {
             self.add(EntryKind::Message { message });
             if let Some(dir) = new_cwd {
                 self.move_to(dir);
+            }
+        }
+        // Announce found tools in-line (L4.8): the request's tool list never changes.
+        if !found.is_empty() && self.adapter.native_tool_changes(&self.cfg.model) {
+            let defs: Vec<ToolDef> = self
+                .deferred
+                .iter()
+                .filter(|t| found.iter().any(|f| f == t.name()) && !activated.iter().any(|a| a == t.name()))
+                .map(|t| pipeline::def(t.as_ref()))
+                .collect();
+            if !defs.is_empty() {
+                self.add(EntryKind::Message {
+                    message: Message::Custom {
+                        kind: "tools_added".into(),
+                        data: serde_json::json!({ "tools": defs }),
+                    },
+                });
             }
         }
         all_rejected
