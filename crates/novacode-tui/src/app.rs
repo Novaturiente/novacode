@@ -97,6 +97,8 @@ pub enum Cmd {
     Compact,
     /// Write the session to a file; `true` = HTML (L4.14).
     Export(bool),
+    /// The terminal gained or lost focus (L11.9: notify only when unwatched).
+    Focus(bool),
     Quit,
 }
 
@@ -481,6 +483,8 @@ impl App {
             Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
             Event::Paste(s) if self.approvals.is_empty() && self.overlay.is_none() => self.editor.paste(&s),
             Event::Mouse(m) if self.overlay.is_none() => self.on_mouse(m),
+            Event::FocusGained => self.send(Cmd::Focus(true)),
+            Event::FocusLost => self.send(Cmd::Focus(false)),
             _ => {}
         }
     }

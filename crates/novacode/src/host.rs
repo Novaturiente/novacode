@@ -192,6 +192,7 @@ impl Host {
                 }
                 let _ = ui.send(UiEvent::Branch { action, items });
             }
+            Cmd::Focus(f) => self.hub.set_focus(f),
             Cmd::Quit => {}
         }
     }

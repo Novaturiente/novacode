@@ -624,6 +624,10 @@ pub fn summary(path: &Path) -> Option<Summary> {
 
 /// Find a session by id prefix: this cwd first, then every cwd.
 pub fn find(paths: &Paths, cwd: &Path, prefix: &str) -> Result<PathBuf, StoreError> {
+    // A session file path works too (tmux restore stores the file, L8.14).
+    if prefix.ends_with(".jsonl") && Path::new(prefix).is_file() {
+        return Ok(PathBuf::from(prefix));
+    }
     let hit = |dir: &Path| -> Option<PathBuf> {
         std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).find(|p| {
             p.extension().is_some_and(|x| x == "jsonl")

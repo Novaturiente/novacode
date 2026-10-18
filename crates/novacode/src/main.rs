@@ -25,6 +25,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
+mod activity;
 mod doctor;
 mod host;
 mod hub;
@@ -663,6 +664,8 @@ async fn print_mode(
         busy: false,
         price: None,
         spent: 0.0,
+        activity: Default::default(),
+        file: agent.store.path().map(|p| p.display().to_string()),
     };
     let (handle, task) = agent::spawn(agent);
     let mut events = handle.subscribe();
@@ -811,6 +814,7 @@ async fn start_session(
     local: Option<mpsc::UnboundedSender<UiEvent>>,
     undo: &Arc<std::sync::Mutex<Vec<String>>>,
     bg: bool,
+    sinks: activity::Sinks,
 ) -> anyhow::Result<(serve::Live, tokio::task::JoinHandle<Agent>)> {
     let slot = hub::HubSlot::default();
     let (agent, spec) = ctx.agent(store, model, Some(Arc::new(slot.clone()))).await?;
@@ -828,6 +832,8 @@ async fn start_session(
         busy: false,
         price,
         spent: models::spent(&ctx.providers, agent.store.entries()),
+        activity: Default::default(),
+        file: agent.store.path().map(|p| p.display().to_string()),
     };
     let history = agent.store.projection();
     let id = agent.store.id().to_string();
@@ -847,14 +853,24 @@ async fn start_session(
         limits: models::Limits::new(&ctx.settings),
         trace: ctx.trace(),
     });
-    let live = serve::go_live(&host, bg)?;
+    let mut live = serve::go_live(&host, bg)?;
+    live.add_task(activity::spawn(&host.hub, sinks));
     Ok((live, task))
 }
 
 /// `--bg` (the child) and `--rpc`: a session with no window of its own.
 async fn serve_headless(ctx: &Ctx, store: Store, model: String) -> anyhow::Result<ExitCode> {
     let undo = Arc::default();
-    let (live, task) = start_session(ctx, store, &model, None, &undo, !ctx.cli.rpc).await?;
+    let (live, task) = start_session(
+        ctx,
+        store,
+        &model,
+        None,
+        &undo,
+        !ctx.cli.rpc,
+        activity::Sinks::headless(&ctx.settings),
+    )
+    .await?;
     let host = live.host.clone();
     if ctx.cli.rpc {
         tokio::spawn(serve::serve(
@@ -880,7 +896,7 @@ async fn serve_headless(ctx: &Ctx, store: Store, model: String) -> anyhow::Resul
     });
     let agent = task.await?;
     drop(agent);
-    live.end("session ended");
+    live.end("session ended").await;
     // Let the last lines (and the bye) reach RPC clients.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     Ok(ExitCode::SUCCESS)
@@ -926,7 +942,16 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
         .flatten();
     loop {
         let (ui_tx, ui_rx) = mpsc::unbounded_channel();
-        let (live, task) = start_session(ctx, store, &model, Some(ui_tx.clone()), &undo, false).await?;
+        let (live, task) = start_session(
+            ctx,
+            store,
+            &model,
+            Some(ui_tx.clone()),
+            &undo,
+            false,
+            activity::Sinks::for_window(&ctx.settings),
+        )
+        .await?;
         let host = live.host.clone();
         let (handle, id) = (host.hub.handle.clone(), host.id.clone());
         let (etx, erx) = mpsc::unbounded_channel();
@@ -981,7 +1006,7 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
         handle.abort();
         handle.shutdown();
         let agent = task.await?;
-        live.end("the session's window closed");
+        live.end("the session's window closed").await;
         // /new and /resume keep the model; the level comes from the session (or settings).
         model = host.cur.lock().unwrap().0.clone();
         let prev = agent.store.path().map(Path::to_path_buf);

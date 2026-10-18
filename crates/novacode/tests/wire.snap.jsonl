@@ -1,4 +1,4 @@
-{"type":"hello","protocol":1,"version":"x","capabilities":["events","history","approvals","prompt","steer","models","thinking","compact","export"],"state":{"session":"01abc","cwd":"/w","model":"claude/claude-opus-5-5","level":"medium","window_tokens":200000,"busy":false,"spent":0.0}}
+{"type":"hello","protocol":1,"version":"x","capabilities":["events","history","approvals","prompt","steer","models","thinking","compact","export"],"state":{"session":"01abc","cwd":"/w","model":"claude/claude-opus-5-5","level":"medium","window_tokens":200000,"busy":false,"spent":0.0,"activity":{"state":"working","detail":"tool:bash"},"file":"/s/01abc.jsonl"}}
 {"type":"history","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}
 {"type":"event","event":{"type":"stream","stream":"delta","index":0,"text":"he"}}
 {"type":"event","event":{"type":"agent_end","stop":{"type":"stop"}}}
@@ -7,7 +7,7 @@
 {"type":"ui","ui":{"kind":"notice","text":"n","error":false}}
 {"type":"approve","id":3,"tool":"bash","detail":"rm -rf build","reason":"deletes files","rule":"Bash(rm:*)","risky":true}
 {"type":"approval_done","id":3}
-{"type":"state","state":{"session":"01abc","cwd":"/w","model":"claude/claude-opus-5-5","level":"medium","window_tokens":200000,"busy":false,"spent":0.0}}
+{"type":"state","state":{"session":"01abc","cwd":"/w","model":"claude/claude-opus-5-5","level":"medium","window_tokens":200000,"busy":false,"spent":0.0,"activity":{"state":"working","detail":"tool:bash"},"file":"/s/01abc.jsonl"}}
 {"type":"bye","reason":"session ended"}
 {"id":"1","type":"prompt","text":"fix it"}
 {"type":"steer","text":"also tests"}

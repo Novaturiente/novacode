@@ -11,6 +11,35 @@ use serde_json::Value;
 /// Bump on any breaking change to the messages below.
 pub const PROTOCOL: u32 = 1;
 
+/// What the session is doing (L8.14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActState {
+    Working,
+    /// Waiting on a person: a permission card (later also ask_user).
+    Blocked,
+    #[default]
+    Idle,
+}
+
+impl ActState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActState::Working => "working",
+            ActState::Blocked => "blocked",
+            ActState::Idle => "idle",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Activity {
+    pub state: ActState,
+    /// thinking, writing, tool:<name>, compacting, retrying, permission:<tool>…
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
 /// What every client is told about the session, at `hello` and on change.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct State {
@@ -28,6 +57,11 @@ pub struct State {
     /// USD spent so far on API-key routes.
     #[serde(default)]
     pub spent: f64,
+    #[serde(default)]
+    pub activity: Activity,
+    /// The session file; absent for `--no-session`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 /// Server → client.
@@ -186,6 +220,11 @@ mod tests {
             busy: false,
             price: None,
             spent: 0.0,
+            activity: Activity {
+                state: ActState::Working,
+                detail: "tool:bash".into(),
+            },
+            file: Some("/s/01abc.jsonl".into()),
         };
         let server = vec![
             ServerMsg::Hello {

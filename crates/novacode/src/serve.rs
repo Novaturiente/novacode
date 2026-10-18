@@ -158,10 +158,20 @@ pub struct Live {
 }
 
 impl Live {
-    pub fn end(self, reason: &str) {
+    pub fn add_task(&mut self, t: tokio::task::JoinHandle<()>) {
+        self.tasks.push(t);
+    }
+
+    /// Close the hub, then give the sinks a moment to clear tmux options.
+    pub async fn end(mut self, reason: &str) {
         self.host.hub.close(reason);
+        self.host.hub.changed.send_modify(|_| {});
+        let rest = self.tasks.split_off(2.min(self.tasks.len()));
         for t in &self.tasks {
             t.abort();
+        }
+        for t in rest {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), t).await;
         }
         let _ = std::fs::remove_file(&self.sock);
         let _ = std::fs::remove_file(&self.run);
@@ -429,7 +439,7 @@ pub async fn attach(paths: &Paths, prefix: &str, base: crate::TuiBase) -> anyhow
                 Cmd::Compact => ClientCmd::Compact,
                 Cmd::Export(html) => ClientCmd::Export { html },
                 // The session-swapping commands are refused by the attached TUI itself.
-                Cmd::ListSessions | Cmd::ListPrompts(_) => continue,
+                Cmd::ListSessions | Cmd::ListPrompts(_) | Cmd::Focus(_) => continue,
                 Cmd::Quit => break,
             };
             let id = matches!(cmd, ClientCmd::GetContext | ClientCmd::Export { .. }).then(|| "ui".to_string());

@@ -2,13 +2,13 @@
 //! client needs to catch up (messages, the in-flight partial, open approvals)
 //! and fans events out to every connected client in order.
 
-use crate::wire::{ServerMsg, State, capabilities};
+use crate::wire::{ActState, ServerMsg, State, capabilities};
 use futures_util::future::BoxFuture;
 use novacode_core::agent::SessionHandle;
 use novacode_core::policy::{Approval, ApprovalRequest, Approver};
 use novacode_tui::app::UiEvent;
 use novacode_tui::dialog::{Answer, ApproveReq};
-use novacode_types::{AgentEvent, Message};
+use novacode_types::{AgentEvent, BlockKind, Message, StreamEvent};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -41,6 +41,17 @@ pub struct Hub {
     next_approval: std::sync::atomic::AtomicU64,
     /// Fires after every state change (the run file and sinks follow it).
     pub changed: tokio::sync::watch::Sender<State>,
+    focused: std::sync::atomic::AtomicBool,
+}
+
+fn activity_state(busy: bool, blocked: bool) -> ActState {
+    if blocked {
+        ActState::Blocked
+    } else if busy {
+        ActState::Working
+    } else {
+        ActState::Idle
+    }
 }
 
 impl Hub {
@@ -66,6 +77,7 @@ impl Hub {
             handle,
             next_approval: 1.into(),
             changed: tokio::sync::watch::channel(state).0,
+            focused: true.into(),
         });
         let h = Arc::downgrade(&hub);
         tokio::spawn(async move {
@@ -87,11 +99,35 @@ impl Hub {
 
     fn on_event(&self, ev: AgentEvent) {
         let mut g = self.inner.lock().unwrap();
-        let busy = match &ev {
-            AgentEvent::AgentStart => Some(true),
-            AgentEvent::Settled => Some(false),
+        let before = (g.state.busy, g.state.activity.clone());
+        match &ev {
+            AgentEvent::AgentStart => g.state.busy = true,
+            AgentEvent::Settled => g.state.busy = false,
+            _ => {}
+        }
+        let detail = match &ev {
+            AgentEvent::AgentStart => Some("working".to_string()),
+            AgentEvent::TurnStart => Some("waiting for the model".into()),
+            AgentEvent::Stream(StreamEvent::BlockStart { kind, name, .. }) => Some(match kind {
+                BlockKind::Thinking => "thinking".into(),
+                BlockKind::ToolCall => format!("writing {} call", name.as_deref().unwrap_or("tool")),
+                _ => "writing".into(),
+            }),
+            AgentEvent::Stream(StreamEvent::Notice { text }) if text.starts_with("compacting") => {
+                Some("compacting".into())
+            }
+            AgentEvent::ToolStart { call } => Some(format!("tool:{}", call.name)),
+            AgentEvent::Retry { .. } => Some("retrying".into()),
             _ => None,
         };
+        if let Some(d) = detail {
+            g.state.activity.detail = d;
+        }
+        if matches!(ev, AgentEvent::Settled) {
+            g.state.activity.detail.clear();
+        }
+        let blocked = !g.approvals.is_empty();
+        g.state.activity.state = activity_state(g.state.busy, blocked);
         match &ev {
             AgentEvent::Message(m) => {
                 g.history.push(m.clone());
@@ -116,12 +152,41 @@ impl Hub {
         }
         let msg = ServerMsg::Event { event: ev };
         g.clients.retain(|_, tx| tx.send(msg.clone()).is_ok());
-        if let Some(b) = busy {
-            g.state.busy = b;
+        if (g.state.busy, g.state.activity.clone()) != before {
             let s = g.state.clone();
             drop(g);
             self.state_changed(s, false);
         }
+    }
+
+    fn set_blocked(&self) {
+        let s = {
+            let mut g = self.inner.lock().unwrap();
+            let blocked = g.approvals.values().next().map(|p| match &p.msg {
+                ServerMsg::Approve { tool, .. } => format!("permission:{tool}"),
+                _ => String::new(),
+            });
+            let state = activity_state(g.state.busy, blocked.is_some());
+            match blocked {
+                Some(d) => g.state.activity.detail = d,
+                None if g.state.activity.detail.starts_with("permission:") => {
+                    g.state.activity.detail = "working".into()
+                }
+                None => {}
+            }
+            g.state.activity.state = state;
+            g.state.clone()
+        };
+        self.state_changed(s, false);
+    }
+
+    /// The owner's terminal has focus (L11.9: notify only when nobody is looking).
+    pub fn set_focus(&self, focused: bool) {
+        self.focused.store(focused, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn focused(&self) -> bool {
+        self.focused.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A new client: what it needs to catch up, then its live feed.
@@ -166,6 +231,10 @@ impl Hub {
 
     pub fn disconnect(&self, id: u64) {
         self.inner.lock().unwrap().clients.remove(&id);
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.lock().unwrap().closed
     }
 
     pub fn state(&self) -> State {
@@ -246,6 +315,7 @@ impl Hub {
             }
             g.approvals.insert(id, Pending { msg, reply: tx });
         }
+        self.set_blocked();
         rx.await.unwrap_or(Answer::Deny(None))
     }
 
@@ -259,6 +329,8 @@ impl Hub {
         if let Some(l) = &g.local {
             let _ = l.send(UiEvent::ApprovalDone { id });
         }
+        drop(g);
+        self.set_blocked();
     }
 
     /// The session is over: tell every client and refuse open approvals.
