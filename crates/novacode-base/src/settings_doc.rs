@@ -162,6 +162,24 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "A subagent running this long is stopped.",
     ),
     (
+        "goal.audit",
+        "bool",
+        "true",
+        "`/goal` completion is checked by the `auditor` subagent before it counts.",
+    ),
+    (
+        "goal.auditModel",
+        "string",
+        "the session's model",
+        "Model of the goal auditor (`provider/model[:level]`).",
+    ),
+    (
+        "goal.maxRuns",
+        "number",
+        "30",
+        "Automatic continuations of a goal before it pauses (per start or `/goal resume`).",
+    ),
+    (
         "web.native",
         "bool",
         "false",

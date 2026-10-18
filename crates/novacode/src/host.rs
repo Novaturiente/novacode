@@ -32,6 +32,7 @@ pub struct Host {
     pub mcp: Option<Arc<novacode_core::mcp::Hub>>,
     pub extensions: Option<Arc<novacode_core::extensions::Extensions>>,
     pub modes: Option<Arc<novacode_core::modes::Modes>>,
+    pub goals: Option<Arc<crate::goals::Goals>>,
 }
 
 /// Mode commands (L10.7), handled here so they work in every window and over RPC.
@@ -42,6 +43,10 @@ pub const MODE_COMMANDS: &[(&str, &str)] = &[
         "plan mode on/off (read-only until a plan is approved); /plan <task> starts planning it",
     ),
     ("/mode", "switch mode preset: /mode <name>, /mode off, /mode lists them"),
+    (
+        "/goal",
+        "work until done: /goal <objective>; /goal shows it; pause, resume, clear, audit on|off",
+    ),
     (
         "/usage",
         "tokens and cost per route, cache warming, memory workers, subscription windows",
@@ -81,6 +86,36 @@ impl Host {
                     title: "Debug".into(),
                     text: self.debug_text(),
                 });
+            }
+            Cmd::Prompt(t) | Cmd::Steer(t) if t.split_whitespace().next() == Some("/goal") => {
+                let arg = t.trim().strip_prefix("/goal").unwrap_or("").trim().to_string();
+                let Some(g) = &self.goals else {
+                    let _ = ui.send(UiEvent::Notice {
+                        text: "goals need a window or RPC client (and not a subagent at max depth)".into(),
+                        error: true,
+                    });
+                    return;
+                };
+                match g.command(&arg) {
+                    Ok(text) if arg.is_empty() || arg == "status" => {
+                        let _ = ui.send(UiEvent::Page {
+                            title: "Goal".into(),
+                            text,
+                        });
+                    }
+                    Ok(text) => {
+                        let _ = ui.send(UiEvent::Notice { text, error: false });
+                    }
+                    // Not a subcommand: it's the objective.
+                    Err(_) if !matches!(arg.as_str(), "pause" | "resume" | "clear" | "audit on" | "audit off") => {
+                        // The how-to rides as a hidden reminder; the transcript shows the goal itself.
+                        self.hub.handle.remind_as("goal", crate::goals::draft_prompt(), false);
+                        Box::pin(self.handle(Cmd::Prompt(format!("Goal: {arg}")), ui, local)).await;
+                    }
+                    Err(e) => {
+                        let _ = ui.send(UiEvent::Notice { text: e, error: true });
+                    }
+                }
             }
             Cmd::Prompt(t) | Cmd::Steer(t) if is_mode_command(&t) => {
                 if let Some(task) = self.mode_command(&t, ui) {

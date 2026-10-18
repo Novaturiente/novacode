@@ -189,7 +189,11 @@ fn secs(d: Duration) -> String {
 impl Default for Panel {
     fn default() -> Self {
         let mut agent = Tab::new("agent", "Agent", 20);
-        for (id, title, order, newest) in [("todos", "Todos", 5.0, false), ("subagents", "Subagents", 10.0, true)] {
+        for (id, title, order, newest) in [
+            ("goal", "Goal", 1.0, false),
+            ("todos", "Todos", 5.0, false),
+            ("subagents", "Subagents", 10.0, true),
+        ] {
             let s = agent.source(id);
             s.title = Some(title.into());
             s.order = order;
@@ -1162,7 +1166,12 @@ mod tests {
             None,
         );
         let agent = p.tabs.iter().find(|t| t.name == "agent").unwrap();
-        assert_eq!(agent.sources[0].nodes[0].status.as_deref(), Some("running"));
+        assert_eq!(
+            agent.sources.iter().find(|s| s.id == "todos").unwrap().nodes[0]
+                .status
+                .as_deref(),
+            Some("running")
+        );
         p.tick();
         assert!(
             p.visible && p.shown.as_deref() == Some("agent"),

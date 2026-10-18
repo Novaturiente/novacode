@@ -841,6 +841,14 @@ pub fn summary(name: &str, args: &Value) -> String {
             }
             if p.is_empty() { "list".into() } else { p.join(" · ") }
         }
+        "goal" => {
+            let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("");
+            match s("action") {
+                "set" => format!("set \"{}\"", s("objective").lines().next().unwrap_or("")),
+                "block" => format!("block: {}", s("reason").lines().next().unwrap_or("")),
+                a => a.to_string(),
+            }
+        }
         "agent" if args.get("action").and_then(Value::as_str) == Some("spawn") => {
             let s = |k: &str| args.get(k).and_then(Value::as_str);
             format!(

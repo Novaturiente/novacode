@@ -107,6 +107,13 @@ fn builtins() -> Vec<Def> {
             None,
             "You are a reviewer. Read the change and the code it touches. Report findings ranked by severity, each with file:line and a one-line fix. Run only read-only commands (git diff, git log, tests). Never edit.",
         ),
+        def(
+            "auditor",
+            "Checks that a goal is really done (used by the goal tool); changes nothing.",
+            Some(&["read", "grep", "find", "ls", "bash"]),
+            None,
+            "You are a completion auditor. You get a goal, its completion criteria and the agent's evidence. Don't trust the evidence: check each criterion yourself in the workspace (read files, run the tests or commands that prove it; read-only commands only, never edit). Your first line must be exactly `VERDICT: approved` or `VERDICT: rejected`. Then one line per criterion: met or not met, with what you checked. If rejected, end with the concrete work still needed.",
+        ),
     ]
 }
 
@@ -505,6 +512,27 @@ impl Supervisor {
         drop(g);
         self.changed.notify_waiters();
         Some(r)
+    }
+
+    /// Run the `auditor` agent on `task` and return its whole report (the goal tool).
+    pub async fn audit(self: &Arc<Self>, task: String, title: String, model: Option<String>) -> Result<String, String> {
+        let id = self.spawn(SpawnArgs {
+            task,
+            title: Some(title),
+            agent: Some("auditor".into()),
+            model,
+            cwd: None,
+            after: Vec::new(),
+            notify: Notify_::Quiet,
+            worktree: false,
+        })?;
+        self.wait(vec![id.clone()], false, self.timeout).await;
+        let g = self.children.lock().unwrap();
+        let c = g.iter().find(|c| c.n == id).ok_or("the auditor vanished")?;
+        match (c.status, &c.report) {
+            (Status::Done, Some(r)) => Ok(r.clone()),
+            _ => Err(format!("the auditor didn't finish ({})", c.status.word())),
+        }
     }
 
     fn spawn(self: &Arc<Self>, a: SpawnArgs) -> Result<String, String> {

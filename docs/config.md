@@ -33,6 +33,9 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `memory.indexChars` | number | 2000 | Character cap of that index. |
 | `agents.stallMinutes` | number | 10 | A subagent silent this long is stopped. |
 | `agents.timeoutMinutes` | number | 45 | A subagent running this long is stopped. |
+| `goal.audit` | bool | true | `/goal` completion is checked by the `auditor` subagent before it counts. |
+| `goal.auditModel` | string | the session's model | Model of the goal auditor (`provider/model[:level]`). |
+| `goal.maxRuns` | number | 30 | Automatic continuations of a goal before it pauses (per start or `/goal resume`). |
 | `web.native` | bool | false | Use the model's own web search when it has one (L2.23). |
 | `web.searxngUrl` | string | unset | SearXNG instance for `web_search`, the last fallback. |
 | `debug.metrics` | bool | false | Per-session timing JSONL in `~/.novacode/metrics/` for `novacode stats`. |

@@ -29,6 +29,7 @@ mod activity;
 mod agents;
 mod diag;
 mod doctor;
+mod goals;
 mod host;
 mod hub;
 mod models;
@@ -674,6 +675,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         providers,
         cli,
         trusted,
+        goals: Default::default(),
     };
     let store = if let Some(prefix) = &ctx.cli.resume {
         Store::open(&session::find(&ctx.paths, &ctx.cwd, prefix)?)?
@@ -726,6 +728,8 @@ struct Ctx {
     cli: Cli,
     /// Project config loads (L6.3): gates project skills.
     trusted: bool,
+    /// The goals of the agent just built, for its Host (`agent()` returns only the agent).
+    goals: std::sync::Mutex<Option<Arc<goals::Goals>>>,
 }
 
 impl Ctx {
@@ -1011,6 +1015,16 @@ impl Ctx {
                 exe: None,
                 nerd: s.get::<String>("ui.icons").as_deref() != Some("unicode"),
             });
+            // Goals (/goal): audited by the `auditor` subagent.
+            let g = goals::Goals::new(
+                self.paths.home().join("goals").join(format!("{}.json", store.id())),
+                Some(sup.clone()),
+                s.get("goal.maxRuns").unwrap_or(30),
+                s.get("goal.audit").unwrap_or(true),
+                s.get("goal.auditModel"),
+            );
+            all.push(Arc::new(goals::GoalTool(g.clone())));
+            *self.goals.lock().unwrap() = Some(g);
             all.push(Arc::new(agents::AgentTool::new(sup)));
         }
         // Mode presets and plan mode (L10.7).
@@ -1509,6 +1523,7 @@ async fn start_session(
     let mcp = agent.mcp().cloned();
     let extensions = agent.extensions().cloned();
     let modes = agent.modes().cloned();
+    let goals = ctx.goals.lock().unwrap().take();
     let (handle, task) = agent::spawn(agent);
     let hub = hub::Hub::start(handle, history, state, local);
     if let Some(e) = &extensions {
@@ -1530,8 +1545,12 @@ async fn start_session(
         mcp,
         extensions,
         modes,
+        goals: goals.clone(),
     });
     let mut live = serve::go_live(&host, bg)?;
+    if let Some(g) = goals {
+        live.add_task(g.watch(host.hub.handle.clone()));
+    }
     live.add_task(activity::spawn(&host.hub, sinks));
     live.add_task(quota_task(host.clone()));
     if let Some(m) = host.mcp.clone() {
