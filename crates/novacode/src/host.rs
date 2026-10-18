@@ -30,6 +30,7 @@ pub struct Host {
     pub trace: Option<Trace>,
     pub processes: Option<Arc<novacode_tools::process::ProcessManager>>,
     pub mcp: Option<Arc<novacode_core::mcp::Hub>>,
+    pub extensions: Option<Arc<novacode_core::extensions::Extensions>>,
 }
 
 impl Host {
@@ -39,6 +40,7 @@ impl Host {
         let steer = matches!(c, Cmd::Steer(_));
         match c {
             Cmd::Prompt(t) | Cmd::Steer(t) if t.starts_with('!') => self.user_shell(&t, ui).await,
+            Cmd::Prompt(t) | Cmd::Steer(t) if t.starts_with('/') && self.ext_command(&t, ui).await => {}
             Cmd::Prompt(t) | Cmd::Steer(t) => {
                 let (blocks, notes) = attach(t, self.cwd.clone(), &self.inputs).await;
                 for n in notes {
@@ -282,6 +284,21 @@ impl Host {
         }))
     }
 
+    /// `/name args` owned by a script extension: run it and show what it returns.
+    pub async fn ext_command(&self, text: &str, ui: &UnboundedSender<UiEvent>) -> bool {
+        let Some(exts) = &self.extensions else { return false };
+        let Some(r) = exts.command(text).await else {
+            return false;
+        };
+        let (text, error) = match r {
+            Ok(t) if t.is_empty() => return true,
+            Ok(t) => (t, false),
+            Err(e) => (e, true),
+        };
+        let _ = ui.send(UiEvent::Notice { text, error });
+        true
+    }
+
     /// Every slash command: built-ins, then templates and skills (L8.9).
     pub fn commands(&self) -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = novacode_tui::app::COMMANDS
@@ -289,6 +306,7 @@ impl Host {
             .map(|(c, d)| (c.to_string(), d.to_string()))
             .collect();
         v.extend(self.inputs.commands().0);
+        v.extend(self.extensions.iter().flat_map(|e| e.commands()));
         v
     }
 

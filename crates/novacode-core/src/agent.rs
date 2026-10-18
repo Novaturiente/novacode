@@ -102,6 +102,8 @@ pub struct Agent {
     mcp: Option<Arc<crate::mcp::Hub>>,
     /// before/after tool handlers (L7.1, L7.3).
     hooks: Arc<crate::hooks::Hooks>,
+    /// Script extensions (L7.2): commands for the host.
+    extensions: Option<Arc<crate::extensions::Extensions>>,
 }
 
 /// Where a model's tool call goes (L5.17).
@@ -297,6 +299,7 @@ impl Agent {
             scripted: Vec::new(),
             mcp: None,
             hooks: Arc::default(),
+            extensions: None,
             pending_cp: None,
         };
         agent.update_report();
@@ -802,6 +805,18 @@ impl Agent {
     pub fn with_mcp(mut self, hub: Arc<crate::mcp::Hub>) -> Self {
         self.mcp = Some(hub);
         self
+    }
+
+    /// Script extensions: notices go to this session; `on(event)` handlers follow it.
+    pub fn with_extensions(mut self, exts: Arc<crate::extensions::Extensions>) -> Self {
+        exts.attach(self.events.clone());
+        exts.spawn_events(self.events.subscribe());
+        self.extensions = Some(exts);
+        self
+    }
+
+    pub fn extensions(&self) -> Option<&Arc<crate::extensions::Extensions>> {
+        self.extensions.as_ref()
     }
 
     /// The session's events, before it is spawned (hook observers).

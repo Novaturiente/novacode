@@ -747,6 +747,22 @@ impl Ctx {
                 file: file.to_path_buf(),
             }));
         }
+        // Script extensions (L7.2): project ones only when trusted; the project wins a name clash.
+        let mut ext_dirs = Vec::new();
+        if self.trusted {
+            ext_dirs.push(self.cwd.join(".novacode").join("extensions"));
+        }
+        ext_dirs.push(self.paths.home().join("extensions"));
+        let exts = novacode_core::extensions::Extensions::load(
+            &ext_dirs,
+            &self.cwd,
+            &std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default(),
+            &self.paths.home().join("cache").join("extensions"),
+        )
+        .await;
+        all.extend(exts.tools());
         let (servers, mcp_warnings) = novacode_core::mcp::load(self.paths.home(), &self.cwd, self.trusted);
         let described: Vec<(String, String)> = servers
             .iter()
@@ -785,9 +801,10 @@ impl Ctx {
         if let Some(h) = mcp {
             agent = agent.with_mcp(h);
         }
-        // Command hooks (L7.1); off inside a hook's own novacode (recursion guard).
-        let hook_cfg: novacode_core::hooks::Config = s.get("hooks").unwrap_or_default();
+        // Command hooks (L7.1), then extension handlers; none inside a hook's own novacode (recursion guard).
+        let mut handlers: Vec<Arc<dyn novacode_core::hooks::Handler>> = Vec::new();
         if !novacode_core::hooks::disabled() {
+            let hook_cfg: novacode_core::hooks::Config = s.get("hooks").unwrap_or_default();
             let cmds = Arc::new(novacode_core::hooks::Commands {
                 config: hook_cfg,
                 cwd: self.cwd.clone(),
@@ -795,8 +812,15 @@ impl Ctx {
             });
             novacode_core::hooks::spawn_observers(cmds.clone(), agent.subscribe());
             if !cmds.config.before_tool.is_empty() || !cmds.config.after_tool.is_empty() {
-                agent = agent.with_hooks(Arc::new(novacode_core::hooks::Hooks { handlers: vec![cmds] }));
+                handlers.push(cmds);
             }
+        }
+        if !exts.is_empty() || !exts.failed.is_empty() {
+            handlers.push(exts.clone());
+            agent = agent.with_extensions(exts);
+        }
+        if !handlers.is_empty() {
+            agent = agent.with_hooks(Arc::new(novacode_core::hooks::Hooks { handlers }));
         }
         if s.get("checkpoints.enabled").unwrap_or(true)
             && agent.store.path().is_some()
@@ -1079,6 +1103,7 @@ async fn start_session(
     let level = state.level;
     let processes = agent.processes().cloned();
     let mcp = agent.mcp().cloned();
+    let extensions = agent.extensions().cloned();
     let (handle, task) = agent::spawn(agent);
     let hub = hub::Hub::start(handle, history, state, local);
     let _ = slot.0.set(Arc::downgrade(&hub));
@@ -1095,6 +1120,7 @@ async fn start_session(
         trace: ctx.trace(),
         processes,
         mcp,
+        extensions,
     });
     let mut live = serve::go_live(&host, bg)?;
     live.add_task(activity::spawn(&host.hub, sinks));
@@ -1272,7 +1298,8 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
                 h.handle(c, &ui_tx, true).await;
             }
         });
-        let (commands, warn) = ctx.inputs().commands();
+        let (mut commands, warn) = ctx.inputs().commands();
+        commands.extend(host.extensions.iter().flat_map(|e| e.commands()));
         notices.extend(warn);
         let base = tui_base(&ctx.paths, &ctx.settings);
         notices.extend(base.notices);
