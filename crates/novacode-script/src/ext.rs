@@ -112,6 +112,36 @@ const PRELUDE: &str = r#"
 })
 "#;
 
+/// Anything that registered tools/commands/handlers and runs them by id: a
+/// script extension here, a process extension in the core (L7.2 tier 2).
+pub trait Backend: Send + Sync {
+    fn name(&self) -> &str;
+    fn reg(&self) -> &Registration;
+    fn invoke<'a>(
+        &'a self,
+        handler: u32,
+        payload: &'a Value,
+        timeout: Duration,
+    ) -> BoxFuture<'a, Result<Value, Failure>>;
+}
+
+impl Backend for Extension {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn reg(&self) -> &Registration {
+        &self.reg
+    }
+    fn invoke<'a>(
+        &'a self,
+        handler: u32,
+        payload: &'a Value,
+        timeout: Duration,
+    ) -> BoxFuture<'a, Result<Value, Failure>> {
+        Box::pin(Extension::invoke(self, handler, payload, timeout))
+    }
+}
+
 impl Extension {
     /// Load `js` (already TypeScript-stripped, an ES module) and run its setup.
     pub async fn load(

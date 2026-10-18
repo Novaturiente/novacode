@@ -66,6 +66,10 @@ where
             }
         }
     });
+    let link = Arc::new(ClientLink {
+        tx: tx.clone(),
+        pending: Default::default(),
+    });
     let mut lines = BufReader::new(r).lines();
     while let Ok(Some(l)) = lines.next_line().await {
         if l.trim().is_empty() {
@@ -86,7 +90,38 @@ where
         };
         let command = req.cmd.name().to_string();
         let shutdown = matches!(req.cmd, ClientCmd::Shutdown);
-        let res = dispatch(&host, req.cmd, &ui_tx).await;
+        let res = match req.cmd {
+            ClientCmd::RegisterTools { tools } => {
+                let n = tools.len();
+                let tools: Vec<Arc<dyn novacode_tools::Tool>> = tools
+                    .into_iter()
+                    .map(|def| {
+                        Arc::new(ClientTool {
+                            def,
+                            link: link.clone(),
+                        }) as Arc<dyn novacode_tools::Tool>
+                    })
+                    .collect();
+                hub.handle.add_tools(tools);
+                Ok(json!({ "registered": n }))
+            }
+            ClientCmd::ToolResult {
+                call,
+                content,
+                is_error,
+            } => match link.pending.lock().unwrap().remove(&call) {
+                Some(done) => {
+                    let _ = done.send(if is_error {
+                        novacode_tools::ToolOutput::error(content)
+                    } else {
+                        novacode_tools::ToolOutput::text(content)
+                    });
+                    Ok(Value::Null)
+                }
+                None => Err(format!("no tool call {call} is waiting")),
+            },
+            cmd => dispatch(&host, cmd, &ui_tx).await,
+        };
         if req.id.is_some() || res.is_err() {
             let (ok, data, error) = match res {
                 Ok(d) => (true, d, None),
@@ -104,6 +139,8 @@ where
             break;
         }
     }
+    // Calls waiting on this client fail now (their senders drop).
+    link.pending.lock().unwrap().clear();
     if eof_ends_session {
         hub.handle.shutdown();
     } else {
@@ -111,6 +148,61 @@ where
     }
     drop((tx, ui_tx));
     let _ = writer.await;
+}
+
+/// One connected client that runs tools for the session (L7.8).
+struct ClientLink {
+    tx: mpsc::UnboundedSender<ServerMsg>,
+    pending: std::sync::Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<novacode_tools::ToolOutput>>>,
+}
+
+static CALL_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+struct ClientTool {
+    def: crate::wire::ClientToolDef,
+    link: Arc<ClientLink>,
+}
+
+impl novacode_tools::Tool for ClientTool {
+    fn name(&self) -> &str {
+        &self.def.name
+    }
+    fn description(&self) -> &str {
+        &self.def.description
+    }
+    fn schema(&self) -> Value {
+        if self.def.parameters.is_object() {
+            self.def.parameters.clone()
+        } else {
+            json!({ "type": "object", "properties": {} })
+        }
+    }
+    fn execute<'a>(
+        &'a self,
+        args: Value,
+        ctx: &'a novacode_tools::ToolCtx,
+    ) -> futures_util::future::BoxFuture<'a, novacode_tools::ToolOutput> {
+        Box::pin(async move {
+            let id = CALL_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (done, rx) = tokio::sync::oneshot::channel();
+            self.link.pending.lock().unwrap().insert(id, done);
+            let msg = ServerMsg::ToolCall {
+                id,
+                name: self.def.name.clone(),
+                args,
+            };
+            if self.link.tx.send(msg).is_err() {
+                return novacode_tools::ToolOutput::error("the client that runs this tool has disconnected");
+            }
+            tokio::select! {
+                r = rx => r.unwrap_or_else(|_| novacode_tools::ToolOutput::error("the client that runs this tool has disconnected")),
+                _ = ctx.cancel.cancelled() => {
+                    self.link.pending.lock().unwrap().remove(&id);
+                    novacode_tools::ToolOutput::error("cancelled")
+                }
+            }
+        })
+    }
 }
 
 async fn dispatch(host: &Arc<Host>, cmd: ClientCmd, ui: &mpsc::UnboundedSender<UiEvent>) -> Result<Value, String> {
@@ -165,6 +257,8 @@ async fn dispatch(host: &Arc<Host>, cmd: ClientCmd, ui: &mpsc::UnboundedSender<U
             hub.handle.shutdown();
             Ok(Value::Null)
         }
+        // Handled in `serve`, which owns the client link.
+        ClientCmd::RegisterTools { .. } | ClientCmd::ToolResult { .. } => Err("not available here".into()),
     }
 }
 
@@ -462,7 +556,7 @@ pub async fn attach(paths: &Paths, prefix: &str, base: crate::TuiBase) -> anyhow
                     *bye_seen.lock().unwrap() = Some(reason);
                     break;
                 }
-                ServerMsg::Hello { .. } | ServerMsg::History { .. } => {}
+                ServerMsg::Hello { .. } | ServerMsg::History { .. } | ServerMsg::ToolCall { .. } => {}
             }
         }
     });

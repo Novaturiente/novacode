@@ -4,7 +4,7 @@
 
 use crate::hooks::{Gate, Handler};
 use futures_util::future::BoxFuture;
-use novacode_script::ext::{ExtHost, Extension, Failure};
+use novacode_script::ext::{Backend, ExtHost, Extension, Failure};
 use novacode_tools::{Exposure, Tool, ToolCtx, ToolOutput};
 use novacode_types::{AgentEvent, Block, StreamEvent};
 use serde_json::{Value, json};
@@ -174,7 +174,7 @@ impl ExtHost for Host {
 
 /// One loaded extension plus its health.
 pub struct Loaded {
-    pub ext: Arc<Extension>,
+    pub ext: Arc<dyn Backend>,
     pub path: PathBuf,
     off: AtomicBool,
     throws: AtomicU32,
@@ -190,9 +190,34 @@ pub struct Extensions {
 
 impl Extensions {
     pub async fn load(dirs: &[PathBuf], cwd: &Path, home: &Path, cache: &Path) -> Arc<Extensions> {
+        Self::load_all(dirs, &[], cwd, home, cache, "", Path::new("")).await
+    }
+
+    /// Script extensions from `dirs`, then process extensions (`(name, config)`, L7.2 tier 2).
+    pub async fn load_all(
+        dirs: &[PathBuf],
+        procs: &[(String, crate::process_ext::Config)],
+        cwd: &Path,
+        home: &Path,
+        cache: &Path,
+        session: &str,
+        log_dir: &Path,
+    ) -> Arc<Extensions> {
         let events: Arc<OnceLock<broadcast::Sender<AgentEvent>>> = Arc::default();
         let mut loaded = Vec::new();
         let mut failed = Vec::new();
+        for (name, c) in procs {
+            let log = log_dir.join(format!("ext-{name}.log"));
+            match crate::process_ext::ProcessExt::start(name, c, cwd, session, &log, events.clone()).await {
+                Ok(ext) => loaded.push(Arc::new(Loaded {
+                    ext: ext as Arc<dyn Backend>,
+                    path: PathBuf::from(&c.command),
+                    off: AtomicBool::new(false),
+                    throws: AtomicU32::new(0),
+                })),
+                Err(e) => failed.push((name.clone(), e)),
+            }
+        }
         for (name, path) in discover(dirs) {
             let src = match std::fs::read_to_string(&path) {
                 Ok(s) => s,
@@ -235,7 +260,7 @@ impl Extensions {
     /// Run one handler, turning crashes into a disabled extension and a notice.
     async fn invoke(&self, l: &Loaded, handler: u32, payload: &Value, timeout: Duration) -> Result<Value, String> {
         if l.off.load(Ordering::Relaxed) {
-            return Err(format!("extension `{}` is disabled", l.ext.name));
+            return Err(format!("extension `{}` is disabled", l.ext.name()));
         }
         match l.ext.invoke(handler, payload, timeout).await {
             Ok(v) => {
@@ -259,7 +284,7 @@ impl Extensions {
         if !l.off.swap(true, Ordering::Relaxed) {
             notice(
                 &self.events,
-                format!("extension `{}` disabled: {why} (fix it and /reload)", l.ext.name),
+                format!("extension `{}` disabled: {why} (fix it and /reload)", l.ext.name()),
             );
         }
     }
@@ -267,7 +292,7 @@ impl Extensions {
     pub fn tools(self: &Arc<Self>) -> Vec<Arc<dyn Tool>> {
         let mut out: Vec<Arc<dyn Tool>> = Vec::new();
         for l in &self.loaded {
-            for t in &l.ext.reg.tools {
+            for t in &l.ext.reg().tools {
                 let exposure = t
                     .exposure
                     .as_ref()
@@ -290,7 +315,7 @@ impl Extensions {
             .iter()
             .flat_map(|l| {
                 l.ext
-                    .reg
+                    .reg()
                     .commands
                     .iter()
                     .map(|c| (format!("/{}", c.name), c.description.clone()))
@@ -307,7 +332,7 @@ impl Extensions {
         let (l, c) = self
             .loaded
             .iter()
-            .find_map(|l| l.ext.reg.commands.iter().find(|c| c.name == name).map(|c| (l, c)))?;
+            .find_map(|l| l.ext.reg().commands.iter().find(|c| c.name == name).map(|c| (l, c)))?;
         Some(
             self.invoke(l, c.handler, &json!(args), TOOL_TIMEOUT)
                 .await
@@ -322,7 +347,7 @@ impl Extensions {
     fn handlers<'a>(&'a self, event: &'a str) -> impl Iterator<Item = (&'a Arc<Loaded>, u32)> + 'a {
         self.loaded.iter().flat_map(move |l| {
             l.ext
-                .reg
+                .reg()
                 .events
                 .iter()
                 .filter(move |(e, _)| e == event)
@@ -336,7 +361,7 @@ impl Extensions {
         let wanted: Vec<String> = me
             .loaded
             .iter()
-            .flat_map(|l| l.ext.reg.events.iter().map(|(e, _)| e.clone()))
+            .flat_map(|l| l.ext.reg().events.iter().map(|(e, _)| e.clone()))
             .collect();
         if wanted.iter().all(|e| e == "before_tool" || e == "after_tool") {
             return;
@@ -375,7 +400,7 @@ impl Handler for Extensions {
                     continue;
                 };
                 if let Some(why) = r["block"].as_str() {
-                    return Gate::Block(format!("{} ({})", why, l.ext.name));
+                    return Gate::Block(format!("{} ({})", why, l.ext.name()));
                 }
                 if r["args"].is_object() {
                     args = r["args"].clone();
@@ -513,9 +538,9 @@ mod tests {
         let boom = tools.iter().find(|t| t.name() == "boom").unwrap();
         let exts2 = exts.clone();
         let out = tokio::time::timeout(Duration::from_secs(20), async {
-            let l = exts2.loaded.iter().find(|l| l.ext.name == "multi").unwrap();
+            let l = exts2.loaded.iter().find(|l| l.ext.name() == "multi").unwrap();
             exts2
-                .invoke(l, l.ext.reg.tools[0].handler, &json!({}), Duration::from_millis(300))
+                .invoke(l, l.ext.reg().tools[0].handler, &json!({}), Duration::from_millis(300))
                 .await
         })
         .await

@@ -152,6 +152,8 @@ struct Shared {
     /// Route to switch to at the start of the next run.
     next_model: Mutex<Option<Switch>>,
     next_thinking: Mutex<Option<ThinkingLevel>>,
+    /// Tools a client registered (L7.8), added at the start of the next run.
+    new_tools: Mutex<Vec<Arc<dyn Tool>>>,
     /// What the context holds, refreshed after each run (for `/context`).
     report: Mutex<ContextReport>,
     /// The last request that touched the cache, for the miss detector and the warmer (L2.17).
@@ -905,6 +907,15 @@ impl Agent {
             self.cfg.thinking = level;
             self.add(EntryKind::ThinkingChange { level });
         }
+        let added: Vec<Arc<dyn Tool>> = std::mem::take(&mut *self.shared.new_tools.lock().unwrap());
+        if !added.is_empty() {
+            // Same name = the client's newer definition. The tool list changes: one cache miss mid-session.
+            for t in added {
+                self.tools.retain(|x| x.name() != t.name());
+                self.tools.push(t);
+            }
+            self.defs = self.tools.iter().map(|t| pipeline::def(t.as_ref())).collect();
+        }
         refresh_prompt(&mut self.store, &self.cfg.prompt);
         self.store_warm_usage();
         self.set_busy(true);
@@ -1465,6 +1476,10 @@ impl SessionHandle {
     /// Switch model (any provider) from the next run on.
     pub fn set_model(&self, switch: Switch) {
         *self.shared.next_model.lock().unwrap() = Some(switch);
+    }
+    /// Tools run by an RPC client (L7.8), declared to the model from the next run on.
+    pub fn add_tools(&self, tools: Vec<Arc<dyn Tool>>) {
+        self.shared.new_tools.lock().unwrap().extend(tools);
     }
     /// Thinking level from the next run on (L2.16).
     pub fn set_thinking(&self, level: ThinkingLevel) {

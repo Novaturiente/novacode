@@ -181,6 +181,8 @@ pub enum ServerMsg {
     AskDone { id: u64 },
     /// The session's state changed (model, level, busy…).
     State { state: State },
+    /// Run a client-registered tool (L7.8); answer with `tool_result`.
+    ToolCall { id: u64, name: String, args: Value },
     /// The server is closing this connection.
     Bye { reason: String },
 }
@@ -242,8 +244,29 @@ pub enum ClientCmd {
         approval: u64,
         answer: Answer,
     },
+    /// Tools this client runs (L7.8): the model sees them from the next run;
+    /// calls arrive as `tool_call` and are answered with `tool_result`.
+    RegisterTools {
+        tools: Vec<ClientToolDef>,
+    },
+    /// Answer `tool_call` `call`.
+    ToolResult {
+        call: u64,
+        content: String,
+        #[serde(default)]
+        is_error: bool,
+    },
     /// End the session (a `--bg` one included).
     Shutdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClientToolDef {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub parameters: Value,
 }
 
 impl ClientCmd {
@@ -264,6 +287,8 @@ impl ClientCmd {
             ClientCmd::Approval { .. } => "approval",
             ClientCmd::Answer { .. } => "answer",
             ClientCmd::Shutdown => "shutdown",
+            ClientCmd::RegisterTools { .. } => "register_tools",
+            ClientCmd::ToolResult { .. } => "tool_result",
         }
     }
 }

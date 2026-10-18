@@ -163,6 +163,18 @@ enum Command {
         #[arg(long)]
         turns: bool,
     },
+    /// Install a package (extensions/, skills/, prompts/) from a git URL or a local folder (linked) (L7.7).
+    Install {
+        source: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Remove an installed package.
+    Uninstall { name: String },
+    /// `git pull` installed packages (all, or one).
+    Update { name: Option<String> },
+    /// List installed packages.
+    Packages,
     /// MCP servers: list (connects to each), add, remove (L7.4).
     Mcp {
         #[command(subcommand)]
@@ -414,6 +426,48 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             return models::command(&Arc::new(Providers::load(paths.home(), &settings)), filter, all).await;
         }
         Some(Command::Mcp { what }) => return mcp_command(&paths, what).await,
+        Some(Command::Install { source, name }) => {
+            let n =
+                novacode_core::packages::install(paths.home(), &source, name.as_deref()).map_err(anyhow::Error::msg)?;
+            eprintln!("installed `{n}`; new sessions load its extensions, skills and prompts");
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Command::Uninstall { name }) => {
+            novacode_core::packages::uninstall(paths.home(), &name).map_err(anyhow::Error::msg)?;
+            eprintln!("removed `{name}`");
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Command::Update { name }) => {
+            let mut bad = false;
+            for (n, r) in novacode_core::packages::update(paths.home(), name.as_deref()) {
+                match r {
+                    Ok(()) => eprintln!("{n}: up to date"),
+                    Err(e) => {
+                        bad = true;
+                        eprintln!("{n}: {e}");
+                    }
+                }
+            }
+            return Ok(if bad { ExitCode::from(1) } else { ExitCode::SUCCESS });
+        }
+        Some(Command::Packages) => {
+            let l = novacode_core::packages::list(paths.home());
+            if l.is_empty() {
+                println!("no packages (install one with `novacode install <git url | folder>`)");
+            }
+            for p in l {
+                let what: Vec<&str> = ["extensions", "skills", "prompts"]
+                    .into_iter()
+                    .filter(|d| p.dir.join(d).is_dir())
+                    .collect();
+                let src = p
+                    .link
+                    .map(|l| format!("→ {}", l.display()))
+                    .unwrap_or_else(|| "git".into());
+                println!("{}  [{}]  {src}", p.name, what.join(", "));
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
         Some(Command::Trust { path, revoke }) => {
             let dir = std::fs::canonicalize(path.unwrap_or(std::env::current_dir()?))?;
             let trust = TrustStore::new(paths.home().join("trust.json"));
@@ -575,15 +629,26 @@ impl Ctx {
         if let Some(h) = std::env::var_os("HOME") {
             d.push(Path::new(&h).join(".agents/skills"));
         }
+        d.extend(
+            novacode_core::packages::list(self.paths.home())
+                .into_iter()
+                .map(|p| p.dir.join("skills")),
+        );
         d
     }
 
     /// Prompt-template folders, project first (L4.11).
     fn template_dirs(&self) -> Vec<std::path::PathBuf> {
-        vec![
+        let mut d = vec![
             Paths::project_dir(&self.cwd).join("prompts"),
             self.paths.home().join("prompts"),
-        ]
+        ];
+        d.extend(
+            novacode_core::packages::list(self.paths.home())
+                .into_iter()
+                .map(|p| p.dir.join("prompts")),
+        );
+        d
     }
 
     fn inputs(&self) -> Inputs {
@@ -753,13 +818,24 @@ impl Ctx {
             ext_dirs.push(self.cwd.join(".novacode").join("extensions"));
         }
         ext_dirs.push(self.paths.home().join("extensions"));
-        let exts = novacode_core::extensions::Extensions::load(
+        for p in novacode_core::packages::list(self.paths.home()) {
+            ext_dirs.push(p.dir.join("extensions"));
+        }
+        let procs: Vec<(String, novacode_core::process_ext::Config)> = s
+            .get::<std::collections::BTreeMap<String, novacode_core::process_ext::Config>>("processExtensions")
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let exts = novacode_core::extensions::Extensions::load_all(
             &ext_dirs,
+            &procs,
             &self.cwd,
             &std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_default(),
             &self.paths.home().join("cache").join("extensions"),
+            store.id(),
+            &self.paths.home().join("logs"),
         )
         .await;
         all.extend(exts.tools());
