@@ -70,14 +70,6 @@ impl Tab {
         self.sources.last_mut().unwrap()
     }
 
-    /// Something in it is still going (keeps the panel up).
-    fn active(&self) -> bool {
-        self.sources
-            .iter()
-            .flat_map(|s| &s.nodes)
-            .any(|n| matches!(n.status.as_deref(), Some("running" | "starting" | "waiting")))
-    }
-
     fn empty(&self) -> bool {
         self.region.is_none() && self.sources.iter().all(|s| s.nodes.is_empty())
     }
@@ -554,14 +546,24 @@ impl Panel {
             .collect();
     }
 
-    /// Auto show/hide (L9.16): up while something is going, down 5 s after it all stops.
-    pub fn tick(&mut self, busy: bool) {
+    /// Auto show/hide (L9.16): only the Agent tab opens the panel by itself, while
+    /// a todo or subagent is unfinished; it closes 5 s after they all finish.
+    /// Every other tab is opened by hand (Ctrl+Alt+P).
+    pub fn tick(&mut self) {
         if let Some(p) = self.pinned {
             self.visible = p;
             return;
         }
-        let active = busy && self.tabs.iter().any(|t| !t.empty()) || self.tabs.iter().any(Tab::active);
-        if active {
+        let pending = self.tabs.iter().find(|t| t.name == "agent").is_some_and(|t| {
+            t.sources
+                .iter()
+                .flat_map(|s| &s.nodes)
+                .any(|n| !matches!(n.status.as_deref(), Some("done" | "stopped" | "failed")))
+        });
+        if pending {
+            if !self.visible {
+                self.shown = Some("agent".into());
+            }
             self.idle_since = None;
             self.visible = true;
         } else if self.visible {
@@ -834,8 +836,8 @@ mod tests {
         p.apply("x", &op(json!({"op": "publish", "tab": "deploy", "source": "s", "node": {"id": "a", "label": "build", "status": "running"}})));
         p.apply("x", &op(json!({"op": "publish", "tab": "deploy", "source": "s", "node": {"id": "b", "parent": "a", "label": "step", "actions": {"r": "retry", "l": "/ps"}}})));
         assert_eq!(p.shown.as_deref(), Some("deploy"), "higher priority takes the slot");
-        p.tick(false);
-        assert!(p.visible, "a running node keeps it up");
+        p.tick();
+        assert!(!p.visible, "extension tabs never open the panel by themselves");
         let rows: Vec<(String, usize)> = p.rows().iter().map(|(n, d, _)| (n.id.clone(), *d)).collect();
         assert_eq!(rows, vec![("a".to_string(), 0), ("b".to_string(), 1)]);
         p.focused = true;
@@ -864,6 +866,27 @@ mod tests {
         );
         let agent = p.tabs.iter().find(|t| t.name == "agent").unwrap();
         assert_eq!(agent.sources[0].nodes[0].status.as_deref(), Some("running"));
+        p.tick();
+        assert!(
+            p.visible && p.shown.as_deref() == Some("agent"),
+            "an open todo opens the Agent tab"
+        );
+        p.on_agent(
+            &AgentEvent::Message(Message::ToolResult {
+                call_id: "c2".into(),
+                tool_name: "todo".into(),
+                content: vec![],
+                is_error: false,
+                details: Some(json!({"todo": [{"id": 1, "text": "build", "status": "done"}]})),
+            }),
+            100_000,
+            None,
+        );
+        p.tick();
+        p.focused = false; // a focused panel stays up
+        p.idle_since = Some(Instant::now() - HIDE_AFTER);
+        p.tick();
+        assert!(!p.visible, "closes once every todo is done");
         p.apply("x", &op(json!({"op": "close_tab", "name": "deploy"})));
         assert_eq!(
             p.shown.as_deref(),

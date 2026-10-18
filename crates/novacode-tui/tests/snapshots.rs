@@ -2,6 +2,7 @@
 //! render to a test backend, compare with `tests/snapshots/*.txt`.
 //! `UPDATE_SNAPSHOTS=1 cargo test -p novacode-tui` rewrites them.
 
+use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use novacode_tui::dialog::{Answer, ApproveReq, PickItem};
 use novacode_tui::{App, Cmd, Exit, Init, UiEvent};
@@ -699,19 +700,45 @@ fn images_draw_in_reserved_rows() {
         "a placeholder without a protocol: {before}"
     );
     a.set_images(novacode_tui::images::Images::halfblocks());
-    let mut t = Terminal::new(TestBackend::new(60, 14)).unwrap();
-    t.draw(|f| a.draw(f)).unwrap();
-    let buf = t.backend().buffer();
-    let text: String = (0..14)
-        .map(|y| (0..60).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>() + "\n")
-        .collect();
+    let draw = |a: &mut App| {
+        let mut t = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        t.draw(|f| a.draw(f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let text: Vec<String> = (0..14)
+            .map(|y| (0..60).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+        let painted = (0..14)
+            .flat_map(|y| (0..60).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].bg != ratatui::style::Color::Reset)
+            .count();
+        (text, painted)
+    };
+    let (text, painted) = draw(&mut a);
+    let row = text.iter().position(|l| l.contains("▸ image 80×40 · click to show"));
+    assert!(row.is_some() && painted < 10, "folded by default: {text:#?}");
+    let click = |a: &mut App, row: usize| {
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            a.on_event(Event::Mouse(MouseEvent {
+                kind,
+                column: 3,
+                row: row as u16,
+                modifiers: KeyModifiers::NONE,
+            }));
+        }
+    };
+    click(&mut a, row.unwrap());
+    let (text, painted) = draw(&mut a);
     assert!(
-        !text.contains("[image") && !text.contains("×40"),
-        "the image covers its placeholder: {text}"
+        painted >= 10,
+        "a click shows it, drawn with half-blocks ({painted}): {text:#?}"
     );
-    let painted = (0..14)
-        .flat_map(|y| (0..60).map(move |x| (x, y)))
-        .filter(|&(x, y)| buf[(x, y)].bg != ratatui::style::Color::Reset)
-        .count();
-    assert!(painted >= 10, "half-block cells carry the image colours ({painted})");
+    let row = text
+        .iter()
+        .position(|l| l.contains("▾ image 80×40"))
+        .expect("the fold line stays");
+    click(&mut a, row);
+    assert!(draw(&mut a).1 < 10, "a second click folds it");
 }

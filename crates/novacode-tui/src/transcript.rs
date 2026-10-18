@@ -52,6 +52,8 @@ pub struct Img {
     pub data: std::sync::Arc<String>,
     pub w: u32,
     pub h: u32,
+    /// Shown at size; folded to one line by default (click toggles).
+    pub open: bool,
 }
 
 impl Img {
@@ -65,6 +67,7 @@ impl Img {
             data: std::sync::Arc::new(data.to_string()),
             w,
             h,
+            open: false,
         }
     }
 
@@ -77,28 +80,27 @@ impl Img {
         }
     }
 
-    /// Rows it takes at `width` columns (cells are about twice as tall as wide).
-    pub fn rows(&self, width: usize, enabled: bool) -> usize {
-        if !enabled || self.w == 0 || self.h == 0 {
-            return 1;
+    /// Rows at full size within `width` columns, at most `max` (cells are about twice as tall as wide).
+    pub fn rows(&self, width: usize, max: usize) -> usize {
+        if self.w == 0 || self.h == 0 {
+            return max.min(8);
         }
-        let cols = (self.w as usize / 8).clamp(1, width.max(1));
-        (self.h as usize * cols / self.w as usize / 2).clamp(2, IMAGE_ROWS)
+        let cols = self.cols(width);
+        (self.h as usize * cols / self.w as usize / 2).clamp(1, max.max(1))
     }
 }
 
 /// The most rows a tool's own `details.ui` lines take.
 const TOOL_UI_ROWS: usize = 12;
 
-/// The tallest an image gets in the transcript.
-pub const IMAGE_ROWS: usize = 16;
-
 struct Layout {
     width: usize,
     expanded: bool,
     lines: Vec<Line<'static>>,
-    /// (line inside the turn, image) for images drawn over their reserved rows.
-    images: Vec<(usize, Img)>,
+    /// (first reserved line inside the turn, rows, image) for open images.
+    images: Vec<(usize, usize, Img)>,
+    /// (line inside the turn, item index) of image fold lines.
+    image_toggles: Vec<(usize, usize)>,
     /// Line offsets (inside this turn) that toggle collapse on click.
     toggles: Vec<usize>,
 }
@@ -134,8 +136,9 @@ pub struct Transcript {
     pub thinking_hint: String,
     /// Stream pacer (L9.7): bytes of each live block shown so far.
     pub(crate) live_shown: Vec<usize>,
-    /// The terminal can draw images: reserve rows for them (L9.14).
-    pub images: bool,
+    /// Tallest an open image may be, in rows (the transcript height); 0 = this
+    /// terminal draws no images (L9.14).
+    pub image_rows: usize,
 }
 
 /// How thinking blocks show (L9.7, setting `ui.thinking`).
@@ -167,6 +170,8 @@ pub struct View {
     pub toggles: Vec<(usize, usize)>,
     /// (first line, rows, image) to draw over the text.
     pub images: Vec<(usize, usize, Img)>,
+    /// (line, turn, item) of image fold lines a click toggles.
+    pub image_toggles: Vec<(usize, usize, usize)>,
 }
 
 impl Transcript {
@@ -215,6 +220,16 @@ impl Transcript {
         self.expand_all = !self.expand_all;
         for t in self.turns.iter_mut().filter(|t| t.done) {
             t.expanded = self.expand_all;
+            t.touch();
+        }
+    }
+
+    /// Show or fold one image.
+    pub fn toggle_image(&mut self, turn: usize, item: usize) {
+        if let Some(t) = self.turns.get_mut(turn) {
+            if let Some(Item::Image(img)) = t.items.get_mut(item) {
+                img.open = !img.open;
+            }
             t.touch();
         }
     }
@@ -447,8 +462,9 @@ impl Transcript {
             starts: Vec::new(),
             toggles: Vec::new(),
             images: Vec::new(),
+            image_toggles: Vec::new(),
         };
-        let images = self.images;
+        let images = self.image_rows;
         let last = self.turns.len().saturating_sub(1);
         for (i, turn) in self.turns.iter_mut().enumerate() {
             let fresh = turn
@@ -464,11 +480,11 @@ impl Transcript {
             }
             v.starts.push(v.lines.len());
             v.toggles.extend(c.toggles.iter().map(|o| (v.lines.len() + o, i)));
-            v.images.extend(
-                c.images
-                    .iter()
-                    .map(|(o, img)| (v.lines.len() + o, img.rows(width, images), img.clone())),
-            );
+            let at = v.lines.len();
+            v.images
+                .extend(c.images.iter().map(|(o, r, img)| (at + o, *r, img.clone())));
+            v.image_toggles
+                .extend(c.image_toggles.iter().map(|(o, item)| (at + o, i, *item)));
             v.lines.extend(c.lines.iter().cloned());
             if i == last
                 && let Some(live) = &live
@@ -504,10 +520,11 @@ fn images_of(content: &[Block]) -> impl Iterator<Item = Item> + '_ {
     })
 }
 
-fn lay_turn(turn: &Turn, width: usize, t: &Theme, thinking: Thinking, hint: &str, images: bool) -> Layout {
+fn lay_turn(turn: &Turn, width: usize, t: &Theme, thinking: Thinking, hint: &str, image_rows: usize) -> Layout {
     let mut lines = Vec::new();
     let mut toggles = Vec::new();
     let mut imgs = Vec::new();
+    let mut image_toggles = Vec::new();
     let collapsed = turn.collapsed();
     let (n, errors) = turn.tool_count();
     // In a collapsed turn only the prompt, the fold line and the final reply show.
@@ -558,16 +575,28 @@ fn lay_turn(turn: &Turn, width: usize, t: &Theme, thinking: Thinking, hint: &str
             }
             Item::Tool(tool) => lines.extend(lay_tool(tool, width, t)),
             Item::Image(img) => {
-                // A placeholder line, then blank rows the image is drawn over.
-                let label = if img.w > 0 {
-                    format!("[image {}×{}]", img.w, img.h)
+                let size = if img.w > 0 {
+                    format!(" {}×{}", img.w, img.h)
                 } else {
-                    "[image]".into()
+                    String::new()
                 };
-                imgs.push((lines.len(), img.clone()));
-                lines.push(Line::styled(label, t.dim));
-                for _ in 1..img.rows(width, images) {
-                    lines.push(Line::default());
+                if image_rows == 0 {
+                    // This terminal draws no images: a plain reference.
+                    lines.push(Line::styled(format!("[image{size}]"), t.dim));
+                } else {
+                    // A fold line; when open, blank rows below it the image is drawn over.
+                    image_toggles.push((lines.len(), idx));
+                    let label = if img.open {
+                        format!("▾ image{size}")
+                    } else {
+                        format!("▸ image{size} · click to show")
+                    };
+                    lines.push(Line::styled(label, t.toggle));
+                    if img.open {
+                        let rows = img.rows(width, image_rows);
+                        imgs.push((lines.len(), rows, img.clone()));
+                        lines.extend(std::iter::repeat_n(Line::default(), rows));
+                    }
                 }
             }
             Item::Notice { text, error } => {
@@ -597,6 +626,7 @@ fn lay_turn(turn: &Turn, width: usize, t: &Theme, thinking: Thinking, hint: &str
         lines,
         toggles,
         images: imgs,
+        image_toggles,
     }
 }
 

@@ -677,7 +677,7 @@ impl App {
     #[cfg(feature = "images")]
     pub fn set_images(&mut self, i: crate::images::Images) {
         self.images = Some(i);
-        self.tr.images = true;
+        self.tr.image_rows = 16;
         for t in &mut self.tr.turns {
             t.touch();
         }
@@ -694,7 +694,7 @@ impl App {
     /// Advance timers: the panel's auto show/hide. Returns true when something changed.
     pub fn tick(&mut self) -> bool {
         let before = self.panel.visible;
-        self.panel.tick(self.busy);
+        self.panel.tick();
         before != self.panel.visible || (self.panel.visible && self.busy)
     }
 
@@ -1282,7 +1282,14 @@ impl App {
                             let p = wrap::plain(l);
                             p.starts_with("∴ ")
                         });
-                    if let Some(t) = toggle {
+                    let image = self
+                        .shown
+                        .as_ref()
+                        .and_then(|s| s.view.image_toggles.iter().find(|(l, _, _)| *l == a.line))
+                        .map(|(_, t, i)| (*t, *i));
+                    if let Some((t, i)) = image {
+                        self.tr.toggle_image(t, i);
+                    } else if let Some(t) = toggle {
                         self.tr.toggle(t);
                     } else if thought {
                         // A click on a thinking line shows or folds thinking, like Ctrl+T.
@@ -1504,6 +1511,14 @@ impl App {
     }
 
     fn draw_transcript(&mut self, f: &mut Frame, area: Rect) {
+        // An open image fits the transcript height, so it can always be seen whole.
+        let fit = (area.height as usize).saturating_sub(2).max(2);
+        if self.tr.image_rows != 0 && self.tr.image_rows != fit {
+            self.tr.image_rows = fit;
+            for t in &mut self.tr.turns {
+                t.touch();
+            }
+        }
         let view = self.tr.layout(area.width as usize, &self.theme);
         let h = area.height as usize;
         let max_top = view.lines.len().saturating_sub(h);
@@ -1524,7 +1539,7 @@ impl App {
         #[cfg(feature = "images")]
         if let Some(imgs) = self.images.as_mut() {
             for (line, rows, img) in &view.images {
-                if *rows > 1 && *line >= top && line + rows <= top + h {
+                if *line >= top && line + rows <= top + h {
                     let r = Rect {
                         x: area.x,
                         y: area.y + (line - top) as u16,
