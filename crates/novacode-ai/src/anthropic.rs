@@ -10,6 +10,7 @@ use crate::trace::Trace;
 use crate::transform::{self, Target};
 use novacode_types::{Block, BlockKind, ErrorKind, Message, StopReason, StreamEvent, ThinkingLevel, Usage};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -47,6 +48,8 @@ pub enum Auth {
         access_token: String,
         profile: OAuthProfile,
     },
+    /// A plain bearer token for an Anthropic-compatible gateway (GitHub Copilot).
+    Bearer(String),
 }
 
 pub struct Anthropic {
@@ -56,6 +59,7 @@ pub struct Anthropic {
     trace: Option<Trace>,
     /// Replay namespace: `anthropic` for Claude (key or subscription), the vendor id otherwise.
     provider: String,
+    headers: BTreeMap<String, String>,
 }
 
 impl Anthropic {
@@ -66,7 +70,19 @@ impl Anthropic {
             auth,
             trace,
             provider: PROVIDER.into(),
+            headers: BTreeMap::new(),
         }
+    }
+
+    pub fn with_headers(mut self, h: BTreeMap<String, String>) -> Self {
+        self.headers = h;
+        self
+    }
+
+    /// Share a connection pool (one per provider, not one per request).
+    pub fn with_http(mut self, c: reqwest::Client) -> Self {
+        self.http = c;
+        self
     }
 
     /// An Anthropic-compatible vendor (e.g. MiniMax): its own replay namespace.
@@ -115,7 +131,7 @@ impl Anthropic {
         let r = r.header("anthropic-version", API_VERSION);
         let mut betas: Vec<&str> = match &self.auth {
             Auth::OAuth { profile, .. } => profile.betas.split(',').collect(),
-            Auth::ApiKey(_) => Vec::new(),
+            Auth::ApiKey(_) | Auth::Bearer(_) => Vec::new(),
         };
         betas.extend(extra_betas);
         let r = if betas.is_empty() {
@@ -123,13 +139,18 @@ impl Anthropic {
         } else {
             r.header("anthropic-beta", betas.join(","))
         };
-        match &self.auth {
+        let mut r = match &self.auth {
             Auth::ApiKey(k) => r.header("x-api-key", k),
+            Auth::Bearer(t) => r.bearer_auth(t),
             Auth::OAuth { access_token, profile } => r
                 .bearer_auth(access_token)
                 .header("user-agent", &profile.user_agent)
                 .header("x-app", "cli"),
+        };
+        for (k, v) in &self.headers {
+            r = r.header(k, v);
         }
+        r
     }
 
     fn http_request(&self, body: &[u8], extra_betas: &[&str]) -> reqwest::RequestBuilder {
@@ -148,7 +169,7 @@ impl Adapter for Anthropic {
     fn stream(&self, req: Request, cancel: CancellationToken) -> mpsc::Receiver<StreamEvent> {
         let oauth_profile = match &self.auth {
             Auth::OAuth { profile, .. } => Some(profile.clone()),
-            Auth::ApiKey(_) => None,
+            Auth::ApiKey(_) | Auth::Bearer(_) => None,
         };
         let body = serde_json::to_vec(&build_body(&req, oauth_profile.as_ref(), &self.provider)).unwrap_or_default();
         let effort = in_conversation_effort(&req.model, req.thinking);

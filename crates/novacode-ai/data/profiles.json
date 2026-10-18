@@ -97,6 +97,13 @@
    "reasoningEffort": false
   }
  },
+ "copilot": {
+  "name": "GitHub Copilot",
+  "api": "copilot",
+  "auth": "oauth",
+  "baseUrl": "https://api.individual.githubcopilot.com",
+  "catalog": "github-copilot"
+ },
  "deepinfra": {
   "name": "Deep Infra",
   "api": "openai-chat",

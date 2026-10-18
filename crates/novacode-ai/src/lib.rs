@@ -5,6 +5,7 @@ pub mod anthropic;
 pub mod auth;
 pub mod catalog;
 pub mod connect;
+pub mod copilot;
 pub mod faux;
 pub mod gemini;
 pub mod http;

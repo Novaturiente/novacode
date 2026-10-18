@@ -210,6 +210,10 @@ impl Providers {
                 };
                 Arc::new(gemini::Gemini::new(&p.id, &p.base_url, auth, trace))
             }
+            Api::Copilot => {
+                let token = self.auth.access_token(&p.id, DEFAULT_ACCOUNT).await?;
+                Arc::new(crate::copilot::Copilot::new(token, trace))
+            }
         };
         Ok((adapter, key))
     }

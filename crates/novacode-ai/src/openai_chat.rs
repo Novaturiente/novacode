@@ -75,6 +75,12 @@ impl OpenAiChat {
         self
     }
 
+    /// Share a connection pool (one per provider, not one per request).
+    pub fn with_http(mut self, c: reqwest::Client) -> Self {
+        self.http = c;
+        self
+    }
+
     fn authed(&self, mut r: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Some(k) = &self.key {
             r = r.bearer_auth(k);

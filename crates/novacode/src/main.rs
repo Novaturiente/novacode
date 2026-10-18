@@ -4,7 +4,7 @@ use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use futures_util::future::BoxFuture;
 use novacode_ai::adapter::CacheRetention;
-use novacode_ai::auth::{self, AuthStore, DEFAULT_ACCOUNT, antigravity, claude, codex};
+use novacode_ai::auth::{self, AuthStore, DEFAULT_ACCOUNT, antigravity, claude, codex, copilot};
 use novacode_ai::connect::Providers;
 use novacode_ai::trace::Trace;
 use novacode_base::redact::Redactor;
@@ -66,7 +66,7 @@ struct Cli {
 
 #[derive(Subcommand, Clone)]
 enum Command {
-    /// Log in to a subscription provider (claude, codex, antigravity).
+    /// Log in to a subscription provider (claude, codex, antigravity, copilot).
     Login { provider: String },
     /// Remove a stored login.
     Logout { provider: String },
@@ -787,7 +787,22 @@ async fn login(store: &AuthStore, provider: &str) -> anyhow::Result<ExitCode> {
             }
             antigravity::exchange(&code, &verifier).await?
         }
-        _ => bail!("unknown login provider `{provider}` (logins: claude, codex, antigravity)"),
+        copilot::PROVIDER => {
+            let d = copilot::start().await?;
+            eprintln!(
+                "Open {} and enter the code\n\n    {}\n\nWaiting for you to approve (Ctrl+C to cancel)…",
+                copilot::VERIFY_URL,
+                d.user_code
+            );
+            open(copilot::VERIFY_URL);
+            let c = copilot::finish(&d).await?;
+            let on = copilot::enable_models(&c.access).await;
+            if !on.is_empty() {
+                eprintln!("enabled models: {}", on.join(", "));
+            }
+            c
+        }
+        _ => bail!("unknown login provider `{provider}` (logins: claude, codex, antigravity, copilot)"),
     };
     store.put(provider, DEFAULT_ACCOUNT, cred).await?;
     eprintln!("logged in to {provider}");

@@ -157,6 +157,7 @@ impl AuthStore {
         let mut fresh = match provider {
             codex::PROVIDER => codex::refresh(&cred.refresh).await?,
             antigravity::PROVIDER => antigravity::refresh(&cred.refresh).await?,
+            copilot::PROVIDER => copilot::exchange(&cred.refresh).await?,
             _ => claude::refresh(&cred.refresh).await?,
         };
         if fresh.refresh.is_empty() {
@@ -575,8 +576,189 @@ pub mod antigravity {
     }
 }
 
+/// GitHub Copilot: GitHub device login, then the GitHub token (kept as the
+/// refresh token) is exchanged for a short-lived Copilot token (the access token).
+pub mod copilot {
+    use super::*;
+
+    pub const PROVIDER: &str = "copilot";
+    // The VS Code Copilot client id (public).
+    const CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
+    pub const VERIFY_URL: &str = "https://github.com/login/device";
+    pub const DEFAULT_BASE: &str = "https://api.individual.githubcopilot.com";
+    /// Headers every Copilot request carries; the backend checks them.
+    pub const HEADERS: &[(&str, &str)] = &[
+        ("user-agent", "GitHubCopilotChat/0.35.0"),
+        ("editor-version", "vscode/1.107.0"),
+        ("editor-plugin-version", "copilot-chat/0.35.0"),
+        ("copilot-integration-id", "vscode-chat"),
+    ];
+
+    pub struct Device {
+        code: String,
+        pub user_code: String,
+        interval: u64,
+    }
+
+    fn req(r: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        HEADERS
+            .iter()
+            .fold(r, |r, (k, v)| r.header(*k, *v))
+            .header("accept", "application/json")
+            .timeout(Duration::from_secs(30))
+    }
+
+    async fn form(url: &str, form: &[(&str, &str)]) -> Result<serde_json::Value, AuthError> {
+        let body: Vec<String> = form.iter().map(|(k, v)| format!("{k}={}", claude::encode(v))).collect();
+        let resp = req(reqwest::Client::new().post(url))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(body.join("&"))
+            .send()
+            .await
+            .map_err(|e| AuthError::Http(e.to_string()))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(AuthError::Http(format!("{url} returned {status}: {text}")));
+        }
+        serde_json::from_str(&text).map_err(|e| AuthError::Http(format!("bad response: {e}")))
+    }
+
+    pub async fn start() -> Result<Device, AuthError> {
+        let v = form(
+            "https://github.com/login/device/code",
+            &[("client_id", CLIENT_ID), ("scope", "read:user")],
+        )
+        .await?;
+        Ok(Device {
+            code: v["device_code"].as_str().unwrap_or_default().into(),
+            user_code: v["user_code"].as_str().unwrap_or_default().into(),
+            interval: v["interval"].as_u64().unwrap_or(5),
+        })
+    }
+
+    /// Poll until the user approves (15 min max), then get the Copilot token.
+    pub async fn finish(d: &Device) -> Result<OAuthCredential, AuthError> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15 * 60);
+        let mut wait = Duration::from_secs(d.interval.max(1));
+        let github = loop {
+            tokio::time::sleep(wait).await;
+            if std::time::Instant::now() > deadline {
+                return Err(AuthError::Http("login timed out".into()));
+            }
+            let v = form(
+                "https://github.com/login/oauth/access_token",
+                &[
+                    ("client_id", CLIENT_ID),
+                    ("device_code", &d.code),
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ],
+            )
+            .await?;
+            if let Some(t) = v["access_token"].as_str() {
+                break t.to_string();
+            }
+            match v["error"].as_str().unwrap_or_default() {
+                "authorization_pending" => {}
+                "slow_down" => wait = Duration::from_secs(v["interval"].as_u64().unwrap_or(wait.as_secs() + 5)),
+                e => {
+                    return Err(AuthError::Http(format!(
+                        "device login failed: {e} {}",
+                        v["error_description"]
+                    )));
+                }
+            }
+        };
+        exchange(&github).await
+    }
+
+    /// GitHub token → Copilot token. Also the refresh step.
+    pub async fn exchange(github: &str) -> Result<OAuthCredential, AuthError> {
+        let resp = req(reqwest::Client::new().get("https://api.github.com/copilot_internal/v2/token"))
+            .bearer_auth(github)
+            .send()
+            .await
+            .map_err(|e| AuthError::Http(e.to_string()))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(AuthError::Http(format!(
+                "Copilot token request returned {status} (is Copilot enabled for this GitHub account?): {text}"
+            )));
+        }
+        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| AuthError::Http(e.to_string()))?;
+        let (Some(token), Some(exp)) = (v["token"].as_str(), v["expires_at"].as_u64()) else {
+            return Err(AuthError::Http("bad Copilot token response".into()));
+        };
+        Ok(OAuthCredential {
+            access: token.into(),
+            refresh: github.into(),
+            expires_ms: (exp * 1000).saturating_sub(5 * 60 * 1000),
+            project: None,
+        })
+    }
+
+    /// The API host the token is for: `proxy-ep=proxy.X` → `https://api.X`.
+    pub fn base_url(token: &str) -> String {
+        token
+            .split(';')
+            .find_map(|kv| kv.strip_prefix("proxy-ep="))
+            .map(|h| {
+                format!(
+                    "https://{}",
+                    h.strip_prefix("proxy.").map(|r| format!("api.{r}")).unwrap_or(h.into())
+                )
+            })
+            .unwrap_or_else(|| DEFAULT_BASE.into())
+    }
+
+    /// Switch on models whose policy is still unconfigured (some, like Claude,
+    /// need it before first use). Best effort; returns the ids enabled.
+    pub async fn enable_models(token: &str) -> Vec<String> {
+        let base = base_url(token);
+        let Ok(resp) = req(reqwest::Client::new().get(format!("{base}/models")))
+            .bearer_auth(token)
+            .send()
+            .await
+        else {
+            return Vec::new();
+        };
+        let v: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap_or_default()).unwrap_or_default();
+        let mut done = Vec::new();
+        for m in v["data"].as_array().into_iter().flatten() {
+            let Some(id) = m["id"].as_str() else { continue };
+            if m["policy"]["state"] != "unconfigured" {
+                continue;
+            }
+            let ok = req(reqwest::Client::new().post(format!("{base}/models/{id}/policy")))
+                .bearer_auth(token)
+                .header("content-type", "application/json")
+                .header("openai-intent", "chat-policy")
+                .header("x-interaction-type", "chat-policy")
+                .body(r#"{"state":"enabled"}"#)
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success());
+            if ok {
+                done.push(id.to_string());
+            }
+        }
+        done
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn copilot_base_url_from_token() {
+        use super::copilot::base_url;
+        assert_eq!(
+            base_url("tid=1;exp=2;proxy-ep=proxy.business.githubcopilot.com;st=x"),
+            "https://api.business.githubcopilot.com"
+        );
+        assert_eq!(base_url("tid=1"), super::copilot::DEFAULT_BASE);
+    }
+
     use super::*;
 
     #[test]

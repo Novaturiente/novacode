@@ -30,6 +30,9 @@ pub enum Api {
     OpenAiResponses,
     #[serde(rename = "gemini")]
     Gemini,
+    /// GitHub Copilot: picks one of the three wires per model.
+    #[serde(rename = "copilot")]
+    Copilot,
 }
 
 /// A provider profile: mostly data (L2.1). Bundled ones can be changed and new
