@@ -50,6 +50,8 @@ pub struct Config {
     pub prompt: crate::prompt::Sources,
     /// Keep the prompt cache warm while it pays off (L2.17, setting `cache.warm`, off by default).
     pub warm: bool,
+    /// Record dev metrics to `<home>/metrics/<session>.jsonl` (L11.11, setting `debug.metrics`).
+    pub metrics: bool,
 }
 
 /// A model change, possibly to another provider (L2.11): everything that
@@ -848,6 +850,22 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
         events: agent.events.clone(),
         session_id: agent.store.id().into(),
     };
+    if agent.cfg.metrics {
+        let id = agent.store.id().to_string();
+        let header = crate::metrics::Record::Session {
+            ts: crate::session::now_ms(),
+            session: id.clone(),
+            cwd: agent.cfg.cwd.display().to_string(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            window: agent.cfg.window_tokens,
+        };
+        tokio::spawn(crate::metrics::record(
+            agent.events.subscribe(),
+            crate::metrics::path(&agent.cfg.prompt.home, &id),
+            header,
+            agent.cfg.redactor.clone(),
+        ));
+    }
     if agent.cfg.warm {
         tokio::spawn(warmer(agent.shared.clone(), agent.events.clone()));
     }

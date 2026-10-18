@@ -56,6 +56,7 @@ fn cfg(cwd: &Path, home: &Path) -> Config {
             tool_guidelines: vec![],
         },
         warm: false,
+        metrics: false,
     }
 }
 
@@ -554,4 +555,101 @@ async fn cache_miss_is_named_and_logged() {
     );
     let log = std::fs::read_to_string(home.path().join("logs/cache-misses.jsonl")).unwrap();
     assert!(log.contains("\"lost\":20070"), "{log}");
+}
+
+/// L11.11 check: a session with a known slow tool writes model, tool and task
+/// records whose timings, tokens and cache hits add up.
+#[tokio::test]
+async fn metrics_record_calls_tools_and_tasks() {
+    use novacode_core::metrics::{Record, load, path};
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let usage = |read, write| novacode_types::Usage {
+        input: 100,
+        output: 10,
+        cache_read: read,
+        cache_write: write,
+        ..Default::default()
+    };
+    let faux = Faux::new([
+        FauxReply::Message {
+            blocks: vec![call("c1", "bash", json!({"command": "sleep 0.3; echo done"}))],
+            stop: StopReason::ToolUse,
+            usage: usage(0, 900),
+        },
+        FauxReply::Message {
+            blocks: vec![Block::text("finished")],
+            stop: StopReason::Stop,
+            usage: usage(900, 50),
+        },
+    ]);
+    let store = Store::create(&Paths::new(home.path()), work.path(), false);
+    let id = store.id().to_string();
+    let mut c = cfg(work.path(), home.path());
+    c.metrics = true;
+    let agent = Agent::new(
+        Arc::new(faux),
+        novacode_tools::builtins(false),
+        store,
+        c,
+        Arc::new(LocalEnv),
+    );
+    let (_agent, _) = drive(agent, &["run the slow thing"]).await;
+    let file = path(home.path(), &id);
+    let mut recs = Vec::new();
+    for _ in 0..100 {
+        recs = load(&file);
+        if recs.iter().any(|r| matches!(r, Record::Task { .. })) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(matches!(&recs[0], Record::Session { session, .. } if *session == id));
+    let models: Vec<_> = recs.iter().filter(|r| matches!(r, Record::Model { .. })).collect();
+    assert_eq!(models.len(), 2);
+    let Record::Model {
+        hit_pct,
+        ctx_tokens,
+        turn,
+        ..
+    } = models[1]
+    else {
+        panic!()
+    };
+    assert_eq!((*hit_pct, *ctx_tokens, *turn), (85.7, 1060, 2));
+    let tool = recs.iter().find(|r| matches!(r, Record::Tool { .. })).unwrap();
+    let Record::Tool {
+        name,
+        duration_ms,
+        out_preview,
+        args_preview,
+        is_error,
+        ..
+    } = tool
+    else {
+        panic!()
+    };
+    assert_eq!((name.as_str(), *is_error), ("bash", false));
+    assert!(*duration_ms >= 300, "{duration_ms}");
+    assert!(
+        args_preview.contains("sleep 0.3") && out_preview.contains("done"),
+        "{tool:?}"
+    );
+    let task = recs.last().unwrap();
+    let Record::Task {
+        wall_ms,
+        tools_ms,
+        turns,
+        tool_calls,
+        usage,
+        prompt_preview,
+        stop,
+        ..
+    } = task
+    else {
+        panic!("{task:?}")
+    };
+    assert!(*tools_ms >= 300 && wall_ms >= tools_ms, "{task:?}");
+    assert_eq!((*turns, *tool_calls, usage.cache_read, usage.input), (2, 1, 900, 200));
+    assert_eq!((prompt_preview.as_str(), stop.as_str()), ("run the slow thing", "stop"));
 }

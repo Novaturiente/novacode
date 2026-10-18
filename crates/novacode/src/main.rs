@@ -28,6 +28,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 mod doctor;
 mod models;
+mod stats;
 
 #[derive(Parser, Clone)]
 #[command(name = "novacode", version, about = "An agent harness")]
@@ -109,6 +110,12 @@ enum Command {
     },
     /// Check every connected provider, settings and key bindings.
     Doctor,
+    /// Dev metrics report (needs `debug.metrics`): the latest session, one by id prefix, or --all.
+    Stats {
+        session: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
     /// Trust a folder's project config (default: the current folder); --revoke to distrust it.
     Trust {
         path: Option<std::path::PathBuf>,
@@ -185,6 +192,9 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
                 return Ok(doctor::doctor(&p, &settings, problems).await);
             }
             return Ok(doctor::auth_status(&p));
+        }
+        Some(Command::Stats { session, all }) => {
+            std::process::exit(stats::run(paths.home(), session.as_deref(), all));
         }
         Some(Command::Models { filter, all, refresh }) => {
             let cache = novacode_ai::connect::cache_path(paths.home());
@@ -402,6 +412,7 @@ impl Ctx {
             reasoning: route.info.reasoning,
             spill_dir: self.paths.home().join("spill"),
             warm: self.settings.get("cache.warm").unwrap_or(false),
+            metrics: self.settings.get("debug.metrics").unwrap_or(false),
             prompt: novacode_core::prompt::Sources {
                 cwd: self.cwd.clone(),
                 home: self.paths.home().to_path_buf(),

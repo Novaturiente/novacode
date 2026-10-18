@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod cache;
+pub mod metrics;
 pub mod pipeline;
 pub mod policy;
 pub mod prompt;
