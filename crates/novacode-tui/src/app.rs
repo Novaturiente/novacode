@@ -299,6 +299,9 @@ impl App {
                         _ => "writing".into(),
                     };
                 }
+                if let StreamEvent::Notice(text) = &e {
+                    self.tr.notice(text.clone(), false);
+                }
                 self.tr.on_stream(&e);
             }
             AgentEvent::Message(m) => {

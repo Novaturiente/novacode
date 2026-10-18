@@ -525,3 +525,15 @@ fn folded_thinking_names_its_key() {
     let s = screen(&mut a, 70, 30);
     assert!(s.contains("∴ thought · 6 words · ctrl+t to show"), "{s}");
 }
+
+#[test]
+fn provider_notice_is_shown() {
+    let (mut a, _rx) = app(vec![]);
+    a.on_agent(AgentEvent::AgentStart);
+    a.on_agent(AgentEvent::Message(Message::user("go")));
+    a.on_agent(AgentEvent::Stream(StreamEvent::Notice(
+        "claude account `default` is exhausted (quota); switched to account `work`".into(),
+    )));
+    let s = screen(&mut a, 90, 10);
+    assert!(s.contains("switched to account `work`"), "{s}");
+}

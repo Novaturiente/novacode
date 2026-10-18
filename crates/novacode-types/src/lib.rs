@@ -279,6 +279,9 @@ pub enum StreamEvent {
     Usage(Usage),
     /// Discard everything streamed so far; a retry follows.
     RetryRollback,
+    /// Something the user should know about this call (e.g. a switch to another
+    /// account). Shown, never sent to the model or stored.
+    Notice(String),
     Done(AssistantMessage),
     /// Terminal failure. The message holds any partial content and `stop = Error|Aborted`.
     Error(AssistantMessage),

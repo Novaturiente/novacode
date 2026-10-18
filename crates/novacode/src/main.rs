@@ -17,7 +17,7 @@ use novacode_tools::LocalEnv;
 use novacode_tui::dialog::{Answer, ApproveReq, PickItem};
 use novacode_tui::keys::Keymap;
 use novacode_tui::{Cmd, Exit, UiEvent};
-use novacode_types::{AgentEvent, Message, StopReason, ThinkingLevel};
+use novacode_types::{AgentEvent, Message, StopReason, StreamEvent, ThinkingLevel};
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
@@ -345,6 +345,7 @@ async fn print_mode(agent: Agent, prompt: String, verbose: bool) -> anyhow::Resu
         match events.recv().await {
             Ok(AgentEvent::Message(Message::Assistant(m))) => last = Some(m),
             Ok(AgentEvent::ToolStart { call }) if verbose => eprintln!("tool {} {}", call.name, call.arguments),
+            Ok(AgentEvent::Stream(StreamEvent::Notice(text))) => eprintln!("{text}"),
             Ok(AgentEvent::Retry {
                 attempt,
                 delay_ms,

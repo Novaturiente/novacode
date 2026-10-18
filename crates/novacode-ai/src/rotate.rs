@@ -126,7 +126,14 @@ impl Inner {
                     && exhausted(&m.stop)
                 {
                     let next = (i + 1) % n;
-                    // shortcut: logged, not shown in the UI; add a notice event with L9.12 status work.
+                    let why = m.error_message.as_deref().unwrap_or("used up");
+                    let note = format!(
+                        "{} account `{}` is exhausted ({why}); switched to account `{}`",
+                        self.provider, self.accounts[i], self.accounts[next]
+                    );
+                    if tx.send(StreamEvent::Notice(note)).await.is_err() {
+                        return;
+                    }
                     tracing::warn!(
                         provider = %self.provider,
                         from = %self.accounts[i],
@@ -235,11 +242,26 @@ mod tests {
             images: false,
             session: None,
         };
-        for _ in 0..2 {
-            let m = collect(a.stream(req.clone(), CancellationToken::new())).await;
-            assert_eq!(m.stop, StopReason::Stop, "{:?}", m.error_message);
-            assert_eq!(a.account(), "work", "rotated once and stayed");
-        }
+        let mut rx = a.stream(req.clone(), CancellationToken::new());
+        let first = rx.recv().await.unwrap();
+        assert!(
+            matches!(&first, StreamEvent::Notice(n) if n.contains("`default` is exhausted") && n.contains("`work`")),
+            "{first:?}"
+        );
+        let m = collect(rx).await;
+        assert_eq!(
+            (m.stop, a.account()),
+            (StopReason::Stop, "work".to_string()),
+            "{:?}",
+            m.error_message
+        );
+        // The next request goes straight to `work`: no notice, no quota error.
+        let m = collect(a.stream(req.clone(), CancellationToken::new())).await;
+        assert_eq!(
+            (m.stop, a.account()),
+            (StopReason::Stop, "work".to_string()),
+            "rotated once and stayed"
+        );
     }
 
     #[test]
