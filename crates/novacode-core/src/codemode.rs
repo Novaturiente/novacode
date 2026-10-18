@@ -31,6 +31,7 @@ pub struct Runner {
     pub redactor: Redactor,
     pub budget: Budget,
     pub seq: AtomicUsize,
+    pub hooks: Arc<crate::hooks::Hooks>,
 }
 
 impl Nested for Runner {
@@ -44,11 +45,12 @@ impl Nested for Runner {
             replay: None,
         };
         let prepared = pipeline::prepare(&self.tools, &call);
-        let (policy, approver, redactor, budget) = (
+        let (policy, approver, redactor, budget, hooks) = (
             self.policy.clone(),
             self.approver.clone(),
             self.redactor.clone(),
             self.budget,
+            self.hooks.clone(),
         );
         let spill = self.spill_dir.join(format!("{}-script-{n}.txt", ctx.session_id));
         Box::pin(async move {
@@ -56,10 +58,16 @@ impl Nested for Runner {
                 Prepared::Rejected(o) => return o,
                 Prepared::Ready(t, a, acc) => (t, a, acc),
             };
+            let args = match hooks.before_tool(&call.name, args).await {
+                Ok(a) => a,
+                Err(out) => return out,
+            };
             if let Some(refusal) = pipeline::authorize(&policy, approver.as_ref(), &call.name, &args, &ctx.cwd).await {
                 return refusal;
             }
-            pipeline::run(tool.as_ref(), args, accept, &ctx, &spill, budget, &redactor).await
+            let mut out = pipeline::run(tool.as_ref(), args.clone(), accept, &ctx, &spill, budget, &redactor).await;
+            hooks.after_tool(&call.name, &args, &mut out).await;
+            out
         })
     }
 

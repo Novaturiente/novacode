@@ -213,7 +213,12 @@ fn main() -> ExitCode {
         Ok(rt) => rt,
         Err(e) => return fail(e.into()),
     };
-    match rt.block_on(run(cli, paths)) {
+    let r = rt.block_on(async {
+        let r = run(cli, paths).await;
+        novacode_core::hooks::flush(std::time::Duration::from_secs(5)).await;
+        r
+    });
+    match r {
         Ok(code) => code,
         Err(e) => fail(e),
     }
@@ -779,6 +784,19 @@ impl Ctx {
             .with_scripted(scripted);
         if let Some(h) = mcp {
             agent = agent.with_mcp(h);
+        }
+        // Command hooks (L7.1); off inside a hook's own novacode (recursion guard).
+        let hook_cfg: novacode_core::hooks::Config = s.get("hooks").unwrap_or_default();
+        if !novacode_core::hooks::disabled() {
+            let cmds = Arc::new(novacode_core::hooks::Commands {
+                config: hook_cfg,
+                cwd: self.cwd.clone(),
+                session: agent.store.id().to_string(),
+            });
+            novacode_core::hooks::spawn_observers(cmds.clone(), agent.subscribe());
+            if !cmds.config.before_tool.is_empty() || !cmds.config.after_tool.is_empty() {
+                agent = agent.with_hooks(Arc::new(novacode_core::hooks::Hooks { handlers: vec![cmds] }));
+            }
         }
         if s.get("checkpoints.enabled").unwrap_or(true)
             && agent.store.path().is_some()

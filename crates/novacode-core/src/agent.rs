@@ -100,6 +100,8 @@ pub struct Agent {
     scripted: Vec<Arc<dyn Tool>>,
     /// MCP servers (L7.4); scripts see tools of servers that connected after start too.
     mcp: Option<Arc<crate::mcp::Hub>>,
+    /// before/after tool handlers (L7.1, L7.3).
+    hooks: Arc<crate::hooks::Hooks>,
 }
 
 /// Where a model's tool call goes (L5.17).
@@ -294,6 +296,7 @@ impl Agent {
             deferred: Vec::new(),
             scripted: Vec::new(),
             mcp: None,
+            hooks: Arc::default(),
             pending_cp: None,
         };
         agent.update_report();
@@ -791,9 +794,19 @@ impl Agent {
         pipeline::authorize(&self.policy, self.approver.as_ref(), &call.name, args, &self.cfg.cwd).await
     }
 
+    pub fn with_hooks(mut self, hooks: Arc<crate::hooks::Hooks>) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
     pub fn with_mcp(mut self, hub: Arc<crate::mcp::Hub>) -> Self {
         self.mcp = Some(hub);
         self
+    }
+
+    /// The session's events, before it is spawned (hook observers).
+    pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
+        self.events.subscribe()
     }
 
     pub fn mcp(&self) -> Option<&Arc<crate::mcp::Hub>> {
@@ -1142,6 +1155,18 @@ impl Agent {
         let all_rejected = prepared.iter().all(|(_, p)| matches!(p, Prepared::Rejected(_)));
         // Permissions are part of the sequential preflight (L3.3, L6.1); approvals are asked one at a time.
         for (call, p) in &mut prepared {
+            // Hooks first (they may rewrite the args), so permissions judge what will run.
+            if let Prepared::Ready(_, args, _) = p
+                && !self.hooks.is_empty()
+            {
+                match self.hooks.before_tool(&call.name, args.clone()).await {
+                    Ok(a) => *args = a,
+                    Err(out) => {
+                        *p = Prepared::Rejected(out);
+                        continue;
+                    }
+                }
+            }
             if let Prepared::Ready(_, args, _) = p
                 && let Some(refusal) = self.authorize(call, args).await
             {
@@ -1197,10 +1222,12 @@ impl Agent {
                 redactor: self.cfg.redactor.clone(),
                 budget,
                 seq: Default::default(),
+                hooks: self.hooks.clone(),
             }));
         }
         let one = |call: &ToolCall, p: &Prepared| {
             let events = self.events.clone();
+            let hooks = self.hooks.clone();
             let redactor = self.cfg.redactor.clone();
             let spill = self
                 .cfg
@@ -1231,7 +1258,10 @@ impl Agent {
                                 });
                             }
                         });
-                        pipeline::run(tool.as_ref(), args, accept, &ctx, &spill, budget, &redactor).await
+                        let mut out =
+                            pipeline::run(tool.as_ref(), args.clone(), accept, &ctx, &spill, budget, &redactor).await;
+                        hooks.after_tool(&call.name, &args, &mut out).await;
+                        out
                     }
                 };
                 let duration_ms = t0.elapsed().as_millis() as u64;

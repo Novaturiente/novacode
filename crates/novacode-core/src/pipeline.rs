@@ -1,7 +1,7 @@
 //! The tool pipeline (L3.2): lookup with a name suggestion, argument repair
 //! and lenient coercion, permission check (the agent's preflight, L6.1),
 //! execute, guard and redact the output once. Every call path uses it.
-// shortcut: no before_tool/after_tool hooks yet; they slot in next to the permission check (M10).
+// Hooks (L7.1) run before the permission check and after the guard: agent::run_tools and codemode::Runner.
 
 use novacode_base::redact::Redactor;
 

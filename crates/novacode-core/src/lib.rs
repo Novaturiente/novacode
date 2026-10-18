@@ -5,6 +5,7 @@ pub mod cache;
 pub mod checkpoint;
 pub mod codemode;
 pub mod export;
+pub mod hooks;
 pub mod image_gen;
 pub mod mcp;
 pub mod memory;
