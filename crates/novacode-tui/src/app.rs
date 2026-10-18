@@ -13,7 +13,7 @@ use novacode_types::{AgentEvent, BlockKind, Cost, Message, StopReason, StreamEve
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph};
+use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -65,6 +65,8 @@ pub struct Init {
     pub collapse_turns: bool,
     /// Startup warnings (bad keybindings, settings).
     pub notices: Vec<String>,
+    /// Startup notes that aren't problems (a rewind's result, a reload).
+    pub info: Vec<String>,
     pub theme: Theme,
     /// Setting `ui.thinking`: collapsed, full or hidden.
     pub thinking: Thinking,
@@ -366,6 +368,9 @@ impl App {
         }
         for n in std::mem::take(&mut init.notices) {
             tr.notice(n, true);
+        }
+        for n in std::mem::take(&mut init.info) {
+            tr.notice(n, false);
         }
         tr.settle();
         Self {
@@ -1346,7 +1351,8 @@ impl App {
         } else {
             full
         };
-        let inner_w = area.width.saturating_sub(2) as usize;
+        // Border plus one column of padding each side.
+        let inner_w = area.width.saturating_sub(4) as usize;
         self.editor_width = inner_w;
         let ed_rows = self.editor.height(inner_w).clamp(1, EDITOR_MAX_ROWS);
         let mut notes: Vec<Line> = self
@@ -1482,6 +1488,7 @@ impl App {
 
         let (rows, (cr, cc)) = self.editor.view(inner_w, ed_rows);
         let mut block = Block::bordered()
+            .padding(Padding::horizontal(1))
             .border_type(BorderType::Rounded)
             .border_style(match &self.editor_border {
                 Some(b) => t.token(Some(b)),

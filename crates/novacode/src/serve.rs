@@ -12,6 +12,10 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
+/// `bye` reason when the owner window rebuilds the same session (rewind, tree,
+/// reload, restart): attached windows wait for it and reconnect.
+pub const RELOADING: &str = "reloading the session";
+
 pub fn run_dir(paths: &Paths) -> PathBuf {
     paths.home().join("run")
 }
@@ -438,7 +442,7 @@ pub async fn attach(
     prefix: &str,
     base: crate::TuiBase,
     panel_only: bool,
-) -> anyhow::Result<std::process::ExitCode> {
+) -> anyhow::Result<Option<std::process::ExitCode>> {
     use anyhow::Context;
     let f = find_live(paths, prefix)?;
     let stream = tokio::net::UnixStream::connect(&f.socket)
@@ -634,11 +638,8 @@ pub async fn attach(
         history: messages,
         keymap: base.keymap,
         collapse_turns: base.collapse_turns,
-        notices: {
-            let mut n = base.notices;
-            n.push(format!("attached to session {id}: leaving only detaches"));
-            n
-        },
+        info: vec![format!("attached to session {id}: leaving only detaches")],
+        notices: base.notices,
         theme: base.theme,
         thinking: base.thinking,
         level: state.level,
@@ -656,11 +657,43 @@ pub async fn attach(
     };
     novacode_tui::run(init, erx, ui_rx, cmd_tx).await?;
     match bye.lock().unwrap().take() {
+        // The owner is rebuilding it: the caller reconnects (None).
+        Some(reason) if reason == RELOADING => return Ok(None),
         Some(reason) => eprintln!("the session is over: {reason}"),
         None => eprintln!(
             "detached; the session keeps running (novacode attach {})",
             &id[..id.len().min(13)]
         ),
     }
-    Ok(std::process::ExitCode::SUCCESS)
+    Ok(Some(std::process::ExitCode::SUCCESS))
+}
+
+/// `attach`/`panel`, reconnecting while the owner rebuilds the same session.
+pub async fn attach_loop(
+    paths: &Paths,
+    prefix: &str,
+    base: impl Fn() -> crate::TuiBase,
+    panel_only: bool,
+) -> anyhow::Result<std::process::ExitCode> {
+    loop {
+        if let Some(code) = attach(paths, prefix, base(), panel_only).await? {
+            return Ok(code);
+        }
+        // The owner closes the old socket, then goes live again with the same id.
+        let back = async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if find_live(paths, prefix).is_ok() {
+                    break;
+                }
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(10), back)
+            .await
+            .is_err()
+        {
+            eprintln!("the session is over: it didn't come back after a reload");
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
+    }
 }

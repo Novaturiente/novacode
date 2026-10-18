@@ -501,7 +501,10 @@ pub async fn record(mut rx: broadcast::Receiver<AgentEvent>, file: PathBuf, head
                     ts: t.ts,
                     task: t.n,
                     idle_ms,
-                    prompt_preview: std::mem::take(&mut t.prompt),
+                    // No user message: a reminder (schedule, process exit, subagent report) woke it.
+                    prompt_preview: Some(std::mem::take(&mut t.prompt))
+                        .filter(|p| !p.is_empty())
+                        .unwrap_or_else(|| "(woken by a reminder)".into()),
                     wall_ms: ms(start),
                     model_ms: t.model_ms,
                     tools_ms: t.tools_ms,

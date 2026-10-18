@@ -20,6 +20,9 @@ pub struct AskReq {
     pub reply: oneshot::Sender<Option<Vec<Reply>>>,
 }
 
+/// The most preview rows a form shows.
+const PREVIEW_ROWS: usize = 24;
+
 pub struct AskForm {
     pub req: AskReq,
     q: usize,
@@ -204,11 +207,16 @@ impl AskForm {
             w,
         ));
         if let Some(p) = q.options.get(sel).and_then(|o| o.preview.as_ref()) {
-            for l in p.lines().take(12) {
-                out.push(wrap::truncate(
-                    vec![Span::styled(format!("   │ {}", wrap::sanitize(l)), t.code)],
-                    w,
-                ));
+            // Wrapped, not cut: a plan's lines are long. Capped so the keys line stays on screen.
+            let bar = [Span::styled("   │ ", t.code)];
+            let rows: Vec<Line<'static>> = p
+                .lines()
+                .flat_map(|l| wrap::wrap(vec![Span::styled(wrap::sanitize(l), t.code)], w, &bar, &bar))
+                .collect();
+            let more = rows.len().saturating_sub(PREVIEW_ROWS);
+            out.extend(rows.into_iter().take(PREVIEW_ROWS));
+            if more > 0 {
+                out.push(Line::styled(format!("   │ … {more} more lines"), t.dim));
             }
         }
         let keys = if self.typing {
@@ -239,6 +247,37 @@ mod tests {
 
     fn key(c: KeyCode) -> KeyEvent {
         KeyEvent::new(c, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn long_preview_lines_wrap() {
+        let (tx, _rx) = oneshot::channel();
+        let long = "word ".repeat(30);
+        let f = AskForm::new(AskReq {
+            id: 1,
+            questions: vec![Question {
+                question: "ok?".into(),
+                header: None,
+                options: vec![Choice {
+                    label: "yes".into(),
+                    description: None,
+                    preview: Some(long.clone()),
+                    recommended: false,
+                }],
+                multi: false,
+            }],
+            reply: tx,
+        });
+        let text: String = f
+            .lines(40, &Theme::default())
+            .iter()
+            .map(|l| crate::wrap::plain(l) + "\n")
+            .collect();
+        assert_eq!(text.matches("word").count(), 30, "nothing cut: {text}");
+        assert!(
+            text.lines().filter(|l| l.contains('│')).all(|l| !l.contains('…')),
+            "{text}"
+        );
     }
 
     #[test]

@@ -210,13 +210,30 @@ impl ApprovalCard {
 
     fn lines(&self, w: usize, t: &Theme) -> Vec<Line<'static>> {
         let r = &self.req;
-        let mut lines = wrap::wrap(
-            vec![Span::styled(wrap::sanitize(&r.detail), t.text)],
-            w,
-            &[Span::styled(format!("{} ", r.tool), t.accent)],
-            &[Span::raw("  ")],
-        );
-        lines.truncate(8);
+        // Line by line: `sanitize` drops newlines, which glued multi-line commands together.
+        let mut lines: Vec<Line<'static>> = r
+            .detail
+            .lines()
+            .enumerate()
+            .flat_map(|(i, l)| {
+                let first = if i == 0 {
+                    Span::styled(format!("{} ", r.tool), t.accent)
+                } else {
+                    Span::raw("  ")
+                };
+                wrap::wrap(
+                    vec![Span::styled(wrap::sanitize(l), t.text)],
+                    w,
+                    &[first],
+                    &[Span::raw("  ")],
+                )
+            })
+            .collect();
+        if lines.len() > 12 {
+            let more = lines.len() - 11;
+            lines.truncate(11);
+            lines.push(Line::styled(format!("  … {more} more lines"), t.dim));
+        }
         let why_st = if r.risky { t.error } else { t.dim };
         lines.extend(wrap::wrap(vec![Span::styled(r.reason.clone(), why_st)], w, &[], &[]));
         match &self.reason {
@@ -399,6 +416,29 @@ mod tests {
 
     fn k(c: KeyCode) -> KeyEvent {
         KeyEvent::new(c, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn approval_card_keeps_command_lines() {
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        let card = ApprovalCard::new(ApproveReq {
+            id: 1,
+            tool: "bash".into(),
+            detail: "python3 -c \"from inventory import Inventory as I\ni=I()\"".into(),
+            reason: "r".into(),
+            rule: String::new(),
+            risky: false,
+            reply,
+        });
+        let text: Vec<String> = card
+            .lines(80, &Theme::default())
+            .iter()
+            .map(crate::wrap::plain)
+            .collect();
+        assert!(
+            text[0].ends_with("Inventory as I") && text[1].trim() == "i=I()\"",
+            "{text:?}"
+        );
     }
 
     #[test]

@@ -638,7 +638,7 @@ mod tests {
                await nc.ui.setStatus('k', 'hello', { style: 'accent' });
                await nc.ui.publish('t', 's', { id: 'a', label: 'A', status: 'running' });
                nc.registerTool({ name: 'bad', execute: async () => { try { await nc.ui.publish('t', 's', { nope: 1 }); return 'no error'; } catch (e) { return String(e.message); } } });
-               nc.on('ui_key', (e) => nc.ui.setStatus('k', `key ${e.key}`));
+               nc.on('ui_key', (e) => nc.ui.setStatus('k', [{ text: 'key ' }, { text: e.key, style: 'warn' }]));
                nc.registerTool({ name: 'pick', execute: async () => `${await nc.ui.select('Colour?', ['red', 'blue'])} / ${await nc.ui.confirm('Sure?')}` });
              };",
         )
@@ -687,7 +687,8 @@ mod tests {
         assert_eq!(text_of(&pick.execute(json!({}), &ctx).await), "blue / false");
         exts.ui_key("ui", json!({"key": "x"})).await;
         assert!(
-            matches!(rx.try_recv().unwrap(), AgentEvent::Ui { op: novacode_types::ui::UiOp::Status { text: Some(t), .. }, .. } if t == "key x")
+            matches!(rx.try_recv().unwrap(), AgentEvent::Ui { op: novacode_types::ui::UiOp::Status { text: Some(t), style: Some(st), .. }, .. } if t == "key x" && st == "warn"),
+            "segments join; their style is kept"
         );
     }
 

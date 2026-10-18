@@ -234,7 +234,7 @@ impl Claims {
             return Ok(());
         }
         let _ = std::fs::create_dir_all(self.file.parent().unwrap_or(Path::new(".")));
-        let _lock = novacode_base::storage::lock(&self.file.with_extension("lock")).map_err(|e| e.to_string())?;
+        let _lock = novacode_base::storage::lock(&self.file).map_err(|e| e.to_string())?;
         let mut all: Vec<Claim> = novacode_base::storage::read_json(&self.file)
             .ok()
             .flatten()
@@ -259,6 +259,12 @@ impl Claims {
                     pid: std::process::id(),
                 });
             }
+        }
+        if all.is_empty() {
+            // Nobody holds anything: leave no file behind (claims are runtime state).
+            let _ = std::fs::remove_file(&self.file);
+            let _ = std::fs::remove_file(novacode_base::storage::backup_path(&self.file));
+            return Ok(());
         }
         novacode_base::storage::write_json(&self.file, &all, novacode_base::storage::Durability::Fast)
             .map_err(|e| e.to_string())

@@ -108,7 +108,15 @@ const PRELUDE: &str = r#"
     // UI API v1 (L9): data in, novacode draws it. Keys come back as on("ui_key").
     ui: Object.freeze({
       version: 1,
-      setStatus: (key, text, opts) => call("ui", { op: "status", key, text: text == null ? null : fmt(text), style: opts?.style ?? null }),
+      // Text, or styled segments like every other UI call (joined; the first segment's style wins).
+      setStatus: (key, text, opts) => {
+        let style = opts?.style ?? null;
+        if (Array.isArray(text)) {
+          style = style ?? text.find((s) => s && s.style)?.style ?? null;
+          text = text.map((s) => (typeof s === "string" ? s : s?.text ?? "")).join("");
+        }
+        return call("ui", { op: "status", key, text: text == null ? null : fmt(text), style });
+      },
       setWidget: (key, lines, opts) => call("ui", { op: "widget", key, lines: lines ?? null, below: !!opts?.below }),
       setFooter: (lines) => call("ui", { op: "footer", lines: lines ?? null }),
       setHeader: (lines) => call("ui", { op: "header", lines: lines ?? null }),

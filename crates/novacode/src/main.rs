@@ -465,15 +465,13 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             let cwd = std::env::current_dir()?;
             let trusted = trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &cwd, false);
             let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
-            let base = tui_base(&paths, &settings);
-            return serve::attach(&paths, &session, base, false).await;
+            return serve::attach_loop(&paths, &session, || tui_base(&paths, &settings), false).await;
         }
         Some(Command::Panel { session }) => {
             let cwd = std::env::current_dir()?;
             let trusted = trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &cwd, false);
             let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
-            let base = tui_base(&paths, &settings);
-            return serve::attach(&paths, &session, base, true).await;
+            return serve::attach_loop(&paths, &session, || tui_base(&paths, &settings), true).await;
         }
         Some(Command::Stats { session, all, turns }) => {
             std::process::exit(stats::run(paths.home(), session.as_deref(), all, turns));
@@ -785,7 +783,16 @@ impl Ctx {
         asker: Option<Arc<dyn novacode_tools::ask::Asker>>,
         slot: Option<hub::HubSlot>,
     ) -> anyhow::Result<(Agent, String)> {
-        let route = self.providers.resolve(model)?;
+        // A resumed session keeps its own model unless -m says otherwise.
+        let resumed = match (&self.cli.model, store.last_model()) {
+            (None, Some((p, m))) => Some(format!("{p}/{m}")),
+            _ => None,
+        };
+        // …and falls back to the given one if that model can't be resolved any more.
+        let route = match resumed.as_deref().map(|r| self.providers.resolve(r)) {
+            Some(Ok(r)) => r,
+            _ => self.providers.resolve(model)?,
+        };
         // `model:level` wins, then the session's own level (resume), then settings.
         let level = route
             .level
@@ -1287,7 +1294,7 @@ fn ago(t: std::time::SystemTime) -> String {
 }
 
 /// What every TUI window takes from settings.
-struct TuiBase {
+pub(crate) struct TuiBase {
     keymap: Keymap,
     theme: novacode_tui::theme::Theme,
     collapse_turns: bool,
@@ -1597,6 +1604,7 @@ fn spawn_bg() -> anyhow::Result<ExitCode> {
 /// The TUI, one session at a time; /resume and /new swap the session in place.
 async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> anyhow::Result<ExitCode> {
     let mut notices = Vec::new();
+    let mut info: Vec<String> = Vec::new();
     let mut draft = String::new();
     // File rewinds to undo, newest last (L4.15).
     let undo: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
@@ -1669,6 +1677,7 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
             thinking: base.thinking,
             theme: base.theme,
             notices: std::mem::take(&mut notices),
+            info: std::mem::take(&mut info),
             price: state.price,
             spent: state.spent,
             commands,
@@ -1686,7 +1695,18 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
         handle.abort();
         handle.shutdown();
         let agent = task.await?;
-        live.end("the session's window closed").await;
+        live.end(match &res {
+            // Same session again: attached windows reconnect.
+            Ok(
+                Exit::Rewind { .. }
+                | Exit::Reload
+                | Exit::Restart
+                | Exit::Branch(novacode_tui::app::BranchAction::Tree, _),
+            ) => serve::RELOADING,
+            Ok(Exit::New | Exit::Resume(_)) => "the session's window switched to another session",
+            _ => "the session's window closed",
+        })
+        .await;
         if let Some(p) = &tmux_pane {
             let _ = std::process::Command::new("tmux").args(["kill-pane", "-t", p]).status();
         }
@@ -1701,10 +1721,10 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
                     None => notices.push("file checkpoints are off (checkpoints.enabled)".into()),
                     Some(repo) if at == "undo" => match undo.lock().unwrap().pop() {
                         Some(t) => match novacode_core::checkpoint::undo(&store_, repo, &t) {
-                            Ok(n) => notices.push(format!("file rewind undone: {n} files restored")),
+                            Ok(n) => info.push(format!("file rewind undone: {n} files restored")),
                             Err(e) => notices.push(format!("undo failed: {e}")),
                         },
-                        None => notices.push("nothing to undo".into()),
+                        None => info.push("nothing to undo".into()),
                     },
                     Some(repo) => match novacode_core::checkpoint::rewind(&store_, repo, at) {
                         Ok(r) => {
@@ -1716,7 +1736,7 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
                                     r.skipped.join(", ")
                                 ));
                             }
-                            notices.push(m);
+                            info.push(m);
                         }
                         Err(e) => notices.push(format!("file rewind failed: {e}")),
                     },
@@ -1744,7 +1764,7 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
         }
         if res == Exit::Reload {
             notices.extend(ctx.reload());
-            notices.push("reloaded settings, keys, theme, skills and context files".into());
+            info.push("reloaded settings, keys, theme, skills and context files".into());
             store = agent.store;
             continue;
         }
