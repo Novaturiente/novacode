@@ -31,6 +31,9 @@ pub struct OAuthCredential {
     pub refresh: String,
     /// Unix ms when `access` expires.
     pub expires_ms: u64,
+    /// Antigravity: the Cloud Code project the account runs in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -124,6 +127,11 @@ impl AuthStore {
     /// A valid access token, refreshing first when needed. Not cancel-safe on
     /// purpose: callers must not drop this future mid-refresh.
     pub async fn access_token(&self, provider: &str, account: &str) -> Result<String, AuthError> {
+        Ok(self.credential(provider, account).await?.access)
+    }
+
+    /// The whole credential, refreshed first when needed (same rules as [`Self::access_token`]).
+    pub async fn credential(&self, provider: &str, account: &str) -> Result<OAuthCredential, AuthError> {
         let cred = self
             .read()?
             .providers
@@ -132,7 +140,7 @@ impl AuthStore {
             .cloned();
         let cred = cred.ok_or_else(|| AuthError::NotLoggedIn(provider.into()))?;
         if cred.expires_ms > now_ms() + REFRESH_MARGIN.as_millis() as u64 {
-            return Ok(cred.access);
+            return Ok(cred);
         }
         let _lock = self.locked().await?;
         // Another process may have refreshed while we waited for the lock.
@@ -144,19 +152,24 @@ impl AuthStore {
             .cloned();
         let cred = cred.ok_or_else(|| AuthError::NotLoggedIn(provider.into()))?;
         if cred.expires_ms > now_ms() + REFRESH_MARGIN.as_millis() as u64 {
-            return Ok(cred.access);
+            return Ok(cred);
         }
-        let fresh = match provider {
+        let mut fresh = match provider {
             codex::PROVIDER => codex::refresh(&cred.refresh).await?,
+            antigravity::PROVIDER => antigravity::refresh(&cred.refresh).await?,
             _ => claude::refresh(&cred.refresh).await?,
         };
+        if fresh.refresh.is_empty() {
+            fresh.refresh = cred.refresh.clone(); // Google keeps the old refresh token
+        }
+        fresh.project = fresh.project.or(cred.project);
         let mut f = self.read()?;
         f.providers
             .entry(provider.into())
             .or_default()
             .insert(account.into(), fresh.clone());
         write(&self.path, &f)?;
-        Ok(fresh.access)
+        Ok(fresh)
     }
 }
 
@@ -296,6 +309,7 @@ pub mod claude {
             access: t.access_token,
             refresh: t.refresh_token,
             expires_ms: now_ms() + t.expires_in * 1000,
+            project: None,
         })
     }
 }
@@ -443,6 +457,120 @@ pub mod codex {
             access: t.access_token,
             refresh: t.refresh_token,
             expires_ms: now_ms() + t.expires_in * 1000,
+            project: None,
+        })
+    }
+}
+
+/// Antigravity (Google Cloud Code) OAuth: PKCE with a loopback callback, or a
+/// pasted callback URL on a headless box; then the user's Cloud Code project.
+pub mod antigravity {
+    use super::*;
+
+    pub const PROVIDER: &str = "antigravity";
+    // Google's public desktop client for Antigravity (not a secret: installed-app OAuth).
+    const CLIENT_ID: &str = "moc.tnetnocresuelgoog.sppa.pe304g4hjolotv532ercl12h2nisshmt-1950606001701";
+    const CLIENT_SECRET: &str = "fADq6z4CXs8BLm1JLdL684RWF85K-XPSCOG";
+    const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+    const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+    pub const PORT: u16 = 51121;
+    pub const REDIRECT_URI: &str = "http://localhost:51121/oauth-callback";
+    pub const ENDPOINT: &str = "https://daily-cloudcode-pa.googleapis.com";
+    pub const USER_AGENT: &str =
+        "antigravity/cli/1.2.4 (aidev_client; os_type=linux; arch=amd64; cl=982146307; auth_method=consumer)";
+    const SCOPES: &str = "https://www.googleapis.com/auth/aicode https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
+
+    pub fn authorize_url(challenge: &str, state: &str) -> String {
+        let q = [
+            ("client_id", CLIENT_ID),
+            ("response_type", "code"),
+            ("redirect_uri", REDIRECT_URI),
+            ("scope", SCOPES),
+            ("code_challenge", challenge),
+            ("code_challenge_method", "S256"),
+            ("state", state),
+            ("access_type", "offline"),
+            ("prompt", "consent"),
+        ];
+        let qs: Vec<String> = q.iter().map(|(k, v)| format!("{k}={}", claude::encode(v))).collect();
+        format!("{AUTH_URL}?{}", qs.join("&"))
+    }
+
+    /// Exchange the code, then find the user's Cloud Code project.
+    pub async fn exchange(code: &str, verifier: &str) -> Result<OAuthCredential, AuthError> {
+        let mut c = token(&[
+            ("client_id", CLIENT_ID),
+            ("client_secret", CLIENT_SECRET),
+            ("code", code),
+            ("grant_type", "authorization_code"),
+            ("redirect_uri", REDIRECT_URI),
+            ("code_verifier", verifier),
+        ])
+        .await?;
+        if c.refresh.is_empty() {
+            return Err(AuthError::Http(
+                "Google sent no refresh token; log in again and allow offline access".into(),
+            ));
+        }
+        c.project = project(&c.access).await;
+        Ok(c)
+    }
+
+    pub async fn refresh(refresh_token: &str) -> Result<OAuthCredential, AuthError> {
+        token(&[
+            ("client_id", CLIENT_ID),
+            ("client_secret", CLIENT_SECRET),
+            ("refresh_token", refresh_token),
+            ("grant_type", "refresh_token"),
+        ])
+        .await
+    }
+
+    /// `loadCodeAssist` names the project the account's quota lives in.
+    pub async fn project(access: &str) -> Option<String> {
+        let resp = reqwest::Client::new()
+            .post(format!("{ENDPOINT}/v1internal:loadCodeAssist"))
+            .timeout(Duration::from_secs(15))
+            .bearer_auth(access)
+            .header("user-agent", USER_AGENT)
+            .header("content-type", "application/json")
+            .body(json!({ "metadata": { "ideType": "ANTIGRAVITY" } }).to_string())
+            .send()
+            .await
+            .ok()?;
+        let v: serde_json::Value = serde_json::from_str(&resp.text().await.ok()?).ok()?;
+        let p = &v["cloudaicompanionProject"];
+        p.as_str().or(p["id"].as_str()).map(String::from)
+    }
+
+    async fn token(form: &[(&str, &str)]) -> Result<OAuthCredential, AuthError> {
+        let body: Vec<String> = form.iter().map(|(k, v)| format!("{k}={}", claude::encode(v))).collect();
+        let resp = reqwest::Client::new()
+            .post(TOKEN_URL)
+            .timeout(Duration::from_secs(30))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(body.join("&"))
+            .send()
+            .await
+            .map_err(|e| AuthError::Http(format!("token request failed: {e}")))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(AuthError::Http(format!("token endpoint returned {status}: {text}")));
+        }
+        #[derive(Deserialize)]
+        struct T {
+            access_token: String,
+            #[serde(default)]
+            refresh_token: String,
+            expires_in: u64,
+        }
+        let t: T = serde_json::from_str(&text).map_err(|e| AuthError::Http(format!("bad token response: {e}")))?;
+        Ok(OAuthCredential {
+            access: t.access_token,
+            refresh: t.refresh_token,
+            expires_ms: now_ms() + t.expires_in * 1000,
+            project: None,
         })
     }
 }
@@ -486,6 +614,7 @@ mod tests {
             access: "a".into(),
             refresh: "r".into(),
             expires_ms: now_ms() + 3_600_000,
+            project: None,
         };
         s.put("claude", DEFAULT_ACCOUNT, cred).await.unwrap();
         assert_eq!(s.access_token("claude", DEFAULT_ACCOUNT).await.unwrap(), "a");

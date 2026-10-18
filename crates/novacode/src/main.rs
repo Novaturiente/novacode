@@ -4,7 +4,7 @@ use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use futures_util::future::BoxFuture;
 use novacode_ai::adapter::CacheRetention;
-use novacode_ai::auth::{self, AuthStore, DEFAULT_ACCOUNT, claude, codex};
+use novacode_ai::auth::{self, AuthStore, DEFAULT_ACCOUNT, antigravity, claude, codex};
 use novacode_ai::connect::Providers;
 use novacode_ai::trace::Trace;
 use novacode_base::redact::Redactor;
@@ -66,7 +66,7 @@ struct Cli {
 
 #[derive(Subcommand, Clone)]
 enum Command {
-    /// Log in to a subscription provider (claude, codex).
+    /// Log in to a subscription provider (claude, codex, antigravity).
     Login { provider: String },
     /// Remove a stored login.
     Logout { provider: String },
@@ -771,9 +771,106 @@ async fn login(store: &AuthStore, provider: &str) -> anyhow::Result<ExitCode> {
             open(codex::VERIFY_URL);
             codex::finish(&d).await?
         }
-        _ => bail!("unknown login provider `{provider}` (logins: claude, codex)"),
+        antigravity::PROVIDER => {
+            let (verifier, challenge) = auth::pkce();
+            let state = auth::pkce().0;
+            let url = antigravity::authorize_url(&challenge, &state);
+            eprintln!(
+                "Open this URL and sign in with Google:\n\n{url}\n\nnovacode catches the redirect on localhost:{}. On another machine, paste the URL the browser ends on:",
+                antigravity::PORT
+            );
+            let (code, got_state) = loopback_or_paste(antigravity::PORT).await?;
+            if got_state.as_deref() != Some(state.as_str()) {
+                bail!("OAuth state mismatch; start the login again");
+            }
+            antigravity::exchange(&code, &verifier).await?
+        }
+        _ => bail!("unknown login provider `{provider}` (logins: claude, codex, antigravity)"),
     };
     store.put(provider, DEFAULT_ACCOUNT, cred).await?;
     eprintln!("logged in to {provider}");
     Ok(ExitCode::SUCCESS)
+}
+
+/// Wait for an OAuth redirect on `127.0.0.1:port`, or a pasted redirect URL on stdin,
+/// whichever comes first (L2.13). Returns (code, state).
+async fn loopback_or_paste(port: u16) -> anyhow::Result<(String, Option<String>)> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.ok();
+    let caught = async {
+        let Some(l) = listener else {
+            return std::future::pending().await;
+        };
+        loop {
+            let Ok((mut sock, _)) = l.accept().await else { continue };
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let target = req.split_whitespace().nth(1).unwrap_or_default().to_string();
+            if !target.contains("code=") {
+                let _ = sock
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                continue;
+            }
+            let page = "<html><body><h3>novacode is logged in. You can close this tab.</h3></body></html>";
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                page.len()
+            );
+            let _ = sock.write_all(reply.as_bytes()).await;
+            return target;
+        }
+    };
+    let pasted = async {
+        let mut line = String::new();
+        let _ = BufReader::new(tokio::io::stdin()).read_line(&mut line).await;
+        line
+    };
+    let got = tokio::select! {
+        t = caught => t,
+        l = pasted => l,
+    };
+    let (code, state) = claude::parse_pasted(&got);
+    if code.is_empty() {
+        bail!("no authorization code received");
+    }
+    Ok((percent_decode(&code), state.map(|s| percent_decode(&s))))
+}
+
+/// `4%2F0Ab` → `4/0Ab` (query values in a redirect URL).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match (
+            b[i],
+            b.get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()),
+        ) {
+            (b'%', Some(v)) => {
+                out.push(v);
+                i += 3;
+            }
+            (b'+', _) => {
+                out.push(b' ');
+                i += 1;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn percent_decoding() {
+        assert_eq!(super::percent_decode("4%2F0Ab-x%3D"), "4/0Ab-x=");
+        assert_eq!(super::percent_decode("plain%zz"), "plain%zz");
+    }
 }

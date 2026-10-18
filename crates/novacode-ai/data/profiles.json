@@ -37,6 +37,13 @@
    "ANTHROPIC_API_KEY"
   ]
  },
+ "antigravity": {
+  "name": "Antigravity (Google)",
+  "api": "gemini",
+  "auth": "oauth",
+  "baseUrl": "https://daily-cloudcode-pa.googleapis.com",
+  "catalog": "google"
+ },
  "baseten": {
   "name": "Baseten",
   "api": "openai-chat",
@@ -124,6 +131,16 @@
   "baseUrl": "https://api.friendli.ai/serverless/v1",
   "env": [
    "FRIENDLI_TOKEN"
+  ]
+ },
+ "google": {
+  "name": "Google Gemini API",
+  "api": "gemini",
+  "baseUrl": "https://generativelanguage.googleapis.com",
+  "env": [
+   "GEMINI_API_KEY",
+   "GOOGLE_API_KEY",
+   "GOOGLE_GENERATIVE_AI_API_KEY"
   ]
  },
  "groq": {

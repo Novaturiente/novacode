@@ -5,6 +5,7 @@ use crate::adapter::Adapter;
 use crate::anthropic::{self, Anthropic, OAuthProfile};
 use crate::auth::{self, AuthError, AuthStore, DEFAULT_ACCOUNT};
 use crate::catalog::{self, Api, Catalog, ModelInfo, Profile};
+use crate::gemini;
 use crate::openai_chat::{Compat, OpenAiChat};
 use crate::openai_responses;
 use crate::trace::Trace;
@@ -188,9 +189,26 @@ impl Providers {
                         .with_headers(p.headers.clone()),
                 )
             }
-            // shortcut: M5c builds this adapter.
             Api::Gemini => {
-                return Err(setup(format!("the {:?} adapter for {} isn't built yet", p.api, p.id)));
+                let auth = if p.oauth() {
+                    let c = self.auth.credential(&p.id, DEFAULT_ACCOUNT).await?;
+                    let project = match c.project {
+                        Some(pr) => pr,
+                        None => crate::auth::antigravity::project(&c.access)
+                            .await
+                            .ok_or_else(|| setup("could not find your Cloud Code project; log in again"))?,
+                    };
+                    gemini::Auth::Antigravity {
+                        access_token: c.access,
+                        project,
+                        user_agent: p
+                            .extra_str("userAgent")
+                            .unwrap_or_else(|| crate::auth::antigravity::USER_AGENT.into()),
+                    }
+                } else {
+                    gemini::Auth::ApiKey(key.clone().ok_or_else(|| setup(format!("{} needs an API key", p.id)))?)
+                };
+                Arc::new(gemini::Gemini::new(&p.id, &p.base_url, auth, trace))
             }
         };
         Ok((adapter, key))
