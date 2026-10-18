@@ -74,6 +74,8 @@ pub struct Providers {
     pub auth: AuthStore,
     /// `--api-key` for one provider, ahead of every other source (pi's runtime override).
     pub cli_key: Option<(String, String)>,
+    /// `web.native`: use the provider's own web search where it has one (L2.23).
+    pub native_search: bool,
 }
 
 impl Providers {
@@ -83,6 +85,7 @@ impl Providers {
             catalog: Catalog::load(&cache_path(home), settings.get::<Value>("models").as_ref()),
             auth: AuthStore::new(home.join("auth.json")),
             cli_key: None,
+            native_search: settings.get::<bool>("web.native").unwrap_or(false),
         }
     }
 
@@ -177,7 +180,8 @@ impl Providers {
                 if p.catalog_id() != anthropic::PROVIDER {
                     a = a.with_provider(p.id.clone());
                 }
-                Arc::new(a)
+                // Server-side search is Anthropic's own; vendors on its API (MiniMax) don't have it.
+                Arc::new(a.with_native_search(self.native_search && p.catalog_id() == anthropic::PROVIDER))
             }
             Api::OpenAiChat => {
                 let raw = if p.compat.is_null() {
@@ -211,7 +215,8 @@ impl Providers {
                     serde_json::from_value(raw).map_err(|e| setup(format!("providers.{}.compat: {e}", p.id)))?;
                 Arc::new(
                     openai_responses::OpenAiResponses::new(&p.id, &p.base_url, auth, compat, trace)
-                        .with_headers(p.headers.clone()),
+                        .with_headers(p.headers.clone())
+                        .with_native_search(self.native_search),
                 )
             }
             Api::Gemini => {

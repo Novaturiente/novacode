@@ -160,6 +160,23 @@ impl Builder {
             .map(|(_, p)| p.text.as_str())
     }
 
+    /// Append `item` to the list `key` in a block's replay data (citations).
+    pub fn push_replay(&mut self, index: usize, key: &str, item: serde_json::Value) {
+        let provider = self.provider.clone();
+        if let Some(p) = self.partial(index) {
+            let r = p.replay.get_or_insert_with(|| Replay {
+                provider,
+                data: serde_json::json!({}),
+            });
+            if let Some(o) = r.data.as_object_mut() {
+                match o.entry(key).or_insert_with(|| serde_json::json!([])) {
+                    serde_json::Value::Array(a) => a.push(item),
+                    v => *v = serde_json::json!([item]),
+                }
+            }
+        }
+    }
+
     pub fn set_replay(&mut self, index: usize, data: serde_json::Value) {
         let provider = self.provider.clone();
         if let Some(p) = self.partial(index) {

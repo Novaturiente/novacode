@@ -60,9 +60,33 @@ pub struct Anthropic {
     /// Replay namespace: `anthropic` for Claude (key or subscription), the vendor id otherwise.
     provider: String,
     headers: BTreeMap<String, String>,
+    /// Swap the `web_search` function tool for Anthropic's server-side search (L2.23).
+    native_search: bool,
+}
+
+/// Replace a function tool named `web_search` with the provider's own search tool,
+/// in place (same position, so cache markers stay put).
+pub fn swap_search_tool(body: &mut Value, native: Value) {
+    let Some(tools) = body["tools"].as_array_mut() else {
+        return;
+    };
+    for t in tools.iter_mut() {
+        if t["name"] == "web_search" && t.get("type").is_none_or(|ty| ty == "function") {
+            let mut n = native.clone();
+            if let (Some(cc), Some(o)) = (t.get("cache_control").cloned(), n.as_object_mut()) {
+                o.insert("cache_control".into(), cc);
+            }
+            *t = n;
+        }
+    }
 }
 
 impl Anthropic {
+    pub fn with_native_search(mut self, on: bool) -> Self {
+        self.native_search = on;
+        self
+    }
+
     pub fn new(auth: Auth, trace: Option<Trace>) -> Self {
         Self {
             http: http::client(),
@@ -71,6 +95,7 @@ impl Anthropic {
             trace,
             provider: PROVIDER.into(),
             headers: BTreeMap::new(),
+            native_search: false,
         }
     }
 
@@ -185,7 +210,14 @@ impl Adapter for Anthropic {
             Auth::OAuth { profile, .. } => Some(profile.clone()),
             Auth::ApiKey(_) | Auth::Bearer(_) => None,
         };
-        let body = serde_json::to_vec(&build_body(&req, oauth_profile.as_ref(), &self.provider)).unwrap_or_default();
+        let mut body = build_body(&req, oauth_profile.as_ref(), &self.provider);
+        if self.native_search {
+            swap_search_tool(
+                &mut body,
+                json!({ "type": "web_search_20250305", "name": "web_search", "max_uses": 5 }),
+            );
+        }
+        let body = serde_json::to_vec(&body).unwrap_or_default();
         let effort = in_conversation_effort(&req.model, req.thinking);
         // Mid-conversation effort needs these two betas (as pi sends them).
         let mut betas: Vec<&str> = Vec::new();
@@ -267,6 +299,7 @@ impl Wire for State {
                     "thinking_delta" => b.delta(index, d["thinking"].as_str().unwrap_or_default()).await,
                     "input_json_delta" => b.delta(index, d["partial_json"].as_str().unwrap_or_default()).await,
                     "signature_delta" => b.set_replay(index, json!({ "signature": d["signature"] })),
+                    "citations_delta" => b.push_replay(index, "citations", d["citation"].clone()),
                     _ => {}
                 }
             }
@@ -718,7 +751,13 @@ fn assistant_block(b: &Block, ns: &str, same_provider: bool) -> Option<Value> {
     let replay_data =
         |r: &Option<novacode_types::Replay>| r.as_ref().filter(|r| r.provider == ns).map(|r| r.data.clone());
     match b {
-        Block::Text { text, .. } if !text.is_empty() => Some(json!({ "type": "text", "text": text })),
+        Block::Text { text, replay } if !text.is_empty() => {
+            // Search citations go back with their text, to the provider that made them.
+            match replay_data(replay).and_then(|d| d.get("citations").cloned()) {
+                Some(c) if same_provider => Some(json!({ "type": "text", "text": text, "citations": c })),
+                _ => Some(json!({ "type": "text", "text": text })),
+            }
+        }
         Block::Thinking { text, replay } => {
             // Thinking is replayed only with its signature from Anthropic; otherwise dropped (L2.15).
             let data = replay_data(replay)?;

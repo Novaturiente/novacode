@@ -242,10 +242,13 @@ impl Transcript {
                     .content
                     .iter()
                     .filter_map(|b| match b {
-                        Block::Text { text, .. } if !text.trim().is_empty() => Some((BlockKind::Text, text.clone())),
+                        Block::Text { text, replay } if !text.trim().is_empty() => {
+                            Some((BlockKind::Text, with_sources(text, replay.as_ref())))
+                        }
                         Block::Thinking { text, .. } if !text.trim().is_empty() => {
                             Some((BlockKind::Thinking, text.clone()))
                         }
+                        Block::ProviderNative { item, .. } => searched(item).map(|q| (BlockKind::Text, q)),
                         _ => None,
                     })
                     .collect();
@@ -688,4 +691,60 @@ fn lay_tool(tool: &Tool, width: usize, t: &Theme) -> Vec<Line<'static>> {
         lines.push(more(skipped_after));
     }
     lines
+}
+
+/// A provider-run web search, as one line (L2.23).
+fn searched(item: &serde_json::Value) -> Option<String> {
+    let q = match item["type"].as_str()? {
+        "server_tool_use" if item["name"] == "web_search" => item["input"]["query"].as_str(),
+        "web_search_call" => item["action"]["query"].as_str(),
+        _ => return None,
+    };
+    Some(format!("*searched the web: {}*", q.unwrap_or("…")))
+}
+
+/// Text plus the web sources it cites (Anthropic `citations`, OpenAI `url_citation`s).
+fn with_sources(text: &str, replay: Option<&novacode_types::Replay>) -> String {
+    let Some(c) = replay.and_then(|r| r.data["citations"].as_array()) else {
+        return text.to_string();
+    };
+    let mut seen: Vec<&str> = Vec::new();
+    let mut out = text.trim_end().to_string();
+    for c in c {
+        let Some(url) = c["url"].as_str() else { continue };
+        if seen.contains(&url) {
+            continue;
+        }
+        if seen.is_empty() {
+            out.push_str("\n\nSources:");
+        }
+        seen.push(url);
+        let title = c["title"].as_str().filter(|t| !t.is_empty()).unwrap_or(url);
+        out.push_str(&format!("\n- [{title}]({url})"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn native_search_shows_query_and_sources() {
+        let item = json!({"type": "server_tool_use", "name": "web_search", "input": {"query": "rust stable"}});
+        assert_eq!(searched(&item).as_deref(), Some("*searched the web: rust stable*"));
+        assert_eq!(
+            searched(&json!({"type": "web_search_call", "action": {"query": "q"}})).as_deref(),
+            Some("*searched the web: q*")
+        );
+        let r = novacode_types::Replay {
+            provider: "anthropic".into(),
+            data: json!({"citations": [{"url": "https://a", "title": "A"}, {"url": "https://a", "title": "A"}, {"url": "https://b"}]}),
+        };
+        assert_eq!(
+            with_sources("1.99.1", Some(&r)),
+            "1.99.1\n\nSources:\n- [A](https://a)\n- [https://b](https://b)"
+        );
+    }
 }

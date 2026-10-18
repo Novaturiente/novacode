@@ -45,9 +45,16 @@ pub struct OpenAiResponses {
     /// Replay namespace = profile id (`openai` or `codex`).
     provider: String,
     trace: Option<Trace>,
+    /// Swap the `web_search` function tool for OpenAI's hosted search (L2.23).
+    native_search: bool,
 }
 
 impl OpenAiResponses {
+    pub fn with_native_search(mut self, on: bool) -> Self {
+        self.native_search = on;
+        self
+    }
+
     pub fn new(provider: &str, base_url: &str, auth: Auth, compat: Compat, trace: Option<Trace>) -> Self {
         Self {
             http: http::client(),
@@ -57,6 +64,7 @@ impl OpenAiResponses {
             headers: BTreeMap::new(),
             provider: provider.into(),
             trace,
+            native_search: false,
         }
     }
 
@@ -134,7 +142,11 @@ impl OpenAiResponses {
 
 impl Adapter for OpenAiResponses {
     fn stream(&self, req: Request, cancel: CancellationToken) -> mpsc::Receiver<StreamEvent> {
-        let body = serde_json::to_vec(&build_body(&req, &self.compat, &self.provider)).unwrap_or_default();
+        let mut body = build_body(&req, &self.compat, &self.provider);
+        if self.native_search {
+            crate::anthropic::swap_search_tool(&mut body, json!({ "type": "web_search" }));
+        }
+        let body = serde_json::to_vec(&body).unwrap_or_default();
         let mut r = self
             .authed(self.http.post(format!("{}/responses", self.base_url)))
             .header("content-type", "application/json")
@@ -331,6 +343,8 @@ fn input_parts(content: &[Block]) -> Vec<Value> {
 struct State {
     /// output_index → builder index, for open items.
     open: BTreeMap<u64, BlockKind>,
+    /// Hosted `web_search_call` items in flight.
+    searches: std::collections::BTreeSet<u64>,
     tools: usize,
 }
 
@@ -383,6 +397,11 @@ impl Wire for State {
                     "reasoning" => BlockKind::Thinking,
                     "message" => BlockKind::Text,
                     "function_call" => BlockKind::ToolCall,
+                    // Hosted search: shown, never replayed (store is off).
+                    "web_search_call" => {
+                        self.searches.insert(idx);
+                        return Ok(None);
+                    }
                     _ => return Ok(None),
                 };
                 let call_id = item["call_id"].as_str().unwrap_or_default();
@@ -402,12 +421,29 @@ impl Wire for State {
             "response.reasoning_summary_part.done" => b.delta(i, "\n\n").await,
             "response.output_item.done" => {
                 let item = &v["item"];
+                if self.searches.remove(&idx) {
+                    b.start_native(i, item.clone());
+                    b.end(i).await;
+                    return Ok(None);
+                }
                 let Some(k) = self.open.remove(&idx) else {
                     return Ok(None);
                 };
                 match k {
                     BlockKind::Thinking => b.set_replay(i, json!({ "item": item })),
-                    BlockKind::Text => b.set_replay(i, json!({ "id": item["id"] })),
+                    BlockKind::Text => {
+                        let ann: Vec<Value> = item["content"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .flat_map(|c| c["annotations"].as_array().cloned().unwrap_or_default())
+                            .collect();
+                        let mut d = json!({ "id": item["id"] });
+                        if !ann.is_empty() {
+                            d["citations"] = Value::Array(ann);
+                        }
+                        b.set_replay(i, d);
+                    }
                     BlockKind::ToolCall => {
                         // Arguments that only arrive whole (no deltas) are added here.
                         if b.partial_text(i).is_some_and(str::is_empty)
