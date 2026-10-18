@@ -686,3 +686,139 @@ async fn metrics_record_calls_tools_and_tasks() {
     ));
     assert!(matches!(task, Record::Task { idle_ms: None, .. }));
 }
+
+fn notes_reply(n: usize) -> FauxReply {
+    FauxReply::Message {
+        blocks: vec![call(
+            &format!("n{n}"),
+            "record_notes",
+            json!({"notes": [{"content": format!("completed: step {n}"), "type": "change", "relevance": "high", "sources": [1]}]}),
+        )],
+        stop: StopReason::ToolUse,
+        usage: Usage::default(),
+    }
+}
+
+/// M7 check: a long session compacts with no LLM call for the summary. The
+/// observer runs in the background as the session grows, catches up to the cut,
+/// and the next request carries the rendered notes plus the kept tail.
+#[tokio::test]
+async fn long_session_compacts_from_notes() {
+    use novacode_core::memory::{Settings, Worker};
+    use novacode_core::session::EntryKind;
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let big = "lorem ipsum ".repeat(300); // ~1k tokens
+    let main = Faux::new((0..8).map(|i| FauxReply::text(&format!("answer {i} {big}"))));
+    let observer = Faux::new((0..20).map(notes_reply));
+    let (main_reqs, obs_reqs) = (main.requests.clone(), observer.requests.clone());
+    let store = Store::create(&Paths::new(home.path()), work.path(), false);
+    let agent = Agent::new(
+        Arc::new(main),
+        vec![],
+        store,
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_memory(
+        Worker {
+            adapter: Arc::new(observer),
+            provider: "faux".into(),
+            model: "small".into(),
+        },
+        Settings {
+            observe_after: 1500,
+            keep_recent: 2500,
+            compact_at: 7000,
+            chunk_tokens: 3000,
+        },
+    );
+    let prompts: Vec<String> = (0..8).map(|i| format!("task {i} {big}")).collect();
+    let refs: Vec<&str> = prompts.iter().map(String::as_str).collect();
+    let (agent, events) = drive(agent, &refs).await;
+    let entries = agent.store.entries();
+    let compactions: Vec<_> = entries
+        .iter()
+        .filter(|e| matches!(e.kind, EntryKind::Compaction { .. }))
+        .collect();
+    assert!(!compactions.is_empty(), "no compaction");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Compacted { fallback: false, .. }))
+    );
+    // Every main request is a real prompt: no summary call was made.
+    assert_eq!(main_reqs.lock().unwrap().len(), 8);
+    // Observer requests carry only the observer prompt and one chunk.
+    for r in obs_reqs.lock().unwrap().iter() {
+        assert_eq!(r.model, "small");
+        assert_eq!(r.tools[0].name, "record_notes");
+    }
+    // The request after the first compaction: full prompt, then the summary in
+    // front of the first kept user message, then the kept tail.
+    let EntryKind::Compaction { first_kept, .. } = &compactions[0].kind else {
+        panic!()
+    };
+    let after = agent.store.projection();
+    assert!(matches!(&after[0], Message::System { .. }));
+    let Message::User { content } = &after[1] else {
+        panic!("{:?}", after[1])
+    };
+    let summary = format!("{:?}", content[0]);
+    assert!(
+        summary.contains("compaction-summary") && summary.contains("completed: step 0"),
+        "{summary}"
+    );
+    assert!(
+        !format!("{after:?}").contains("task 0 "),
+        "the first prompt is compacted away"
+    );
+    assert!(entries.iter().any(|e| &e.id == first_kept));
+    let total: u64 = after.iter().map(novacode_types::estimate::message).sum();
+    assert!(total < 7000, "{total} tokens after compaction");
+}
+
+/// When the observer can't run, compaction still frees the context and says so.
+#[tokio::test]
+async fn compaction_without_notes_falls_back() {
+    use novacode_core::memory::{Settings, Worker};
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let big = "lorem ipsum ".repeat(300);
+    let main = Faux::new((0..5).map(|i| FauxReply::text(&format!("answer {i} {big}"))));
+    let observer = Faux::new((0..20).map(|_| FauxReply::Fail(ErrorKind::Auth, "no login".into())));
+    let store = Store::create(&Paths::new(home.path()), work.path(), false);
+    let agent = Agent::new(
+        Arc::new(main),
+        vec![],
+        store,
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_memory(
+        Worker {
+            adapter: Arc::new(observer),
+            provider: "faux".into(),
+            model: "small".into(),
+        },
+        Settings {
+            observe_after: 1_000_000,
+            keep_recent: 2500,
+            compact_at: 6000,
+            chunk_tokens: 3000,
+        },
+    );
+    let prompts: Vec<String> = (0..5).map(|i| format!("task {i} {big}")).collect();
+    let refs: Vec<&str> = prompts.iter().map(String::as_str).collect();
+    let (agent, events) = drive(agent, &refs).await;
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Compacted {
+            fallback: true,
+            notes: 0,
+            ..
+        }
+    )));
+    let p = format!("{:?}", agent.store.projection());
+    assert!(p.contains("No notes were available"));
+}

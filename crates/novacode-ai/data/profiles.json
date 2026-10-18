@@ -35,14 +35,16 @@
   "baseUrl": "https://api.anthropic.com",
   "env": [
    "ANTHROPIC_API_KEY"
-  ]
+  ],
+  "smallModel": "claude-haiku"
  },
  "antigravity": {
   "name": "Antigravity (Google)",
   "api": "gemini",
   "auth": "oauth",
   "baseUrl": "https://daily-cloudcode-pa.googleapis.com",
-  "catalog": "google"
+  "catalog": "google",
+  "smallModel": "gemini-3.8-flash-low"
  },
  "baseten": {
   "name": "Baseten",
@@ -73,7 +75,8 @@
   "api": "anthropic",
   "auth": "oauth",
   "catalog": "anthropic",
-  "login": true
+  "login": true,
+  "smallModel": "claude-haiku"
  },
  "codex": {
   "name": "ChatGPT Plus/Pro (Codex)",
@@ -148,7 +151,8 @@
    "GEMINI_API_KEY",
    "GOOGLE_API_KEY",
    "GOOGLE_GENERATIVE_AI_API_KEY"
-  ]
+  ],
+  "smallModel": "gemini-2.5-flash"
  },
  "groq": {
   "name": "Groq",

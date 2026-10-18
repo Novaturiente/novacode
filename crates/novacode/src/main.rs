@@ -361,6 +361,51 @@ impl Ctx {
         })
     }
 
+    /// The observer's model (L4.5): `memory.model`, else the provider's small
+    /// model, else the session's own. A worker that can't connect falls back to it.
+    async fn memory_worker(
+        &self,
+        route: &novacode_ai::connect::Route,
+        main: Arc<dyn novacode_ai::adapter::Adapter>,
+    ) -> novacode_core::memory::Worker {
+        let small = self.providers.profile(&route.provider).ok().and_then(|p| {
+            p.extra
+                .get("smallModel")?
+                .as_str()
+                .map(|m| format!("{}/{m}", route.provider))
+        });
+        let spec = self.settings.get::<String>("memory.model").or(small);
+        let fallback = || novacode_core::memory::Worker {
+            adapter: main.clone(),
+            provider: route.provider.clone(),
+            model: route.model.clone(),
+        };
+        let Some(spec) = spec else { return fallback() };
+        let r = match self.providers.resolve(&spec) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(%e, "memory.model");
+                return fallback();
+            }
+        };
+        let adapter = if r.provider == route.provider {
+            main.clone()
+        } else {
+            match self.providers.adapter(&r.provider, None).await {
+                Ok((a, _)) => a,
+                Err(e) => {
+                    tracing::warn!(%e, "memory.model connect");
+                    return fallback();
+                }
+            }
+        };
+        novacode_core::memory::Worker {
+            adapter,
+            provider: r.provider,
+            model: r.model,
+        }
+    }
+
     /// Build the agent for `model` (`provider/model[:level]`). Returns the resolved `provider/model`.
     async fn agent(
         &self,
@@ -432,12 +477,32 @@ impl Ctx {
                 })
             },
         };
-        let tools = novacode_tools::listed(novacode_tools::builtins(false), |name| {
-            self.settings.get(&format!("tools.{name}.exposure"))
-        });
+        let memory_on = s.get("memory.enabled").unwrap_or(true);
+        let mut all = novacode_tools::builtins(false);
+        if memory_on && let Some(file) = store.path() {
+            all.push(Arc::new(novacode_core::memory::Recall {
+                file: file.to_path_buf(),
+            }));
+        }
+        let tools = novacode_tools::listed(all, |name| self.settings.get(&format!("tools.{name}.exposure")));
+        let window = cfg.window_tokens;
+        let worker = memory_on.then(|| self.memory_worker(&route, adapter.clone()));
         let mut agent = Agent::new(adapter, tools, store, cfg, Arc::new(LocalEnv))
             .with_policy(policy)
             .with_quirks(self.quirks.clone());
+        if let Some(w) = worker {
+            let mut m = novacode_core::memory::Settings::for_window(window);
+            if let Some(v) = s.get("memory.observeAfterTokens") {
+                m.observe_after = v;
+            }
+            if let Some(v) = s.get("memory.keepRecentTokens") {
+                m.keep_recent = v;
+            }
+            if let Some(v) = s.get("memory.compactAtTokens") {
+                m.compact_at = v;
+            }
+            agent = agent.with_memory(w.await, m);
+        }
         if let Some(a) = approver {
             agent = agent.with_approver(a);
         }
@@ -776,6 +841,7 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
                             text: h.context().render(),
                         });
                     }
+                    Cmd::Compact => h.compact(),
                     Cmd::Quit => break,
                 }
             }

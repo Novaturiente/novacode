@@ -344,6 +344,14 @@ pub enum AgentEvent {
     },
     /// Stopped and nothing is queued (L3.10).
     Settled,
+    /// The context was compacted (L4.5): earlier messages replaced by notes.
+    Compacted {
+        tokens_before: u64,
+        tokens_after: u64,
+        notes: usize,
+        /// No notes were available: earlier messages were dropped without a summary.
+        fallback: bool,
+    },
 }
 
 #[cfg(test)]

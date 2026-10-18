@@ -84,6 +84,23 @@ pub struct Agent {
     approver: Option<Arc<dyn Approver>>,
     /// Learned tool-schema rejections (L2.20).
     quirks: Arc<Quirks>,
+    /// Observer and compaction (L4.5); `None` = compaction off.
+    memory: Option<Memory>,
+    /// A compaction happened since the last request: its miss is deliberate.
+    compacted: bool,
+}
+
+struct Memory {
+    worker: crate::memory::Worker,
+    settings: crate::memory::Settings,
+    /// The background observer run, if one is going.
+    task: Option<tokio::task::JoinHandle<ObserverRun>>,
+}
+
+/// What a background observer run produced.
+struct ObserverRun {
+    covers: String,
+    result: Result<(Vec<crate::memory::Note>, Usage), String>,
 }
 
 #[derive(Default)]
@@ -109,6 +126,8 @@ struct Shared {
     sent: Mutex<Option<crate::cache::Sent>>,
     warm: Mutex<Warm>,
     warm_wake: Notify,
+    /// `/compact` was asked for; the owner compacts when idle.
+    compact: Mutex<bool>,
 }
 
 /// Warmer state, reset by every real request.
@@ -198,6 +217,20 @@ impl Agent {
             .collect();
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        // Compacted after the last reply (e.g. at the end of a `-p` run): the next miss is expected.
+        let compacted = {
+            let b = store.branch();
+            let last = |f: &dyn Fn(&EntryKind) -> bool| b.iter().rposition(|e| f(&e.kind));
+            last(&|k| matches!(k, EntryKind::Compaction { .. }))
+                > last(&|k| {
+                    matches!(
+                        k,
+                        EntryKind::Message {
+                            message: Message::Assistant(_)
+                        }
+                    )
+                })
+        };
         let shared: Arc<Shared> = Arc::default();
         // A resumed session: its last request, so the first reply is checked for a miss too.
         if let Some((messages, provider, model, usage, ts)) = store.last_request() {
@@ -231,6 +264,8 @@ impl Agent {
             policy: Arc::new(Policy::new(Permissions::default(), home, None)),
             approver: None,
             quirks: Arc::new(Quirks::ephemeral()),
+            memory: None,
+            compacted,
         };
         agent.update_report();
         agent
@@ -277,7 +312,11 @@ impl Agent {
     fn after_request(&mut self, req: Request, usage: &Usage) {
         let ttl = self.adapter.warm_ttl(&req);
         let prev = self.shared.sent.lock().unwrap().take();
-        if let Some(m) = prev.and_then(|p| crate::cache::miss(&p, &self.cfg.provider, &req, usage, ttl)) {
+        let compacted = std::mem::take(&mut self.compacted);
+        if let Some(mut m) = prev.and_then(|p| crate::cache::miss(&p, &self.cfg.provider, &req, usage, ttl)) {
+            if compacted {
+                m.cause = "compaction (expected once)".into();
+            }
             let text = format!("cache miss: {} prompt tokens not read from cache ({})", m.lost, m.cause);
             self.emit(AgentEvent::Stream(StreamEvent::Notice(text)));
             let line = serde_json::json!({
@@ -326,6 +365,177 @@ impl Agent {
         for (provider, model, usage) in done {
             self.add(EntryKind::WarmUsage { provider, model, usage });
         }
+    }
+
+    /// Turn on the observer and compaction (L4.5).
+    pub fn with_memory(mut self, worker: crate::memory::Worker, settings: crate::memory::Settings) -> Self {
+        self.memory = Some(Memory {
+            worker,
+            settings,
+            task: None,
+        });
+        self
+    }
+
+    fn context_tokens(&self) -> u64 {
+        novacode_types::estimate::context(&self.store.projection())
+    }
+
+    /// Store a finished observer run; with `wait`, wait for a running one.
+    async fn collect_notes(&mut self, wait: bool) {
+        let Some(m) = self.memory.as_mut() else { return };
+        let Some(task) = m.task.take_if(|t| wait || t.is_finished()) else {
+            return;
+        };
+        let Ok(run) = task.await else { return };
+        let model = format!("{}/{}", m.worker.provider, m.worker.model);
+        match run.result {
+            // A branch switch while it ran: the notes belong to another branch.
+            Ok(_) if !self.store.branch().iter().any(|e| e.id == run.covers) => {}
+            Ok((notes, usage)) => {
+                self.add(EntryKind::Notes {
+                    notes,
+                    covers: run.covers,
+                    usage,
+                    model,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "memory observer");
+                self.emit(AgentEvent::Stream(StreamEvent::Notice(format!(
+                    "memory observer failed: {e}"
+                ))));
+            }
+        }
+    }
+
+    /// After a run settles: store notes, compact when the context is past the
+    /// threshold, else start the observer once enough new conversation built up.
+    async fn after_settle(&mut self) {
+        self.collect_notes(false).await;
+        let Some(m) = self.memory.as_ref() else { return };
+        if self.context_tokens() >= m.settings.compact_at {
+            self.compact("the context reached the compaction threshold").await;
+            return;
+        }
+        if m.task.is_some() {
+            return;
+        }
+        let path = self.store.branch();
+        let from = crate::memory::watermark(&path);
+        if crate::memory::tokens(&path, from, path.len()) < m.settings.observe_after {
+            return;
+        }
+        let chunk = crate::memory::chunk(&path, from, path.len(), m.settings.chunk_tokens);
+        if chunk.aliases.is_empty() {
+            return;
+        }
+        let known = crate::memory::notes(&path);
+        let (worker, session) = (m.worker.clone(), self.store.id().to_string());
+        let notify = self.shared.clone();
+        let covers = chunk.covers.clone();
+        let task = tokio::spawn(async move {
+            let result = crate::memory::observe(&worker, &known, &chunk, &session).await;
+            notify.notify.notify_one();
+            ObserverRun { covers, result }
+        });
+        if let Some(m) = self.memory.as_mut() {
+            m.task = Some(task);
+        }
+    }
+
+    /// Replace the conversation before a cut with the observer's notes (L4.5).
+    /// The observer first catches up to the cut, so nothing before it goes
+    /// unnoted. Returns whether anything was compacted.
+    pub async fn compact(&mut self, why: &str) -> bool {
+        use crate::memory;
+        if self.memory.is_none() {
+            return false;
+        }
+        self.collect_notes(true).await;
+        let tokens_before = self.context_tokens();
+        let Some(m) = self.memory.as_ref() else { return false };
+        let (settings, worker) = (m.settings.clone(), m.worker.clone());
+        let (from, cut) = {
+            let path = self.store.branch();
+            let from = path
+                .iter()
+                .rev()
+                .find_map(|e| match &e.kind {
+                    EntryKind::Compaction { first_kept, .. } => path.iter().position(|x| &x.id == first_kept),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let Some(cut) = memory::cut_point(&path, from, settings.keep_recent) else {
+                return false;
+            };
+            (from, path[cut].id.clone())
+        };
+        self.emit(AgentEvent::Stream(StreamEvent::Notice(format!("compacting: {why}"))));
+        // Catch up to the cut.
+        let mut failed = None;
+        loop {
+            let path = self.store.branch();
+            let cut_i = path.iter().position(|e| e.id == cut).unwrap_or(path.len());
+            let wm = memory::watermark(&path).max(from);
+            if wm >= cut_i {
+                break;
+            }
+            let chunk = memory::chunk(&path, wm, cut_i, settings.chunk_tokens);
+            let known = memory::notes(&path);
+            let covers = chunk.covers.clone();
+            match memory::observe(&worker, &known, &chunk, self.store.id()).await {
+                Ok((notes, usage)) => {
+                    self.add(EntryKind::Notes {
+                        notes,
+                        covers,
+                        usage,
+                        model: format!("{}/{}", worker.provider, worker.model),
+                    });
+                }
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = &failed {
+            self.emit(AgentEvent::Stream(StreamEvent::Notice(format!(
+                "memory observer failed while catching up ({e}); compacting with the notes there are"
+            ))));
+        }
+        let path = self.store.branch();
+        let cut_i = path.iter().position(|e| e.id == cut).unwrap_or(path.len());
+        let pos = |id: &str| path.iter().position(|e| e.id == id);
+        let notes: Vec<memory::Note> = memory::notes(&path)
+            .into_iter()
+            .filter(|n| n.sources.iter().any(|s| pos(s).is_some_and(|i| i < cut_i)))
+            .collect();
+        let (read, changed) = memory::files(&path[..cut_i]);
+        let dropped = path[from..cut_i]
+            .iter()
+            .filter(|e| matches!(e.kind, EntryKind::Message { .. }))
+            .count();
+        let summary = memory::render_summary(&notes, &read, &changed, dropped);
+        let system = crate::prompt::render(&self.store.sections());
+        let n = notes.len();
+        self.add(EntryKind::Compaction {
+            system,
+            summary,
+            first_kept: cut,
+            tokens_before,
+            notes: n,
+        });
+        self.compacted = true;
+        let tokens_after = self.context_tokens();
+        self.emit(AgentEvent::Compacted {
+            tokens_before,
+            tokens_after,
+            notes: n,
+            fallback: n == 0,
+        });
+        self.update_report();
+        true
     }
 
     pub fn with_quirks(mut self, q: Arc<Quirks>) -> Self {
@@ -467,6 +677,13 @@ impl Agent {
                 });
             }
             steering_only = true;
+            // A long run near the window: compact at this model-call boundary (L4.5).
+            if let Some(m) = &self.memory
+                && self.context_tokens() >= self.cfg.window_tokens * 95 / 100
+                && m.settings.compact_at < self.cfg.window_tokens
+            {
+                self.compact("the context is nearly full").await;
+            }
             self.emit(AgentEvent::TurnStart);
             let msg = self.call_model(&cancel).await;
             let calls: Vec<ToolCall> = msg.tool_calls().cloned().collect();
@@ -556,6 +773,7 @@ impl Agent {
     async fn call_model(&mut self, cancel: &CancellationToken) -> AssistantMessage {
         let mut attempt = 0;
         let mut learned = 0;
+        let mut compacted = false;
         loop {
             let route = format!("{}/{}", self.cfg.provider, self.cfg.model);
             let messages = self.store.projection();
@@ -605,7 +823,25 @@ impl Agent {
                 });
                 continue;
             }
-            // shortcut: Overflow is surfaced; compact-then-retry-once arrives with compaction (M7, L4.5).
+            // Too long for the model: compact, then retry once (L4.6).
+            if *kind == ErrorKind::Overflow && !compacted && !cancel.is_cancelled() {
+                compacted = true;
+                self.hide_failed(m);
+                if self.compact("the model rejected the request as too long").await {
+                    self.emit(AgentEvent::Retry {
+                        attempt: 1,
+                        delay_ms: 0,
+                        error: ErrorKind::Overflow,
+                        message: "compacted, retrying".into(),
+                    });
+                    continue;
+                }
+                return failed(
+                    &self.cfg,
+                    ErrorKind::Overflow,
+                    "the context is too long and nothing could be compacted",
+                );
+            }
             if !kind.is_retryable() || cancel.is_cancelled() {
                 return m;
             }
@@ -837,6 +1073,12 @@ impl SessionHandle {
         *self.shared.next_thinking.lock().unwrap() = Some(level);
     }
     /// Stop after the current run; the owner task then returns the agent.
+    /// Compact now, or as soon as the running turn ends (`/compact`, L4.5).
+    pub fn compact(&self) {
+        *self.shared.compact.lock().unwrap() = true;
+        self.shared.notify.notify_one();
+    }
+
     pub fn shutdown(&self) {
         *self.shared.closed.lock().unwrap() = true;
         self.shared.notify.notify_one();
@@ -876,8 +1118,28 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
                 let q = agent.shared.queues.lock().unwrap();
                 !q.steering.is_empty() || !q.follow_up.is_empty()
             };
+            agent.collect_notes(false).await;
+            if std::mem::take(&mut *agent.shared.compact.lock().unwrap()) {
+                if agent.memory.is_none() {
+                    agent.emit(AgentEvent::Stream(StreamEvent::Notice(
+                        "compaction is off (memory.enabled)".into(),
+                    )));
+                } else if !agent.compact("you asked for it").await {
+                    agent.emit(AgentEvent::Stream(StreamEvent::Notice(
+                        "nothing to compact: the conversation fits in the part kept verbatim".into(),
+                    )));
+                }
+                continue;
+            }
             if pending {
                 agent.run().await;
+                let idle = {
+                    let q = agent.shared.queues.lock().unwrap();
+                    q.steering.is_empty() && q.follow_up.is_empty()
+                };
+                if idle {
+                    agent.after_settle().await;
+                }
             } else if *agent.shared.closed.lock().unwrap() {
                 agent.shared.warm_wake.notify_one();
                 agent.store_warm_usage();

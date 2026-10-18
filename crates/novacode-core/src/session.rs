@@ -65,6 +65,25 @@ pub enum EntryKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         head: Option<String>,
     },
+    /// Observer notes about the conversation up to entry `covers` (L4.5). Not sent.
+    Notes {
+        notes: Vec<crate::memory::Note>,
+        covers: String,
+        #[serde(default)]
+        usage: novacode_types::Usage,
+        #[serde(default)]
+        model: String,
+    },
+    /// The conversation before `first_kept` is replaced for the model by `system`
+    /// (the full prompt at this point) and `summary` (L4.5). Old entries stay.
+    Compaction {
+        system: String,
+        summary: String,
+        first_kept: String,
+        tokens_before: u64,
+        #[serde(default)]
+        notes: usize,
+    },
     /// Moves the leaf (branch navigation). Not a tree node.
     Leaf {
         target: String,
@@ -254,6 +273,11 @@ impl Store {
     }
 
     /// Entries from the root to the leaf.
+    /// The current branch, root first.
+    pub fn branch(&self) -> Vec<&Entry> {
+        self.path_to_leaf()
+    }
+
     fn path_to_leaf(&self) -> Vec<&Entry> {
         let mut out = Vec::new();
         let mut cur = self.leaf.as_deref();
@@ -343,6 +367,9 @@ impl Store {
 }
 
 /// Messages of a path, with context edits applied (L4.2).
+/// After the last compaction: its prompt, then the kept entries with the
+/// summary placed in front of the first kept user message (L4.5). System
+/// deltas older than the compaction are already part of its prompt.
 fn project(path: &[&Entry]) -> Vec<Message> {
     let mut edits: HashMap<&str, Option<&Message>> = HashMap::new();
     for e in path {
@@ -351,6 +378,38 @@ fn project(path: &[&Entry]) -> Vec<Message> {
         }
     }
     let mut out = Vec::new();
+    let compaction = path.iter().enumerate().rev().find_map(|(i, e)| match &e.kind {
+        EntryKind::Compaction {
+            system,
+            summary,
+            first_kept,
+            ..
+        } => Some((i, system, summary, first_kept)),
+        _ => None,
+    });
+    let mut path: Vec<&Entry> = path.to_vec();
+    let mut summary = None;
+    if let Some((ci, system, text, first_kept)) = compaction
+        && let Some(k) = path.iter().position(|e| &e.id == first_kept)
+    {
+        out.push(Message::System { text: system.clone() });
+        summary = Some(text.clone());
+        path = path
+            .iter()
+            .enumerate()
+            .filter(|(i, e)| {
+                *i >= k
+                    && !(*i < ci
+                        && matches!(
+                            e.kind,
+                            EntryKind::Message {
+                                message: Message::System { .. }
+                            }
+                        ))
+            })
+            .map(|(_, e)| *e)
+            .collect();
+    }
     for e in path {
         let msg = match &e.kind {
             EntryKind::Message { message } => message.clone(),
@@ -359,11 +418,20 @@ fn project(path: &[&Entry]) -> Vec<Message> {
             },
             _ => continue,
         };
-        match edits.get(e.id.as_str()) {
-            Some(None) => {}
-            Some(Some(r)) => out.push((*r).clone()),
-            None => out.push(msg),
+        let mut msg = match edits.get(e.id.as_str()) {
+            Some(None) => continue,
+            Some(Some(r)) => (*r).clone(),
+            None => msg,
+        };
+        if let Message::User { content } = &mut msg
+            && let Some(s) = summary.take()
+        {
+            content.insert(
+                0,
+                Block::text(format!("<compaction-summary>\n{s}\n</compaction-summary>")),
+            );
         }
+        out.push(msg);
     }
     out
 }

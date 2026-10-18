@@ -36,6 +36,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/new", "start a new session"),
     ("/keys", "show keybindings"),
     ("/context", "where the context window goes"),
+    ("/compact", "replace older messages with the memory notes"),
     ("/copy", "copy the last reply"),
     ("/quit", "quit"),
 ];
@@ -82,6 +83,7 @@ pub enum Cmd {
     ListSessions,
     /// The host answers with [`UiEvent::Page`].
     Context,
+    Compact,
     Quit,
 }
 
@@ -372,6 +374,27 @@ impl App {
                 );
             }
             AgentEvent::AgentEnd { .. } => {}
+            AgentEvent::Compacted {
+                tokens_before,
+                tokens_after,
+                notes,
+                fallback,
+            } => {
+                self.ctx = tokens_after;
+                let how = if fallback {
+                    "no notes were available, earlier messages were dropped".to_string()
+                } else {
+                    format!("{notes} notes")
+                };
+                self.tr.notice(
+                    format!(
+                        "compacted: {}k → {}k tokens ({how})",
+                        tokens_before / 1000,
+                        tokens_after / 1000
+                    ),
+                    false,
+                );
+            }
             AgentEvent::Settled => {
                 self.busy = false;
                 self.activity.clear();
@@ -752,6 +775,7 @@ impl App {
                 }
                 "/copy" => self.copy_reply(),
                 "/context" => self.send(Cmd::Context),
+                "/compact" => self.send(Cmd::Compact),
                 _ => {}
             }
             return;
