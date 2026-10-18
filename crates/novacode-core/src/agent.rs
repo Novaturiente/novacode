@@ -137,7 +137,7 @@ struct Queues {
     follow_up: VecDeque<Vec<Block>>,
     /// Notes for the model (process exits, log matches): stored as reminders at
     /// the next model call (L4.12).
-    reminders: VecDeque<String>,
+    reminders: VecDeque<(String, String)>,
     /// A reminder that should start a run when idle.
     wake: bool,
 }
@@ -164,6 +164,16 @@ struct Shared {
     compact: Mutex<bool>,
     /// The session's prompts as a tree, refreshed with the report (for `/tree`).
     prompts: Mutex<Vec<crate::session::PromptNode>>,
+}
+
+impl Shared {
+    fn remind(&self, kind: &str, text: String, wake: bool) {
+        let mut q = self.queues.lock().unwrap();
+        q.reminders.push_back((kind.to_string(), text));
+        q.wake |= wake;
+        drop(q);
+        self.notify.notify_one();
+    }
 }
 
 /// Warmer state, reset by every real request.
@@ -266,6 +276,7 @@ impl Agent {
             let ago = Duration::from_millis(crate::session::now_ms().saturating_sub(ts));
             *shared.sent.lock().unwrap() = Some(crate::cache::Sent {
                 req: Request {
+                    tail: Vec::new(),
                     model,
                     messages,
                     tools: defs.clone(),
@@ -811,7 +822,11 @@ impl Agent {
 
     /// Script extensions: notices go to this session; `on(event)` handlers follow it.
     pub fn with_extensions(mut self, exts: Arc<crate::extensions::Extensions>) -> Self {
-        exts.attach(self.events.clone());
+        let shared = self.shared.clone();
+        exts.attach(
+            self.events.clone(),
+            Arc::new(move |name: &str, text: String, wake: bool| shared.remind(&format!("ext:{name}"), text, wake)),
+        );
         exts.spawn_events(self.events.subscribe());
         self.extensions = Some(exts);
         self
@@ -932,14 +947,14 @@ impl Agent {
                     message: Message::User { content },
                 });
             }
-            let notes: Vec<String> = {
+            let notes: Vec<(String, String)> = {
                 let mut q = self.shared.queues.lock().unwrap();
                 q.wake = false;
                 q.reminders.drain(..).collect()
             };
-            for text in notes {
+            for (kind, text) in notes {
                 self.add(EntryKind::CustomMessage {
-                    kind: "process".into(),
+                    kind,
                     text,
                     display: false,
                 });
@@ -1038,8 +1053,39 @@ impl Agent {
         }
     }
 
+    /// Extensions' `before_request` text for this call: sent after the cached
+    /// prefix and never stored, so it costs no cache miss.
+    async fn request_tail(&self) -> Vec<String> {
+        let Some(exts) = &self.extensions else {
+            return Vec::new();
+        };
+        let messages = self.store.projection();
+        let last_user = messages.iter().rev().find_map(|m| match m {
+            Message::User { content } => Some(
+                content
+                    .iter()
+                    .filter_map(|b| match b {
+                        Block::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => None,
+        });
+        exts.before_request(&serde_json::json!({
+            "provider": self.cfg.provider,
+            "model": self.cfg.model,
+            "cwd": self.cfg.cwd,
+            "contextTokens": novacode_types::estimate::context(&messages),
+            "lastUser": last_user,
+        }))
+        .await
+    }
+
     /// One model call with the overflow/retry state machine (L4.6).
     async fn call_model(&mut self, cancel: &CancellationToken) -> AssistantMessage {
+        let tail = self.request_tail().await;
         let mut attempt = 0;
         let mut learned = 0;
         let mut compacted = false;
@@ -1052,6 +1098,7 @@ impl Agent {
                 .window_tokens
                 .saturating_sub(novacode_types::estimate::context(&messages));
             let req = Request {
+                tail: tail.clone(),
                 model: self.cfg.model.clone(),
                 max_tokens: self.cfg.max_tokens.min(room.clamp(1024, u32::MAX as u64) as u32),
                 messages,
@@ -1457,11 +1504,7 @@ impl SessionHandle {
     }
     /// A note for the model at its next call; `wake` starts a run when idle.
     pub fn remind(&self, text: impl Into<String>, wake: bool) {
-        let mut q = self.shared.queues.lock().unwrap();
-        q.reminders.push_back(text.into());
-        q.wake |= wake;
-        drop(q);
-        self.shared.notify.notify_one();
+        self.shared.remind("process", text.into(), wake);
     }
 
     pub fn steer_content(&self, content: Vec<Block>) {

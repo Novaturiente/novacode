@@ -30,7 +30,14 @@ pub fn miss(prev: &Sent, provider: &str, req: &Request, usage: &Usage, ttl: Opti
     // Everything the previous request sent was cached (the marker sits on its last message).
     // Capped by this request's own size: a reply with server-run tools (web search) sums
     // usage over several internal passes, so its total counts the prefix twice.
-    let expected = prev.usage.prompt_total().min(usage.prompt_total());
+    // Per-request tail text (extensions' before_request) sits after the marker: never cached.
+    let tail = prev
+        .req
+        .tail
+        .iter()
+        .map(|t| novacode_types::estimate::text(t))
+        .sum::<u64>();
+    let expected = prev.usage.prompt_total().min(usage.prompt_total()).saturating_sub(tail);
     let noise = (expected / 20).max(1024);
     if usage.cache_read + noise >= expected {
         return None;
@@ -129,6 +136,7 @@ mod tests {
 
     fn req(model: &str, msgs: &[&str]) -> Request {
         Request {
+            tail: Vec::new(),
             model: model.into(),
             messages: msgs.iter().map(|m| Message::user(*m)).collect(),
             tools: vec![],

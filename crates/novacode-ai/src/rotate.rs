@@ -243,6 +243,7 @@ mod tests {
         let a = Live::new(p.clone(), "sub", p.auth.accounts("sub"), None, first);
         assert_eq!(a.account(), "default");
         let req = Request {
+            tail: Vec::new(),
             model: "m".into(),
             messages: vec![Message::user("hi")],
             tools: vec![],

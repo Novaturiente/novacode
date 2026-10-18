@@ -32,6 +32,29 @@ pub struct Request {
     pub images: bool,
     /// Session id, for providers that key their cache on it (L2.17).
     pub session: Option<String>,
+    /// Text for this request only, never stored (extensions' `before_request`). Sent
+    /// after the last cache marker as `<system-reminder>`s, so the cached prefix holds.
+    pub tail: Vec<String>,
+}
+
+impl Request {
+    /// The history plus the tail as one trailing user message, for adapters whose
+    /// cache is an automatic prefix match (OpenAI, Gemini).
+    pub fn messages_with_tail(&self) -> std::borrow::Cow<'_, [Message]> {
+        if self.tail.is_empty() {
+            return std::borrow::Cow::Borrowed(&self.messages);
+        }
+        let mut m = self.messages.clone();
+        m.push(Message::user(tail_text(&self.tail)));
+        std::borrow::Cow::Owned(m)
+    }
+}
+
+pub fn tail_text(tail: &[String]) -> String {
+    tail.iter()
+        .map(|t| format!("<system-reminder>\n{t}\n</system-reminder>"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// One wire protocol. Stateless per call: `stream` never fails, it reports

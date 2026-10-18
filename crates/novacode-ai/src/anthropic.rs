@@ -545,6 +545,16 @@ pub fn build_body(req: &Request, oauth: Option<&OAuthProfile>, ns: &str) -> Valu
         .map(|t| json!({ "name": t.name, "description": t.description, "input_schema": t.schema }))
         .collect();
     place_cache_markers(&mut system, &mut messages, &cache);
+    // Per-request text goes after the last marker: into the last user turn, else a new one.
+    if !req.tail.is_empty() {
+        let block = json!({ "type": "text", "text": crate::adapter::tail_text(&req.tail) });
+        match messages.last_mut() {
+            Some(m) if m["role"] == "user" && m["content"].is_array() => {
+                m["content"].as_array_mut().unwrap().push(block);
+            }
+            _ => messages.push(json!({ "role": "user", "content": [block] })),
+        }
+    }
     let level = req.thinking.map(|l| clamp_thinking(&req.model, l));
     let style = thinking_style(&req.model);
     // Mid-conversation effort (after the cache markers, so they stay on real messages):
@@ -780,6 +790,7 @@ mod tests {
 
     fn req(messages: Vec<Message>) -> Request {
         Request {
+            tail: Vec::new(),
             model: "claude-x".into(),
             messages,
             tools: vec![],

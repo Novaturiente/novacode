@@ -176,7 +176,7 @@ impl Adapter for OpenAiResponses {
 /// The JSON body. Pure and deterministic (L1.7 rule 3).
 pub fn build_body(req: &Request, c: &Compat, ns: &str) -> Value {
     let history = transform::for_target(
-        &req.messages,
+        &req.messages_with_tail(),
         &Target {
             provider: ns,
             model: &req.model,
@@ -501,6 +501,7 @@ mod tests {
 
     fn req(messages: Vec<Message>) -> Request {
         Request {
+            tail: Vec::new(),
             model: "gpt-5.5".into(),
             messages,
             tools: vec![ToolDef {

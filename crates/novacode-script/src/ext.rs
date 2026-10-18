@@ -9,7 +9,8 @@
 //! - `on(event, handler)`: `before_tool` (return `{ block }` or `{ args }`),
 //!   `after_tool` (return feedback text), or any session event type (observe).
 //! - `exec(command, { timeout? })`, `readFile(path)`, `writeFile(path, text)`,
-//!   `notify(text)`, `log(...)`, `apiVersion`.
+//!   `notify(text)`, `remind(text, {wake})`, `log(...)`, `apiVersion`.
+//!   Events include `input` and the tail-only `before_request`.
 
 use futures_util::future::BoxFuture;
 use rquickjs::{
@@ -25,7 +26,7 @@ pub const API_VERSION: u32 = 1;
 
 /// What the extension's `novacode.*` calls reach on the host side.
 pub trait ExtHost: Send + Sync + 'static {
-    /// `op` is `exec`, `readFile`, `writeFile`, `notify` or `log`.
+    /// `op` is `exec`, `readFile`, `writeFile`, `notify`, `remind` or `log`.
     fn call(&self, op: String, args: Value) -> BoxFuture<'static, Result<Value, String>>;
 }
 
@@ -100,6 +101,8 @@ const PRELUDE: &str = r#"
     readFile: (path) => call("readFile", { path }),
     writeFile: (path, text) => call("writeFile", { path, text }),
     notify: (text) => call("notify", { text: fmt(text) }),
+    // A note for the model, saved and sent at the next model call; `wake` starts a run when idle.
+    remind: (text, opts) => call("remind", { text: fmt(text), wake: !!(opts && opts.wake) }),
     log: (...a) => { bridge.host("log", JSON.stringify({ text: a.map(fmt).join(" ") })); },
   });
   globalThis.novacode = api;

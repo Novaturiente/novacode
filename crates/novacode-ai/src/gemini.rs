@@ -178,7 +178,7 @@ fn thinking(model: &str, level: Option<ThinkingLevel>) -> Option<Value> {
 /// The inner `generateContent` body. Pure and deterministic (L1.7 rule 3).
 pub fn build_request(req: &Request, ns: &str) -> Value {
     let history = transform::for_target(
-        &req.messages,
+        &req.messages_with_tail(),
         &Target {
             provider: ns,
             model: &req.model,
@@ -486,6 +486,7 @@ mod tests {
 
     fn req(model: &str, messages: Vec<Message>) -> Request {
         Request {
+            tail: Vec::new(),
             model: model.into(),
             messages,
             tools: vec![ToolDef {

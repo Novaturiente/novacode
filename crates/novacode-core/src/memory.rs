@@ -299,6 +299,7 @@ pub async fn observe(w: &Worker, known: &[Note], c: &Chunk, session: &str) -> Re
         let _ = writeln!(existing, "- {}", n.content);
     }
     let req = Request {
+        tail: Vec::new(),
         model: w.model.clone(),
         messages: vec![
             Message::System {
@@ -573,6 +574,7 @@ async fn ask(
 ) -> Result<(Vec<Value>, Usage), String> {
     let name = tool.name.clone();
     let req = Request {
+        tail: Vec::new(),
         model: w.model.clone(),
         messages: vec![
             Message::System { text: system.into() },
@@ -701,6 +703,7 @@ pub async fn summarize(
     session: &str,
 ) -> Result<(String, Usage), String> {
     let req = Request {
+        tail: Vec::new(),
         model: model.into(),
         messages: vec![
             Message::System {

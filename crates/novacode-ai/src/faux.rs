@@ -96,6 +96,7 @@ mod tests {
 
     fn req() -> Request {
         Request {
+            tail: Vec::new(),
             thinking: None,
             images: true,
             session: None,

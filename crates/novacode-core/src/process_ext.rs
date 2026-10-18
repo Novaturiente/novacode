@@ -8,7 +8,9 @@
 //! - `command {name, args}` → text to show
 //! - `event {event, payload}` → for `before_tool` `{block}`/`{args}`, for `after_tool` feedback text
 //!
-//! extension → novacode (notifications): `notify {text}`, `log {text}`.
+//! - for `input` `{text}`/`{handled}`, for `before_request` text (or a list) appended to that request only
+//!
+//! extension → novacode (notifications): `notify {text}`, `remind {text, wake}` (a saved note for the model), `log {text}`.
 
 use futures_util::future::BoxFuture;
 use novacode_script::ext::{Backend, CommandReg, Failure, Registration, ToolReg};
@@ -17,10 +19,10 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct Config {
@@ -59,7 +61,7 @@ impl ProcessExt {
         cwd: &Path,
         session: &str,
         log: &Path,
-        events: Arc<OnceLock<broadcast::Sender<AgentEvent>>>,
+        sink: Arc<crate::extensions::Sink>,
     ) -> Result<Arc<ProcessExt>, String> {
         let mut p = tokio::process::Command::new(&c.command);
         p.args(&c.args)
@@ -113,10 +115,16 @@ impl ProcessExt {
                 let text = v["params"]["text"].as_str().unwrap_or_default().to_string();
                 match v["method"].as_str() {
                     Some("notify") => {
-                        if let Some(tx) = events.get() {
+                        if let Some(tx) = sink.events.get() {
                             let _ = tx.send(AgentEvent::Stream(StreamEvent::Notice {
                                 text: format!("[{n2}] {text}"),
                             }));
+                        }
+                    }
+                    Some("remind") => {
+                        let wake = v["params"]["wake"] == true;
+                        if let Err(e) = sink.remind(&n2, text, wake) {
+                            tracing::warn!(extension = %n2, "{e}");
                         }
                     }
                     Some("log") => tracing::info!(extension = %n2, "{text}"),
@@ -255,15 +263,15 @@ for line in sys.stdin:
     async fn speaks_json_rpc() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("e.py"), EXT).unwrap();
-        let events: Arc<OnceLock<broadcast::Sender<AgentEvent>>> = Arc::default();
-        let (tx, mut rx) = broadcast::channel(4);
-        let _ = events.set(tx);
+        let sink: Arc<crate::extensions::Sink> = Arc::default();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        let _ = sink.events.set(tx);
         let c = Config {
             command: "python3".into(),
             args: vec![d.path().join("e.py").display().to_string()],
             ..Default::default()
         };
-        let e = ProcessExt::start("py", &c, d.path(), "s", &d.path().join("log"), events)
+        let e = ProcessExt::start("py", &c, d.path(), "s", &d.path().join("log"), sink)
             .await
             .unwrap();
         let t = Duration::from_secs(5);

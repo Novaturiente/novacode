@@ -81,7 +81,30 @@ struct Host {
     name: String,
     cwd: PathBuf,
     home: PathBuf,
-    events: Arc<OnceLock<broadcast::Sender<AgentEvent>>>,
+    sink: Arc<Sink>,
+}
+
+/// A saved reminder for the model: (extension name, text, wake an idle session).
+pub type Reminder = Arc<dyn Fn(&str, String, bool) + Send + Sync>;
+
+/// Where extensions reach their session, filled in when it attaches.
+#[derive(Default)]
+pub struct Sink {
+    pub events: OnceLock<broadcast::Sender<AgentEvent>>,
+    pub remind: OnceLock<Reminder>,
+}
+
+impl Sink {
+    /// `remind(text, wake)` from an extension: stored as a hidden `<system-reminder>`
+    /// at the next model call, appended, so the cache holds (L4.12).
+    pub fn remind(&self, name: &str, text: String, wake: bool) -> Result<(), String> {
+        if text.trim().is_empty() {
+            return Err("remind: text is empty".into());
+        }
+        let f = self.remind.get().ok_or("remind: no session yet")?;
+        f(name, text, wake);
+        Ok(())
+    }
 }
 
 fn notice(events: &OnceLock<broadcast::Sender<AgentEvent>>, text: String) {
@@ -95,11 +118,11 @@ fn notice(events: &OnceLock<broadcast::Sender<AgentEvent>>, text: String) {
 
 impl ExtHost for Host {
     fn call(&self, op: String, args: Value) -> BoxFuture<'static, Result<Value, String>> {
-        let (name, cwd, home, events) = (
+        let (name, cwd, home, sink) = (
             self.name.clone(),
             self.cwd.clone(),
             self.home.clone(),
-            self.events.clone(),
+            self.sink.clone(),
         );
         Box::pin(async move {
             let path = |p: &Value| -> Result<PathBuf, String> {
@@ -157,11 +180,18 @@ impl ExtHost for Host {
                 }
                 "notify" => {
                     notice(
-                        &events,
+                        &sink.events,
                         format!("[{name}] {}", args["text"].as_str().unwrap_or_default()),
                     );
                     Ok(Value::Null)
                 }
+                "remind" => sink
+                    .remind(
+                        &name,
+                        args["text"].as_str().unwrap_or_default().to_string(),
+                        args["wake"] == true,
+                    )
+                    .map(|_| Value::Null),
                 "log" => {
                     tracing::info!(extension = %name, "{}", args["text"].as_str().unwrap_or_default());
                     Ok(Value::Null)
@@ -185,7 +215,7 @@ pub struct Extensions {
     pub loaded: Vec<Arc<Loaded>>,
     /// (name, error) of extensions that failed to load.
     pub failed: Vec<(String, String)>,
-    events: Arc<OnceLock<broadcast::Sender<AgentEvent>>>,
+    sink: Arc<Sink>,
 }
 
 impl Extensions {
@@ -203,12 +233,12 @@ impl Extensions {
         session: &str,
         log_dir: &Path,
     ) -> Arc<Extensions> {
-        let events: Arc<OnceLock<broadcast::Sender<AgentEvent>>> = Arc::default();
+        let sink: Arc<Sink> = Arc::default();
         let mut loaded = Vec::new();
         let mut failed = Vec::new();
         for (name, c) in procs {
             let log = log_dir.join(format!("ext-{name}.log"));
-            match crate::process_ext::ProcessExt::start(name, c, cwd, session, &log, events.clone()).await {
+            match crate::process_ext::ProcessExt::start(name, c, cwd, session, &log, sink.clone()).await {
                 Ok(ext) => loaded.push(Arc::new(Loaded {
                     ext: ext as Arc<dyn Backend>,
                     path: PathBuf::from(&c.command),
@@ -230,7 +260,7 @@ impl Extensions {
                 name: name.clone(),
                 cwd: cwd.into(),
                 home: home.into(),
-                events: events.clone(),
+                sink: sink.clone(),
             });
             match Extension::load(&name, compiled(&src, cache), host, 64 << 20).await {
                 Ok(ext) => loaded.push(Arc::new(Loaded {
@@ -242,14 +272,15 @@ impl Extensions {
                 Err(e) => failed.push((name, e)),
             }
         }
-        Arc::new(Extensions { loaded, failed, events })
+        Arc::new(Extensions { loaded, failed, sink })
     }
 
     /// Route notices (disabled extensions, `novacode.notify`) to the session's events.
-    pub fn attach(&self, tx: broadcast::Sender<AgentEvent>) {
-        let _ = self.events.set(tx);
+    pub fn attach(&self, tx: broadcast::Sender<AgentEvent>, remind: Reminder) {
+        let _ = self.sink.events.set(tx);
+        let _ = self.sink.remind.set(remind);
         for (n, e) in &self.failed {
-            notice(&self.events, format!("extension `{n}` failed to load: {e}"));
+            notice(&self.sink.events, format!("extension `{n}` failed to load: {e}"));
         }
     }
 
@@ -283,7 +314,7 @@ impl Extensions {
     fn disable(&self, l: &Loaded, why: &str) {
         if !l.off.swap(true, Ordering::Relaxed) {
             notice(
-                &self.events,
+                &self.sink.events,
                 format!("extension `{}` disabled: {why} (fix it and /reload)", l.ext.name()),
             );
         }
@@ -378,6 +409,29 @@ impl Extensions {
         Some(text)
     }
 
+    /// `before_request` handlers (tail-only, L3.5): each may return text (a string, a
+    /// list, or `{append}`) to send after the cached prefix of this one request. It's
+    /// never stored, so early history can't change and the cache holds. Fails open.
+    pub async fn before_request(&self, payload: &Value) -> Vec<String> {
+        let mut out = Vec::new();
+        for (l, h) in self.handlers("before_request").collect::<Vec<_>>() {
+            let Ok(r) = self.invoke(l, h, payload, HOOK_TIMEOUT).await else {
+                continue;
+            };
+            let r = if r.is_object() { r["append"].clone() } else { r };
+            match r {
+                Value::String(s) if !s.trim().is_empty() => out.push(s),
+                Value::Array(a) => out.extend(
+                    a.into_iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .filter(|s| !s.trim().is_empty()),
+                ),
+                _ => {}
+            }
+        }
+        out
+    }
+
     pub fn spawn_events(self: &Arc<Self>, mut rx: broadcast::Receiver<AgentEvent>) {
         let me = self.clone();
         let wanted: Vec<String> = me
@@ -387,7 +441,7 @@ impl Extensions {
             .collect();
         if wanted
             .iter()
-            .all(|e| matches!(e.as_str(), "before_tool" | "after_tool" | "input"))
+            .all(|e| matches!(e.as_str(), "before_tool" | "after_tool" | "input" | "before_request"))
         {
             return;
         }
@@ -560,7 +614,7 @@ mod tests {
         assert_eq!(exts.failed[0].0, "broken");
         assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 3, "stripped source cached");
         let (tx, mut rx) = broadcast::channel(16);
-        exts.attach(tx);
+        exts.attach(tx, Arc::new(|_: &str, _: String, _: bool| {}));
         assert!(
             matches!(rx.recv().await.unwrap(), AgentEvent::Stream(StreamEvent::Notice { text }) if text.contains("broken"))
         );

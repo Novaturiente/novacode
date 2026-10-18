@@ -1025,3 +1025,81 @@ async fn codemode_chains_through_the_pipeline() {
     assert_eq!(std::fs::read_to_string(work.path().join("a.txt")).unwrap(), "alpha");
     assert!(!work.path().join("new.txt").exists());
 }
+
+/// Extension context injection without cache misses: `remind` notes are saved and
+/// re-sent unchanged; `before_request` text rides after the cached prefix of one
+/// request only and is never stored.
+#[tokio::test]
+async fn extension_reminders_are_saved_and_tails_are_not() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let ext = home.path().join("extensions");
+    std::fs::create_dir_all(&ext).unwrap();
+    std::fs::write(
+        ext.join("ctx.js"),
+        "let n = 0;
+         export default (nc) => {
+           nc.on('before_request', ({ lastUser }) => `request ${++n} for: ${lastUser}`);
+           nc.registerTool({ name: 'note', description: 'leave a note', execute: async () => { await nc.remind('remember: tabs'); return 'ok'; } });
+         };",
+    )
+    .unwrap();
+    let exts =
+        novacode_core::extensions::Extensions::load(&[ext], work.path(), home.path(), &home.path().join("cache")).await;
+    let faux = Faux::new([
+        tools_reply(vec![call("c1", "note", json!({}))]),
+        FauxReply::text("noted"),
+        FauxReply::text("second"),
+    ]);
+    let store = Store::create(&Paths::new(home.path()), work.path(), false);
+    let mut tools = novacode_tools::builtins(false);
+    tools.extend(exts.tools());
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        tools,
+        store,
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_extensions(exts);
+    let (agent, _) = drive(agent, &["one", "two"]).await;
+    let reqs = faux.requests.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 3);
+    // Each request gets its own fresh tail, built from the latest user text.
+    assert_eq!(reqs[0].tail, vec!["request 1 for: one".to_string()]);
+    assert_eq!(reqs[2].tail, vec!["request 3 for: two".to_string()]);
+    // The reminder is stored (hidden) and re-sent in later requests.
+    let reminder = |r: &Request| {
+        r.messages
+            .iter()
+            .any(|m| matches!(m, Message::User { content } if content.iter().any(|b| matches!(b, Block::Text { text, .. } if text.contains("remember: tabs")))))
+    };
+    assert!(!reminder(&reqs[0]) && reminder(&reqs[2]));
+    // Stored history never holds a tail, and every request is a prefix of the next.
+    let stored = std::fs::read_to_string(agent.store.path().unwrap()).unwrap();
+    assert!(!stored.contains("request 1 for"), "tails are never saved");
+    for w in reqs.windows(2) {
+        let mut untailed = w[0].clone();
+        untailed.tail.clear();
+        let (a, b) = (wire_messages(&untailed), wire_messages(&w[1]));
+        assert_eq!(
+            &b[..a.len()],
+            &a[..],
+            "minus its tail, each request is a prefix of the next"
+        );
+    }
+    // On the wire the tail comes after the last cache marker.
+    let body = build_body(&reqs[2], None, "anthropic");
+    let last = body["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(last[last.len() - 2].get("cache_control").is_some());
+    assert!(
+        last.last().unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .contains("request 3 for: two")
+    );
+    assert!(last.last().unwrap().get("cache_control").is_none());
+}
