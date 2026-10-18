@@ -134,6 +134,13 @@ pub enum Exit {
     New,
     /// Branch at a prompt (its entry id), or at the leaf for `/clone` (L4.3).
     Branch(BranchAction, Option<String>),
+    /// `/rewind` to before a prompt: its files, its conversation or both (L4.15).
+    /// `at = "undo"` undoes the last file rewind.
+    Rewind {
+        at: String,
+        files: bool,
+        chat: bool,
+    },
 }
 
 /// What picking a prompt does (L4.3).
@@ -182,6 +189,8 @@ enum Overlay {
     Thinking(Picker),
     Sessions(Picker),
     Branch(BranchAction, Picker),
+    /// After a prompt is picked in `/rewind`: what to restore.
+    RewindMode(String, Picker),
     Pager(Pager),
 }
 
@@ -487,21 +496,50 @@ impl App {
                         self.overlay = None;
                     }
                 }
-                Overlay::Models(p) | Overlay::Sessions(p) | Overlay::Thinking(p) | Overlay::Branch(_, p) => {
-                    match p.handle(k, &self.keymap) {
-                        Picked::Pending => {}
-                        Picked::Cancel => self.overlay = None,
-                        Picked::Value(v) => {
-                            let o = self.overlay.take();
-                            match o {
-                                Some(Overlay::Models(_)) => self.set_model(&v),
-                                Some(Overlay::Thinking(_)) => self.set_thinking(&v),
-                                Some(Overlay::Branch(a, _)) => self.exit = Some(Exit::Branch(a, Some(v))),
-                                _ => self.exit = Some(Exit::Resume(v)),
+                Overlay::Models(p)
+                | Overlay::Sessions(p)
+                | Overlay::Thinking(p)
+                | Overlay::Branch(_, p)
+                | Overlay::RewindMode(_, p) => match p.handle(k, &self.keymap) {
+                    Picked::Pending => {}
+                    Picked::Cancel => self.overlay = None,
+                    Picked::Value(v) => {
+                        let o = self.overlay.take();
+                        match o {
+                            Some(Overlay::Models(_)) => self.set_model(&v),
+                            Some(Overlay::Thinking(_)) => self.set_thinking(&v),
+                            Some(Overlay::Branch(BranchAction::Rewind, _)) if v == "undo" => {
+                                self.exit = Some(Exit::Rewind {
+                                    at: v,
+                                    files: true,
+                                    chat: false,
+                                })
                             }
+                            Some(Overlay::Branch(BranchAction::Rewind, _)) => {
+                                let item = |label: &str, value: &str| PickItem {
+                                    label: label.into(),
+                                    detail: String::new(),
+                                    value: value.into(),
+                                };
+                                let items = vec![
+                                    item("Files and conversation", "both"),
+                                    item("Conversation only", "chat"),
+                                    item("Files only", "files"),
+                                ];
+                                self.overlay = Some(Overlay::RewindMode(v, Picker::new("Restore what?", items)));
+                            }
+                            Some(Overlay::Branch(a, _)) => self.exit = Some(Exit::Branch(a, Some(v))),
+                            Some(Overlay::RewindMode(at, _)) => {
+                                self.exit = Some(Exit::Rewind {
+                                    at,
+                                    files: v != "chat",
+                                    chat: v != "files",
+                                })
+                            }
+                            _ => self.exit = Some(Exit::Resume(v)),
                         }
                     }
-                }
+                },
             }
             return;
         }
@@ -1059,9 +1097,13 @@ impl App {
 
         let t = &self.theme;
         match &self.overlay {
-            Some(Overlay::Models(p) | Overlay::Sessions(p) | Overlay::Thinking(p) | Overlay::Branch(_, p)) => {
-                p.render(f, dialog::centered(main, 70, 70, 20), t)
-            }
+            Some(
+                Overlay::Models(p)
+                | Overlay::Sessions(p)
+                | Overlay::Thinking(p)
+                | Overlay::Branch(_, p)
+                | Overlay::RewindMode(_, p),
+            ) => p.render(f, dialog::centered(main, 70, 70, 20), t),
             Some(Overlay::Pager(p)) => p.render(f, dialog::centered(main, 90, 90, main.height), t),
             None => {}
         }

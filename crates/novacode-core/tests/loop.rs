@@ -877,3 +877,58 @@ async fn reflector_and_dropper_respect_their_budgets() {
     // because the reflection keeps its meaning; the rest is capped away.
     assert_eq!(dropped, vec![ids[0].clone()]);
 }
+
+/// M7 check: each prompt gets a checkpoint before any tool runs; rewinding to a
+/// prompt restores its files, bash changes and created files included.
+#[tokio::test]
+async fn rewind_restores_files_of_a_prompt() {
+    use novacode_core::checkpoint;
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let w = work.path();
+    let git = |a: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(w)
+                .args(a)
+                .status()
+                .unwrap()
+                .success()
+        )
+    };
+    git(&["init", "-q"]);
+    std::fs::write(w.join("a.txt"), "one\n").unwrap();
+    let bash = |id: &str, cmd: &str| tools_reply(vec![call(id, "bash", json!({ "command": cmd }))]);
+    let faux = Faux::new([
+        bash("b1", "echo two > a.txt && echo new > b.txt"),
+        FauxReply::text("done"),
+        bash("b2", "echo three > a.txt && rm b.txt"),
+        FauxReply::text("done"),
+    ]);
+    let store = Store::create(&Paths::new(home.path()), w, false);
+    let repo = checkpoint::resolve(w, home.path()).unwrap();
+    let agent = Agent::new(
+        Arc::new(faux),
+        novacode_tools::builtins(false),
+        store,
+        cfg(w, home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_checkpoints(repo.clone());
+    let (agent, _) = drive(agent, &["first", "second"]).await;
+    assert_eq!(std::fs::read_to_string(w.join("a.txt")).unwrap(), "three\n");
+    let prompts = agent.store.prompts();
+    let (first, second) = (&prompts[0].id, &prompts[1].id);
+    // Back to before "second": the first prompt's result.
+    let r = checkpoint::rewind(&agent.store, &repo, second).unwrap();
+    assert_eq!(std::fs::read_to_string(w.join("a.txt")).unwrap(), "two\n");
+    assert!(w.join("b.txt").exists());
+    // Back to before "first": the original, created file gone.
+    checkpoint::rewind(&agent.store, &repo, first).unwrap();
+    assert_eq!(std::fs::read_to_string(w.join("a.txt")).unwrap(), "one\n");
+    assert!(!w.join("b.txt").exists());
+    // Undo of the first rewind returns to the end state.
+    checkpoint::undo(&agent.store, &repo, &r.undo).unwrap();
+    assert_eq!(std::fs::read_to_string(w.join("a.txt")).unwrap(), "three\n");
+}

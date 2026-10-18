@@ -101,6 +101,20 @@ pub enum EntryKind {
         #[serde(default)]
         notes: usize,
     },
+    /// Files as they were at the start of the run of the prompt before it (L4.15):
+    /// a git tree in the repo or shadow store. Not sent.
+    Checkpoint {
+        tree: String,
+        /// Untracked files too big to snapshot.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skipped: Vec<String>,
+    },
+    /// Outside git: a file's content before novacode first changed it (`None` =
+    /// it didn't exist), as a blob in the shadow store (L4.15). Not sent.
+    FileBefore {
+        path: String,
+        blob: Option<String>,
+    },
     /// Moves the leaf (branch navigation). Not a tree node.
     Leaf {
         target: String,

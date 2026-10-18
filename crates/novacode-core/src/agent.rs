@@ -88,6 +88,10 @@ pub struct Agent {
     memory: Option<Memory>,
     /// A compaction happened since the last request: its miss is deliberate.
     compacted: bool,
+    /// Where file checkpoints go (L4.15); `None` = off.
+    checkpoints: Option<crate::checkpoint::Repo>,
+    /// The run's snapshot, taken while the model thinks; awaited before any tool runs.
+    pending_cp: Option<tokio::task::JoinHandle<crate::checkpoint::Snapshot>>,
 }
 
 struct Memory {
@@ -270,6 +274,8 @@ impl Agent {
             quirks: Arc::new(Quirks::ephemeral()),
             memory: None,
             compacted,
+            checkpoints: None,
+            pending_cp: None,
         };
         agent.update_report();
         agent
@@ -369,6 +375,81 @@ impl Agent {
         let done = std::mem::take(&mut self.shared.warm.lock().unwrap().usage);
         for (provider, model, usage) in done {
             self.add(EntryKind::WarmUsage { provider, model, usage });
+        }
+    }
+
+    /// Take a file checkpoint at the start of every run (L4.15).
+    pub fn with_checkpoints(mut self, repo: crate::checkpoint::Repo) -> Self {
+        self.checkpoints = Some(repo);
+        self
+    }
+
+    /// Paths with a pre-image on this branch (shadow stores).
+    fn tracked_paths(&self) -> Vec<String> {
+        let mut v: Vec<String> = Vec::new();
+        for e in self.store.branch() {
+            if let EntryKind::FileBefore { path, .. } = &e.kind
+                && !v.contains(path)
+            {
+                v.push(path.clone());
+            }
+        }
+        v
+    }
+
+    fn start_checkpoint(&mut self) {
+        if let Some(repo) = self.checkpoints.clone() {
+            let tracked = self.tracked_paths();
+            self.pending_cp = Some(tokio::task::spawn_blocking(move || {
+                crate::checkpoint::snapshot(&repo, &tracked)
+            }));
+        }
+    }
+
+    /// Store the run's checkpoint once it's taken; tools wait for this.
+    async fn finish_checkpoint(&mut self) {
+        let Some(task) = self.pending_cp.take() else { return };
+        match task.await {
+            Ok(Ok((tree, skipped))) => {
+                self.add(EntryKind::Checkpoint { tree, skipped });
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "checkpoint");
+                self.emit(AgentEvent::Stream(StreamEvent::Notice(format!(
+                    "file checkpoint failed, this prompt can't rewind files: {e}"
+                ))));
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Outside git: keep a file's content before novacode first changes it.
+    fn pre_images(&mut self, prepared: &[(ToolCall, Prepared)]) {
+        let Some(repo) = self.checkpoints.clone().filter(|r| r.shadow.is_some()) else {
+            return;
+        };
+        let mut tracked = self.tracked_paths();
+        for (_, p) in prepared {
+            let Prepared::Ready(t, args, _) = p else { continue };
+            if !matches!(t.name(), "edit" | "write") {
+                continue;
+            }
+            let Some(raw) = args["path"].as_str() else { continue };
+            let abs = self.cfg.cwd.join(raw);
+            let Ok(rel) = abs.strip_prefix(&repo.root) else {
+                continue;
+            };
+            let rel = rel.to_string_lossy().to_string();
+            if tracked.contains(&rel) {
+                continue;
+            }
+            match crate::checkpoint::pre_image(&repo, &rel) {
+                Ok(blob) => {
+                    tracked.push(rel.clone());
+                    self.add(EntryKind::FileBefore { path: rel, blob });
+                }
+                Err(e) => tracing::warn!(error = %e, "pre-image"),
+            }
         }
     }
 
@@ -734,6 +815,7 @@ impl Agent {
         let cancel = CancellationToken::new();
         *self.shared.cancel.lock().unwrap() = Some(cancel.clone());
         self.emit(AgentEvent::AgentStart);
+        self.start_checkpoint();
         let mut rec = Recovery::default();
         let mut steering_only = false;
         let stop = loop {
@@ -811,6 +893,7 @@ impl Agent {
             break stop;
         };
         *self.shared.cancel.lock().unwrap() = None;
+        self.finish_checkpoint().await;
         self.set_busy(false);
         self.update_report();
         self.emit(AgentEvent::AgentEnd { stop });
@@ -968,6 +1051,9 @@ impl Agent {
                 *p = Prepared::Rejected(refusal);
             }
         }
+        // No tool may change files before the prompt's checkpoint exists (L4.15).
+        self.finish_checkpoint().await;
+        self.pre_images(&prepared);
         let sequential = prepared
             .iter()
             .any(|(_, p)| matches!(p, Prepared::Ready(t, ..) if t.sequential()));

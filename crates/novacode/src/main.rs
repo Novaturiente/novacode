@@ -490,6 +490,12 @@ impl Ctx {
         let mut agent = Agent::new(adapter, tools, store, cfg, Arc::new(LocalEnv))
             .with_policy(policy)
             .with_quirks(self.quirks.clone());
+        if s.get("checkpoints.enabled").unwrap_or(true)
+            && agent.store.path().is_some()
+            && let Some(repo) = novacode_core::checkpoint::resolve(&self.cwd, self.paths.home())
+        {
+            agent = agent.with_checkpoints(repo);
+        }
         if let Some(w) = worker {
             let mut m = novacode_core::memory::Settings::for_window(window);
             if let Some(v) = s.get("memory.observeAfterTokens") {
@@ -703,6 +709,14 @@ fn ago(t: std::time::SystemTime) -> String {
 async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> anyhow::Result<ExitCode> {
     let mut notices = Vec::new();
     let mut draft = String::new();
+    // File rewinds to undo, newest last (L4.15).
+    let undo: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let checkpoints = ctx
+        .settings
+        .get("checkpoints.enabled")
+        .unwrap_or(true)
+        .then(|| novacode_core::checkpoint::resolve(&ctx.cwd, ctx.paths.home()))
+        .flatten();
     loop {
         let (ui_tx, ui_rx) = mpsc::unbounded_channel();
         let approver: Arc<dyn Approver> = Arc::new(TuiApprover(ui_tx.clone()));
@@ -740,6 +754,7 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
         let cur = current.clone();
         let (paths, cwd, this_id) = (ctx.paths.clone(), ctx.cwd.clone(), id.clone());
         let inputs = ctx.inputs();
+        let undo_list = undo.clone();
         let (providers, limits, trace) = (ctx.providers.clone(), models::Limits::new(&ctx.settings), ctx.trace());
         tokio::spawn(async move {
             while let Some(c) = crx.recv().await {
@@ -872,6 +887,19 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
                                 value: p.id,
                             })
                             .collect();
+                        let mut items: Vec<PickItem> = items;
+                        if matches!(action, novacode_tui::app::BranchAction::Rewind)
+                            && !undo_list.lock().unwrap().is_empty()
+                        {
+                            items.insert(
+                                0,
+                                PickItem {
+                                    label: "↩ Undo the last file rewind".into(),
+                                    detail: String::new(),
+                                    value: "undo".into(),
+                                },
+                            );
+                        }
                         let _ = ui_tx.send(UiEvent::Branch(action, items));
                     }
                     Cmd::Quit => break,
@@ -920,6 +948,48 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
         model = current.lock().unwrap().0.clone();
         let prev = agent.store.path().map(Path::to_path_buf);
         let res = res?;
+        if let Exit::Rewind { at, files, chat } = &res {
+            let mut store_ = agent.store;
+            if *files {
+                match checkpoints.as_ref() {
+                    None => notices.push("file checkpoints are off (checkpoints.enabled)".into()),
+                    Some(repo) if at == "undo" => match undo.lock().unwrap().pop() {
+                        Some(t) => match novacode_core::checkpoint::undo(&store_, repo, &t) {
+                            Ok(n) => notices.push(format!("file rewind undone: {n} files restored")),
+                            Err(e) => notices.push(format!("undo failed: {e}")),
+                        },
+                        None => notices.push("nothing to undo".into()),
+                    },
+                    Some(repo) => match novacode_core::checkpoint::rewind(&store_, repo, at) {
+                        Ok(r) => {
+                            undo.lock().unwrap().push(r.undo);
+                            let mut m = format!("files rewound: {} changed", r.changed);
+                            if !r.skipped.is_empty() {
+                                m.push_str(&format!(
+                                    "; left as they are (untracked, over 1 MB): {}",
+                                    r.skipped.join(", ")
+                                ));
+                            }
+                            notices.push(m);
+                        }
+                        Err(e) => notices.push(format!("file rewind failed: {e}")),
+                    },
+                }
+            }
+            if *chat && at != "undo" {
+                let (s, err) = branch(
+                    ctx,
+                    store_,
+                    novacode_tui::app::BranchAction::Rewind,
+                    Some(at),
+                    &mut draft,
+                );
+                notices.extend(err);
+                store_ = s;
+            }
+            store = store_;
+            continue;
+        }
         if let Exit::Branch(action, at) = &res {
             let (s, err) = branch(ctx, agent.store, *action, at.as_deref(), &mut draft);
             store = s;
@@ -935,7 +1005,7 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
                 return Ok(ExitCode::SUCCESS);
             }
             Exit::New => Ok(Store::create(&ctx.paths, &ctx.cwd, ctx.cli.no_session)),
-            Exit::Branch(..) => unreachable!("handled above"),
+            Exit::Branch(..) | Exit::Rewind { .. } => unreachable!("handled above"),
             Exit::Resume(path) => Store::open(Path::new(&path)),
         };
         store = match next {
