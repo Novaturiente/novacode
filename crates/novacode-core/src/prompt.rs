@@ -37,6 +37,8 @@ pub struct Sources {
     pub agent: Option<(String, bool)>,
     /// The saved-memory index (L10.4), read once at session start so it never drifts.
     pub memory_index: Option<String>,
+    /// The active mode preset's section (L10.7); switching appends a delta.
+    pub mode: Option<String>,
 }
 
 /// What drifts during a session: compared before each run.
@@ -159,6 +161,9 @@ pub fn build(src: &Sources, environment: &str) -> Sections {
         add("memory", m.clone());
     }
     add("environment", environment.into());
+    if let Some(m) = &src.mode {
+        add("mode", m.clone());
+    }
     out
 }
 
@@ -282,6 +287,7 @@ mod tests {
             tool_guidelines: vec![],
             agent: None,
             memory_index: None,
+            mode: None,
         };
         let a = build(&src, "Date: x");
         assert_eq!(a[0], ("preamble".into(), DEFAULT_PREAMBLE.into()));

@@ -31,6 +31,7 @@ mod doctor;
 mod host;
 mod hub;
 mod models;
+mod schedule;
 mod serve;
 mod stats;
 mod status;
@@ -860,6 +861,7 @@ impl Ctx {
                     .as_ref()
                     .filter(|d| !d.prompt.is_empty())
                     .map(|d| (d.prompt.clone(), d.replace)),
+                mode: None,
                 memory_index: memories.as_ref().map(|m| {
                     m.index(
                         s.get("memory.indexItems").unwrap_or(15),
@@ -908,6 +910,12 @@ impl Ctx {
         }
         // Subagents (L10.1): not below the depth limit, and only with windows/RPC to report to.
         let place = agents::Place::from_env();
+        // `schedule` (L10.5): fires into a live session, so only with windows/RPC.
+        if let Some(slot) = &slot {
+            let sched = schedule::Schedule::from_history(&store.projection());
+            sched.run(slot.clone());
+            all.push(Arc::new(schedule::ScheduleTool(sched)));
+        }
         if let Some(slot) = slot
             && place.depth < agents::MAX_DEPTH
         {
@@ -929,6 +937,19 @@ impl Ctx {
                 exe: None,
             });
             all.push(Arc::new(agents::AgentTool::new(sup)));
+        }
+        // Mode presets and plan mode (L10.7).
+        let policy = Arc::new(policy);
+        let modes = novacode_core::modes::Modes::new(policy.clone(), s.get("modes").unwrap_or_default());
+        if let Some(a) = asker.clone() {
+            all.push(Arc::new(novacode_core::modes::EnterPlanMode {
+                modes: modes.clone(),
+                asker: a.clone(),
+            }));
+            all.push(Arc::new(novacode_core::modes::PlanComplete {
+                modes: modes.clone(),
+                asker: a,
+            }));
         }
         if let Some(m) = &memories {
             all.push(Arc::new(novacode_core::memstore::MemoryTool {
@@ -1002,7 +1023,8 @@ impl Ctx {
         let window = cfg.window_tokens;
         let worker = memory_on.then(|| self.memory_worker(&route, adapter.clone()));
         let mut agent = Agent::new(adapter, tools, store, cfg, Arc::new(LocalEnv))
-            .with_policy(policy)
+            .with_shared_policy(policy)
+            .with_modes(modes)
             .with_quirks(self.quirks.clone())
             .with_deferred(deferred)
             .with_scripted(scripted);
@@ -1409,6 +1431,7 @@ async fn start_session(
     let processes = agent.processes().cloned();
     let mcp = agent.mcp().cloned();
     let extensions = agent.extensions().cloned();
+    let modes = agent.modes().cloned();
     let (handle, task) = agent::spawn(agent);
     let hub = hub::Hub::start(handle, history, state, local);
     if let Some(e) = &extensions {
@@ -1429,6 +1452,7 @@ async fn start_session(
         processes,
         mcp,
         extensions,
+        modes,
     });
     let mut live = serve::go_live(&host, bg)?;
     live.add_task(activity::spawn(&host.hub, sinks));
@@ -1627,6 +1651,7 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
             }
         });
         let (mut commands, warn) = ctx.inputs().commands();
+        commands.extend(host::MODE_COMMANDS.iter().map(|(c, d)| (c.to_string(), d.to_string())));
         commands.extend(host.extensions.iter().flat_map(|e| e.commands()));
         notices.extend(warn);
         let base = tui_base(&ctx.paths, &ctx.settings);

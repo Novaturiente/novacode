@@ -80,6 +80,7 @@ pub struct Agent {
     events: broadcast::Sender<AgentEvent>,
     shared: Arc<Shared>,
     policy: Arc<Policy>,
+    modes: Option<Arc<crate::modes::Modes>>,
     /// `None` = nobody to ask (print mode, headless): asks become refusals or justifications.
     approver: Option<Arc<dyn Approver>>,
     /// Learned tool-schema rejections (L2.20).
@@ -304,6 +305,7 @@ impl Agent {
             events,
             shared,
             policy: Arc::new(Policy::new(Permissions::default(), home, None)),
+            modes: None,
             approver: None,
             quirks: Arc::new(Quirks::ephemeral()),
             memory: None,
@@ -836,6 +838,27 @@ impl Agent {
         self
     }
 
+    /// The shared policy (mode presets change it at run time, L10.7).
+    pub fn policy(&self) -> Arc<Policy> {
+        self.policy.clone()
+    }
+
+    /// Share an existing policy (mode presets hold it too).
+    pub fn with_shared_policy(mut self, policy: Arc<Policy>) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn modes(&self) -> Option<&Arc<crate::modes::Modes>> {
+        self.modes.as_ref()
+    }
+
+    /// Mode presets: their prompt section is applied at the start of each run.
+    pub fn with_modes(mut self, modes: Arc<crate::modes::Modes>) -> Self {
+        self.modes = Some(modes);
+        self
+    }
+
     pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
         self.approver = Some(approver);
         self
@@ -966,6 +989,9 @@ impl Agent {
                 self.tools.push(t);
             }
             self.defs = self.tools.iter().map(|t| pipeline::def(t.as_ref())).collect();
+        }
+        if let Some(m) = &self.modes {
+            self.cfg.prompt.mode = m.prompt();
         }
         refresh_prompt(&mut self.store, &self.cfg.prompt);
         self.store_warm_usage();

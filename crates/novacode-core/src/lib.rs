@@ -14,6 +14,7 @@ pub mod mcp_oauth;
 pub mod memory;
 pub mod memstore;
 pub mod metrics;
+pub mod modes;
 pub mod packages;
 pub mod pipeline;
 pub mod policy;

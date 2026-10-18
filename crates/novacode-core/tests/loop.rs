@@ -56,6 +56,7 @@ fn cfg(cwd: &Path, home: &Path) -> Config {
             tool_guidelines: vec![],
             agent: None,
             memory_index: None,
+            mode: None,
         },
         warm: false,
         metrics: false,

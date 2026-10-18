@@ -31,7 +31,17 @@ pub struct Host {
     pub processes: Option<Arc<novacode_tools::process::ProcessManager>>,
     pub mcp: Option<Arc<novacode_core::mcp::Hub>>,
     pub extensions: Option<Arc<novacode_core::extensions::Extensions>>,
+    pub modes: Option<Arc<novacode_core::modes::Modes>>,
 }
+
+/// Mode commands (L10.7), handled here so they work in every window and over RPC.
+pub const MODE_COMMANDS: &[(&str, &str)] = &[
+    (
+        "/plan",
+        "plan mode on/off (read-only until a plan is approved); /plan <task> starts planning it",
+    ),
+    ("/mode", "switch mode preset: /mode <name>, /mode off, /mode lists them"),
+];
 
 impl Host {
     /// Do `c` for a window; replies go to `ui`. `local` = the session's own TUI.
@@ -40,6 +50,11 @@ impl Host {
         let steer = matches!(c, Cmd::Steer(_));
         match c {
             Cmd::Prompt(t) | Cmd::Steer(t) if t.starts_with('!') => self.user_shell(&t, ui).await,
+            Cmd::Prompt(t) | Cmd::Steer(t) if is_mode_command(&t) => {
+                if let Some(task) = self.mode_command(&t, ui) {
+                    Box::pin(self.handle(Cmd::Prompt(task), ui, local)).await;
+                }
+            }
             Cmd::Prompt(t) | Cmd::Steer(t) if t.starts_with('/') && self.ext_command(&t, ui).await => {}
             Cmd::Prompt(t) | Cmd::Steer(t) => {
                 let t = match &self.extensions {
@@ -320,12 +335,59 @@ impl Host {
         true
     }
 
+    /// `/plan [task]` and `/mode [name|off]`. Returns a task to send after switching.
+    fn mode_command(&self, text: &str, ui: &UnboundedSender<UiEvent>) -> Option<String> {
+        let say = |text: String, error: bool| {
+            let _ = ui.send(UiEvent::Notice { text, error });
+        };
+        let Some(m) = &self.modes else {
+            say("modes are not available in this session".into(), true);
+            return None;
+        };
+        let (cmd, arg) = text
+            .trim()
+            .split_once(char::is_whitespace)
+            .map_or((text.trim(), ""), |(a, b)| (a, b.trim()));
+        let target = match (cmd, arg) {
+            ("/plan", "") if m.active().as_deref() == Some("plan") => None,
+            ("/plan", _) => Some("plan"),
+            ("/mode", "") => {
+                say(
+                    format!(
+                        "modes: {} (active: {})",
+                        m.names().join(", "),
+                        m.active().unwrap_or_else(|| "none".into())
+                    ),
+                    false,
+                );
+                return None;
+            }
+            ("/mode", "off") => None,
+            (_, name) => Some(name),
+        };
+        match m.set(target) {
+            Ok(()) => say(
+                match target {
+                    Some(n) => format!("{n} mode on (from the next step)"),
+                    None => "mode off".into(),
+                },
+                false,
+            ),
+            Err(e) => {
+                say(e, true);
+                return None;
+            }
+        }
+        (cmd == "/plan" && !arg.is_empty()).then(|| arg.to_string())
+    }
+
     /// Every slash command: built-ins, then templates and skills (L8.9).
     pub fn commands(&self) -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = novacode_tui::app::COMMANDS
             .iter()
             .map(|(c, d)| (c.to_string(), d.to_string()))
             .collect();
+        v.extend(MODE_COMMANDS.iter().map(|(c, d)| (c.to_string(), d.to_string())));
         v.extend(self.inputs.commands().0);
         v.extend(self.extensions.iter().flat_map(|e| e.commands()));
         v
@@ -401,4 +463,9 @@ impl Host {
         let file = session::dir_for(&self.paths, &self.cwd).join(format!("{}.jsonl", self.id));
         export_session(&self.paths, &file, html, None)
     }
+}
+
+fn is_mode_command(t: &str) -> bool {
+    let first = t.split_whitespace().next().unwrap_or_default();
+    MODE_COMMANDS.iter().any(|(c, _)| *c == first)
 }

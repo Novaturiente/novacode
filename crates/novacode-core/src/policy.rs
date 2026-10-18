@@ -155,6 +155,9 @@ const FILE_TOOLS: &[&str] = &["read", "write", "edit", "grep", "find", "ls"];
 /// A justification shorter than this is a blind retry, not a reason.
 const MIN_JUSTIFICATION: usize = 12;
 
+/// A mode preset's rules: (name, read-only, only these tools).
+pub type Overlay = (String, bool, Option<Vec<String>>);
+
 #[derive(Debug)]
 pub struct Policy {
     perms: Permissions,
@@ -166,6 +169,8 @@ pub struct Policy {
     /// Global settings file, for "always allow".
     global_settings: Option<PathBuf>,
     session_allow: Mutex<Vec<Rule>>,
+    /// The active mode preset (L10.7): (name, read-only, only these tools).
+    overlay: Mutex<Option<Overlay>>,
     /// Risk-gated commands the user approved for this session, verbatim.
     session_commands: Mutex<HashSet<String>>,
 }
@@ -193,6 +198,7 @@ impl Policy {
             home,
             global_settings,
             session_allow: Mutex::default(),
+            overlay: Mutex::default(),
             session_commands: Mutex::default(),
         }
     }
@@ -207,6 +213,11 @@ impl Policy {
     }
 
     /// Only these tools may run (a subagent definition's `tools`, L10.1).
+    /// Apply a mode preset's rules on top of the session's (`None` clears it).
+    pub fn set_overlay(&self, o: Option<Overlay>) {
+        *self.overlay.lock().unwrap() = o;
+    }
+
     pub fn with_tools(mut self, tools: Vec<String>) -> Self {
         self.profile.tools = Some(tools);
         self
@@ -232,6 +243,16 @@ impl Policy {
         if self.profile.deny.iter().any(|t| t.eq_ignore_ascii_case(tool)) {
             return Verdict::Deny(format!("The `{tool}` tool is not available to this agent."));
         }
+        let overlay = self.overlay.lock().unwrap().clone();
+        if let Some((name, _, Some(only))) = &overlay
+            && !only.iter().any(|t| t.eq_ignore_ascii_case(tool))
+        {
+            return Verdict::Deny(format!("The `{tool}` tool is not available in {name} mode."));
+        }
+        let read_only = self.perms.mode == Mode::ReadOnly || overlay.as_ref().is_some_and(|o| o.1);
+        let mode_name = overlay.map_or("Read-only".to_string(), |o| {
+            format!("{} mode is read-only", capitalise(&o.0))
+        });
 
         let command = (lower == "bash").then(|| args.get("command").and_then(Value::as_str).unwrap_or(""));
         let segments = command.map(|c| risk::segments(c).unwrap_or_else(|| vec![c.to_string()]));
@@ -311,14 +332,14 @@ impl Policy {
             }
         }
 
-        if self.perms.mode == Mode::ReadOnly {
+        if read_only {
             if MUTATING.contains(&lower.as_str()) {
-                return Verdict::Deny(format!("Read-only mode: `{tool}` can't change files now."));
+                return Verdict::Deny(format!("{mode_name}: `{tool}` can't change files now."));
             }
             if command.is_some() && !read_only_bash {
-                return Verdict::Deny(
-                    "Read-only mode: only read-only shell commands run now (ls, cat, grep, git status, …).".into(),
-                );
+                return Verdict::Deny(format!(
+                    "{mode_name}: only read-only shell commands run now (ls, cat, grep, git status, …)."
+                ));
             }
         }
 
@@ -378,6 +399,11 @@ fn builtin_profile(name: &str) -> Option<Profile> {
         "scout" | "reviewer" => Some(tools(&["read", "grep", "find", "ls"])),
         _ => None,
     }
+}
+
+fn capitalise(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
 }
 
 /// What "always allow" would save: `Bash(<first two words>:*)` or `Edit(<path>)`.
