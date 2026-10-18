@@ -821,3 +821,55 @@ fn images_draw_in_reserved_rows() {
     click(&mut a, row);
     assert!(draw(&mut a).1 < 10, "a second click folds it");
 }
+
+/// L11.12 budget: keypress to frame < 16 ms with extension UI active, on a long
+/// transcript. Timing-sensitive, so `scripts/bench.sh` runs it (`--ignored`), not check.sh.
+#[test]
+#[ignore]
+fn bench_frame() {
+    let mut history = Vec::new();
+    for i in 0..300 {
+        history.push(Message::user(format!("question {i}: why does `foo` fail?")));
+        history.push(assistant(
+            vec![
+                call(&format!("c{i}"), "bash", json!({"command": "cargo test"})),
+                Block::text(format!(
+                    "## Answer {i}\n\nThe **bug** is in `foo`:\n\n```rust\nfn foo() -> u32 {{ {i} }}\n```\n\n- one\n- two\n"
+                )),
+            ],
+            StopReason::Stop,
+        ));
+    }
+    let (mut a, _rx) = app(history);
+    for k in 0..5 {
+        let op = |v| serde_json::from_value(v).unwrap();
+        let ext = format!("e{k}");
+        a.on_agent(AgentEvent::Ui {
+            ext: ext.clone(),
+            op: op(json!({"op": "status", "key": ext, "text": "ready"})),
+        });
+        a.on_agent(AgentEvent::Ui {
+            ext: ext.clone(),
+            op: op(json!({"op": "widget", "key": ext, "lines": ["line a", [{"text": "b", "style": "accent"}]]})),
+        });
+    }
+    let mut t = Terminal::new(TestBackend::new(200, 60)).unwrap();
+    t.draw(|f| a.draw(f)).unwrap();
+    let mut times = Vec::new();
+    for i in 0..200 {
+        let start = std::time::Instant::now();
+        key(
+            &mut a,
+            KeyCode::Char(if i % 2 == 0 { 'x' } else { 'y' }),
+            KeyModifiers::NONE,
+        );
+        t.draw(|f| a.draw(f)).unwrap();
+        times.push(start.elapsed());
+    }
+    times.sort();
+    let p50 = times[times.len() / 2];
+    let p99 = times[times.len() * 99 / 100];
+    println!("BENCH frame_p50_ms {:.2}", p50.as_secs_f64() * 1e3);
+    println!("BENCH frame_p99_ms {:.2}", p99.as_secs_f64() * 1e3);
+    assert!(p99.as_millis() < 16, "frame p99 {p99:?} over the 16 ms budget");
+}

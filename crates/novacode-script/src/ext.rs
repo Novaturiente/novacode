@@ -545,6 +545,30 @@ mod tests {
         );
     }
 
+    /// L11.12 budget: one hook round trip < 1 ms. Run by `scripts/bench.sh` (`--ignored`).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn bench_hook() {
+        let e = load(
+            "export default (nc) => nc.on('before_tool', (ev) => ev.tool === 'bash' ? { block: 'no' } : undefined)",
+        )
+        .await
+        .unwrap();
+        let (h, t) = (e.reg.events[0].1, Duration::from_secs(2));
+        let payload = json!({"tool": "read", "args": {"path": "src/main.rs"}, "cwd": "/tmp"});
+        for _ in 0..100 {
+            e.invoke(h, &payload, t).await.unwrap();
+        }
+        let n = 5000;
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            e.invoke(h, &payload, t).await.unwrap();
+        }
+        let us = start.elapsed().as_secs_f64() * 1e6 / n as f64;
+        println!("BENCH hook_us {us:.1}");
+        assert!(us < 1000.0, "hook {us:.1} µs over the 1 ms budget");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn bad_setup_is_an_error() {
         assert!(load("throw new Error('nope')").await.unwrap_err().contains("nope"));
