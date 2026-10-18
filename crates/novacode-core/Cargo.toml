@@ -22,6 +22,9 @@ tokio-util.workspace = true
 futures-util.workspace = true
 globset = "0.4"
 schemars = { version = "1", features = ["preserve_order"] }
+htmd = "0.5"
+reqwest.workspace = true
+regex = "1"
 
 [dev-dependencies]
 novacode-base.workspace = true

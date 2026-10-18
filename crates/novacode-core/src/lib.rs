@@ -14,3 +14,4 @@ pub mod resources;
 pub mod risk;
 pub mod session;
 pub mod trust;
+pub mod web;

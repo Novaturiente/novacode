@@ -593,6 +593,12 @@ impl Ctx {
         let memory_on = s.get("memory.enabled").unwrap_or(true);
         let mut all = novacode_tools::builtins(false);
         all.push(Arc::new(novacode_tools::process::ProcessTool));
+        all.push(Arc::new(novacode_core::web::WebFetch));
+        all.push(Arc::new(novacode_core::web::WebSearch {
+            auth: Arc::new(AuthStore::new(self.paths.home().join("auth.json"))),
+            providers: self.providers.clone(),
+            searxng: s.get::<String>("web.searxngUrl"),
+        }));
         if let Some(a) = asker {
             all.push(Arc::new(novacode_tools::ask::AskUser(a)));
         }

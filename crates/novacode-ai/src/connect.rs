@@ -260,6 +260,12 @@ impl Providers {
         p.key_optional.then(|| "local server, no key needed".into())
     }
 
+    /// The API key of `provider`, if one is set (tools that call a vendor API directly).
+    pub fn api_key(&self, provider: &str) -> Option<String> {
+        let p = self.profiles.get(provider)?;
+        self.key(p).ok().flatten()
+    }
+
     /// Key order (pi): `--api-key`, then `novacode login`, then settings, then env.
     fn key(&self, p: &Profile) -> Result<Option<String>, ConnectError> {
         if let Some((_, k)) = self.cli_key.as_ref().filter(|(id, _)| *id == p.id) {
