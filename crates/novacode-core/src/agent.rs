@@ -116,6 +116,8 @@ enum Resolved {
 }
 
 struct Memory {
+    /// Where reflections are promoted across sessions (L10.4).
+    store: Option<crate::memstore::Memories>,
     worker: crate::memory::Worker,
     settings: crate::memory::Settings,
     /// The background observer run, if one is going.
@@ -553,10 +555,19 @@ impl Agent {
     /// Turn on the observer and compaction (L4.5).
     pub fn with_memory(mut self, worker: crate::memory::Worker, settings: crate::memory::Settings) -> Self {
         self.memory = Some(Memory {
+            store: None,
             worker,
             settings,
             task: None,
         });
+        self
+    }
+
+    /// Promote the observer's reflections into the project memory (L10.4).
+    pub fn with_memory_store(mut self, store: crate::memstore::Memories) -> Self {
+        if let Some(m) = self.memory.as_mut() {
+            m.store = Some(store);
+        }
         self
     }
 
@@ -573,6 +584,31 @@ impl Agent {
         let Ok(run) = task.await else { return };
         // A branch switch while it ran: the notes belong to another branch.
         if self.store.branch().iter().any(|e| e.id == run.covers) {
+            if let Some(mem) = m.store.clone() {
+                let new: Vec<String> = run
+                    .entries
+                    .iter()
+                    .filter_map(|e| match e {
+                        EntryKind::Reflections { reflections, .. } => {
+                            Some(reflections.iter().map(|r| r.content.clone()))
+                        }
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect();
+                let session = self.store.id().to_string();
+                if !new.is_empty() {
+                    tokio::task::spawn_blocking(move || {
+                        for text in new {
+                            if let Err(e) =
+                                mem.remember(crate::memstore::Scope::Project, &text, "reflection", false, &session)
+                            {
+                                tracing::warn!(%e, "memory promote");
+                            }
+                        }
+                    });
+                }
+            }
             for e in run.entries {
                 self.add(e);
             }

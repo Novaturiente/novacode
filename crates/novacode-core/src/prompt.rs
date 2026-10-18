@@ -35,6 +35,8 @@ pub struct Sources {
     pub tool_guidelines: Vec<String>,
     /// A subagent's role prompt (L10.1): (text, replaces the preamble).
     pub agent: Option<(String, bool)>,
+    /// The saved-memory index (L10.4), read once at session start so it never drifts.
+    pub memory_index: Option<String>,
 }
 
 /// What drifts during a session: compared before each run.
@@ -152,6 +154,9 @@ pub fn build(src: &Sources, environment: &str) -> Sections {
     let skills = crate::resources::render_skills(&crate::resources::skills(&src.skill_dirs).0);
     if !skills.is_empty() {
         add("skills", skills);
+    }
+    if let Some(m) = src.memory_index.as_ref().filter(|m| !m.is_empty()) {
+        add("memory", m.clone());
     }
     add("environment", environment.into());
     out
@@ -276,6 +281,7 @@ mod tests {
             skill_dirs: vec![],
             tool_guidelines: vec![],
             agent: None,
+            memory_index: None,
         };
         let a = build(&src, "Date: x");
         assert_eq!(a[0], ("preamble".into(), DEFAULT_PREAMBLE.into()));

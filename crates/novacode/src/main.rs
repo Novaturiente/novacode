@@ -829,6 +829,11 @@ impl Ctx {
             policy = policy.with_tools(t);
         }
         let (window_tokens, max_tokens) = models::Limits::new(s).of(&route);
+        // Cross-session memory (L10.4); `memory.store: false` turns it off.
+        let memories = s
+            .get::<bool>("memory.store")
+            .unwrap_or(true)
+            .then(|| novacode_core::memstore::Memories::open(self.paths.home(), &self.cwd));
         let cfg = Config {
             cwd: self.cwd.clone(),
             provider: route.provider.clone(),
@@ -855,6 +860,12 @@ impl Ctx {
                     .as_ref()
                     .filter(|d| !d.prompt.is_empty())
                     .map(|d| (d.prompt.clone(), d.replace)),
+                memory_index: memories.as_ref().map(|m| {
+                    m.index(
+                        s.get("memory.indexItems").unwrap_or(15),
+                        s.get("memory.indexChars").unwrap_or(2000),
+                    )
+                }),
             },
             redactor: {
                 let auth_path = self.paths.home().join("auth.json");
@@ -918,6 +929,12 @@ impl Ctx {
                 exe: None,
             });
             all.push(Arc::new(agents::AgentTool::new(sup)));
+        }
+        if let Some(m) = &memories {
+            all.push(Arc::new(novacode_core::memstore::MemoryTool {
+                mem: m.clone(),
+                session: store.id().to_string(),
+            }));
         }
         if memory_on && let Some(file) = store.path() {
             all.push(Arc::new(novacode_core::memory::Recall {
@@ -1045,6 +1062,9 @@ impl Ctx {
                 m.pool_target = v;
             }
             agent = agent.with_memory(w.await, m);
+            if let Some(m) = memories {
+                agent = agent.with_memory_store(m);
+            }
         }
         if let Some(a) = approver {
             agent = agent.with_approver(a);

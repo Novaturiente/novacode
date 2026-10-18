@@ -12,6 +12,7 @@ pub mod image_gen;
 pub mod mcp;
 pub mod mcp_oauth;
 pub mod memory;
+pub mod memstore;
 pub mod metrics;
 pub mod packages;
 pub mod pipeline;

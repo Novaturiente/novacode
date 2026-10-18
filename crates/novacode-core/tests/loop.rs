@@ -55,6 +55,7 @@ fn cfg(cwd: &Path, home: &Path) -> Config {
             skill_dirs: vec![],
             tool_guidelines: vec![],
             agent: None,
+            memory_index: None,
         },
         warm: false,
         metrics: false,
