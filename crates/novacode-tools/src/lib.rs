@@ -48,6 +48,31 @@ impl ToolOutput {
     }
 }
 
+/// How a tool reaches the model (L5.16). Each tool declares its default; settings
+/// (`tools.<name>.exposure`) override it (L4.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Exposure {
+    /// Declared to the model.
+    Listed,
+    /// Callable only from codemode scripts (L7.5).
+    CodemodeOnly,
+    /// Found through `tool_search` (L5.17).
+    Deferred,
+    /// Only the user and the UI use it.
+    Hidden,
+}
+
+/// The tools the model may call directly. The rest stay out of the request, so
+/// their declarations cost no tokens.
+// shortcut: non-listed tools are dropped; keep them for codemode/tool_search when those land (M9, M10).
+pub fn listed(tools: Vec<Arc<dyn Tool>>, overrides: impl Fn(&str) -> Option<Exposure>) -> Vec<Arc<dyn Tool>> {
+    tools
+        .into_iter()
+        .filter(|t| overrides(t.name()).unwrap_or(t.exposure()) == Exposure::Listed)
+        .collect()
+}
+
 /// Which end of a long output to keep (L5.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keep {
@@ -102,6 +127,10 @@ pub trait Tool: Send + Sync {
     }
     fn keep(&self) -> Keep {
         Keep::Head
+    }
+    /// Default exposure (L5.16); settings can override it.
+    fn exposure(&self) -> Exposure {
+        Exposure::Listed
     }
     fn execute<'a>(&'a self, args: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput>;
 
@@ -170,5 +199,28 @@ pub(crate) mod testutil {
                 _ => None,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod exposure_tests {
+    use super::*;
+
+    #[test]
+    fn settings_override_the_declared_exposure() {
+        let names = |t: Vec<Arc<dyn Tool>>| t.iter().map(|t| t.name().to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            names(listed(builtins(false), |_| None)).len(),
+            7,
+            "built-ins are listed by default"
+        );
+        let got = names(listed(builtins(false), |n| match n {
+            "ls" => Some(Exposure::Hidden),
+            "find" => Some(Exposure::CodemodeOnly),
+            _ => None,
+        }));
+        assert_eq!(got, ["read", "write", "edit", "bash", "grep"]);
+        let e: Exposure = serde_json::from_value(serde_json::json!("codemode-only")).unwrap();
+        assert_eq!(e, Exposure::CodemodeOnly);
     }
 }

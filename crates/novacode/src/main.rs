@@ -416,7 +416,10 @@ impl Ctx {
                 })
             },
         };
-        let mut agent = Agent::new(adapter, novacode_tools::builtins(false), store, cfg, Arc::new(LocalEnv))
+        let tools = novacode_tools::listed(novacode_tools::builtins(false), |name| {
+            self.settings.get(&format!("tools.{name}.exposure"))
+        });
+        let mut agent = Agent::new(adapter, tools, store, cfg, Arc::new(LocalEnv))
             .with_policy(policy)
             .with_quirks(self.quirks.clone());
         if let Some(a) = approver {
