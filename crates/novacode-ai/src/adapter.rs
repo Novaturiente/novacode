@@ -38,6 +38,11 @@ pub struct Request {
 /// failure as a terminal [`StreamEvent::Error`] (L2.1, "the loop never throws").
 pub trait Adapter: Send + Sync {
     fn stream(&self, req: Request, cancel: CancellationToken) -> mpsc::Receiver<StreamEvent>;
+    /// How long the provider keeps this request's prefix cached, when replaying it
+    /// with `max_tokens: 1` is a cheap way to keep it alive (L2.17 warmer). `None` = don't warm.
+    fn warm_ttl(&self, _req: &Request) -> Option<std::time::Duration> {
+        None
+    }
     /// Model ids this account can use right now (the live list, L2.10).
     fn list_models(&self) -> futures_util::future::BoxFuture<'_, Result<Vec<String>, String>> {
         Box::pin(async { Err("this provider has no model list".to_string()) })

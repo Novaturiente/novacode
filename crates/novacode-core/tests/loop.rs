@@ -54,6 +54,7 @@ fn cfg(cwd: &Path, home: &Path) -> Config {
             context_files: true,
             skill_dirs: vec![],
         },
+        warm: false,
     }
 }
 
@@ -507,4 +508,49 @@ async fn prompt_changes_are_appended_deltas() {
             .count(),
         1
     );
+}
+
+/// M6 check: a reply whose cache read falls short of the previous prompt is
+/// reported once, with its cause, in the transcript and in logs/cache-misses.jsonl.
+#[tokio::test]
+async fn cache_miss_is_named_and_logged() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let reply = |read, write| FauxReply::Message {
+        blocks: vec![Block::text("ok")],
+        stop: StopReason::Stop,
+        usage: novacode_types::Usage {
+            input: 10,
+            cache_read: read,
+            cache_write: write,
+            ..Default::default()
+        },
+    };
+    // Turn 2 reads the whole cached prompt; turn 3 reads nothing.
+    let faux = Faux::new([reply(0, 20_000), reply(20_010, 50), reply(0, 20_100)]);
+    let store = Store::create(&Paths::new(home.path()), work.path(), false);
+    let agent = Agent::new(
+        Arc::new(faux),
+        vec![],
+        store,
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    );
+    let (_agent, events) = drive(agent, &["one", "two", "three"]).await;
+    let notices: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Stream(novacode_types::StreamEvent::Notice(n)) => Some(n),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0].starts_with("cache miss: 20070 prompt tokens")
+            && notices[0].contains("(evicted by the provider: prefix unchanged"),
+        "{}",
+        notices[0]
+    );
+    let log = std::fs::read_to_string(home.path().join("logs/cache-misses.jsonl")).unwrap();
+    assert!(log.contains("\"lost\":20070"), "{log}");
 }

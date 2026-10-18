@@ -48,6 +48,8 @@ pub struct Config {
     pub redactor: Redactor,
     /// Where the system prompt's parts come from (L4.7).
     pub prompt: crate::prompt::Sources,
+    /// Keep the prompt cache warm while it pays off (L2.17, setting `cache.warm`, off by default).
+    pub warm: bool,
 }
 
 /// A model change, possibly to another provider (L2.11): everything that
@@ -101,6 +103,25 @@ struct Shared {
     next_thinking: Mutex<Option<ThinkingLevel>>,
     /// What the context holds, refreshed after each run (for `/context`).
     report: Mutex<ContextReport>,
+    /// The last request that touched the cache, for the miss detector and the warmer (L2.17).
+    sent: Mutex<Option<crate::cache::Sent>>,
+    warm: Mutex<Warm>,
+    warm_wake: Notify,
+}
+
+/// Warmer state, reset by every real request.
+#[derive(Default)]
+struct Warm {
+    adapter: Option<Arc<dyn Adapter>>,
+    /// Bumped by each real request: a warm decision made before it is stale.
+    generation: u64,
+    started: Option<Instant>,
+    busy: bool,
+    idle_warms: u32,
+    stopped: bool,
+    status: String,
+    /// Replays done since the owner last stored them: (provider, model, usage).
+    usage: Vec<(String, String, Usage)>,
 }
 
 /// Where the context window goes, in estimated tokens (L4.7 `/context`).
@@ -111,6 +132,8 @@ pub struct ContextReport {
     /// Everything after the prompt: messages, deltas, reminders.
     pub messages: u64,
     pub window: u64,
+    /// Cache warmer state, one line.
+    pub warm: String,
 }
 
 impl ContextReport {
@@ -137,6 +160,9 @@ impl ContextReport {
             pct(total),
             self.window / 1000
         );
+        if !self.warm.is_empty() {
+            let _ = write!(s, "\n\n  cache warmer: {}", self.warm);
+        }
         s
     }
 }
@@ -159,7 +185,7 @@ impl Agent {
         if store.last_thinking() != Some(cfg.thinking) {
             log_err(store.append(EntryKind::ThinkingChange { level: cfg.thinking }));
         }
-        let defs = tools
+        let defs: Vec<ToolDef> = tools
             .iter()
             .map(|t| ToolDef {
                 name: t.name().into(),
@@ -169,6 +195,26 @@ impl Agent {
             .collect();
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let shared: Arc<Shared> = Arc::default();
+        // A resumed session: its last request, so the first reply is checked for a miss too.
+        if let Some((messages, provider, model, usage, ts)) = store.last_request() {
+            let ago = Duration::from_millis(crate::session::now_ms().saturating_sub(ts));
+            *shared.sent.lock().unwrap() = Some(crate::cache::Sent {
+                req: Request {
+                    model,
+                    messages,
+                    tools: defs.clone(),
+                    max_tokens: cfg.max_tokens,
+                    cache: cfg.cache,
+                    thinking: cfg.reasoning.then_some(cfg.thinking),
+                    images: cfg.images,
+                    session: Some(store.id().to_string()),
+                },
+                provider,
+                usage,
+                at: Instant::now().checked_sub(ago).unwrap_or_else(Instant::now),
+            });
+        }
         let agent = Self {
             adapter,
             tools,
@@ -178,7 +224,7 @@ impl Agent {
             env,
             files: Arc::new(FileState::default()),
             events,
-            shared: Arc::default(),
+            shared,
             policy: Arc::new(Policy::new(Permissions::default(), home, None)),
             approver: None,
             quirks: Arc::new(Quirks::ephemeral()),
@@ -210,12 +256,73 @@ impl Agent {
             .take_while(|m| matches!(m, Message::System { .. }))
             .count();
         let messages = projection[lead..].iter().map(estimate::message).sum();
+        let warm = if self.cfg.warm {
+            self.shared.warm.lock().unwrap().status.clone()
+        } else {
+            "off (setting cache.warm)".into()
+        };
         *self.shared.report.lock().unwrap() = ContextReport {
             sections,
             tools,
             messages,
             window: self.cfg.window_tokens,
+            warm,
         };
+    }
+
+    /// Miss detection and warmer reset after a real request (L2.17).
+    fn after_request(&mut self, req: Request, usage: &Usage) {
+        let ttl = self.adapter.warm_ttl(&req);
+        let prev = self.shared.sent.lock().unwrap().take();
+        if let Some(m) = prev.and_then(|p| crate::cache::miss(&p, &self.cfg.provider, &req, usage, ttl)) {
+            let text = format!("cache miss: {} prompt tokens not read from cache ({})", m.lost, m.cause);
+            self.emit(AgentEvent::Stream(StreamEvent::Notice(text)));
+            let line = serde_json::json!({
+                "session": self.store.id(),
+                "provider": self.cfg.provider,
+                "model": self.cfg.model,
+                "lost": m.lost,
+                "cause": m.cause,
+                "usage": usage,
+            });
+            let path = self.cfg.prompt.home.join("logs").join("cache-misses.jsonl");
+            let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
+            if let Err(e) = novacode_base::storage::append_jsonl(&path, &line) {
+                tracing::warn!(%e, "cache miss log");
+            }
+        }
+        *self.shared.sent.lock().unwrap() = Some(crate::cache::Sent {
+            req,
+            provider: self.cfg.provider.clone(),
+            usage: *usage,
+            at: Instant::now(),
+        });
+        let mut w = self.shared.warm.lock().unwrap();
+        w.generation += 1;
+        w.started = Some(Instant::now());
+        w.idle_warms = 0;
+        w.stopped = ttl.is_none();
+        w.adapter = Some(self.adapter.clone());
+        w.status = if ttl.is_some() {
+            "scheduled".into()
+        } else {
+            "this provider has no cache to keep warm".into()
+        };
+        drop(w);
+        self.shared.warm_wake.notify_one();
+    }
+
+    fn set_busy(&self, busy: bool) {
+        self.shared.warm.lock().unwrap().busy = busy;
+        self.shared.warm_wake.notify_one();
+    }
+
+    /// Persist the usage of warm replays done since the last look.
+    fn store_warm_usage(&mut self) {
+        let done = std::mem::take(&mut self.shared.warm.lock().unwrap().usage);
+        for (provider, model, usage) in done {
+            self.add(EntryKind::WarmUsage { provider, model, usage });
+        }
     }
 
     pub fn with_quirks(mut self, q: Arc<Quirks>) -> Self {
@@ -342,6 +449,8 @@ impl Agent {
             self.add(EntryKind::ThinkingChange { level });
         }
         refresh_prompt(&mut self.store, &self.cfg.prompt);
+        self.store_warm_usage();
+        self.set_busy(true);
         self.update_report();
         let cancel = CancellationToken::new();
         *self.shared.cancel.lock().unwrap() = Some(cancel.clone());
@@ -416,6 +525,7 @@ impl Agent {
             break stop;
         };
         *self.shared.cancel.lock().unwrap() = None;
+        self.set_busy(false);
         self.update_report();
         self.emit(AgentEvent::AgentEnd { stop });
         let q = self.shared.queues.lock().unwrap();
@@ -461,7 +571,7 @@ impl Agent {
                 images: self.cfg.images,
                 session: Some(self.store.id().to_string()),
             };
-            let mut rx = self.adapter.stream(req, cancel.child_token());
+            let mut rx = self.adapter.stream(req.clone(), cancel.child_token());
             let mut fin = None;
             while let Some(ev) = rx.recv().await {
                 match ev {
@@ -471,6 +581,9 @@ impl Agent {
             }
             let m =
                 fin.unwrap_or_else(|| failed(&self.cfg, ErrorKind::Other, "provider stream ended without a result"));
+            if !matches!(m.stop, StopReason::Error { .. } | StopReason::Aborted) {
+                self.after_request(req, &m.usage);
+            }
             let StopReason::Error { kind } = &m.stop else { return m };
             // A tool schema the backend can't take (L2.20): strip what it named, resend at once.
             if *kind == ErrorKind::InvalidRequest
@@ -682,7 +795,13 @@ impl SessionHandle {
     }
     /// Where the context goes, as of the last finished run.
     pub fn context(&self) -> ContextReport {
-        self.shared.report.lock().unwrap().clone()
+        let mut r = self.shared.report.lock().unwrap().clone();
+        // The warmer acts between runs: read its state now, not at the last run's end.
+        let live = self.shared.warm.lock().unwrap().status.clone();
+        if !r.warm.starts_with("off") && !live.is_empty() {
+            r.warm = live;
+        }
+        r
     }
     /// Queue a prompt; delivered when the agent is idle or after the current run (follow-up).
     pub fn prompt(&self, text: impl Into<String>) {
@@ -728,6 +847,9 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
         events: agent.events.clone(),
         session_id: agent.store.id().into(),
     };
+    if agent.cfg.warm {
+        tokio::spawn(warmer(agent.shared.clone(), agent.events.clone()));
+    }
     let task = tokio::spawn(async move {
         let mut agent = agent;
         loop {
@@ -738,6 +860,8 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
             if pending {
                 agent.run().await;
             } else if *agent.shared.closed.lock().unwrap() {
+                agent.shared.warm_wake.notify_one();
+                agent.store_warm_usage();
                 break agent;
             } else {
                 agent.shared.notify.notified().await;
@@ -801,5 +925,104 @@ fn env_entry(e: crate::prompt::EnvState) -> EntryKind {
         date: e.date,
         branch: e.branch,
         head: e.head,
+    }
+}
+
+/// Replays the last request with `max_tokens: 1` shortly before its cache expires,
+/// while the expected saving beats the cost (L2.17). Stops after 60 minutes of
+/// work or 30 idle minutes since the last real request (pi's caps).
+async fn warmer(shared: Arc<Shared>, events: broadcast::Sender<AgentEvent>) {
+    use crate::cache;
+    loop {
+        if *shared.closed.lock().unwrap() {
+            return;
+        }
+        let plan = {
+            let sent = shared.sent.lock().unwrap().clone();
+            let w = shared.warm.lock().unwrap();
+            match (sent, &w.adapter, w.stopped) {
+                (Some(s), Some(a), false) => a
+                    .warm_ttl(&s.req)
+                    .and_then(cache::warm_delay)
+                    .map(|d| (s.at + d, w.generation, a.clone(), s)),
+                _ => None,
+            }
+        };
+        let Some((when, generation, adapter, sent)) = plan else {
+            shared.warm_wake.notified().await;
+            continue;
+        };
+        tokio::select! {
+            _ = tokio::time::sleep_until(when.into()) => {}
+            _ = shared.warm_wake.notified() => continue,
+        }
+        let (chance, tokens) = {
+            let mut w = shared.warm.lock().unwrap();
+            if w.generation != generation || *shared.closed.lock().unwrap() {
+                continue;
+            }
+            let age = w.started.map(|s| s.elapsed()).unwrap_or_default();
+            let cap = Duration::from_secs(if w.busy { 3600 } else { 1800 });
+            let chance = cache::return_chance(w.busy, w.idle_warms);
+            let tokens = sent.usage.prompt_total();
+            let saving = cache::warm_saving(tokens, sent.req.cache, chance);
+            let stop = if age > cap {
+                Some(format!("stopped: {} since the last request", cache::human(age)))
+            } else if saving < cache::WARM_THRESHOLD {
+                Some(format!(
+                    "stopped: a refresh of {tokens} tokens at {:.0}% return chance isn't worth it",
+                    chance * 100.0
+                ))
+            } else {
+                None
+            };
+            if let Some(why) = stop {
+                w.stopped = true;
+                w.status = why;
+                continue;
+            }
+            w.status = "refreshing".into();
+            (chance, tokens)
+        };
+        let mut req = sent.req.clone();
+        req.max_tokens = 1;
+        let mut rx = adapter.stream(req, CancellationToken::new());
+        let mut done = None;
+        while let Some(ev) = rx.recv().await {
+            if let StreamEvent::Done(m) = ev {
+                done = Some(m);
+            }
+        }
+        let mut w = shared.warm.lock().unwrap();
+        match done {
+            Some(m) if w.generation == generation => {
+                if !w.busy {
+                    w.idle_warms += 1;
+                }
+                w.status = format!(
+                    "kept {} tokens warm ({:.0}% return chance), next in about {}",
+                    m.usage.cache_read,
+                    chance * 100.0,
+                    adapter
+                        .warm_ttl(&sent.req)
+                        .and_then(cache::warm_delay)
+                        .map(cache::human)
+                        .unwrap_or_default()
+                );
+                w.usage.push((sent.provider.clone(), sent.req.model.clone(), m.usage));
+                if let Some(s) = shared.sent.lock().unwrap().as_mut() {
+                    s.at = Instant::now();
+                }
+                let _ = events.send(AgentEvent::Stream(StreamEvent::Notice(format!(
+                    "cache kept warm: {} of {tokens} prompt tokens read",
+                    m.usage.cache_read
+                ))));
+            }
+            Some(_) => {}
+            None => {
+                w.stopped = true;
+                w.status = "stopped: the warm request failed".into();
+            }
+        }
     }
 }

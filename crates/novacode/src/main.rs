@@ -401,6 +401,7 @@ impl Ctx {
             images: route.info.images,
             reasoning: route.info.reasoning,
             spill_dir: self.paths.home().join("spill"),
+            warm: self.settings.get("cache.warm").unwrap_or(false),
             prompt: novacode_core::prompt::Sources {
                 cwd: self.cwd.clone(),
                 home: self.paths.home().to_path_buf(),

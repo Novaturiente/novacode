@@ -46,6 +46,12 @@ pub enum EntryKind {
     SessionInfo {
         name: String,
     },
+    /// Usage of a cache-warming replay (L2.17): billed, but not part of the conversation.
+    WarmUsage {
+        provider: String,
+        model: String,
+        usage: novacode_types::Usage,
+    },
     /// The prompt sections a `System` message sets: the first has them all, later
     /// ones only the changed (`None` = removed) (L4.7). Not sent; the message is.
     Sections {
@@ -262,29 +268,28 @@ impl Store {
 
     /// The messages sent to the model (L4.2). Pure: same file, same output.
     pub fn projection(&self) -> Vec<Message> {
+        project(&self.path_to_leaf())
+    }
+
+    /// The last request that got a reply with usage, as far as the file can tell:
+    /// the messages sent, the route, the reply's usage and its time. Lets a resumed
+    /// session's first reply be checked for a cache miss (L2.17).
+    pub fn last_request(&self) -> Option<(Vec<Message>, String, String, novacode_types::Usage, u64)> {
         let path = self.path_to_leaf();
-        let mut edits: HashMap<&str, Option<&Message>> = HashMap::new();
-        for e in &path {
-            if let EntryKind::ContextEdit { target, replace } = &e.kind {
-                edits.insert(target, replace.as_ref());
-            }
-        }
-        let mut out = Vec::new();
-        for e in path {
-            let msg = match &e.kind {
-                EntryKind::Message { message } => message.clone(),
-                EntryKind::CustomMessage { text, .. } => Message::User {
-                    content: vec![Block::text(format!("<system-reminder>\n{text}\n</system-reminder>"))],
-                },
-                _ => continue,
-            };
-            match edits.get(e.id.as_str()) {
-                Some(None) => {}
-                Some(Some(r)) => out.push((*r).clone()),
-                None => out.push(msg),
-            }
-        }
-        out
+        let i = path.iter().rposition(
+            |e| matches!(&e.kind, EntryKind::Message { message: Message::Assistant(a) } if a.usage.prompt_total() > 0),
+        )?;
+        let EntryKind::Message {
+            message: Message::Assistant(a),
+        } = &path[i].kind
+        else {
+            return None;
+        };
+        let (provider, model) = path[..i].iter().rev().find_map(|e| match &e.kind {
+            EntryKind::ModelChange { provider, model } => Some((provider.clone(), model.clone())),
+            _ => None,
+        })?;
+        Some((project(&path[..i]), provider, model, a.usage, path[i].ts_ms))
     }
 
     /// Last recorded thinking level.
@@ -335,6 +340,32 @@ impl Store {
             _ => None,
         })
     }
+}
+
+/// Messages of a path, with context edits applied (L4.2).
+fn project(path: &[&Entry]) -> Vec<Message> {
+    let mut edits: HashMap<&str, Option<&Message>> = HashMap::new();
+    for e in path {
+        if let EntryKind::ContextEdit { target, replace } = &e.kind {
+            edits.insert(target, replace.as_ref());
+        }
+    }
+    let mut out = Vec::new();
+    for e in path {
+        let msg = match &e.kind {
+            EntryKind::Message { message } => message.clone(),
+            EntryKind::CustomMessage { text, .. } => Message::User {
+                content: vec![Block::text(format!("<system-reminder>\n{text}\n</system-reminder>"))],
+            },
+            _ => continue,
+        };
+        match edits.get(e.id.as_str()) {
+            Some(None) => {}
+            Some(Some(r)) => out.push((*r).clone()),
+            None => out.push(msg),
+        }
+    }
+    out
 }
 
 /// Session files for a cwd, newest (last written) first.

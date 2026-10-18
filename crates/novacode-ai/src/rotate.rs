@@ -154,6 +154,11 @@ impl Inner {
 }
 
 impl Adapter for Live {
+    fn warm_ttl(&self, req: &Request) -> Option<std::time::Duration> {
+        let built = self.inner.cached.lock().unwrap().as_ref().map(|b| b.2.clone());
+        built.and_then(|a| a.warm_ttl(req))
+    }
+
     fn stream(&self, req: Request, cancel: CancellationToken) -> mpsc::Receiver<StreamEvent> {
         let (tx, rx) = mpsc::channel(EVENT_BUFFER);
         let inner = self.inner.clone();

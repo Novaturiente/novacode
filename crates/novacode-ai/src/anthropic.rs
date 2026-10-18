@@ -166,6 +166,16 @@ impl Anthropic {
 }
 
 impl Adapter for Anthropic {
+    fn warm_ttl(&self, req: &Request) -> Option<std::time::Duration> {
+        // A thinking budget would be spent on the replay (pi skips these too).
+        let budget = thinking_style(&req.model) == ThinkingStyle::Budget
+            && req.thinking.is_some_and(|l| l != ThinkingLevel::Off);
+        (!budget).then_some(std::time::Duration::from_secs(match req.cache {
+            CacheRetention::Short => 300,
+            CacheRetention::Long => 3600,
+        }))
+    }
+
     fn stream(&self, req: Request, cancel: CancellationToken) -> mpsc::Receiver<StreamEvent> {
         let oauth_profile = match &self.auth {
             Auth::OAuth { profile, .. } => Some(profile.clone()),
