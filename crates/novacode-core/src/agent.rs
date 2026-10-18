@@ -165,6 +165,8 @@ struct Shared {
     warm_wake: Notify,
     /// `/compact` was asked for; the owner compacts when idle.
     compact: Mutex<bool>,
+    /// `/name`: written between runs (L4.4).
+    rename: Mutex<Option<String>>,
     /// The session's prompts as a tree, refreshed with the report (for `/tree`).
     prompts: Mutex<Vec<crate::session::PromptNode>>,
 }
@@ -1601,6 +1603,20 @@ impl SessionHandle {
         *self.shared.next_thinking.lock().unwrap() = Some(level);
     }
     /// Stop after the current run; the owner task then returns the agent.
+    /// Name the session (shown by `/resume` and `novacode agents`); applied between runs.
+    pub fn rename(&self, name: impl Into<String>) {
+        *self.shared.rename.lock().unwrap() = Some(name.into());
+        self.shared.notify.notify_one();
+    }
+
+    /// Take back the newest queued message that hasn't reached the model yet (pi's
+    /// Alt+Up). `steer` picks the steering queue, else the follow-ups.
+    pub fn dequeue(&self, steer: bool) -> bool {
+        let mut q = self.shared.queues.lock().unwrap();
+        let q = if steer { &mut q.steering } else { &mut q.follow_up };
+        q.pop_back().is_some()
+    }
+
     /// Compact now, or as soon as the running turn ends (`/compact`, L4.5).
     pub fn compact(&self) {
         *self.shared.compact.lock().unwrap() = true;
@@ -1685,6 +1701,16 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
                 !q.steering.is_empty() || !q.follow_up.is_empty() || q.wake
             };
             agent.collect_notes(false).await;
+            if let Some(name) = agent.shared.rename.lock().unwrap().take() {
+                log_err(
+                    agent
+                        .store
+                        .append(crate::session::EntryKind::SessionInfo { name: name.clone() }),
+                );
+                agent.emit(AgentEvent::Stream(StreamEvent::Notice {
+                    text: format!("session named \"{name}\""),
+                }));
+            }
             if std::mem::take(&mut *agent.shared.compact.lock().unwrap()) {
                 if agent.memory.is_none() {
                     agent.emit(AgentEvent::Stream(StreamEvent::Notice {

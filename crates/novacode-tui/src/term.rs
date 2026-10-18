@@ -140,6 +140,26 @@ pub fn external_editor(t: &mut Term, text: &str) -> std::io::Result<Option<Strin
     Ok((new != text).then_some(new))
 }
 
+/// `/login <provider>`: hand the terminal to `novacode login` (browser or device
+/// code, hidden key prompt), then come back. `true` = it logged in.
+pub fn login(t: &mut Term, provider: &str) -> std::io::Result<bool> {
+    let exe = std::env::current_exe()?;
+    // After a rebuild Linux names the running binary `<path> (deleted)`.
+    let exe = exe
+        .to_str()
+        .and_then(|p| p.strip_suffix(" (deleted)"))
+        .map_or(exe.clone(), Into::into);
+    restore();
+    let status = std::process::Command::new(exe).args(["login", provider]).status();
+    if status.as_ref().is_ok_and(|s| !s.success()) {
+        // Leave the error on screen until a key.
+        eprintln!("\npress Enter to go back");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
+    *t = enter()?;
+    Ok(status?.success())
+}
+
 /// Copy to the clipboard: OSC 52 (works over SSH and in tmux with
 /// set-clipboard on), plus wl-copy when on Wayland.
 pub fn copy(text: &str) {

@@ -274,6 +274,12 @@ impl Host {
                 let _ = ui.send(UiEvent::Branch { action, items });
             }
             Cmd::Focus(f) => self.hub.set_focus(f),
+            Cmd::Rename(name) => self.hub.handle.rename(name.trim()),
+            Cmd::Dequeue(steer) => {
+                let _ = ui.send(UiEvent::Dequeued {
+                    ok: self.hub.handle.dequeue(steer),
+                });
+            }
             Cmd::Background => {
                 let n = self.processes.as_ref().map_or(0, |pm| pm.detach_all());
                 let text = match n {
@@ -347,6 +353,7 @@ impl Host {
             "/compact" => Cmd::Compact,
             "/context" => Cmd::Context,
             "/mcp" => Cmd::Mcp,
+            "/name" if !arg.is_empty() => Cmd::Rename(arg.into()),
             "/export" => Cmd::Export(arg == "html"),
             "/model" if !arg.is_empty() => Cmd::SetModel(arg.into()),
             "/thinking" if !arg.is_empty() => match ThinkingLevel::parse(arg) {

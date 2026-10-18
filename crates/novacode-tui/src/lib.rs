@@ -71,6 +71,15 @@ pub async fn run(
             }
             app.dirty = true;
         }
+        if let Some(provider) = app.login.take() {
+            match term::login(&mut t, &provider) {
+                // New credentials load on reload; the session carries on.
+                Ok(true) => break Ok(Exit::Reload),
+                Ok(false) => app.tr.notice(format!("login to {provider} didn't finish"), true),
+                Err(e) => app.tr.notice(format!("login failed to start: {e}"), true),
+            }
+            app.dirty = true;
+        }
         if app.dirty {
             if last_draw.elapsed() >= frame {
                 // One pacer step per drawn frame (L9.7).

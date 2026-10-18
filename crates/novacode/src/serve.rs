@@ -604,6 +604,9 @@ pub async fn attach(
                 Cmd::Compact => ClientCmd::Compact,
                 Cmd::Export(html) => ClientCmd::Export { html },
                 Cmd::Mcp => ClientCmd::Prompt { text: "/mcp".into() },
+                Cmd::Rename(name) => ClientCmd::Prompt {
+                    text: format!("/name {name}"),
+                },
                 Cmd::ExtKey {
                     ext,
                     tab,
@@ -620,7 +623,12 @@ pub async fn attach(
                     height,
                 },
                 // The session-swapping commands are refused by the attached TUI itself.
-                Cmd::ListSessions | Cmd::ListPrompts(_) | Cmd::Focus(_) | Cmd::Background | Cmd::Processes => continue,
+                Cmd::ListSessions
+                | Cmd::ListPrompts(_)
+                | Cmd::Focus(_)
+                | Cmd::Background
+                | Cmd::Processes
+                | Cmd::Dequeue(_) => continue,
                 Cmd::Quit => break,
             };
             let id = matches!(cmd, ClientCmd::GetContext | ClientCmd::Export { .. }).then(|| "ui".to_string());

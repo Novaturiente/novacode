@@ -93,6 +93,9 @@ struct Cli {
     /// API key for the model's provider, for this run only (ahead of saved and env keys).
     #[arg(long, value_name = "KEY")]
     api_key: Option<String>,
+    /// Start the interactive session with this prompt (`novacode "fix the build"`).
+    #[arg(value_name = "PROMPT")]
+    initial: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -1734,6 +1737,10 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
                 h.handle(c, &ui_tx, true).await;
             }
         });
+        // `novacode "prompt"`: sent once, as if typed into the first window.
+        if let Some(p) = ctx.cli.initial.take() {
+            let _ = ctx_tx.send(Cmd::Prompt(p));
+        }
         let (mut commands, warn) = ctx.inputs().commands();
         commands.extend(host::MODE_COMMANDS.iter().map(|(c, d)| (c.to_string(), d.to_string())));
         commands.extend(host.extensions.iter().flat_map(|e| e.commands()));

@@ -46,6 +46,8 @@ pub enum A {
     FollowUp,
     MessageCopy,
     InputCopy,
+    Dequeue,
+    Reload,
     PasteImage,
     Background,
     PanelToggle,
@@ -97,6 +99,8 @@ defs! {
     FollowUp, "app.message.followUp", App, ["alt+enter"], "Queue as a follow-up";
     MessageCopy, "app.message.copy", App, ["ctrl+x"], "Copy the last reply";
     InputCopy, "app.input.copy", App, ["alt+c"], "Copy what's in the input box";
+    Dequeue, "app.message.dequeue", App, ["alt+up"], "Take back the last queued message into the editor";
+    Reload, "app.reload", App, ["alt+shift+r"], "Reload settings, keys, theme, skills and extensions";
     PasteImage, "app.clipboard.pasteImage", App, ["ctrl+v"], "Paste an image (or text) from the clipboard";
     Background, "app.process.background", App, ["ctrl+alt+b"], "Move running commands to the process manager";
     PanelToggle, "app.panel.toggle", App, ["ctrl+alt+p"], "Show or hide the side panel";

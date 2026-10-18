@@ -44,6 +44,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/clone", "new session with this whole branch"),
     ("/export", "write this branch to a file (/export html for a web page)"),
     ("/copy", "copy the last reply"),
+    ("/name", "name this session: /name <text>"),
+    (
+        "/login",
+        "log in: /login <provider> (claude, codex, antigravity, copilot, or an API-key provider)",
+    ),
     ("/ps", "processes in the process manager, with their latest output"),
     ("/mcp", "MCP servers: status and tool counts"),
     ("/reload", "re-read settings, keys, theme, skills and context files"),
@@ -124,6 +129,11 @@ pub enum Cmd {
     Processes,
     /// `/mcp`: server status page (L7.4).
     Mcp,
+    /// `/name` (L4.4).
+    Rename(String),
+    /// Alt+Up: take back the newest queued message; `true` = a steer. The host
+    /// answers with [`UiEvent::Dequeued`].
+    Dequeue(bool),
     /// A key or panel action for an extension (L9 UI API).
     ExtKey {
         ext: String,
@@ -173,6 +183,10 @@ pub enum UiEvent {
     Notice {
         text: String,
         error: bool,
+    },
+    /// Answer to [`Cmd::Dequeue`]: `false` = it already reached the model.
+    Dequeued {
+        ok: bool,
     },
     /// The level actually used (clamped to what the model supports), and a note.
     Thinking {
@@ -285,7 +299,8 @@ pub struct App {
     /// Context in use: the last reply's usage plus estimates since (L2.21).
     ctx: u64,
     /// Steering messages sent but not yet delivered.
-    pending: Vec<String>,
+    /// Queued while busy: (text, steer).
+    pending: Vec<(String, bool)>,
     /// `None` = follow the tail; otherwise (turn, line offset in turn) at the top.
     anchor: Option<(usize, usize)>,
     shown: Option<Shown>,
@@ -305,6 +320,8 @@ pub struct App {
     pub suspend: bool,
     /// Open `$EDITOR` on the prompt (needs the terminal, so the loop does it).
     pub external_editor: bool,
+    /// `/login <provider>`: the run loop hands the terminal to `novacode login`.
+    pub login: Option<String>,
     pub panel: crate::panel::Panel,
     /// Extension status segments `ext:<ext>:<key>` → (text, style).
     ext_status: std::collections::BTreeMap<String, (String, Option<String>)>,
@@ -412,6 +429,7 @@ impl App {
             exit: None,
             suspend: false,
             external_editor: false,
+            login: None,
             panel,
             ext_status: Default::default(),
             widgets: Default::default(),
@@ -460,6 +478,15 @@ impl App {
                 self.overlay = Some(Overlay::Branch(a, Picker::new(title, items)));
             }
             UiEvent::Notice { text, error } => self.tr.notice(text, error),
+            UiEvent::Dequeued { ok: true } => {
+                if let Some((t, _)) = self.pending.pop() {
+                    // The draft goes after it, so nothing typed is lost.
+                    let draft = self.editor.take().unwrap_or_default();
+                    self.editor
+                        .set_text(&if draft.is_empty() { t } else { format!("{t}\n{draft}") });
+                }
+            }
+            UiEvent::Dequeued { ok: false } => self.flash("too late: it already reached the model"),
             UiEvent::Page { title, text } => self.overlay = Some(Overlay::Pager(Pager::new(title, &text, &self.theme))),
             UiEvent::Thinking { level, note } => {
                 self.init.level = level;
@@ -532,7 +559,7 @@ impl App {
             AgentEvent::Message(m) => {
                 if let Message::User { content } = &m {
                     let text = text_of(content);
-                    if let Some(i) = self.pending.iter().position(|p| *p == text) {
+                    if let Some(i) = self.pending.iter().position(|(p, _)| *p == text) {
                         self.pending.remove(i);
                     }
                 }
@@ -924,6 +951,13 @@ impl App {
                     .notice("nothing to paste (no wl-paste/xclip, or an empty clipboard)", true),
             },
             Some(A::ExternalEditor) => self.external_editor = true,
+            Some(A::Dequeue) if self.init.attached => self.flash("Alt+Up works in the session's own window"),
+            Some(A::Dequeue) => match self.pending.last() {
+                Some((_, steer)) => self.send(Cmd::Dequeue(*steer)),
+                None => self.flash("nothing queued"),
+            },
+            Some(A::Reload) if self.init.attached => self.flash("reload works in the session's own window"),
+            Some(A::Reload) => self.exit = Some(Exit::Reload),
             Some(A::HistorySearch) => self.editor.search_history(),
             Some(A::FollowUp) => {
                 if let Some(t) = self.editor.take() {
@@ -1187,7 +1221,7 @@ impl App {
             if self.init.attached
                 && matches!(
                     cmd,
-                    "/resume" | "/new" | "/tree" | "/rewind" | "/fork" | "/clone" | "/reload" | "/restart"
+                    "/resume" | "/new" | "/tree" | "/rewind" | "/fork" | "/clone" | "/reload" | "/restart" | "/login"
                 )
             {
                 self.tr.notice(
@@ -1213,6 +1247,10 @@ impl App {
                     self.overlay = Some(Overlay::Pager(Pager::keys_help(&self.keymap, &self.theme)));
                 }
                 "/copy" => self.copy_reply(),
+                "/name" if !arg.is_empty() => self.send(Cmd::Rename(arg.to_string())),
+                "/name" => self.flash("usage: /name <text>"),
+                "/login" if !arg.is_empty() => self.login = Some(arg.to_string()),
+                "/login" => self.flash("usage: /login <provider>, e.g. /login claude"),
                 "/context" => self.send(Cmd::Context),
                 "/compact" => self.send(Cmd::Compact),
                 "/tree" => self.send(Cmd::ListPrompts(BranchAction::Tree)),
@@ -1231,7 +1269,7 @@ impl App {
             return;
         }
         if self.busy {
-            self.pending.push(text.clone());
+            self.pending.push((text.clone(), steer));
             self.send(if steer { Cmd::Steer(text) } else { Cmd::Prompt(text) });
         } else {
             self.send(Cmd::Prompt(text));
@@ -1384,7 +1422,7 @@ impl App {
             .rev()
             .take(3)
             .rev()
-            .map(|p| {
+            .map(|(p, _)| {
                 wrap::truncate(
                     vec![Span::styled(
                         format!(" ⏵ queued: {}", p.lines().next().unwrap_or("")),
