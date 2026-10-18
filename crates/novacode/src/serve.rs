@@ -120,6 +120,14 @@ async fn dispatch(host: &Arc<Host>, cmd: ClientCmd, ui: &mpsc::UnboundedSender<U
         Ok(Value::Null)
     };
     match cmd {
+        ClientCmd::Prompt { text } if text.starts_with('/') && host.slash(&text).is_some() => {
+            let cmd = host.slash(&text).unwrap()?;
+            host.handle(cmd, ui, false).await;
+            Ok(json!({ "disposition": "handled" }))
+        }
+        ClientCmd::GetCommands => Ok(json!({
+            "commands": host.commands().into_iter().map(|(name, description)| json!({"name": name, "description": description})).collect::<Vec<_>>()
+        })),
         ClientCmd::Prompt { text } => {
             let disposition = if hub.state().busy { "queued" } else { "started" };
             // Busy from hand-in, not from agent_start: a second prompt right after is queued.

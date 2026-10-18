@@ -186,8 +186,9 @@ pub struct Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientCmd {
-    /// Starts a run, or is queued as a follow-up when one is running.
-    /// Response data: `{"disposition": "started" | "queued"}`.
+    /// Starts a run, or is queued as a follow-up when one is running. A
+    /// session slash command (`/compact`, `/model x`…) runs instead of being sent.
+    /// Response data: `{"disposition": "started" | "queued" | "handled"}`.
     Prompt {
         text: String,
     },
@@ -218,6 +219,8 @@ pub enum ClientCmd {
     GetState,
     /// Response data: `{"messages": [...]}`.
     GetMessages,
+    /// Response data: `{"commands": [{"name", "description"}]}` (L8.9).
+    GetCommands,
     /// Answer approval `approval`.
     Approval {
         approval: u64,
@@ -241,6 +244,7 @@ impl ClientCmd {
             ClientCmd::Export { .. } => "export",
             ClientCmd::GetState => "get_state",
             ClientCmd::GetMessages => "get_messages",
+            ClientCmd::GetCommands => "get_commands",
             ClientCmd::Approval { .. } => "approval",
             ClientCmd::Shutdown => "shutdown",
         }

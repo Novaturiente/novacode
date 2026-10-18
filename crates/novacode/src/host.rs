@@ -197,6 +197,39 @@ impl Host {
         }
     }
 
+    /// A slash command typed over RPC or attach (L8.9): run by the session, never
+    /// sent as a prompt. `None` = not one of these (skills and templates expand later).
+    pub fn slash(&self, text: &str) -> Option<Result<Cmd, String>> {
+        let t = text.trim();
+        let (name, arg) = t
+            .split_once(char::is_whitespace)
+            .map_or((t, ""), |(a, b)| (a, b.trim()));
+        Some(Ok(match name {
+            "/compact" => Cmd::Compact,
+            "/context" => Cmd::Context,
+            "/export" => Cmd::Export(arg == "html"),
+            "/model" if !arg.is_empty() => Cmd::SetModel(arg.into()),
+            "/thinking" if !arg.is_empty() => match ThinkingLevel::parse(arg) {
+                Some(l) => Cmd::SetThinking(l),
+                None => return Some(Err(format!("unknown thinking level `{arg}`"))),
+            },
+            n if novacode_tui::app::COMMANDS.iter().any(|(c, _)| *c == n) => {
+                return Some(Err(format!("{n} works only in the session's own window")));
+            }
+            _ => return None,
+        }))
+    }
+
+    /// Every slash command: built-ins, then templates and skills (L8.9).
+    pub fn commands(&self) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = novacode_tui::app::COMMANDS
+            .iter()
+            .map(|(c, d)| (c.to_string(), d.to_string()))
+            .collect();
+        v.extend(self.inputs.commands().0);
+        v
+    }
+
     pub fn export(&self, html: bool) -> anyhow::Result<PathBuf> {
         let file = session::dir_for(&self.paths, &self.cwd).join(format!("{}.jsonl", self.id));
         export_session(&self.paths, &file, html, None)

@@ -388,7 +388,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         return serve_headless(&ctx, store, model).await;
     }
     match prompt {
-        None => interactive_loop(&ctx, store, model).await,
+        None => interactive_loop(ctx, store, model).await,
         Some(prompt) => {
             // Nobody to approve: asks become refusals, risky commands need a justification.
             let (agent, _) = ctx.agent(store, &model, None).await?;
@@ -418,6 +418,26 @@ struct Ctx {
 }
 
 impl Ctx {
+    /// `/reload` (L8.10): read trust, settings and provider config again. CLI flags stay.
+    fn reload(&mut self) -> Vec<String> {
+        // A `novacode trust` since start applies; no prompt here.
+        self.trusted = trust::resolve(
+            &TrustStore::new(self.paths.home().join("trust.json")),
+            &self.cwd,
+            self.cli.trust,
+        );
+        self.settings = Settings::load(
+            &self.paths.settings(),
+            Some(&Paths::project_settings(&self.cwd)),
+            self.trusted,
+        );
+        let mut p = Providers::load(self.paths.home(), &self.settings);
+        p.cli_key = self.providers.cli_key.clone();
+        self.providers = Arc::new(p);
+        self.quirks = Arc::new(novacode_ai::schema::Quirks::load(self.paths.home()));
+        self.settings.diagnostics().into_iter().map(|d| d.message).collect()
+    }
+
     /// Skill folders, first wins (L4.10): project (trusted only), novacode's, then the shared `~/.agents`.
     /// `.claude/skills` is never scanned (user requirement).
     fn skill_dirs(&self) -> Vec<std::path::PathBuf> {
@@ -953,6 +973,31 @@ async fn serve_headless(ctx: &Ctx, store: Store, model: String) -> anyhow::Resul
     Ok(ExitCode::SUCCESS)
 }
 
+/// `/restart` (L8.10): exec the binary on disk again, resuming this session.
+/// Returns only if exec failed.
+fn restart(id: &str) -> anyhow::Error {
+    use std::os::unix::process::CommandExt;
+    let mut args = Vec::new();
+    let mut skip = false;
+    for a in std::env::args().skip(1) {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        match a.as_str() {
+            "-c" | "--continue" => {}
+            "-r" | "--resume" => skip = true,
+            s if s.starts_with("--resume=") => {}
+            _ => args.push(a),
+        }
+    }
+    args.extend(["-r".into(), id.to_string()]);
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => return e.into(),
+    };
+    anyhow::anyhow!("restart failed: {}", std::process::Command::new(exe).args(args).exec())
+}
+
 /// `--bg`: re-run this command detached, wait for its session id, print it.
 fn spawn_bg() -> anyhow::Result<ExitCode> {
     use std::io::BufRead;
@@ -980,7 +1025,7 @@ fn spawn_bg() -> anyhow::Result<ExitCode> {
 }
 
 /// The TUI, one session at a time; /resume and /new swap the session in place.
-async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> anyhow::Result<ExitCode> {
+async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> anyhow::Result<ExitCode> {
     let mut notices = Vec::new();
     let mut draft = String::new();
     // File rewinds to undo, newest last (L4.15).
@@ -994,7 +1039,7 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
     loop {
         let (ui_tx, ui_rx) = mpsc::unbounded_channel();
         let (live, task) = start_session(
-            ctx,
+            &ctx,
             store,
             &model,
             Some(ui_tx.clone()),
@@ -1092,7 +1137,7 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
             }
             if *chat && at != "undo" {
                 let (s, err) = branch(
-                    ctx,
+                    &ctx,
                     store_,
                     novacode_tui::app::BranchAction::Rewind,
                     Some(at),
@@ -1105,10 +1150,20 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
             continue;
         }
         if let Exit::Branch(action, at) = &res {
-            let (s, err) = branch(ctx, agent.store, *action, at.as_deref(), &mut draft);
+            let (s, err) = branch(&ctx, agent.store, *action, at.as_deref(), &mut draft);
             store = s;
             notices.extend(err);
             continue;
+        }
+        if res == Exit::Reload {
+            notices.extend(ctx.reload());
+            notices.push("reloaded settings, keys, theme, skills and context files".into());
+            store = agent.store;
+            continue;
+        }
+        if res == Exit::Restart {
+            drop(agent);
+            return Err(restart(&id));
         }
         drop(agent);
         let next = match res {
@@ -1119,7 +1174,7 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
                 return Ok(ExitCode::SUCCESS);
             }
             Exit::New => Ok(Store::create(&ctx.paths, &ctx.cwd, ctx.cli.no_session)),
-            Exit::Branch(..) | Exit::Rewind { .. } => unreachable!("handled above"),
+            Exit::Branch(..) | Exit::Rewind { .. } | Exit::Reload | Exit::Restart => unreachable!("handled above"),
             Exit::Resume(path) => Store::open(Path::new(&path)),
         };
         store = match next {

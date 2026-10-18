@@ -28,7 +28,8 @@ const COMPLETE_ROWS: usize = 8;
 const FILE_CAP: usize = 20_000;
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Slash commands typed in the editor (L8.9 registry arrives in M8).
+/// Built-in slash commands (L8.9). Skill and template commands come from the
+/// host (`Init.commands`); over RPC the host runs the session ones itself.
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/model", "pick a model, or /model <id>"),
     ("/thinking", "pick a thinking level, or /thinking <level>"),
@@ -43,6 +44,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/clone", "new session with this whole branch"),
     ("/export", "write this branch to a file (/export html for a web page)"),
     ("/copy", "copy the last reply"),
+    ("/reload", "re-read settings, keys, theme, skills and context files"),
+    ("/restart", "restart novacode (a new build) and resume this session"),
     ("/quit", "quit"),
 ];
 
@@ -163,6 +166,10 @@ pub enum Exit {
         files: bool,
         chat: bool,
     },
+    /// `/reload` (L8.10): same session, settings read again.
+    Reload,
+    /// `/restart` (L8.10): exec the binary again on this session.
+    Restart,
 }
 
 /// What picking a prompt does (L4.3).
@@ -870,7 +877,12 @@ impl App {
         let mut words = text.trim().splitn(2, char::is_whitespace);
         let (cmd, arg) = (words.next().unwrap_or(""), words.next().map(str::trim).unwrap_or(""));
         if COMMANDS.iter().any(|(c, _)| *c == cmd) || cmd == "/exit" || cmd == "/help" {
-            if self.init.attached && matches!(cmd, "/resume" | "/new" | "/tree" | "/rewind" | "/fork" | "/clone") {
+            if self.init.attached
+                && matches!(
+                    cmd,
+                    "/resume" | "/new" | "/tree" | "/rewind" | "/fork" | "/clone" | "/reload" | "/restart"
+                )
+            {
                 self.tr.notice(
                     format!("{cmd} works in the session's own window, not an attached one"),
                     true,
@@ -886,6 +898,8 @@ impl App {
                 "/thinking" => self.pick_thinking(),
                 "/resume" => self.send(Cmd::ListSessions),
                 "/new" => self.exit = Some(Exit::New),
+                "/reload" => self.exit = Some(Exit::Reload),
+                "/restart" => self.exit = Some(Exit::Restart),
                 "/keys" | "/help" => {
                     self.overlay = Some(Overlay::Pager(Pager::keys_help(&self.keymap, &self.theme)));
                 }

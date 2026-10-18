@@ -199,7 +199,7 @@ impl Store {
     }
 
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let lock = storage::try_lock(path)?.ok_or_else(|| StoreError::Busy(path.display().to_string()))?;
+        let lock = lock_session(path)?.ok_or_else(|| StoreError::Busy(path.display().to_string()))?;
         let mut f = std::fs::OpenOptions::new().read(true).append(true).open(path)?;
         let mut text = String::new();
         f.read_to_string(&mut text)?;
@@ -289,7 +289,7 @@ impl Store {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let lock = storage::try_lock(path)?.ok_or_else(|| StoreError::Busy(self.header.id.clone()))?;
+        let lock = lock_session(path)?.ok_or_else(|| StoreError::Busy(self.header.id.clone()))?;
         let mut buf = serde_json::to_string(&self.header).map_err(io::Error::other)?;
         buf.push('\n');
         for e in &self.entries {
@@ -623,6 +623,18 @@ pub fn summary(path: &Path) -> Option<Summary> {
 }
 
 /// Find a session by id prefix: this cwd first, then every cwd.
+/// The session's lock, retried for up to ~100 ms: a child forked by another
+/// thread (bash, git) briefly holds a copy of a just-released lock until it execs.
+fn lock_session(path: &Path) -> io::Result<Option<storage::FileLock>> {
+    for _ in 0..5 {
+        if let Some(l) = storage::try_lock(path)? {
+            return Ok(Some(l));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    storage::try_lock(path)
+}
+
 pub fn find(paths: &Paths, cwd: &Path, prefix: &str) -> Result<PathBuf, StoreError> {
     // A session file path works too (tmux restore stores the file, L8.14).
     if prefix.ends_with(".jsonl") && Path::new(prefix).is_file() {
