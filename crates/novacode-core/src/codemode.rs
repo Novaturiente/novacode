@@ -75,9 +75,40 @@ impl Nested for Runner {
 }
 
 /// The tool; `store`/`load` values live for the session (shortcut: lost on restart).
-#[derive(Default)]
 pub struct Codemode {
     pub store: Mutex<Map<String, Value>>,
+    description: String,
+}
+
+const DESCRIPTION: &str = "Run a short JavaScript/TypeScript script that calls tools, to chain several calls (or MCP calls) and return only the result you need. \
+`await tools.<name>(args)` calls a tool (resolves to its text output, throws on error); `await mcp.<server>.<tool>(args)` calls an MCP tool (`mcp.server[\"tool-name\"]` for dashed names). \
+Use `Promise.all` for parallel calls. Only `text(v)`, `console.log(...)`, `image(dataUrl)` and the `return` value reach you. \
+`await searchTools(query)`, `await describeTool(name)` and `await describeNamespace(server)` show what exists and its argument types. `store(key, v)`/`load(key)` keep JSON across scripts.";
+
+impl Codemode {
+    /// `servers`: MCP (name, description), fixed for the session so the tool list stays cacheable.
+    pub fn new(servers: &[(String, String)]) -> Self {
+        let mut description = DESCRIPTION.to_string();
+        if !servers.is_empty() {
+            description.push_str("\nMCP servers (describeNamespace for their tools):");
+            for (n, d) in servers {
+                description.push_str(&format!(
+                    "\n- {n}{}",
+                    if d.is_empty() { String::new() } else { format!(": {d}") }
+                ));
+            }
+        }
+        Codemode {
+            store: Mutex::default(),
+            description,
+        }
+    }
+}
+
+impl Default for Codemode {
+    fn default() -> Self {
+        Self::new(&[])
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -182,10 +213,7 @@ impl Tool for Codemode {
         NAME
     }
     fn description(&self) -> &str {
-        "Run a short JavaScript/TypeScript script that calls tools, to chain several calls (or MCP calls) and return only the result you need. \
-`await tools.<name>(args)` calls a tool (resolves to its text output, throws on error); `await mcp.<server>.<tool>(args)` calls an MCP tool. \
-Use `Promise.all` for parallel calls. Only `text(v)`, `console.log(...)`, `image(dataUrl)` and the `return` value reach you. \
-`searchTools(query)`, `describeTool(name)` and `describeNamespace(server)` show what exists and its argument types. `store(key, v)`/`load(key)` keep JSON across scripts."
+        &self.description
     }
     fn schema(&self) -> Value {
         novacode_tools::schema_for::<Args>()

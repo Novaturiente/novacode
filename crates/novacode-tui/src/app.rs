@@ -45,6 +45,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/export", "write this branch to a file (/export html for a web page)"),
     ("/copy", "copy the last reply"),
     ("/ps", "processes in the process manager, with their latest output"),
+    ("/mcp", "MCP servers: status and tool counts"),
     ("/reload", "re-read settings, keys, theme, skills and context files"),
     ("/restart", "restart novacode (a new build) and resume this session"),
     ("/quit", "quit"),
@@ -107,6 +108,8 @@ pub enum Cmd {
     Background,
     /// `/ps`: the host answers with a page of processes (L5.11).
     Processes,
+    /// `/mcp`: server status page (L7.4).
+    Mcp,
     Quit,
 }
 
@@ -973,6 +976,7 @@ impl App {
                 "/new" => self.exit = Some(Exit::New),
                 "/reload" => self.exit = Some(Exit::Reload),
                 "/ps" => self.send(Cmd::Processes),
+                "/mcp" => self.send(Cmd::Mcp),
                 "/restart" => self.exit = Some(Exit::Restart),
                 "/keys" | "/help" => {
                     self.overlay = Some(Overlay::Pager(Pager::keys_help(&self.keymap, &self.theme)));

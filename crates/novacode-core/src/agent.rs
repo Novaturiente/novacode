@@ -98,6 +98,8 @@ pub struct Agent {
     deferred: Vec<Arc<dyn Tool>>,
     /// Codemode-only tools (L5.16).
     scripted: Vec<Arc<dyn Tool>>,
+    /// MCP servers (L7.4); scripts see tools of servers that connected after start too.
+    mcp: Option<Arc<crate::mcp::Hub>>,
 }
 
 /// Where a model's tool call goes (L5.17).
@@ -291,6 +293,7 @@ impl Agent {
             processes: None,
             deferred: Vec::new(),
             scripted: Vec::new(),
+            mcp: None,
             pending_cp: None,
         };
         agent.update_report();
@@ -788,6 +791,15 @@ impl Agent {
         pipeline::authorize(&self.policy, self.approver.as_ref(), &call.name, args, &self.cfg.cwd).await
     }
 
+    pub fn with_mcp(mut self, hub: Arc<crate::mcp::Hub>) -> Self {
+        self.mcp = Some(hub);
+        self
+    }
+
+    pub fn mcp(&self) -> Option<&Arc<crate::mcp::Hub>> {
+        self.mcp.as_ref()
+    }
+
     /// Everything codemode scripts may call besides the listed tools (L5.16).
     pub fn with_scripted(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.scripted = tools;
@@ -1162,7 +1174,7 @@ impl Agent {
             .iter()
             .any(|(_, p)| matches!(p, Prepared::Ready(t, ..) if t.name() == crate::codemode::NAME))
         {
-            let tools: Vec<Arc<dyn Tool>> = self
+            let mut tools: Vec<Arc<dyn Tool>> = self
                 .tools
                 .iter()
                 .chain(&self.deferred)
@@ -1170,6 +1182,13 @@ impl Agent {
                 .filter(|t| t.name() != crate::codemode::NAME)
                 .cloned()
                 .collect();
+            if let Some(hub) = &self.mcp {
+                for t in hub.tools() {
+                    if t.exposure() != novacode_tools::Exposure::Hidden && !tools.iter().any(|x| x.name() == t.name()) {
+                        tools.push(t);
+                    }
+                }
+            }
             base.nested = Some(Arc::new(crate::codemode::Runner {
                 tools,
                 policy: self.policy.clone(),

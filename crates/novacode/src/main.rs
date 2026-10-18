@@ -163,12 +163,36 @@ enum Command {
         #[arg(long)]
         turns: bool,
     },
+    /// MCP servers: list (connects to each), add, remove (L7.4).
+    Mcp {
+        #[command(subcommand)]
+        what: McpCmd,
+    },
     /// Trust a folder's project config (default: the current folder); --revoke to distrust it.
     Trust {
         path: Option<std::path::PathBuf>,
         #[arg(long)]
         revoke: bool,
     },
+}
+
+#[derive(clap::Subcommand, Clone)]
+enum McpCmd {
+    /// Every configured server with its status and tools.
+    List,
+    /// Add a stdio server to ~/.novacode/mcp.json: `novacode mcp add name -- cmd args…`, or --url for HTTP.
+    Add {
+        name: String,
+        #[arg(long)]
+        url: Option<String>,
+        /// KEY=VALUE environment for the server (repeatable).
+        #[arg(long = "env")]
+        env: Vec<String>,
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Remove a server from ~/.novacode/mcp.json.
+    Remove { name: String },
 }
 
 fn parse_mode(s: &str) -> Result<Mode, String> {
@@ -192,6 +216,102 @@ fn main() -> ExitCode {
     match rt.block_on(run(cli, paths)) {
         Ok(code) => code,
         Err(e) => fail(e),
+    }
+}
+
+async fn mcp_command(paths: &Paths, what: McpCmd) -> anyhow::Result<ExitCode> {
+    use novacode_core::mcp;
+    match what {
+        McpCmd::List => {
+            let cwd = std::env::current_dir()?;
+            let trusted = trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &cwd, false);
+            let (servers, warnings) = mcp::load(paths.home(), &cwd, trusted);
+            for w in warnings {
+                eprintln!("warning: {w}");
+            }
+            if !trusted && mcp::project_file(&cwd).is_some() {
+                eprintln!("note: this folder's .mcp.json is ignored (not trusted)");
+            }
+            if servers.is_empty() {
+                println!("no MCP servers (add one with `novacode mcp add name -- command args…`)");
+                return Ok(ExitCode::SUCCESS);
+            }
+            let sources: Vec<_> = servers.iter().map(|s| (s.name.clone(), s.source.clone())).collect();
+            let hub = mcp::Hub::start(servers, paths.home(), &cwd);
+            hub.settle().await;
+            let tools = hub.tools();
+            let mut bad = false;
+            for (name, status, n, _) in hub.status() {
+                let src = sources
+                    .iter()
+                    .find(|(s, _)| *s == name)
+                    .map(|(_, p)| p.display().to_string())
+                    .unwrap_or_default();
+                let st = match status {
+                    mcp::Status::Ready => "ready".to_string(),
+                    mcp::Status::Connecting => "connecting".into(),
+                    mcp::Status::Failed(e) => {
+                        bad = true;
+                        format!("failed: {e}")
+                    }
+                };
+                println!("{name}  {st}  {n} tools  ({src})");
+                let mine: Vec<_> = tools
+                    .iter()
+                    .filter(|t| t.name().starts_with(&format!("{name}__")))
+                    .collect();
+                for t in mine.iter().take(15) {
+                    let ex = match t.exposure() {
+                        novacode_tools::Exposure::Listed => "listed",
+                        novacode_tools::Exposure::CodemodeOnly => "codemode-only",
+                        novacode_tools::Exposure::Deferred => "deferred",
+                        novacode_tools::Exposure::Hidden => "hidden",
+                    };
+                    println!("  {}  [{ex}]", t.name());
+                }
+                if mine.len() > 15 {
+                    println!("  … {} more", mine.len() - 15);
+                }
+            }
+            Ok(if bad { ExitCode::from(1) } else { ExitCode::SUCCESS })
+        }
+        McpCmd::Add {
+            name,
+            url,
+            env,
+            command,
+        } => {
+            let mut v = serde_json::Map::new();
+            match (url, command.split_first()) {
+                (Some(u), _) => {
+                    v.insert("url".into(), u.into());
+                }
+                (None, Some((cmd, args))) => {
+                    v.insert("command".into(), cmd.clone().into());
+                    v.insert("args".into(), serde_json::json!(args));
+                }
+                (None, None) => anyhow::bail!("give a command after `--`, or --url"),
+            }
+            let env: serde_json::Map<String, serde_json::Value> = env
+                .iter()
+                .filter_map(|kv| kv.split_once('=').map(|(k, val)| (k.to_string(), val.into())))
+                .collect();
+            if !env.is_empty() {
+                v.insert("env".into(), env.into());
+            }
+            mcp::edit_global(paths.home(), &name, Some(v.into()))?;
+            eprintln!("added `{name}` to {}", paths.home().join("mcp.json").display());
+            Ok(ExitCode::SUCCESS)
+        }
+        McpCmd::Remove { name } => {
+            if mcp::edit_global(paths.home(), &name, None)? {
+                eprintln!("removed `{name}`");
+                Ok(ExitCode::SUCCESS)
+            } else {
+                eprintln!("no server `{name}` in {}", paths.home().join("mcp.json").display());
+                Ok(ExitCode::from(1))
+            }
+        }
     }
 }
 
@@ -288,6 +408,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
             return models::command(&Arc::new(Providers::load(paths.home(), &settings)), filter, all).await;
         }
+        Some(Command::Mcp { what }) => return mcp_command(&paths, what).await,
         Some(Command::Trust { path, revoke }) => {
             let dir = std::fs::canonicalize(path.unwrap_or(std::env::current_dir()?))?;
             let trust = TrustStore::new(paths.home().join("trust.json"));
@@ -621,7 +742,20 @@ impl Ctx {
                 file: file.to_path_buf(),
             }));
         }
-        all.push(Arc::new(novacode_core::codemode::Codemode::default()));
+        let (servers, mcp_warnings) = novacode_core::mcp::load(self.paths.home(), &self.cwd, self.trusted);
+        let described: Vec<(String, String)> = servers
+            .iter()
+            .filter(|s| s.config.exposure != Some(novacode_tools::Exposure::Hidden))
+            .map(|s| (s.name.clone(), s.config.description.clone().unwrap_or_default()))
+            .collect();
+        all.push(Arc::new(novacode_core::codemode::Codemode::new(&described)));
+        for w in &mcp_warnings {
+            tracing::warn!("mcp config: {w}");
+        }
+        let mcp = (!servers.is_empty()).then(|| novacode_core::mcp::Hub::start(servers, self.paths.home(), &self.cwd));
+        if let Some(h) = &mcp {
+            all.extend(h.tools());
+        }
         let novacode_tools::Exposed {
             listed: mut tools,
             deferred,
@@ -643,6 +777,9 @@ impl Ctx {
             .with_quirks(self.quirks.clone())
             .with_deferred(deferred)
             .with_scripted(scripted);
+        if let Some(h) = mcp {
+            agent = agent.with_mcp(h);
+        }
         if s.get("checkpoints.enabled").unwrap_or(true)
             && agent.store.path().is_some()
             && let Some(repo) = novacode_core::checkpoint::resolve(&self.cwd, self.paths.home())
@@ -923,6 +1060,7 @@ async fn start_session(
     let id = agent.store.id().to_string();
     let level = state.level;
     let processes = agent.processes().cloned();
+    let mcp = agent.mcp().cloned();
     let (handle, task) = agent::spawn(agent);
     let hub = hub::Hub::start(handle, history, state, local);
     let _ = slot.0.set(Arc::downgrade(&hub));
@@ -938,6 +1076,7 @@ async fn start_session(
         limits: models::Limits::new(&ctx.settings),
         trace: ctx.trace(),
         processes,
+        mcp,
     });
     let mut live = serve::go_live(&host, bg)?;
     live.add_task(activity::spawn(&host.hub, sinks));

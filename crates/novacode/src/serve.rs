@@ -478,6 +478,7 @@ pub async fn attach(paths: &Paths, prefix: &str, base: crate::TuiBase) -> anyhow
                 Cmd::Context => ClientCmd::GetContext,
                 Cmd::Compact => ClientCmd::Compact,
                 Cmd::Export(html) => ClientCmd::Export { html },
+                Cmd::Mcp => ClientCmd::Prompt { text: "/mcp".into() },
                 // The session-swapping commands are refused by the attached TUI itself.
                 Cmd::ListSessions | Cmd::ListPrompts(_) | Cmd::Focus(_) | Cmd::Background | Cmd::Processes => continue,
                 Cmd::Quit => break,

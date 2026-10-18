@@ -112,9 +112,10 @@ const PRELUDE: &str = r#"
   }
   globalThis.mcp = new Proxy(spaces, { get(o, s) { if (typeof s !== "string" || s === "then") return undefined; if (!(s in o)) throw new Error(`unknown MCP server '${s}'. Servers: ${Object.keys(o).join(", ") || "none"}`); return o[s]; } });
   globalThis.ALL_TOOLS = list.map((t) => ({ name: t.namespace ? `mcp.${t.namespace}.${t.name.slice(t.namespace.length + 2)}` : t.name, description: t.description }));
-  globalThis.searchTools = (q, opts) => parse(bridge.search(String(q ?? ""), Number((opts && opts.limit) || 10)));
-  globalThis.describeTool = (n) => { const r = bridge.describe(String(n)); return r === "" ? undefined : r; };
-  globalThis.describeNamespace = (s) => { const r = bridge.namespace(String(s)); return r === "" ? undefined : r; };
+  // Async like everything else a script awaits, so `.then`/`.catch` work too.
+  globalThis.searchTools = async (q, opts) => parse(bridge.search(String(q ?? ""), Number((opts && opts.limit) || 10)));
+  globalThis.describeTool = async (n) => { const r = bridge.describe(String(n)); return r === "" ? undefined : r; };
+  globalThis.describeNamespace = async (s) => { const r = bridge.namespace(String(s)); return r === "" ? undefined : r; };
   globalThis.store = (k, v) => { bridge.set(String(k), stringify(v === undefined ? null : v)); return v; };
   globalThis.load = (k) => { const r = bridge.get(String(k)); return r === "" ? undefined : parse(r); };
 })
@@ -618,7 +619,7 @@ mod tests {
         let o = go("const r: number = (await tools.read({q: 'x'})).args.q.length; return r;").await;
         assert_eq!(o.result, Some(json!(1)), "TypeScript is accepted: {:?}", o.error);
         let o =
-            go("return [searchTools('search')[0].name, describeTool('mcp.ctx7.search').includes('q: string')];").await;
+            go("return [(await searchTools('search'))[0].name, (await describeTool('mcp.ctx7.search')).includes('q: string')];").await;
         assert_eq!(o.result, Some(json!(["mcp.ctx7.search", true])));
     }
 

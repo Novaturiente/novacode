@@ -29,6 +29,7 @@ pub struct Host {
     pub limits: models::Limits,
     pub trace: Option<Trace>,
     pub processes: Option<Arc<novacode_tools::process::ProcessManager>>,
+    pub mcp: Option<Arc<novacode_core::mcp::Hub>>,
 }
 
 impl Host {
@@ -230,6 +231,29 @@ impl Host {
                     text,
                 });
             }
+            Cmd::Mcp => {
+                use novacode_core::mcp::Status;
+                let text = match &self.mcp {
+                    None => "no MCP servers (add one with `novacode mcp add name -- command args…`)".to_string(),
+                    Some(h) => h
+                        .status()
+                        .into_iter()
+                        .map(|(name, st, n, d)| {
+                            let st = match st {
+                                Status::Ready => "ready".to_string(),
+                                Status::Connecting => "connecting…".into(),
+                                Status::Failed(e) => format!("failed: {e}"),
+                            };
+                            format!("{name}  {st}  {n} tools\n  {d}\n  log: ~/.novacode/logs/mcp-{name}.log\n")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                };
+                let _ = ui.send(UiEvent::Page {
+                    title: "MCP servers".into(),
+                    text,
+                });
+            }
             Cmd::Quit => {}
         }
     }
@@ -244,6 +268,7 @@ impl Host {
         Some(Ok(match name {
             "/compact" => Cmd::Compact,
             "/context" => Cmd::Context,
+            "/mcp" => Cmd::Mcp,
             "/export" => Cmd::Export(arg == "html"),
             "/model" if !arg.is_empty() => Cmd::SetModel(arg.into()),
             "/thinking" if !arg.is_empty() => match ThinkingLevel::parse(arg) {

@@ -123,6 +123,11 @@ fn kill_group(pid: u32) {
     );
 }
 
+/// SIGKILL a process group at once (MCP servers on shutdown).
+pub fn kill_group_now(pid: u32) {
+    kill_group_hard(pid);
+}
+
 fn kill_group_hard(pid: u32) {
     let _ = nix::sys::signal::killpg(
         nix::unistd::Pid::from_raw(pid as i32),
