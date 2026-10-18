@@ -116,6 +116,18 @@ const PRELUDE: &str = r#"
   globalThis.searchTools = async (q, opts) => parse(bridge.search(String(q ?? ""), Number((opts && opts.limit) || 10)));
   globalThis.describeTool = async (n) => { const r = bridge.describe(String(n)); return r === "" ? undefined : r; };
   globalThis.describeNamespace = async (s) => { const r = bridge.namespace(String(s)); return r === "" ? undefined : r; };
+  // Non-chat models (L2.26): classifiers, through the `classify` tool. Errors come back
+  // in stopReason/errorMessage, as in pi.
+  if (names.has("classify")) {
+    const spec = (m) => typeof m === "string" ? m : `${m.provider}/${m.id}`;
+    const avail = async (type, provider) => type !== "classifier" ? [] : (await call("classify", { list: true })).filter((m) => !provider || m.provider === provider).map((m) => ({ ...m, type: "classifier" }));
+    globalThis.models = Object.freeze({
+      getAvailableOfType: avail,
+      getModelsOfType: avail,
+      getModelOfType: async (type, provider, id) => (await avail(type, provider)).find((m) => m.id === id),
+      classify: (model, context) => call("classify", { ...context, model: spec(model) }),
+    });
+  }
   globalThis.store = (k, v) => { bridge.set(String(k), stringify(v === undefined ? null : v)); return v; };
   globalThis.load = (k) => { const r = bridge.get(String(k)); return r === "" ? undefined : parse(r); };
 })
@@ -572,6 +584,49 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         )
         .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn models_classify_goes_through_the_classify_tool() {
+        let mut list = tools();
+        list.push(ToolInfo {
+            name: "classify".into(),
+            description: String::new(),
+            schema: json!({}),
+            namespace: None,
+        });
+        let o = run(
+            "const m = await models.getModelOfType('classifier', 'x', 'jev');
+             const r = await models.classify(m, {state: {a: 1}, questions: {}});
+             return [m.type, r.tool, r.args.model, r.args.state.a, (await models.getAvailableOfType('image')).length];",
+            Arc::new(Fake),
+            list,
+            Map::new(),
+            Limits::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        assert_eq!(
+            o.result,
+            Some(json!(["classifier", "classify", "x/jev", 1, 0])),
+            "{:?}",
+            o.error
+        );
+        // Without the tool, there is no `models` global.
+        assert_eq!(go("return typeof models").await.result, Some(json!("undefined")));
+    }
+
+    struct Fake;
+    impl Host for Fake {
+        fn call(&self, name: String, args: Value) -> BoxFuture<'static, Result<Value, String>> {
+            Box::pin(async move {
+                if args["list"] == true {
+                    Ok(json!([{"provider": "x", "id": "jev"}]))
+                } else {
+                    Ok(json!({ "tool": name, "args": args }))
+                }
+            })
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

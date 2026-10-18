@@ -835,6 +835,10 @@ impl Ctx {
         let mut all = novacode_tools::builtins(false);
         all.push(Arc::new(novacode_tools::process::ProcessTool));
         all.push(Arc::new(novacode_core::web::WebFetch));
+        // Codemode-only: scripts call it as models.classify().
+        all.push(Arc::new(novacode_core::classifier::Classify::new(
+            self.providers.clone(),
+        )));
         all.push(Arc::new(novacode_core::image_gen::GenerateImage {
             auth: Arc::new(AuthStore::new(self.paths.home().join("auth.json"))),
             providers: self.providers.clone(),
@@ -1048,6 +1052,7 @@ async fn print_mode(
         file: agent.store.path().map(|p| p.display().to_string()),
         ..Default::default()
     };
+    let exts = agent.extensions().cloned();
     let (handle, task) = agent::spawn(agent);
     let mut events = handle.subscribe();
     let mut out_json = json.then(std::io::stdout);
@@ -1068,6 +1073,18 @@ async fn print_mode(
             on_ctrl_c.abort();
         }
     });
+    let prompt = match exts {
+        Some(e) => match e.input(&prompt, false).await {
+            Some(p) => p,
+            None => {
+                eprintln!("(an extension handled the prompt)");
+                handle.shutdown();
+                let _ = task.await;
+                return Ok(ExitCode::SUCCESS);
+            }
+        },
+        None => prompt,
+    };
     let (blocks, notes) = attach(prompt, cwd, &inputs).await;
     for n in notes {
         eprintln!("{n}");

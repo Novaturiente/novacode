@@ -42,6 +42,13 @@ impl Host {
             Cmd::Prompt(t) | Cmd::Steer(t) if t.starts_with('!') => self.user_shell(&t, ui).await,
             Cmd::Prompt(t) | Cmd::Steer(t) if t.starts_with('/') && self.ext_command(&t, ui).await => {}
             Cmd::Prompt(t) | Cmd::Steer(t) => {
+                let t = match &self.extensions {
+                    Some(e) => match e.input(&t, steer).await {
+                        Some(t) => t,
+                        None => return, // an extension handled it
+                    },
+                    None => t,
+                };
                 let (blocks, notes) = attach(t, self.cwd.clone(), &self.inputs).await;
                 for n in notes {
                     let error = !n.starts_with("attached");

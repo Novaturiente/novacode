@@ -91,7 +91,9 @@ pub struct Codemode {
 const DESCRIPTION: &str = "Run a short JavaScript/TypeScript script that calls tools, to chain several calls (or MCP calls) and return only the result you need. \
 `await tools.<name>(args)` calls a tool (resolves to its text output, throws on error); `await mcp.<server>.<tool>(args)` calls an MCP tool (`mcp.server[\"tool-name\"]` for dashed names). \
 Use `Promise.all` for parallel calls. Only `text(v)`, `console.log(...)`, `image(dataUrl)` and the `return` value reach you. \
-`await searchTools(query)`, `await describeTool(name)` and `await describeNamespace(server)` show what exists and its argument types. `store(key, v)`/`load(key)` keep JSON across scripts.";
+`await searchTools(query)`, `await describeTool(name)` and `await describeNamespace(server)` show what exists and its argument types. `store(key, v)`/`load(key)` keep JSON across scripts. \
+Classifier models answer typed questions about JSON with probabilities: `await models.getAvailableOfType(\"classifier\")`, then \
+`await models.classify(model, {state, questions: {id: {type: \"choice\"|\"score\"|\"bool\", instructions, criteria}}})` (check `stopReason`).";
 
 impl Codemode {
     /// `servers`: MCP (name, description), fixed for the session so the tool list stays cacheable.

@@ -356,6 +356,28 @@ impl Extensions {
     }
 
     /// Forward session events to `on(type, …)` handlers (observe-only), until the session ends.
+    /// `input` handlers, in load order, before a prompt or steer is saved (so what's
+    /// stored is what's sent: the cache is safe). Each sees the previous one's text.
+    /// A handler returns `{text}` to rewrite it, `{handled: true}` to swallow it (it
+    /// handled the input itself), or nothing. pi's `{action: …}` form works too.
+    /// `None` = handled. Fails open: a broken handler leaves the text as it was.
+    pub async fn input(&self, text: &str, steer: bool) -> Option<String> {
+        let mut text = text.to_string();
+        for (l, h) in self.handlers("input").collect::<Vec<_>>() {
+            let payload = json!({ "text": text, "source": if steer { "steer" } else { "prompt" } });
+            let Ok(r) = self.invoke(l, h, &payload, HOOK_TIMEOUT).await else {
+                continue;
+            };
+            if r["handled"] == true || r["action"] == "handled" {
+                return None;
+            }
+            if let Some(t) = r["text"].as_str() {
+                text = t.to_string();
+            }
+        }
+        Some(text)
+    }
+
     pub fn spawn_events(self: &Arc<Self>, mut rx: broadcast::Receiver<AgentEvent>) {
         let me = self.clone();
         let wanted: Vec<String> = me
@@ -363,7 +385,10 @@ impl Extensions {
             .iter()
             .flat_map(|l| l.ext.reg().events.iter().map(|(e, _)| e.clone()))
             .collect();
-        if wanted.iter().all(|e| e == "before_tool" || e == "after_tool") {
+        if wanted
+            .iter()
+            .all(|e| matches!(e.as_str(), "before_tool" | "after_tool" | "input"))
+        {
             return;
         }
         tokio::spawn(async move {
@@ -492,6 +517,28 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn input_handlers_rewrite_or_handle() {
+        let d = tempfile::tempdir().unwrap();
+        let ext = d.path().join("ext");
+        std::fs::create_dir_all(&ext).unwrap();
+        std::fs::write(ext.join("a.js"), "export default (nc) => nc.on('input', ({ text }) => text.startsWith('ship') ? { text: text.replace('ship', 'commit and push') } : undefined);").unwrap();
+        std::fs::write(ext.join("b.js"), "export default (nc) => nc.on('input', ({ text, source }) => text === 'ping' ? { action: 'handled' } : { text: `${text} [${source}]` });").unwrap();
+        std::fs::write(
+            ext.join("c.js"),
+            "export default (nc) => nc.on('input', () => { throw new Error('bad'); });",
+        )
+        .unwrap();
+        let exts = Extensions::load(std::slice::from_ref(&ext), d.path(), d.path(), &d.path().join("cache")).await;
+        assert_eq!(
+            exts.input("ship it", false).await.as_deref(),
+            Some("commit and push it [prompt]"),
+            "chained, in order"
+        );
+        assert_eq!(exts.input("hi", true).await.as_deref(), Some("hi [steer]"));
+        assert_eq!(exts.input("ping", false).await, None, "handled");
+    }
+
+    #[tokio::test]
     async fn loads_runs_and_disables() {
         let d = tempfile::tempdir().unwrap();
         let ext = d.path().join("ext");

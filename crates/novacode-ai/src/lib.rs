@@ -4,6 +4,7 @@ pub mod adapter;
 pub mod anthropic;
 pub mod auth;
 pub mod catalog;
+pub mod classify;
 pub mod connect;
 pub mod copilot;
 pub mod faux;

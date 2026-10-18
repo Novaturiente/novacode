@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod cache;
 pub mod checkpoint;
+pub mod classifier;
 pub mod codemode;
 pub mod export;
 pub mod extensions;
