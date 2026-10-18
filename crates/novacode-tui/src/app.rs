@@ -86,6 +86,8 @@ pub struct Init {
     pub panel_only: bool,
     /// `ui.panel.auto`: show the panel while work is going, hide it after (default on).
     pub panel_auto: bool,
+    /// `ui.icons`: Nerd Font glyphs in the panel (default) or plain Unicode.
+    pub nerd_icons: bool,
     /// Lower frame rate, no animation (SSH or a loaded machine, L9.17).
     pub slow: bool,
     /// `ui.images`: auto (default), kitty, iterm2, sixel, halfblocks or off (L9.14).
@@ -342,6 +344,7 @@ impl App {
         let mut usage = None;
         let ctx = novacode_types::estimate::context(&init.history);
         let mut panel = crate::panel::Panel::default();
+        panel.nerd = init.nerd_icons;
         if init.panel_only {
             panel.pinned = Some(true);
             panel.focused = true;
@@ -1403,7 +1406,11 @@ impl App {
                 })
                 .collect()
         };
-        let (above_w, below_w) = (widget_lines(false, self), widget_lines(true, self));
+        let (mut above_w, below_w) = (widget_lines(false, self), widget_lines(true, self));
+        // Too narrow for the panel: open todos as a compact widget instead (pi's fallback).
+        if f.area().width < crate::panel::MIN_SCREEN {
+            above_w.extend(self.panel.todo_summary(area.width as usize, &self.theme));
+        }
         let status_lines: Vec<Line<'static>> = match &self.footer {
             Some(lines) => lines
                 .iter()

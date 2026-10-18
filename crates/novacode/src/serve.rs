@@ -650,6 +650,7 @@ pub async fn attach(
         statusline: base.statusline,
         panel_only,
         panel_auto: base.panel_auto,
+        nerd_icons: base.nerd_icons,
         slow: base.slow,
         images: base.images.clone(),
     };

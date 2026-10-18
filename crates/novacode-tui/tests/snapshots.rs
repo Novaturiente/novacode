@@ -34,6 +34,7 @@ fn app(history: Vec<Message>) -> (App, mpsc::UnboundedReceiver<Cmd>) {
         statusline: Default::default(),
         panel_only: false,
         panel_auto: false,
+        nerd_icons: false,
         slow: false,
         images: "off".into(),
     };
@@ -429,6 +430,7 @@ fn file_completion_in_a_real_folder() {
             statusline: Default::default(),
             panel_only: false,
             panel_auto: false,
+            nerd_icons: false,
             slow: false,
             images: "off".into(),
         },
@@ -655,7 +657,12 @@ fn side_panel_extension_ui_and_keys() {
     key(&mut a, KeyCode::Char('d'), KeyModifiers::CONTROL | KeyModifiers::ALT);
     assert!(matches!(rx.try_recv(), Ok(Cmd::ExtKey { ext, tab: None, .. }) if ext == "deploy"));
     // Narrow screens keep the panel hidden.
-    assert!(!screen(&mut a, 80, 16).contains("Todos"));
+    let narrow = screen(&mut a, 80, 16);
+    assert!(!narrow.contains("│  Agent"), "no panel: {narrow}");
+    assert!(
+        narrow.contains("Todos 1/3") && narrow.contains("next ○ test it"),
+        "the compact todo widget instead: {narrow}"
+    );
     // A header, and a tool that draws its own result lines.
     ui(
         &mut a,

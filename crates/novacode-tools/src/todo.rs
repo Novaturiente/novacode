@@ -26,6 +26,18 @@ pub struct Item {
     pub status: Status,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Unix ms it was first started and finished (the panel shows the time spent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done_ms: Option<u64>,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[derive(Default)]
@@ -105,6 +117,8 @@ impl Todo {
                     text,
                     status: Status::Pending,
                     note: None,
+                    started_ms: None,
+                    done_ms: None,
                 })
                 .collect();
         }
@@ -115,10 +129,17 @@ impl Todo {
                 text,
                 status: Status::Pending,
                 note: None,
+                started_ms: None,
+                done_ms: None,
             });
         }
         let find = |v: &mut Vec<Item>, id: u32, st: Status| -> Result<(), String> {
             let i = v.iter_mut().find(|i| i.id == id).ok_or(format!("no task #{id}"))?;
+            match st {
+                Status::Active => i.started_ms = i.started_ms.or(Some(now_ms())),
+                Status::Done => i.done_ms = Some(now_ms()),
+                _ => {}
+            }
             i.status = st;
             i.note = None;
             Ok(())

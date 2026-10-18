@@ -26,8 +26,23 @@ pub struct Source {
     pub title: Option<String>,
     pub order: f64,
     pub newest_first: bool,
+    /// (done, total): drawn as a bar after the title.
+    pub progress: Option<(usize, usize)>,
     /// Insertion order; publishing an existing id replaces it in place.
     pub nodes: Vec<Node>,
+}
+
+/// One drawn node row with its tree guides (pi panel viewer style).
+struct Row<'a> {
+    node: &'a Node,
+    /// Section heading drawn above it (first row of a titled source).
+    title: Option<(&'a str, Option<(usize, usize)>)>,
+    /// First row of a later source: a rule goes above it.
+    rule: bool,
+    /// `├─`/`└─` with the ancestors' `│ ` before it.
+    guide: String,
+    /// The guide for its detail lines.
+    below: String,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +80,7 @@ impl Tab {
             title: None,
             order: 0.0,
             newest_first: false,
+            progress: None,
             nodes: Vec::new(),
         });
         self.sources.last_mut().unwrap()
@@ -99,6 +115,8 @@ pub struct Panel {
     /// Selected row in the shown node tab.
     pub sel: usize,
     idle_since: Option<Instant>,
+    /// Nerd Font glyphs (`ui.icons`, default nerd) instead of plain Unicode.
+    pub nerd: bool,
     /// Inner size at the last draw (sent with region keys).
     pub size: (u16, u16),
     stats: Stats,
@@ -186,6 +204,7 @@ impl Default for Panel {
             focused: false,
             sel: 0,
             idle_since: None,
+            nerd: true,
             size: (0, 0),
             stats: Stats::default(),
         }
@@ -417,13 +436,12 @@ impl Panel {
     }
 
     fn todos(&mut self, v: &serde_json::Value) {
-        let nodes = v
-            .as_array()
-            .into_iter()
-            .flatten()
+        let items: Vec<&serde_json::Value> = v.as_array().into_iter().flatten().collect();
+        let nodes: Vec<Node> = items
+            .iter()
             .map(|i| {
-                let id = i["id"].as_u64().unwrap_or(0).to_string();
-                let mut n = node(&id, i["text"].as_str().unwrap_or_default());
+                let id = i["id"].as_u64().unwrap_or(0);
+                let mut n = node(&format!("t{id}"), i["text"].as_str().unwrap_or_default());
                 let status = i["status"].as_str().unwrap_or_default();
                 n.status = Some(
                     match status {
@@ -434,12 +452,34 @@ impl Panel {
                     }
                     .into(),
                 );
+                // Checkboxes, not the play/stop glyphs other nodes use.
+                n.icon = Some(format!("todo:{status}"));
                 n.dim = status == "dropped" || status == "done";
                 n.tag = Some(format!("#{id}"));
-                n.detail = i["note"].as_str().map(|s| vec![s.to_string()]).unwrap_or_default();
+                n.order = Some(id as f64);
+                let (start, end) = (i["started_ms"].as_u64(), i["done_ms"].as_u64());
+                n.time = match (status, start, end) {
+                    ("active", Some(s), _) => Some(novacode_types::ui::Time {
+                        ms: None,
+                        since: Some(s),
+                    }),
+                    ("done", Some(s), Some(e)) => Some(novacode_types::ui::Time {
+                        ms: Some(e.saturating_sub(s)),
+                        since: None,
+                    }),
+                    _ => None,
+                };
+                if status == "active" {
+                    n.detail = i["note"].as_str().map(|s| vec![s.to_string()]).unwrap_or_default();
+                }
                 n
             })
             .collect();
+        let done = items.iter().filter(|i| i["status"] == "done").count();
+        let live = items.iter().filter(|i| i["status"] != "dropped").count();
+        if let Some(t) = self.tab("agent") {
+            t.source("todos").progress = Some((done, live));
+        }
         self.set_nodes("agent", "todos", nodes);
         self.offer("agent");
     }
@@ -609,43 +649,88 @@ impl Panel {
         self.sel = 0;
     }
 
-    /// Rows of the shown node tab, flattened in display order: (node, depth).
-    fn rows(&self) -> Vec<(&Node, usize, Option<&str>)> {
+    /// Open todos in two or three lines: progress, the active one, what's next.
+    pub fn todo_summary(&self, w: usize, t: &Theme) -> Vec<Line<'static>> {
+        let Some(src) = self
+            .tabs
+            .iter()
+            .find(|x| x.name == "agent")
+            .and_then(|x| x.sources.iter().find(|s| s.id == "todos"))
+        else {
+            return Vec::new();
+        };
+        let open = |s: &str| matches!(s, "running" | "queued");
+        if !src.nodes.iter().any(|n| n.status.as_deref().is_some_and(open)) {
+            return Vec::new();
+        }
+        let (done, total) = src.progress.unwrap_or((0, 0));
+        let filled = (done * 10 + total / 2).checked_div(total).unwrap_or(0);
+        let mut out = vec![Line::from(vec![
+            Span::styled(
+                format!(" Todos {done}/{total} "),
+                t.heading.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("▰".repeat(filled), t.ok),
+            Span::styled("▱".repeat(10 - filled), t.dim),
+        ])];
+        let row = |n: &Node, lead: &str| {
+            let (g, gs) = glyph(n.icon.as_deref(), n.status.as_deref(), self.nerd, t);
+            let mut v = vec![
+                Span::styled(format!(" {lead}{g} "), gs),
+                Span::styled(n.label.clone(), t.text),
+            ];
+            if let Some(d) = n.detail.first() {
+                v.push(Span::styled(format!("  {d}"), t.dim));
+            }
+            crate::wrap::truncate(v, w)
+        };
+        if let Some(n) = src.nodes.iter().find(|n| n.status.as_deref() == Some("running")) {
+            out.push(row(n, ""));
+        }
+        if let Some(n) = src.nodes.iter().find(|n| n.status.as_deref() == Some("queued")) {
+            out.push(row(n, "next "));
+        }
+        out
+    }
+
+    /// Rows of the shown node tab in display order, with tree guides.
+    fn rows(&self) -> Vec<Row<'_>> {
         let Some(t) = self.current() else { return Vec::new() };
         let mut srcs: Vec<&Source> = t.sources.iter().filter(|s| !s.nodes.is_empty()).collect();
         srcs.sort_by(|a, b| a.order.total_cmp(&b.order));
         let mut out = Vec::new();
         for s in srcs {
             let mut nodes: Vec<&Node> = s.nodes.iter().collect();
+            nodes.sort_by(|a, b| a.order.unwrap_or(0.0).total_cmp(&b.order.unwrap_or(0.0)));
             if s.newest_first {
                 nodes.reverse();
             }
-            nodes.sort_by(|a, b| a.order.unwrap_or(0.0).total_cmp(&b.order.unwrap_or(0.0)));
-            fn walk<'a>(
-                all: &[&'a Node],
-                parent: Option<&str>,
-                depth: usize,
-                title: Option<&'a str>,
-                out: &mut Vec<(&'a Node, usize, Option<&'a str>)>,
-            ) {
-                for n in all.iter().filter(|n| {
-                    n.parent.as_deref() == parent
-                        || (depth == 0 && n.parent.as_ref().is_some_and(|p| !all.iter().any(|x| &x.id == p)))
-                }) {
-                    if depth == 0
-                        && parent.is_none()
-                        && n.parent.is_some()
-                        && all.iter().any(|x| Some(&x.id) == n.parent.as_ref())
-                    {
-                        continue;
-                    }
-                    out.push((n, depth, if out.is_empty() { title } else { None }));
-                    walk(all, Some(&n.id), depth + 1, None, out);
+            let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+            fn walk<'a>(all: &[&'a Node], ids: &[&str], parent: Option<&str>, prefix: &str, out: &mut Vec<Row<'a>>) {
+                // A parent that isn't here makes the node a root.
+                let kids: Vec<&&Node> = all
+                    .iter()
+                    .filter(|n| n.parent.as_deref().filter(|p| ids.contains(p)) == parent)
+                    .collect();
+                for (i, n) in kids.iter().enumerate() {
+                    let last = i + 1 == kids.len();
+                    out.push(Row {
+                        node: n,
+                        title: None,
+                        rule: false,
+                        guide: format!("{prefix}{}", if last { "└─" } else { "├─" }),
+                        below: format!("{prefix}{}", if last { "  " } else { "│ " }),
+                    });
+                    let below = format!("{prefix}{}", if last { "  " } else { "│ " });
+                    walk(all, ids, Some(&n.id), &below, out);
                 }
             }
-            let mut part = Vec::new();
-            walk(&nodes, None, 0, s.title.as_deref(), &mut part);
-            out.extend(part);
+            let first = out.len();
+            walk(&nodes, &ids, None, " ", &mut out);
+            if let Some(r) = out.get_mut(first) {
+                r.title = s.title.as_deref().map(|t| (t, s.progress));
+                r.rule = first > 0;
+            }
         }
         out
     }
@@ -654,8 +739,8 @@ impl Panel {
     pub fn key(&mut self, key: &str) -> Option<Option<PanelAction>> {
         let tab = self.current()?.clone();
         let rows = self.rows();
-        let sel_id = rows.get(self.sel).map(|(n, ..)| n.id.clone());
-        let sel_actions = rows.get(self.sel).map(|(n, ..)| n.actions.clone()).unwrap_or_default();
+        let sel_id = rows.get(self.sel).map(|r| r.node.id.clone());
+        let sel_actions = rows.get(self.sel).map(|r| r.node.actions.clone()).unwrap_or_default();
         let n = rows.len();
         // Region tabs get every key except the ones that leave the panel.
         if tab.region.is_some() && !matches!(key, "esc" | "tab" | "shift+tab") {
@@ -707,7 +792,7 @@ impl Panel {
         for t in &tabs {
             let on = self.shown.as_deref() == Some(t.name.as_str());
             let st = if on {
-                theme.accent.add_modifier(Modifier::BOLD)
+                theme.text.add_modifier(Modifier::BOLD | Modifier::REVERSED)
             } else {
                 theme.dim
             };
@@ -744,49 +829,112 @@ impl Panel {
             None => {
                 let n = self.rows().len();
                 self.sel = self.sel.min(n.saturating_sub(1));
-                let rows = self.rows();
+                let (rows, nerd, focused, sel) = (self.rows(), self.nerd, self.focused, self.sel);
                 let now = now_ms();
                 let mut out = Vec::new();
-                for (i, (n, depth, title)) in rows.iter().enumerate() {
-                    if let Some(t) = title {
-                        if !out.is_empty() {
-                            out.push(Line::raw(""));
+                let mut sel_line = 0;
+                for (i, r) in rows.iter().enumerate() {
+                    let n = r.node;
+                    if r.rule {
+                        out.push(Line::raw(""));
+                        out.push(Line::styled("─".repeat(w), theme.border));
+                    }
+                    if let Some((title, progress)) = r.title {
+                        let mut h = vec![Span::styled(
+                            format!(" {}{title}", if nerd { "\u{f0ae} " } else { "" }),
+                            theme.heading.add_modifier(Modifier::BOLD),
+                        )];
+                        if let Some((done, total)) = progress {
+                            let filled = (done * 10 + total / 2).checked_div(total).unwrap_or(0);
+                            h.push(Span::styled(
+                                format!(" {done}/{total} "),
+                                theme.heading.add_modifier(Modifier::BOLD),
+                            ));
+                            h.push(Span::styled("▰".repeat(filled), theme.ok));
+                            h.push(Span::styled("▱".repeat(10 - filled), theme.dim));
                         }
-                        out.push(Line::styled(t.to_string(), theme.heading));
+                        out.push(crate::wrap::truncate(h, w));
                     }
-                    let (glyph, gs) = glyph(n.status.as_deref(), theme);
-                    let mut left = vec![Span::raw("  ".repeat(*depth)), Span::styled(format!("{glyph} "), gs)];
-                    if let Some(ic) = &n.icon {
-                        left.push(Span::raw(format!("{ic} ")));
-                    }
-                    let ls = if n.dim { theme.dim } else { theme.text };
-                    let ls = if self.focused && i == self.sel {
-                        ls.add_modifier(Modifier::REVERSED)
+                    let (g, gs) = glyph(n.icon.as_deref(), n.status.as_deref(), nerd, theme);
+                    let label_style = if n.dim {
+                        theme.dim.add_modifier(Modifier::CROSSED_OUT)
                     } else {
-                        ls
+                        theme.text.add_modifier(Modifier::BOLD)
                     };
-                    left.push(Span::styled(n.label.clone(), ls));
-                    let mut right = String::new();
+                    let mut left = vec![
+                        Span::styled(r.guide.clone(), theme.border),
+                        Span::styled(format!("{g} "), gs),
+                        Span::styled(n.label.clone(), label_style),
+                    ];
                     if let Some(t) = &n.tag {
-                        right.push_str(t);
+                        left.push(Span::styled(format!(" {t}"), theme.dim));
                     }
-                    if let Some(t) = n.time {
-                        let ms = t.ms.or(t.since.map(|s| now.saturating_sub(s))).unwrap_or(0);
-                        right.push_str(&format!(" {}", secs(Duration::from_millis(ms))));
-                    }
+                    let (right, rs) = match n.time {
+                        Some(t) => {
+                            let ms = t.ms.unwrap_or(0) + t.since.map(|s| now.saturating_sub(s)).unwrap_or(0);
+                            (clock(ms), if t.since.is_some() { theme.warn } else { theme.dim })
+                        }
+                        None => (String::new(), theme.dim),
+                    };
                     let rw = unicode_width::UnicodeWidthStr::width(right.as_str());
-                    let l = crate::wrap::truncate(left, w.saturating_sub(rw + 1));
+                    let l = crate::wrap::truncate(left, w.saturating_sub(rw + 1).max(1));
                     let pad = w.saturating_sub(crate::wrap::width(&l.spans) + rw);
                     let mut sp = l.spans;
                     sp.push(Span::raw(" ".repeat(pad)));
-                    sp.push(Span::styled(right, theme.dim));
-                    out.push(Line::from(sp));
-                    for d in &n.detail {
-                        out.push(crate::wrap::truncate(
-                            vec![Span::raw("  ".repeat(depth + 1)), Span::styled(d.clone(), theme.dim)],
-                            w,
-                        ));
+                    sp.push(Span::styled(right, rs));
+                    if focused && i == sel {
+                        sel_line = out.len();
+                        sp = sp
+                            .into_iter()
+                            .map(|s| {
+                                let st = s.style.add_modifier(Modifier::REVERSED);
+                                s.style(st)
+                            })
+                            .collect();
                     }
+                    out.push(Line::from(sp));
+                    // Details hang under the label; the guide keeps going to the children.
+                    let has_kids = rows
+                        .get(i + 1)
+                        .is_some_and(|x| x.node.parent.as_deref() == Some(n.id.as_str()));
+                    let pad = format!("{}{}", r.below, if has_kids { "│ " } else { "  " });
+                    for (k, d) in n.detail.iter().enumerate() {
+                        let mut v = vec![Span::styled(pad.clone(), theme.border)];
+                        if k == 0
+                            && n.status.as_deref() == Some("running")
+                            && n.icon.as_deref().is_some_and(|i| i.starts_with("todo:"))
+                        {
+                            v.push(Span::styled(if nerd { "\u{f0da} " } else { "▸ " }, theme.warn));
+                        }
+                        v.push(Span::styled(d.clone(), theme.dim));
+                        out.push(crate::wrap::truncate(v, w));
+                    }
+                }
+                if out.is_empty() {
+                    out.push(Line::styled(" (empty)", theme.dim));
+                }
+                // Keys for the selected row while focused (pi viewer footer).
+                let footer = focused.then(|| {
+                    let mut k: Vec<String> = rows
+                        .get(sel)
+                        .map(|r| {
+                            r.node
+                                .actions
+                                .iter()
+                                .map(|(k, a)| format!("{} {a}", if k == "enter" { "⏎" } else { k }))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    k.push("⇥ tab".into());
+                    k.push("esc back".into());
+                    k.join("  ")
+                });
+                let room = body.height as usize - footer.is_some() as usize;
+                let start = sel_line.saturating_sub(room / 2).min(out.len().saturating_sub(room));
+                let mut out: Vec<Line> = out.into_iter().skip(start).take(room).collect();
+                if let Some(f) = footer {
+                    out.resize(room, Line::raw(""));
+                    out.push(crate::wrap::truncate(vec![Span::styled(f, theme.dim)], w));
                 }
                 out
             }
@@ -795,17 +943,64 @@ impl Panel {
     }
 }
 
-fn glyph(status: Option<&str>, t: &Theme) -> (&'static str, Style) {
-    match status {
-        Some("running") => ("◐", t.accent),
-        Some("starting") => ("◌", t.accent),
-        Some("waiting") => ("⏸", t.warn),
-        Some("queued") => ("○", t.dim),
-        Some("done") => ("✓", t.ok),
-        Some("failed") => ("✗", t.error),
-        Some("stopped") => ("■", t.dim),
-        Some("idle") => ("·", t.dim),
-        _ => ("•", t.dim),
+/// The status glyph and its colour: Nerd Font like the pi panel, or plain Unicode.
+/// `icon` "todo:<status>" asks for checkboxes; any other icon is drawn as given.
+fn glyph(icon: Option<&str>, status: Option<&str>, nerd: bool, t: &Theme) -> (String, Style) {
+    let style = match status {
+        Some("running" | "starting") => t.warn,
+        Some("waiting") => t.accent,
+        Some("done") => t.ok,
+        Some("failed") => t.error,
+        Some("idle") => t.heading,
+        _ => t.dim,
+    };
+    let g = match (icon, nerd) {
+        (Some(i), _) if !i.starts_with("todo:") => return (i.to_string(), style),
+        (Some(i), true) => match &i[5..] {
+            "active" => "\u{f192}",
+            "done" => "\u{f14a}",
+            "dropped" => "\u{f05e}",
+            _ => "\u{f096}",
+        },
+        (Some(i), false) => match &i[5..] {
+            "active" => "◐",
+            "done" => "✓",
+            "dropped" => "✗",
+            _ => "○",
+        },
+        (None, true) => match status {
+            Some("running") => "\u{f04b}",
+            Some("starting") => "\u{f110}",
+            Some("waiting") => "\u{f128}",
+            Some("queued") => "\u{f017}",
+            Some("done") => "\u{f00c}",
+            Some("idle") => "\u{f10c}",
+            Some("failed") => "\u{f00d}",
+            Some("stopped") => "\u{f04d}",
+            _ => "•",
+        },
+        (None, false) => match status {
+            Some("running") => "◐",
+            Some("starting") => "◌",
+            Some("waiting") => "⏸",
+            Some("queued") => "○",
+            Some("done") => "✓",
+            Some("failed") => "✗",
+            Some("stopped") => "■",
+            Some("idle") => "·",
+            _ => "•",
+        },
+    };
+    (g.to_string(), style)
+}
+
+/// pi viewer clock: 42s, 3m07s, 1h05m.
+fn clock(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m{:02}s", s / 60, s % 60),
+        _ => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
     }
 }
 
@@ -838,8 +1033,14 @@ mod tests {
         assert_eq!(p.shown.as_deref(), Some("deploy"), "higher priority takes the slot");
         p.tick();
         assert!(!p.visible, "extension tabs never open the panel by themselves");
-        let rows: Vec<(String, usize)> = p.rows().iter().map(|(n, d, _)| (n.id.clone(), *d)).collect();
-        assert_eq!(rows, vec![("a".to_string(), 0), ("b".to_string(), 1)]);
+        let rows: Vec<(String, String)> = p.rows().iter().map(|r| (r.node.id.clone(), r.guide.clone())).collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("a".to_string(), " └─".to_string()),
+                ("b".to_string(), "   └─".to_string())
+            ]
+        );
         p.focused = true;
         p.sel = 1;
         assert_eq!(

@@ -1201,6 +1201,7 @@ struct TuiBase {
     notices: Vec<String>,
     statusline: novacode_tui::statusline::Config,
     panel_auto: bool,
+    nerd_icons: bool,
     slow: bool,
     images: String,
 }
@@ -1281,6 +1282,7 @@ fn tui_base(paths: &Paths, settings: &Settings) -> TuiBase {
         notices,
         statusline,
         panel_auto: settings.get("ui.panel.auto").unwrap_or(true),
+        nerd_icons: settings.get::<String>("ui.icons").is_none_or(|v| v != "unicode"),
         slow: settings.get::<bool>("ui.slow").unwrap_or_else(slow_terminal),
         images: settings.get::<String>("ui.images").unwrap_or_else(|| "auto".into()),
     }
@@ -1573,6 +1575,7 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
             panel_only: false,
             // The tmux pane has the panel; the window keeps its full width.
             panel_auto: base.panel_auto && tmux_pane.is_none(),
+            nerd_icons: base.nerd_icons,
             slow: base.slow,
             images: base.images.clone(),
         };
