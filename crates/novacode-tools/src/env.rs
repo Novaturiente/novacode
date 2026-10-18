@@ -119,7 +119,7 @@ impl ExecutionEnv for LocalEnv {
                 .arg(&spec.command)
                 .current_dir(&spec.cwd)
                 .envs(spec.env.iter().map(|(k, v)| (k, v)))
-                // shortcut: stdin is /dev/null so nothing can wait on input; a /dev/tty prompt can still hang until timeout. Add tty detection with the process manager (M9).
+                // stdin is /dev/null so nothing can wait on input; a /dev/tty prompt still hangs until the timeout.
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())

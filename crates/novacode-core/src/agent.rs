@@ -92,6 +92,8 @@ pub struct Agent {
     checkpoints: Option<crate::checkpoint::Repo>,
     /// The run's snapshot, taken while the model thinks; awaited before any tool runs.
     pending_cp: Option<tokio::task::JoinHandle<crate::checkpoint::Snapshot>>,
+    /// Long-running commands (L5.11); dropping the agent kills them.
+    processes: Option<Arc<novacode_tools::process::ProcessManager>>,
 }
 
 struct Memory {
@@ -114,6 +116,11 @@ struct Queues {
     /// User content: text, plus any attached images (L2.22).
     steering: VecDeque<Vec<Block>>,
     follow_up: VecDeque<Vec<Block>>,
+    /// Notes for the model (process exits, log matches): stored as reminders at
+    /// the next model call (L4.12).
+    reminders: VecDeque<String>,
+    /// A reminder that should start a run when idle.
+    wake: bool,
 }
 
 #[derive(Default)]
@@ -275,6 +282,7 @@ impl Agent {
             memory: None,
             compacted,
             checkpoints: None,
+            processes: None,
             pending_cp: None,
         };
         agent.update_report();
@@ -379,6 +387,16 @@ impl Agent {
     }
 
     /// Take a file checkpoint at the start of every run (L4.15).
+    /// Give bash and the `process` tool a process manager (L5.11).
+    pub fn with_processes(mut self, pm: Arc<novacode_tools::process::ProcessManager>) -> Self {
+        self.processes = Some(pm);
+        self
+    }
+
+    pub fn processes(&self) -> Option<&Arc<novacode_tools::process::ProcessManager>> {
+        self.processes.as_ref()
+    }
+
     pub fn with_checkpoints(mut self, repo: crate::checkpoint::Repo) -> Self {
         self.checkpoints = Some(repo);
         self
@@ -828,6 +846,18 @@ impl Agent {
                     message: Message::User { content },
                 });
             }
+            let notes: Vec<String> = {
+                let mut q = self.shared.queues.lock().unwrap();
+                q.wake = false;
+                q.reminders.drain(..).collect()
+            };
+            for text in notes {
+                self.add(EntryKind::CustomMessage {
+                    kind: "process".into(),
+                    text,
+                    display: false,
+                });
+            }
             steering_only = true;
             // A long run near the window: compact at this model-call boundary (L4.5).
             if let Some(m) = &self.memory
@@ -902,7 +932,7 @@ impl Agent {
         self.update_report();
         self.emit(AgentEvent::AgentEnd { stop });
         let q = self.shared.queues.lock().unwrap();
-        if q.steering.is_empty() && q.follow_up.is_empty() {
+        if q.steering.is_empty() && q.follow_up.is_empty() && !q.wake {
             self.emit(AgentEvent::Settled);
         }
     }
@@ -1072,6 +1102,7 @@ impl Agent {
             updates: None,
             files: self.files.clone(),
             session_id: self.store.id().to_string(),
+            processes: self.processes.clone(),
         };
         let one = |call: &ToolCall, p: &Prepared| {
             let events = self.events.clone();
@@ -1216,6 +1247,15 @@ impl SessionHandle {
     pub fn steer(&self, text: impl Into<String>) {
         self.steer_content(vec![Block::text(text.into())]);
     }
+    /// A note for the model at its next call; `wake` starts a run when idle.
+    pub fn remind(&self, text: impl Into<String>, wake: bool) {
+        let mut q = self.shared.queues.lock().unwrap();
+        q.reminders.push_back(text.into());
+        q.wake |= wake;
+        drop(q);
+        self.shared.notify.notify_one();
+    }
+
     pub fn steer_content(&self, content: Vec<Block>) {
         self.shared.queues.lock().unwrap().steering.push_back(content);
         self.shared.notify.notify_one();
@@ -1246,6 +1286,37 @@ impl SessionHandle {
     }
 }
 
+/// Process manager → loop events and reminders for the model (L5.11).
+async fn process_bridge(
+    mut rx: broadcast::Receiver<novacode_tools::process::Event>,
+    handle: SessionHandle,
+    events: broadcast::Sender<AgentEvent>,
+) {
+    use novacode_tools::process::{Attention, Event};
+    loop {
+        match rx.recv().await {
+            Ok(Event::Started { id, name }) => {
+                let _ = events.send(AgentEvent::ProcessStarted { id, name });
+            }
+            Ok(Event::Ended { id, name, end }) => {
+                let _ = events.send(AgentEvent::ProcessEnded {
+                    id,
+                    name,
+                    code: end.code,
+                    stopped: end.stopped,
+                });
+            }
+            Ok(Event::Notice { text, on, .. }) => match on {
+                Attention::Wake => handle.remind(text, true),
+                Attention::Context => handle.remind(text, false),
+                Attention::Ignore => {}
+            },
+            Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 /// Start the owner task. It is the only code that changes the session.
 pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
     let handle = SessionHandle {
@@ -1269,6 +1340,13 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
             agent.cfg.redactor.clone(),
         ));
     }
+    if let Some(pm) = &agent.processes {
+        tokio::spawn(process_bridge(
+            pm.events.subscribe(),
+            handle.clone(),
+            agent.events.clone(),
+        ));
+    }
     if agent.cfg.warm {
         tokio::spawn(warmer(agent.shared.clone(), agent.events.clone()));
     }
@@ -1277,7 +1355,7 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
         loop {
             let pending = {
                 let q = agent.shared.queues.lock().unwrap();
-                !q.steering.is_empty() || !q.follow_up.is_empty()
+                !q.steering.is_empty() || !q.follow_up.is_empty() || q.wake
             };
             agent.collect_notes(false).await;
             if std::mem::take(&mut *agent.shared.compact.lock().unwrap()) {
@@ -1296,7 +1374,7 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
                 agent.run().await;
                 let idle = {
                     let q = agent.shared.queues.lock().unwrap();
-                    q.steering.is_empty() && q.follow_up.is_empty()
+                    q.steering.is_empty() && q.follow_up.is_empty() && !q.wake
                 };
                 if idle {
                     agent.after_settle().await;

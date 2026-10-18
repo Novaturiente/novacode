@@ -60,6 +60,9 @@ impl Tool for Bash {
                 env: vec![("NOVACODE_SESSION_ID".into(), ctx.session_id.clone())],
                 timeout: Duration::from_secs(secs),
             };
+            if let Some(pm) = &ctx.processes {
+                return run_managed(pm, spec, secs, ctx).await;
+            }
             let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
             let run = ctx.env.exec(spec, ctx.cancel.clone(), tx);
             let mut buf: Vec<u8> = Vec::new();
@@ -117,6 +120,79 @@ impl Tool for Bash {
     }
 }
 
+/// Through the process manager (L5.8): on timeout or Ctrl+Alt+B the command keeps
+/// running there and the model gets its id; at twice the timeout it is asked
+/// whether to keep it.
+// shortcut: managed commands run locally, not through ExecutionEnv; route spawn through it with the SSH backend (L8.11).
+async fn run_managed(
+    pm: &std::sync::Arc<crate::process::ProcessManager>,
+    spec: ExecSpec,
+    secs: u64,
+    ctx: &ToolCtx,
+) -> ToolOutput {
+    let name: String = spec.command.lines().next().unwrap_or("").chars().take(40).collect();
+    let id = match pm.start(&name, &spec.command, &spec.cwd, &spec.env, false) {
+        Ok(id) => id,
+        Err(e) => return ToolOutput::error(format!("could not start bash: {e}")),
+    };
+    // bash calls get no input: a prompt sees EOF at once instead of hanging (the `process` tool keeps stdin).
+    let _ = pm.write(&id, "", true).await;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut dropped = 0usize;
+    let ended = tokio::select! {
+        e = pm.wait(&id, spec.timeout, |c| {
+            ctx.update(String::from_utf8_lossy(c).into_owned());
+            buf.extend_from_slice(c);
+            if buf.len() > BUFFER_CAP {
+                let cut = buf.len() - BUFFER_CAP;
+                buf.drain(..cut);
+                dropped += cut;
+            }
+        }) => e,
+        _ = ctx.cancel.cancelled() => {
+            pm.stop(&id).await;
+            pm.clear_one(&id);
+            return ToolOutput { is_error: true, ..ToolOutput::text("[cancelled]".to_string()) };
+        }
+    };
+    let mut out = String::new();
+    if dropped > 0 {
+        out.push_str(&format!("[first {dropped} bytes of output dropped]\n"));
+    }
+    out.push_str(&String::from_utf8_lossy(&buf));
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    let Some(end) = ended else {
+        pm.reveal(&id, crate::process::Attention::Wake);
+        pm.ask_at(&id, novacode_base_now_ms() + secs * 1000);
+        out.push_str(&format!(
+            "[still running: moved to the process manager as {id}. Use the `process` tool to read its output or stop it; you'll be told when it exits]"
+        ));
+        return ToolOutput::text(out.trim_end().to_string());
+    };
+    pm.clear_one(&id);
+    let (status, is_error) = match end.code {
+        Some(0) => (String::new(), false),
+        Some(c) => (format!("[exit code {c}]"), true),
+        None => ("[killed by a signal]".to_string(), true),
+    };
+    if out.is_empty() && status.is_empty() {
+        out.push_str("(no output)");
+    }
+    out.push_str(&status);
+    ToolOutput {
+        is_error,
+        ..ToolOutput::text(out.trim_end().to_string())
+    }
+}
+
+fn novacode_base_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +232,31 @@ mod tests {
             .await;
         assert!(o.is_error && text(&o).contains("timeout"), "{}", text(&o));
         assert!(t0.elapsed() < Duration::from_secs(5));
+    }
+
+    /// L5.8: a timed-out command keeps running in the process manager.
+    #[tokio::test]
+    async fn timeout_hands_over_to_the_process_manager() {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = ctx(d.path());
+        let pm = crate::process::ProcessManager::new(&d.path().join("procs"), "s");
+        c.processes = Some(pm.clone());
+        let o = Bash
+            .execute(json!({"command": "echo up; sleep 2; echo later", "timeout": 1}), &c)
+            .await;
+        let t = text(&o);
+        assert!(
+            !o.is_error && t.contains("up") && t.contains("moved to the process manager as proc_1"),
+            "{t}"
+        );
+        assert_eq!(pm.running(), 1);
+        tokio::time::sleep(Duration::from_millis(1800)).await;
+        assert!(pm.output("proc_1", 10, None).unwrap().contains("later"));
+        assert_eq!(pm.running(), 0);
+        // A quick one leaves nothing behind; stdin is closed, so `read` doesn't wait.
+        let o = Bash.execute(json!({"command": "read x; echo fine"}), &c).await;
+        assert_eq!(text(&o), "fine");
+        assert_eq!(pm.list().len(), 1);
     }
 
     #[tokio::test]

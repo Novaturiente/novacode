@@ -591,6 +591,7 @@ impl Ctx {
         };
         let memory_on = s.get("memory.enabled").unwrap_or(true);
         let mut all = novacode_tools::builtins(false);
+        all.push(Arc::new(novacode_tools::process::ProcessTool));
         if store.path().is_some() {
             all.push(Arc::new(novacode_core::export::SessionSearch {
                 sessions_root: self.paths.home().join("sessions"),
@@ -615,6 +616,8 @@ impl Ctx {
         {
             agent = agent.with_checkpoints(repo);
         }
+        let pm = novacode_tools::process::ProcessManager::new(&self.paths.home().join("processes"), agent.store.id());
+        agent = agent.with_processes(pm);
         if let Some(w) = worker {
             let mut m = novacode_core::memory::Settings::for_window(window);
             if let Some(v) = s.get("memory.observeAfterTokens") {
@@ -884,6 +887,7 @@ async fn start_session(
     state.spent = models::spent(&ctx.providers, agent.store.entries());
     let id = agent.store.id().to_string();
     let level = state.level;
+    let processes = agent.processes().cloned();
     let (handle, task) = agent::spawn(agent);
     let hub = hub::Hub::start(handle, history, state, local);
     let _ = slot.0.set(Arc::downgrade(&hub));
@@ -898,6 +902,7 @@ async fn start_session(
         providers: ctx.providers.clone(),
         limits: models::Limits::new(&ctx.settings),
         trace: ctx.trace(),
+        processes,
     });
     let mut live = serve::go_live(&host, bg)?;
     live.add_task(activity::spawn(&host.hub, sinks));

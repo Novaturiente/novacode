@@ -348,6 +348,19 @@ pub enum AgentEvent {
     },
     /// Stopped and nothing is queued (L3.10).
     Settled,
+    /// A long-running command is in the process manager (L5.11).
+    ProcessStarted {
+        id: String,
+        name: String,
+    },
+    ProcessEnded {
+        id: String,
+        name: String,
+        /// `None` = killed by a signal.
+        code: Option<i32>,
+        /// Stopped on purpose (the `process` tool, session exit).
+        stopped: bool,
+    },
     /// The context was compacted (L4.5): earlier messages replaced by notes.
     Compacted {
         tokens_before: u64,

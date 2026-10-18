@@ -199,6 +199,17 @@ pub fn spawn(hub: &Arc<Hub>, sinks: Sinks) -> tokio::task::JoinHandle<()> {
             let prev = last.as_ref().map_or(ActState::Idle, |l| l.activity.state);
             let state_changed = last.as_ref().is_none_or(|l| l.activity.state != s.activity.state);
             let route_changed = last.as_ref().is_none_or(|l| l.model != s.model);
+            if let Some(p) = &sinks.tmux_pane
+                && last.as_ref().is_none_or(|l| l.processes.len() != s.processes.len())
+            {
+                // Apart from the state, so a long-lived dev server never blocks the done alert.
+                let n = s.processes.len().to_string();
+                if s.processes.is_empty() {
+                    tmux(&["set", "-p", "-t", p, "-u", "@agent_bg"]).await;
+                } else {
+                    tmux(&["set", "-p", "-t", p, "@agent_bg", &n]).await;
+                }
+            }
             if let Some(pane) = &sinks.tmux_pane
                 && (state_changed || route_changed)
             {
@@ -317,6 +328,7 @@ pub fn spawn(hub: &Arc<Hub>, sinks: Sinks) -> tokio::task::JoinHandle<()> {
                 "@agent_cwd",
                 "@agent_project",
                 "@agent_model",
+                "@agent_bg",
             ] {
                 if !args.is_empty() {
                     args.push(";");

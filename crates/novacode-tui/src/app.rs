@@ -44,6 +44,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/clone", "new session with this whole branch"),
     ("/export", "write this branch to a file (/export html for a web page)"),
     ("/copy", "copy the last reply"),
+    ("/ps", "processes in the process manager, with their latest output"),
     ("/reload", "re-read settings, keys, theme, skills and context files"),
     ("/restart", "restart novacode (a new build) and resume this session"),
     ("/quit", "quit"),
@@ -102,6 +103,10 @@ pub enum Cmd {
     Export(bool),
     /// The terminal gained or lost focus (L11.9: notify only when unwatched).
     Focus(bool),
+    /// Ctrl+Alt+B: running bash commands move to the process manager (L5.8).
+    Background,
+    /// `/ps`: the host answers with a page of processes (L5.11).
+    Processes,
     Quit,
 }
 
@@ -232,6 +237,8 @@ pub struct App {
     tx: UnboundedSender<Cmd>,
     init: Init,
     pub busy: bool,
+    /// Running processes in the manager (L5.11), for the status line.
+    procs: std::collections::BTreeSet<String>,
     activity: String,
     pub spinner: usize,
     usage: Option<Usage>,
@@ -309,6 +316,7 @@ impl App {
             tx,
             init,
             busy: false,
+            procs: Default::default(),
             activity: String::new(),
             spinner: 0,
             usage,
@@ -455,6 +463,27 @@ impl App {
                 );
             }
             AgentEvent::AgentEnd { .. } => {}
+            AgentEvent::ProcessStarted { id, name } => {
+                self.tr
+                    .notice(format!("⚙ {id} {name}: running in the process manager (/ps)"), false);
+                self.procs.insert(id);
+            }
+            AgentEvent::ProcessEnded {
+                id,
+                name,
+                code,
+                stopped,
+            } => {
+                let how = match (stopped, code) {
+                    (true, _) => "stopped".to_string(),
+                    (_, Some(0)) => "exited".into(),
+                    (_, Some(c)) => format!("exited with code {c}"),
+                    (_, None) => "killed".into(),
+                };
+                self.tr
+                    .notice(format!("⚙ {id} {name}: {how}"), !stopped && code != Some(0));
+                self.procs.remove(&id);
+            }
             AgentEvent::Compacted {
                 tokens_before,
                 tokens_after,
@@ -626,6 +655,7 @@ impl App {
             },
             Some(A::KeysHelp) => self.overlay = Some(Overlay::Pager(Pager::keys_help(&self.keymap, &self.theme))),
             Some(A::MessageCopy) => self.copy_reply(),
+            Some(A::Background) => self.send(Cmd::Background),
             Some(A::PasteImage) => match crate::term::paste() {
                 Some(crate::term::Pasted::Image(path)) => {
                     self.editor.insert(&format!("@{} ", path.display()));
@@ -899,6 +929,7 @@ impl App {
                 "/resume" => self.send(Cmd::ListSessions),
                 "/new" => self.exit = Some(Exit::New),
                 "/reload" => self.exit = Some(Exit::Reload),
+                "/ps" => self.send(Cmd::Processes),
                 "/restart" => self.exit = Some(Exit::Restart),
                 "/keys" | "/help" => {
                     self.overlay = Some(Overlay::Pager(Pager::keys_help(&self.keymap, &self.theme)));
@@ -1246,6 +1277,9 @@ impl App {
             ));
         }
         let mut right = Vec::new();
+        if !self.procs.is_empty() {
+            right.push(Span::styled(format!("⚙ {}  ", self.procs.len()), t.accent));
+        }
         if self.ctx > 0 {
             let pct = self.ctx as f64 * 100.0 / self.init.window_tokens.max(1) as f64;
             let st = match pct {

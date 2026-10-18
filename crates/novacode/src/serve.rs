@@ -451,7 +451,7 @@ pub async fn attach(paths: &Paths, prefix: &str, base: crate::TuiBase) -> anyhow
                 Cmd::Compact => ClientCmd::Compact,
                 Cmd::Export(html) => ClientCmd::Export { html },
                 // The session-swapping commands are refused by the attached TUI itself.
-                Cmd::ListSessions | Cmd::ListPrompts(_) | Cmd::Focus(_) => continue,
+                Cmd::ListSessions | Cmd::ListPrompts(_) | Cmd::Focus(_) | Cmd::Background | Cmd::Processes => continue,
                 Cmd::Quit => break,
             };
             let id = matches!(cmd, ClientCmd::GetContext | ClientCmd::Export { .. }).then(|| "ui".to_string());

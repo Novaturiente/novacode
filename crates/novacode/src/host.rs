@@ -28,6 +28,7 @@ pub struct Host {
     pub providers: Arc<Providers>,
     pub limits: models::Limits,
     pub trace: Option<Trace>,
+    pub processes: Option<Arc<novacode_tools::process::ProcessManager>>,
 }
 
 impl Host {
@@ -193,6 +194,41 @@ impl Host {
                 let _ = ui.send(UiEvent::Branch { action, items });
             }
             Cmd::Focus(f) => self.hub.set_focus(f),
+            Cmd::Background => {
+                let n = self.processes.as_ref().map_or(0, |pm| pm.detach_all());
+                let text = match n {
+                    0 => "no running command to move".to_string(),
+                    n => format!(
+                        "moved {n} running command{} to the process manager",
+                        if n == 1 { "" } else { "s" }
+                    ),
+                };
+                let _ = ui.send(UiEvent::Notice { text, error: false });
+            }
+            Cmd::Processes => {
+                let text = match &self.processes {
+                    None => "the process manager is off".to_string(),
+                    Some(pm) if pm.list().is_empty() => "no processes".to_string(),
+                    Some(pm) => pm
+                        .list()
+                        .iter()
+                        .map(|i| {
+                            let state = match &i.end {
+                                None => "running".to_string(),
+                                Some(e) if e.stopped => "stopped".into(),
+                                Some(e) => e.code.map_or("killed".into(), |c| format!("exited {c}")),
+                            };
+                            let tail = pm.output(&i.id, 15, None).unwrap_or_default();
+                            format!("{} {} [{state}]\n$ {}\n{}\n", i.id, i.name, i.command, tail)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                };
+                let _ = ui.send(UiEvent::Page {
+                    title: "Processes".into(),
+                    text,
+                });
+            }
             Cmd::Quit => {}
         }
     }

@@ -46,6 +46,7 @@ pub enum A {
     FollowUp,
     MessageCopy,
     PasteImage,
+    Background,
     SessionNew,
     SessionResume,
     KeysHelp,
@@ -93,6 +94,7 @@ defs! {
     FollowUp, "app.message.followUp", App, ["alt+enter"], "Queue as a follow-up";
     MessageCopy, "app.message.copy", App, ["ctrl+x"], "Copy the last reply";
     PasteImage, "app.clipboard.pasteImage", App, ["ctrl+v"], "Paste an image (or text) from the clipboard";
+    Background, "app.process.background", App, ["ctrl+alt+b"], "Move running commands to the process manager";
     SessionNew, "app.session.new", App, [], "Start a new session";
     SessionResume, "app.session.resume", App, [], "Resume a session";
     KeysHelp, "app.keys.help", App, ["alt+/"], "Show keybindings";

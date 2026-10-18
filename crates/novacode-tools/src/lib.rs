@@ -7,6 +7,7 @@ pub mod files;
 pub mod guard;
 pub mod image;
 pub mod patch;
+pub mod process;
 pub mod read;
 pub mod search;
 pub mod write;
@@ -90,6 +91,8 @@ pub struct ToolCtx {
     pub updates: Option<mpsc::Sender<String>>,
     pub files: Arc<FileState>,
     pub session_id: String,
+    /// The session's process manager (L5.11); bash hands timed-out commands to it.
+    pub processes: Option<Arc<process::ProcessManager>>,
 }
 
 impl ToolCtx {
@@ -203,6 +206,7 @@ pub(crate) mod testutil {
             updates: None,
             files: Arc::new(FileState::default()),
             session_id: "test".into(),
+            processes: None,
         }
     }
 

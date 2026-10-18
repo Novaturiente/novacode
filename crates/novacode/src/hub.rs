@@ -136,6 +136,8 @@ impl Hub {
                 g.state.cache.last_miss = Some(text.trim_start_matches("cache miss:").trim().to_string());
             }
             AgentEvent::Message(m) => g.state.add(m),
+            AgentEvent::ProcessStarted { id, .. } => g.state.processes.push(id.clone()),
+            AgentEvent::ProcessEnded { id, .. } => g.state.processes.retain(|p| p != id),
             _ => {}
         }
         match &ev {
@@ -160,7 +162,13 @@ impl Hub {
                 }
             }
         }
-        let figures = matches!(ev, AgentEvent::Message(_) | AgentEvent::Compacted { .. });
+        let figures = matches!(
+            ev,
+            AgentEvent::Message(_)
+                | AgentEvent::Compacted { .. }
+                | AgentEvent::ProcessStarted { .. }
+                | AgentEvent::ProcessEnded { .. }
+        );
         let msg = ServerMsg::Event { event: ev };
         g.clients.retain(|_, tx| tx.send(msg.clone()).is_ok());
         if figures || (g.state.busy, g.state.activity.clone()) != before {
