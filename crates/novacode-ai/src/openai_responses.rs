@@ -23,6 +23,8 @@ use tokio_util::sync::CancellationToken;
 pub struct Compat {
     /// The endpoint rejects `max_output_tokens` (the Codex backend).
     pub no_max_tokens: bool,
+    /// Thinking `off` can't be sent as effort `none` (GitHub Copilot); the model's default is used.
+    pub no_effort_none: bool,
 }
 
 pub enum Auth {
@@ -202,12 +204,18 @@ pub fn build_body(req: &Request, c: &Compat, ns: &str) -> Value {
         body.insert("tool_choice".into(), json!("auto"));
         body.insert("parallel_tool_calls".into(), json!(true));
     }
-    // shortcut: Off sends nothing (the model's default), as in Chat Completions.
-    if let Some(level) = req.thinking.filter(|l| *l != ThinkingLevel::Off) {
-        body.insert(
-            "reasoning".into(),
-            json!({ "effort": effort_name(level), "summary": "auto" }),
-        );
+    // `thinking` is only set for reasoning models (L2.16), so Off means switch reasoning off.
+    match req.thinking {
+        Some(ThinkingLevel::Off) if !c.no_effort_none => {
+            body.insert("reasoning".into(), json!({ "effort": "none" }));
+        }
+        Some(ThinkingLevel::Off) | None => {}
+        Some(level) => {
+            body.insert(
+                "reasoning".into(),
+                json!({ "effort": effort_name(level), "summary": "auto" }),
+            );
+        }
     }
     if !c.no_max_tokens {
         body.insert("max_output_tokens".into(), json!(req.max_tokens));
@@ -531,8 +539,29 @@ mod tests {
     }
 
     #[test]
+    fn thinking_off_means_effort_none() {
+        let with = |t, c: &Compat| {
+            let mut r = req(vec![Message::user("hi")]);
+            r.thinking = t;
+            build_body(&r, c, "codex")["reasoning"].clone()
+        };
+        let d = Compat::default();
+        assert_eq!(with(Some(ThinkingLevel::Off), &d), json!({ "effort": "none" }));
+        assert_eq!(with(None, &d), Value::Null, "non-reasoning model: nothing");
+        let copilot = Compat {
+            no_effort_none: true,
+            ..Default::default()
+        };
+        assert_eq!(with(Some(ThinkingLevel::Off), &copilot), Value::Null);
+    }
+
+    #[test]
     fn body_replays_encrypted_reasoning_to_the_same_model_only() {
-        let b = build_body(&req(history("codex")), &Compat { no_max_tokens: true }, "codex");
+        let codex = Compat {
+            no_max_tokens: true,
+            ..Default::default()
+        };
+        let b = build_body(&req(history("codex")), &codex, "codex");
         assert_eq!(b["instructions"], "be brief");
         let input = b["input"].as_array().unwrap();
         assert_eq!(

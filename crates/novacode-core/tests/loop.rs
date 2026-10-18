@@ -44,6 +44,7 @@ fn cfg(cwd: &Path, home: &Path) -> Config {
         cache: CacheRetention::Short,
         window_tokens: 200_000,
         images: true,
+        reasoning: true,
         thinking: Default::default(),
         spill_dir: home.join("spill"),
         redactor: Default::default(),

@@ -75,6 +75,7 @@ pub async fn switch(
         window_tokens,
         max_tokens,
         images: route.info.images,
+        reasoning: route.info.reasoning,
         thinking: route.clamp(route.level.unwrap_or(level)),
     };
     Ok((switch, route))

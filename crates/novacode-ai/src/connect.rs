@@ -253,12 +253,12 @@ impl Providers {
 
     fn key(&self, p: &Profile) -> Result<Option<String>, ConnectError> {
         if let Some(v) = &p.api_key {
-            return Ok(Some(auth::resolve_key(v)?));
+            return Ok(Some(clean_key(&auth::resolve_key(v)?)));
         }
         if let Some(k) = p
             .env
             .iter()
-            .find_map(|v| std::env::var(v).ok().filter(|k| !k.is_empty()))
+            .find_map(|v| std::env::var(v).ok().map(|k| clean_key(&k)).filter(|k| !k.is_empty()))
         {
             return Ok(Some(k));
         }
@@ -271,6 +271,16 @@ impl Providers {
             p.id, p.id
         )))
     }
+}
+
+/// A pasted key can carry invisible characters (zero-width spaces, a BOM, a
+/// newline) that make the vendor reject it (jcode #376): drop them.
+fn clean_key(k: &str) -> String {
+    k.chars()
+        .filter(|c| {
+            !c.is_whitespace() && !c.is_control() && !matches!(c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}')
+        })
+        .collect()
 }
 
 /// Where the refreshed models.dev copy lives (L2.10).
@@ -312,6 +322,11 @@ mod tests {
         assert!(p.resolve("claude-opus").is_err());
         let r = p.resolve("deepseek/brand-new-model").unwrap();
         assert!(!r.info.known, "unknown models still route, with defaults");
+    }
+
+    #[test]
+    fn keys_lose_invisible_characters() {
+        assert_eq!(super::clean_key("\u{FEFF}sk-ab\u{200B}c \n"), "sk-abc");
     }
 
     #[tokio::test]

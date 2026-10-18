@@ -146,7 +146,10 @@ impl Adapter for Copilot {
                 PROVIDER,
                 &self.base_url,
                 openai_responses::Auth::ApiKey(self.token.clone()),
-                Default::default(),
+                openai_responses::Compat {
+                    no_effort_none: true,
+                    ..Default::default()
+                },
                 trace,
             )
             .with_headers(h)

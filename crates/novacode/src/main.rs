@@ -335,6 +335,7 @@ impl Ctx {
             window_tokens,
             thinking: route.clamp(level),
             images: route.info.images,
+            reasoning: route.info.reasoning,
             spill_dir: self.paths.home().join("spill"),
             redactor: {
                 let auth_path = self.paths.home().join("auth.json");

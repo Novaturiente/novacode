@@ -171,7 +171,23 @@ pub fn build_body(req: &Request, c: &Compat, ns: &str, cache_key: bool) -> Value
     }
     let field = c.max_tokens_field.as_deref().unwrap_or("max_tokens");
     body.insert(field.into(), json!(req.max_tokens));
-    // shortcut: Off sends nothing (the model's default); add explicit "disable" per format if a vendor needs it.
+    // `thinking` is only set for reasoning models (L2.16): Off switches reasoning off where
+    // the format has a documented switch.
+    // shortcut: the plain `openai` format sends nothing for Off (vendors differ on `none`).
+    if req.thinking == Some(ThinkingLevel::Off) {
+        match c.thinking_format.as_deref().unwrap_or("openai") {
+            "openrouter" => {
+                body.insert("reasoning".into(), json!({ "effort": "none" }));
+            }
+            "deepseek" | "zai" => {
+                body.insert("thinking".into(), json!({ "type": "disabled" }));
+            }
+            "qwen" => {
+                body.insert("enable_thinking".into(), json!(false));
+            }
+            _ => {}
+        }
+    }
     if let Some(level) = req.thinking.filter(|l| *l != ThinkingLevel::Off) {
         let effort = effort_name(level);
         match c.thinking_format.as_deref().unwrap_or("openai") {
@@ -669,6 +685,30 @@ mod tests {
         let plain = build_body(&req(history()), &Compat::default(), "x", false);
         assert_eq!(plain["reasoning_effort"], "high");
         assert!(plain["messages"][2].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn thinking_off_per_format() {
+        let off = |format: &str| {
+            let mut r = req(vec![Message::user("hi")]);
+            r.thinking = Some(ThinkingLevel::Off);
+            let c = Compat {
+                thinking_format: Some(format.into()),
+                ..Default::default()
+            };
+            let b = build_body(&r, &c, "x", false);
+            (
+                b["reasoning"].clone(),
+                b["thinking"].clone(),
+                b["enable_thinking"].clone(),
+                b["reasoning_effort"].clone(),
+            )
+        };
+        assert_eq!(off("openrouter").0, json!({ "effort": "none" }));
+        assert_eq!(off("deepseek").1, json!({ "type": "disabled" }));
+        assert_eq!(off("zai").1, json!({ "type": "disabled" }));
+        assert_eq!(off("qwen").2, json!(false));
+        assert_eq!(off("openai"), (Value::Null, Value::Null, Value::Null, Value::Null));
     }
 
     #[test]

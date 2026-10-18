@@ -40,6 +40,8 @@ pub struct Config {
     pub thinking: ThinkingLevel,
     /// The model takes images (L2.15).
     pub images: bool,
+    /// The model reasons: only then is a thinking level sent (L2.16).
+    pub reasoning: bool,
     /// Where cut tool output is spilled in full.
     pub spill_dir: PathBuf,
     /// Masks novacode's own secrets in tool output (L6.6).
@@ -55,6 +57,7 @@ pub struct Switch {
     pub window_tokens: u64,
     pub max_tokens: u32,
     pub images: bool,
+    pub reasoning: bool,
     /// Already clamped to what the new model supports.
     pub thinking: ThinkingLevel,
 }
@@ -255,6 +258,7 @@ impl Agent {
             self.cfg.window_tokens = s.window_tokens;
             self.cfg.max_tokens = s.max_tokens;
             self.cfg.images = s.images;
+            self.cfg.reasoning = s.reasoning;
             let mut slot = self.shared.next_thinking.lock().unwrap();
             if slot.is_none() {
                 *slot = Some(s.thinking);
@@ -380,7 +384,7 @@ impl Agent {
                 messages,
                 tools: self.quirks.apply(&route, &self.defs),
                 cache: self.cfg.cache,
-                thinking: Some(self.cfg.thinking),
+                thinking: self.cfg.reasoning.then_some(self.cfg.thinking),
                 images: self.cfg.images,
                 session: Some(self.store.id().to_string()),
             };
