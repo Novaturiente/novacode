@@ -474,6 +474,10 @@ impl App {
                 );
             }
             AgentEvent::AgentEnd { .. } => {}
+            AgentEvent::CwdChanged { cwd, branch } => {
+                self.init.cwd = cwd;
+                self.init.branch = branch;
+            }
             AgentEvent::ProcessStarted { id, name } => {
                 self.tr
                     .notice(format!("⚙ {id} {name}: running in the process manager (/ps)"), false);

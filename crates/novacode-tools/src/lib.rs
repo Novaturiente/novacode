@@ -12,6 +12,7 @@ pub mod process;
 pub mod read;
 pub mod search;
 pub mod todo;
+pub mod worktree;
 pub mod write;
 
 use futures_util::future::BoxFuture;

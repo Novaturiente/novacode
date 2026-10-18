@@ -147,6 +147,10 @@ impl Hub {
                 g.state.cache.last_miss = Some(text.trim_start_matches("cache miss:").trim().to_string());
             }
             AgentEvent::Message(m) => g.state.add(m),
+            AgentEvent::CwdChanged { cwd, branch } => {
+                g.state.cwd = cwd.clone();
+                g.state.branch = branch.clone();
+            }
             AgentEvent::ProcessStarted { id, .. } => g.state.processes.push(id.clone()),
             AgentEvent::ProcessEnded { id, .. } => g.state.processes.retain(|p| p != id),
             _ => {}
@@ -177,6 +181,7 @@ impl Hub {
             ev,
             AgentEvent::Message(_)
                 | AgentEvent::Compacted { .. }
+                | AgentEvent::CwdChanged { .. }
                 | AgentEvent::ProcessStarted { .. }
                 | AgentEvent::ProcessEnded { .. }
         );

@@ -348,6 +348,12 @@ pub enum AgentEvent {
     },
     /// Stopped and nothing is queued (L3.10).
     Settled,
+    /// The session moved to another folder (a worktree, L5.22).
+    CwdChanged {
+        cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+    },
     /// A long-running command is in the process manager (L5.11).
     ProcessStarted {
         id: String,

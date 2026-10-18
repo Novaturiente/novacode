@@ -1,0 +1,394 @@
+//! `enter_worktree` / `exit_worktree` (L5.22): move the session into
+//! `<repo>/.worktrees/<name>` on branch `worktree-<name>`, and back. The cwd
+//! change travels as `details.set_cwd`, which the agent applies after the call.
+
+use crate::ask::Asker;
+use crate::{Tool, ToolCtx, ToolOutput, parse, schema_for};
+use futures_util::future::BoxFuture;
+use novacode_types::{Choice, Question};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+
+fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+struct Repo {
+    top: PathBuf,
+    common: PathBuf,
+    /// Inside a linked worktree, not the main checkout.
+    linked: bool,
+    main: PathBuf,
+}
+
+fn repo(cwd: &Path) -> Result<Repo, String> {
+    let r = git(
+        cwd,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+    )
+    .map_err(|_| format!("{} is not in a git repository", cwd.display()))?;
+    let mut it = r.lines();
+    let (top, dir, common) = (
+        it.next().unwrap_or(""),
+        it.next().unwrap_or(""),
+        it.next().unwrap_or(""),
+    );
+    let main = git(cwd, &["worktree", "list", "--porcelain"])?
+        .lines()
+        .find_map(|l| l.strip_prefix("worktree ").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(top));
+    Ok(Repo {
+        top: top.into(),
+        common: common.into(),
+        linked: dir != common,
+        main,
+    })
+}
+
+fn set_cwd(text: String, cwd: &Path) -> ToolOutput {
+    ToolOutput {
+        details: Some(json!({ "set_cwd": cwd })),
+        ..ToolOutput::text(text)
+    }
+}
+
+/// Untracked root `.env*` files in the worktree that still match the main checkout's.
+fn env_copies(r: &Repo) -> Vec<String> {
+    std::fs::read_dir(&r.top)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|f| f.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with(".env"))
+        .filter(|n| {
+            let a = std::fs::read(r.top.join(n)).ok();
+            a.is_some() && a == std::fs::read(r.main.join(n)).ok()
+        })
+        .collect()
+}
+
+pub struct EnterWorktree;
+
+#[derive(Deserialize, JsonSchema)]
+struct EnterArgs {
+    /// Short kebab-case name, e.g. fix-login-redirect.
+    name: String,
+    /// Commit or branch to start the new branch from (default: HEAD).
+    base: Option<String>,
+}
+
+fn enter(cwd: &Path, a: &EnterArgs) -> Result<(PathBuf, String), String> {
+    if a.name.is_empty() || !a.name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
+        return Err(format!("bad worktree name `{}`: letters, digits, . _ - only", a.name));
+    }
+    let r = repo(cwd)?;
+    if r.linked {
+        return Err(format!(
+            "already in worktree {}; call exit_worktree first",
+            r.top.display()
+        ));
+    }
+    let path = r.top.join(".worktrees").join(&a.name);
+    let branch = format!("worktree-{}", a.name);
+    let registered = git(&r.top, &["worktree", "list", "--porcelain"])?
+        .lines()
+        .any(|l| l.strip_prefix("worktree ").is_some_and(|p| Path::new(p) == path));
+    if registered {
+        return Ok((
+            path,
+            format!(
+                "entered existing worktree {} (branch {branch})",
+                r.top.join(".worktrees").join(&a.name).display()
+            ),
+        ));
+    }
+    if path.exists() {
+        return Err(format!("{} exists but is not a git worktree", path.display()));
+    }
+    // Keep the folder out of `git status` without touching the user's .gitignore.
+    if git(&r.top, &["check-ignore", "-q", ".worktrees/x"]).is_err() {
+        let ex = r.common.join("info").join("exclude");
+        let _ = std::fs::create_dir_all(ex.parent().unwrap_or(&r.common));
+        let mut cur = std::fs::read_to_string(&ex).unwrap_or_default();
+        if !cur.ends_with('\n') && !cur.is_empty() {
+            cur.push('\n');
+        }
+        cur.push_str(".worktrees/\n");
+        std::fs::write(&ex, cur).map_err(|e| e.to_string())?;
+    }
+    let p = path.to_string_lossy().to_string();
+    let exists = git(&r.top, &["show-ref", "--verify", "-q", &format!("refs/heads/{branch}")]).is_ok();
+    if exists {
+        git(&r.top, &["worktree", "add", &p, &branch])
+    } else {
+        git(
+            &r.top,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch,
+                &p,
+                a.base.as_deref().unwrap_or("HEAD"),
+            ],
+        )
+    }
+    .map_err(|e| format!("git worktree add failed: {e}"))?;
+    // Root .env* files are untracked by design; the worktree needs them to run.
+    let mut copied = Vec::new();
+    for f in std::fs::read_dir(&r.top).into_iter().flatten().flatten() {
+        let n = f.file_name().to_string_lossy().to_string();
+        if n.starts_with(".env")
+            && f.path().is_file()
+            && !path.join(&n).exists()
+            && std::fs::copy(f.path(), path.join(&n)).is_ok()
+        {
+            copied.push(n);
+        }
+    }
+    let mut msg = format!("created worktree {} on branch {branch}", path.display());
+    if !copied.is_empty() {
+        msg += &format!("; copied {}", copied.join(", "));
+    }
+    Ok((path, msg))
+}
+
+impl Tool for EnterWorktree {
+    fn name(&self) -> &str {
+        "enter_worktree"
+    }
+    fn description(&self) -> &str {
+        "Create (or reuse) a git worktree at <repo>/.worktrees/<name> on branch worktree-<name> and move this session into it, so large changes don't touch the main checkout. Root .env files are copied in."
+    }
+    fn schema(&self) -> Value {
+        schema_for::<EnterArgs>()
+    }
+    fn sequential(&self) -> bool {
+        true
+    }
+    fn large_output(&self) -> bool {
+        false
+    }
+    fn execute<'a>(&'a self, args: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput> {
+        Box::pin(async move {
+            let a: EnterArgs = match parse(args) {
+                Ok(a) => a,
+                Err(e) => return e,
+            };
+            let cwd = ctx.cwd.clone();
+            match tokio::task::spawn_blocking(move || enter(&cwd, &a)).await {
+                Ok(Ok((path, msg))) => set_cwd(
+                    format!("{msg}. The working directory is now {}.", path.display()),
+                    &path,
+                ),
+                Ok(Err(e)) => ToolOutput::error(e),
+                Err(e) => ToolOutput::error(e.to_string()),
+            }
+        })
+    }
+}
+
+/// Asks keep or remove when someone can answer; keeps it otherwise.
+pub struct ExitWorktree(pub Option<Arc<dyn Asker>>);
+
+#[derive(Deserialize, JsonSchema)]
+struct ExitArgs {}
+
+impl Tool for ExitWorktree {
+    fn name(&self) -> &str {
+        "exit_worktree"
+    }
+    fn description(&self) -> &str {
+        "Leave the current git worktree and move this session back to the main checkout. The user is asked whether to keep or remove it (removal refuses uncommitted changes and keeps unmerged branches). Commit your work first."
+    }
+    fn schema(&self) -> Value {
+        schema_for::<ExitArgs>()
+    }
+    fn sequential(&self) -> bool {
+        true
+    }
+    fn large_output(&self) -> bool {
+        false
+    }
+    fn execute<'a>(&'a self, _args: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput> {
+        Box::pin(async move {
+            let cwd = ctx.cwd.clone();
+            let info = tokio::task::spawn_blocking(move || -> Result<_, String> {
+                let r = repo(&cwd)?;
+                if !r.linked {
+                    return Err("not inside a linked worktree".into());
+                }
+                let branch = git(&r.top, &["branch", "--show-current"]).unwrap_or_default();
+                // The .env copies made on entry aren't the user's changes.
+                let copies = env_copies(&r);
+                let dirty = git(&r.top, &["status", "--porcelain"])
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|l| !copies.iter().any(|c| l.trim_start_matches("?? ") == c))
+                    .count();
+                let main_head = git(&r.main, &["rev-parse", "HEAD"])?;
+                let ahead = git(&r.top, &["rev-list", "--count", &format!("{main_head}..HEAD")]).unwrap_or_default();
+                Ok((r, branch, dirty, ahead))
+            })
+            .await;
+            let (r, branch, dirty, ahead) = match info {
+                Ok(Ok(x)) => x,
+                Ok(Err(e)) => return ToolOutput::error(e),
+                Err(e) => return ToolOutput::error(e.to_string()),
+            };
+            let remove = match &self.0 {
+                None => false,
+                Some(asker) => {
+                    let q = Question {
+                        question: format!(
+                            "Leave {} ({}): {dirty} uncommitted file(s), {ahead} commit(s) not in the main checkout. Keep or remove the worktree?",
+                            r.top.display(),
+                            if branch.is_empty() { "detached" } else { &branch }
+                        ),
+                        header: Some("Worktree".into()),
+                        options: vec![
+                            Choice {
+                                label: "Keep worktree".into(),
+                                description: Some("Leave it on disk to come back to.".into()),
+                                preview: None,
+                                recommended: dirty > 0,
+                            },
+                            Choice {
+                                label: "Remove worktree".into(),
+                                description: Some("Delete the folder; an unmerged branch is kept.".into()),
+                                preview: None,
+                                recommended: dirty == 0,
+                            },
+                        ],
+                        multi: false,
+                    };
+                    match asker.ask(vec![q]).await {
+                        None => return ToolOutput::text("The user cancelled: still in the worktree."),
+                        Some(r) => r
+                            .first()
+                            .is_some_and(|r| r.chosen.iter().any(|c| c == "Remove worktree")),
+                    }
+                }
+            };
+            let (top, main) = (r.top.clone(), r.main.clone());
+            let copies = env_copies(&r);
+            let note = if remove {
+                tokio::task::spawn_blocking(move || {
+                    for c in copies {
+                        let _ = std::fs::remove_file(top.join(c));
+                    }
+                    match git(&main, &["worktree", "remove", &top.to_string_lossy()]) {
+                        Err(e) => format!(" Worktree NOT removed: {e}"),
+                        Ok(_) if branch.is_empty() => " Worktree removed.".into(),
+                        Ok(_) if git(&main, &["branch", "-d", &branch]).is_ok() => {
+                            format!(" Worktree and branch {branch} removed.")
+                        }
+                        Ok(_) => format!(" Worktree removed; branch {branch} kept (not merged)."),
+                    }
+                })
+                .await
+                .unwrap_or_default()
+            } else {
+                format!(" Worktree kept at {}.", r.top.display())
+            };
+            set_cwd(
+                format!("Back in the main checkout {}.{note}", r.main.display()),
+                &r.main,
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{ctx, text};
+
+    #[tokio::test]
+    async fn enter_and_exit() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().canonicalize().unwrap();
+        let sh = |a: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(a)
+                    .status()
+                    .unwrap()
+                    .success()
+            )
+        };
+        sh(&["init", "-q"]);
+        sh(&[
+            "-c",
+            "user.email=a@b",
+            "-c",
+            "user.name=a",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x",
+        ]);
+        std::fs::write(root.join(".env"), "K=1\n").unwrap();
+        let c = ctx(&root);
+        let o = EnterWorktree.execute(json!({"name": "fix-x"}), &c).await;
+        let wt = root.join(".worktrees/fix-x");
+        assert!(!o.is_error, "{}", text(&o));
+        assert_eq!(o.details.as_ref().unwrap()["set_cwd"], json!(wt));
+        assert_eq!(std::fs::read_to_string(wt.join(".env")).unwrap(), "K=1\n");
+        // The folder is excluded, so the main checkout stays clean.
+        assert_eq!(git(&root, &["status", "--porcelain"]).unwrap(), "?? .env");
+        assert!(EnterWorktree.execute(json!({"name": "bad name"}), &c).await.is_error);
+        // From inside: exit with nobody to ask keeps it.
+        let o = ExitWorktree(None).execute(json!({}), &ctx(&wt)).await;
+        assert!(text(&o).contains("Worktree kept"), "{}", text(&o));
+        assert_eq!(o.details.as_ref().unwrap()["set_cwd"], json!(root));
+        assert!(wt.exists());
+        // Entering again reuses it.
+        assert!(text(&EnterWorktree.execute(json!({"name": "fix-x"}), &c).await).contains("existing"));
+        // Removal: the unchanged .env copy doesn't count as work and doesn't block it.
+        struct Remove;
+        impl Asker for Remove {
+            fn ask(&self, q: Vec<Question>) -> BoxFuture<'_, Option<Vec<novacode_types::Reply>>> {
+                assert!(q[0].question.contains("0 uncommitted"), "{}", q[0].question);
+                Box::pin(async move {
+                    Some(vec![novacode_types::Reply {
+                        question: String::new(),
+                        chosen: vec!["Remove worktree".into()],
+                        text: None,
+                    }])
+                })
+            }
+        }
+        let o = ExitWorktree(Some(Arc::new(Remove))).execute(json!({}), &ctx(&wt)).await;
+        assert!(
+            text(&o).contains("Worktree and branch worktree-fix-x removed"),
+            "{}",
+            text(&o)
+        );
+        assert!(!wt.exists());
+    }
+}

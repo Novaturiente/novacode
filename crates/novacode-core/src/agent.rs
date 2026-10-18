@@ -1158,6 +1158,12 @@ impl Agent {
             futures_util::future::join_all(prepared.iter().map(|(c, p)| one(c, p))).await
         };
         for (call, out) in results {
+            let new_cwd = out
+                .details
+                .as_ref()
+                .and_then(|d| d["set_cwd"].as_str())
+                .filter(|_| !out.is_error)
+                .map(PathBuf::from);
             let message = Message::ToolResult {
                 call_id: call.id,
                 tool_name: call.name,
@@ -1166,8 +1172,36 @@ impl Agent {
                 details: out.details,
             };
             self.add(EntryKind::Message { message });
+            if let Some(dir) = new_cwd {
+                self.move_to(dir);
+            }
         }
         all_rejected
+    }
+
+    /// A tool moved the session (L5.22): tools, prompt sources, checkpoints and
+    /// the process follow, and the model is told before its next call.
+    fn move_to(&mut self, dir: PathBuf) {
+        if !dir.is_dir() || dir == self.cfg.cwd {
+            return;
+        }
+        let _ = std::env::set_current_dir(&dir);
+        self.cfg.cwd = dir.clone();
+        self.cfg.prompt.cwd = dir.clone();
+        if self.checkpoints.is_some() {
+            self.checkpoints = crate::checkpoint::resolve(&dir, &self.cfg.prompt.home);
+        }
+        let text = format!("The working directory is now {}.", dir.display());
+        self.add(EntryKind::CustomMessage {
+            kind: "env".into(),
+            text: text.clone(),
+            display: false,
+        });
+        self.emit(AgentEvent::Stream(StreamEvent::Notice { text }));
+        self.emit(AgentEvent::CwdChanged {
+            cwd: dir.display().to_string(),
+            branch: crate::prompt::env_state(&dir).branch,
+        });
     }
 }
 

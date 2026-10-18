@@ -599,6 +599,8 @@ impl Ctx {
             providers: self.providers.clone(),
             searxng: s.get::<String>("web.searxngUrl"),
         }));
+        all.push(Arc::new(novacode_tools::worktree::EnterWorktree));
+        all.push(Arc::new(novacode_tools::worktree::ExitWorktree(asker.clone())));
         if let Some(a) = asker {
             all.push(Arc::new(novacode_tools::ask::AskUser(a)));
         }
