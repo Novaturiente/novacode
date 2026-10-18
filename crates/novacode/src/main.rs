@@ -1142,9 +1142,25 @@ impl Ctx {
                 handlers.push(cmds);
             }
         }
+        // Diagnostics after edits (language servers), last so hooks see the plain result.
+        let d = novacode_core::lsp::Config::default();
+        let lsp_cfg = novacode_core::lsp::Config {
+            enabled: s.get("lsp.enabled").unwrap_or(d.enabled),
+            wait_ms: s.get("lsp.waitMs").unwrap_or(d.wait_ms),
+            severity: s.get("lsp.severity").unwrap_or(d.severity),
+            max_items: s.get("lsp.maxItems").unwrap_or(d.max_items),
+            servers: s.get("lsp.servers").unwrap_or_default(),
+        };
+        let (lsp, lsp_warn) = novacode_core::lsp::Lsp::new(lsp_cfg, &self.cwd, &self.paths.home().join("logs"));
+        for w in lsp_warn {
+            tracing::warn!("{w}");
+        }
         if !exts.is_empty() || !exts.failed.is_empty() {
             handlers.push(exts.clone());
             agent = agent.with_extensions(exts);
+        }
+        if lsp.has_servers() {
+            handlers.push(lsp);
         }
         if !handlers.is_empty() {
             agent = agent.with_hooks(Arc::new(novacode_core::hooks::Hooks { handlers }));

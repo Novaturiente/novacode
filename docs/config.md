@@ -33,6 +33,11 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `memory.indexChars` | number | 2000 | Character cap of that index. |
 | `agents.stallMinutes` | number | 10 | A subagent silent this long is stopped. |
 | `agents.timeoutMinutes` | number | 45 | A subagent running this long is stopped. |
+| `lsp.enabled` | bool | true | After edit/write/apply_patch, language servers report the errors the change left (in the tool result). |
+| `lsp.waitMs` | number | 3000 | Longest wait for a language server per tool call. |
+| `lsp.severity` | string | `error` | `warning` lists warnings too. |
+| `lsp.maxItems` | number | 10 | Most problems listed per file. |
+| `lsp.servers` | object | built-ins on PATH | By name: `{command, args, extensions, rootMarkers}` adds or replaces one, `false` turns it off. Built-ins: rust (rust-analyzer), typescript, python (pyright), go (gopls), c (clangd). |
 | `goal.audit` | bool | true | `/goal` completion is checked by the `auditor` subagent before it counts. |
 | `goal.auditModel` | string | the session's model | Model of the goal auditor (`provider/model[:level]`). |
 | `goal.maxRuns` | number | 30 | Automatic continuations of a goal before it pauses (per start or `/goal resume`). |

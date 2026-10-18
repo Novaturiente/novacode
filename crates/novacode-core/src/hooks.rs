@@ -24,6 +24,10 @@ pub enum Gate {
 }
 
 pub trait Handler: Send + Sync {
+    /// Tag of its feedback in the result (`[hook] …`, `[diagnostics] …`).
+    fn label(&self) -> &str {
+        "hook"
+    }
     fn before_tool<'a>(&'a self, _tool: &'a str, _args: &'a Value) -> BoxFuture<'a, Gate> {
         Box::pin(async { Gate::Allow })
     }
@@ -66,7 +70,8 @@ impl Hooks {
         for h in &self.handlers {
             if let Some(text) = h.after_tool(tool, args, out).await.filter(|t| !t.trim().is_empty()) {
                 let text: String = text.trim().chars().take(8000).collect();
-                out.content.push(novacode_types::Block::text(format!("[hook] {text}")));
+                out.content
+                    .push(novacode_types::Block::text(format!("[{}] {text}", h.label())));
             }
         }
     }
