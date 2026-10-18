@@ -62,7 +62,7 @@ impl Turn {
         self.done && !self.expanded && self.tool_count().0 > 0
     }
 
-    fn touch(&mut self) {
+    pub fn touch(&mut self) {
         self.cache = None;
     }
 }
@@ -76,6 +76,8 @@ pub struct Transcript {
     /// Default for finished turns; Alt+O flips it.
     pub expand_all: bool,
     pub thinking: Thinking,
+    /// Key that shows thinking in full, named on folded thinking lines.
+    pub thinking_hint: String,
     /// Stream pacer (L9.7): bytes of each live block shown so far.
     pub(crate) live_shown: Vec<usize>,
 }
@@ -355,6 +357,7 @@ impl Transcript {
     /// Lay out every turn for `width`, reusing cached finished turns.
     pub fn layout(&mut self, width: usize, theme: &Theme) -> View {
         let thinking = self.thinking;
+        let hint = self.thinking_hint.clone();
         let live = self.live_view();
         let mut v = View {
             lines: Vec::new(),
@@ -368,7 +371,7 @@ impl Transcript {
                 .as_ref()
                 .is_some_and(|c| c.width == width && c.expanded == turn.expanded);
             if !fresh {
-                turn.cache = Some(lay_turn(turn, width, theme, thinking));
+                turn.cache = Some(lay_turn(turn, width, theme, thinking, &self.thinking_hint));
             }
             let c = turn.cache.as_ref().unwrap();
             if i > 0 {
@@ -380,13 +383,13 @@ impl Transcript {
             if i == last
                 && let Some(live) = &live
             {
-                v.lines.extend(lay_assistant(live, width, theme, true, thinking));
+                v.lines.extend(lay_assistant(live, width, theme, true, thinking, &hint));
             }
         }
         if self.turns.is_empty()
             && let Some(live) = &live
         {
-            v.lines.extend(lay_assistant(live, width, theme, true, thinking));
+            v.lines.extend(lay_assistant(live, width, theme, true, thinking, &hint));
         }
         v
     }
@@ -404,7 +407,7 @@ fn text_of(content: &[Block]) -> String {
         .join("\n")
 }
 
-fn lay_turn(turn: &Turn, width: usize, t: &Theme, thinking: Thinking) -> Layout {
+fn lay_turn(turn: &Turn, width: usize, t: &Theme, thinking: Thinking, hint: &str) -> Layout {
     let mut lines = Vec::new();
     let mut toggles = Vec::new();
     let collapsed = turn.collapsed();
@@ -448,7 +451,7 @@ fn lay_turn(turn: &Turn, width: usize, t: &Theme, thinking: Thinking) -> Layout 
                     .filter(|(k, _)| !only_reply || *k == BlockKind::Text)
                     .cloned()
                     .collect();
-                lines.extend(lay_assistant(&blocks, width, t, false, thinking));
+                lines.extend(lay_assistant(&blocks, width, t, false, thinking, hint));
             }
             Item::Tool(tool) => lines.extend(lay_tool(tool, width, t)),
             Item::Notice { text, error } => {
@@ -473,23 +476,44 @@ fn lay_turn(turn: &Turn, width: usize, t: &Theme, thinking: Thinking) -> Layout 
 /// A prompt in a heavy box, so the start of each turn stands out when scrolling
 /// (like the user's pi `rounded-boxes` extension).
 fn user_box(text: &str, width: usize, t: &Theme) -> Vec<Line<'static>> {
-    let inner = width.saturating_sub(4).max(1);
-    let body: Vec<Span<'static>> = vec![Span::styled(sanitize(text), t.text)];
-    let mut rows = Vec::new();
-    for para in split_lines(body) {
-        rows.extend(wrap::wrap(para, inner, &[], &[]));
+    let b = &t.user_box;
+    let edge = if b.border.is_some() { 1 } else { 0 };
+    let inner = width.saturating_sub(2 * (edge + b.pad_x)).max(1);
+    // The text colour's background (if any) fills the box, padding included.
+    let fill = ratatui::style::Style {
+        fg: None,
+        add_modifier: ratatui::style::Modifier::empty(),
+        ..b.text
+    };
+    let mut rows = vec![Vec::new(); b.pad_y];
+    for para in split_lines(vec![Span::styled(sanitize(text), b.text)]) {
+        rows.extend(wrap::wrap(para, inner, &[], &[]).into_iter().map(|l| l.spans));
     }
-    let rule = "━".repeat(width.saturating_sub(2));
-    let mut out = vec![Line::styled(format!("┏{rule}┓"), t.user)];
+    rows.extend(vec![Vec::new(); b.pad_y]);
+    let side = |s: &str| Span::styled(s.to_string(), b.border_style);
+    let mut out = Vec::new();
+    if let Some([tl, tr, _, _, h, _]) = b.border {
+        let rule: String = std::iter::repeat_n(h, width.saturating_sub(2)).collect();
+        out.push(Line::styled(format!("{tl}{rule}{tr}"), b.border_style));
+    }
     for row in rows {
-        let pad = inner.saturating_sub(row.width());
-        let mut spans = vec![Span::styled("┃ ", t.user)];
-        spans.extend(row.spans);
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(Span::styled(" ┃", t.user));
+        let w: usize = row.iter().map(|s| s.width()).sum();
+        let mut spans = Vec::new();
+        if let Some(g) = b.border {
+            spans.push(side(&g[5].to_string()));
+        }
+        spans.push(Span::styled(" ".repeat(b.pad_x), fill));
+        spans.extend(row);
+        spans.push(Span::styled(" ".repeat(inner.saturating_sub(w) + b.pad_x), fill));
+        if let Some(g) = b.border {
+            spans.push(side(&g[5].to_string()));
+        }
         out.push(Line::from(spans));
     }
-    out.push(Line::styled(format!("┗{rule}┛"), t.user));
+    if let Some([_, _, bl, br, h, _]) = b.border {
+        let rule: String = std::iter::repeat_n(h, width.saturating_sub(2)).collect();
+        out.push(Line::styled(format!("{bl}{rule}{br}"), b.border_style));
+    }
     out
 }
 
@@ -512,6 +536,7 @@ fn lay_assistant(
     t: &Theme,
     live: bool,
     thinking: Thinking,
+    hint: &str,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::default()];
     for (kind, text) in blocks {
@@ -529,7 +554,11 @@ fn lay_assistant(
             BlockKind::Thinking => {
                 let words = text.split_whitespace().count();
                 let label = if live { "thinking…" } else { "thought" };
-                lines.push(Line::styled(format!("∴ {label} · {words} words"), t.thinking));
+                let mut l = Line::styled(format!("∴ {label} · {words} words"), t.thinking);
+                if !hint.is_empty() {
+                    l.push_span(Span::styled(format!(" · {hint} to show"), t.dim));
+                }
+                lines.push(l);
             }
             BlockKind::Text => lines.extend(markdown::render(text, width, t, !live)),
             _ => {}

@@ -489,3 +489,33 @@ fn thinking_level_cycle_and_picker() {
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(rx.try_recv().unwrap(), Cmd::SetThinking(ThinkingLevel::Xhigh));
 }
+
+#[test]
+fn user_message_style_setting() {
+    let (mut a, _rx) = app(vec![Message::user("hi")]);
+    assert!(screen(&mut a, 30, 8).contains("╭────"), "rounded by default");
+    let warn = a
+        .theme
+        .apply_user_message(&json!({ "border": "double", "paddingX": 2 }));
+    assert!(warn.is_none());
+    a.tr.turns[0].touch();
+    let s = screen(&mut a, 30, 8);
+    assert!(s.contains("╔═") && s.contains("║  hi"), "{s}");
+    let warn = a
+        .theme
+        .apply_user_message(&json!({ "border": "wavy", "text": { "fg": "#ffffff", "bg": "#333333" } }));
+    assert_eq!(warn.as_deref(), Some("settings ui.userMessage: ignored bad border"));
+    a.theme.apply_user_message(&json!({ "border": "none", "paddingX": 0 }));
+    a.tr.turns[0].touch();
+    let s = screen(&mut a, 30, 8);
+    assert!(s.starts_with(" hi"), "no frame: {s}");
+}
+
+#[test]
+fn folded_thinking_names_its_key() {
+    let (mut a, _rx) = app(vec![]);
+    run_events(&mut a);
+    key(&mut a, KeyCode::Char('o'), KeyModifiers::ALT);
+    let s = screen(&mut a, 70, 30);
+    assert!(s.contains("∴ thought · 6 words · ctrl+t to show"), "{s}");
+}

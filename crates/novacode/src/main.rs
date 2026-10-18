@@ -547,7 +547,7 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
             }
         });
         let init = novacode_tui::Init {
-            model: model.clone(),
+            model: split_level(&model).0.to_string(),
             cwd: ctx.cwd.display().to_string(),
             branch: git_branch(&ctx.cwd),
             window_tokens: ctx.window_tokens(),
@@ -565,8 +565,11 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
             theme: {
                 let name = ctx.settings.get::<String>("ui.theme").unwrap_or_else(|| "auto".into());
                 let dark = (name == "auto").then(novacode_tui::term::query_background).flatten();
-                let (t, warn) = novacode_tui::theme::Theme::load(&name, &ctx.paths.home().join("themes"), dark);
+                let (mut t, warn) = novacode_tui::theme::Theme::load(&name, &ctx.paths.home().join("themes"), dark);
                 notices.extend(warn);
+                if let Some(v) = ctx.settings.get::<serde_json::Value>("ui.userMessage") {
+                    notices.extend(t.apply_user_message(&v));
+                }
                 t
             },
             notices: std::mem::take(&mut notices),

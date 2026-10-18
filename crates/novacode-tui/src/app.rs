@@ -184,6 +184,7 @@ impl App {
         let mut tr = Transcript {
             expand_all: !init.collapse_turns,
             thinking: init.thinking,
+            thinking_hint: init.keymap.keys(A::ThinkingToggle),
             ..Default::default()
         };
         let mut history = Vec::new();
@@ -455,14 +456,7 @@ impl App {
                 let i = all.iter().position(|l| *l == self.init.level).unwrap_or(0);
                 self.send(Cmd::SetThinking(all[(i + 1) % all.len()]));
             }
-            Some(A::ThinkingToggle) => {
-                let next = if self.tr.thinking == Thinking::Full {
-                    Thinking::Collapsed
-                } else {
-                    Thinking::Full
-                };
-                self.tr.set_thinking(next);
-            }
+            Some(A::ThinkingToggle) => self.toggle_thinking(),
             a => {
                 if let Action::Submit(text) = self.editor.handle(a, k, self.editor_width) {
                     self.completion = None;
@@ -650,6 +644,15 @@ impl App {
         self.send(Cmd::SetModel(id));
     }
 
+    fn toggle_thinking(&mut self) {
+        let next = if self.tr.thinking == Thinking::Full {
+            Thinking::Collapsed
+        } else {
+            Thinking::Full
+        };
+        self.tr.set_thinking(next);
+    }
+
     fn pick_thinking(&mut self) {
         let items = ThinkingLevel::ALL
             .iter()
@@ -781,8 +784,19 @@ impl App {
                         .shown
                         .as_ref()
                         .and_then(|s| s.view.toggles.iter().find(|(l, _)| *l == a.line).map(|(_, t)| *t));
+                    let thought = self
+                        .shown
+                        .as_ref()
+                        .and_then(|s| s.view.lines.get(a.line))
+                        .is_some_and(|l| {
+                            let p = wrap::plain(l);
+                            p.starts_with("∴ ")
+                        });
                     if let Some(t) = toggle {
                         self.tr.toggle(t);
+                    } else if thought {
+                        // A click on a thinking line shows or folds thinking, like Ctrl+T.
+                        self.toggle_thinking();
                     }
                 } else {
                     let text = self.selected_text(a.min(b), a.max(b));

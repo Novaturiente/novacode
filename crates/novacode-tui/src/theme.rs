@@ -39,7 +39,30 @@ pub struct Theme {
     pub matched: Style,
     /// Downgrade truecolor to the 256-colour palette.
     pub ansi256: bool,
+    /// How prompts are drawn in the transcript (setting `ui.userMessage`).
+    pub user_box: UserBox,
 }
+
+/// The frame around a prompt in the transcript.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserBox {
+    /// Corner and edge glyphs; `None` = no frame.
+    pub border: Option<[char; 6]>,
+    pub border_style: Style,
+    /// Text colours; a `bg` fills the whole box.
+    pub text: Style,
+    pub pad_x: usize,
+    pub pad_y: usize,
+}
+
+/// tl, tr, bl, br, horizontal, vertical.
+const BORDERS: &[(&str, [char; 6])] = &[
+    ("rounded", ['╭', '╮', '╰', '╯', '─', '│']),
+    ("single", ['┌', '┐', '└', '┘', '─', '│']),
+    ("heavy", ['┏', '┓', '┗', '┛', '━', '┃']),
+    ("double", ['╔', '╗', '╚', '╝', '═', '║']),
+    ("ascii", ['+', '+', '+', '+', '-', '|']),
+];
 
 #[derive(Deserialize)]
 struct File {
@@ -168,7 +191,60 @@ impl Theme {
             toggle: get("toggle"),
             matched: get("match"),
             ansi256,
+            user_box: UserBox {
+                border: Some(BORDERS[0].1),
+                border_style: get("text"),
+                text: get("text"),
+                pad_x: 1,
+                pad_y: 0,
+            },
         }
+    }
+
+    /// Apply the `ui.userMessage` setting:
+    /// `{ "border": "rounded|single|heavy|double|ascii|none", "borderColor": "#hex" | {fg,bold,…},
+    ///    "text": "#hex" | {fg,bg,bold,italic,…}, "paddingX": 1, "paddingY": 0 }`.
+    /// Returns a warning for values it could not use.
+    pub fn apply_user_message(&mut self, v: &Value) -> Option<String> {
+        let mut bad = Vec::new();
+        let fix = |st: Style| {
+            if self.ansi256 {
+                Style {
+                    fg: st.fg.map(to_256),
+                    bg: st.bg.map(to_256),
+                    ..st
+                }
+            } else {
+                st
+            }
+        };
+        let b = &mut self.user_box;
+        if let Some(name) = v.get("border") {
+            match name.as_str() {
+                Some("none") => b.border = None,
+                Some(n) if BORDERS.iter().any(|(k, _)| *k == n) => {
+                    b.border = BORDERS.iter().find(|(k, _)| *k == n).map(|(_, g)| *g)
+                }
+                _ => bad.push("border"),
+            }
+        }
+        for (key, slot) in [("borderColor", &mut b.border_style), ("text", &mut b.text)] {
+            if let Some(x) = v.get(key) {
+                match style(x) {
+                    Some(st) => *slot = fix(st),
+                    None => bad.push(key),
+                }
+            }
+        }
+        for (key, slot) in [("paddingX", &mut b.pad_x), ("paddingY", &mut b.pad_y)] {
+            if let Some(x) = v.get(key) {
+                match x.as_u64() {
+                    Some(n) if n <= 8 => *slot = n as usize,
+                    _ => bad.push(key),
+                }
+            }
+        }
+        (!bad.is_empty()).then(|| format!("settings ui.userMessage: ignored bad {}", bad.join(", ")))
     }
 
     /// `name`: `auto` (by terminal background), `dark`, `light`, a bundled name, or a file in `dir`.
