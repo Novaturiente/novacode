@@ -594,6 +594,10 @@ impl Ctx {
         let mut all = novacode_tools::builtins(false);
         all.push(Arc::new(novacode_tools::process::ProcessTool));
         all.push(Arc::new(novacode_core::web::WebFetch));
+        all.push(Arc::new(novacode_core::image_gen::GenerateImage {
+            auth: Arc::new(AuthStore::new(self.paths.home().join("auth.json"))),
+            providers: self.providers.clone(),
+        }));
         all.push(Arc::new(novacode_core::web::WebSearch {
             auth: Arc::new(AuthStore::new(self.paths.home().join("auth.json"))),
             providers: self.providers.clone(),

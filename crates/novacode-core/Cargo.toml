@@ -23,6 +23,7 @@ futures-util.workspace = true
 globset = "0.4"
 schemars = { version = "1", features = ["preserve_order"] }
 htmd = "0.5"
+base64 = "0.22"
 reqwest.workspace = true
 regex = "1"
 
