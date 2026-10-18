@@ -592,6 +592,7 @@ impl Ctx {
         let memory_on = s.get("memory.enabled").unwrap_or(true);
         let mut all = novacode_tools::builtins(false);
         all.push(Arc::new(novacode_tools::process::ProcessTool));
+        all.push(Arc::new(novacode_tools::todo::Todo::from_history(&store.projection())));
         if store.path().is_some() {
             all.push(Arc::new(novacode_core::export::SessionSearch {
                 sessions_root: self.paths.home().join("sessions"),
