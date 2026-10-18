@@ -25,6 +25,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+mod doctor;
 mod models;
 
 #[derive(Parser, Clone)]
@@ -65,6 +66,12 @@ struct Cli {
 }
 
 #[derive(Subcommand, Clone)]
+enum AuthCmd {
+    /// Each login and key: where it comes from and whether its token is valid.
+    Status,
+}
+
+#[derive(Subcommand, Clone)]
 enum Command {
     /// Log in to a subscription provider (claude, codex, antigravity, copilot).
     /// Several accounts per provider (--account work) rotate when one runs out (L2.14).
@@ -87,6 +94,13 @@ enum Command {
         #[arg(long)]
         refresh: bool,
     },
+    /// Show logins and keys (`auth status`).
+    Auth {
+        #[command(subcommand)]
+        what: AuthCmd,
+    },
+    /// Check every connected provider, settings and key bindings.
+    Doctor,
     /// Trust a folder's project config (default: the current folder); --revoke to distrust it.
     Trust {
         path: Option<std::path::PathBuf>,
@@ -139,6 +153,18 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
                 }
             );
             return Ok(ExitCode::SUCCESS);
+        }
+        Some(Command::Auth { what: AuthCmd::Status }) | Some(Command::Doctor) => {
+            let cwd = std::env::current_dir()?;
+            let trusted = trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &cwd, false);
+            let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
+            let p = Arc::new(Providers::load(paths.home(), &settings));
+            if matches!(cli.command, Some(Command::Doctor)) {
+                let (km, mut problems) = load_keymap(&paths);
+                problems.extend(km.conflicts());
+                return Ok(doctor::doctor(&p, &settings, problems).await);
+            }
+            return Ok(doctor::auth_status(&p));
         }
         Some(Command::Models { filter, all, refresh }) => {
             let cache = novacode_ai::connect::cache_path(paths.home());
@@ -476,6 +502,12 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
         let history = agent.store.projection();
         let level = agent.config().thinking;
         let window_tokens = agent.config().window_tokens;
+        let price = ctx
+            .providers
+            .resolve(&spec)
+            .ok()
+            .and_then(|r| models::price(&ctx.providers, &r));
+        let spent = models::spent(&ctx.providers, &history);
         let id = agent.store.id().to_string();
         let (handle, task) = agent::spawn(agent);
         let (etx, erx) = mpsc::unbounded_channel();
@@ -528,6 +560,7 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
                                         model: route.spec(),
                                         window_tokens: sw.window_tokens,
                                         level: sw.thinking,
+                                        price: models::price(&p, &route),
                                     };
                                     *cur.lock().unwrap() = (route.spec(), sw.thinking);
                                     h.set_model(sw);
@@ -631,6 +664,8 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
                 t
             },
             notices: std::mem::take(&mut notices),
+            price,
+            spent,
         };
         let res = novacode_tui::run(init, erx, ui_rx, ctx_tx).await;
         handle.abort();

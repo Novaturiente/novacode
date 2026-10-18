@@ -25,6 +25,8 @@ fn app(history: Vec<Message>) -> (App, mpsc::UnboundedReceiver<Cmd>) {
         theme: Default::default(),
         thinking: Default::default(),
         level: Default::default(),
+        price: None,
+        spent: 0.0,
     };
     (App::new(init, tx), rx)
 }
@@ -302,6 +304,7 @@ fn slash_commands_pickers_and_pager() {
         model: "claude/haiku".into(),
         window_tokens: 200_000,
         level: ThinkingLevel::Medium,
+        price: None,
     });
     let s = screen(&mut a, 60, 30);
     assert!(s.contains("model → claude/haiku · medium"), "{s}");
@@ -406,6 +409,8 @@ fn file_completion_in_a_real_folder() {
             theme: Default::default(),
             thinking: Default::default(),
             level: Default::default(),
+            price: None,
+            spent: 0.0,
         },
         tx,
     );
@@ -536,4 +541,35 @@ fn provider_notice_is_shown() {
     )));
     let s = screen(&mut a, 90, 10);
     assert!(s.contains("switched to account `work`"), "{s}");
+}
+
+#[test]
+fn cost_shows_only_with_api_prices() {
+    let (mut a, _rx) = app(vec![]);
+    let reply = || {
+        let mut m = assistant(vec![Block::text("ok")], StopReason::Stop);
+        if let Message::Assistant(x) = &mut m {
+            x.usage = novacode_types::Usage {
+                input: 100_000,
+                output: 10_000,
+                ..Default::default()
+            };
+        }
+        m
+    };
+    a.on_agent(AgentEvent::Message(reply()));
+    assert!(!screen(&mut a, 100, 8).contains('$'), "subscription: no cost");
+    a.on_ui(UiEvent::ModelSet {
+        model: "anthropic/sonnet".into(),
+        window_tokens: 200_000,
+        level: ThinkingLevel::Medium,
+        price: Some(novacode_types::Cost {
+            input: 3.0,
+            output: 15.0,
+            ..Default::default()
+        }),
+    });
+    a.on_agent(AgentEvent::Message(reply()));
+    let s = screen(&mut a, 100, 8);
+    assert!(s.contains("$0.45"), "{s}");
 }

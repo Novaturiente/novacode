@@ -16,9 +16,8 @@ pub struct Budget {
     pub used_tokens: u64,
 }
 
-// shortcut: 4 chars per token; replace with the hybrid estimator (L2.21) in M5.
 pub fn estimate_tokens(text: &str) -> u64 {
-    text.len().div_ceil(4) as u64
+    novacode_types::estimate::text(text)
 }
 
 /// Cut `text` to the limits. Returns the text to send; when cut, the full text

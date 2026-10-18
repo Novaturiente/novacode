@@ -120,7 +120,29 @@ pub struct Usage {
     pub reasoning: Option<u64>,
 }
 
+/// API prices, USD per million tokens (L2.21).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Cost {
+    #[serde(default)]
+    pub input: f64,
+    #[serde(default)]
+    pub output: f64,
+    #[serde(default)]
+    pub cache_read: f64,
+    #[serde(default)]
+    pub cache_write: f64,
+}
+
 impl Usage {
+    /// What this usage costs at `price`, in USD.
+    pub fn cost(&self, price: &Cost) -> f64 {
+        (self.input as f64 * price.input
+            + self.output as f64 * price.output
+            + self.cache_read as f64 * price.cache_read
+            + self.cache_write as f64 * price.cache_write)
+            / 1e6
+    }
+
     /// Prompt tokens including cached ones.
     pub fn prompt_total(&self) -> u64 {
         self.input + self.cache_read + self.cache_write
@@ -366,5 +388,101 @@ mod tests {
         let s = serde_json::to_string(&stop).unwrap();
         assert_eq!(s, r#"{"type":"error","kind":{"type":"rate_limit","retry_after_ms":5}}"#);
         assert_eq!(serde_json::from_str::<StopReason>(&s).unwrap(), stop);
+    }
+}
+
+/// Token estimates (L2.21): the provider's last reported usage is exact for
+/// everything up to that reply; only what came after it is estimated, at
+/// pi's ~3.5 chars per token. No tokenizer: it's for budgets and display.
+pub mod estimate {
+    use super::{Block, Message};
+
+    /// One image, as pi counts it (4800 chars ÷ 3.5).
+    pub const IMAGE_TOKENS: u64 = 1372;
+
+    pub fn text(s: &str) -> u64 {
+        (s.len() as u64 * 2).div_ceil(7)
+    }
+
+    fn blocks(b: &[Block]) -> u64 {
+        b.iter()
+            .map(|b| match b {
+                Block::Text { text: t, .. } | Block::Thinking { text: t, .. } => text(t),
+                Block::Image { .. } => IMAGE_TOKENS,
+                Block::ToolCall(c) => text(&c.name) + text(&c.arguments.to_string()),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    pub fn message(m: &Message) -> u64 {
+        match m {
+            Message::System { text: t } => text(t),
+            Message::User { content } | Message::ToolResult { content, .. } => blocks(content),
+            Message::Assistant(a) => blocks(&a.content),
+            Message::Custom { .. } => 0,
+        }
+    }
+
+    /// Context size of a projection: the last real usage plus estimates for
+    /// the messages after it, or an estimate of everything when no reply has usage yet.
+    pub fn context(messages: &[Message]) -> u64 {
+        let last = messages
+            .iter()
+            .rposition(|m| matches!(m, Message::Assistant(a) if a.usage.prompt_total() > 0));
+        match last {
+            Some(i) => {
+                let Message::Assistant(a) = &messages[i] else {
+                    unreachable!()
+                };
+                a.usage.prompt_total() + a.usage.output + messages[i + 1..].iter().map(message).sum::<u64>()
+            }
+            None => messages.iter().map(message).sum(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::{AssistantMessage, StopReason, Usage};
+
+        #[test]
+        fn hybrid() {
+            let reply = |input| {
+                Message::Assistant(AssistantMessage {
+                    content: vec![Block::text("ok")],
+                    stop: StopReason::ToolUse,
+                    usage: Usage {
+                        input,
+                        output: 10,
+                        ..Default::default()
+                    },
+                    provider: String::new(),
+                    model: String::new(),
+                    response_id: None,
+                    error_message: None,
+                    thinking_level: None,
+                })
+            };
+            let seven = Message::user("x".repeat(70)); // 20 tokens
+            assert_eq!(context(std::slice::from_ref(&seven)), 20, "no usage yet: all estimated");
+            let msgs = [
+                seven.clone(),
+                reply(1000),
+                seven.clone(),
+                Message::User {
+                    content: vec![Block::Image {
+                        mime_type: "image/png".into(),
+                        data: String::new(),
+                    }],
+                },
+            ];
+            assert_eq!(context(&msgs), 1000 + 10 + 20 + IMAGE_TOKENS);
+            assert_eq!(
+                context(&[reply(1000), reply(0)]),
+                1010 + 1,
+                "a reply without usage is estimated"
+            );
+        }
     }
 }

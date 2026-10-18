@@ -70,7 +70,6 @@ pub struct Agent {
     files: Arc<FileState>,
     events: broadcast::Sender<AgentEvent>,
     shared: Arc<Shared>,
-    last_usage: Usage,
     policy: Arc<Policy>,
     /// `None` = nobody to ask (print mode, headless): asks become refusals or justifications.
     approver: Option<Arc<dyn Approver>>,
@@ -140,7 +139,6 @@ impl Agent {
             files: Arc::new(FileState::default()),
             events,
             shared: Arc::default(),
-            last_usage: Usage::default(),
             policy: Arc::new(Policy::new(Permissions::default(), home, None)),
             approver: None,
             quirks: Arc::new(Quirks::ephemeral()),
@@ -283,7 +281,6 @@ impl Agent {
             steering_only = true;
             self.emit(AgentEvent::TurnStart);
             let msg = self.call_model(&cancel).await;
-            self.last_usage = msg.usage;
             let calls: Vec<ToolCall> = msg.tool_calls().cloned().collect();
             let stop = msg.stop.clone();
             let has_text = !msg.text().trim().is_empty();
@@ -371,11 +368,17 @@ impl Agent {
         let mut learned = 0;
         loop {
             let route = format!("{}/{}", self.cfg.provider, self.cfg.model);
+            let messages = self.store.projection();
+            // Never ask for more output than the window has room for (L2.21).
+            let room = self
+                .cfg
+                .window_tokens
+                .saturating_sub(novacode_types::estimate::context(&messages));
             let req = Request {
                 model: self.cfg.model.clone(),
-                messages: self.store.projection(),
+                max_tokens: self.cfg.max_tokens.min(room.clamp(1024, u32::MAX as u64) as u32),
+                messages,
                 tools: self.quirks.apply(&route, &self.defs),
-                max_tokens: self.cfg.max_tokens,
                 cache: self.cfg.cache,
                 thinking: Some(self.cfg.thinking),
                 images: self.cfg.images,
@@ -475,7 +478,7 @@ impl Agent {
             .any(|(_, p)| matches!(p, Prepared::Ready(t, ..) if t.sequential()));
         let budget = Budget {
             window_tokens: self.cfg.window_tokens,
-            used_tokens: self.last_usage.prompt_total() + self.last_usage.output,
+            used_tokens: novacode_types::estimate::context(&self.store.projection()),
         };
         let base = ToolCtx {
             cwd: self.cfg.cwd.clone(),

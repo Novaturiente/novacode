@@ -240,6 +240,17 @@ impl Providers {
         Ok((adapter, key))
     }
 
+    /// Where an API-key provider's key comes from, without reading it (L2.25).
+    pub fn key_source(&self, p: &Profile) -> Option<String> {
+        if p.api_key.is_some() {
+            return Some(format!("settings providers.{}.apiKey", p.id));
+        }
+        if let Some(v) = p.env.iter().find(|v| std::env::var(v).is_ok_and(|k| !k.is_empty())) {
+            return Some(format!("env {v}"));
+        }
+        p.key_optional.then(|| "local server, no key needed".into())
+    }
+
     fn key(&self, p: &Profile) -> Result<Option<String>, ConnectError> {
         if let Some(v) = &p.api_key {
             return Ok(Some(auth::resolve_key(v)?));

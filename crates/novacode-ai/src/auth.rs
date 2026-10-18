@@ -94,6 +94,15 @@ impl AuthStore {
         write(&self.path, &f)
     }
 
+    /// Every stored login: (provider, account, credential), without refreshing.
+    pub fn logins(&self) -> Vec<(String, String, OAuthCredential)> {
+        let Ok(f) = self.read() else { return Vec::new() };
+        f.providers
+            .into_iter()
+            .flat_map(|(p, m)| m.into_iter().map(move |(a, c)| (p.clone(), a, c)))
+            .collect()
+    }
+
     /// The stored access token, without refreshing (may be stale).
     pub fn cached_access(&self, provider: &str, account: &str) -> Option<String> {
         self.read()

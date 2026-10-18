@@ -34,6 +34,29 @@ impl Limits {
     }
 }
 
+/// API prices of a route, or `None` on a subscription: subscription spend isn't
+/// something novacode can compute, so no cost is shown there (L2.21).
+pub fn price(p: &Providers, route: &Route) -> Option<novacode_types::Cost> {
+    p.profile(&route.provider)
+        .ok()
+        .filter(|pr| !pr.oauth())
+        .and(route.info.cost)
+}
+
+/// USD spent on API-key routes across a session's replies, each at its own model's price.
+pub fn spent(p: &Providers, history: &[novacode_types::Message]) -> f64 {
+    history
+        .iter()
+        .filter_map(|m| match m {
+            novacode_types::Message::Assistant(a) => {
+                let route = p.resolve(&format!("{}/{}", a.provider, a.model)).ok()?;
+                Some(a.usage.cost(&price(p, &route)?))
+            }
+            _ => None,
+        })
+        .sum()
+}
+
 /// Everything the agent needs to move to `spec` (another provider is fine).
 pub async fn switch(
     p: &Arc<Providers>,

@@ -121,17 +121,7 @@ fn merge(base: &mut Value, over: &Value) {
 
 // ---------- models ----------
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
-pub struct Cost {
-    #[serde(default)]
-    pub input: f64,
-    #[serde(default)]
-    pub output: f64,
-    #[serde(default)]
-    pub cache_read: f64,
-    #[serde(default)]
-    pub cache_write: f64,
-}
+pub use novacode_types::Cost;
 
 /// What novacode needs to know about one model.
 #[derive(Debug, Clone, PartialEq)]

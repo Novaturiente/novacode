@@ -9,7 +9,7 @@ use crate::theme::Theme;
 use crate::transcript::{Thinking, Transcript, View};
 use crate::wrap;
 use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
-use novacode_types::{AgentEvent, BlockKind, Message, StopReason, StreamEvent, ThinkingLevel, Usage};
+use novacode_types::{AgentEvent, BlockKind, Cost, Message, StopReason, StreamEvent, ThinkingLevel, Usage};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
@@ -58,6 +58,10 @@ pub struct Init {
     pub thinking: Thinking,
     /// Thinking level in use (L2.16).
     pub level: ThinkingLevel,
+    /// API prices of the current route; `None` on subscriptions, where no cost is shown (L2.21).
+    pub price: Option<Cost>,
+    /// USD already spent on API-key routes in this session (resumed history).
+    pub spent: f64,
 }
 
 /// What the UI asks of the session.
@@ -95,6 +99,7 @@ pub enum UiEvent {
         model: String,
         window_tokens: u64,
         level: ThinkingLevel,
+        price: Option<Cost>,
     },
 }
 
@@ -153,6 +158,8 @@ pub struct App {
     activity: String,
     pub spinner: usize,
     usage: Option<Usage>,
+    /// Context in use: the last reply's usage plus estimates since (L2.21).
+    ctx: u64,
     /// Steering messages sent but not yet delivered.
     pending: Vec<String>,
     /// `None` = follow the tail; otherwise (turn, line offset in turn) at the top.
@@ -195,6 +202,7 @@ impl App {
         };
         let mut history = Vec::new();
         let mut usage = None;
+        let ctx = novacode_types::estimate::context(&init.history);
         for m in std::mem::take(&mut init.history) {
             if let Message::User { content } = &m {
                 history.push(text_of(content));
@@ -221,6 +229,7 @@ impl App {
             activity: String::new(),
             spinner: 0,
             usage,
+            ctx,
             pending: Vec::new(),
             anchor: None,
             shown: None,
@@ -268,7 +277,9 @@ impl App {
                 model,
                 window_tokens,
                 level,
+                price,
             } => {
+                self.init.price = price;
                 // L1.7: a model change re-sends the whole prompt uncached; say so, never block.
                 let est = self.usage.map_or(0, |u| u.prompt_total());
                 let mut note = format!("model → {model} · {} from the next message", level.as_str());
@@ -310,6 +321,15 @@ impl App {
                     if let Some(i) = self.pending.iter().position(|p| *p == text) {
                         self.pending.remove(i);
                     }
+                }
+                match &m {
+                    Message::Assistant(a) if a.usage.prompt_total() > 0 => {
+                        self.ctx = a.usage.prompt_total() + a.usage.output;
+                        if let Some(p) = &self.init.price {
+                            self.init.spent += a.usage.cost(p);
+                        }
+                    }
+                    other => self.ctx += novacode_types::estimate::message(other),
                 }
                 if let Message::Assistant(a) = &m {
                     if a.usage.prompt_total() > 0 {
@@ -1049,9 +1069,8 @@ impl App {
             ));
         }
         let mut right = Vec::new();
-        if let Some(u) = self.usage {
-            let used = u.prompt_total() + u.output;
-            let pct = used as f64 * 100.0 / self.init.window_tokens.max(1) as f64;
+        if self.ctx > 0 {
+            let pct = self.ctx as f64 * 100.0 / self.init.window_tokens.max(1) as f64;
             let st = match pct {
                 p if p < 50.0 => t.ok,
                 p if p < 70.0 => t.warn,
@@ -1059,11 +1078,20 @@ impl App {
                 _ => t.error,
             };
             right.push(Span::styled(format!("ctx {pct:.0}%"), st));
-            if u.prompt_total() > 0 {
+            if let Some(u) = self.usage.filter(|u| u.prompt_total() > 0) {
                 let hit = u.cache_read as f64 * 100.0 / u.prompt_total() as f64;
                 right.push(Span::styled(format!("  cache {hit:.0}%"), t.dim));
             }
             right.push(Span::raw("  "));
+        }
+        if self.init.price.is_some() || self.init.spent > 0.0 {
+            let s = self.init.spent;
+            let s = if s < 0.01 {
+                format!("${s:.4}")
+            } else {
+                format!("${s:.2}")
+            };
+            right.push(Span::styled(format!("{s}  "), t.dim));
         }
         right.push(Span::styled(self.init.model.clone(), t.accent));
         right.push(Span::styled(format!(" · {}", self.init.level.as_str()), t.dim));
