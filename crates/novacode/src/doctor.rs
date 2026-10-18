@@ -56,7 +56,7 @@ pub fn auth_status(p: &Providers) -> ExitCode {
     }
     if rows.is_empty() {
         eprintln!(
-            "No logins or keys. Run `novacode login <claude|codex|antigravity|copilot>` or set a provider's API key env var."
+            "No logins or keys. Run `novacode login <provider>` (claude, codex, antigravity, copilot, or any API-key provider) or set its API key env var."
         );
         return ExitCode::FAILURE;
     }

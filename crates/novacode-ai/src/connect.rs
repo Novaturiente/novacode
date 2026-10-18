@@ -72,6 +72,8 @@ pub struct Providers {
     pub profiles: BTreeMap<String, Profile>,
     pub catalog: Catalog,
     pub auth: AuthStore,
+    /// `--api-key` for one provider, ahead of every other source (pi's runtime override).
+    pub cli_key: Option<(String, String)>,
 }
 
 impl Providers {
@@ -80,6 +82,7 @@ impl Providers {
             profiles: catalog::profiles(settings.get::<Value>("providers").as_ref()),
             catalog: Catalog::load(&cache_path(home), settings.get::<Value>("models").as_ref()),
             auth: AuthStore::new(home.join("auth.json")),
+            cli_key: None,
         }
     }
 
@@ -97,7 +100,7 @@ impl Providers {
         if p.oauth() {
             return self.auth.has(&p.id);
         }
-        p.api_key.is_some() || p.key_optional || p.env.iter().any(|v| std::env::var_os(v).is_some())
+        self.key_source(p).is_some()
     }
 
     /// Parse and resolve a model spec. Aliases resolve against the catalog.
@@ -242,6 +245,12 @@ impl Providers {
 
     /// Where an API-key provider's key comes from, without reading it (L2.25).
     pub fn key_source(&self, p: &Profile) -> Option<String> {
+        if self.cli_key.as_ref().is_some_and(|(id, _)| *id == p.id) {
+            return Some("--api-key".into());
+        }
+        if self.auth.stored_key(&p.id).is_some() {
+            return Some("novacode login (auth.json)".into());
+        }
         if p.api_key.is_some() {
             return Some(format!("settings providers.{}.apiKey", p.id));
         }
@@ -251,9 +260,13 @@ impl Providers {
         p.key_optional.then(|| "local server, no key needed".into())
     }
 
+    /// Key order (pi): `--api-key`, then `novacode login`, then settings, then env.
     fn key(&self, p: &Profile) -> Result<Option<String>, ConnectError> {
-        if let Some(v) = &p.api_key {
-            return Ok(Some(clean_key(&auth::resolve_key(v)?)));
+        if let Some((_, k)) = self.cli_key.as_ref().filter(|(id, _)| *id == p.id) {
+            return Ok(Some(clean_key(&auth::resolve_key(k)?)));
+        }
+        if let Some(v) = self.auth.stored_key(&p.id).or_else(|| p.api_key.clone()) {
+            return Ok(Some(clean_key(&auth::resolve_key(&v)?)));
         }
         if let Some(k) = p
             .env
@@ -267,7 +280,7 @@ impl Providers {
         }
         let env = p.env.first().map(String::as_str).unwrap_or("its key env var");
         Err(setup(format!(
-            "{} needs an API key: set {env}, or providers.{}.apiKey in settings",
+            "{} needs an API key: run `novacode login {}`, or set {env}",
             p.id, p.id
         )))
     }
@@ -338,5 +351,28 @@ mod tests {
         assert!(p.connected(&p.profiles["ollama"]), "local server needs no key");
         let err = p.adapter("sambanova", None).await.err().unwrap().to_string();
         assert!(err.contains("SAMBANOVA_API_KEY"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn key_order_is_cli_then_login_then_settings() {
+        let (_d, p) = providers(r#"{ "providers": { "groq": { "apiKey": "gsk-settings" } } }"#);
+        let p = Arc::try_unwrap(p).ok().unwrap();
+        p.auth.put_key("groq", "gsk-login\n").await.unwrap();
+        p.auth.put_key("sambanova", "$NOVACODE_TEST_UNSET_VAR").await.unwrap();
+        assert!(p.connected(&p.profiles["sambanova"]), "a saved key connects");
+        let p = Arc::new(p);
+        assert_eq!(p.adapter("groq", None).await.unwrap().1.as_deref(), Some("gsk-login"));
+        assert!(p.auth.secrets().iter().any(|(k, _)| k == "gsk-login\n"));
+        assert!(
+            !p.auth.secrets().iter().any(|(k, _)| k.starts_with('$')),
+            "indirections aren't secrets"
+        );
+        let mut p = Arc::try_unwrap(p).ok().unwrap();
+        p.cli_key = Some(("groq".into(), "gsk-cli".into()));
+        assert_eq!(p.key_source(&p.profiles["groq"]).as_deref(), Some("--api-key"));
+        let p = Arc::new(p);
+        assert_eq!(p.adapter("groq", None).await.unwrap().1.as_deref(), Some("gsk-cli"));
+        assert!(p.auth.remove("groq", None).await.unwrap(), "logout drops the key");
+        assert!(p.auth.stored_key("groq").is_none());
     }
 }

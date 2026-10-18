@@ -61,6 +61,9 @@ struct Cli {
     /// Trust this folder's project config for this run only (L6.3).
     #[arg(long)]
     trust: bool,
+    /// API key for the model's provider, for this run only (ahead of saved and env keys).
+    #[arg(long, value_name = "KEY")]
+    api_key: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -73,8 +76,9 @@ enum AuthCmd {
 
 #[derive(Subcommand, Clone)]
 enum Command {
-    /// Log in to a subscription provider (claude, codex, antigravity, copilot).
-    /// Several accounts per provider (--account work) rotate when one runs out (L2.14).
+    /// Log in to a subscription (claude, codex, antigravity, copilot), or save an
+    /// API key for any other provider (openrouter, openai, google, …).
+    /// Several subscription accounts (--account work) rotate when one runs out (L2.14).
     Login {
         provider: String,
         #[arg(long, default_value = DEFAULT_ACCOUNT)]
@@ -141,7 +145,19 @@ fn fail(e: anyhow::Error) -> ExitCode {
 async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     let auth_store = AuthStore::new(paths.home().join("auth.json"));
     match cli.command {
-        Some(Command::Login { provider, account }) => return login(&auth_store, &provider, &account).await,
+        Some(Command::Login { provider, account }) => {
+            let cwd = std::env::current_dir()?;
+            let trusted = trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &cwd, false);
+            let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
+            let p = Providers::load(paths.home(), &settings);
+            if p.profiles.get(&provider).is_some_and(|pr| !pr.oauth()) {
+                if account != DEFAULT_ACCOUNT {
+                    bail!("API keys don't rotate, so there is one per provider (no --account)");
+                }
+                return key_login(p, &provider).await;
+            }
+            return login(&auth_store, &provider, &account).await;
+        }
         Some(Command::Logout { provider, account }) => {
             let had = auth_store.remove(&provider, account.as_deref()).await?;
             eprintln!(
@@ -222,8 +238,20 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         }
     }
     let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
-    let providers = Arc::new(Providers::load(paths.home(), &settings));
-    let model = match cli.model.clone().or_else(|| settings.get::<String>("model")) {
+    let mut providers = Providers::load(paths.home(), &settings);
+    let chosen = cli.model.clone().or_else(|| settings.get::<String>("model"));
+    if let Some(k) = cli.api_key.clone() {
+        let Some(provider) = chosen
+            .as_deref()
+            .and_then(|m| m.split_once('/'))
+            .map(|(p, _)| p.to_string())
+        else {
+            bail!("--api-key needs a model: pass -m provider/model");
+        };
+        providers.cli_key = Some((provider, k));
+    }
+    let providers = Arc::new(providers);
+    let model = match chosen {
         Some(m) => m,
         None if interactive => onboard(&paths, &providers).await?,
         None => bail!("no model: pass -m provider/model or set \"model\" in settings"),
@@ -814,6 +842,70 @@ fn git_branch(cwd: &Path) -> Option<String> {
     })
 }
 
+/// `novacode login <api-key provider>`: read the key without echo, check it with a
+/// free model-list call (jcode validates at login), save it in auth.json (pi).
+async fn key_login(mut p: Providers, provider: &str) -> anyhow::Result<ExitCode> {
+    let pr = &p.profiles[provider];
+    let env = pr.env.first().cloned().unwrap_or_default();
+    eprintln!("Paste your {provider} API key (or $VAR / !command to read it on each use).");
+    if !env.is_empty() {
+        eprintln!("Without a saved key novacode reads {env}.");
+    }
+    let key = read_secret("key: ")?;
+    if key.is_empty() {
+        bail!("no key entered; nothing saved");
+    }
+    p.cli_key = Some((provider.into(), key.clone()));
+    let p = Arc::new(p);
+    let check = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        match p.adapter(provider, None).await {
+            Ok((a, _)) => a.list_models().await,
+            Err(e) => Err(e.to_string()),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Err("no answer in 30s".into()));
+    match check {
+        Ok(ids) => eprintln!("key works: {} models", ids.len()),
+        Err(e) => {
+            eprintln!("key check failed: {e}");
+            if !std::io::stdin().is_terminal() {
+                bail!("key not saved");
+            }
+            eprint!("save it anyway? [y/N] ");
+            let mut a = String::new();
+            std::io::stdin().read_line(&mut a)?;
+            if !a.trim().eq_ignore_ascii_case("y") {
+                bail!("key not saved");
+            }
+        }
+    }
+    p.auth.put_key(provider, &key).await?;
+    eprintln!("saved in auth.json (owner-only); `novacode logout {provider}` removes it");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One line from stdin with echo off when it's a terminal.
+// shortcut: echo is switched with `stty`; use termios directly if a non-Unix build ever matters.
+fn read_secret(prompt: &str) -> anyhow::Result<String> {
+    let tty = std::io::stdin().is_terminal();
+    let stty = |arg: &str| {
+        let _ = std::process::Command::new("stty").arg(arg).status();
+    };
+    eprint!("{prompt}");
+    if tty {
+        stty("-echo");
+    }
+    let mut line = String::new();
+    let r = std::io::stdin().read_line(&mut line);
+    if tty {
+        stty("echo");
+        eprintln!();
+    }
+    r?;
+    Ok(line.trim().to_string())
+}
+
 async fn login(store: &AuthStore, provider: &str, account: &str) -> anyhow::Result<ExitCode> {
     // Default browser via xdg-open; the URL is always printed too, for headless or another browser.
     let open = |url: &str| {
@@ -874,7 +966,9 @@ async fn login(store: &AuthStore, provider: &str, account: &str) -> anyhow::Resu
             }
             c
         }
-        _ => bail!("unknown login provider `{provider}` (logins: claude, codex, antigravity, copilot)"),
+        _ => bail!(
+            "unknown provider `{provider}` (subscriptions: claude, codex, antigravity, copilot; API keys: see `novacode models --all`)"
+        ),
     };
     store.put(provider, account, cred).await?;
     if account == DEFAULT_ACCOUNT {

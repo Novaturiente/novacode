@@ -43,6 +43,10 @@ struct AuthFile {
     /// provider → account label → credential.
     #[serde(default)]
     providers: BTreeMap<String, BTreeMap<String, OAuthCredential>>,
+    /// provider → API key saved by `novacode login` (pi's `api_key` entries). May be
+    /// `$VAR` or `!command`, resolved on use. One per provider: keys never rotate (L2.14).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    keys: BTreeMap<String, String>,
 }
 
 fn version() -> u32 {
@@ -94,6 +98,19 @@ impl AuthStore {
         write(&self.path, &f)
     }
 
+    /// Save an API key for `provider` (replaces the old one).
+    pub async fn put_key(&self, provider: &str, key: &str) -> Result<(), AuthError> {
+        let _lock = self.locked().await?;
+        let mut f = self.read()?;
+        f.keys.insert(provider.into(), key.into());
+        write(&self.path, &f)
+    }
+
+    /// The saved API key as written (maybe `$VAR`/`!command`), unresolved.
+    pub fn stored_key(&self, provider: &str) -> Option<String> {
+        self.read().ok()?.keys.remove(provider)
+    }
+
     /// Every stored login: (provider, account, credential), without refreshing.
     pub fn logins(&self) -> Vec<(String, String, OAuthCredential)> {
         let Ok(f) = self.read() else { return Vec::new() };
@@ -133,7 +150,7 @@ impl AuthStore {
         let _lock = self.locked().await?;
         let mut f = self.read()?;
         let had = match account {
-            None => f.providers.remove(provider).is_some(),
+            None => f.providers.remove(provider).is_some() | f.keys.remove(provider).is_some(),
             Some(a) => {
                 let m = f.providers.entry(provider.into()).or_default();
                 let had = m.remove(a).is_some();
@@ -150,6 +167,11 @@ impl AuthStore {
     /// Every stored token with a label, for masking tool output (L6.6). Read errors give none.
     pub fn secrets(&self) -> Vec<(String, String)> {
         let Ok(f) = self.read() else { return Vec::new() };
+        let keys = f
+            .keys
+            .iter()
+            .filter(|(_, k)| !k.starts_with(['$', '!']))
+            .map(|(p, k)| (k.clone(), format!("{p} API key")));
         f.providers
             .iter()
             .flat_map(|(p, accounts)| {
@@ -160,6 +182,7 @@ impl AuthStore {
                     ]
                 })
             })
+            .chain(keys)
             .collect()
     }
 
