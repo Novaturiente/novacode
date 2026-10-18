@@ -40,8 +40,22 @@ pub struct Activity {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct CacheStats {
+    /// Prompt tokens read from / written to the cache by the last reply.
+    pub last_read: u64,
+    pub last_write: u64,
+    /// Session: cache reads over all prompt tokens, 0–100.
+    pub hit_pct: f64,
+    /// The last miss the detector named (L2.17).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_miss: Option<String>,
+}
+
 /// What every client is told about the session, at `hello` and on change.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Also the status record (L8.15): `get_state`/`get_status`, the run file and
+/// `novacode status`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct State {
     pub session: String,
     pub cwd: String,
@@ -62,6 +76,56 @@ pub struct State {
     /// The session file; absent for `--no-session`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// Context in use (last reply's usage plus estimates since), in tokens.
+    #[serde(default)]
+    pub context_tokens: u64,
+    #[serde(default)]
+    pub cache: CacheStats,
+    /// Session token totals.
+    #[serde(default)]
+    pub tokens: novacode_types::Usage,
+    /// Subscription quota windows, when the route has them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<novacode_ai::quota::Quota>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// When this process took the session up, and when the running task started (unix ms).
+    #[serde(default)]
+    pub started_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_started_ms: Option<u64>,
+}
+
+impl State {
+    /// Context use, 0–100.
+    pub fn context_pct(&self) -> u64 {
+        (self.context_tokens * 100).checked_div(self.window_tokens).unwrap_or(0)
+    }
+
+    /// Fold one stored message into the token, cache and context figures.
+    pub fn add(&mut self, m: &Message) {
+        match m {
+            Message::Assistant(a) if a.usage.prompt_total() > 0 => {
+                let u = &a.usage;
+                self.context_tokens = u.prompt_total() + u.output;
+                self.tokens.input += u.input;
+                self.tokens.output += u.output;
+                self.tokens.cache_read += u.cache_read;
+                self.tokens.cache_write += u.cache_write;
+                self.cache.last_read = u.cache_read;
+                self.cache.last_write = u.cache_write;
+                let prompt = self.tokens.input + self.tokens.cache_read + self.tokens.cache_write;
+                self.cache.hit_pct =
+                    (self.tokens.cache_read as f64 * 100.0 / prompt.max(1) as f64 * 10.0).round() / 10.0;
+                if let Some(p) = &self.price {
+                    self.spent += u.cost(p);
+                }
+            }
+            other => self.context_tokens += novacode_types::estimate::message(other),
+        }
+    }
 }
 
 /// Server → client.
@@ -149,7 +213,8 @@ pub enum ClientCmd {
         #[serde(default)]
         html: bool,
     },
-    /// Response data: [`State`].
+    /// Response data: [`State`], the status record (L8.15).
+    #[serde(alias = "get_status")]
     GetState,
     /// Response data: `{"messages": [...]}`.
     GetMessages,
@@ -225,6 +290,7 @@ mod tests {
                 detail: "tool:bash".into(),
             },
             file: Some("/s/01abc.jsonl".into()),
+            ..Default::default()
         };
         let server = vec![
             ServerMsg::Hello {

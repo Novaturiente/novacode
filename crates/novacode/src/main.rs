@@ -32,6 +32,7 @@ mod hub;
 mod models;
 mod serve;
 mod stats;
+mod status;
 mod wire;
 
 #[derive(Parser, Clone)]
@@ -138,6 +139,21 @@ enum Command {
     Agents,
     /// End a live session, a background one included
     Stop { session: String },
+    /// Status of a live session: this pane's, else this folder's newest (L8.15)
+    Status {
+        /// Session id prefix.
+        #[arg(long)]
+        session: Option<String>,
+        /// Every live session.
+        #[arg(long)]
+        all: bool,
+        /// The full record as JSON lines.
+        #[arg(long)]
+        json: bool,
+        /// Template, e.g. '{ctx}% {5h}'. Fields: session state detail model level ctx ctx_tokens window hit read write miss cost 5h week branch project cwd bg.
+        #[arg(long, value_name = "TEMPLATE")]
+        format: Option<String>,
+    },
     /// Dev metrics report (needs `debug.metrics`): the latest session, one by id prefix, or --all.
     Stats {
         session: Option<String>,
@@ -238,6 +254,12 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Some(Command::Agents) => return Ok(serve::agents(&paths)),
+        Some(Command::Status {
+            session,
+            all,
+            json,
+            format,
+        }) => return Ok(status::run(&paths, session.as_deref(), all, json, format.as_deref())),
         Some(Command::Stop { session }) => return serve::stop(&paths, &session).await,
         Some(Command::Attach { session }) => {
             if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -662,10 +684,8 @@ async fn print_mode(
         level: agent.config().thinking,
         window_tokens: agent.config().window_tokens,
         busy: false,
-        price: None,
-        spent: 0.0,
-        activity: Default::default(),
         file: agent.store.path().map(|p| p.display().to_string()),
+        ..Default::default()
     };
     let (handle, task) = agent::spawn(agent);
     let mut events = handle.subscribe();
@@ -823,19 +843,25 @@ async fn start_session(
         .resolve(&spec)
         .ok()
         .and_then(|r| models::price(&ctx.providers, &r));
-    let state = wire::State {
+    let history = agent.store.projection();
+    let mut state = wire::State {
         session: agent.store.id().to_string(),
         cwd: ctx.cwd.display().to_string(),
         model: spec.clone(),
         level: agent.config().thinking,
         window_tokens: agent.config().window_tokens,
-        busy: false,
-        price,
-        spent: models::spent(&ctx.providers, agent.store.entries()),
-        activity: Default::default(),
         file: agent.store.path().map(|p| p.display().to_string()),
+        branch: git_branch(&ctx.cwd),
+        project: activity::project(&ctx.cwd).await,
+        started_ms: novacode_core::session::now_ms(),
+        ..Default::default()
     };
-    let history = agent.store.projection();
+    for m in &history {
+        state.add(m);
+    }
+    // Priced per reply at its own model's rate (models::spent), not the current one.
+    state.price = price;
+    state.spent = models::spent(&ctx.providers, agent.store.entries());
     let id = agent.store.id().to_string();
     let level = state.level;
     let (handle, task) = agent::spawn(agent);
@@ -855,7 +881,32 @@ async fn start_session(
     });
     let mut live = serve::go_live(&host, bg)?;
     live.add_task(activity::spawn(&host.hub, sinks));
+    live.add_task(quota_task(host.clone()));
     Ok((live, task))
+}
+
+/// Keep `State.quota` current: at start and after each task (L8.15).
+fn quota_task(host: Arc<host::Host>) -> tokio::task::JoinHandle<()> {
+    let mut changed = host.hub.changed.subscribe();
+    tokio::spawn(async move {
+        let auth = AuthStore::new(host.paths.home().join("auth.json"));
+        let mut was_busy = true;
+        loop {
+            let s = changed.borrow_and_update().clone();
+            if was_busy && !s.busy {
+                let (provider, model) = s.model.split_once('/').unwrap_or((&s.model, ""));
+                if let Some(q) = novacode_ai::quota::cached(host.paths.home(), &auth, provider, model).await
+                    && s.quota.as_ref() != Some(&q)
+                {
+                    host.hub.update(false, |st| st.quota = Some(q));
+                }
+            }
+            was_busy = s.busy;
+            if host.hub.is_closed() || changed.changed().await.is_err() {
+                break;
+            }
+        }
+    })
 }
 
 /// `--bg` (the child) and `--rpc`: a session with no window of its own.

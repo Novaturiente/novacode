@@ -23,6 +23,9 @@ pub struct RunFile {
     pub socket: PathBuf,
     /// Started with `--bg`: outlives its terminal.
     pub bg: bool,
+    /// tmux pane of the session's own window, so `status` in that pane finds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
     pub started_ms: u64,
     pub state: State,
 }
@@ -201,6 +204,7 @@ pub fn go_live(host: &Arc<Host>, bg: bool) -> std::io::Result<Live> {
         pid: std::process::id(),
         socket: sock.clone(),
         bg,
+        pane: if bg { None } else { std::env::var("TMUX_PANE").ok() },
         started_ms: novacode_core::session::now_ms(),
         state: host.hub.state(),
     };

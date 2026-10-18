@@ -129,6 +129,16 @@ impl Hub {
         let blocked = !g.approvals.is_empty();
         g.state.activity.state = activity_state(g.state.busy, blocked);
         match &ev {
+            AgentEvent::AgentStart => g.state.task_started_ms = Some(novacode_core::session::now_ms()),
+            AgentEvent::Settled => g.state.task_started_ms = None,
+            AgentEvent::Compacted { tokens_after, .. } => g.state.context_tokens = *tokens_after,
+            AgentEvent::Stream(StreamEvent::Notice { text }) if text.starts_with("cache miss:") => {
+                g.state.cache.last_miss = Some(text.trim_start_matches("cache miss:").trim().to_string());
+            }
+            AgentEvent::Message(m) => g.state.add(m),
+            _ => {}
+        }
+        match &ev {
             AgentEvent::Message(m) => {
                 g.history.push(m.clone());
                 // Running tools stay; everything else is now in the message.
@@ -150,9 +160,10 @@ impl Hub {
                 }
             }
         }
+        let figures = matches!(ev, AgentEvent::Message(_) | AgentEvent::Compacted { .. });
         let msg = ServerMsg::Event { event: ev };
         g.clients.retain(|_, tx| tx.send(msg.clone()).is_ok());
-        if (g.state.busy, g.state.activity.clone()) != before {
+        if figures || (g.state.busy, g.state.activity.clone()) != before {
             let s = g.state.clone();
             drop(g);
             self.state_changed(s, false);

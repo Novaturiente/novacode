@@ -45,7 +45,7 @@ impl Sinks {
 }
 
 /// Repo name for a folder (main checkout, so worktrees map back); `None` outside git.
-async fn project(dir: &Path) -> Option<String> {
+pub async fn project(dir: &Path) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)

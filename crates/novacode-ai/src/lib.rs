@@ -12,6 +12,7 @@ pub mod http;
 pub mod json;
 pub mod openai_chat;
 pub mod openai_responses;
+pub mod quota;
 pub mod retry;
 pub mod rotate;
 pub mod schema;
