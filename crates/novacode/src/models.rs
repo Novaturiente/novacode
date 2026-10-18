@@ -9,6 +9,7 @@ use novacode_core::agent::Switch;
 use novacode_tui::dialog::PickItem;
 use novacode_types::ThinkingLevel;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 /// Settings that cap what the catalog says.
 #[derive(Clone, Copy)]
@@ -35,7 +36,7 @@ impl Limits {
 
 /// Everything the agent needs to move to `spec` (another provider is fine).
 pub async fn switch(
-    p: &Providers,
+    p: &Arc<Providers>,
     spec: &str,
     level: ThinkingLevel,
     limits: Limits,
@@ -57,7 +58,7 @@ pub async fn switch(
 }
 
 /// Live model lists of every connected provider, plus errors worth showing.
-pub async fn list(p: &Providers, current: &str) -> (Vec<PickItem>, Vec<String>) {
+pub async fn list(p: &Arc<Providers>, current: &str) -> (Vec<PickItem>, Vec<String>) {
     let connected: Vec<_> = p.profiles.values().filter(|pr| p.connected(pr)).collect();
     let lists = join_all(connected.iter().map(|pr| async move {
         let ids = match p.adapter(&pr.id, None).await {
@@ -100,7 +101,7 @@ pub async fn list(p: &Providers, current: &str) -> (Vec<PickItem>, Vec<String>) 
 }
 
 /// `novacode models [filter]`: connected providers' models with their metadata.
-pub async fn command(p: &Providers, filter: Option<String>, all: bool) -> anyhow::Result<ExitCode> {
+pub async fn command(p: &Arc<Providers>, filter: Option<String>, all: bool) -> anyhow::Result<ExitCode> {
     let f = filter.unwrap_or_default().to_lowercase();
     if all {
         // Every provider novacode knows, connected or not.

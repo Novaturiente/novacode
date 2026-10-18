@@ -121,9 +121,31 @@ impl Providers {
     }
 
     /// The adapter for a provider, plus the API key it uses (for masking, L6.6).
+    /// The adapter for a provider. Subscription logins get a live adapter that
+    /// follows token refreshes and rotates between the provider's logged-in
+    /// accounts when one is exhausted (L2.14). Returns the API key used, for masking.
     pub async fn adapter(
+        self: &Arc<Self>,
+        provider: &str,
+        trace: Option<Trace>,
+    ) -> Result<(Arc<dyn Adapter>, Option<String>), ConnectError> {
+        let p = self.profile(provider)?;
+        if !p.oauth() {
+            return self.adapter_for(provider, DEFAULT_ACCOUNT, trace).await;
+        }
+        let accounts = self.auth.accounts(provider);
+        let first = accounts.first().map(String::as_str).unwrap_or(DEFAULT_ACCOUNT);
+        // Build the first account now, so a missing or broken login shows at connect time.
+        let (a, _) = self.adapter_for(provider, first, trace.clone()).await?;
+        let live = crate::rotate::Live::new(self.clone(), provider, accounts, trace, a);
+        Ok((Arc::new(live), None))
+    }
+
+    /// The adapter for one account, with the credential as it is right now.
+    pub async fn adapter_for(
         &self,
         provider: &str,
+        account: &str,
         trace: Option<Trace>,
     ) -> Result<(Arc<dyn Adapter>, Option<String>), ConnectError> {
         let p = self.profile(provider)?;
@@ -134,7 +156,7 @@ impl Providers {
                     let d = OAuthProfile::default();
                     let get = |k: &str, def: String| p.extra_str(k).unwrap_or(def);
                     anthropic::Auth::OAuth {
-                        access_token: self.auth.access_token(&p.id, DEFAULT_ACCOUNT).await?,
+                        access_token: self.auth.access_token(&p.id, account).await?,
                         profile: OAuthProfile {
                             user_agent: get("userAgent", d.user_agent),
                             betas: get("betas", d.betas),
@@ -169,7 +191,7 @@ impl Providers {
             Api::OpenAiResponses => {
                 let auth = if p.oauth() {
                     openai_responses::Auth::Codex {
-                        access_token: self.auth.access_token(&p.id, DEFAULT_ACCOUNT).await?,
+                        access_token: self.auth.access_token(&p.id, account).await?,
                         originator: p.extra_str("originator").unwrap_or_else(|| "novacode".into()),
                     }
                 } else {
@@ -191,7 +213,7 @@ impl Providers {
             }
             Api::Gemini => {
                 let auth = if p.oauth() {
-                    let c = self.auth.credential(&p.id, DEFAULT_ACCOUNT).await?;
+                    let c = self.auth.credential(&p.id, account).await?;
                     let project = match c.project {
                         Some(pr) => pr,
                         None => crate::auth::antigravity::project(&c.access)
@@ -211,7 +233,7 @@ impl Providers {
                 Arc::new(gemini::Gemini::new(&p.id, &p.base_url, auth, trace))
             }
             Api::Copilot => {
-                let token = self.auth.access_token(&p.id, DEFAULT_ACCOUNT).await?;
+                let token = self.auth.access_token(&p.id, account).await?;
                 Arc::new(crate::copilot::Copilot::new(token, trace))
             }
         };
@@ -249,12 +271,12 @@ pub fn cache_path(home: &Path) -> std::path::PathBuf {
 mod tests {
     use super::*;
 
-    fn providers(settings: &str) -> (tempfile::TempDir, Providers) {
+    fn providers(settings: &str) -> (tempfile::TempDir, Arc<Providers>) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         std::fs::write(&path, settings).unwrap();
         let s = Settings::load(&path, None, false);
-        let p = Providers::load(dir.path(), &s);
+        let p = Arc::new(Providers::load(dir.path(), &s));
         (dir, p)
     }
 

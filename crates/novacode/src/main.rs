@@ -67,9 +67,18 @@ struct Cli {
 #[derive(Subcommand, Clone)]
 enum Command {
     /// Log in to a subscription provider (claude, codex, antigravity, copilot).
-    Login { provider: String },
-    /// Remove a stored login.
-    Logout { provider: String },
+    /// Several accounts per provider (--account work) rotate when one runs out (L2.14).
+    Login {
+        provider: String,
+        #[arg(long, default_value = DEFAULT_ACCOUNT)]
+        account: String,
+    },
+    /// Remove a stored login (one account with --account, else all of them).
+    Logout {
+        provider: String,
+        #[arg(long)]
+        account: Option<String>,
+    },
     /// List models of connected providers (with a filter); --all lists every provider; --refresh updates the catalog.
     Models {
         filter: Option<String>,
@@ -118,9 +127,9 @@ fn fail(e: anyhow::Error) -> ExitCode {
 async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     let auth_store = AuthStore::new(paths.home().join("auth.json"));
     match cli.command {
-        Some(Command::Login { provider }) => return login(&auth_store, &provider).await,
-        Some(Command::Logout { provider }) => {
-            let had = auth_store.remove(&provider).await?;
+        Some(Command::Login { provider, account }) => return login(&auth_store, &provider, &account).await,
+        Some(Command::Logout { provider, account }) => {
+            let had = auth_store.remove(&provider, account.as_deref()).await?;
             eprintln!(
                 "{}",
                 if had {
@@ -143,7 +152,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             let cwd = std::env::current_dir()?;
             let trusted = trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &cwd, false);
             let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
-            return models::command(&Providers::load(paths.home(), &settings), filter, all).await;
+            return models::command(&Arc::new(Providers::load(paths.home(), &settings)), filter, all).await;
         }
         Some(Command::Trust { path, revoke }) => {
             let dir = std::fs::canonicalize(path.unwrap_or(std::env::current_dir()?))?;
@@ -204,6 +213,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     }
     drop(auth_store);
     let ctx = Ctx {
+        quirks: Arc::new(novacode_ai::schema::Quirks::load(paths.home())),
         paths,
         cwd,
         settings,
@@ -237,6 +247,7 @@ struct Ctx {
     cwd: std::path::PathBuf,
     settings: Settings,
     providers: Arc<Providers>,
+    quirks: Arc<novacode_ai::schema::Quirks>,
     cli: Cli,
 }
 
@@ -308,8 +319,9 @@ impl Ctx {
                 })
             },
         };
-        let mut agent =
-            Agent::new(adapter, novacode_tools::builtins(false), store, cfg, Arc::new(LocalEnv)).with_policy(policy);
+        let mut agent = Agent::new(adapter, novacode_tools::builtins(false), store, cfg, Arc::new(LocalEnv))
+            .with_policy(policy)
+            .with_quirks(self.quirks.clone());
         if let Some(a) = approver {
             agent = agent.with_approver(a);
         }
@@ -671,7 +683,7 @@ fn ask_trust(store: &TrustStore, cwd: &Path) -> anyhow::Result<bool> {
 }
 
 /// L11.6 first run: connect (subscription first), pick a model, save it.
-async fn onboard(paths: &Paths, p: &Providers) -> anyhow::Result<String> {
+async fn onboard(paths: &Paths, p: &Arc<Providers>) -> anyhow::Result<String> {
     let item = |label: String, detail: String, value: &str| PickItem {
         label,
         detail,
@@ -706,7 +718,7 @@ async fn onboard(paths: &Paths, p: &Providers) -> anyhow::Result<String> {
         .context("setup cancelled; run novacode again, or pass -m provider/model")?;
     let pr = p.profile(&provider)?;
     if pr.oauth() && !p.connected(pr) {
-        login(&p.auth, &provider).await?;
+        login(&p.auth, &provider, DEFAULT_ACCOUNT).await?;
     }
     let (adapter, _) = p.adapter(&provider, None).await?;
     let ids = adapter
@@ -742,7 +754,7 @@ fn git_branch(cwd: &Path) -> Option<String> {
     })
 }
 
-async fn login(store: &AuthStore, provider: &str) -> anyhow::Result<ExitCode> {
+async fn login(store: &AuthStore, provider: &str, account: &str) -> anyhow::Result<ExitCode> {
     // Default browser via xdg-open; the URL is always printed too, for headless or another browser.
     let open = |url: &str| {
         let _ = std::process::Command::new("xdg-open")
@@ -804,8 +816,12 @@ async fn login(store: &AuthStore, provider: &str) -> anyhow::Result<ExitCode> {
         }
         _ => bail!("unknown login provider `{provider}` (logins: claude, codex, antigravity, copilot)"),
     };
-    store.put(provider, DEFAULT_ACCOUNT, cred).await?;
-    eprintln!("logged in to {provider}");
+    store.put(provider, account, cred).await?;
+    if account == DEFAULT_ACCOUNT {
+        eprintln!("logged in to {provider}");
+    } else {
+        eprintln!("logged in to {provider} (account `{account}`)");
+    }
     Ok(ExitCode::SUCCESS)
 }
 

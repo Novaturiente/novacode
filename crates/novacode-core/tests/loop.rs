@@ -403,3 +403,51 @@ async fn ask_mode_uses_the_approver_once_per_rule() {
         vec!["Bash(touch one:*)".to_string(), "Bash(touch two:*)".to_string()]
     );
 }
+
+#[tokio::test]
+async fn rejected_schema_keyword_is_stripped_and_remembered() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let faux = Faux::new([
+        FauxReply::Fail(
+            ErrorKind::InvalidRequest,
+            "Invalid schema for function 'read': In context=('properties', 'offset'), 'minimum' is not permitted."
+                .into(),
+        ),
+        FauxReply::text("ok"),
+        FauxReply::text("again"),
+    ]);
+    let store = Store::create(&Paths::new(home.path()), work.path(), true);
+    let quirks = Arc::new(novacode_ai::schema::Quirks::load(home.path()));
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        novacode_tools::builtins(false),
+        store,
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_quirks(quirks);
+    let (agent, events) = drive(agent, &["hi", "more"]).await;
+    let reqs = faux.requests.lock().unwrap();
+    let has_min = |r: &Request| r.tools.iter().any(|t| t.schema.to_string().contains("\"minimum\""));
+    assert!(has_min(&reqs[0]), "builtin schemas carry `minimum` (schemars integers)");
+    assert!(
+        !has_min(&reqs[1]) && !has_min(&reqs[2]),
+        "stripped on retry and for later turns"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Retry { delay_ms: 0, .. }))
+    );
+    // The failed attempt is hidden from the model.
+    assert!(
+        !reqs[1]
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Assistant(a) if a.error_message.is_some()))
+    );
+    drop(agent);
+    let saved = std::fs::read_to_string(home.path().join("cache/schema-quirks.json")).unwrap();
+    assert!(saved.contains("faux/m") && saved.contains("minimum"), "{saved}");
+}

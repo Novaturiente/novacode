@@ -94,10 +94,46 @@ impl AuthStore {
         write(&self.path, &f)
     }
 
-    pub async fn remove(&self, provider: &str) -> Result<bool, AuthError> {
+    /// The stored access token, without refreshing (may be stale).
+    pub fn cached_access(&self, provider: &str, account: &str) -> Option<String> {
+        self.read()
+            .ok()?
+            .providers
+            .get(provider)?
+            .get(account)
+            .map(|c| c.access.clone())
+    }
+
+    /// Logged-in accounts of a provider: `default` first, then by name.
+    pub fn accounts(&self, provider: &str) -> Vec<String> {
+        let mut a: Vec<String> = self
+            .read()
+            .map(|f| {
+                f.providers
+                    .get(provider)
+                    .map(|m| m.keys().cloned().collect())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        a.sort_by_key(|x| (x != DEFAULT_ACCOUNT, x.clone()));
+        a
+    }
+
+    /// Remove one account, or every account of the provider when `account` is None.
+    pub async fn remove(&self, provider: &str, account: Option<&str>) -> Result<bool, AuthError> {
         let _lock = self.locked().await?;
         let mut f = self.read()?;
-        let had = f.providers.remove(provider).is_some();
+        let had = match account {
+            None => f.providers.remove(provider).is_some(),
+            Some(a) => {
+                let m = f.providers.entry(provider.into()).or_default();
+                let had = m.remove(a).is_some();
+                if m.is_empty() {
+                    f.providers.remove(provider);
+                }
+                had
+            }
+        };
         write(&self.path, &f)?;
         Ok(had)
     }
@@ -806,7 +842,7 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
-        assert!(s.has("claude") && s.remove("claude").await.unwrap() && !s.has("claude"));
+        assert!(s.has("claude") && s.remove("claude", None).await.unwrap() && !s.has("claude"));
     }
 
     #[test]

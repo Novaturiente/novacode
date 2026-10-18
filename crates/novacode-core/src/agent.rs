@@ -11,6 +11,7 @@ use crate::recovery::{Nudge, Recovery};
 use crate::session::{EntryKind, Store};
 use novacode_ai::adapter::{Adapter, CacheRetention, Request};
 use novacode_ai::retry;
+use novacode_ai::schema::{self, Quirks};
 use novacode_base::redact::Redactor;
 use novacode_tools::guard::Budget;
 use novacode_tools::{ExecutionEnv, FileState, Tool, ToolCtx, ToolOutput};
@@ -73,6 +74,8 @@ pub struct Agent {
     policy: Arc<Policy>,
     /// `None` = nobody to ask (print mode, headless): asks become refusals or justifications.
     approver: Option<Arc<dyn Approver>>,
+    /// Learned tool-schema rejections (L2.20).
+    quirks: Arc<Quirks>,
 }
 
 #[derive(Default)]
@@ -139,7 +142,13 @@ impl Agent {
             last_usage: Usage::default(),
             policy: Arc::new(Policy::new(Permissions::default(), home, None)),
             approver: None,
+            quirks: Arc::new(Quirks::ephemeral()),
         }
+    }
+
+    pub fn with_quirks(mut self, q: Arc<Quirks>) -> Self {
+        self.quirks = q;
+        self
     }
 
     pub fn config(&self) -> &Config {
@@ -358,11 +367,13 @@ impl Agent {
     /// One model call with the overflow/retry state machine (L4.6).
     async fn call_model(&mut self, cancel: &CancellationToken) -> AssistantMessage {
         let mut attempt = 0;
+        let mut learned = 0;
         loop {
+            let route = format!("{}/{}", self.cfg.provider, self.cfg.model);
             let req = Request {
                 model: self.cfg.model.clone(),
                 messages: self.store.projection(),
-                tools: self.defs.clone(),
+                tools: self.quirks.apply(&route, &self.defs),
                 max_tokens: self.cfg.max_tokens,
                 cache: self.cfg.cache,
                 thinking: Some(self.cfg.thinking),
@@ -380,6 +391,23 @@ impl Agent {
             let m =
                 fin.unwrap_or_else(|| failed(&self.cfg, ErrorKind::Other, "provider stream ended without a result"));
             let StopReason::Error { kind } = &m.stop else { return m };
+            // A tool schema the backend can't take (L2.20): strip what it named, resend at once.
+            if *kind == ErrorKind::InvalidRequest
+                && learned < 3
+                && let Some(r) = m.error_message.as_deref().and_then(schema::rejected)
+                && self.quirks.learn(&route, &r)
+            {
+                learned += 1;
+                let text = m.error_message.clone().unwrap_or_default();
+                self.hide_failed(m);
+                self.emit(AgentEvent::Retry {
+                    attempt: learned,
+                    delay_ms: 0,
+                    error: ErrorKind::InvalidRequest,
+                    message: format!("tool schema rejected, retrying without it: {text}"),
+                });
+                continue;
+            }
             // shortcut: Overflow is surfaced; compact-then-retry-once arrives with compaction (M7, L4.5).
             if !kind.is_retryable() || cancel.is_cancelled() {
                 return m;
@@ -393,15 +421,8 @@ impl Agent {
             let Some(delay) = retry::delay(attempt, server) else {
                 return m;
             };
-            // Keep the failed attempt on record, hidden from the model.
             let (kind, text) = (kind.clone(), m.error_message.clone().unwrap_or_default());
-            let id = self.add(EntryKind::Message {
-                message: Message::Assistant(m),
-            });
-            self.add(EntryKind::ContextEdit {
-                target: id,
-                replace: None,
-            });
+            self.hide_failed(m);
             attempt += 1;
             self.emit(AgentEvent::Retry {
                 attempt,
@@ -414,6 +435,17 @@ impl Agent {
                 _ = cancel.cancelled() => return failed(&self.cfg, ErrorKind::Aborted, "aborted during retry wait"),
             }
         }
+    }
+
+    /// Keep a failed attempt on record, hidden from the model.
+    fn hide_failed(&mut self, m: AssistantMessage) {
+        let id = self.add(EntryKind::Message {
+            message: Message::Assistant(m),
+        });
+        self.add(EntryKind::ContextEdit {
+            target: id,
+            replace: None,
+        });
     }
 
     /// Run one batch (L3.3): sequential preflight, then concurrent execution

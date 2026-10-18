@@ -13,6 +13,7 @@ pub mod json;
 pub mod openai_chat;
 pub mod openai_responses;
 pub mod retry;
+pub mod rotate;
 pub mod schema;
 pub mod sse;
 pub mod trace;
