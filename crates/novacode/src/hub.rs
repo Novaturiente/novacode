@@ -7,8 +7,9 @@ use futures_util::future::BoxFuture;
 use novacode_core::agent::SessionHandle;
 use novacode_core::policy::{Approval, ApprovalRequest, Approver};
 use novacode_tui::app::UiEvent;
+use novacode_tui::ask::AskReq;
 use novacode_tui::dialog::{Answer, ApproveReq};
-use novacode_types::{AgentEvent, BlockKind, Message, StreamEvent};
+use novacode_types::{AgentEvent, BlockKind, Message, Question, Reply, StreamEvent};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -17,6 +18,9 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 /// shortcut: capped by count, oldest tool output dropped first; a client that
 /// attaches mid-way through a huge tool output sees only its tail.
 const TAIL_MAX: usize = 4000;
+
+/// Where an `ask_user` answer goes (`None` = dismissed).
+type AskReply = oneshot::Sender<Option<Vec<Reply>>>;
 
 struct Pending {
     msg: ServerMsg,
@@ -30,6 +34,8 @@ struct Inner {
     clients: BTreeMap<u64, mpsc::UnboundedSender<ServerMsg>>,
     next_client: u64,
     approvals: BTreeMap<u64, Pending>,
+    /// Open `ask_user` forms (L5.21): the message and the waiting tool.
+    asks: BTreeMap<u64, (ServerMsg, AskReply)>,
     /// The owner's own TUI, if any: gets approvals and remote state changes.
     local: Option<mpsc::UnboundedSender<UiEvent>>,
     closed: bool,
@@ -71,6 +77,7 @@ impl Hub {
                 clients: BTreeMap::new(),
                 next_client: 0,
                 approvals: BTreeMap::new(),
+                asks: BTreeMap::new(),
                 local,
                 closed: false,
             }),
@@ -120,13 +127,17 @@ impl Hub {
             AgentEvent::Retry { .. } => Some("retrying".into()),
             _ => None,
         };
-        if let Some(d) = detail {
+        // While waiting on a person, the detail says what for.
+        if let Some(d) = detail
+            && g.approvals.is_empty()
+            && g.asks.is_empty()
+        {
             g.state.activity.detail = d;
         }
         if matches!(ev, AgentEvent::Settled) {
             g.state.activity.detail.clear();
         }
-        let blocked = !g.approvals.is_empty();
+        let blocked = !g.approvals.is_empty() || !g.asks.is_empty();
         g.state.activity.state = activity_state(g.state.busy, blocked);
         match &ev {
             AgentEvent::AgentStart => g.state.task_started_ms = Some(novacode_core::session::now_ms()),
@@ -181,14 +192,19 @@ impl Hub {
     fn set_blocked(&self) {
         let s = {
             let mut g = self.inner.lock().unwrap();
-            let blocked = g.approvals.values().next().map(|p| match &p.msg {
-                ServerMsg::Approve { tool, .. } => format!("permission:{tool}"),
-                _ => String::new(),
-            });
+            let blocked = g
+                .approvals
+                .values()
+                .next()
+                .map(|p| match &p.msg {
+                    ServerMsg::Approve { tool, .. } => format!("permission:{tool}"),
+                    _ => String::new(),
+                })
+                .or_else(|| (!g.asks.is_empty()).then(|| "ask_user".to_string()));
             let state = activity_state(g.state.busy, blocked.is_some());
             match blocked {
                 Some(d) => g.state.activity.detail = d,
-                None if g.state.activity.detail.starts_with("permission:") => {
+                None if g.state.activity.detail.starts_with("permission:") || g.state.activity.detail == "ask_user" => {
                     g.state.activity.detail = "working".into()
                 }
                 None => {}
@@ -237,6 +253,7 @@ impl Hub {
         }
         first.extend(g.tail.iter().map(|e| ServerMsg::Event { event: e.clone() }));
         first.extend(g.approvals.values().map(|p| p.msg.clone()));
+        first.extend(g.asks.values().map(|(m, _)| m.clone()));
         if g.closed {
             first.push(ServerMsg::Bye {
                 reason: "session ended".into(),
@@ -362,6 +379,55 @@ impl Hub {
         }
         g.clients.clear();
         g.approvals.clear();
+        g.asks.clear();
+    }
+
+    /// `ask_user` in every window; the first answer (or dismissal) wins.
+    async fn ask_user(self: &Arc<Self>, questions: Vec<Question>) -> Option<Vec<Reply>> {
+        let id = self.next_approval.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let msg = ServerMsg::Ask {
+            id,
+            questions: questions.clone(),
+        };
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.clients.retain(|_, c| c.send(msg.clone()).is_ok());
+            if let Some(l) = &g.local {
+                let (ltx, lrx) = oneshot::channel();
+                if l.send(UiEvent::Ask(AskReq {
+                    id,
+                    questions,
+                    reply: ltx,
+                }))
+                .is_ok()
+                {
+                    let hub = self.clone();
+                    tokio::spawn(async move {
+                        if let Ok(r) = lrx.await {
+                            hub.answer_ask(id, r);
+                        }
+                    });
+                }
+            }
+            g.asks.insert(id, (msg, tx));
+        }
+        self.set_blocked();
+        rx.await.ok().flatten()
+    }
+
+    /// Replies from any window (`None` = dismissed). Late ones are ignored.
+    pub fn answer_ask(&self, id: u64, replies: Option<Vec<Reply>>) {
+        let mut g = self.inner.lock().unwrap();
+        let Some((_, tx)) = g.asks.remove(&id) else { return };
+        let _ = tx.send(replies);
+        let done = ServerMsg::AskDone { id };
+        g.clients.retain(|_, c| c.send(done.clone()).is_ok());
+        if let Some(l) = &g.local {
+            let _ = l.send(UiEvent::AskDone { id });
+        }
+        drop(g);
+        self.set_blocked();
     }
 }
 
@@ -382,6 +448,15 @@ impl Approver for HubSlot {
                 Answer::Always => Approval::Always,
                 Answer::Deny(why) => Approval::Deny(why),
             }
+        })
+    }
+}
+
+impl novacode_tools::ask::Asker for HubSlot {
+    fn ask(&self, questions: Vec<Question>) -> BoxFuture<'_, Option<Vec<Reply>>> {
+        Box::pin(async move {
+            let hub = self.0.get().and_then(|w| w.upgrade())?;
+            hub.ask_user(questions).await
         })
     }
 }

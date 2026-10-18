@@ -152,6 +152,10 @@ async fn dispatch(host: &Arc<Host>, cmd: ClientCmd, ui: &mpsc::UnboundedSender<U
             hub.answer(approval, answer);
             Ok(Value::Null)
         }
+        ClientCmd::Answer { ask, replies } => {
+            hub.answer_ask(ask, replies);
+            Ok(Value::Null)
+        }
         ClientCmd::Shutdown => {
             hub.handle.abort();
             hub.handle.shutdown();
@@ -393,6 +397,26 @@ pub async fn attach(paths: &Paths, prefix: &str, base: crate::TuiBase) -> anyhow
                 }
                 ServerMsg::ApprovalDone { id } => {
                     let _ = ui_tx.send(UiEvent::ApprovalDone { id });
+                }
+                ServerMsg::Ask { id, questions } => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let _ = ui_tx.send(UiEvent::Ask(novacode_tui::ask::AskReq {
+                        id,
+                        questions,
+                        reply: tx,
+                    }));
+                    let out = approvals.clone();
+                    tokio::spawn(async move {
+                        if let Ok(replies) = rx.await {
+                            let _ = out.send(Request {
+                                id: None,
+                                cmd: ClientCmd::Answer { ask: id, replies },
+                            });
+                        }
+                    });
+                }
+                ServerMsg::AskDone { id } => {
+                    let _ = ui_tx.send(UiEvent::AskDone { id });
                 }
                 ServerMsg::State { state } => {
                     if state.model != last.model || state.level != last.level {

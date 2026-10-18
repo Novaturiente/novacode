@@ -171,6 +171,14 @@ pub enum ServerMsg {
     },
     /// Approval `id` was answered (here or elsewhere).
     ApprovalDone { id: u64 },
+    /// `ask_user` (L5.21): questions for the user; every client gets them, the
+    /// first `answer` wins.
+    Ask {
+        id: u64,
+        questions: Vec<novacode_types::Question>,
+    },
+    /// Questions `id` were answered or dismissed (here or elsewhere).
+    AskDone { id: u64 },
     /// The session's state changed (model, level, busy…).
     State { state: State },
     /// The server is closing this connection.
@@ -224,6 +232,11 @@ pub enum ClientCmd {
     GetMessages,
     /// Response data: `{"commands": [{"name", "description"}]}` (L8.9).
     GetCommands,
+    /// Answer `ask_user` form `ask`, one reply per question; `null` = dismissed.
+    Answer {
+        ask: u64,
+        replies: Option<Vec<novacode_types::Reply>>,
+    },
     /// Answer approval `approval`.
     Approval {
         approval: u64,
@@ -249,6 +262,7 @@ impl ClientCmd {
             ClientCmd::GetMessages => "get_messages",
             ClientCmd::GetCommands => "get_commands",
             ClientCmd::Approval { .. } => "approval",
+            ClientCmd::Answer { .. } => "answer",
             ClientCmd::Shutdown => "shutdown",
         }
     }
@@ -259,6 +273,7 @@ pub fn capabilities() -> Vec<String> {
         "events",
         "history",
         "approvals",
+        "ask_user",
         "prompt",
         "steer",
         "models",
@@ -348,6 +363,21 @@ mod tests {
                 risky: true,
             },
             ServerMsg::ApprovalDone { id: 3 },
+            ServerMsg::Ask {
+                id: 4,
+                questions: vec![novacode_types::Question {
+                    question: "Which db?".into(),
+                    header: Some("Database".into()),
+                    options: vec![novacode_types::Choice {
+                        label: "SQLite".into(),
+                        description: Some("zero setup".into()),
+                        preview: None,
+                        recommended: true,
+                    }],
+                    multi: false,
+                }],
+            },
+            ServerMsg::AskDone { id: 4 },
             ServerMsg::State { state },
             ServerMsg::Bye {
                 reason: "session ended".into(),
@@ -394,6 +424,17 @@ mod tests {
             Request {
                 id: Some("9".into()),
                 cmd: ClientCmd::GetState,
+            },
+            Request {
+                id: None,
+                cmd: ClientCmd::Answer {
+                    ask: 4,
+                    replies: Some(vec![novacode_types::Reply {
+                        question: "Which db?".into(),
+                        chosen: vec!["SQLite".into()],
+                        text: None,
+                    }]),
+                },
             },
         ];
         let _ = Block::text("");

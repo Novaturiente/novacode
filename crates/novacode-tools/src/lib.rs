@@ -1,5 +1,6 @@
 //! Tool trait, ExecutionEnv, output guards, file queue and the built-in tools (L5).
 
+pub mod ask;
 pub mod bash;
 pub mod edit;
 pub mod env;

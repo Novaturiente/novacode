@@ -130,7 +130,7 @@ impl Picker {
 }
 
 /// Clear `area`, draw a rounded frame with a title, return the inside.
-fn frame(f: &mut Frame, area: Rect, title: &str, t: &Theme) -> Rect {
+pub fn frame(f: &mut Frame, area: Rect, title: &str, t: &Theme) -> Rect {
     f.render_widget(Clear, area);
     let b = Block::bordered()
         .border_type(BorderType::Rounded)

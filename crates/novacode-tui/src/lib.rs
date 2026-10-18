@@ -2,6 +2,7 @@
 //! events in, commands out.
 
 pub mod app;
+pub mod ask;
 pub mod dialog;
 pub mod editor;
 #[cfg(feature = "highlight")]

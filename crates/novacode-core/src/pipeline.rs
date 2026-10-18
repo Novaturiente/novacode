@@ -161,18 +161,20 @@ mod tests {
     #[test]
     fn lookup_repair_coerce() {
         let tools = novacode_tools::builtins(false);
-        let Prepared::Rejected(o) = prepare(&tools, &call("Grepp", json!({}))) else {
-            panic!()
+        let o = match prepare(&tools, &call("Grepp", json!({}))) {
+            Prepared::Rejected(o) => o,
+            _ => panic!("expected a rejection"),
         };
         assert!(format!("{:?}", o.content).contains("Did you mean `grep`?"));
         let mut bad = call("read", json!({}));
         bad.arguments_error = Some("{oops".into());
         assert!(matches!(prepare(&tools, &bad), Prepared::Rejected(_)));
-        let Prepared::Ready(_, args, accept) = prepare(
+        let (args, accept) = match prepare(
             &tools,
             &call("read", json!({"path": "a", "offset": "3", "accept_large_output": true})),
-        ) else {
-            panic!()
+        ) {
+            Prepared::Ready(_, args, accept) => (args, accept),
+            _ => panic!("expected ready"),
         };
         assert_eq!(args, json!({"path": "a", "offset": 3}));
         assert!(accept);

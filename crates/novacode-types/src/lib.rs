@@ -535,3 +535,46 @@ pub mod estimate {
         }
     }
 }
+
+/// `ask_user` (L5.21): one question for the user. Any number per call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Question {
+    /// The question, as one clear sentence.
+    pub question: String,
+    /// A short label for it (a few words).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// The choices. The user can always type their own answer instead, so don't add an "other" choice.
+    #[serde(default)]
+    pub options: Vec<Choice>,
+    /// More than one choice may be picked.
+    #[serde(default)]
+    pub multi: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Choice {
+    /// 1–5 words.
+    pub label: String,
+    /// What picking it means, or its trade-off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Text shown beside the choice when it is focused: a code snippet, a mockup, a config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    /// Your recommendation (at most one per question).
+    #[serde(default)]
+    pub recommended: bool,
+}
+
+/// The user's answer to one [`Question`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Reply {
+    pub question: String,
+    /// Labels of the picked choices.
+    #[serde(default)]
+    pub chosen: Vec<String>,
+    /// What the user typed instead of (or as well as) picking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}

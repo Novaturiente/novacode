@@ -122,6 +122,13 @@ pub enum UiEvent {
     },
     #[serde(skip)]
     Approve(ApproveReq),
+    /// `ask_user` questions (L5.21).
+    #[serde(skip)]
+    Ask(crate::ask::AskReq),
+    /// Another window answered questions `id`: drop the form.
+    AskDone {
+        id: u64,
+    },
     /// Another window answered approval `id`: drop its card.
     ApprovalDone {
         id: u64,
@@ -255,6 +262,7 @@ pub struct App {
     last_esc: Option<Instant>,
     editor_width: usize,
     approvals: VecDeque<ApprovalCard>,
+    asks: VecDeque<crate::ask::AskForm>,
     overlay: Option<Overlay>,
     completion: Option<Completion>,
     files: Option<Vec<String>>,
@@ -330,6 +338,7 @@ impl App {
             last_esc: None,
             editor_width: 80,
             approvals: VecDeque::new(),
+            asks: VecDeque::new(),
             overlay: None,
             completion: None,
             files: None,
@@ -356,6 +365,8 @@ impl App {
         match ev {
             UiEvent::Approve(req) => self.approvals.push_back(ApprovalCard::new(req)),
             UiEvent::ApprovalDone { id } => self.approvals.retain(|c| c.req.id != id),
+            UiEvent::Ask(req) => self.asks.push_back(crate::ask::AskForm::new(req)),
+            UiEvent::AskDone { id } => self.asks.retain(|f| f.req.id != id),
             UiEvent::Models { result: Ok(items) } => self.overlay = Some(Overlay::Models(Picker::new("Model", items))),
             UiEvent::Models { result: Err(e) } => self.tr.notice(format!("could not list models: {e}"), true),
             UiEvent::Sessions { items } if items.is_empty() => self.flash("no other sessions in this folder"),
@@ -517,7 +528,9 @@ impl App {
         self.dirty = true;
         match ev {
             Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
-            Event::Paste(s) if self.approvals.is_empty() && self.overlay.is_none() => self.editor.paste(&s),
+            Event::Paste(s) if self.approvals.is_empty() && self.asks.is_empty() && self.overlay.is_none() => {
+                self.editor.paste(&s)
+            }
             Event::Mouse(m) if self.overlay.is_none() => self.on_mouse(m),
             Event::FocusGained => self.send(Cmd::Focus(true)),
             Event::FocusLost => self.send(Cmd::Focus(false)),
@@ -548,6 +561,32 @@ impl App {
             if let Some(ans) = card.handle(k) {
                 self.answer(ans);
             }
+            return;
+        }
+        if let Some(form) = self.asks.front_mut() {
+            use crate::ask::Done;
+            let done = form.handle(k);
+            self.dirty = true;
+            let replies = match done {
+                Done::Pending => return,
+                Done::Answered(r) => Some(r),
+                Done::Dismissed => None,
+            };
+            let form = self.asks.pop_front().unwrap();
+            // Kept in the transcript so the answer stays visible (C5).
+            match &replies {
+                Some(r) => {
+                    for r in r {
+                        let mut a = r.chosen.join(", ");
+                        if let Some(t) = &r.text {
+                            a = if a.is_empty() { t.clone() } else { format!("{a}; {t}") };
+                        }
+                        self.tr.notice(format!("{} → {a}", r.question), false);
+                    }
+                }
+                None => self.tr.notice("questions dismissed", true),
+            }
+            let _ = form.req.reply.send(replies);
             return;
         }
         if let Some(o) = &mut self.overlay {
@@ -1111,10 +1150,11 @@ impl App {
                 area.width as usize,
             ));
         }
-        let card_h = self
-            .approvals
-            .front()
-            .map_or(0, |c| c.height(area.width).min(area.height / 2));
+        let card_h = match (self.approvals.front(), self.asks.front()) {
+            (Some(c), _) => c.height(area.width).min(area.height / 2),
+            (None, Some(f)) => f.height(area.width).min(area.height * 2 / 3),
+            _ => 0,
+        };
         let comp_h = self
             .completion
             .as_ref()
@@ -1166,11 +1206,13 @@ impl App {
         let inner = block.inner(ed);
         let text: Vec<Line> = rows.into_iter().map(|r| Line::styled(r, t.text)).collect();
         f.render_widget(Paragraph::new(text).block(block), ed);
-        if self.approvals.is_empty() && self.overlay.is_none() {
+        if self.approvals.is_empty() && self.asks.is_empty() && self.overlay.is_none() {
             f.set_cursor_position(Position::new(inner.x + cc, inner.y + cr));
         }
         if let Some(c) = self.approvals.front() {
             c.render(f, card, t);
+        } else if let Some(a) = self.asks.front() {
+            a.render(f, card, t);
         }
         let st = self.status_line(area.width as usize);
         f.render_widget(Paragraph::new(st), status);
@@ -1250,9 +1292,16 @@ impl App {
     fn status_line(&mut self, width: usize) -> Line<'static> {
         let t = &self.theme;
         let mut left = Vec::new();
-        if !self.approvals.is_empty() {
+        if !self.approvals.is_empty() || !self.asks.is_empty() {
             left.push(Span::styled(" ? ", t.warn));
-            left.push(Span::styled("waiting for your approval", t.warn));
+            left.push(Span::styled(
+                if self.approvals.is_empty() {
+                    "waiting for your answer"
+                } else {
+                    "waiting for your approval"
+                },
+                t.warn,
+            ));
         } else if self.busy {
             left.push(Span::styled(
                 format!(" {} ", SPINNER[self.spinner % SPINNER.len()]),

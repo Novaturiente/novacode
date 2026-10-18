@@ -391,7 +391,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         None => interactive_loop(ctx, store, model).await,
         Some(prompt) => {
             // Nobody to approve: asks become refusals, risky commands need a justification.
-            let (agent, _) = ctx.agent(store, &model, None).await?;
+            let (agent, _) = ctx.agent(store, &model, None, None).await?;
             print_mode(
                 agent,
                 prompt,
@@ -524,6 +524,7 @@ impl Ctx {
         store: Store,
         model: &str,
         approver: Option<Arc<dyn Approver>>,
+        asker: Option<Arc<dyn novacode_tools::ask::Asker>>,
     ) -> anyhow::Result<(Agent, String)> {
         let route = self.providers.resolve(model)?;
         // `model:level` wins, then the session's own level (resume), then settings.
@@ -592,6 +593,9 @@ impl Ctx {
         let memory_on = s.get("memory.enabled").unwrap_or(true);
         let mut all = novacode_tools::builtins(false);
         all.push(Arc::new(novacode_tools::process::ProcessTool));
+        if let Some(a) = asker {
+            all.push(Arc::new(novacode_tools::ask::AskUser(a)));
+        }
         all.push(Arc::new(novacode_tools::todo::Todo::from_history(&store.projection())));
         if store.path().is_some() {
             all.push(Arc::new(novacode_core::export::SessionSearch {
@@ -861,7 +865,9 @@ async fn start_session(
     sinks: activity::Sinks,
 ) -> anyhow::Result<(serve::Live, tokio::task::JoinHandle<Agent>)> {
     let slot = hub::HubSlot::default();
-    let (agent, spec) = ctx.agent(store, model, Some(Arc::new(slot.clone()))).await?;
+    let (agent, spec) = ctx
+        .agent(store, model, Some(Arc::new(slot.clone())), Some(Arc::new(slot.clone())))
+        .await?;
     let price = ctx
         .providers
         .resolve(&spec)
