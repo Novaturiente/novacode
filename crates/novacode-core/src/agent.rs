@@ -161,6 +161,8 @@ struct Shared {
     report: Mutex<ContextReport>,
     /// The last request that touched the cache, for the miss detector and the warmer (L2.17).
     sent: Mutex<Option<crate::cache::Sent>>,
+    /// The reply to `sent` and the `/btw` side thread on top of them.
+    side: Mutex<Side>,
     warm: Mutex<Warm>,
     warm_wake: Notify,
     /// `/compact` was asked for; the owner compacts when idle.
@@ -182,6 +184,13 @@ impl Shared {
 }
 
 /// Warmer state, reset by every real request.
+#[derive(Default)]
+struct Side {
+    reply: Option<AssistantMessage>,
+    /// (question, answer) pairs, valid while the main thread hasn't moved on.
+    thread: Vec<(String, String)>,
+}
+
 #[derive(Default)]
 struct Warm {
     adapter: Option<Arc<dyn Adapter>>,
@@ -1184,6 +1193,9 @@ impl Agent {
                 fin.unwrap_or_else(|| failed(&self.cfg, ErrorKind::Other, "provider stream ended without a result"));
             if !matches!(m.stop, StopReason::Error { .. } | StopReason::Aborted) {
                 self.after_request(req, &m.usage);
+                let mut side = self.shared.side.lock().unwrap();
+                side.reply = Some(m.clone());
+                side.thread.clear();
             }
             let StopReason::Error { kind } = &m.stop else { return m };
             // A tool schema the backend can't take (L2.20): strip what it named, resend at once.
@@ -1603,6 +1615,67 @@ impl SessionHandle {
         *self.shared.next_thinking.lock().unwrap() = Some(level);
     }
     /// Stop after the current run; the owner task then returns the agent.
+    /// `/btw`: ask a side question on top of the conversation so far. Not stored,
+    /// not seen by the main thread. It reuses the last request's bytes, so the
+    /// cached prefix is read, not written. Follow-ups continue the side thread until
+    /// the main thread makes its next request.
+    pub async fn side_question(&self, question: &str) -> Result<String, String> {
+        // shortcut: needs one model call in this process (a fresh resume has none yet).
+        let (sent, adapter) = {
+            let w = self.shared.warm.lock().unwrap();
+            (self.shared.sent.lock().unwrap().clone(), w.adapter.clone())
+        };
+        let (Some(sent), Some(adapter)) = (sent, adapter) else {
+            return Err("ask after the first reply of this session".into());
+        };
+        let (reply, thread) = {
+            let side = self.shared.side.lock().unwrap();
+            (side.reply.clone(), side.thread.clone())
+        };
+        let mut req = sent.req;
+        // A reply that called tools can't be followed by a plain user turn.
+        if let Some(r) = reply.filter(|r| r.stop != StopReason::ToolUse) {
+            req.messages.push(Message::Assistant(r));
+        }
+        let note = "<system-reminder>\nThe user asks a side question (/btw) while you work. Answer it directly and briefly from what you already know; don't call tools. Neither the question nor your answer stays in the conversation.\n</system-reminder>";
+        for (q, a) in &thread {
+            req.messages.push(Message::user(q.clone()));
+            req.messages.push(Message::Assistant(AssistantMessage {
+                content: vec![Block::text(a.clone())],
+                stop: StopReason::Stop,
+                usage: Usage::default(),
+                provider: String::new(),
+                model: req.model.clone(),
+                response_id: None,
+                error_message: None,
+                thinking_level: None,
+            }));
+        }
+        req.messages.push(Message::user(format!("{note}\n\n{question}")));
+        let mut rx = adapter.stream(req, CancellationToken::new());
+        let mut done = None;
+        while let Some(ev) = rx.recv().await {
+            if let StreamEvent::Done(m) | StreamEvent::Error(m) = ev {
+                done = Some(m);
+            }
+        }
+        let m = done.ok_or("the provider stream ended without a result")?;
+        if let StopReason::Error { .. } = m.stop {
+            return Err(m.error_message.unwrap_or_else(|| "request failed".into()));
+        }
+        let mut answer = m.text().trim().to_string();
+        if m.content.iter().any(|b| matches!(b, Block::ToolCall { .. })) {
+            answer.push_str("\n\n(it wanted to call a tool; /btw answers without tools)");
+        }
+        self.shared
+            .side
+            .lock()
+            .unwrap()
+            .thread
+            .push((question.into(), answer.clone()));
+        Ok(answer)
+    }
+
     /// Name the session (shown by `/resume` and `novacode agents`); applied between runs.
     pub fn rename(&self, name: impl Into<String>) {
         *self.shared.rename.lock().unwrap() = Some(name.into());

@@ -604,6 +604,9 @@ pub async fn attach(
                 Cmd::Compact => ClientCmd::Compact,
                 Cmd::Export(html) => ClientCmd::Export { html },
                 Cmd::Mcp => ClientCmd::Prompt { text: "/mcp".into() },
+                Cmd::Btw(q) => ClientCmd::Prompt {
+                    text: format!("/btw {q}"),
+                },
                 Cmd::Rename(name) => ClientCmd::Prompt {
                     text: format!("/name {name}"),
                 },

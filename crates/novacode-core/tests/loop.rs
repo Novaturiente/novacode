@@ -1101,3 +1101,56 @@ async fn extension_reminders_are_saved_and_tails_are_not() {
     );
     assert!(last.last().unwrap().get("cache_control").is_none());
 }
+
+/// `/btw`: the side question rides on the last request's bytes, and nothing of it
+/// is stored or seen by the next main request.
+#[tokio::test]
+async fn side_question_reuses_the_prefix_and_leaves_no_trace() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let faux = Faux::new([
+        FauxReply::text("main answer"),
+        FauxReply::text("side answer"),
+        FauxReply::text("follow-up answer"),
+        FauxReply::text("next main"),
+    ]);
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        vec![],
+        Store::create(&Paths::new(home.path()), work.path(), true),
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    );
+    let (h, task) = agent::spawn(agent);
+    let mut rx = h.subscribe();
+    let until_end = |rx: &mut tokio::sync::broadcast::Receiver<AgentEvent>| {
+        let mut rx = rx.resubscribe();
+        async move { while !matches!(rx.recv().await.unwrap(), AgentEvent::Settled) {} }
+    };
+    let wait = until_end(&mut rx);
+    h.prompt("main question");
+    wait.await;
+    assert_eq!(h.side_question("side?").await.unwrap(), "side answer");
+    assert_eq!(h.side_question("and?").await.unwrap(), "follow-up answer");
+    let wait = until_end(&mut rx);
+    h.prompt("go on");
+    wait.await;
+    h.shutdown();
+    let a = task.await.unwrap();
+    let reqs = faux.requests.lock().unwrap();
+    let first = wire_messages(&reqs[0]);
+    assert_eq!(
+        wire_messages(&reqs[1])[..first.len()],
+        first[..],
+        "the side request extends the main prefix"
+    );
+    assert_eq!(
+        reqs[2].messages.len(),
+        reqs[1].messages.len() + 2,
+        "follow-up continues the side thread"
+    );
+    let main = format!("{:?}", reqs[3].messages);
+    assert!(!main.contains("side?") && !main.contains("side answer"), "{main}");
+    let stored = format!("{:?}", a.store.projection());
+    assert!(!stored.contains("side answer"));
+}

@@ -44,6 +44,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/clone", "new session with this whole branch"),
     ("/export", "write this branch to a file (/export html for a web page)"),
     ("/copy", "copy the last reply"),
+    ("/btw", "side question: /btw <question>, not kept in the conversation"),
     ("/name", "name this session: /name <text>"),
     (
         "/login",
@@ -131,6 +132,8 @@ pub enum Cmd {
     Mcp,
     /// `/name` (L4.4).
     Rename(String),
+    /// `/btw <question>`: a side answer, shown as a page, never stored.
+    Btw(String),
     /// Alt+Up: take back the newest queued message; `true` = a steer. The host
     /// answers with [`UiEvent::Dequeued`].
     Dequeue(bool),
@@ -1247,6 +1250,8 @@ impl App {
                     self.overlay = Some(Overlay::Pager(Pager::keys_help(&self.keymap, &self.theme)));
                 }
                 "/copy" => self.copy_reply(),
+                "/btw" if !arg.is_empty() => self.send(Cmd::Btw(arg.to_string())),
+                "/btw" => self.flash("usage: /btw <question>"),
                 "/name" if !arg.is_empty() => self.send(Cmd::Rename(arg.to_string())),
                 "/name" => self.flash("usage: /name <text>"),
                 "/login" if !arg.is_empty() => self.login = Some(arg.to_string()),

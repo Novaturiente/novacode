@@ -275,6 +275,32 @@ impl Host {
             }
             Cmd::Focus(f) => self.hub.set_focus(f),
             Cmd::Rename(name) => self.hub.handle.rename(name.trim()),
+            Cmd::Btw(q) => {
+                let (h, ui) = (self.hub.handle.clone(), ui.clone());
+                let _ = ui.send(UiEvent::Notice {
+                    text: format!("btw: asking \"{}\"…", q.lines().next().unwrap_or("")),
+                    error: false,
+                });
+                // Off the command loop: the main thread keeps going meanwhile.
+                tokio::spawn(async move {
+                    let ev = match h.side_question(&q).await {
+                        // Short answers sit in the transcript (never stored); long ones get a page.
+                        Ok(a) if a.lines().count() <= 6 && a.len() <= 600 => UiEvent::Notice {
+                            text: format!("btw › {a}"),
+                            error: false,
+                        },
+                        Ok(a) => UiEvent::Page {
+                            title: format!("btw: {}", q.lines().next().unwrap_or("")),
+                            text: a,
+                        },
+                        Err(e) => UiEvent::Notice {
+                            text: format!("btw: {e}"),
+                            error: true,
+                        },
+                    };
+                    let _ = ui.send(ev);
+                });
+            }
             Cmd::Dequeue(steer) => {
                 let _ = ui.send(UiEvent::Dequeued {
                     ok: self.hub.handle.dequeue(steer),
@@ -354,6 +380,7 @@ impl Host {
             "/context" => Cmd::Context,
             "/mcp" => Cmd::Mcp,
             "/name" if !arg.is_empty() => Cmd::Rename(arg.into()),
+            "/btw" if !arg.is_empty() => Cmd::Btw(arg.into()),
             "/export" => Cmd::Export(arg == "html"),
             "/model" if !arg.is_empty() => Cmd::SetModel(arg.into()),
             "/thinking" if !arg.is_empty() => match ThinkingLevel::parse(arg) {
