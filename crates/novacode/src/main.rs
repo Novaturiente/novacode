@@ -61,6 +61,9 @@ struct Cli {
     /// Trust this folder's project config for this run only (L6.3).
     #[arg(long)]
     trust: bool,
+    /// Don't load AGENTS.md / CLAUDE.md context files (L4.9).
+    #[arg(long)]
+    no_context_files: bool,
     /// API key for the model's provider, for this run only (ahead of saved and env keys).
     #[arg(long, value_name = "KEY")]
     api_key: Option<String>,
@@ -365,6 +368,12 @@ impl Ctx {
             images: route.info.images,
             reasoning: route.info.reasoning,
             spill_dir: self.paths.home().join("spill"),
+            prompt: novacode_core::prompt::Sources {
+                cwd: self.cwd.clone(),
+                home: self.paths.home().to_path_buf(),
+                context_files: !self.cli.no_context_files,
+                skills: String::new(),
+            },
             redactor: {
                 let auth_path = self.paths.home().join("auth.json");
                 Redactor::new(move || {
@@ -536,7 +545,7 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
             .resolve(&spec)
             .ok()
             .and_then(|r| models::price(&ctx.providers, &r));
-        let spent = models::spent(&ctx.providers, &history);
+        let spent = models::spent(&ctx.providers, agent.store.entries());
         let id = agent.store.id().to_string();
         let (handle, task) = agent::spawn(agent);
         let (etx, erx) = mpsc::unbounded_channel();
@@ -661,6 +670,12 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
                             })
                             .collect();
                         let _ = ui_tx.send(UiEvent::Sessions(items));
+                    }
+                    Cmd::Context => {
+                        let _ = ui_tx.send(UiEvent::Page {
+                            title: "Context".into(),
+                            text: h.context().render(),
+                        });
                     }
                     Cmd::Quit => break,
                 }

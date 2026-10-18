@@ -46,6 +46,8 @@ pub struct Config {
     pub spill_dir: PathBuf,
     /// Masks novacode's own secrets in tool output (L6.6).
     pub redactor: Redactor,
+    /// Where the system prompt's parts come from (L4.7).
+    pub prompt: crate::prompt::Sources,
 }
 
 /// A model change, possibly to another provider (L2.11): everything that
@@ -97,6 +99,46 @@ struct Shared {
     /// Route to switch to at the start of the next run.
     next_model: Mutex<Option<Switch>>,
     next_thinking: Mutex<Option<ThinkingLevel>>,
+    /// What the context holds, refreshed after each run (for `/context`).
+    report: Mutex<ContextReport>,
+}
+
+/// Where the context window goes, in estimated tokens (L4.7 `/context`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ContextReport {
+    pub sections: Vec<(String, u64)>,
+    pub tools: Vec<(String, u64)>,
+    /// Everything after the prompt: messages, deltas, reminders.
+    pub messages: u64,
+    pub window: u64,
+}
+
+impl ContextReport {
+    pub fn render(&self) -> String {
+        use std::fmt::Write;
+        let sum = |v: &[(String, u64)]| v.iter().map(|(_, t)| t).sum::<u64>();
+        let total = sum(&self.sections) + sum(&self.tools) + self.messages;
+        let pct = |t: u64| t as f64 * 100.0 / self.window.max(1) as f64;
+        let mut s = String::new();
+        let mut line = |name: &str, t: u64| {
+            let _ = writeln!(s, "  {name:<24} {t:>8}  {:>5.1}%", pct(t));
+        };
+        for (title, rows) in [("system prompt", &self.sections), ("tools", &self.tools)] {
+            line(title, sum(rows));
+            for (n, t) in rows {
+                line(&format!("  {n}"), *t);
+            }
+        }
+        line("messages", self.messages);
+        let _ = write!(
+            s,
+            "\n  {:<24} {total:>8}  {:>5.1}% of {}k (estimated)",
+            "total",
+            pct(total),
+            self.window / 1000
+        );
+        s
+    }
 }
 
 impl Agent {
@@ -107,12 +149,7 @@ impl Agent {
         cfg: Config,
         env: Arc<dyn ExecutionEnv>,
     ) -> Self {
-        if store.entries().is_empty() {
-            let text = crate::prompt::system_prompt(&cfg.cwd);
-            log_err(store.append(EntryKind::Message {
-                message: Message::System { text },
-            }));
-        }
+        refresh_prompt(&mut store, &cfg.prompt);
         if store.last_model() != Some((cfg.provider.clone(), cfg.model.clone())) {
             log_err(store.append(EntryKind::ModelChange {
                 provider: cfg.provider.clone(),
@@ -132,7 +169,7 @@ impl Agent {
             .collect();
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-        Self {
+        let agent = Self {
             adapter,
             tools,
             defs,
@@ -145,7 +182,40 @@ impl Agent {
             policy: Arc::new(Policy::new(Permissions::default(), home, None)),
             approver: None,
             quirks: Arc::new(Quirks::ephemeral()),
-        }
+        };
+        agent.update_report();
+        agent
+    }
+
+    fn update_report(&self) {
+        use novacode_types::estimate;
+        let sections: Vec<(String, u64)> = self
+            .store
+            .sections()
+            .into_iter()
+            .map(|(n, t)| (n, estimate::text(&t)))
+            .collect();
+        let tools = self
+            .defs
+            .iter()
+            .map(|d| {
+                let json = serde_json::to_string(&d.schema).unwrap_or_default();
+                (d.name.clone(), estimate::text(&d.description) + estimate::text(&json))
+            })
+            .collect();
+        let projection = self.store.projection();
+        // The leading system messages are the prompt, counted per section above.
+        let lead = projection
+            .iter()
+            .take_while(|m| matches!(m, Message::System { .. }))
+            .count();
+        let messages = projection[lead..].iter().map(estimate::message).sum();
+        *self.shared.report.lock().unwrap() = ContextReport {
+            sections,
+            tools,
+            messages,
+            window: self.cfg.window_tokens,
+        };
     }
 
     pub fn with_quirks(mut self, q: Arc<Quirks>) -> Self {
@@ -271,6 +341,8 @@ impl Agent {
             self.cfg.thinking = level;
             self.add(EntryKind::ThinkingChange { level });
         }
+        refresh_prompt(&mut self.store, &self.cfg.prompt);
+        self.update_report();
         let cancel = CancellationToken::new();
         *self.shared.cancel.lock().unwrap() = Some(cancel.clone());
         self.emit(AgentEvent::AgentStart);
@@ -344,6 +416,7 @@ impl Agent {
             break stop;
         };
         *self.shared.cancel.lock().unwrap() = None;
+        self.update_report();
         self.emit(AgentEvent::AgentEnd { stop });
         let q = self.shared.queues.lock().unwrap();
         if q.steering.is_empty() && q.follow_up.is_empty() {
@@ -607,6 +680,10 @@ impl SessionHandle {
     pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
         self.events.subscribe()
     }
+    /// Where the context goes, as of the last finished run.
+    pub fn context(&self) -> ContextReport {
+        self.shared.report.lock().unwrap().clone()
+    }
     /// Queue a prompt; delivered when the agent is idle or after the current run (follow-up).
     pub fn prompt(&self, text: impl Into<String>) {
         self.prompt_content(vec![Block::text(text.into())]);
@@ -668,4 +745,61 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
         }
     });
     (handle, task)
+}
+
+/// Bring the model's prompt up to date by appending only (L4.7, L1.7): the full
+/// prompt on a new session; later, a delta of the sections that changed and a
+/// reminder when the day, branch or HEAD moved. Sessions from before sections
+/// existed keep their prompt as it is.
+fn refresh_prompt(store: &mut Store, src: &crate::prompt::Sources) {
+    use crate::prompt;
+    let have = store.sections();
+    let fresh = store.entries().is_empty();
+    if have.is_empty() && !fresh {
+        return;
+    }
+    let now = prompt::env_state(&src.cwd);
+    let environment = match have.iter().find(|(n, _)| n == "environment") {
+        // Kept as written at start: only its body is passed back in.
+        Some((_, t)) => t
+            .trim_start_matches("<environment>\n")
+            .trim_end_matches("\n</environment>")
+            .to_string(),
+        None => prompt::environment(&src.cwd, &now),
+    };
+    let want = prompt::build(src, &environment);
+    let patch = prompt::diff(&have, &want);
+    if !patch.is_empty() {
+        let text = if fresh {
+            prompt::render(&want)
+        } else {
+            prompt::render_update(&patch)
+        };
+        log_err(store.append(EntryKind::Sections { patch }));
+        log_err(store.append(EntryKind::Message {
+            message: Message::System { text },
+        }));
+    }
+    match store.last_env() {
+        Some(old) if old == now => {}
+        Some(old) => {
+            if let Some(text) = prompt::reminder(&old, &now) {
+                log_err(store.append(EntryKind::CustomMessage {
+                    kind: "env".into(),
+                    text,
+                    display: false,
+                }));
+            }
+            log_err(store.append(env_entry(now)));
+        }
+        None => log_err(store.append(env_entry(now))),
+    }
+}
+
+fn env_entry(e: crate::prompt::EnvState) -> EntryKind {
+    EntryKind::Env {
+        date: e.date,
+        branch: e.branch,
+        head: e.head,
+    }
 }

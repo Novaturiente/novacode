@@ -46,6 +46,19 @@ pub enum EntryKind {
     SessionInfo {
         name: String,
     },
+    /// The prompt sections a `System` message sets: the first has them all, later
+    /// ones only the changed (`None` = removed) (L4.7). Not sent; the message is.
+    Sections {
+        patch: Vec<(String, Option<String>)>,
+    },
+    /// Day, branch and HEAD the model was last told about (L4.7). Not sent.
+    Env {
+        date: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head: Option<String>,
+    },
     /// Moves the leaf (branch navigation). Not a tree node.
     Leaf {
         target: String,
@@ -278,6 +291,39 @@ impl Store {
     pub fn last_thinking(&self) -> Option<novacode_types::ThinkingLevel> {
         self.entries.iter().rev().find_map(|e| match &e.kind {
             EntryKind::ThinkingChange { level } => Some(*level),
+            _ => None,
+        })
+    }
+
+    /// The prompt sections the model has now, folded along the current branch.
+    pub fn sections(&self) -> crate::prompt::Sections {
+        let mut out: crate::prompt::Sections = Vec::new();
+        for e in self.path_to_leaf() {
+            if let EntryKind::Sections { patch } = &e.kind {
+                for (name, text) in patch {
+                    let at = out.iter().position(|(n, _)| n == name);
+                    match (at, text) {
+                        (Some(i), Some(t)) => out[i].1 = t.clone(),
+                        (Some(i), None) => {
+                            out.remove(i);
+                        }
+                        (None, Some(t)) => out.push((name.clone(), t.clone())),
+                        (None, None) => {}
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The environment the model was last told about.
+    pub fn last_env(&self) -> Option<crate::prompt::EnvState> {
+        self.path_to_leaf().into_iter().rev().find_map(|e| match &e.kind {
+            EntryKind::Env { date, branch, head } => Some(crate::prompt::EnvState {
+                date: date.clone(),
+                branch: branch.clone(),
+                head: head.clone(),
+            }),
             _ => None,
         })
     }

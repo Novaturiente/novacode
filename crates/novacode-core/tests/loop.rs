@@ -48,6 +48,12 @@ fn cfg(cwd: &Path, home: &Path) -> Config {
         thinking: Default::default(),
         spill_dir: home.join("spill"),
         redactor: Default::default(),
+        prompt: novacode_core::prompt::Sources {
+            cwd: cwd.into(),
+            home: home.into(),
+            context_files: true,
+            skills: String::new(),
+        },
     }
 }
 
@@ -451,4 +457,54 @@ async fn rejected_schema_keyword_is_stripped_and_remembered() {
     drop(agent);
     let saved = std::fs::read_to_string(home.path().join("cache/schema-quirks.json")).unwrap();
     assert!(saved.contains("faux/m") && saved.contains("minimum"), "{saved}");
+}
+
+/// M6 check: a context file added mid-session reaches the model as an appended
+/// delta; the system prompt and every earlier message keep their bytes (L4.7, L1.7).
+#[tokio::test]
+async fn prompt_changes_are_appended_deltas() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let faux = Faux::new([FauxReply::text("one"), FauxReply::text("two")]);
+    let paths = Paths::new(home.path());
+    let store = Store::create(&paths, work.path(), false);
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        novacode_tools::builtins(false),
+        store,
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    );
+    let (h, task) = agent::spawn(agent);
+    let mut rx = h.subscribe();
+    h.prompt("first");
+    while !matches!(rx.recv().await.unwrap(), AgentEvent::AgentEnd { .. }) {}
+    std::fs::write(work.path().join("AGENTS.md"), "Always answer in French.").unwrap();
+    h.prompt("second");
+    while !matches!(rx.recv().await.unwrap(), AgentEvent::AgentEnd { .. }) {}
+    h.shutdown();
+    let agent = task.await.unwrap();
+
+    let reqs = faux.requests.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 2);
+    let sys = |r: &Request| build_body(r, None, "anthropic")["system"].clone();
+    assert_eq!(sys(&reqs[0]), sys(&reqs[1]), "the prompt itself never changes");
+    let (a, b) = (wire_messages(&reqs[0]), wire_messages(&reqs[1]));
+    assert!(b[..a.len()] == a[..], "request is not a prefix of the next");
+    let tail = b[a.len()..].join("");
+    assert!(
+        tail.contains("Updated system prompt section \\\"project_context\\\"")
+            && tail.contains("Always answer in French."),
+        "{tail}"
+    );
+    // Nothing changed since: a third look appends nothing.
+    assert_eq!(
+        agent
+            .store
+            .sections()
+            .iter()
+            .filter(|(n, _)| n == "project_context")
+            .count(),
+        1
+    );
 }

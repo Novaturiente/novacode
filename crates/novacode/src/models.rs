@@ -43,18 +43,28 @@ pub fn price(p: &Providers, route: &Route) -> Option<novacode_types::Cost> {
         .and(route.info.cost)
 }
 
-/// USD spent on API-key routes across a session's replies, each at its own model's price.
-pub fn spent(p: &Providers, history: &[novacode_types::Message]) -> f64 {
-    history
-        .iter()
-        .filter_map(|m| match m {
-            novacode_types::Message::Assistant(a) => {
-                let route = p.resolve(&format!("{}/{}", a.provider, a.model)).ok()?;
-                Some(a.usage.cost(&price(p, &route)?))
+/// USD spent on API-key routes across a session's replies, each at the price of the
+/// route recorded before it. A reply's own `provider` is its replay namespace, which
+/// the Claude login shares with the Anthropic API key, so it can't tell them apart.
+pub fn spent(p: &Providers, entries: &[novacode_core::session::Entry]) -> f64 {
+    use novacode_core::session::EntryKind;
+    let mut price_now = None;
+    let mut sum = 0.0;
+    for e in entries {
+        match &e.kind {
+            EntryKind::ModelChange { provider, model } => {
+                price_now = p
+                    .resolve(&format!("{provider}/{model}"))
+                    .ok()
+                    .and_then(|r| price(p, &r));
             }
-            _ => None,
-        })
-        .sum()
+            EntryKind::Message {
+                message: novacode_types::Message::Assistant(a),
+            } => sum += price_now.as_ref().map_or(0.0, |c| a.usage.cost(c)),
+            _ => {}
+        }
+    }
+    sum
 }
 
 /// Everything the agent needs to move to `spec` (another provider is fine).

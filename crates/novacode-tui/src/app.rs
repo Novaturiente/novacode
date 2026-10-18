@@ -35,6 +35,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/resume", "resume another session in this folder"),
     ("/new", "start a new session"),
     ("/keys", "show keybindings"),
+    ("/context", "where the context window goes"),
     ("/copy", "copy the last reply"),
     ("/quit", "quit"),
 ];
@@ -77,11 +78,18 @@ pub enum Cmd {
     SetThinking(ThinkingLevel),
     ListModels,
     ListSessions,
+    /// The host answers with [`UiEvent::Page`].
+    Context,
     Quit,
 }
 
 /// Things the host tells the UI besides agent events.
 pub enum UiEvent {
+    /// Text to show in the pager (e.g. `/context`).
+    Page {
+        title: String,
+        text: String,
+    },
     Approve(ApproveReq),
     Models(Result<Vec<PickItem>, String>),
     Sessions(Vec<PickItem>),
@@ -269,6 +277,7 @@ impl App {
             UiEvent::Sessions(items) if items.is_empty() => self.flash("no other sessions in this folder"),
             UiEvent::Sessions(items) => self.overlay = Some(Overlay::Sessions(Picker::new("Resume session", items))),
             UiEvent::Notice { text, error } => self.tr.notice(text, error),
+            UiEvent::Page { title, text } => self.overlay = Some(Overlay::Pager(Pager::new(title, &text, &self.theme))),
             UiEvent::Thinking { level, note } => {
                 self.init.level = level;
                 self.tr.notice(note, false);
@@ -738,6 +747,7 @@ impl App {
                     self.overlay = Some(Overlay::Pager(Pager::keys_help(&self.keymap, &self.theme)));
                 }
                 "/copy" => self.copy_reply(),
+                "/context" => self.send(Cmd::Context),
                 _ => {}
             }
             return;

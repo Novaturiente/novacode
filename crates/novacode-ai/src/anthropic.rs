@@ -343,6 +343,20 @@ pub enum ThinkingStyle {
     Managed,
 }
 
+/// Models that take `system` messages inside the conversation (pi's verified list).
+fn mid_convo_system(model: &str) -> bool {
+    let id = base_id(model).replace('.', "-");
+    [
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+    ]
+    .contains(&id.as_str())
+        || ["claude-fable-5", "claude-mythos-5"].iter().any(|p| id.starts_with(p))
+}
+
 fn base_id(model: &str) -> String {
     let id = model.to_lowercase();
     // Drop a dated snapshot suffix (`-20260723`).
@@ -447,15 +461,17 @@ pub fn build_body(req: &Request, oauth: Option<&OAuthProfile>, ns: &str) -> Valu
         system.push(json!({ "type": "text", "text": format!("x-anthropic-billing-header: {}", p.billing_header) }));
         system.push(json!({ "type": "text", "text": p.identity }));
     }
-    // Anthropic has no mid-conversation system role: merge every System message, in order (L1.1).
-    for m in &history {
+    // The leading System messages are the prompt; later ones are deltas (L4.7) and
+    // stay where they are, so the cached prefix never changes.
+    for m in history.iter().take_while(|m| matches!(m, Message::System { .. })) {
         if let Message::System { text } = m
             && !text.is_empty()
         {
             system.push(json!({ "type": "text", "text": text }));
         }
     }
-    let (mut messages, levels) = convert_messages(&history, ns);
+    let native = (ns == "claude" || ns == "anthropic") && mid_convo_system(&req.model);
+    let (mut messages, levels) = convert_messages(&history, ns, native);
     let tools: Vec<Value> = req
         .tools
         .iter()
@@ -540,11 +556,10 @@ fn place_cache_markers(system: &mut [Value], messages: &mut [Value], cache: &Val
     if let Some(last) = system.last_mut() {
         last["cache_control"] = cache.clone();
     }
-    let n = messages.len();
-    let prev_turn_end = messages[..n.saturating_sub(1)]
-        .iter()
-        .rposition(|m| m["role"] == "assistant");
-    for i in [prev_turn_end, n.checked_sub(1)].into_iter().flatten() {
+    // The last real (non-system) message, and the previous turn's last reply.
+    let last = messages.iter().rposition(|m| m["role"] != "system");
+    let prev_turn_end = last.and_then(|l| messages[..l].iter().rposition(|m| m["role"] == "assistant"));
+    for i in [prev_turn_end, last].into_iter().flatten() {
         let blocks = messages[i]["content"].as_array_mut();
         // Thinking blocks can't carry cache_control; mark the last block that can.
         if let Some(b) = blocks.and_then(|bs| {
@@ -558,7 +573,7 @@ fn place_cache_markers(system: &mut [Value], messages: &mut [Value], cache: &Val
 }
 
 /// Wire messages, plus the recorded effort of each assistant one (for mid-conversation effort).
-fn convert_messages(messages: &[Message], ns: &str) -> (Vec<Value>, Vec<Option<String>>) {
+fn convert_messages(messages: &[Message], ns: &str, native_system: bool) -> (Vec<Value>, Vec<Option<String>>) {
     let mut out: Vec<Value> = Vec::new();
     let mut levels: Vec<Option<String>> = Vec::new();
     let mut push = |role: &str, blocks: Vec<Value>, level: Option<&String>| {
@@ -576,10 +591,26 @@ fn convert_messages(messages: &[Message], ns: &str) -> (Vec<Value>, Vec<Option<S
         out.push(json!({ "role": role, "content": blocks }));
         levels.push(level.cloned());
     };
-    for m in messages {
+    let lead = messages
+        .iter()
+        .take_while(|m| matches!(m, Message::System { .. }))
+        .count();
+    let reminder = |t: &str| json!({ "type": "text", "text": format!("<system-reminder>\n{t}\n</system-reminder>") });
+    // A native system message must follow a user message: deltas wait for the next one.
+    let mut held: Vec<Value> = Vec::new();
+    for m in &messages[lead..] {
         match m {
-            Message::System { .. } | Message::Custom { .. } => {}
-            Message::User { content } => push("user", content.iter().filter_map(user_block).collect(), None),
+            Message::System { text } if text.is_empty() => {}
+            Message::System { text } if native_system => held.push(json!({ "type": "text", "text": text })),
+            // Older models: the delta rides in the conversation as a reminder.
+            Message::System { text } => push("user", vec![reminder(text)], None),
+            Message::Custom { .. } => {}
+            Message::User { content } => {
+                push("user", content.iter().filter_map(user_block).collect(), None);
+                if !held.is_empty() {
+                    push("system", std::mem::take(&mut held), None);
+                }
+            }
             Message::Assistant(a) => {
                 let same = a.provider == ns;
                 push(
@@ -606,6 +637,12 @@ fn convert_messages(messages: &[Message], ns: &str) -> (Vec<Value>, Vec<Option<S
             }
         }
     }
+    // Nothing followed: keep the text as a reminder rather than lose it.
+    let left: Vec<Value> = held
+        .iter()
+        .map(|b| reminder(b["text"].as_str().unwrap_or_default()))
+        .collect();
+    push("user", left, None);
     (out, levels)
 }
 
@@ -655,6 +692,44 @@ mod tests {
             images: true,
             session: None,
         }
+    }
+
+    #[test]
+    fn later_system_messages_stay_in_place() {
+        let sys = |t: &str| Message::System { text: t.into() };
+        let history = vec![sys("prompt"), Message::user("hi"), sys("delta"), Message::user("next")];
+        let mut r = req(history);
+        r.model = "claude-opus-5-5".into();
+        let b = build_body(&r, None, "claude");
+        assert_eq!(
+            b["system"].as_array().unwrap().len(),
+            1,
+            "only the leading prompt is top-level"
+        );
+        let m = b["messages"].as_array().unwrap();
+        // Held until a user message precedes it (the API's rule), then marked nowhere.
+        let roles: Vec<&str> = m.iter().map(|x| x["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "system"]);
+        assert_eq!(m[1]["content"][0]["text"], "delta");
+        assert!(
+            m[1]["content"][0].get("cache_control").is_none(),
+            "markers go on real messages"
+        );
+        assert!(m[0]["content"][1].get("cache_control").is_some());
+        // Older model, or another vendor on this wire: a reminder inside the user turn.
+        r.model = "claude-sonnet-4-5".into();
+        let b = build_body(&r, None, "claude");
+        let m = b["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 1, "user turns merge");
+        assert_eq!(
+            m[0]["content"][1]["text"],
+            "<system-reminder>\ndelta\n</system-reminder>"
+        );
+        assert!(
+            !build_body(&r, None, "minimax")
+                .to_string()
+                .contains("\"role\":\"system\"")
+        );
     }
 
     fn assistant(content: Vec<Block>) -> Message {
