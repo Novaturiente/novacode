@@ -70,20 +70,48 @@ pub enum Exposure {
 
 pub type Tools = Vec<Arc<dyn Tool>>;
 
-/// Split by exposure: (listed, deferred). Listed ones go in the request; deferred
-/// ones are found with `tool_search` (L5.17), so their declarations cost no tokens.
-// shortcut: codemode-only tools are dropped until codemode lands (M10).
-pub fn exposed(tools: Vec<Arc<dyn Tool>>, overrides: impl Fn(&str) -> Option<Exposure>) -> (Tools, Tools) {
-    let mut listed = Vec::new();
-    let mut deferred = Vec::new();
+/// Tools split by exposure (L5.16).
+#[derive(Default)]
+pub struct Exposed {
+    /// In the request.
+    pub listed: Tools,
+    /// Found with `tool_search` (L5.17), so their declarations cost no tokens.
+    pub deferred: Tools,
+    /// Reachable only from codemode scripts (L7.5).
+    pub scripted: Tools,
+}
+
+impl Exposed {
+    /// Everything a codemode script may call.
+    pub fn scriptable(&self) -> Tools {
+        self.listed
+            .iter()
+            .chain(&self.deferred)
+            .chain(&self.scripted)
+            .cloned()
+            .collect()
+    }
+}
+
+pub fn exposed(tools: Vec<Arc<dyn Tool>>, overrides: impl Fn(&str) -> Option<Exposure>) -> Exposed {
+    let mut e = Exposed::default();
     for t in tools {
         match overrides(t.name()).unwrap_or(t.exposure()) {
-            Exposure::Listed => listed.push(t),
-            Exposure::Deferred => deferred.push(t),
-            Exposure::CodemodeOnly | Exposure::Hidden => {}
+            Exposure::Listed => e.listed.push(t),
+            Exposure::Deferred => e.deferred.push(t),
+            Exposure::CodemodeOnly => e.scripted.push(t),
+            Exposure::Hidden => {}
         }
     }
-    (listed, deferred)
+    e
+}
+
+/// Runs a tool call through the session's pipeline from inside another tool
+/// (codemode, L3.11): same lookup, permissions, hooks and output guards.
+pub trait Nested: Send + Sync {
+    fn call(&self, name: String, args: Value, ctx: ToolCtx) -> BoxFuture<'static, ToolOutput>;
+    /// What a script can call: definitions plus the MCP server of `server__tool` names.
+    fn tools(&self) -> Vec<(ToolDef, Option<String>)>;
 }
 
 /// Which end of a long output to keep (L5.3).
@@ -107,6 +135,8 @@ pub struct ToolCtx {
     pub processes: Option<Arc<process::ProcessManager>>,
     /// The model takes tool changes in-line (L4.8): found tools are called directly.
     pub native_tools: bool,
+    /// Nested calls through the pipeline (codemode); None inside a nested call.
+    pub nested: Option<Arc<dyn Nested>>,
 }
 
 impl ToolCtx {
@@ -222,6 +252,7 @@ pub(crate) mod testutil {
             session_id: "test".into(),
             processes: None,
             native_tools: false,
+            nested: None,
         }
     }
 
@@ -256,16 +287,18 @@ mod exposure_tests {
     fn settings_override_the_declared_exposure() {
         let names = |t: Vec<Arc<dyn Tool>>| t.iter().map(|t| t.name().to_string()).collect::<Vec<_>>();
         assert_eq!(
-            names(exposed(builtins(false), |_| None).0).len(),
+            names(exposed(builtins(false), |_| None).listed).len(),
             7,
             "built-ins are listed by default"
         );
-        let (listed, deferred) = exposed(builtins(false), |n| match n {
+        let e = exposed(builtins(false), |n| match n {
             "ls" => Some(Exposure::Hidden),
             "find" => Some(Exposure::CodemodeOnly),
             "grep" => Some(Exposure::Deferred),
             _ => None,
         });
+        assert_eq!(names(e.scriptable()), ["read", "write", "edit", "bash", "grep", "find"]);
+        let (listed, deferred) = (e.listed, e.deferred);
         assert_eq!(names(listed), ["read", "write", "edit", "bash"]);
         assert_eq!(names(deferred), ["grep"]);
         let e: Exposure = serde_json::from_value(serde_json::json!("codemode-only")).unwrap();

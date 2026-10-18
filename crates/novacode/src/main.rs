@@ -621,8 +621,12 @@ impl Ctx {
                 file: file.to_path_buf(),
             }));
         }
-        let (mut tools, deferred) =
-            novacode_tools::exposed(all, |name| self.settings.get(&format!("tools.{name}.exposure")));
+        all.push(Arc::new(novacode_core::codemode::Codemode::default()));
+        let novacode_tools::Exposed {
+            listed: mut tools,
+            deferred,
+            scripted,
+        } = novacode_tools::exposed(all, |name| self.settings.get(&format!("tools.{name}.exposure")));
         // Deferred tools (L5.17): found by tool_search, run in-line once announced or through `call`.
         if !deferred.is_empty() {
             let defs = deferred
@@ -637,7 +641,8 @@ impl Ctx {
         let mut agent = Agent::new(adapter, tools, store, cfg, Arc::new(LocalEnv))
             .with_policy(policy)
             .with_quirks(self.quirks.clone())
-            .with_deferred(deferred);
+            .with_deferred(deferred)
+            .with_scripted(scripted);
         if s.get("checkpoints.enabled").unwrap_or(true)
             && agent.store.path().is_some()
             && let Some(repo) = novacode_core::checkpoint::resolve(&self.cwd, self.paths.home())

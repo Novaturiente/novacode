@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod cache;
 pub mod checkpoint;
+pub mod codemode;
 pub mod export;
 pub mod image_gen;
 pub mod memory;

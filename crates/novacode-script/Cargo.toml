@@ -8,4 +8,13 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-novacode-types.workspace = true
+rquickjs = { version = "0.14", features = ["futures"] }
+oxc_allocator = "0.154"
+oxc_parser = "0.154"
+oxc_semantic = "0.154"
+oxc_transformer = "0.154"
+oxc_codegen = "0.154"
+oxc_span = "0.154"
+serde_json.workspace = true
+tokio = { workspace = true }
+futures-util.workspace = true

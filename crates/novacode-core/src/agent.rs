@@ -6,7 +6,7 @@
 //! session entry plus an event.
 
 use crate::pipeline::{self, Prepared};
-use crate::policy::{Approval, ApprovalRequest, Approver, Permissions, Policy, Verdict};
+use crate::policy::{Approver, Permissions, Policy};
 use crate::recovery::{Nudge, Recovery};
 use crate::session::{EntryKind, Store};
 use novacode_ai::adapter::{Adapter, CacheRetention, Request};
@@ -96,6 +96,8 @@ pub struct Agent {
     processes: Option<Arc<novacode_tools::process::ProcessManager>>,
     /// Found through `tool_search`, never in the request (L5.17).
     deferred: Vec<Arc<dyn Tool>>,
+    /// Codemode-only tools (L5.16).
+    scripted: Vec<Arc<dyn Tool>>,
 }
 
 /// Where a model's tool call goes (L5.17).
@@ -288,6 +290,7 @@ impl Agent {
             checkpoints: None,
             processes: None,
             deferred: Vec::new(),
+            scripted: Vec::new(),
             pending_cp: None,
         };
         agent.update_report();
@@ -782,35 +785,13 @@ impl Agent {
 
     /// Permission check for one prepared call (L6.1). `None` = run it; `Some` = the refusal to return.
     async fn authorize(&self, call: &ToolCall, args: &serde_json::Value) -> Option<ToolOutput> {
-        let verdict = self
-            .policy
-            .check(&call.name, args, &self.cfg.cwd, self.approver.is_some());
-        let (reason, rule, risky) = match verdict {
-            Verdict::Allow => return None,
-            Verdict::Deny(why) => return Some(ToolOutput::error(why)),
-            Verdict::Ask { reason, rule, risky } => (reason, rule, risky),
-        };
-        let Some(approver) = &self.approver else {
-            return Some(ToolOutput::error(format!(
-                "Not run: this needs the user's approval ({reason}) and nobody can approve it here. Add an allow rule or run interactively."
-            )));
-        };
-        let req = ApprovalRequest {
-            tool: call.name.clone(),
-            args: args.clone(),
-            reason,
-            rule,
-            risky,
-        };
-        let answer = approver.approve(req.clone()).await;
-        self.policy.record(&req, &answer);
-        match answer {
-            Approval::Deny(why) => Some(ToolOutput::error(match why {
-                Some(w) if !w.trim().is_empty() => format!("The user declined this call: {w}"),
-                _ => "The user declined this call.".into(),
-            })),
-            _ => None,
-        }
+        pipeline::authorize(&self.policy, self.approver.as_ref(), &call.name, args, &self.cfg.cwd).await
+    }
+
+    /// Everything codemode scripts may call besides the listed tools (L5.16).
+    pub fn with_scripted(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.scripted = tools;
+        self
     }
 
     fn emit(&self, ev: AgentEvent) {
@@ -1174,7 +1155,31 @@ impl Agent {
             session_id: self.store.id().to_string(),
             processes: self.processes.clone(),
             native_tools: self.adapter.native_tool_changes(&self.cfg.model),
+            nested: None,
         };
+        let mut base = base;
+        if prepared
+            .iter()
+            .any(|(_, p)| matches!(p, Prepared::Ready(t, ..) if t.name() == crate::codemode::NAME))
+        {
+            let tools: Vec<Arc<dyn Tool>> = self
+                .tools
+                .iter()
+                .chain(&self.deferred)
+                .chain(&self.scripted)
+                .filter(|t| t.name() != crate::codemode::NAME)
+                .cloned()
+                .collect();
+            base.nested = Some(Arc::new(crate::codemode::Runner {
+                tools,
+                policy: self.policy.clone(),
+                approver: self.approver.clone(),
+                spill_dir: self.cfg.spill_dir.clone(),
+                redactor: self.cfg.redactor.clone(),
+                budget,
+                seq: Default::default(),
+            }));
+        }
         let one = |call: &ToolCall, p: &Prepared| {
             let events = self.events.clone();
             let redactor = self.cfg.redactor.clone();

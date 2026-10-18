@@ -122,6 +122,43 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// Permission check for one call (L6.1). `None` = run it; `Some` = the refusal to return.
+pub async fn authorize(
+    policy: &crate::policy::Policy,
+    approver: Option<&Arc<dyn crate::policy::Approver>>,
+    tool: &str,
+    args: &Value,
+    cwd: &Path,
+) -> Option<ToolOutput> {
+    use crate::policy::{Approval, ApprovalRequest, Verdict};
+    let (reason, rule, risky) = match policy.check(tool, args, cwd, approver.is_some()) {
+        Verdict::Allow => return None,
+        Verdict::Deny(why) => return Some(ToolOutput::error(why)),
+        Verdict::Ask { reason, rule, risky } => (reason, rule, risky),
+    };
+    let Some(approver) = approver else {
+        return Some(ToolOutput::error(format!(
+            "Not run: this needs the user's approval ({reason}) and nobody can approve it here. Add an allow rule or run interactively."
+        )));
+    };
+    let req = ApprovalRequest {
+        tool: tool.to_string(),
+        args: args.clone(),
+        reason,
+        rule,
+        risky,
+    };
+    let answer = approver.approve(req.clone()).await;
+    policy.record(&req, &answer);
+    match answer {
+        Approval::Deny(why) => Some(ToolOutput::error(match why {
+            Some(w) if !w.trim().is_empty() => format!("The user declined this call: {w}"),
+            _ => "The user declined this call.".into(),
+        })),
+        _ => None,
+    }
+}
+
 /// Execute and guard once (L5.3). Output text is cut/spilled, then budget-checked.
 pub async fn run(
     tool: &dyn Tool,

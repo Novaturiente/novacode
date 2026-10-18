@@ -976,3 +976,52 @@ async fn deferred_tools_run_through_call() {
     let req = faux.requests.lock().unwrap().clone();
     assert!(req[0].tools.iter().all(|t| t.name != "read"));
 }
+
+/// L7.5: codemode chains calls through the pipeline (permissions apply inside
+/// scripts), returns only what it prints, and a transaction rolls back on error.
+#[tokio::test]
+async fn codemode_chains_through_the_pipeline() {
+    use novacode_core::policy::{Permissions, Policy};
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(work.path().join("a.txt"), "alpha").unwrap();
+    std::fs::write(work.path().join("b.txt"), "beta").unwrap();
+    let script = "const [a, b] = await Promise.all([tools.read({path: 'a.txt'}), tools.read({path: 'b.txt'})]);\n\
+                  let denied = '';\n\
+                  try { await tools.bash({command: 'git push origin main'}); } catch (e) { denied = e.message; }\n\
+                  text(a.includes('alpha') && b.includes('beta') ? 'both read' : 'missing');\n\
+                  return denied.includes('git push') ? 'push refused' : 'push ran: ' + denied;";
+    let tx = "await tools.write({path: 'a.txt', content: 'changed'});\nawait tools.write({path: 'new.txt', content: 'x'});\nthrow new Error('stop');";
+    let faux = Faux::new([
+        tools_reply(vec![call("a", "codemode", json!({ "code": script }))]),
+        tools_reply(vec![call("b", "codemode", json!({ "code": tx, "transaction": true }))]),
+        FauxReply::text("done"),
+    ]);
+    let mut tools = novacode_tools::builtins(false);
+    tools.push(Arc::new(novacode_core::codemode::Codemode::default()));
+    let perms: Permissions = serde_json::from_value(json!({ "deny": ["Bash(git push:*)"] })).unwrap();
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        tools,
+        Store::create(&Paths::new(home.path()), work.path(), true),
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_policy(Policy::new(perms, home.path().into(), None));
+    let (agent, _) = drive(agent, &["go"]).await;
+    let results: Vec<String> = agent
+        .store
+        .projection()
+        .iter()
+        .filter(|m| matches!(m, Message::ToolResult { .. }))
+        .map(result_text)
+        .collect();
+    assert_eq!(results[0], "both read\npush refused");
+    assert!(
+        results[1].contains("Script failed: Error: stop") && results[1].contains("2 file(s) restored"),
+        "{}",
+        results[1]
+    );
+    assert_eq!(std::fs::read_to_string(work.path().join("a.txt")).unwrap(), "alpha");
+    assert!(!work.path().join("new.txt").exists());
+}
