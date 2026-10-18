@@ -375,6 +375,194 @@ pub enum AgentEvent {
         /// No notes were available: earlier messages were dropped without a summary.
         fallback: bool,
     },
+    /// A UI change from an extension (L9 UI API): panels, status segments, widgets.
+    /// Never stored or sent to the model; every window applies it.
+    Ui {
+        /// The extension that sent it (keys and actions go back to it).
+        ext: String,
+        op: ui::UiOp,
+    },
+}
+
+/// The extension UI API, version 1 (L9). Extensions send data; novacode draws it with
+/// its own components, so internals stay private and customisations survive updates.
+pub mod ui {
+    use serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
+
+    pub const API_VERSION: u32 = 1;
+
+    /// A styled piece of text; `style` is a theme token (`accent`, `dim`, `ok`, …).
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct Seg {
+        pub text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub style: Option<String>,
+    }
+
+    /// A line: plain text, or styled segments.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(untagged)]
+    pub enum Line {
+        Plain(String),
+        Styled(Vec<Seg>),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+    pub struct Time {
+        /// A fixed duration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ms: Option<u64>,
+        /// Unix ms start: shown ticking.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub since: Option<u64>,
+    }
+
+    /// One row of a panel source (the user's pi panel node schema).
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct Node {
+        pub id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub parent: Option<String>,
+        pub label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tag: Option<String>,
+        /// running, starting, waiting, queued, done, idle, failed or stopped.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub icon: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub dim: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub detail: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub time: Option<Time>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub order: Option<f64>,
+        /// Key → action: a `/command`, or a name sent back to the extension.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pub actions: BTreeMap<String, String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "op", rename_all = "snake_case")]
+    pub enum UiOp {
+        /// A status-line segment `ext:<key>`; `text: None` removes it.
+        Status {
+            key: String,
+            #[serde(default)]
+            text: Option<String>,
+            #[serde(default)]
+            style: Option<String>,
+        },
+        /// Lines above (default) or below the editor; `lines: None` removes them.
+        Widget {
+            key: String,
+            #[serde(default)]
+            lines: Option<Vec<Line>>,
+            #[serde(default)]
+            below: bool,
+        },
+        /// Replace the status line; `None` gives it back.
+        Footer {
+            #[serde(default)]
+            lines: Option<Vec<Line>>,
+        },
+        /// Lines above the transcript; `None` removes them.
+        Header {
+            #[serde(default)]
+            lines: Option<Vec<Line>>,
+        },
+        /// Editor decoration: a title in the border and the border's style.
+        Editor {
+            #[serde(default)]
+            title: Option<String>,
+            #[serde(default)]
+            border: Option<String>,
+        },
+        OpenTab {
+            name: String,
+            #[serde(default)]
+            title: Option<String>,
+            #[serde(default)]
+            priority: i32,
+            #[serde(default)]
+            width: Option<u16>,
+            /// A raw region the extension paints (and gets keys for) instead of nodes.
+            #[serde(default)]
+            region: bool,
+            /// Bring it to the front now.
+            #[serde(default)]
+            show: bool,
+        },
+        ShowTab {
+            name: String,
+        },
+        CloseTab {
+            name: String,
+        },
+        Source {
+            tab: String,
+            id: String,
+            #[serde(default)]
+            title: Option<String>,
+            #[serde(default)]
+            order: f64,
+            #[serde(default)]
+            newest_first: bool,
+        },
+        /// Add or replace a node (by id) in a source.
+        Publish {
+            tab: String,
+            source: String,
+            node: Box<Node>,
+        },
+        /// Remove a node, or (no id) clear the source.
+        Remove {
+            tab: String,
+            source: String,
+            #[serde(default)]
+            id: Option<String>,
+        },
+        /// Paint a region tab: lines clipped to its rectangle.
+        Region {
+            tab: String,
+            lines: Vec<Line>,
+        },
+        /// A key the extension handles (when no built-in binding takes it).
+        Shortcut {
+            key: String,
+            #[serde(default)]
+            description: String,
+        },
+    }
+
+    impl UiOp {
+        /// Later ops with the same key replace earlier ones, so a window joining late
+        /// gets the current UI without the whole history.
+        pub fn slot(&self, ext: &str) -> String {
+            match self {
+                UiOp::Status { key, .. } => format!("status:{ext}:{key}"),
+                UiOp::Widget { key, .. } => format!("widget:{ext}:{key}"),
+                UiOp::Footer { .. } => "footer".into(),
+                UiOp::Header { .. } => "header".into(),
+                UiOp::Editor { .. } => "editor".into(),
+                UiOp::OpenTab { name, .. } | UiOp::CloseTab { name } => format!("tab:{name}"),
+                UiOp::ShowTab { name } => format!("show:{name}"),
+                UiOp::Source { tab, id, .. } => format!("source:{tab}:{id}"),
+                UiOp::Publish { tab, source, node } => format!("node:{tab}:{source}:{}", node.id),
+                UiOp::Remove {
+                    tab,
+                    source,
+                    id: Some(id),
+                } => format!("node:{tab}:{source}:{id}"),
+                UiOp::Remove { tab, source, id: None } => format!("clear:{tab}:{source}"),
+                UiOp::Region { tab, .. } => format!("region:{tab}"),
+                UiOp::Shortcut { key, .. } => format!("shortcut:{key}"),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

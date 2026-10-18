@@ -99,9 +99,24 @@ pub struct State {
     /// Running processes in the process manager (L5.11): tmux `@agent_bg`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub processes: Vec<String>,
+    /// MCP servers: (ready, configured).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<(usize, usize)>,
 }
 
 impl State {
+    /// What the status line and Usage tab need from the host (L9.12).
+    pub fn info(&self) -> novacode_tui::UiEvent {
+        let q = self.quota.as_ref();
+        let (mcp_ready, mcp_total) = self.mcp.unwrap_or_default();
+        novacode_tui::UiEvent::Info {
+            five_hour: q.and_then(|q| q.five_hour.as_ref()).map(|w| w.used_pct),
+            weekly: q.and_then(|q| q.weekly.as_ref()).map(|w| w.used_pct),
+            mcp_ready,
+            mcp_total,
+        }
+    }
+
     /// Context use, 0–100.
     pub fn context_pct(&self) -> u64 {
         (self.context_tokens * 100).checked_div(self.window_tokens).unwrap_or(0)
@@ -256,6 +271,19 @@ pub enum ClientCmd {
         #[serde(default)]
         is_error: bool,
     },
+    /// A key or panel action for extension `ext` (L9 UI API).
+    ExtKey {
+        ext: String,
+        #[serde(default)]
+        tab: Option<String>,
+        #[serde(default)]
+        node: Option<String>,
+        key: String,
+        #[serde(default)]
+        width: u16,
+        #[serde(default)]
+        height: u16,
+    },
     /// End the session (a `--bg` one included).
     Shutdown,
 }
@@ -289,6 +317,7 @@ impl ClientCmd {
             ClientCmd::Shutdown => "shutdown",
             ClientCmd::RegisterTools { .. } => "register_tools",
             ClientCmd::ToolResult { .. } => "tool_result",
+            ClientCmd::ExtKey { .. } => "ext_key",
         }
     }
 }

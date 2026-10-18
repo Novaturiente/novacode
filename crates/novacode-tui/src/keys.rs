@@ -47,6 +47,8 @@ pub enum A {
     MessageCopy,
     PasteImage,
     Background,
+    PanelToggle,
+    PanelFocus,
     SessionNew,
     SessionResume,
     KeysHelp,
@@ -95,6 +97,8 @@ defs! {
     MessageCopy, "app.message.copy", App, ["ctrl+x"], "Copy the last reply";
     PasteImage, "app.clipboard.pasteImage", App, ["ctrl+v"], "Paste an image (or text) from the clipboard";
     Background, "app.process.background", App, ["ctrl+alt+b"], "Move running commands to the process manager";
+    PanelToggle, "app.panel.toggle", App, ["ctrl+alt+p"], "Show or hide the side panel";
+    PanelFocus, "app.panel.focus", App, ["ctrl+alt+f"], "Move keys to the side panel (Esc returns)";
     SessionNew, "app.session.new", App, [], "Start a new session";
     SessionResume, "app.session.resume", App, [], "Resume a session";
     KeysHelp, "app.keys.help", App, ["alt+/"], "Show keybindings";
@@ -208,6 +212,46 @@ fn normalize(code: KeyCode, mut mods: KeyModifiers) -> Combo {
 
 pub fn combo(k: &KeyEvent) -> Combo {
     normalize(k.code, k.modifiers)
+}
+
+/// A key as text (`ctrl+x`, `enter`, `a`), for panel keys and extensions.
+pub fn name(k: &KeyEvent) -> String {
+    let c = combo(k);
+    let mut s = String::new();
+    for (m, n) in [
+        (KeyModifiers::CONTROL, "ctrl+"),
+        (KeyModifiers::ALT, "alt+"),
+        (KeyModifiers::SHIFT, "shift+"),
+    ] {
+        if c.mods.contains(m) {
+            s.push_str(n);
+        }
+    }
+    s.push_str(&match c.code {
+        KeyCode::Enter => "enter".into(),
+        KeyCode::Esc => "esc".into(),
+        KeyCode::Tab => "tab".into(),
+        KeyCode::Backspace => "backspace".into(),
+        KeyCode::Delete => "delete".into(),
+        KeyCode::Up => "up".into(),
+        KeyCode::Down => "down".into(),
+        KeyCode::Left => "left".into(),
+        KeyCode::Right => "right".into(),
+        KeyCode::Home => "home".into(),
+        KeyCode::End => "end".into(),
+        KeyCode::PageUp => "pageUp".into(),
+        KeyCode::PageDown => "pageDown".into(),
+        KeyCode::Char(' ') => "space".into(),
+        KeyCode::Char(ch) => ch.to_string(),
+        KeyCode::F(n) => format!("f{n}"),
+        _ => "?".into(),
+    });
+    s
+}
+
+/// `k` is the key written as `s` (an extension shortcut).
+pub fn is(k: &KeyEvent, s: &str) -> bool {
+    parse(s).is_some_and(|c| c == combo(k))
 }
 
 pub struct Binding {

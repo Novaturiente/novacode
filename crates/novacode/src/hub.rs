@@ -31,6 +31,9 @@ struct Inner {
     state: State,
     history: Vec<Message>,
     tail: Vec<AgentEvent>,
+    /// The current extension UI, latest op per slot (in arrival order), for late windows.
+    ui: BTreeMap<String, (u64, AgentEvent)>,
+    ui_seq: u64,
     clients: BTreeMap<u64, mpsc::UnboundedSender<ServerMsg>>,
     next_client: u64,
     approvals: BTreeMap<u64, Pending>,
@@ -74,6 +77,8 @@ impl Hub {
                 state: state.clone(),
                 history,
                 tail: Vec::new(),
+                ui: BTreeMap::new(),
+                ui_seq: 0,
                 clients: BTreeMap::new(),
                 next_client: 0,
                 approvals: BTreeMap::new(),
@@ -168,6 +173,11 @@ impl Hub {
                 _ => true,
             }),
             AgentEvent::Settled => g.tail.clear(),
+            AgentEvent::Ui { ext, op } => {
+                g.ui_seq += 1;
+                let (slot, seq) = (op.slot(ext), g.ui_seq);
+                g.ui.insert(slot, (seq, ev.clone()));
+            }
             _ => {
                 g.tail.push(ev.clone());
                 if g.tail.len() > TAIL_MAX
@@ -256,6 +266,10 @@ impl Hub {
                 event: AgentEvent::AgentStart,
             });
         }
+        let mut ui: Vec<&(u64, AgentEvent)> = g.ui.values().collect();
+        ui.sort_by_key(|(seq, _)| *seq);
+        let ui: Vec<AgentEvent> = ui.into_iter().map(|(_, e)| e.clone()).collect();
+        first.extend(ui.into_iter().map(|event| ServerMsg::Event { event }));
         first.extend(g.tail.iter().map(|e| ServerMsg::Event { event: e.clone() }));
         first.extend(g.approvals.values().map(|p| p.msg.clone()));
         first.extend(g.asks.values().map(|(m, _)| m.clone()));
@@ -282,6 +296,26 @@ impl Hub {
         self.inner.lock().unwrap().state.clone()
     }
 
+    /// Seed the UI log (extension setup ops sent before the hub existed).
+    pub fn seed_ui(&self, events: Vec<AgentEvent>) {
+        let mut g = self.inner.lock().unwrap();
+        for ev in events {
+            if let AgentEvent::Ui { ext, op } = &ev {
+                g.ui_seq += 1;
+                let (slot, seq) = (op.slot(ext), g.ui_seq);
+                g.ui.insert(slot, (seq, ev));
+            }
+        }
+    }
+
+    /// The current extension UI, in order, for a window starting up.
+    pub fn ui_log(&self) -> Vec<AgentEvent> {
+        let g = self.inner.lock().unwrap();
+        let mut ui: Vec<&(u64, AgentEvent)> = g.ui.values().collect();
+        ui.sort_by_key(|(seq, _)| *seq);
+        ui.into_iter().map(|(_, e)| e.clone()).collect()
+    }
+
     pub fn history(&self) -> Vec<Message> {
         self.inner.lock().unwrap().history.clone()
     }
@@ -292,8 +326,14 @@ impl Hub {
         let (s, route_changed) = {
             let mut g = self.inner.lock().unwrap();
             let before = (g.state.model.clone(), g.state.level, g.state.window_tokens);
+            let info_before = (g.state.quota.clone(), g.state.mcp);
             f(&mut g.state);
             let after = (g.state.model.clone(), g.state.level, g.state.window_tokens);
+            if info_before != (g.state.quota.clone(), g.state.mcp)
+                && let Some(l) = &g.local
+            {
+                let _ = l.send(g.state.info());
+            }
             (g.state.clone(), before != after)
         };
         self.state_changed(s, !from_local && route_changed);

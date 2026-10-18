@@ -61,6 +61,20 @@ impl Host {
                 }
             }
             Cmd::Abort => h.abort(),
+            Cmd::ExtKey {
+                ext,
+                tab,
+                node,
+                key,
+                width,
+                height,
+            } => {
+                if let Some(e) = self.extensions.clone() {
+                    let payload =
+                        serde_json::json!({ "tab": tab, "node": node, "key": key, "width": width, "height": height });
+                    tokio::spawn(async move { e.ui_key(&ext, payload).await });
+                }
+            }
             Cmd::SetModel(m) => {
                 let (me, tx) = (self.clone(), ui.clone());
                 tokio::spawn(async move {

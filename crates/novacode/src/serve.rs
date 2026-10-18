@@ -257,6 +257,25 @@ async fn dispatch(host: &Arc<Host>, cmd: ClientCmd, ui: &mpsc::UnboundedSender<U
             hub.handle.shutdown();
             Ok(Value::Null)
         }
+        ClientCmd::ExtKey {
+            ext,
+            tab,
+            node,
+            key,
+            width,
+            height,
+        } => {
+            if let Some(e) = host.extensions.clone() {
+                tokio::spawn(async move {
+                    e.ui_key(
+                        &ext,
+                        json!({ "tab": tab, "node": node, "key": key, "width": width, "height": height }),
+                    )
+                    .await
+                });
+            }
+            Ok(Value::Null)
+        }
         // Handled in `serve`, which owns the client link.
         ClientCmd::RegisterTools { .. } | ClientCmd::ToolResult { .. } => Err("not available here".into()),
     }
@@ -414,7 +433,12 @@ pub async fn stop(paths: &Paths, prefix: &str) -> anyhow::Result<std::process::E
 }
 
 /// `novacode attach <id>`: another window on a live session. Leaving only detaches.
-pub async fn attach(paths: &Paths, prefix: &str, base: crate::TuiBase) -> anyhow::Result<std::process::ExitCode> {
+pub async fn attach(
+    paths: &Paths,
+    prefix: &str,
+    base: crate::TuiBase,
+    panel_only: bool,
+) -> anyhow::Result<std::process::ExitCode> {
     use anyhow::Context;
     let f = find_live(paths, prefix)?;
     let stream = tokio::net::UnixStream::connect(&f.socket)
@@ -517,6 +541,9 @@ pub async fn attach(paths: &Paths, prefix: &str, base: crate::TuiBase) -> anyhow
                     let _ = ui_tx.send(UiEvent::AskDone { id });
                 }
                 ServerMsg::State { state } => {
+                    if (state.quota.clone(), state.mcp) != (last.quota.clone(), last.mcp) {
+                        let _ = ui_tx.send(state.info());
+                    }
                     if state.model != last.model || state.level != last.level {
                         let _ = ui_tx.send(UiEvent::ModelSet {
                             model: state.model.clone(),
@@ -573,6 +600,21 @@ pub async fn attach(paths: &Paths, prefix: &str, base: crate::TuiBase) -> anyhow
                 Cmd::Compact => ClientCmd::Compact,
                 Cmd::Export(html) => ClientCmd::Export { html },
                 Cmd::Mcp => ClientCmd::Prompt { text: "/mcp".into() },
+                Cmd::ExtKey {
+                    ext,
+                    tab,
+                    node,
+                    key,
+                    width,
+                    height,
+                } => ClientCmd::ExtKey {
+                    ext,
+                    tab,
+                    node,
+                    key,
+                    width,
+                    height,
+                },
                 // The session-swapping commands are refused by the attached TUI itself.
                 Cmd::ListSessions | Cmd::ListPrompts(_) | Cmd::Focus(_) | Cmd::Background | Cmd::Processes => continue,
                 Cmd::Quit => break,
@@ -605,6 +647,11 @@ pub async fn attach(paths: &Paths, prefix: &str, base: crate::TuiBase) -> anyhow
         commands: vec![],
         draft: String::new(),
         attached: true,
+        statusline: base.statusline,
+        panel_only,
+        panel_auto: base.panel_auto,
+        slow: base.slow,
+        images: base.images.clone(),
     };
     novacode_tui::run(init, erx, ui_rx, cmd_tx).await?;
     match bye.lock().unwrap().take() {

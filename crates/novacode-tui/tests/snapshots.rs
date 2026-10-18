@@ -30,6 +30,11 @@ fn app(history: Vec<Message>) -> (App, mpsc::UnboundedReceiver<Cmd>) {
         commands: vec![],
         draft: String::new(),
         attached: false,
+        statusline: Default::default(),
+        panel_only: false,
+        panel_auto: false,
+        slow: false,
+        images: "off".into(),
     };
     (App::new(init, tx), rx)
 }
@@ -420,6 +425,11 @@ fn file_completion_in_a_real_folder() {
             commands: vec![],
             draft: String::new(),
             attached: false,
+            statusline: Default::default(),
+            panel_only: false,
+            panel_auto: false,
+            slow: false,
+            images: "off".into(),
         },
         tx,
     );
@@ -581,4 +591,127 @@ fn cost_shows_only_with_api_prices() {
     a.on_agent(AgentEvent::Message(reply()));
     let s = screen(&mut a, 100, 8);
     assert!(s.contains("$0.45"), "{s}");
+}
+
+#[test]
+fn side_panel_extension_ui_and_keys() {
+    let (mut a, mut rx) = app(vec![]);
+    let ui = |a: &mut App, ext: &str, op: serde_json::Value| {
+        a.on_agent(AgentEvent::Ui {
+            ext: ext.into(),
+            op: serde_json::from_value(op).unwrap(),
+        })
+    };
+    a.on_agent(AgentEvent::AgentStart);
+    a.on_agent(AgentEvent::Message(Message::ToolResult {
+        call_id: "t".into(),
+        tool_name: "todo".into(),
+        content: vec![],
+        is_error: false,
+        details: Some(json!({"todo": [
+            {"id": 1, "text": "read the code", "status": "done"},
+            {"id": 2, "text": "write the panel", "status": "active", "note": "rendering"},
+            {"id": 3, "text": "test it", "status": "pending"}
+        ]})),
+    }));
+    ui(
+        &mut a,
+        "deploy",
+        json!({"op": "status", "key": "deploy", "text": "▲ deploying", "style": "warn"}),
+    );
+    ui(
+        &mut a,
+        "deploy",
+        json!({"op": "widget", "key": "w", "lines": [[{"text": "build 3/5", "style": "accent"}]]}),
+    );
+    ui(&mut a, "deploy", json!({"op": "editor", "title": "deploy mode"}));
+    ui(&mut a, "deploy", json!({"op": "shortcut", "key": "ctrl+alt+d"}));
+    key(&mut a, KeyCode::Char('p'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+    snapshot("panel_agent_tab", &screen(&mut a, 110, 16));
+    // Focus the panel; a region tab with higher priority takes it and gets the keys.
+    key(&mut a, KeyCode::Char('f'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+    ui(
+        &mut a,
+        "deploy",
+        json!({"op": "open_tab", "name": "deploy", "title": "Deploy", "priority": 30, "region": true}),
+    );
+    ui(
+        &mut a,
+        "deploy",
+        json!({"op": "region", "tab": "deploy", "lines": ["region line", [{"text": "ok", "style": "ok"}]]}),
+    );
+    key(&mut a, KeyCode::Left, KeyModifiers::NONE);
+    match rx.try_recv() {
+        Ok(Cmd::ExtKey { ext, tab, key, .. }) => assert_eq!(
+            (ext.as_str(), tab.as_deref(), key.as_str()),
+            ("deploy", Some("deploy"), "left")
+        ),
+        other => panic!("{other:?}"),
+    }
+    snapshot("panel_region_tab", &screen(&mut a, 110, 16));
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    // Back in the editor: an extension shortcut goes to its extension.
+    key(&mut a, KeyCode::Char('d'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+    assert!(matches!(rx.try_recv(), Ok(Cmd::ExtKey { ext, tab: None, .. }) if ext == "deploy"));
+    // Narrow screens keep the panel hidden.
+    assert!(!screen(&mut a, 80, 16).contains("Todos"));
+    // A header, and a tool that draws its own result lines.
+    ui(
+        &mut a,
+        "deploy",
+        json!({"op": "header", "lines": [[{"text": "DEPLOY MODE", "style": "error"}]]}),
+    );
+    a.on_agent(AgentEvent::Message(assistant(
+        vec![call("d1", "deploy_status", json!({}))],
+        StopReason::ToolUse,
+    )));
+    a.on_agent(AgentEvent::Message(Message::ToolResult {
+        call_id: "d1".into(),
+        tool_name: "deploy_status".into(),
+        content: vec![Block::text("raw text the model reads")],
+        is_error: false,
+        details: Some(json!({"ui": [[{"text": "✓ ", "style": "ok"}, {"text": "prod is healthy"}]]})),
+    }));
+    let s = screen(&mut a, 80, 16);
+    assert!(s.lines().next().unwrap().contains("DEPLOY MODE"), "{s}");
+    assert!(
+        s.contains("✓ prod is healthy") && !s.contains("raw text the model reads"),
+        "{s}"
+    );
+}
+
+#[cfg(feature = "images")]
+#[test]
+fn images_draw_in_reserved_rows() {
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAFAAAAAoCAIAAADmAupWAAAAZ0lEQVR4nO3ayQ0AMAwCQfpvGpfBwyPlb0U5jBfSZLJGZbsqa8NO2JX2hn1afmltSR8mPCgt0pKWNjyYloyHAADiAfFgWiAeagnT4tJAPOeB1cJbYqZxD/nDDHEJAJEHGQ+hlnxN8RyI7HQ1MYqMpQAAAABJRU5ErkJggg==";
+    let (mut a, _rx) = app(vec![Message::User {
+        content: vec![
+            Block::text("look"),
+            Block::Image {
+                mime_type: "image/png".into(),
+                data: PNG.into(),
+            },
+        ],
+    }]);
+    let before = screen(&mut a, 60, 14);
+    assert!(
+        before.contains("[image 80×40]"),
+        "a placeholder without a protocol: {before}"
+    );
+    a.set_images(novacode_tui::images::Images::halfblocks());
+    let mut t = Terminal::new(TestBackend::new(60, 14)).unwrap();
+    t.draw(|f| a.draw(f)).unwrap();
+    let buf = t.backend().buffer();
+    let text: String = (0..14)
+        .map(|y| (0..60).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>() + "\n")
+        .collect();
+    assert!(
+        !text.contains("[image") && !text.contains("×40"),
+        "the image covers its placeholder: {text}"
+    );
+    let painted = (0..14)
+        .flat_map(|y| (0..60).map(move |x| (x, y)))
+        .filter(|&(x, y)| buf[(x, y)].bg != ratatui::style::Color::Reset)
+        .count();
+    assert!(painted >= 10, "half-block cells carry the image colours ({painted})");
 }

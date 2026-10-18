@@ -92,9 +92,31 @@ pub type Reminder = Arc<dyn Fn(&str, String, bool) + Send + Sync>;
 pub struct Sink {
     pub events: OnceLock<broadcast::Sender<AgentEvent>>,
     pub remind: OnceLock<Reminder>,
+    /// Who answers `nc.ui.ask/select/confirm/input`: the session's windows (L5.21 form).
+    pub asker: OnceLock<Arc<dyn novacode_tools::ask::Asker>>,
+    /// UI ops sent before the session attached (an extension's setup); the hub
+    /// starts its UI log from them, since no window was listening yet.
+    early: std::sync::Mutex<Vec<AgentEvent>>,
 }
 
 impl Sink {
+    /// A UI op from extension `name` (L9 UI API). The JSON is checked here, at the
+    /// boundary, so a bad op is the extension's error, never a window's.
+    pub fn ui(&self, name: &str, op: Value) -> Result<(), String> {
+        let op: novacode_types::ui::UiOp = serde_json::from_value(op).map_err(|e| format!("ui: {e}"))?;
+        let ev = AgentEvent::Ui {
+            ext: name.to_string(),
+            op,
+        };
+        match self.events.get() {
+            Some(tx) => {
+                let _ = tx.send(ev);
+            }
+            None => self.early.lock().unwrap().push(ev),
+        }
+        Ok(())
+    }
+
     /// `remind(text, wake)` from an extension: stored as a hidden `<system-reminder>`
     /// at the next model call, appended, so the cache holds (L4.12).
     pub fn remind(&self, name: &str, text: String, wake: bool) -> Result<(), String> {
@@ -184,6 +206,17 @@ impl ExtHost for Host {
                         format!("[{name}] {}", args["text"].as_str().unwrap_or_default()),
                     );
                     Ok(Value::Null)
+                }
+                "ui" => sink.ui(&name, args).map(|_| Value::Null),
+                "ask" => {
+                    let qs: Vec<novacode_types::Question> =
+                        serde_json::from_value(args["questions"].clone()).map_err(|e| format!("ask: {e}"))?;
+                    let a = sink
+                        .asker
+                        .get()
+                        .cloned()
+                        .ok_or("ask: this session has no window to ask in")?;
+                    Ok(serde_json::to_value(a.ask(qs).await).unwrap_or_default())
                 }
                 "remind" => sink
                     .remind(
@@ -282,6 +315,16 @@ impl Extensions {
         for (n, e) in &self.failed {
             notice(&self.sink.events, format!("extension `{n}` failed to load: {e}"));
         }
+    }
+
+    /// Dialogs from extensions go to the session's windows.
+    pub fn set_asker(&self, a: Arc<dyn novacode_tools::ask::Asker>) {
+        let _ = self.sink.asker.set(a);
+    }
+
+    /// UI ops the extensions sent during setup (see [`Sink`]).
+    pub fn setup_ui(&self) -> Vec<AgentEvent> {
+        self.sink.early.lock().unwrap().clone()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -432,6 +475,18 @@ impl Extensions {
         out
     }
 
+    /// A key or panel action for extension `ext`: its `ui_key` handlers get
+    /// `{tab, node, key, width, height}` (L9 UI API). Errors only count toward disabling.
+    pub async fn ui_key(&self, ext: &str, payload: Value) {
+        for (l, h) in self
+            .handlers("ui_key")
+            .filter(|(l, _)| l.ext.name() == ext)
+            .collect::<Vec<_>>()
+        {
+            let _ = self.invoke(l, h, &payload, HOOK_TIMEOUT).await;
+        }
+    }
+
     pub fn spawn_events(self: &Arc<Self>, mut rx: broadcast::Receiver<AgentEvent>) {
         let me = self.clone();
         let wanted: Vec<String> = me
@@ -439,10 +494,12 @@ impl Extensions {
             .iter()
             .flat_map(|l| l.ext.reg().events.iter().map(|(e, _)| e.clone()))
             .collect();
-        if wanted
-            .iter()
-            .all(|e| matches!(e.as_str(), "before_tool" | "after_tool" | "input" | "before_request"))
-        {
+        if wanted.iter().all(|e| {
+            matches!(
+                e.as_str(),
+                "before_tool" | "after_tool" | "input" | "before_request" | "ui_key"
+            )
+        }) {
             return;
         }
         tokio::spawn(async move {
@@ -571,6 +628,70 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn ui_ops_are_checked_and_buffered_until_attach() {
+        let d = tempfile::tempdir().unwrap();
+        let ext = d.path().join("ext");
+        std::fs::create_dir_all(&ext).unwrap();
+        std::fs::write(
+            ext.join("ui.js"),
+            "export default async (nc) => {
+               await nc.ui.setStatus('k', 'hello', { style: 'accent' });
+               await nc.ui.publish('t', 's', { id: 'a', label: 'A', status: 'running' });
+               nc.registerTool({ name: 'bad', execute: async () => { try { await nc.ui.publish('t', 's', { nope: 1 }); return 'no error'; } catch (e) { return String(e.message); } } });
+               nc.on('ui_key', (e) => nc.ui.setStatus('k', `key ${e.key}`));
+               nc.registerTool({ name: 'pick', execute: async () => `${await nc.ui.select('Colour?', ['red', 'blue'])} / ${await nc.ui.confirm('Sure?')}` });
+             };",
+        )
+        .unwrap();
+        let exts = Extensions::load(std::slice::from_ref(&ext), d.path(), d.path(), &d.path().join("cache")).await;
+        assert!(exts.failed.is_empty(), "{:?}", exts.failed);
+        let (tx, mut rx) = broadcast::channel(16);
+        exts.attach(tx, Arc::new(|_: &str, _: String, _: bool| {}));
+        let ops: Vec<String> = exts
+            .setup_ui()
+            .into_iter()
+            .map(|e| match e {
+                AgentEvent::Ui { ext, op } => format!("{ext}:{}", op.slot(&ext)),
+                e => panic!("{e:?}"),
+            })
+            .collect();
+        assert_eq!(ops, ["ui:status:ui:k", "ui:node:t:s:a"], "setup ops are kept, in order");
+        let bad = exts.tools().into_iter().find(|t| t.name() == "bad").unwrap();
+        let ctx = ToolCtx {
+            cwd: d.path().into(),
+            env: Arc::new(novacode_tools::LocalEnv),
+            cancel: Default::default(),
+            updates: None,
+            files: Default::default(),
+            session_id: "s".into(),
+            processes: None,
+            native_tools: false,
+            nested: None,
+        };
+        let out = bad.execute(json!({}), &ctx).await;
+        assert!(text_of(&out).contains("missing field"), "{}", text_of(&out));
+        struct Pick;
+        impl novacode_tools::ask::Asker for Pick {
+            fn ask(&self, q: Vec<novacode_types::Question>) -> BoxFuture<'_, Option<Vec<novacode_types::Reply>>> {
+                Box::pin(async move {
+                    Some(vec![novacode_types::Reply {
+                        question: q[0].question.clone(),
+                        chosen: vec![q[0].options[1].label.clone()],
+                        text: None,
+                    }])
+                })
+            }
+        }
+        exts.set_asker(Arc::new(Pick));
+        let pick = exts.tools().into_iter().find(|t| t.name() == "pick").unwrap();
+        assert_eq!(text_of(&pick.execute(json!({}), &ctx).await), "blue / false");
+        exts.ui_key("ui", json!({"key": "x"})).await;
+        assert!(
+            matches!(rx.try_recv().unwrap(), AgentEvent::Ui { op: novacode_types::ui::UiOp::Status { text: Some(t), .. }, .. } if t == "key x")
+        );
+    }
+
+    #[tokio::test]
     async fn input_handlers_rewrite_or_handle() {
         let d = tempfile::tempdir().unwrap();
         let ext = d.path().join("ext");

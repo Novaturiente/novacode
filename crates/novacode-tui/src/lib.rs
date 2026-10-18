@@ -7,9 +7,12 @@ pub mod dialog;
 pub mod editor;
 #[cfg(feature = "highlight")]
 pub mod highlight;
+pub mod images;
 pub mod keys;
 pub mod markdown;
+pub mod panel;
 pub mod prompt;
+pub mod statusline;
 pub mod term;
 pub mod theme;
 pub mod transcript;
@@ -38,8 +41,16 @@ pub async fn run(
     term::install_panic_hook();
     let mut t = term::enter()?;
     let mut app = App::new(init, cmds);
+    // L9.17: over SSH or on a loaded machine, fewer frames and a slower spinner.
+    let frame = if app.slow() { FRAME * 3 } else { FRAME };
+    #[cfg(feature = "images")]
+    if let Some(i) = images::Images::detect(app.image_setting()) {
+        app.set_images(i);
+    }
     let mut input = EventStream::new();
-    let mut spin = tokio::time::interval(Duration::from_millis(100));
+    let mut spin = tokio::time::interval(Duration::from_millis(if app.slow() { 500 } else { 100 }));
+    let mut second = tokio::time::interval(Duration::from_secs(1));
+    second.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     spin.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_draw = Instant::now() - FRAME;
     let mut deadline: Option<tokio::time::Instant> = None;
@@ -61,7 +72,7 @@ pub async fn run(
             app.dirty = true;
         }
         if app.dirty {
-            if last_draw.elapsed() >= FRAME {
+            if last_draw.elapsed() >= frame {
                 // One pacer step per drawn frame (L9.7).
                 let behind = app.pace();
                 // L9.3: a panic while drawing is reported, not fatal.
@@ -76,9 +87,9 @@ pub async fn run(
                 last_draw = Instant::now();
                 // Text still held back: draw again next frame.
                 app.dirty = behind;
-                deadline = behind.then(|| tokio::time::Instant::from_std(last_draw + FRAME));
+                deadline = behind.then(|| tokio::time::Instant::from_std(last_draw + frame));
             } else {
-                deadline = Some(tokio::time::Instant::from_std(last_draw + FRAME));
+                deadline = Some(tokio::time::Instant::from_std(last_draw + frame));
             }
         }
         if let Some(e) = app.exit.take() {
@@ -99,6 +110,11 @@ pub async fn run(
             _ = spin.tick(), if app.busy => {
                 app.spinner += 1;
                 app.dirty = true;
+            }
+            _ = second.tick(), if app.busy || app.panel.visible => {
+                if app.tick() {
+                    app.dirty = true;
+                }
             }
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {}
         }

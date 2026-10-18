@@ -81,6 +81,7 @@ pub struct Extension {
 const PRELUDE: &str = r#"
 ((bridge, version) => {
   const handlers = [];
+  const shortcuts = new Map();
   const add = (fn, what) => { if (typeof fn !== "function") throw new TypeError(`${what} must be a function`); handlers.push(fn); return handlers.length - 1; };
   const call = async (op, args) => { const r = JSON.parse(await bridge.host(op, JSON.stringify(args ?? null))); if (!r.ok) throw new Error(`${op}: ${r.error}`); return r.value; };
   const fmt = (v) => typeof v === "string" ? v : (() => { try { return JSON.stringify(v); } catch (_) { return String(v); } })();
@@ -104,6 +105,43 @@ const PRELUDE: &str = r#"
     // A note for the model, saved and sent at the next model call; `wake` starts a run when idle.
     remind: (text, opts) => call("remind", { text: fmt(text), wake: !!(opts && opts.wake) }),
     log: (...a) => { bridge.host("log", JSON.stringify({ text: a.map(fmt).join(" ") })); },
+    // UI API v1 (L9): data in, novacode draws it. Keys come back as on("ui_key").
+    ui: Object.freeze({
+      version: 1,
+      setStatus: (key, text, opts) => call("ui", { op: "status", key, text: text == null ? null : fmt(text), style: opts?.style ?? null }),
+      setWidget: (key, lines, opts) => call("ui", { op: "widget", key, lines: lines ?? null, below: !!opts?.below }),
+      setFooter: (lines) => call("ui", { op: "footer", lines: lines ?? null }),
+      setHeader: (lines) => call("ui", { op: "header", lines: lines ?? null }),
+      // Dialogs, in the ask_user form; `undefined` when dismissed or with no window.
+      ask: (questions) => call("ask", { questions }),
+      select: async (question, options) => {
+        const r = await call("ask", { questions: [{ question, options: options.map((o) => typeof o === "string" ? { label: o } : o) }] });
+        return r ? (r[0].chosen[0] ?? r[0].text ?? undefined) : undefined;
+      },
+      confirm: async (question) => {
+        const r = await call("ask", { questions: [{ question, options: [{ label: "Yes" }, { label: "No" }] }] });
+        return r ? r[0].chosen[0] === "Yes" : undefined;
+      },
+      input: async (question) => {
+        const r = await call("ask", { questions: [{ question, options: [] }] });
+        return r ? (r[0].text ?? r[0].chosen[0] ?? "") : undefined;
+      },
+      setEditor: (d) => call("ui", { op: "editor", title: d?.title ?? null, border: d?.border ?? null }),
+      openTab: (name, o) => call("ui", { op: "open_tab", name, title: o?.title ?? null, priority: o?.priority ?? 0, width: o?.width ?? null, region: !!o?.region, show: !!o?.show }),
+      showTab: (name) => call("ui", { op: "show_tab", name }),
+      closeTab: (name) => call("ui", { op: "close_tab", name }),
+      setSource: (tab, id, o) => call("ui", { op: "source", tab, id, title: o?.title ?? null, order: o?.order ?? 0, newest_first: !!o?.newestFirst }),
+      publish: (tab, source, node) => call("ui", { op: "publish", tab, source, node }),
+      remove: (tab, source, id) => call("ui", { op: "remove", tab, source, id: id ?? null }),
+      region: (tab, lines) => call("ui", { op: "region", tab, lines }),
+    }),
+    registerShortcut(key, s) {
+      const fn = typeof s === "function" ? s : s?.handler;
+      if (typeof fn !== "function") throw new TypeError("registerShortcut(key, handler)");
+      if (!shortcuts.size) api.on("ui_key", (e) => (e.tab == null && shortcuts.has(e.key) ? shortcuts.get(e.key)(e) : undefined));
+      shortcuts.set(String(key), fn);
+      call("ui", { op: "shortcut", key: String(key), description: String(s?.description ?? "") });
+    },
   });
   globalThis.novacode = api;
   globalThis.console = { log: api.log, info: api.log, warn: api.log, error: api.log, debug: api.log };
@@ -276,6 +314,10 @@ async fn thread(
                 Ok(())
             })
             .await;
+        // Calls the setup didn't await (`nc.ui.setStatus(…)` without `await`) still run.
+        if r.is_ok() && tokio::time::timeout(Duration::from_secs(5), rt.idle()).await.is_err() {
+            return Err("setup left work running for more than 5s".into());
+        }
         shared.deadline.store(0, Ordering::Relaxed);
         r.map(|_| (rt, ctx))
     };
@@ -312,7 +354,14 @@ async fn thread(
                 .map_err(|e| classify(&e.to_string()))?;
             Ok(serde_json::from_str(&s).unwrap_or(Value::Null))
         });
-        let r = match tokio::time::timeout(req.timeout, call).await {
+        let r = match tokio::time::timeout(req.timeout, async {
+            let r = call.await;
+            // Finish what the handler started but didn't await.
+            rt.idle().await;
+            r
+        })
+        .await
+        {
             Ok(r) => r,
             Err(_) => Err(Failure::Fatal(format!("hung for more than {}s", req.timeout.as_secs()))),
         };

@@ -80,6 +80,16 @@ pub struct Init {
     pub draft: String,
     /// An `attach` window (L8.13): commands that swap the session stay with its own window.
     pub attached: bool,
+    /// `ui.statusline` (L9.12).
+    pub statusline: crate::statusline::Config,
+    /// Only the side panel, full screen: the tmux panel pane (L9.18).
+    pub panel_only: bool,
+    /// `ui.panel.auto`: show the panel while work is going, hide it after (default on).
+    pub panel_auto: bool,
+    /// Lower frame rate, no animation (SSH or a loaded machine, L9.17).
+    pub slow: bool,
+    /// `ui.images`: auto (default), kitty, iterm2, sixel, halfblocks or off (L9.14).
+    pub images: String,
 }
 
 /// What the UI asks of the session.
@@ -110,6 +120,15 @@ pub enum Cmd {
     Processes,
     /// `/mcp`: server status page (L7.4).
     Mcp,
+    /// A key or panel action for an extension (L9 UI API).
+    ExtKey {
+        ext: String,
+        tab: Option<String>,
+        node: Option<String>,
+        key: String,
+        width: u16,
+        height: u16,
+    },
     Quit,
 }
 
@@ -155,6 +174,13 @@ pub enum UiEvent {
     Thinking {
         level: ThinkingLevel,
         note: String,
+    },
+    /// Host facts for the status line and Usage tab: quota windows (% used) and MCP servers.
+    Info {
+        five_hour: Option<f64>,
+        weekly: Option<f64>,
+        mcp_ready: usize,
+        mcp_total: usize,
     },
     /// A model switch was accepted: the resolved `provider/model`, its context window and level.
     ModelSet {
@@ -275,6 +301,23 @@ pub struct App {
     pub suspend: bool,
     /// Open `$EDITOR` on the prompt (needs the terminal, so the loop does it).
     pub external_editor: bool,
+    pub panel: crate::panel::Panel,
+    /// Extension status segments `ext:<ext>:<key>` → (text, style).
+    ext_status: std::collections::BTreeMap<String, (String, Option<String>)>,
+    /// Extension widgets → (lines, below the editor).
+    widgets: std::collections::BTreeMap<String, (Vec<novacode_types::ui::Line>, bool)>,
+    footer: Option<Vec<novacode_types::ui::Line>>,
+    header: Option<Vec<novacode_types::ui::Line>>,
+    editor_title: Option<String>,
+    editor_border: Option<String>,
+    /// (key, extension) shortcuts.
+    shortcuts: Vec<(String, String)>,
+    quota: (Option<f64>, Option<f64>),
+    mcp: (usize, usize),
+    task_started: Option<Instant>,
+    started: Instant,
+    #[cfg(feature = "images")]
+    images: Option<crate::images::Images>,
 }
 
 fn text_of(content: &[novacode_types::Block]) -> String {
@@ -298,7 +341,16 @@ impl App {
         let mut history = Vec::new();
         let mut usage = None;
         let ctx = novacode_types::estimate::context(&init.history);
+        let mut panel = crate::panel::Panel::default();
+        if init.panel_only {
+            panel.pinned = Some(true);
+            panel.focused = true;
+        }
+        if !init.panel_auto {
+            panel.pinned.get_or_insert(false);
+        }
         for m in std::mem::take(&mut init.history) {
+            panel.on_agent(&AgentEvent::Message(m.clone()), init.window_tokens, init.price.as_ref());
             if let Message::User { content } = &m {
                 history.push(text_of(content));
             }
@@ -350,6 +402,20 @@ impl App {
             exit: None,
             suspend: false,
             external_editor: false,
+            panel,
+            ext_status: Default::default(),
+            widgets: Default::default(),
+            footer: None,
+            header: None,
+            editor_title: None,
+            editor_border: None,
+            shortcuts: Vec::new(),
+            quota: (None, None),
+            mcp: (0, 0),
+            task_started: None,
+            started: Instant::now(),
+            #[cfg(feature = "images")]
+            images: None,
         }
     }
 
@@ -389,6 +455,16 @@ impl App {
                 self.init.level = level;
                 self.tr.notice(note, false);
             }
+            UiEvent::Info {
+                five_hour,
+                weekly,
+                mcp_ready,
+                mcp_total,
+            } => {
+                self.quota = (five_hour, weekly);
+                self.mcp = (mcp_ready, mcp_total);
+                self.panel.quota(five_hour, weekly);
+            }
             UiEvent::ModelSet {
                 model,
                 window_tokens,
@@ -412,6 +488,13 @@ impl App {
 
     pub fn on_agent(&mut self, ev: AgentEvent) {
         self.dirty = true;
+        self.panel
+            .on_agent(&ev, self.init.window_tokens, self.init.price.as_ref());
+        match &ev {
+            AgentEvent::AgentStart => self.task_started = Some(Instant::now()),
+            AgentEvent::Settled => self.task_started = None,
+            _ => {}
+        }
         match ev {
             AgentEvent::AgentStart => {
                 self.busy = true;
@@ -523,12 +606,96 @@ impl App {
                     false,
                 );
             }
+            AgentEvent::Ui { ext, op } => self.ui_op(&ext, op),
             AgentEvent::Settled => {
                 self.busy = false;
                 self.activity.clear();
                 self.tr.settle();
             }
         }
+    }
+
+    /// An extension's UI op (L9 UI API).
+    fn ui_op(&mut self, ext: &str, op: novacode_types::ui::UiOp) {
+        use novacode_types::ui::UiOp;
+        match &op {
+            UiOp::Status { key, text, style } => {
+                let k = format!("ext:{key}");
+                match text {
+                    Some(t) => {
+                        self.ext_status.insert(k, (t.clone(), style.clone()));
+                    }
+                    None => {
+                        self.ext_status.remove(&k);
+                    }
+                }
+            }
+            UiOp::Widget { key, lines, below } => {
+                let k = format!("{ext}:{key}");
+                match lines {
+                    Some(l) => {
+                        self.widgets.insert(k, (l.clone(), *below));
+                    }
+                    None => {
+                        self.widgets.remove(&k);
+                    }
+                }
+            }
+            UiOp::Footer { lines } => self.footer = lines.clone(),
+            UiOp::Header { lines } => self.header = lines.clone(),
+            UiOp::Editor { title, border } => {
+                self.editor_title = title.clone();
+                self.editor_border = border.clone();
+            }
+            UiOp::Shortcut { key, .. } => {
+                self.shortcuts.retain(|(k, _)| k != key);
+                self.shortcuts.push((key.clone(), ext.to_string()));
+            }
+            _ => self.panel.apply(ext, &op),
+        }
+    }
+
+    fn panel_action(&mut self, a: crate::panel::PanelAction) {
+        use crate::panel::PanelAction;
+        match a {
+            PanelAction::Command(c) => self.submit(c, self.busy),
+            PanelAction::Ext { ext, tab, node, action } => {
+                let (width, height) = self.panel.size;
+                self.send(Cmd::ExtKey {
+                    ext,
+                    tab: Some(tab),
+                    node,
+                    key: action,
+                    width,
+                    height,
+                });
+            }
+        }
+    }
+
+    /// Turn on images (L9.14) with the detected terminal protocol.
+    #[cfg(feature = "images")]
+    pub fn set_images(&mut self, i: crate::images::Images) {
+        self.images = Some(i);
+        self.tr.images = true;
+        for t in &mut self.tr.turns {
+            t.touch();
+        }
+    }
+
+    pub fn image_setting(&self) -> &str {
+        &self.init.images
+    }
+
+    pub fn slow(&self) -> bool {
+        self.init.slow
+    }
+
+    /// Advance timers: the panel's auto show/hide. Returns true when something changed.
+    pub fn tick(&mut self) -> bool {
+        let before = self.panel.visible;
+        self.panel.tick(self.busy);
+        before != self.panel.visible || (self.panel.visible && self.busy)
     }
 
     pub fn on_event(&mut self, ev: Event) {
@@ -655,6 +822,22 @@ impl App {
             self.search_key(k);
             return;
         }
+        // The focused panel takes the keys, except the ones that leave it (L9.16).
+        if self.panel.focused && self.panel.visible {
+            match self.keymap.lookup(&k, &[Scope::App]) {
+                Some(A::PanelFocus | A::PanelToggle | A::Clear) if !self.init.panel_only => {}
+                Some(A::Clear) => self.exit = Some(Exit::Quit),
+                _ => {
+                    if let Some(Some(a)) = self.panel.key(&crate::keys::name(&k)) {
+                        self.panel_action(a);
+                    }
+                    if !self.panel.focused && self.init.panel_only {
+                        self.panel.focused = true; // the panel pane has nothing else to focus
+                    }
+                    return;
+                }
+            }
+        }
         if self.completion.is_some() && self.completion_key(k) {
             return;
         }
@@ -736,6 +919,23 @@ impl App {
                 self.send(Cmd::SetThinking(all[(i + 1) % all.len()]));
             }
             Some(A::ThinkingToggle) => self.toggle_thinking(),
+            Some(A::PanelToggle) => self.panel.toggle(),
+            Some(A::PanelFocus) => {
+                if !self.panel.visible {
+                    self.panel.toggle();
+                }
+                self.panel.focused = !self.panel.focused;
+            }
+            None if let Some((key, ext)) = self.shortcuts.iter().find(|(s, _)| crate::keys::is(&k, s)).cloned() => {
+                self.send(Cmd::ExtKey {
+                    ext,
+                    tab: None,
+                    node: None,
+                    key,
+                    width: 0,
+                    height: 0,
+                });
+            }
             a => {
                 if let Action::Submit(text) = self.editor.handle(a, k, self.editor_width) {
                     self.completion = None;
@@ -1121,7 +1321,21 @@ impl App {
     }
 
     pub fn draw(&mut self, f: &mut Frame) {
-        let area = f.area();
+        let full = f.area();
+        if self.init.panel_only {
+            self.panel.visible = true;
+            self.panel.render(f, full, &self.theme);
+            return;
+        }
+        // The side panel takes the right edge when the screen is wide enough (L9.16).
+        let area = if self.panel.visible && full.width >= crate::panel::MIN_SCREEN {
+            let w = self.panel.width(full.width);
+            let [l, r] = Layout::horizontal([Constraint::Min(1), Constraint::Length(w)]).areas(full);
+            self.panel.render(f, r, &self.theme);
+            l
+        } else {
+            full
+        };
         let inner_w = area.width.saturating_sub(2) as usize;
         self.editor_width = inner_w;
         let ed_rows = self.editor.height(inner_w).clamp(1, EDITOR_MAX_ROWS);
@@ -1172,20 +1386,60 @@ impl App {
             .completion
             .as_ref()
             .map_or(0, |c| c.items.len().min(COMPLETE_ROWS) as u16);
-        let [main, card, comp, pend, ed, status] = Layout::vertical([
+        let widget_lines = |below: bool, me: &Self| -> Vec<Line<'static>> {
+            me.widgets
+                .values()
+                .filter(|(_, b)| *b == below)
+                .flat_map(|(l, _)| {
+                    l.iter()
+                        .map(|l| wrap::truncate(crate::panel::spans(l, &me.theme), area.width as usize))
+                })
+                .collect()
+        };
+        let (above_w, below_w) = (widget_lines(false, self), widget_lines(true, self));
+        let status_lines: Vec<Line<'static>> = match &self.footer {
+            Some(lines) => lines
+                .iter()
+                .map(|l| wrap::truncate(crate::panel::spans(l, &self.theme), area.width as usize))
+                .collect(),
+            None => self.status_lines(area.width as usize),
+        };
+        let sh = status_lines.len() as u16;
+        let above = self.init.statusline.above && self.footer.is_none();
+        let [main, card, comp, pend, wa, st_above, ed, wb, st_below] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(card_h),
             Constraint::Length(comp_h),
             Constraint::Length(notes.len() as u16),
+            Constraint::Length(above_w.len() as u16),
+            Constraint::Length(if above { sh } else { 0 }),
             Constraint::Length(ed_rows as u16 + 2),
-            Constraint::Length(1),
+            Constraint::Length(below_w.len() as u16),
+            Constraint::Length(if above { 0 } else { sh }),
         ])
         .areas(area);
-        let main = Rect {
+        let status = if above { st_above } else { st_below };
+        f.render_widget(Paragraph::new(above_w), wa);
+        f.render_widget(Paragraph::new(below_w), wb);
+        let mut main = Rect {
             x: main.x + 1,
             width: main.width.saturating_sub(2),
             ..main
         };
+        if let Some(h) = &self.header {
+            let rows = (h.len() as u16).min(main.height / 3);
+            let lines: Vec<Line> = h
+                .iter()
+                .take(rows as usize)
+                .map(|l| wrap::truncate(crate::panel::spans(l, &self.theme), main.width as usize))
+                .collect();
+            f.render_widget(Paragraph::new(lines), Rect { height: rows, ..main });
+            main = Rect {
+                y: main.y + rows,
+                height: main.height - rows,
+                ..main
+            };
+        }
         self.draw_transcript(f, main);
         let t = &self.theme;
         f.render_widget(Paragraph::new(notes), pend);
@@ -1213,9 +1467,15 @@ impl App {
         }
 
         let (rows, (cr, cc)) = self.editor.view(inner_w, ed_rows);
-        let block = Block::bordered()
+        let mut block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(t.border);
+            .border_style(match &self.editor_border {
+                Some(b) => t.token(Some(b)),
+                None => t.border,
+            });
+        if let Some(title) = &self.editor_title {
+            block = block.title(Span::styled(format!(" {title} "), t.dim));
+        }
         let inner = block.inner(ed);
         let text: Vec<Line> = rows.into_iter().map(|r| Line::styled(r, t.text)).collect();
         f.render_widget(Paragraph::new(text).block(block), ed);
@@ -1227,8 +1487,7 @@ impl App {
         } else if let Some(a) = self.asks.front() {
             a.render(f, card, t);
         }
-        let st = self.status_line(area.width as usize);
-        f.render_widget(Paragraph::new(st), status);
+        f.render_widget(Paragraph::new(status_lines), status);
 
         let t = &self.theme;
         match &self.overlay {
@@ -1261,6 +1520,22 @@ impl App {
         }
         let visible: Vec<Line> = view.lines[top..(top + h).min(view.lines.len())].to_vec();
         f.render_widget(Paragraph::new(visible), area);
+        // Images only when wholly on screen; otherwise their placeholder line shows.
+        #[cfg(feature = "images")]
+        if let Some(imgs) = self.images.as_mut() {
+            for (line, rows, img) in &view.images {
+                if *rows > 1 && *line >= top && line + rows <= top + h {
+                    let r = Rect {
+                        x: area.x,
+                        y: area.y + (line - top) as u16,
+                        width: img.cols(area.width as usize) as u16,
+                        height: *rows as u16,
+                    };
+                    f.render_widget(ratatui::widgets::Clear, Rect { width: area.width, ..r });
+                    imgs.render(f, r, img);
+                }
+            }
+        }
         if let Some(s) = self.search.as_ref().filter(|s| !s.query.is_empty()) {
             let q = s.query.to_lowercase();
             let buf = f.buffer_mut();
@@ -1302,7 +1577,129 @@ impl App {
         self.shown = Some(Shown { view, top, area });
     }
 
-    fn status_line(&mut self, width: usize) -> Line<'static> {
+    /// Every status segment that has something to show (L9.12).
+    fn status_lines(&mut self, width: usize) -> Vec<Line<'static>> {
+        use crate::statusline::Value_;
+        let mut v: std::collections::BTreeMap<String, Value_> = Default::default();
+        v.insert(
+            "activity".into(),
+            Value_ {
+                spans: self.activity_spans(),
+                pct: None,
+            },
+        );
+        let t = &self.theme;
+        if !self.procs.is_empty() {
+            v.insert("bg".into(), Value_::text(format!("⚙ {}", self.procs.len()), t.accent));
+        }
+        if self.ctx > 0 {
+            let pct = self.ctx as f64 * 100.0 / self.init.window_tokens.max(1) as f64;
+            let st = match pct {
+                p if p < 50.0 => t.ok,
+                p if p < 70.0 => t.warn,
+                p if p < 90.0 => t.code,
+                _ => t.error,
+            };
+            v.insert(
+                "ctx".into(),
+                Value_ {
+                    spans: vec![Span::styled(format!("ctx {pct:.0}%"), st)],
+                    pct: Some(pct),
+                },
+            );
+            if let Some(u) = self.usage.filter(|u| u.prompt_total() > 0) {
+                let hit = u.cache_read as f64 * 100.0 / u.prompt_total() as f64;
+                v.insert(
+                    "cache".into(),
+                    Value_ {
+                        spans: vec![Span::styled(format!("cache {hit:.0}%"), t.dim)],
+                        pct: Some(hit),
+                    },
+                );
+            }
+        }
+        if self.init.price.is_some() || self.init.spent > 0.0 {
+            let s = self.init.spent;
+            v.insert(
+                "cost".into(),
+                Value_::text(
+                    if s < 0.01 {
+                        format!("${s:.4}")
+                    } else {
+                        format!("${s:.2}")
+                    },
+                    t.dim,
+                ),
+            );
+        }
+        v.insert(
+            "model".into(),
+            Value_ {
+                spans: vec![
+                    Span::styled(self.init.model.clone(), t.accent),
+                    Span::styled(format!(" · {}", self.init.level.as_str()), t.dim),
+                ],
+                pct: None,
+            },
+        );
+        v.insert("thinking".into(), Value_::text(self.init.level.as_str(), t.dim));
+        let dir = std::path::Path::new(&self.init.cwd)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        v.insert("cwd".into(), Value_::text(dir, t.dim));
+        if let Some(b) = &self.init.branch {
+            v.insert("git".into(), Value_::text(format!("⎇ {b}"), t.dim));
+        }
+        if let Some((_, wt)) = self.init.cwd.split_once("/.worktrees/") {
+            v.insert(
+                "wtpath".into(),
+                Value_::text(format!("wt {}", wt.split('/').next().unwrap_or(wt)), t.warn),
+            );
+        }
+        for (id, label, p) in [("usage_5h", "5h", self.quota.0), ("usage_week", "wk", self.quota.1)] {
+            if let Some(p) = p {
+                v.insert(
+                    id.into(),
+                    Value_ {
+                        spans: vec![Span::styled(format!("{label} {p:.0}%"), t.dim)],
+                        pct: Some(p),
+                    },
+                );
+            }
+        }
+        if let Some(s) = self.task_started {
+            v.insert(
+                "turn_time".into(),
+                Value_::text(crate::panel::secs_pub(s.elapsed()), t.dim),
+            );
+        }
+        v.insert(
+            "session_time".into(),
+            Value_::text(crate::panel::secs_pub(self.started.elapsed()), t.dim),
+        );
+        if !self.pending.is_empty() {
+            v.insert(
+                "queue".into(),
+                Value_::text(format!("queued {}", self.pending.len()), t.warn),
+            );
+        }
+        if self.mcp.1 > 0 {
+            let st = if self.mcp.0 < self.mcp.1 { t.warn } else { t.dim };
+            v.insert(
+                "mcp".into(),
+                Value_::text(format!("mcp {}/{}", self.mcp.0, self.mcp.1), st),
+            );
+        }
+        for (k, (text, style)) in &self.ext_status {
+            v.insert(k.clone(), Value_::text(text.clone(), t.token(style.as_deref())));
+        }
+        let ext: Vec<String> = self.ext_status.keys().cloned().collect();
+        crate::statusline::render(&self.init.statusline, &v, &ext, width, t)
+    }
+
+    /// The `activity` segment: what's going on, or what's wanted from the user.
+    fn activity_spans(&mut self) -> Vec<Span<'static>> {
         let t = &self.theme;
         let mut left = Vec::new();
         if !self.approvals.is_empty() || !self.asks.is_empty() {
@@ -1338,56 +1735,7 @@ impl App {
                 t.dim,
             ));
         }
-        let mut right = Vec::new();
-        if !self.procs.is_empty() {
-            right.push(Span::styled(format!("⚙ {}  ", self.procs.len()), t.accent));
-        }
-        if self.ctx > 0 {
-            let pct = self.ctx as f64 * 100.0 / self.init.window_tokens.max(1) as f64;
-            let st = match pct {
-                p if p < 50.0 => t.ok,
-                p if p < 70.0 => t.warn,
-                p if p < 90.0 => t.code,
-                _ => t.error,
-            };
-            right.push(Span::styled(format!("ctx {pct:.0}%"), st));
-            if let Some(u) = self.usage.filter(|u| u.prompt_total() > 0) {
-                let hit = u.cache_read as f64 * 100.0 / u.prompt_total() as f64;
-                right.push(Span::styled(format!("  cache {hit:.0}%"), t.dim));
-            }
-            right.push(Span::raw("  "));
-        }
-        if self.init.price.is_some() || self.init.spent > 0.0 {
-            let s = self.init.spent;
-            let s = if s < 0.01 {
-                format!("${s:.4}")
-            } else {
-                format!("${s:.2}")
-            };
-            right.push(Span::styled(format!("{s}  "), t.dim));
-        }
-        right.push(Span::styled(self.init.model.clone(), t.accent));
-        right.push(Span::styled(format!(" · {}", self.init.level.as_str()), t.dim));
-        let dir = std::path::Path::new(&self.init.cwd)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        right.push(Span::styled(format!("  {dir}"), t.dim));
-        if let Some(b) = &self.init.branch {
-            right.push(Span::styled(format!(" ⎇ {b}"), t.dim));
-        }
-        right.push(Span::raw(" "));
-        // Narrow screen: keep the activity, drop folder and branch first, then the model.
-        while wrap::width(&right) + 12 > width && right.len() > 1 {
-            right.remove(right.len().saturating_sub(2));
-        }
-        let rw = wrap::width(&right);
-        let left = wrap::truncate(left, width.saturating_sub(rw + 1));
-        let pad = width.saturating_sub(wrap::width(&left.spans) + rw);
-        let mut spans = left.spans;
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.extend(right);
-        Line::from(spans)
+        left
     }
 }
 

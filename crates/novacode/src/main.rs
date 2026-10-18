@@ -135,6 +135,11 @@ enum Command {
     },
     /// Open another window on a live session (leaving only detaches)
     Attach { session: String },
+    /// The side panel of a live session, full screen (the tmux panel pane, L9.18)
+    Panel {
+        #[arg(long)]
+        session: String,
+    },
     /// List live sessions on this machine
     Agents,
     /// End a live session, a background one included
@@ -456,7 +461,14 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             let trusted = trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &cwd, false);
             let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
             let base = tui_base(&paths, &settings);
-            return serve::attach(&paths, &session, base).await;
+            return serve::attach(&paths, &session, base, false).await;
+        }
+        Some(Command::Panel { session }) => {
+            let cwd = std::env::current_dir()?;
+            let trusted = trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &cwd, false);
+            let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
+            let base = tui_base(&paths, &settings);
+            return serve::attach(&paths, &session, base, true).await;
         }
         Some(Command::Stats { session, all, turns }) => {
             std::process::exit(stats::run(paths.home(), session.as_deref(), all, turns));
@@ -850,7 +862,7 @@ impl Ctx {
         }));
         all.push(Arc::new(novacode_tools::worktree::EnterWorktree));
         all.push(Arc::new(novacode_tools::worktree::ExitWorktree(asker.clone())));
-        if let Some(a) = asker {
+        if let Some(a) = asker.clone() {
             all.push(Arc::new(novacode_tools::ask::AskUser(a)));
         }
         all.push(Arc::new(novacode_tools::todo::Todo::from_history(&store.projection())));
@@ -892,6 +904,9 @@ impl Ctx {
             &self.paths.home().join("logs"),
         )
         .await;
+        if let Some(a) = &asker {
+            exts.set_asker(a.clone());
+        }
         all.extend(exts.tools());
         let (servers, mcp_warnings) = novacode_core::mcp::load(self.paths.home(), &self.cwd, self.trusted);
         let described: Vec<(String, String)> = servers
@@ -1184,6 +1199,66 @@ struct TuiBase {
     collapse_turns: bool,
     thinking: novacode_tui::transcript::Thinking,
     notices: Vec<String>,
+    statusline: novacode_tui::statusline::Config,
+    panel_auto: bool,
+    slow: bool,
+    images: String,
+}
+
+/// `ui.panel.host` (L9.18): `tmux` (or `auto` inside tmux) opens the panel as a split
+/// pane running `novacode panel --session <id>`. Returns the pane id to close at the end.
+fn tmux_panel(settings: &Settings, session: &str, home: &Path) -> Option<String> {
+    let host = settings
+        .get::<String>("ui.panel.host")
+        .unwrap_or_else(|| "inline".into());
+    let in_tmux = std::env::var_os("TMUX").is_some();
+    if !(host == "tmux" || host == "auto" && in_tmux) || !in_tmux {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let width = settings
+        .get::<String>("ui.panel.tmuxWidth")
+        .unwrap_or_else(|| "30%".into());
+    let cmd = format!("'{}' panel --session {session}", exe.display());
+    // A new pane gets tmux's environment, not ours: pass the home along.
+    let env = format!("NOVACODE_HOME={}", home.display());
+    let out = std::process::Command::new("tmux")
+        .args([
+            "split-window",
+            "-h",
+            "-d",
+            "-l",
+            &width,
+            "-e",
+            &env,
+            "-P",
+            "-F",
+            "#{pane_id}",
+            &cmd,
+        ])
+        .output()
+        .ok()?;
+    let pane = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || pane.is_empty() {
+        tracing::warn!("tmux panel pane failed: {}", String::from_utf8_lossy(&out.stderr));
+        return None;
+    }
+    // `@slot` makes the user's tmux state save skip it.
+    let _ = std::process::Command::new("tmux")
+        .args(["set-option", "-p", "-t", &pane, "@slot", "panel"])
+        .status();
+    Some(pane)
+}
+
+/// L9.17: over SSH, or when the 1-minute load is above the core count.
+fn slow_terminal() -> bool {
+    let ssh = std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+    let load = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+    ssh || load > cores
 }
 
 fn tui_base(paths: &Paths, settings: &Settings) -> TuiBase {
@@ -1195,12 +1270,19 @@ fn tui_base(paths: &Paths, settings: &Settings) -> TuiBase {
     if let Some(v) = settings.get::<serde_json::Value>("ui.userMessage") {
         notices.extend(theme.apply_user_message(&v));
     }
+    let (statusline, warn) =
+        novacode_tui::statusline::Config::parse(settings.get::<serde_json::Value>("ui.statusline").as_ref());
+    notices.extend(warn);
     TuiBase {
         keymap,
         theme,
         collapse_turns: settings.get("ui.turnCollapse").unwrap_or(true),
         thinking: novacode_tui::transcript::Thinking::parse(&settings.get::<String>("ui.thinking").unwrap_or_default()),
         notices,
+        statusline,
+        panel_auto: settings.get("ui.panel.auto").unwrap_or(true),
+        slow: settings.get::<bool>("ui.slow").unwrap_or_else(slow_terminal),
+        images: settings.get::<String>("ui.images").unwrap_or_else(|| "auto".into()),
     }
 }
 
@@ -1249,6 +1331,9 @@ async fn start_session(
     let extensions = agent.extensions().cloned();
     let (handle, task) = agent::spawn(agent);
     let hub = hub::Hub::start(handle, history, state, local);
+    if let Some(e) = &extensions {
+        hub.seed_ui(e.setup_ui());
+    }
     let _ = slot.0.set(Arc::downgrade(&hub));
     let host = Arc::new(host::Host {
         hub,
@@ -1268,6 +1353,21 @@ async fn start_session(
     let mut live = serve::go_live(&host, bg)?;
     live.add_task(activity::spawn(&host.hub, sinks));
     live.add_task(quota_task(host.clone()));
+    if let Some(m) = host.mcp.clone() {
+        let h = host.clone();
+        live.add_task(tokio::spawn(async move {
+            // MCP connection counts for the `mcp` segment (pi's mcp-status had to poll too).
+            loop {
+                let st = m.status();
+                let ready = st.iter().filter(|s| s.1 == novacode_core::mcp::Status::Ready).count();
+                let now = Some((ready, st.len()));
+                if h.hub.state().mcp != now {
+                    h.hub.update(false, |s| s.mcp = now);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }));
+    }
     Ok((live, task))
 }
 
@@ -1416,7 +1516,12 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
         .await?;
         let host = live.host.clone();
         let (handle, id) = (host.hub.handle.clone(), host.id.clone());
+        let tmux_pane = tmux_panel(&ctx.settings, &id, ctx.paths.home());
         let (etx, erx) = mpsc::unbounded_channel();
+        // The window starts from the current extension UI, as attached windows do.
+        for ev in host.hub.ui_log() {
+            let _ = etx.send(ev);
+        }
         let mut events = handle.subscribe();
         tokio::spawn(async move {
             loop {
@@ -1464,12 +1569,21 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
             commands,
             draft: std::mem::take(&mut draft),
             attached: false,
+            statusline: base.statusline,
+            panel_only: false,
+            // The tmux pane has the panel; the window keeps its full width.
+            panel_auto: base.panel_auto && tmux_pane.is_none(),
+            slow: base.slow,
+            images: base.images.clone(),
         };
         let res = novacode_tui::run(init, erx, ui_rx, ctx_tx).await;
         handle.abort();
         handle.shutdown();
         let agent = task.await?;
         live.end("the session's window closed").await;
+        if let Some(p) = &tmux_pane {
+            let _ = std::process::Command::new("tmux").args(["kill-pane", "-t", p]).status();
+        }
         // /new and /resume keep the model; the level comes from the session (or settings).
         model = host.cur.lock().unwrap().0.clone();
         let prev = agent.store.path().map(Path::to_path_buf);

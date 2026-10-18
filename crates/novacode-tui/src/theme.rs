@@ -205,6 +205,30 @@ impl Theme {
     /// `{ "border": "rounded|single|heavy|double|ascii|none", "borderColor": "#hex" | {fg,bold,…},
     ///    "text": "#hex" | {fg,bg,bold,italic,…}, "paddingX": 1, "paddingY": 0 }`.
     /// Returns a warning for values it could not use.
+    /// A style by token name (`accent`, `dim`, …) or `#rrggbb`, for extension UI. Unknown → text.
+    pub fn token(&self, name: Option<&str>) -> Style {
+        match name.unwrap_or("text") {
+            "dim" => self.dim,
+            "accent" => self.accent,
+            "user" => self.user,
+            "heading" => self.heading,
+            "code" => self.code,
+            "link" => self.link,
+            "thinking" => self.thinking,
+            "ok" | "success" => self.ok,
+            "warn" | "warning" => self.warn,
+            "error" => self.error,
+            "add" => self.add,
+            "del" => self.del,
+            "border" => self.border,
+            n if n.starts_with('#') => match hex(n) {
+                Some(c) => Style::default().fg(if self.ansi256 { to_256(c) } else { c }),
+                None => self.text,
+            },
+            _ => self.text,
+        }
+    }
+
     pub fn apply_user_message(&mut self, v: &Value) -> Option<String> {
         let mut bad = Vec::new();
         let fix = |st: Style| {

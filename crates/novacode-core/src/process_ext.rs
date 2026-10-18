@@ -10,7 +10,8 @@
 //!
 //! - for `input` `{text}`/`{handled}`, for `before_request` text (or a list) appended to that request only
 //!
-//! extension → novacode (notifications): `notify {text}`, `remind {text, wake}` (a saved note for the model), `log {text}`.
+//! extension → novacode (notifications): `notify {text}`, `remind {text, wake}` (a saved note for the model),
+//! `ui {op, …}` (a UI op, L9 UI API), `log {text}`. Keys come back as the `ui_key` event.
 
 use futures_util::future::BoxFuture;
 use novacode_script::ext::{Backend, CommandReg, Failure, Registration, ToolReg};
@@ -119,6 +120,11 @@ impl ProcessExt {
                             let _ = tx.send(AgentEvent::Stream(StreamEvent::Notice {
                                 text: format!("[{n2}] {text}"),
                             }));
+                        }
+                    }
+                    Some("ui") => {
+                        if let Err(e) = sink.ui(&n2, v["params"].clone()) {
+                            tracing::warn!(extension = %n2, "{e}");
                         }
                     }
                     Some("remind") => {

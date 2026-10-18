@@ -1,0 +1,16 @@
+                                                                      │  Agent
+                                                                      │ Todos
+                                                                      │ ✓ read the code                     #1
+                                                                      │ ◐ write the panel                   #2
+                                                                      │   rendering
+                                                                      │ ○ test it                           #3
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+build 3/5                                                             │
+╭ deploy mode ───────────────────────────────────────────────────────╮│
+│                                                                    ││
+╰────────────────────────────────────────────────────────────────────╯│
+ ⠋ working            ▲ deploying  claude/opus · medium  proj  ⎇ main │
