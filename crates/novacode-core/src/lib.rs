@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod cache;
 pub mod checkpoint;
+pub mod export;
 pub mod memory;
 pub mod metrics;
 pub mod pipeline;

@@ -41,6 +41,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/rewind", "go back to before a prompt of this branch"),
     ("/fork", "new session up to a prompt of this branch"),
     ("/clone", "new session with this whole branch"),
+    ("/export", "write this branch to a file (/export html for a web page)"),
     ("/copy", "copy the last reply"),
     ("/quit", "quit"),
 ];
@@ -92,6 +93,8 @@ pub enum Cmd {
     /// The host answers with [`UiEvent::Page`].
     Context,
     Compact,
+    /// Write the session to a file; `true` = HTML (L4.14).
+    Export(bool),
     Quit,
 }
 
@@ -862,6 +865,7 @@ impl App {
                 "/rewind" => self.send(Cmd::ListPrompts(BranchAction::Rewind)),
                 "/fork" => self.send(Cmd::ListPrompts(BranchAction::Fork)),
                 "/clone" => self.exit = Some(Exit::Branch(BranchAction::Clone, None)),
+                "/export" => self.send(Cmd::Export(arg.trim() == "html")),
                 _ => {}
             }
             return;

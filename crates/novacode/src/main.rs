@@ -110,6 +110,15 @@ enum Command {
     },
     /// Check every connected provider, settings and key bindings.
     Doctor,
+    /// Export a session's current branch (default: the newest here) as JSONL, or --html.
+    Export {
+        session: Option<String>,
+        #[arg(long)]
+        html: bool,
+        /// Output file (default: novacode-<id>.jsonl|html in the current folder).
+        #[arg(short, long)]
+        out: Option<std::path::PathBuf>,
+    },
     /// Dev metrics report (needs `debug.metrics`): the latest session, one by id prefix, or --all.
     Stats {
         session: Option<String>,
@@ -195,6 +204,19 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
                 return Ok(doctor::doctor(&p, &settings, problems).await);
             }
             return Ok(doctor::auth_status(&p));
+        }
+        Some(Command::Export { session, html, out }) => {
+            let cwd = std::env::current_dir()?;
+            let file = match session {
+                Some(p) => session::find(&paths, &cwd, &p)?,
+                None => session::list(&paths, &cwd)
+                    .into_iter()
+                    .next()
+                    .context("no sessions in this folder")?,
+            };
+            let out = export_session(&paths, &file, html, out)?;
+            println!("{}", out.display());
+            return Ok(ExitCode::SUCCESS);
         }
         Some(Command::Stats { session, all, turns }) => {
             std::process::exit(stats::run(paths.home(), session.as_deref(), all, turns));
@@ -479,6 +501,13 @@ impl Ctx {
         };
         let memory_on = s.get("memory.enabled").unwrap_or(true);
         let mut all = novacode_tools::builtins(false);
+        if store.path().is_some() {
+            all.push(Arc::new(novacode_core::export::SessionSearch {
+                sessions_root: self.paths.home().join("sessions"),
+                project_dir: session::dir_for(&self.paths, &self.cwd),
+                current: store.id().to_string(),
+            }));
+        }
         if memory_on && let Some(file) = store.path() {
             all.push(Arc::new(novacode_core::memory::Recall {
                 file: file.to_path_buf(),
@@ -864,6 +893,14 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
                         });
                     }
                     Cmd::Compact => h.compact(),
+                    Cmd::Export(html) => {
+                        let file = session::dir_for(&paths, &cwd).join(format!("{this_id}.jsonl"));
+                        let text = match export_session(&paths, &file, html, None) {
+                            Ok(p) => format!("exported to {}", p.display()),
+                            Err(e) => format!("export failed: {e:#}"),
+                        };
+                        let _ = ui_tx.send(UiEvent::Notice { text, error: false });
+                    }
                     Cmd::ListPrompts(action) => {
                         let tree = matches!(action, novacode_tui::app::BranchAction::Tree);
                         let mut nodes: Vec<_> = h.prompts().into_iter().filter(|p| tree || p.on_branch).collect();
@@ -1069,6 +1106,37 @@ fn branch(
             Err(e) => (store, Some(format!("could not move there: {e}"))),
         },
     }
+}
+
+fn export_redactor(paths: &Paths) -> Redactor {
+    let auth_path = paths.home().join("auth.json");
+    Redactor::new(move || AuthStore::new(auth_path.clone()).secrets())
+}
+
+/// Write a session's branch as JSONL or HTML (L4.14), secrets masked (L6.6).
+fn export_session(
+    paths: &Paths,
+    file: &Path,
+    html: bool,
+    out: Option<std::path::PathBuf>,
+) -> anyhow::Result<std::path::PathBuf> {
+    use novacode_core::export;
+    let (header, entries) = export::read(file).context("can't read that session")?;
+    let r = export_redactor(paths);
+    let body = if html {
+        export::html(&header, &entries, &r)
+    } else {
+        export::jsonl(&entries, &r)
+    };
+    let out = out.unwrap_or_else(|| {
+        std::path::PathBuf::from(format!(
+            "novacode-{}.{}",
+            &header.id[..header.id.len().min(13)],
+            if html { "html" } else { "jsonl" }
+        ))
+    });
+    std::fs::write(&out, body).with_context(|| format!("writing {}", out.display()))?;
+    Ok(out)
 }
 
 /// L6.3: four choices, asked once per folder that has project config.
