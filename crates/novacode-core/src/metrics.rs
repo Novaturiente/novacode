@@ -371,7 +371,7 @@ pub async fn record(mut rx: broadcast::Receiver<AgentEvent>, file: PathBuf, head
                     c.blocks.clear();
                 }
             }
-            AgentEvent::Stream(StreamEvent::Notice(text)) => write(&Record::Notice {
+            AgentEvent::Stream(StreamEvent::Notice { text }) => write(&Record::Notice {
                 ts: now_ms(),
                 task: t.n,
                 text,

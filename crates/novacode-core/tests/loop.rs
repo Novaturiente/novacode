@@ -542,7 +542,7 @@ async fn cache_miss_is_named_and_logged() {
     let notices: Vec<&String> = events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::Stream(novacode_types::StreamEvent::Notice(n)) => Some(n),
+            AgentEvent::Stream(novacode_types::StreamEvent::Notice { text: n }) => Some(n),
             _ => None,
         })
         .collect();

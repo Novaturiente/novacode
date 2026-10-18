@@ -1538,6 +1538,7 @@ dependencies = [
  "novacode-tools",
  "novacode-tui",
  "novacode-types",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

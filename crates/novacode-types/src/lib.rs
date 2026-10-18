@@ -279,8 +279,9 @@ pub enum BlockKind {
 
 /// Streamed by an adapter for one model call (L1.4). Consumers build their own
 /// view from deltas; the finished message comes once in `Done`/`Error`.
+/// Tagged `stream` (not `type`) so it nests inside `AgentEvent::Stream` on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "stream", rename_all = "snake_case")]
 pub enum StreamEvent {
     BlockStart {
         index: usize,
@@ -303,13 +304,16 @@ pub enum StreamEvent {
     RetryRollback,
     /// Something the user should know about this call (e.g. a switch to another
     /// account). Shown, never sent to the model or stored.
-    Notice(String),
+    Notice {
+        text: String,
+    },
     Done(AssistantMessage),
     /// Terminal failure. The message holds any partial content and `stop = Error|Aborted`.
     Error(AssistantMessage),
 }
 
 /// Loop → consumers (L1.5). One stream feeds TUI, print, JSON, RPC and attach.
+/// Must round-trip through JSON (the wire protocol, L8.7): see the test below.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -356,6 +360,30 @@ pub enum AgentEvent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_events_round_trip() {
+        use super::*;
+        let evs = vec![
+            AgentEvent::Stream(StreamEvent::BlockStart {
+                index: 0,
+                kind: BlockKind::ToolCall,
+                name: Some("bash".into()),
+            }),
+            AgentEvent::Stream(StreamEvent::Delta {
+                index: 0,
+                text: "x".into(),
+            }),
+            AgentEvent::Stream(StreamEvent::Usage(Usage::default())),
+            AgentEvent::Stream(StreamEvent::RetryRollback),
+            AgentEvent::Stream(StreamEvent::Notice { text: "n".into() }),
+            AgentEvent::Settled,
+        ];
+        for e in evs {
+            let j = serde_json::to_string(&e).unwrap();
+            assert_eq!(serde_json::from_str::<AgentEvent>(&j).unwrap(), e, "{j}");
+        }
+    }
+
     use super::*;
     use serde_json::json;
 

@@ -29,6 +29,7 @@ fn app(history: Vec<Message>) -> (App, mpsc::UnboundedReceiver<Cmd>) {
         spent: 0.0,
         commands: vec![],
         draft: String::new(),
+        attached: false,
     };
     (App::new(init, tx), rx)
 }
@@ -276,6 +277,7 @@ fn approval_card_blocks_input_and_answers() {
     a.on_agent(AgentEvent::Message(Message::user("clean")));
     let (tx, mut reply) = tokio::sync::oneshot::channel();
     a.on_ui(UiEvent::Approve(ApproveReq {
+        id: 1,
         tool: "bash".into(),
         detail: "rm -rf target".into(),
         reason: "rm -r deletes files".into(),
@@ -320,7 +322,7 @@ fn slash_commands_pickers_and_pager() {
             value: format!("claude/{m}"),
         })
         .to_vec();
-    a.on_ui(UiEvent::Models(Ok(items)));
+    a.on_ui(UiEvent::Models { result: Ok(items) });
     snapshot("model_picker", &screen(&mut a, 60, 16));
     key(&mut a, KeyCode::Char('s'), KeyModifiers::NONE);
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
@@ -343,11 +345,13 @@ fn slash_commands_pickers_and_pager() {
     }
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(rx.try_recv().unwrap(), Cmd::ListSessions);
-    a.on_ui(UiEvent::Sessions(vec![PickItem {
-        label: "old work".into(),
-        detail: "3 prompts".into(),
-        value: "/s/1.jsonl".into(),
-    }]));
+    a.on_ui(UiEvent::Sessions {
+        items: vec![PickItem {
+            label: "old work".into(),
+            detail: "3 prompts".into(),
+            value: "/s/1.jsonl".into(),
+        }],
+    });
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(a.exit, Some(Exit::Resume("/s/1.jsonl".into())));
 }
@@ -415,6 +419,7 @@ fn file_completion_in_a_real_folder() {
             spent: 0.0,
             commands: vec![],
             draft: String::new(),
+            attached: false,
         },
         tx,
     );
@@ -540,9 +545,9 @@ fn provider_notice_is_shown() {
     let (mut a, _rx) = app(vec![]);
     a.on_agent(AgentEvent::AgentStart);
     a.on_agent(AgentEvent::Message(Message::user("go")));
-    a.on_agent(AgentEvent::Stream(StreamEvent::Notice(
-        "claude account `default` is exhausted (quota); switched to account `work`".into(),
-    )));
+    a.on_agent(AgentEvent::Stream(StreamEvent::Notice {
+        text: "claude account `default` is exhausted (quota); switched to account `work`".into(),
+    }));
     let s = screen(&mut a, 90, 10);
     assert!(s.contains("switched to account `work`"), "{s}");
 }

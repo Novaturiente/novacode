@@ -131,7 +131,7 @@ impl Inner {
                         "{} account `{}` is exhausted ({why}); switched to account `{}`",
                         self.provider, self.accounts[i], self.accounts[next]
                     );
-                    if tx.send(StreamEvent::Notice(note)).await.is_err() {
+                    if tx.send(StreamEvent::Notice { text: note }).await.is_err() {
                         return;
                     }
                     tracing::warn!(
@@ -250,7 +250,7 @@ mod tests {
         let mut rx = a.stream(req.clone(), CancellationToken::new());
         let first = rx.recv().await.unwrap();
         assert!(
-            matches!(&first, StreamEvent::Notice(n) if n.contains("`default` is exhausted") && n.contains("`work`")),
+            matches!(&first, StreamEvent::Notice { text: n } if n.contains("`default` is exhausted") && n.contains("`work`")),
             "{first:?}"
         );
         let m = collect(rx).await;

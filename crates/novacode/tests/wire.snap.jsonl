@@ -1,0 +1,19 @@
+{"type":"hello","protocol":1,"version":"x","capabilities":["events","history","approvals","prompt","steer","models","thinking","compact","export"],"state":{"session":"01abc","cwd":"/w","model":"claude/claude-opus-5-5","level":"medium","window_tokens":200000,"busy":false,"spent":0.0}}
+{"type":"history","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}
+{"type":"event","event":{"type":"stream","stream":"delta","index":0,"text":"he"}}
+{"type":"event","event":{"type":"agent_end","stop":{"type":"stop"}}}
+{"type":"response","id":"1","command":"prompt","ok":true,"data":{"disposition":"started"}}
+{"type":"response","command":"set_model","ok":false,"error":"unknown model"}
+{"type":"ui","ui":{"kind":"notice","text":"n","error":false}}
+{"type":"approve","id":3,"tool":"bash","detail":"rm -rf build","reason":"deletes files","rule":"Bash(rm:*)","risky":true}
+{"type":"approval_done","id":3}
+{"type":"state","state":{"session":"01abc","cwd":"/w","model":"claude/claude-opus-5-5","level":"medium","window_tokens":200000,"busy":false,"spent":0.0}}
+{"type":"bye","reason":"session ended"}
+{"id":"1","type":"prompt","text":"fix it"}
+{"type":"steer","text":"also tests"}
+{"type":"abort"}
+{"id":"2","type":"set_model","model":"codex/gpt-5.5:high"}
+{"type":"set_thinking","level":"low"}
+{"type":"export","html":true}
+{"type":"approval","approval":3,"answer":{"deny":"not now"}}
+{"id":"9","type":"get_state"}

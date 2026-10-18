@@ -329,7 +329,7 @@ impl Agent {
                 m.cause = "compaction (expected once)".into();
             }
             let text = format!("cache miss: {} prompt tokens not read from cache ({})", m.lost, m.cause);
-            self.emit(AgentEvent::Stream(StreamEvent::Notice(text)));
+            self.emit(AgentEvent::Stream(StreamEvent::Notice { text }));
             let line = serde_json::json!({
                 "session": self.store.id(),
                 "provider": self.cfg.provider,
@@ -415,9 +415,9 @@ impl Agent {
             }
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "checkpoint");
-                self.emit(AgentEvent::Stream(StreamEvent::Notice(format!(
-                    "file checkpoint failed, this prompt can't rewind files: {e}"
-                ))));
+                self.emit(AgentEvent::Stream(StreamEvent::Notice {
+                    text: format!("file checkpoint failed, this prompt can't rewind files: {e}"),
+                }));
             }
             Err(_) => {}
         }
@@ -482,9 +482,9 @@ impl Agent {
         }
         if let Some(e) = run.error {
             tracing::warn!(error = %e, "memory observer");
-            self.emit(AgentEvent::Stream(StreamEvent::Notice(format!(
-                "memory observer failed: {e}"
-            ))));
+            self.emit(AgentEvent::Stream(StreamEvent::Notice {
+                text: format!("memory observer failed: {e}"),
+            }));
         }
     }
 
@@ -604,7 +604,9 @@ impl Agent {
             };
             (from, path[cut].id.clone())
         };
-        self.emit(AgentEvent::Stream(StreamEvent::Notice(format!("compacting: {why}"))));
+        self.emit(AgentEvent::Stream(StreamEvent::Notice {
+            text: format!("compacting: {why}"),
+        }));
         // Catch up to the cut.
         let mut failed = None;
         loop {
@@ -639,15 +641,17 @@ impl Agent {
         if let Some(e) = &failed {
             let wm = memory::watermark(&path).max(from);
             let gap = memory::chunk(&path, wm, cut_i, self.cfg.window_tokens / 2);
-            self.emit(AgentEvent::Stream(StreamEvent::Notice(format!(
-                "memory observer failed while catching up ({e}); summarising {}k tokens with the session model",
-                gap.tokens / 1000
-            ))));
+            self.emit(AgentEvent::Stream(StreamEvent::Notice {
+                text: format!(
+                    "memory observer failed while catching up ({e}); summarising {}k tokens with the session model",
+                    gap.tokens / 1000
+                ),
+            }));
             match memory::summarize(&self.adapter, &self.cfg.model, &gap, self.store.id()).await {
                 Ok((t, _)) => summary_text = Some(t),
-                Err(e) => self.emit(AgentEvent::Stream(StreamEvent::Notice(format!(
-                    "summary failed too ({e}); dropping the older messages"
-                )))),
+                Err(e) => self.emit(AgentEvent::Stream(StreamEvent::Notice {
+                    text: format!("summary failed too ({e}); dropping the older messages"),
+                })),
             }
         }
         let path = self.store.branch();
@@ -1278,13 +1282,13 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
             agent.collect_notes(false).await;
             if std::mem::take(&mut *agent.shared.compact.lock().unwrap()) {
                 if agent.memory.is_none() {
-                    agent.emit(AgentEvent::Stream(StreamEvent::Notice(
-                        "compaction is off (memory.enabled)".into(),
-                    )));
+                    agent.emit(AgentEvent::Stream(StreamEvent::Notice {
+                        text: "compaction is off (memory.enabled)".into(),
+                    }));
                 } else if !agent.compact("you asked for it").await {
-                    agent.emit(AgentEvent::Stream(StreamEvent::Notice(
-                        "nothing to compact: the conversation fits in the part kept verbatim".into(),
-                    )));
+                    agent.emit(AgentEvent::Stream(StreamEvent::Notice {
+                        text: "nothing to compact: the conversation fits in the part kept verbatim".into(),
+                    }));
                 }
                 continue;
             }
@@ -1451,10 +1455,9 @@ async fn warmer(shared: Arc<Shared>, events: broadcast::Sender<AgentEvent>) {
                 if let Some(s) = shared.sent.lock().unwrap().as_mut() {
                     s.at = Instant::now();
                 }
-                let _ = events.send(AgentEvent::Stream(StreamEvent::Notice(format!(
-                    "cache kept warm: {} of {tokens} prompt tokens read",
-                    m.usage.cache_read
-                ))));
+                let _ = events.send(AgentEvent::Stream(StreamEvent::Notice {
+                    text: format!("cache kept warm: {} of {tokens} prompt tokens read", m.usage.cache_read),
+                }));
             }
             Some(_) => {}
             None => {

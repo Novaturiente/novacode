@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use tokio::sync::oneshot;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PickItem {
     pub label: String,
     pub detail: String,
@@ -142,7 +142,8 @@ fn frame(f: &mut Frame, area: Rect, title: &str, t: &Theme) -> Rect {
     inner
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Answer {
     Once,
     Session,
@@ -152,6 +153,8 @@ pub enum Answer {
 
 /// A permission question from the policy (L6.1). The session waits on `reply`.
 pub struct ApproveReq {
+    /// Same id in every window; the first answer wins (L8.13).
+    pub id: u64,
     pub tool: String,
     /// Full command or path.
     pub detail: String,
@@ -423,6 +426,7 @@ mod tests {
         let card = |risky| {
             let (tx, _rx) = oneshot::channel();
             ApprovalCard::new(ApproveReq {
+                id: 1,
                 tool: "bash".into(),
                 detail: "rm -rf build".into(),
                 reason: "deletes files".into(),

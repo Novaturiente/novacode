@@ -73,6 +73,8 @@ pub struct Init {
     pub commands: Vec<(String, String)>,
     /// Editor text to start with (a prompt taken back by `/rewind` or `/tree`).
     pub draft: String,
+    /// An `attach` window (L8.13): commands that swap the session stay with its own window.
+    pub attached: bool,
 }
 
 /// What the UI asks of the session.
@@ -98,18 +100,33 @@ pub enum Cmd {
     Quit,
 }
 
-/// Things the host tells the UI besides agent events.
+/// Things the host tells the UI besides agent events. Serialisable for
+/// attached windows (L8.13), except approvals, which travel as their own message.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiEvent {
     /// Text to show in the pager (e.g. `/context`).
     Page {
         title: String,
         text: String,
     },
+    #[serde(skip)]
     Approve(ApproveReq),
-    Models(Result<Vec<PickItem>, String>),
-    Sessions(Vec<PickItem>),
+    /// Another window answered approval `id`: drop its card.
+    ApprovalDone {
+        id: u64,
+    },
+    Models {
+        result: Result<Vec<PickItem>, String>,
+    },
+    Sessions {
+        items: Vec<PickItem>,
+    },
     /// Prompts to pick for `/tree`, `/rewind` or `/fork`; values are entry ids.
-    Branch(BranchAction, Vec<PickItem>),
+    Branch {
+        action: BranchAction,
+        items: Vec<PickItem>,
+    },
     Notice {
         text: String,
         error: bool,
@@ -147,7 +164,8 @@ pub enum Exit {
 }
 
 /// What picking a prompt does (L4.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BranchAction {
     /// `/tree`: move to any prompt of any branch, its text back in the editor.
     Tree,
@@ -320,12 +338,13 @@ impl App {
         self.dirty = true;
         match ev {
             UiEvent::Approve(req) => self.approvals.push_back(ApprovalCard::new(req)),
-            UiEvent::Models(Ok(items)) => self.overlay = Some(Overlay::Models(Picker::new("Model", items))),
-            UiEvent::Models(Err(e)) => self.tr.notice(format!("could not list models: {e}"), true),
-            UiEvent::Sessions(items) if items.is_empty() => self.flash("no other sessions in this folder"),
-            UiEvent::Sessions(items) => self.overlay = Some(Overlay::Sessions(Picker::new("Resume session", items))),
-            UiEvent::Branch(_, items) if items.is_empty() => self.flash("no prompts yet"),
-            UiEvent::Branch(a, items) => {
+            UiEvent::ApprovalDone { id } => self.approvals.retain(|c| c.req.id != id),
+            UiEvent::Models { result: Ok(items) } => self.overlay = Some(Overlay::Models(Picker::new("Model", items))),
+            UiEvent::Models { result: Err(e) } => self.tr.notice(format!("could not list models: {e}"), true),
+            UiEvent::Sessions { items } if items.is_empty() => self.flash("no other sessions in this folder"),
+            UiEvent::Sessions { items } => self.overlay = Some(Overlay::Sessions(Picker::new("Resume session", items))),
+            UiEvent::Branch { items, .. } if items.is_empty() => self.flash("no prompts yet"),
+            UiEvent::Branch { action: a, items } => {
                 let title = match a {
                     BranchAction::Tree => "Session tree: go to a prompt (● = current branch)",
                     BranchAction::Rewind => "Rewind to before a prompt",
@@ -376,7 +395,7 @@ impl App {
                         _ => "writing".into(),
                     };
                 }
-                if let StreamEvent::Notice(text) = &e {
+                if let StreamEvent::Notice { text } = &e {
                     self.tr.notice(text.clone(), false);
                 }
                 self.tr.on_stream(&e);
@@ -847,6 +866,14 @@ impl App {
         let mut words = text.trim().splitn(2, char::is_whitespace);
         let (cmd, arg) = (words.next().unwrap_or(""), words.next().map(str::trim).unwrap_or(""));
         if COMMANDS.iter().any(|(c, _)| *c == cmd) || cmd == "/exit" || cmd == "/help" {
+            if self.init.attached && matches!(cmd, "/resume" | "/new" | "/tree" | "/rewind" | "/fork" | "/clone") {
+                self.tr.notice(
+                    format!("{cmd} works in the session's own window, not an attached one"),
+                    true,
+                );
+                self.dirty = true;
+                return;
+            }
             match cmd {
                 "/quit" | "/exit" => self.exit = Some(Exit::Quit),
                 "/model" if !arg.is_empty() => self.set_model(arg),

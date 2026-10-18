@@ -2,7 +2,6 @@
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
-use futures_util::future::BoxFuture;
 use novacode_ai::adapter::CacheRetention;
 use novacode_ai::auth::{self, AuthStore, DEFAULT_ACCOUNT, antigravity, claude, codex, copilot};
 use novacode_ai::connect::Providers;
@@ -10,12 +9,12 @@ use novacode_ai::trace::Trace;
 use novacode_base::redact::Redactor;
 use novacode_base::{logging, new_id, paths::Paths, settings, settings::Settings};
 use novacode_core::agent::{self, Agent, Config};
-use novacode_core::policy::{Approval, ApprovalRequest, Approver, Mode, Permissions, Policy};
+use novacode_core::policy::{Approver, Mode, Permissions, Policy};
 use novacode_core::resources;
 use novacode_core::session::{self, Store};
 use novacode_core::trust::{self, TrustStore};
 use novacode_tools::LocalEnv;
-use novacode_tui::dialog::{Answer, ApproveReq, PickItem};
+use novacode_tui::dialog::PickItem;
 use novacode_tui::keys::Keymap;
 use novacode_tui::{Cmd, Exit, UiEvent};
 use novacode_types::{AgentEvent, Message, StopReason, StreamEvent, ThinkingLevel};
@@ -24,11 +23,15 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc};
 
 mod doctor;
+mod host;
+mod hub;
 mod models;
+mod serve;
 mod stats;
+mod wire;
 
 #[derive(Parser, Clone)]
 #[command(name = "novacode", version, about = "An agent harness")]
@@ -66,6 +69,15 @@ struct Cli {
     /// Don't load AGENTS.md / CLAUDE.md context files (L4.9).
     #[arg(long)]
     no_context_files: bool,
+    /// With -p: write the wire protocol's JSONL events to stdout instead of the answer (L8.5).
+    #[arg(long, requires = "print")]
+    json: bool,
+    /// Serve the wire protocol on stdin/stdout: JSONL commands in, events out (L8.6).
+    #[arg(long, conflicts_with = "print")]
+    rpc: bool,
+    /// Run in the background with no window; prints the session id. Attach with `novacode attach` (L8.13).
+    #[arg(long, value_name = "PROMPT", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["print", "rpc"])]
+    bg: Option<String>,
     /// API key for the model's provider, for this run only (ahead of saved and env keys).
     #[arg(long, value_name = "KEY")]
     api_key: Option<String>,
@@ -119,6 +131,12 @@ enum Command {
         #[arg(short, long)]
         out: Option<std::path::PathBuf>,
     },
+    /// Open another window on a live session (leaving only detaches)
+    Attach { session: String },
+    /// List live sessions on this machine
+    Agents,
+    /// End a live session, a background one included
+    Stop { session: String },
     /// Dev metrics report (needs `debug.metrics`): the latest session, one by id prefix, or --all.
     Stats {
         session: Option<String>,
@@ -218,6 +236,18 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             println!("{}", out.display());
             return Ok(ExitCode::SUCCESS);
         }
+        Some(Command::Agents) => return Ok(serve::agents(&paths)),
+        Some(Command::Stop { session }) => return serve::stop(&paths, &session).await,
+        Some(Command::Attach { session }) => {
+            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                bail!("attach needs a terminal");
+            }
+            let cwd = std::env::current_dir()?;
+            let trusted = trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &cwd, false);
+            let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
+            let base = tui_base(&paths, &settings);
+            return serve::attach(&paths, &session, base).await;
+        }
         Some(Command::Stats { session, all, turns }) => {
             std::process::exit(stats::run(paths.home(), session.as_deref(), all, turns));
         }
@@ -249,9 +279,15 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         }
         None => {}
     }
+    // --bg: start a detached copy of this command and report its session id.
+    if cli.bg.is_some() && std::env::var_os("NOVACODE_BG_CHILD").is_none() {
+        return spawn_bg();
+    }
+    let headless = cli.bg.is_some() || cli.rpc;
     let mut prompt = cli.print.clone();
     let stdin = std::io::stdin();
-    if let Some(p) = &mut prompt {
+    if headless {
+    } else if let Some(p) = &mut prompt {
         if !stdin.is_terminal() {
             let mut piped = String::new();
             stdin.lock().read_to_string(&mut piped)?;
@@ -262,7 +298,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     } else if !stdin.is_terminal() || !std::io::stdout().is_terminal() {
         bail!("interactive mode needs a terminal; use -p PROMPT for pipes and scripts");
     }
-    let interactive = prompt.is_none();
+    let interactive = prompt.is_none() && !headless;
 
     let cwd = std::env::current_dir()?;
     let trust_store = TrustStore::new(paths.home().join("trust.json"));
@@ -325,12 +361,23 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     } else {
         Store::create(&ctx.paths, &ctx.cwd, ctx.cli.no_session)
     };
+    if headless {
+        return serve_headless(&ctx, store, model).await;
+    }
     match prompt {
         None => interactive_loop(&ctx, store, model).await,
         Some(prompt) => {
             // Nobody to approve: asks become refusals, risky commands need a justification.
             let (agent, _) = ctx.agent(store, &model, None).await?;
-            print_mode(agent, prompt, ctx.cwd.clone(), ctx.inputs(), ctx.cli.verbose).await
+            print_mode(
+                agent,
+                prompt,
+                ctx.cwd.clone(),
+                ctx.inputs(),
+                ctx.cli.verbose,
+                ctx.cli.json,
+            )
+            .await
         }
     }
 }
@@ -605,9 +652,32 @@ async fn print_mode(
     cwd: std::path::PathBuf,
     inputs: Inputs,
     verbose: bool,
+    json: bool,
 ) -> anyhow::Result<ExitCode> {
+    let state = wire::State {
+        session: agent.store.id().to_string(),
+        cwd: cwd.display().to_string(),
+        model: format!("{}/{}", agent.config().provider, agent.config().model),
+        level: agent.config().thinking,
+        window_tokens: agent.config().window_tokens,
+        busy: false,
+        price: None,
+        spent: 0.0,
+    };
     let (handle, task) = agent::spawn(agent);
     let mut events = handle.subscribe();
+    let mut out_json = json.then(std::io::stdout);
+    if let Some(o) = &mut out_json {
+        o.write_all(
+            wire::line(&wire::ServerMsg::Hello {
+                protocol: wire::PROTOCOL,
+                version: env!("CARGO_PKG_VERSION").into(),
+                capabilities: vec!["events".into()],
+                state,
+            })
+            .as_bytes(),
+        )?;
+    }
     let on_ctrl_c = handle.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -622,10 +692,15 @@ async fn print_mode(
     // stdout gets only the final answer (L8.4); progress goes to stderr with -v.
     let mut last = None;
     let stop = loop {
-        match events.recv().await {
+        let ev = events.recv().await;
+        if let (Some(o), Ok(e)) = (&mut out_json, &ev) {
+            o.write_all(wire::line(&wire::ServerMsg::Event { event: e.clone() }).as_bytes())?;
+            o.flush()?;
+        }
+        match ev {
             Ok(AgentEvent::Message(Message::Assistant(m))) => last = Some(m),
             Ok(AgentEvent::ToolStart { call }) if verbose => eprintln!("tool {} {}", call.name, call.arguments),
-            Ok(AgentEvent::Stream(StreamEvent::Notice(text))) => eprintln!("{text}"),
+            Ok(AgentEvent::Stream(StreamEvent::Notice { text })) => eprintln!("{text}"),
             Ok(AgentEvent::Retry {
                 attempt,
                 delay_ms,
@@ -644,7 +719,7 @@ async fn print_mode(
     let msg = last.context("no reply")?;
     tracing::info!(stop = ?stop, usage = ?msg.usage, "print mode done");
     let text = msg.text();
-    if !text.is_empty() {
+    if !text.is_empty() && !json {
         let mut out = std::io::stdout().lock();
         writeln!(out, "{text}")?;
         out.flush()?;
@@ -668,39 +743,6 @@ async fn print_mode(
             ExitCode::from(1)
         }
     })
-}
-
-/// Sends approval questions to the TUI and waits for the answer (L6.1).
-struct TuiApprover(mpsc::UnboundedSender<UiEvent>);
-
-impl Approver for TuiApprover {
-    fn approve(&self, req: ApprovalRequest) -> BoxFuture<'_, Approval> {
-        Box::pin(async move {
-            let (tx, rx) = oneshot::channel();
-            let detail = match req.args.get("command").or_else(|| req.args.get("path")) {
-                Some(serde_json::Value::String(s)) => s.clone(),
-                _ => req.args.to_string(),
-            };
-            let card = ApproveReq {
-                tool: req.tool,
-                detail,
-                reason: req.reason,
-                rule: req.rule,
-                risky: req.risky,
-                reply: tx,
-            };
-            if self.0.send(UiEvent::Approve(card)).is_err() {
-                return Approval::Deny(None);
-            }
-            match rx.await {
-                Ok(Answer::Once) => Approval::Once,
-                Ok(Answer::Session) => Approval::Session,
-                Ok(Answer::Always) => Approval::Always,
-                Ok(Answer::Deny(why)) => Approval::Deny(why),
-                Err(_) => Approval::Deny(None),
-            }
-        })
-    }
 }
 
 fn load_keymap(paths: &Paths) -> (Keymap, Vec<String>) {
@@ -734,6 +776,142 @@ fn ago(t: std::time::SystemTime) -> String {
     }
 }
 
+/// What every TUI window takes from settings.
+struct TuiBase {
+    keymap: Keymap,
+    theme: novacode_tui::theme::Theme,
+    collapse_turns: bool,
+    thinking: novacode_tui::transcript::Thinking,
+    notices: Vec<String>,
+}
+
+fn tui_base(paths: &Paths, settings: &Settings) -> TuiBase {
+    let (keymap, mut notices) = load_keymap(paths);
+    let name = settings.get::<String>("ui.theme").unwrap_or_else(|| "auto".into());
+    let dark = (name == "auto").then(novacode_tui::term::query_background).flatten();
+    let (mut theme, warn) = novacode_tui::theme::Theme::load(&name, &paths.home().join("themes"), dark);
+    notices.extend(warn);
+    if let Some(v) = settings.get::<serde_json::Value>("ui.userMessage") {
+        notices.extend(theme.apply_user_message(&v));
+    }
+    TuiBase {
+        keymap,
+        theme,
+        collapse_turns: settings.get("ui.turnCollapse").unwrap_or(true),
+        thinking: novacode_tui::transcript::Thinking::parse(&settings.get::<String>("ui.thinking").unwrap_or_default()),
+        notices,
+    }
+}
+
+/// Build the agent, start its owner task and hub, and put it on its socket (L8.13).
+async fn start_session(
+    ctx: &Ctx,
+    store: Store,
+    model: &str,
+    local: Option<mpsc::UnboundedSender<UiEvent>>,
+    undo: &Arc<std::sync::Mutex<Vec<String>>>,
+    bg: bool,
+) -> anyhow::Result<(serve::Live, tokio::task::JoinHandle<Agent>)> {
+    let slot = hub::HubSlot::default();
+    let (agent, spec) = ctx.agent(store, model, Some(Arc::new(slot.clone()))).await?;
+    let price = ctx
+        .providers
+        .resolve(&spec)
+        .ok()
+        .and_then(|r| models::price(&ctx.providers, &r));
+    let state = wire::State {
+        session: agent.store.id().to_string(),
+        cwd: ctx.cwd.display().to_string(),
+        model: spec.clone(),
+        level: agent.config().thinking,
+        window_tokens: agent.config().window_tokens,
+        busy: false,
+        price,
+        spent: models::spent(&ctx.providers, agent.store.entries()),
+    };
+    let history = agent.store.projection();
+    let id = agent.store.id().to_string();
+    let level = state.level;
+    let (handle, task) = agent::spawn(agent);
+    let hub = hub::Hub::start(handle, history, state, local);
+    let _ = slot.0.set(Arc::downgrade(&hub));
+    let host = Arc::new(host::Host {
+        hub,
+        cur: Arc::new(std::sync::Mutex::new((spec, level))),
+        paths: ctx.paths.clone(),
+        cwd: ctx.cwd.clone(),
+        id,
+        inputs: ctx.inputs(),
+        undo: undo.clone(),
+        providers: ctx.providers.clone(),
+        limits: models::Limits::new(&ctx.settings),
+        trace: ctx.trace(),
+    });
+    let live = serve::go_live(&host, bg)?;
+    Ok((live, task))
+}
+
+/// `--bg` (the child) and `--rpc`: a session with no window of its own.
+async fn serve_headless(ctx: &Ctx, store: Store, model: String) -> anyhow::Result<ExitCode> {
+    let undo = Arc::default();
+    let (live, task) = start_session(ctx, store, &model, None, &undo, !ctx.cli.rpc).await?;
+    let host = live.host.clone();
+    if ctx.cli.rpc {
+        tokio::spawn(serve::serve(
+            tokio::io::stdin(),
+            tokio::io::stdout(),
+            host.clone(),
+            true,
+        ));
+    } else {
+        // The parent waits for this line; nothing else goes to stdout.
+        println!("{}", host.id);
+        let (sink, _) = mpsc::unbounded_channel();
+        if let Some(p) = ctx.cli.bg.clone().filter(|p| !p.trim().is_empty()) {
+            host.handle(Cmd::Prompt(p), &sink, false).await;
+        }
+    }
+    let on_signal = host.hub.handle.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            on_signal.abort();
+            on_signal.shutdown();
+        }
+    });
+    let agent = task.await?;
+    drop(agent);
+    live.end("session ended");
+    // Let the last lines (and the bye) reach RPC clients.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `--bg`: re-run this command detached, wait for its session id, print it.
+fn spawn_bg() -> anyhow::Result<ExitCode> {
+    use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
+    let mut child = std::process::Command::new(std::env::current_exe()?)
+        .args(std::env::args_os().skip(1))
+        .env("NOVACODE_BG_CHILD", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        // Its own process group: closing this terminal doesn't hang it up.
+        .process_group(0)
+        .spawn()?;
+    let mut id = String::new();
+    std::io::BufReader::new(child.stdout.take().context("no pipe")?).read_line(&mut id)?;
+    let id = id.trim();
+    if id.is_empty() {
+        let _ = child.wait();
+        bail!("the background session didn't start; see ~/.novacode/logs");
+    }
+    eprintln!("started {id} in the background");
+    eprintln!("attach with: novacode attach {}", &id[..id.len().min(13)]);
+    println!("{id}");
+    Ok(ExitCode::SUCCESS)
+}
+
 /// The TUI, one session at a time; /resume and /new swap the session in place.
 async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> anyhow::Result<ExitCode> {
     let mut notices = Vec::new();
@@ -748,19 +926,9 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
         .flatten();
     loop {
         let (ui_tx, ui_rx) = mpsc::unbounded_channel();
-        let approver: Arc<dyn Approver> = Arc::new(TuiApprover(ui_tx.clone()));
-        let (agent, spec) = ctx.agent(store, &model, Some(approver)).await?;
-        let history = agent.store.projection();
-        let level = agent.config().thinking;
-        let window_tokens = agent.config().window_tokens;
-        let price = ctx
-            .providers
-            .resolve(&spec)
-            .ok()
-            .and_then(|r| models::price(&ctx.providers, &r));
-        let spent = models::spent(&ctx.providers, agent.store.entries());
-        let id = agent.store.id().to_string();
-        let (handle, task) = agent::spawn(agent);
+        let (live, task) = start_session(ctx, store, &model, Some(ui_tx.clone()), &undo, false).await?;
+        let host = live.host.clone();
+        let (handle, id) = (host.hub.handle.clone(), host.id.clone());
         let (etx, erx) = mpsc::unbounded_channel();
         let mut events = handle.subscribe();
         tokio::spawn(async move {
@@ -777,212 +945,45 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
             }
         });
         let (ctx_tx, mut crx) = mpsc::unbounded_channel();
-        let h = handle.clone();
-        // The resolved `provider/model` and the level in use, kept for /resume and /new.
-        let current = Arc::new(std::sync::Mutex::new((spec.clone(), level)));
-        let cur = current.clone();
-        let (paths, cwd, this_id) = (ctx.paths.clone(), ctx.cwd.clone(), id.clone());
-        let inputs = ctx.inputs();
-        let undo_list = undo.clone();
-        let (providers, limits, trace) = (ctx.providers.clone(), models::Limits::new(&ctx.settings), ctx.trace());
+        let h = host.clone();
         tokio::spawn(async move {
             while let Some(c) = crx.recv().await {
-                let steer = matches!(c, Cmd::Steer(_));
-                match c {
-                    Cmd::Prompt(t) | Cmd::Steer(t) => {
-                        let (blocks, notes) = attach(t, cwd.clone(), &inputs).await;
-                        for n in notes {
-                            let error = !n.starts_with("attached");
-                            let _ = ui_tx.send(UiEvent::Notice { text: n, error });
-                        }
-                        if steer {
-                            h.steer_content(blocks)
-                        } else {
-                            h.prompt_content(blocks)
-                        }
-                    }
-                    Cmd::Abort => h.abort(),
-                    Cmd::SetModel(m) => {
-                        let (p, tx, cur, h, trace) =
-                            (providers.clone(), ui_tx.clone(), cur.clone(), h.clone(), trace.clone());
-                        tokio::spawn(async move {
-                            let level = cur.lock().unwrap().1;
-                            match models::switch(&p, &m, level, limits, trace).await {
-                                Ok((sw, route)) => {
-                                    let ev = UiEvent::ModelSet {
-                                        model: route.spec(),
-                                        window_tokens: sw.window_tokens,
-                                        level: sw.thinking,
-                                        price: models::price(&p, &route),
-                                    };
-                                    *cur.lock().unwrap() = (route.spec(), sw.thinking);
-                                    h.set_model(sw);
-                                    let _ = tx.send(ev);
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(UiEvent::Notice {
-                                        text: format!("model not changed: {e:#}"),
-                                        error: true,
-                                    });
-                                }
-                            }
-                        });
-                    }
-                    Cmd::SetThinking(l) => {
-                        let spec = cur.lock().unwrap().0.clone();
-                        let Ok(route) = providers.resolve(&spec) else { continue };
-                        let level = route.clamp(l);
-                        cur.lock().unwrap().1 = level;
-                        h.set_thinking(level);
-                        let mut note = format!("thinking → {} from the next message", level.as_str());
-                        if level != l {
-                            note += &format!(" ({} has no `{}`)", route.model, l.as_str());
-                        }
-                        // L1.7: say what the change costs, never block.
-                        note += if route.thinking_change_keeps_cache() {
-                            "; the cache is kept"
-                        } else {
-                            "; the cache starts over"
-                        };
-                        let _ = ui_tx.send(UiEvent::Thinking { level, note });
-                    }
-                    Cmd::ListModels => {
-                        let (p, tx, cur) = (providers.clone(), ui_tx.clone(), cur.lock().unwrap().0.clone());
-                        tokio::spawn(async move {
-                            let (items, errors) = models::list(&p, &cur).await;
-                            for e in errors {
-                                let _ = tx.send(UiEvent::Notice {
-                                    text: format!("models: {e}"),
-                                    error: true,
-                                });
-                            }
-                            let r = if items.is_empty() {
-                                Err("no connected provider listed any model".into())
-                            } else {
-                                Ok(items)
-                            };
-                            let _ = tx.send(UiEvent::Models(r));
-                        });
-                    }
-                    Cmd::ListSessions => {
-                        let items = session::list(&paths, &cwd)
-                            .iter()
-                            .filter_map(|p| session::summary(p))
-                            .filter(|s| s.id != this_id && s.prompts > 0)
-                            .map(|s| PickItem {
-                                label: if s.title.is_empty() {
-                                    s.id.clone()
-                                } else {
-                                    s.title.clone()
-                                },
-                                detail: format!(
-                                    "{} prompt{} · {}",
-                                    s.prompts,
-                                    if s.prompts == 1 { "" } else { "s" },
-                                    ago(s.modified)
-                                ),
-                                value: s.path.display().to_string(),
-                            })
-                            .collect();
-                        let _ = ui_tx.send(UiEvent::Sessions(items));
-                    }
-                    Cmd::Context => {
-                        let _ = ui_tx.send(UiEvent::Page {
-                            title: "Context".into(),
-                            text: h.context().render(),
-                        });
-                    }
-                    Cmd::Compact => h.compact(),
-                    Cmd::Export(html) => {
-                        let file = session::dir_for(&paths, &cwd).join(format!("{this_id}.jsonl"));
-                        let text = match export_session(&paths, &file, html, None) {
-                            Ok(p) => format!("exported to {}", p.display()),
-                            Err(e) => format!("export failed: {e:#}"),
-                        };
-                        let _ = ui_tx.send(UiEvent::Notice { text, error: false });
-                    }
-                    Cmd::ListPrompts(action) => {
-                        let tree = matches!(action, novacode_tui::app::BranchAction::Tree);
-                        let mut nodes: Vec<_> = h.prompts().into_iter().filter(|p| tree || p.on_branch).collect();
-                        if !tree {
-                            nodes.reverse();
-                        }
-                        let items = nodes
-                            .into_iter()
-                            .map(|p| PickItem {
-                                label: if tree {
-                                    format!(
-                                        "{}{} {}",
-                                        "  ".repeat(p.depth),
-                                        if p.on_branch { "●" } else { "○" },
-                                        p.text
-                                    )
-                                } else {
-                                    p.text
-                                },
-                                detail: novacode_core::memory::utc_minute(p.ts_ms) + "Z",
-                                value: p.id,
-                            })
-                            .collect();
-                        let mut items: Vec<PickItem> = items;
-                        if matches!(action, novacode_tui::app::BranchAction::Rewind)
-                            && !undo_list.lock().unwrap().is_empty()
-                        {
-                            items.insert(
-                                0,
-                                PickItem {
-                                    label: "↩ Undo the last file rewind".into(),
-                                    detail: String::new(),
-                                    value: "undo".into(),
-                                },
-                            );
-                        }
-                        let _ = ui_tx.send(UiEvent::Branch(action, items));
-                    }
-                    Cmd::Quit => break,
+                if c == Cmd::Quit {
+                    break;
                 }
+                h.handle(c, &ui_tx, true).await;
             }
         });
         let (commands, warn) = ctx.inputs().commands();
         notices.extend(warn);
+        let base = tui_base(&ctx.paths, &ctx.settings);
+        notices.extend(base.notices);
+        let state = host.hub.state();
         let init = novacode_tui::Init {
-            model: spec.clone(),
+            model: state.model.clone(),
             cwd: ctx.cwd.display().to_string(),
             branch: git_branch(&ctx.cwd),
-            window_tokens,
-            history,
-            keymap: {
-                let (km, warn) = load_keymap(&ctx.paths);
-                notices.extend(warn);
-                km
-            },
-            collapse_turns: ctx.settings.get("ui.turnCollapse").unwrap_or(true),
-            level,
-            thinking: novacode_tui::transcript::Thinking::parse(
-                &ctx.settings.get::<String>("ui.thinking").unwrap_or_default(),
-            ),
-            theme: {
-                let name = ctx.settings.get::<String>("ui.theme").unwrap_or_else(|| "auto".into());
-                let dark = (name == "auto").then(novacode_tui::term::query_background).flatten();
-                let (mut t, warn) = novacode_tui::theme::Theme::load(&name, &ctx.paths.home().join("themes"), dark);
-                notices.extend(warn);
-                if let Some(v) = ctx.settings.get::<serde_json::Value>("ui.userMessage") {
-                    notices.extend(t.apply_user_message(&v));
-                }
-                t
-            },
+            window_tokens: state.window_tokens,
+            history: host.hub.history(),
+            keymap: base.keymap,
+            collapse_turns: base.collapse_turns,
+            level: state.level,
+            thinking: base.thinking,
+            theme: base.theme,
             notices: std::mem::take(&mut notices),
-            price,
-            spent,
+            price: state.price,
+            spent: state.spent,
             commands,
             draft: std::mem::take(&mut draft),
+            attached: false,
         };
         let res = novacode_tui::run(init, erx, ui_rx, ctx_tx).await;
         handle.abort();
         handle.shutdown();
         let agent = task.await?;
+        live.end("the session's window closed");
         // /new and /resume keep the model; the level comes from the session (or settings).
-        model = current.lock().unwrap().0.clone();
+        model = host.cur.lock().unwrap().0.clone();
         let prev = agent.store.path().map(Path::to_path_buf);
         let res = res?;
         if let Exit::Rewind { at, files, chat } = &res {
