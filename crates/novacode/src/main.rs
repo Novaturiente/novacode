@@ -11,6 +11,7 @@ use novacode_base::redact::Redactor;
 use novacode_base::{logging, new_id, paths::Paths, settings, settings::Settings};
 use novacode_core::agent::{self, Agent, Config};
 use novacode_core::policy::{Approval, ApprovalRequest, Approver, Mode, Permissions, Policy};
+use novacode_core::resources;
 use novacode_core::session::{self, Store};
 use novacode_core::trust::{self, TrustStore};
 use novacode_tools::LocalEnv;
@@ -276,6 +277,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         settings,
         providers,
         cli,
+        trusted,
     };
     let store = if let Some(prefix) = &ctx.cli.resume {
         Store::open(&session::find(&ctx.paths, &ctx.cwd, prefix)?)?
@@ -293,7 +295,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         Some(prompt) => {
             // Nobody to approve: asks become refusals, risky commands need a justification.
             let (agent, _) = ctx.agent(store, &model, None).await?;
-            print_mode(agent, prompt, ctx.cwd.clone(), ctx.cli.verbose).await
+            print_mode(agent, prompt, ctx.cwd.clone(), ctx.inputs(), ctx.cli.verbose).await
         }
     }
 }
@@ -306,9 +308,40 @@ struct Ctx {
     providers: Arc<Providers>,
     quirks: Arc<novacode_ai::schema::Quirks>,
     cli: Cli,
+    /// Project config loads (L6.3): gates project skills.
+    trusted: bool,
 }
 
 impl Ctx {
+    /// Skill folders, first wins (L4.10): project (trusted only), novacode's, then the shared `~/.agents`.
+    /// `.claude/skills` is never scanned (user requirement).
+    fn skill_dirs(&self) -> Vec<std::path::PathBuf> {
+        let mut d = Vec::new();
+        if self.trusted {
+            d.push(Paths::project_dir(&self.cwd).join("skills"));
+        }
+        d.push(self.paths.home().join("skills"));
+        if let Some(h) = std::env::var_os("HOME") {
+            d.push(Path::new(&h).join(".agents/skills"));
+        }
+        d
+    }
+
+    /// Prompt-template folders, project first (L4.11).
+    fn template_dirs(&self) -> Vec<std::path::PathBuf> {
+        vec![
+            Paths::project_dir(&self.cwd).join("prompts"),
+            self.paths.home().join("prompts"),
+        ]
+    }
+
+    fn inputs(&self) -> Inputs {
+        Inputs {
+            skills: self.skill_dirs(),
+            templates: self.template_dirs(),
+        }
+    }
+
     fn trace(&self) -> Option<Trace> {
         self.cli.trace.then(|| Trace {
             path: self.paths.logs().join(format!("trace-{}.jsonl", new_id())),
@@ -372,7 +405,7 @@ impl Ctx {
                 cwd: self.cwd.clone(),
                 home: self.paths.home().to_path_buf(),
                 context_files: !self.cli.no_context_files,
-                skills: String::new(),
+                skill_dirs: self.skill_dirs(),
             },
             redactor: {
                 let auth_path = self.paths.home().join("auth.json");
@@ -394,14 +427,60 @@ impl Ctx {
 }
 
 /// Attach the images a prompt mentions (`@shot.png`, L2.22), off the async threads.
-async fn attach(text: String, cwd: std::path::PathBuf) -> (Vec<novacode_types::Block>, Vec<String>) {
+/// Where `/skill:name` and `/template` come from; re-read on each prompt, so edits apply at once.
+#[derive(Clone)]
+struct Inputs {
+    skills: Vec<std::path::PathBuf>,
+    templates: Vec<std::path::PathBuf>,
+}
+
+impl Inputs {
+    fn expand(&self, text: &str) -> String {
+        if !text.starts_with('/') {
+            return text.to_string();
+        }
+        let skills = resources::skills(&self.skills).0;
+        resources::expand(text, &skills, &resources::templates(&self.templates))
+    }
+
+    /// Slash completions for the editor, and warnings about broken skills.
+    fn commands(&self) -> (Vec<(String, String)>, Vec<String>) {
+        let (skills, warn) = resources::skills(&self.skills);
+        let mut c: Vec<(String, String)> = resources::templates(&self.templates)
+            .into_iter()
+            .map(|t| (format!("/{}", t.name), t.description))
+            .collect();
+        c.extend(skills.into_iter().map(|k| {
+            let d: String = k
+                .description
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take(80)
+                .collect();
+            (format!("/skill:{}", k.name), d)
+        }));
+        (c, warn)
+    }
+}
+
+/// Expand a template or skill command, then attach mentioned images.
+async fn attach(text: String, cwd: std::path::PathBuf, inputs: &Inputs) -> (Vec<novacode_types::Block>, Vec<String>) {
+    let text = inputs.expand(&text);
     let fallback = text.clone();
     tokio::task::spawn_blocking(move || novacode_tools::image::attach(&text, &cwd))
         .await
         .unwrap_or_else(|_| (vec![novacode_types::Block::text(fallback)], vec![]))
 }
 
-async fn print_mode(agent: Agent, prompt: String, cwd: std::path::PathBuf, verbose: bool) -> anyhow::Result<ExitCode> {
+async fn print_mode(
+    agent: Agent,
+    prompt: String,
+    cwd: std::path::PathBuf,
+    inputs: Inputs,
+    verbose: bool,
+) -> anyhow::Result<ExitCode> {
     let (handle, task) = agent::spawn(agent);
     let mut events = handle.subscribe();
     let on_ctrl_c = handle.clone();
@@ -410,7 +489,7 @@ async fn print_mode(agent: Agent, prompt: String, cwd: std::path::PathBuf, verbo
             on_ctrl_c.abort();
         }
     });
-    let (blocks, notes) = attach(prompt, cwd).await;
+    let (blocks, notes) = attach(prompt, cwd, &inputs).await;
     for n in notes {
         eprintln!("{n}");
     }
@@ -569,13 +648,14 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
         let current = Arc::new(std::sync::Mutex::new((spec.clone(), level)));
         let cur = current.clone();
         let (paths, cwd, this_id) = (ctx.paths.clone(), ctx.cwd.clone(), id.clone());
+        let inputs = ctx.inputs();
         let (providers, limits, trace) = (ctx.providers.clone(), models::Limits::new(&ctx.settings), ctx.trace());
         tokio::spawn(async move {
             while let Some(c) = crx.recv().await {
                 let steer = matches!(c, Cmd::Steer(_));
                 match c {
                     Cmd::Prompt(t) | Cmd::Steer(t) => {
-                        let (blocks, notes) = attach(t, cwd.clone()).await;
+                        let (blocks, notes) = attach(t, cwd.clone(), &inputs).await;
                         for n in notes {
                             let error = !n.starts_with("attached");
                             let _ = ui_tx.send(UiEvent::Notice { text: n, error });
@@ -681,6 +761,8 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
                 }
             }
         });
+        let (commands, warn) = ctx.inputs().commands();
+        notices.extend(warn);
         let init = novacode_tui::Init {
             model: spec.clone(),
             cwd: ctx.cwd.display().to_string(),
@@ -710,6 +792,7 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
             notices: std::mem::take(&mut notices),
             price,
             spent,
+            commands,
         };
         let res = novacode_tui::run(init, erx, ui_rx, ctx_tx).await;
         handle.abort();

@@ -27,6 +27,7 @@ fn app(history: Vec<Message>) -> (App, mpsc::UnboundedReceiver<Cmd>) {
         level: Default::default(),
         price: None,
         spent: 0.0,
+        commands: vec![],
     };
     (App::new(init, tx), rx)
 }
@@ -411,6 +412,7 @@ fn file_completion_in_a_real_folder() {
             level: Default::default(),
             price: None,
             spent: 0.0,
+            commands: vec![],
         },
         tx,
     );

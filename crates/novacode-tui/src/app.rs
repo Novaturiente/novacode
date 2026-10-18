@@ -63,6 +63,8 @@ pub struct Init {
     pub price: Option<Cost>,
     /// USD already spent on API-key routes in this session (resumed history).
     pub spent: f64,
+    /// Extra slash commands for completion: prompt templates and `/skill:name` (L4.10, L4.11).
+    pub commands: Vec<(String, String)>,
 }
 
 /// What the UI asks of the session.
@@ -565,8 +567,10 @@ impl App {
         let items: Vec<(String, String, String)> = if start == 0 && token.starts_with('/') {
             COMMANDS
                 .iter()
+                .map(|(c, d)| (c.to_string(), d.to_string()))
+                .chain(self.init.commands.iter().cloned())
                 .filter(|(c, _)| c.starts_with(token))
-                .map(|(c, d)| (c.to_string(), format!("{c} "), d.to_string()))
+                .map(|(c, d)| (c.clone(), format!("{c} "), d))
                 .collect()
         } else if let Some(items) = token.strip_prefix('@').and_then(|q| browse(&self.init.cwd, q)) {
             items

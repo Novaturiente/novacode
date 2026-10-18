@@ -28,8 +28,9 @@ pub struct Sources {
     pub home: PathBuf,
     /// `--no-context-files` turns this off.
     pub context_files: bool,
-    /// Rendered `<skills>` body (L4.10); empty = no section.
-    pub skills: String,
+    /// Skill folders, earlier ones winning a name clash (L4.10). Read on every rebuild,
+    /// so a new skill reaches the model as a section delta.
+    pub skill_dirs: Vec<PathBuf>,
 }
 
 /// What drifts during a session: compared before each run.
@@ -134,8 +135,9 @@ pub fn build(src: &Sources, environment: &str) -> Sections {
             add("project_context", body);
         }
     }
-    if !src.skills.is_empty() {
-        add("skills", src.skills.clone());
+    let skills = crate::resources::render_skills(&crate::resources::skills(&src.skill_dirs).0);
+    if !skills.is_empty() {
+        add("skills", skills);
     }
     add("environment", environment.into());
     out
@@ -257,7 +259,7 @@ mod tests {
             cwd: d.path().into(),
             home: d.path().join("h"),
             context_files: false,
-            skills: String::new(),
+            skill_dirs: vec![],
         };
         let a = build(&src, "Date: x");
         assert_eq!(a[0], ("preamble".into(), DEFAULT_PREAMBLE.into()));

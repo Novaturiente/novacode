@@ -52,7 +52,7 @@ fn cfg(cwd: &Path, home: &Path) -> Config {
             cwd: cwd.into(),
             home: home.into(),
             context_files: true,
-            skills: String::new(),
+            skill_dirs: vec![],
         },
     }
 }
