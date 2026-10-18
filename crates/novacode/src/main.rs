@@ -115,6 +115,9 @@ enum Command {
         session: Option<String>,
         #[arg(long)]
         all: bool,
+        /// List every turn, not only the slowest.
+        #[arg(long)]
+        turns: bool,
     },
     /// Trust a folder's project config (default: the current folder); --revoke to distrust it.
     Trust {
@@ -193,8 +196,8 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             }
             return Ok(doctor::auth_status(&p));
         }
-        Some(Command::Stats { session, all }) => {
-            std::process::exit(stats::run(paths.home(), session.as_deref(), all));
+        Some(Command::Stats { session, all, turns }) => {
+            std::process::exit(stats::run(paths.home(), session.as_deref(), all, turns));
         }
         Some(Command::Models { filter, all, refresh }) => {
             let cache = novacode_ai::connect::cache_path(paths.home());

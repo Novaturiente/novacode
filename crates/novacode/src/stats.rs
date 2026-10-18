@@ -75,8 +75,63 @@ fn tools_table(recs: &[&Record], out: &mut String) {
     }
 }
 
-/// Report of one session's records.
-pub fn session_report(recs: &[Record]) -> String {
+fn turns_table(turns: &[&Record], out: &mut String) {
+    let _ = writeln!(
+        out,
+        "  {:>7} {:>8} {:>8} {:>7} {:>8} {:>7} {:>8} {:>6} {:>8} {:>8} {:>5} {:>6} {:>8}",
+        "task.tn",
+        "wall",
+        "model",
+        "ttft",
+        "thinking",
+        "text",
+        "tool-arg",
+        "wait",
+        "tools",
+        "overhead",
+        "calls",
+        "hit%",
+        "ctx"
+    );
+    for r in turns {
+        if let Record::Turn {
+            task,
+            turn,
+            wall_ms,
+            model_ms,
+            ttft_ms,
+            thinking_ms,
+            text_ms,
+            tool_args_ms,
+            preflight_ms,
+            tools_ms,
+            overhead_ms,
+            tool_calls,
+            hit_pct,
+            ctx_tokens,
+            ..
+        } = r
+        {
+            let _ = writeln!(
+                out,
+                "  {:>7} {:>8} {:>8} {:>7} {:>8} {:>7} {:>8} {:>6} {:>8} {:>8} {tool_calls:>5} {hit_pct:>6.1} {ctx_tokens:>8}",
+                format!("{task}.{turn}"),
+                secs(*wall_ms),
+                secs(*model_ms),
+                ttft_ms.map(secs).unwrap_or("-".into()),
+                secs(*thinking_ms),
+                secs(*text_ms),
+                secs(*tool_args_ms),
+                secs(*preflight_ms),
+                secs(*tools_ms),
+                secs(*overhead_ms),
+            );
+        }
+    }
+}
+
+/// Report of one session's records; `all_turns` lists every turn instead of the slowest.
+pub fn session_report(recs: &[Record], all_turns: bool) -> String {
     let mut out = String::new();
     let all: Vec<&Record> = recs.iter().collect();
     let mut usage = Usage::default();
@@ -110,15 +165,23 @@ pub fn session_report(recs: &[Record]) -> String {
         let _ = writeln!(out, "session {session}  {cwd}  window {}k", window / 1000);
     }
     let other = wall.saturating_sub(model + tools + pre);
+    let idle: u64 = tasks
+        .iter()
+        .filter_map(|t| match t {
+            Record::Task { idle_ms, .. } => *idle_ms,
+            _ => None,
+        })
+        .sum();
     let _ = writeln!(
         out,
-        "{} tasks · {} busy (model {}, tools {}, approvals/checks {}, other {}) · prompt {} tokens, {:.1}% from cache · output {}",
+        "{} tasks · {} busy (model {}, tools {}, approvals/checks {}, other {}) · {} idle between tasks · prompt {} tokens, {:.1}% from cache · output {}",
         tasks.len(),
         secs(wall),
         secs(model),
         secs(tools),
         secs(pre),
         secs(other),
+        secs(idle),
         usage.prompt_total(),
         hit_pct(&usage),
         usage.output
@@ -127,12 +190,13 @@ pub fn session_report(recs: &[Record]) -> String {
         let _ = writeln!(out, "\nTasks");
         let _ = writeln!(
             out,
-            "  {:>3} {:>8} {:>8} {:>8} {:>6} {:>5} {:>5} {:>4} {:>5} {:>6} {:>8}  prompt",
-            "#", "wall", "model", "tools", "wait", "turns", "calls", "err", "retry", "hit%", "ctx"
+            "  {:>3} {:>8} {:>8} {:>8} {:>8} {:>6} {:>5} {:>5} {:>4} {:>5} {:>6} {:>8}  prompt",
+            "#", "idle", "wall", "model", "tools", "wait", "turns", "calls", "err", "retry", "hit%", "ctx"
         );
         for t in &tasks {
             if let Record::Task {
                 task,
+                idle_ms,
                 prompt_preview,
                 wall_ms,
                 model_ms,
@@ -156,7 +220,8 @@ pub fn session_report(recs: &[Record]) -> String {
                 };
                 let _ = writeln!(
                     out,
-                    "  {task:>3} {:>8} {:>8} {:>8} {:>6} {turns:>5} {tool_calls:>5} {tool_errors:>4} {retries:>5} {hit_pct:>6.1} {ctx_tokens:>8}  {p}{stop}",
+                    "  {task:>3} {:>8} {:>8} {:>8} {:>8} {:>6} {turns:>5} {tool_calls:>5} {tool_errors:>4} {retries:>5} {hit_pct:>6.1} {ctx_tokens:>8}  {p}{stop}",
+                    idle_ms.map(secs).unwrap_or("-".into()),
                     secs(*wall_ms),
                     secs(*model_ms),
                     secs(*tools_ms),
@@ -164,6 +229,75 @@ pub fn session_report(recs: &[Record]) -> String {
                 );
             }
         }
+    }
+    let mut turns: Vec<&Record> = all
+        .iter()
+        .copied()
+        .filter(|r| matches!(r, Record::Turn { .. }))
+        .collect();
+    if !turns.is_empty() {
+        let mut split = [0u64; 7];
+        for r in &turns {
+            if let Record::Turn {
+                thinking_ms,
+                text_ms,
+                tool_args_ms,
+                model_ms,
+                preflight_ms,
+                tools_ms,
+                overhead_ms,
+                ..
+            } = r
+            {
+                let wait = model_ms.saturating_sub(thinking_ms + text_ms + tool_args_ms);
+                for (i, v) in [
+                    *thinking_ms,
+                    *text_ms,
+                    *tool_args_ms,
+                    wait,
+                    *preflight_ms,
+                    *tools_ms,
+                    *overhead_ms,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    split[i] += v;
+                }
+            }
+        }
+        let sum: u64 = split.iter().sum::<u64>().max(1);
+        let names = [
+            "thinking",
+            "text",
+            "tool args",
+            "model wait",
+            "approvals/checks",
+            "tools",
+            "overhead",
+        ];
+        let parts: Vec<String> = names
+            .iter()
+            .zip(split)
+            .map(|(n, v)| format!("{n} {} ({:.0}%)", secs(v), v as f64 * 100.0 / sum as f64))
+            .collect();
+        let _ = writeln!(
+            out,
+            "\nWhere turn time went ({} turns)\n  {}",
+            turns.len(),
+            parts.join(" · ")
+        );
+        if all_turns {
+            let _ = writeln!(out, "\nTurns");
+        } else {
+            turns.sort_by_key(|r| match r {
+                Record::Turn { wall_ms, .. } => std::cmp::Reverse(*wall_ms),
+                _ => std::cmp::Reverse(0),
+            });
+            turns.truncate(10);
+            let _ = writeln!(out, "\nSlowest turns (--turns for all)");
+        }
+        turns_table(&turns, &mut out);
     }
     tools_table(&all, &mut out);
     let mut calls: Vec<&Record> = all
@@ -297,7 +431,7 @@ pub fn files(home: &Path) -> Vec<PathBuf> {
 }
 
 /// `novacode stats [session] [--all]`; exit code 1 when nothing matches.
-pub fn run(home: &Path, session: Option<&str>, all: bool) -> i32 {
+pub fn run(home: &Path, session: Option<&str>, all: bool, all_turns: bool) -> i32 {
     let files = files(home);
     if files.is_empty() {
         eprintln!("no metrics yet: set \"debug\": {{\"metrics\": true}} in settings.json, then run a session");
@@ -324,7 +458,7 @@ pub fn run(home: &Path, session: Option<&str>, all: bool) -> i32 {
     };
     match pick {
         Some(p) => {
-            print!("{}", session_report(&load(&p)));
+            print!("{}", session_report(&load(&p), all_turns));
             0
         }
         None => {

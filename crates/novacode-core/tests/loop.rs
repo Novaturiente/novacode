@@ -652,4 +652,14 @@ async fn metrics_record_calls_tools_and_tasks() {
     assert!(*tools_ms >= 300 && wall_ms >= tools_ms, "{task:?}");
     assert_eq!((*turns, *tool_calls, usage.cache_read, usage.input), (2, 1, 900, 200));
     assert_eq!((prompt_preview.as_str(), stop.as_str()), ("run the slow thing", "stop"));
+    let turns: Vec<_> = recs.iter().filter(|r| matches!(r, Record::Turn { .. })).collect();
+    assert_eq!(turns.len(), 2, "{recs:?}");
+    let Record::Turn { turn, wall_ms, model_ms, preflight_ms, tools_ms, overhead_ms, tool_calls, usage, .. } = turns[0] else {
+        panic!()
+    };
+    assert_eq!((*turn, *tool_calls, usage.cache_write), (1, 1, 900));
+    assert!(*tools_ms >= 300, "{:?}", turns[0]);
+    assert_eq!(*wall_ms, model_ms + preflight_ms + tools_ms + overhead_ms, "{:?}", turns[0]);
+    assert!(matches!(turns[1], Record::Turn { turn: 2, tool_calls: 0, .. }));
+    assert!(matches!(task, Record::Task { idle_ms: None, .. }));
 }

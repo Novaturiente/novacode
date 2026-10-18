@@ -3,7 +3,7 @@
 //! `<home>/metrics/<session>.jsonl`. The loop and tools don't know it exists.
 
 use novacode_base::redact::Redactor;
-use novacode_types::{AgentEvent, Block, Message, StopReason, StreamEvent, Usage, estimate};
+use novacode_types::{AgentEvent, Block, BlockKind, Message, StopReason, StreamEvent, Usage, estimate};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -67,10 +67,36 @@ pub enum Record {
     },
     /// Cache misses, warm refreshes, account switches.
     Notice { ts: u64, task: u32, text: String },
+    /// One turn: a model call, then its tools, until the next turn starts.
+    /// `wall_ms = model_ms + preflight_ms + tools_ms + overhead_ms`.
+    Turn {
+        ts: u64,
+        task: u32,
+        turn: u32,
+        wall_ms: u64,
+        model_ms: u64,
+        ttft_ms: Option<u64>,
+        /// Streaming time by block kind, from block start to end (the last attempt).
+        thinking_ms: u64,
+        text_ms: u64,
+        tool_args_ms: u64,
+        /// Reply to first tool start: approvals and checks.
+        preflight_ms: u64,
+        tools_ms: u64,
+        /// Everything else: prompt build, session writes, hooks.
+        overhead_ms: u64,
+        tool_calls: u32,
+        usage: Usage,
+        hit_pct: f64,
+        ctx_tokens: u64,
+    },
     /// One prompt, from start to the loop stopping.
     Task {
         ts: u64,
         task: u32,
+        /// Time since the previous task ended (reading, typing); `None` for the first.
+        #[serde(default)]
+        idle_ms: Option<u64>,
         prompt_preview: String,
         wall_ms: u64,
         /// Time inside model calls.
@@ -170,6 +196,76 @@ struct Task {
     reply_at: Option<Instant>,
     tools_start: Option<Instant>,
     running: BTreeMap<String, Running>,
+    cur: Option<Turn>,
+}
+
+/// The open turn: task totals at its start, so the turn's share is a difference.
+struct Turn {
+    start: Instant,
+    ts: u64,
+    model_ms: u64,
+    tools_ms: u64,
+    preflight_ms: u64,
+    tool_calls: u32,
+    usage: Usage,
+    ttft: Option<u64>,
+    /// thinking, text, tool args.
+    split: [u64; 3],
+    blocks: BTreeMap<usize, (Instant, usize)>,
+}
+
+fn sub(a: &Usage, b: &Usage) -> Usage {
+    Usage {
+        input: a.input - b.input,
+        output: a.output - b.output,
+        cache_read: a.cache_read - b.cache_read,
+        cache_write: a.cache_write - b.cache_write,
+        reasoning: None,
+    }
+}
+
+impl Task {
+    fn open_turn(&mut self, now: Instant) {
+        self.cur = Some(Turn {
+            start: now,
+            ts: now_ms(),
+            model_ms: self.model_ms,
+            tools_ms: self.tools_ms,
+            preflight_ms: self.preflight_ms,
+            tool_calls: self.tool_calls,
+            usage: self.usage,
+            ttft: None,
+            split: [0; 3],
+            blocks: BTreeMap::new(),
+        });
+    }
+
+    fn close_turn(&mut self, now: Instant) -> Option<Record> {
+        let c = self.cur.take()?;
+        let wall_ms = now.duration_since(c.start).as_millis() as u64;
+        let model_ms = self.model_ms - c.model_ms;
+        let preflight_ms = self.preflight_ms - c.preflight_ms;
+        let tools_ms = self.tools_ms - c.tools_ms;
+        let usage = sub(&self.usage, &c.usage);
+        Some(Record::Turn {
+            ts: c.ts,
+            task: self.n,
+            turn: self.turn,
+            wall_ms,
+            model_ms,
+            ttft_ms: c.ttft,
+            thinking_ms: c.split[0],
+            text_ms: c.split[1],
+            tool_args_ms: c.split[2],
+            preflight_ms,
+            tools_ms,
+            overhead_ms: wall_ms.saturating_sub(model_ms + preflight_ms + tools_ms),
+            tool_calls: self.tool_calls - c.tool_calls,
+            usage,
+            hit_pct: hit_pct(&usage),
+            ctx_tokens: self.ctx,
+        })
+    }
 }
 
 /// A started tool call.
@@ -192,7 +288,12 @@ pub async fn record(mut rx: broadcast::Receiver<AgentEvent>, file: PathBuf, head
         }
     };
     // A resumed session continues its task numbers.
-    let mut n = load(&file).iter().filter(|r| matches!(r, Record::Task { .. })).count() as u32;
+    let old = load(&file);
+    let mut n = old.iter().filter(|r| matches!(r, Record::Task { .. })).count() as u32;
+    let mut last_end: Option<u64> = old.iter().rev().find_map(|r| match r {
+        Record::Task { ts, wall_ms, .. } => Some(ts + wall_ms),
+        _ => None,
+    });
     if n == 0 {
         write(&header);
     }
@@ -224,19 +325,52 @@ pub async fn record(mut rx: broadcast::Receiver<AgentEvent>, file: PathBuf, head
                 t.prompt = preview(&redactor, &text_of(&content));
             }
             AgentEvent::TurnStart => {
+                if let Some(r) = t.close_turn(now) {
+                    write(&r);
+                }
+                t.open_turn(now);
                 t.turn += 1;
                 t.call_start = Some((now, now_ms()));
                 t.first_token = None;
                 t.call_retries = 0;
             }
-            AgentEvent::Stream(StreamEvent::BlockStart { .. } | StreamEvent::Delta { .. }) => {
+            AgentEvent::Stream(
+                ev @ (StreamEvent::BlockStart { .. } | StreamEvent::Delta { .. } | StreamEvent::BlockEnd { .. }),
+            ) => {
                 if t.first_token.is_none()
                     && let Some((s, _)) = t.call_start
                 {
                     t.first_token = Some(ms(s));
+                    if let Some(c) = t.cur.as_mut() {
+                        c.ttft = t.first_token;
+                    }
+                }
+                if let Some(c) = t.cur.as_mut() {
+                    match ev {
+                        StreamEvent::BlockStart { index, kind, .. } => {
+                            let k = match kind {
+                                BlockKind::Thinking => 0,
+                                BlockKind::Text => 1,
+                                _ => 2,
+                            };
+                            c.blocks.insert(index, (now, k));
+                        }
+                        StreamEvent::BlockEnd { index, .. } => {
+                            if let Some((s, k)) = c.blocks.remove(&index) {
+                                c.split[k] += ms(s);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
-            AgentEvent::Stream(StreamEvent::RetryRollback) => t.first_token = None,
+            AgentEvent::Stream(StreamEvent::RetryRollback) => {
+                t.first_token = None;
+                if let Some(c) = t.cur.as_mut() {
+                    c.split = [0; 3];
+                    c.blocks.clear();
+                }
+            }
             AgentEvent::Stream(StreamEvent::Notice(text)) => write(&Record::Notice {
                 ts: now_ms(),
                 task: t.n,
@@ -357,10 +491,16 @@ pub async fn record(mut rx: broadcast::Receiver<AgentEvent>, file: PathBuf, head
                 }
             }
             AgentEvent::AgentEnd { stop } => {
+                if let Some(r) = t.close_turn(now) {
+                    write(&r);
+                }
                 let Some(start) = t.start.take() else { continue };
+                let idle_ms = last_end.map(|e| t.ts.saturating_sub(e));
+                last_end = Some(now_ms());
                 write(&Record::Task {
                     ts: t.ts,
                     task: t.n,
+                    idle_ms,
                     prompt_preview: std::mem::take(&mut t.prompt),
                     wall_ms: ms(start),
                     model_ms: t.model_ms,
