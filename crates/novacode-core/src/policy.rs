@@ -206,6 +206,12 @@ impl Policy {
         Ok(self)
     }
 
+    /// Only these tools may run (a subagent definition's `tools`, L10.1).
+    pub fn with_tools(mut self, tools: Vec<String>) -> Self {
+        self.profile.tools = Some(tools);
+        self
+    }
+
     pub fn with_mode(mut self, mode: Mode) -> Self {
         self.perms.mode = mode;
         self

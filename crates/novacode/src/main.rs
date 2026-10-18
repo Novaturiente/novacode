@@ -26,6 +26,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
 mod activity;
+mod agents;
 mod doctor;
 mod host;
 mod hub;
@@ -65,6 +66,9 @@ struct Cli {
     /// Restrict tools to a named profile, e.g. scout (L6.4).
     #[arg(long)]
     profile: Option<String>,
+    /// Run as this subagent definition (L10.1): its tools, role prompt and model.
+    #[arg(long, hide = true)]
+    agent: Option<String>,
     /// Trust this folder's project config for this run only (L6.3).
     #[arg(long)]
     trust: bool,
@@ -633,7 +637,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         None => interactive_loop(ctx, store, model).await,
         Some(prompt) => {
             // Nobody to approve: asks become refusals, risky commands need a justification.
-            let (agent, _) = ctx.agent(store, &model, None, None).await?;
+            let (agent, _) = ctx.agent(store, &model, None, None, None).await?;
             print_mode(
                 agent,
                 prompt,
@@ -778,6 +782,7 @@ impl Ctx {
         model: &str,
         approver: Option<Arc<dyn Approver>>,
         asker: Option<Arc<dyn novacode_tools::ask::Asker>>,
+        slot: Option<hub::HubSlot>,
     ) -> anyhow::Result<(Agent, String)> {
         let route = self.providers.resolve(model)?;
         // `model:level` wins, then the session's own level (resume), then settings.
@@ -810,6 +815,19 @@ impl Ctx {
         if let Some(p) = &self.cli.profile {
             policy = policy.with_profile(p).map_err(anyhow::Error::msg)?;
         }
+        // A subagent: its definition's tools and role prompt (L10.1).
+        let def = match &self.cli.agent {
+            Some(name) => Some(
+                agents::defs(self.paths.home(), &self.cwd, self.trusted)
+                    .into_iter()
+                    .find(|d| &d.name == name)
+                    .with_context(|| format!("no agent definition `{name}`"))?,
+            ),
+            None => None,
+        };
+        if let Some(t) = def.as_ref().and_then(|d| d.tools.clone()) {
+            policy = policy.with_tools(t);
+        }
         let (window_tokens, max_tokens) = models::Limits::new(s).of(&route);
         let cfg = Config {
             cwd: self.cwd.clone(),
@@ -833,6 +851,10 @@ impl Ctx {
                 context_files: !self.cli.no_context_files,
                 skill_dirs: self.skill_dirs(),
                 tool_guidelines: vec![],
+                agent: def
+                    .as_ref()
+                    .filter(|d| !d.prompt.is_empty())
+                    .map(|d| (d.prompt.clone(), d.replace)),
             },
             redactor: {
                 let auth_path = self.paths.home().join("auth.json");
@@ -872,6 +894,30 @@ impl Ctx {
                 project_dir: session::dir_for(&self.paths, &self.cwd),
                 current: store.id().to_string(),
             }));
+        }
+        // Subagents (L10.1): not below the depth limit, and only with windows/RPC to report to.
+        let place = agents::Place::from_env();
+        if let Some(slot) = slot
+            && place.depth < agents::MAX_DEPTH
+        {
+            let small = self.providers.profile(&route.provider).ok().and_then(|p| {
+                p.extra
+                    .get("smallModel")?
+                    .as_str()
+                    .map(|m| format!("{}/{m}", route.provider))
+            });
+            let sup = agents::Supervisor::new(agents::Setup {
+                slot,
+                me: store.id().to_string(),
+                home: self.paths.home().to_path_buf(),
+                cwd: self.cwd.clone(),
+                trusted: self.trusted,
+                stall_min: s.get("agents.stallMinutes").unwrap_or(10),
+                timeout_min: s.get("agents.timeoutMinutes").unwrap_or(45),
+                small_model: small,
+                exe: None,
+            });
+            all.push(Arc::new(agents::AgentTool::new(sup)));
         }
         if memory_on && let Some(file) = store.path() {
             all.push(Arc::new(novacode_core::memory::Recall {
@@ -947,7 +993,13 @@ impl Ctx {
             agent = agent.with_mcp(h);
         }
         // Command hooks (L7.1), then extension handlers; none inside a hook's own novacode (recursion guard).
-        let mut handlers: Vec<Arc<dyn novacode_core::hooks::Handler>> = Vec::new();
+        // File claims first (L10.1): two agents of one tree never edit the same file.
+        let mut handlers: Vec<Arc<dyn novacode_core::hooks::Handler>> = vec![Arc::new(agents::Claims::new(
+            &serve::run_dir(&self.paths),
+            agent.store.id(),
+            place,
+            &self.cwd,
+        ))];
         if !novacode_core::hooks::disabled() {
             let hook_cfg: novacode_core::hooks::Config = s.get("hooks").unwrap_or_default();
             let cmds = Arc::new(novacode_core::hooks::Commands {
@@ -1300,7 +1352,13 @@ async fn start_session(
 ) -> anyhow::Result<(serve::Live, tokio::task::JoinHandle<Agent>)> {
     let slot = hub::HubSlot::default();
     let (agent, spec) = ctx
-        .agent(store, model, Some(Arc::new(slot.clone())), Some(Arc::new(slot.clone())))
+        .agent(
+            store,
+            model,
+            Some(Arc::new(slot.clone())),
+            Some(Arc::new(slot.clone())),
+            Some(slot.clone()),
+        )
         .await?;
     let price = ctx
         .providers

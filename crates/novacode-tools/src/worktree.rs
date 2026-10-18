@@ -98,6 +98,17 @@ struct EnterArgs {
     base: Option<String>,
 }
 
+/// Create (or reuse) `<repo>/.worktrees/<name>` on branch `worktree-<name>`.
+pub fn create(cwd: &Path, name: &str) -> Result<(PathBuf, String), String> {
+    enter(
+        cwd,
+        &EnterArgs {
+            name: name.into(),
+            base: None,
+        },
+    )
+}
+
 fn enter(cwd: &Path, a: &EnterArgs) -> Result<(PathBuf, String), String> {
     if a.name.is_empty() || !a.name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
         return Err(format!("bad worktree name `{}`: letters, digits, . _ - only", a.name));

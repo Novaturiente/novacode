@@ -33,6 +33,8 @@ pub struct Sources {
     pub skill_dirs: Vec<PathBuf>,
     /// Guidelines of the listed tools; the agent fills this from its tools.
     pub tool_guidelines: Vec<String>,
+    /// A subagent's role prompt (L10.1): (text, replaces the preamble).
+    pub agent: Option<(String, bool)>,
 }
 
 /// What drifts during a session: compared before each run.
@@ -116,10 +118,16 @@ pub fn build(src: &Sources, environment: &str) -> Sections {
         };
         out.push((name.into(), text));
     };
-    add(
-        "preamble",
-        read(src.home.join("SYSTEM.md")).unwrap_or_else(|| DEFAULT_PREAMBLE.into()),
-    );
+    match &src.agent {
+        Some((role, true)) => add("preamble", role.clone()),
+        _ => add(
+            "preamble",
+            read(src.home.join("SYSTEM.md")).unwrap_or_else(|| DEFAULT_PREAMBLE.into()),
+        ),
+    }
+    if let Some((role, false)) = &src.agent {
+        add("agent", role.clone());
+    }
     if !src.tool_guidelines.is_empty() {
         let lines: Vec<String> = src.tool_guidelines.iter().map(|g| format!("- {g}")).collect();
         add("tool_guidelines", lines.join("\n"));
@@ -267,6 +275,7 @@ mod tests {
             context_files: false,
             skill_dirs: vec![],
             tool_guidelines: vec![],
+            agent: None,
         };
         let a = build(&src, "Date: x");
         assert_eq!(a[0], ("preamble".into(), DEFAULT_PREAMBLE.into()));

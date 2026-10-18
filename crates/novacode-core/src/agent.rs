@@ -1507,6 +1507,16 @@ impl SessionHandle {
         self.shared.remind("process", text.into(), wake);
     }
 
+    /// A saved hidden note of `kind` (e.g. `agent` for subagent reports).
+    pub fn remind_as(&self, kind: &str, text: impl Into<String>, wake: bool) {
+        self.shared.remind(kind, text.into(), wake);
+    }
+
+    /// Show an event in every window (UI ops, notices); never stored.
+    pub fn emit(&self, ev: AgentEvent) {
+        let _ = self.events.send(ev);
+    }
+
     pub fn steer_content(&self, content: Vec<Block>) {
         self.shared.queues.lock().unwrap().steering.push_back(content);
         self.shared.notify.notify_one();
