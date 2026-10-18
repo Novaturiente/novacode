@@ -32,6 +32,11 @@ impl Tool for Bash {
     fn name(&self) -> &str {
         "bash"
     }
+    fn guidelines(&self) -> &[&str] {
+        &[
+            "Commands run without a terminal and can't take input: use non-interactive forms (`-y`, `--no-pager`, `--no-edit`, `CI=1`), never commands that prompt or open an editor or pager.",
+        ]
+    }
     fn description(&self) -> &str {
         "Run a shell command. stdout and stderr are merged; long output keeps the tail. stdin is closed, so interactive commands fail instead of waiting."
     }

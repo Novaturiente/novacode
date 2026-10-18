@@ -33,6 +33,9 @@ impl Tool for Edit {
     fn name(&self) -> &str {
         "edit"
     }
+    fn guidelines(&self) -> &[&str] {
+        &["Change files with `edit`, not with sed, perl or scripts run through bash."]
+    }
     fn description(&self) -> &str {
         "Replace text in a file. Each old_text must match exactly one place in the current file (whitespace-tolerant fallback). All edits apply together or none do."
     }

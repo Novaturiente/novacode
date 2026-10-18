@@ -168,6 +168,9 @@ impl Tool for ApplyPatch {
     fn name(&self) -> &str {
         "apply_patch"
     }
+    fn guidelines(&self) -> &[&str] {
+        &["Change files with `apply_patch`, not with sed, perl or scripts run through bash."]
+    }
     fn description(&self) -> &str {
         "Edit files with a patch: *** Begin Patch, then *** Add File: <path> (lines with +), *** Delete File: <path>, or *** Update File: <path> (optional *** Move to: <path>) with @@ hunks of ' ' context, '-' removed and '+' added lines; then *** End Patch."
     }

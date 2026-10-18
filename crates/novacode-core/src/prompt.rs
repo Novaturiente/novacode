@@ -31,6 +31,8 @@ pub struct Sources {
     /// Skill folders, earlier ones winning a name clash (L4.10). Read on every rebuild,
     /// so a new skill reaches the model as a section delta.
     pub skill_dirs: Vec<PathBuf>,
+    /// Guidelines of the listed tools; the agent fills this from its tools.
+    pub tool_guidelines: Vec<String>,
 }
 
 /// What drifts during a session: compared before each run.
@@ -118,6 +120,10 @@ pub fn build(src: &Sources, environment: &str) -> Sections {
         "preamble",
         read(src.home.join("SYSTEM.md")).unwrap_or_else(|| DEFAULT_PREAMBLE.into()),
     );
+    if !src.tool_guidelines.is_empty() {
+        let lines: Vec<String> = src.tool_guidelines.iter().map(|g| format!("- {g}")).collect();
+        add("tool_guidelines", lines.join("\n"));
+    }
     if let Some(a) = read(src.home.join("APPEND_SYSTEM.md")) {
         add("addendum", a);
     }
@@ -260,6 +266,7 @@ mod tests {
             home: d.path().join("h"),
             context_files: false,
             skill_dirs: vec![],
+            tool_guidelines: vec![],
         };
         let a = build(&src, "Date: x");
         assert_eq!(a[0], ("preamble".into(), DEFAULT_PREAMBLE.into()));

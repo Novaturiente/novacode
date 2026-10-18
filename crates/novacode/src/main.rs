@@ -407,6 +407,7 @@ impl Ctx {
                 home: self.paths.home().to_path_buf(),
                 context_files: !self.cli.no_context_files,
                 skill_dirs: self.skill_dirs(),
+                tool_guidelines: vec![],
             },
             redactor: {
                 let auth_path = self.paths.home().join("auth.json");

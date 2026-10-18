@@ -53,6 +53,7 @@ fn cfg(cwd: &Path, home: &Path) -> Config {
             home: home.into(),
             context_files: true,
             skill_dirs: vec![],
+            tool_guidelines: vec![],
         },
         warm: false,
     }

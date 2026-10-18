@@ -172,9 +172,10 @@ impl Agent {
         adapter: Arc<dyn Adapter>,
         tools: Vec<Arc<dyn Tool>>,
         mut store: Store,
-        cfg: Config,
+        mut cfg: Config,
         env: Arc<dyn ExecutionEnv>,
     ) -> Self {
+        cfg.prompt.tool_guidelines = novacode_tools::guidelines(&tools);
         refresh_prompt(&mut store, &cfg.prompt);
         if store.last_model() != Some((cfg.provider.clone(), cfg.model.clone())) {
             log_err(store.append(EntryKind::ModelChange {
