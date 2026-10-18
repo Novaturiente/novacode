@@ -1618,6 +1618,15 @@ async fn serve_headless(ctx: &Ctx, store: Store, model: String) -> anyhow::Resul
 
 /// `/restart` (L8.10): exec the binary on disk again, resuming this session.
 /// Returns only if exec failed.
+/// After a rebuild or update, Linux names the running binary `<path> (deleted)`; the
+/// new binary sits at `<path>`, which is what /restart is for.
+fn live_path(exe: std::path::PathBuf) -> std::path::PathBuf {
+    match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(p) => p.into(),
+        None => exe,
+    }
+}
+
 fn restart(id: &str) -> anyhow::Error {
     use std::os::unix::process::CommandExt;
     let mut args = Vec::new();
@@ -1635,7 +1644,7 @@ fn restart(id: &str) -> anyhow::Error {
     }
     args.extend(["-r".into(), id.to_string()]);
     let exe = match std::env::current_exe() {
-        Ok(e) => e,
+        Ok(e) => live_path(e),
         Err(e) => return e.into(),
     };
     anyhow::anyhow!("restart failed: {}", std::process::Command::new(exe).args(args).exec())
@@ -1823,14 +1832,24 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
             continue;
         }
         if let Exit::Branch(action, at) = &res {
+            let old = agent.store.id().to_string();
             let (s, err) = branch(&ctx, agent.store, *action, at.as_deref(), &mut draft);
             store = s;
+            use novacode_tui::app::BranchAction as A;
+            if err.is_none() && matches!(action, A::Fork | A::Clone) {
+                let verb = if at.is_none() { "cloned" } else { "forked" };
+                info.push(format!(
+                    "{verb} into a new session {}; the old one stays (novacode -r {})",
+                    store.id(),
+                    &old[..old.len().min(13)]
+                ));
+            }
             notices.extend(err);
             continue;
         }
         if res == Exit::Reload {
             notices.extend(ctx.reload());
-            info.push("reloaded settings, keys, theme, skills and context files".into());
+            info.push("reloaded settings, keys, theme, extensions, MCP servers, skills and context files".into());
             store = agent.store;
             continue;
         }
@@ -2275,6 +2294,13 @@ fn percent_decode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn restart_uses_the_rebuilt_binary() {
+        let p = |s: &str| super::live_path(s.into());
+        assert_eq!(p("/x/novacode (deleted)"), std::path::PathBuf::from("/x/novacode"));
+        assert_eq!(p("/x/novacode"), std::path::PathBuf::from("/x/novacode"));
+    }
+
     #[test]
     fn percent_decoding() {
         assert_eq!(super::percent_decode("4%2F0Ab-x%3D"), "4/0Ab-x=");

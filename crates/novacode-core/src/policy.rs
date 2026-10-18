@@ -301,6 +301,11 @@ impl Policy {
                         r.reason.trim_start_matches("rm ")
                     ));
                 }
+                // Auto mode never asks, like pi (user choice, revision L6.2): only the
+                // catastrophic list above and the user's own ask/deny rules stop a command.
+                Level::Confirm if self.perms.mode == Mode::Auto => {
+                    tracing::info!(command, reason = %r.reason, "risky command run in auto mode");
+                }
                 Level::Confirm => {
                     if interactive {
                         // The user already approved this exact command; don't ask twice.
@@ -450,11 +455,22 @@ mod tests {
 
     #[test]
     fn auto_mode_and_the_risk_gate() {
-        let p = policy(json!({ "allow": ["Bash(rm:*)"] }));
-        assert_eq!(check(&p, "bash", bash("cargo test"), false), Verdict::Allow);
+        let auto = policy(json!({}));
+        // Auto mode: risky-but-ordinary commands run without asking; catastrophic ones never do.
+        assert_eq!(check(&auto, "bash", bash("rm -rf target"), true), Verdict::Allow);
+        assert_eq!(check(&auto, "bash", bash("git reset --hard"), false), Verdict::Allow);
+        assert!(denied(&check(&auto, "bash", bash("rm -rf ~"), false)));
+        // The user's own ask rules still ask.
+        let rule = policy(json!({ "ask": ["Bash(rm:*)"] }));
+        assert!(matches!(
+            check(&rule, "bash", bash("rm -rf target"), true),
+            Verdict::Ask { .. }
+        ));
+
+        let p = policy(json!({ "allow": ["Bash(rm:*)"] })).with_mode(Mode::Ask);
         // An allow rule can't unlock a catastrophic command.
         assert!(denied(&check(&p, "bash", bash("rm -rf ~"), true)));
-        // Confirm: asks a present user, needs a justification headless.
+        // Ask mode, Confirm: asks a present user, needs a justification headless.
         assert!(matches!(
             check(&p, "bash", bash("rm -rf target"), true),
             Verdict::Ask { risky: true, .. }

@@ -104,7 +104,12 @@ pub async fn doctor(p: &Arc<Providers>, settings: &Settings, key_problems: Vec<S
         failed = true;
         println!("  ✗ nothing connected: run `novacode login <provider>` or set an API key");
     }
-    let diags = settings.diagnostics();
+    let mut diags = settings.diagnostics();
+    for d in settings.check() {
+        if !diags.contains(&d) {
+            diags.push(d);
+        }
+    }
     println!("settings");
     if diags.is_empty() {
         println!("  ✓ no problems");

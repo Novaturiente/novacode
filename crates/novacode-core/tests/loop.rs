@@ -373,19 +373,14 @@ async fn policy_gates_every_call_in_the_loop() {
     let reqs = faux.requests.lock().unwrap();
     let r: Vec<String> = reqs[1].messages.iter().rev().take(4).rev().map(result_text).collect();
     assert!(r[0].contains("can never run"), "{}", r[0]);
-    // Held, not run: the result is the refusal, not bash output.
-    assert!(
-        r[1].contains("Held by the safety check") && r[1].contains("justification"),
-        "{}",
-        r[1]
-    );
+    // Auto mode never asks (revision L6.2): the risky-but-ordinary command just runs.
+    assert!(!r[1].contains("safety check") && !r[1].contains("Held"), "{}", r[1]);
     assert!(r[2].contains("git push"), "{}", r[2]);
     assert!(
         r[3].contains("[redacted: claude login]") && !r[3].contains("SECRET-TOKEN"),
         "{}",
         r[3]
     );
-    // With a justification the held command runs (headless).
     assert!(!work.path().join("target").exists());
 }
 

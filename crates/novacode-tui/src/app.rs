@@ -340,6 +340,7 @@ impl App {
             expand_all: !init.collapse_turns,
             thinking: init.thinking,
             thinking_hint: init.keymap.keys(A::ThinkingToggle),
+            tools_hint: init.keymap.keys(A::ToolsExpand),
             ..Default::default()
         };
         let mut history = Vec::new();
@@ -886,10 +887,12 @@ impl App {
             Some(A::ModelSelect) => self.list_models(),
             Some(A::SessionResume) => self.send(Cmd::ListSessions),
             Some(A::SessionNew) => self.exit = Some(Exit::New),
-            Some(A::ToolsExpand) => match self.tr.last_tool() {
-                Some((title, out)) => self.overlay = Some(Overlay::Pager(Pager::new(title, &out, &self.theme))),
-                None => self.flash("no tool output yet"),
-            },
+            // pi's Ctrl+O: every tool's output in full, inline; again to fold it back.
+            Some(A::ToolsExpand) => {
+                let on = !self.tr.tools_full;
+                self.tr.set_tools_full(on);
+                self.flash(if on { "tool output: full" } else { "tool output: short" });
+            }
             Some(A::KeysHelp) => self.overlay = Some(Overlay::Pager(Pager::keys_help(&self.keymap, &self.theme))),
             Some(A::MessageCopy) => self.copy_reply(),
             Some(A::Background) => self.send(Cmd::Background),
@@ -1135,7 +1138,9 @@ impl App {
                 },
             })
             .collect();
-        self.overlay = Some(Overlay::Thinking(Picker::new("Thinking level", items)));
+        self.overlay = Some(Overlay::Thinking(
+            Picker::new("Thinking level", items).select_value(self.init.level.as_str()),
+        ));
     }
 
     fn set_thinking(&mut self, s: &str) {

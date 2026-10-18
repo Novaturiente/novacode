@@ -676,7 +676,9 @@ fn convert_messages(messages: &[Message], ns: &str, native_system: bool) -> (Vec
         .take_while(|m| matches!(m, Message::System { .. }))
         .count();
     let reminder = |t: &str| json!({ "type": "text", "text": format!("<system-reminder>\n{t}\n</system-reminder>") });
-    // A native system message must follow a user message: deltas wait for the next one.
+    // A native system turn must follow a user turn and precede an assistant one (or end
+    // the request): held deltas go just before the next reply, never between two user
+    // turns (a dropped aborted reply or a saved reminder would put them there).
     let mut held: Vec<Value> = Vec::new();
     // The last wire turn is a user one (prompt or tool_result), so a system turn may follow.
     let mut after_user = false;
@@ -700,9 +702,6 @@ fn convert_messages(messages: &[Message], ns: &str, native_system: bool) -> (Vec
             Message::User { content } => {
                 push("user", content.iter().filter_map(user_block).collect(), None);
                 after_user = true;
-                if !held.is_empty() {
-                    push("system", std::mem::take(&mut held), None);
-                }
             }
             Message::Assistant(a) => {
                 // Held blocks go before the next reply too (pi): after a tool_result,
@@ -737,8 +736,8 @@ fn convert_messages(messages: &[Message], ns: &str, native_system: bool) -> (Vec
             }
         }
     }
-    // Tool additions at the end follow a tool_result (a user turn): send them as is.
-    if held.iter().any(|b| b["type"] == "tool_addition") && after_user {
+    // At the end, after a user turn, a system turn is allowed as is.
+    if !held.is_empty() && after_user {
         push("system", std::mem::take(&mut held), None);
     }
     // Nothing followed: keep the text as a reminder rather than lose it.
@@ -799,6 +798,46 @@ mod tests {
             thinking: None,
             images: true,
             session: None,
+        }
+    }
+
+    #[test]
+    fn system_turn_never_sits_between_two_user_turns() {
+        let sys = |t: &str| Message::System { text: t.into() };
+        let reply = |t: &str| {
+            Message::Assistant(AssistantMessage {
+                content: vec![Block::text(t)],
+                stop: StopReason::Stop,
+                usage: Usage::default(),
+                provider: PROVIDER.into(),
+                model: "claude-opus-5-5".into(),
+                response_id: None,
+                error_message: None,
+                thinking_level: None,
+            })
+        };
+        // A delta, then a second user turn (a saved reminder, or the prompt after an
+        // aborted reply that the transform drops), then the reply.
+        let history = vec![
+            sys("prompt"),
+            Message::user("a"),
+            sys("mode delta"),
+            Message::user("<system-reminder>x</system-reminder>"),
+            reply("ok"),
+            Message::user("b"),
+        ];
+        let mut r = req(history);
+        r.model = "claude-opus-5-5".into();
+        let b = build_body(&r, None, PROVIDER);
+        let roles: Vec<&str> = b["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles[..4], ["user", "system", "assistant", "user"], "{roles:?}");
+        for w in roles.windows(3) {
+            assert!(!(w[0] == "user" && w[1] == "system" && w[2] == "user"), "{roles:?}");
         }
     }
 

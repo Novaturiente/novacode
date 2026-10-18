@@ -90,7 +90,7 @@ defs! {
     Exit, "app.exit", App, ["ctrl+d"], "Quit when the editor is empty";
     Suspend, "app.suspend", App, ["ctrl+z"], "Suspend to the shell";
     ModelSelect, "app.model.select", App, ["ctrl+l"], "Pick a model";
-    ToolsExpand, "app.tools.expand", App, ["ctrl+o"], "Show the last tool's full output";
+    ToolsExpand, "app.tools.expand", App, ["ctrl+o"], "Show every tool's output in full, or short again";
     TurnsToggle, "app.turns.toggle", App, ["alt+o"], "Expand or collapse finished turns";
     ExternalEditor, "app.editor.external", App, ["ctrl+g"], "Edit the prompt in $EDITOR";
     FollowUp, "app.message.followUp", App, ["alt+enter"], "Queue as a follow-up";

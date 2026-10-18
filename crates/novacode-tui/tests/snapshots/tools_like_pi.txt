@@ -1,0 +1,40 @@
+ ╭──────────────────────────────────────────────────────────────────╮
+ │ ask and spawn                                                    │
+ ╰──────────────────────────────────────────────────────────────────╯
+ ▾ 3 tool calls
+
+ ● ask_user "Which database?" (+1 more)
+ ▏ Q: Which database?
+ ▏ A: pg
+ ▏ Q: Name?
+ ▏ A: nova
+
+ ● agent action="read" id="a10"
+ ▏ report line 1
+ ▏ report line 2
+ ▏ report line 3
+ ▏ report line 4
+ ▏ report line 5
+ ▏ report line 6
+ ▏ report line 7
+ ▏ report line 8
+ ▏ report line 9
+ ▏ report line 10
+ ▏ … (4 more lines, ctrl+o to expand)
+
+ ● codemode
+ ▏ const a = await tools.read({path: 'x'});
+ ▏ text(a);
+ ▏ hello from x
+
+
+
+
+
+
+
+
+╭────────────────────────────────────────────────────────────────────╮
+│                                                                    │
+╰────────────────────────────────────────────────────────────────────╯
+ ● ready       ctx 16%  cache 97%  claude/opus · medium  proj  ⎇ main

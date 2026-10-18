@@ -56,6 +56,12 @@ impl Picker {
         }
     }
 
+    /// Start on the item with this value (the current choice).
+    pub fn select_value(mut self, value: &str) -> Self {
+        self.sel = self.items.iter().position(|i| i.value == value).unwrap_or(0);
+        self
+    }
+
     fn visible(&self) -> Vec<&PickItem> {
         if self.filter.is_empty() {
             return self.items.iter().collect();
@@ -210,7 +216,7 @@ impl ApprovalCard {
 
     fn lines(&self, w: usize, t: &Theme) -> Vec<Line<'static>> {
         let r = &self.req;
-        // Line by line: `sanitize` drops newlines, which glued multi-line commands together.
+        // Line by line: `wrap::wrap` runs lines together, which glued multi-line commands.
         let mut lines: Vec<Line<'static>> = r
             .detail
             .lines()

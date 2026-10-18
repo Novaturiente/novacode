@@ -88,6 +88,14 @@ impl Host {
                 }
             }
             Cmd::Prompt(t) | Cmd::Steer(t) if t.starts_with('/') && self.ext_command(&t, ui).await => {}
+            // `/typo` alone on a line is a mistyped command, not a prompt (`/tmp is full` is).
+            Cmd::Prompt(t) | Cmd::Steer(t) if self.unknown_command(&t) => {
+                let name = t.split_whitespace().next().unwrap_or_default();
+                let _ = ui.send(UiEvent::Notice {
+                    text: format!("unknown command {name} (Alt+/ lists keys; type / for commands)"),
+                    error: true,
+                });
+            }
             Cmd::Prompt(t) | Cmd::Steer(t) => {
                 let t = match &self.extensions {
                     Some(e) => match e.input(&t, steer).await {
@@ -398,13 +406,24 @@ impl Host {
             (_, name) => Some(name),
         };
         match m.set(target) {
-            Ok(()) => say(
-                match target {
-                    Some(n) => format!("{n} mode on (from the next step)"),
-                    None => "mode off".into(),
-                },
-                false,
-            ),
+            Ok(()) => {
+                // A lasting marker in every window's status line while a mode is on.
+                self.hub.handle.emit(novacode_types::AgentEvent::Ui {
+                    ext: "novacode".into(),
+                    op: novacode_types::ui::UiOp::Status {
+                        key: "mode".into(),
+                        text: target.map(|n| format!("⏸ {n} mode")),
+                        style: Some("warn".into()),
+                    },
+                });
+                say(
+                    match target {
+                        Some(n) => format!("{n} mode on (from the next step)"),
+                        None => "mode off".into(),
+                    },
+                    false,
+                )
+            }
             Err(e) => {
                 say(e, true);
                 return None;
@@ -414,6 +433,20 @@ impl Host {
     }
 
     /// Every slash command: built-ins, then templates and skills (L8.9).
+    fn unknown_command(&self, t: &str) -> bool {
+        let name = t.split_whitespace().next().unwrap_or_default();
+        let shaped = name.len() > 1
+            && name[1..]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_:".contains(c))
+            && name.as_bytes()[0] == b'/';
+        shaped
+            && !self
+                .commands()
+                .iter()
+                .any(|(c, _)| c == name || c.split_whitespace().next() == Some(name))
+    }
+
     pub fn commands(&self) -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = novacode_tui::app::COMMANDS
             .iter()

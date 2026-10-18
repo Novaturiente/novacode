@@ -60,11 +60,38 @@ enum Tok {
 
 /// Split into words and operators, honouring quotes. `$(…)` and backtick
 /// bodies are returned separately so they can be classified too.
+/// `$(…)` and backtick bodies in an unquoted heredoc body.
+fn expansions(body: &str) -> Option<Vec<String>> {
+    let c: Vec<char> = body.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < c.len() {
+        match c[i] {
+            '\\' => i += 1,
+            '$' if c.get(i + 1) == Some(&'(') => {
+                let (b, end) = paren_body(&c, i + 2)?;
+                out.push(b);
+                i = end;
+            }
+            '`' => {
+                let end = c[i + 1..].iter().position(|&x| x == '`')? + i + 1;
+                out.push(c[i + 1..end].iter().collect());
+                i = end;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Some(out)
+}
+
 fn lex(src: &str) -> Option<(Vec<Tok>, Vec<String>)> {
     let mut toks = Vec::new();
     let mut subs = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
+    // Heredocs opened on this line: (delimiter, strip leading tabs, delimiter quoted).
+    let mut heredocs: Vec<(String, bool, bool)> = Vec::new();
     let c: Vec<char> = src.chars().collect();
     let mut i = 0;
     let flush = |word: &mut String, in_word: &mut bool, toks: &mut Vec<Tok>| {
@@ -144,6 +171,29 @@ fn lex(src: &str) -> Option<(Vec<Tok>, Vec<String>)> {
             ';' | '\n' => {
                 flush(&mut word, &mut in_word, &mut toks);
                 toks.push(Tok::Sep(";".into()));
+                if ch == '\n' && !heredocs.is_empty() {
+                    // Heredoc bodies are data, not commands. Unquoted ones still expand
+                    // `$(…)` and backticks, so those are classified.
+                    i += 1;
+                    for (delim, strip, quoted) in std::mem::take(&mut heredocs) {
+                        let mut body = String::new();
+                        while i < c.len() {
+                            let end = c[i..].iter().position(|&x| x == '\n').map_or(c.len(), |p| p + i);
+                            let line: String = c[i..end].iter().collect();
+                            i = (end + 1).min(c.len());
+                            let l = if strip { line.trim_start_matches('\t') } else { &line };
+                            if l == delim {
+                                break;
+                            }
+                            body.push_str(&line);
+                            body.push('\n');
+                        }
+                        if !quoted {
+                            subs.extend(expansions(&body)?);
+                        }
+                    }
+                    continue;
+                }
             }
             '&' | '|' => {
                 // `&>` / `>&` redirect forms.
@@ -185,6 +235,45 @@ fn lex(src: &str) -> Option<(Vec<Tok>, Vec<String>)> {
                     i += 1;
                 }
                 toks.push(Tok::Redirect);
+            }
+            '<' if c.get(i + 1) == Some(&'<') && c.get(i + 2) != Some(&'<') => {
+                // `<<DELIM` / `<<-DELIM`: the body starts on the next line.
+                flush(&mut word, &mut in_word, &mut toks);
+                i += 2;
+                let strip = c.get(i) == Some(&'-');
+                if strip {
+                    i += 1;
+                }
+                while matches!(c.get(i), Some(' ' | '\t')) {
+                    i += 1;
+                }
+                let mut delim = String::new();
+                let mut quoted = false;
+                while let Some(&d) = c.get(i) {
+                    match d {
+                        '\'' | '"' => {
+                            quoted = true;
+                            let end = c[i + 1..].iter().position(|&x| x == d)? + i + 1;
+                            delim.extend(&c[i + 1..end]);
+                            i = end + 1;
+                        }
+                        '\\' => {
+                            quoted = true;
+                            delim.extend(c.get(i + 1));
+                            i += 2;
+                        }
+                        ' ' | '\t' | '\n' | ';' | '|' | '&' | '<' | '>' | '(' | ')' => break,
+                        x => {
+                            delim.push(x);
+                            i += 1;
+                        }
+                    }
+                }
+                if delim.is_empty() {
+                    return None;
+                }
+                heredocs.push((delim, strip, quoted));
+                continue;
             }
             '<' => flush(&mut word, &mut in_word, &mut toks),
             x => {
@@ -737,6 +826,19 @@ mod tests {
             ("echo hi >&2", Safe),
             ("find . -name '*.rs'", Safe),
             ("git branch", Safe),
+            // Heredoc bodies are data (the screenshot case: JS with `=>` and `{`).
+            (
+                "cat > ./q.mjs <<'EOF'\nconst f = (s)=>{ return a > b; };\nconsole.log(x >> 2);\nEOF",
+                Low,
+            ),
+            ("cat <<-EOF | grep x\n\tplain > text {\n\tEOF", Safe),
+            ("python3 - <<EOF\nprint(1 > 0)\nEOF\necho done", Low),
+            ("grep x <<< 'a > b'", Safe),
+            // …but what runs around or inside them is still checked.
+            ("cat <<EOF\n$(rm -rf ~)\nEOF", Catastrophic),
+            ("cat <<'EOF'\n$(rm -rf ~)\nEOF", Safe),
+            ("cat > a.txt <<'EOF'\nx\nEOF\nrm -rf ~", Catastrophic),
+            ("cat <<EOF && rm -rf /\nbody\nEOF", Catastrophic),
             // Ordinary changes
             ("cargo build", Low),
             ("echo x > out.txt", Low),
@@ -799,6 +901,34 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+    }
+
+    #[test]
+    fn heredoc_script_from_the_field_is_not_confirm() {
+        // A real card the user hit: JS in a quoted heredoc read as shell redirects.
+        let cmd = r#"cd /home/user/Projects/app && cat > ./qpeek.mjs <<'EOF'
+import Redis from "ioredis";
+const u = process.env.SPEECH_REDIS_URL || process.env.REDIS_URL;
+console.log("using", process.env.SPEECH_REDIS_URL ? "SPEECH_REDIS_URL":"REDIS_URL", "host:", new URL(u).hostname);
+const r = new Redis(u, { connectTimeout: 5000, maxRetriesPerRequest: 2 });
+for (const q of ["speech:jobs","pron:jobs"]) {
+  const items = await r.lrange(q, 0, -1);
+  const rows = items.map(s=>{ const j=JSON.parse(s); const ts=parseInt(String(j.id).replace(/^t-/,"").split("-")[0],36); return [new Date(ts).toISOString(), j.engine ?? "-", j.id]; });
+  console.log(q, rows.length, "oldest", rows[0], "newest", rows[rows.length-1]);
+  console.log(" engines:", rows.reduce((a,x)=>(a[x[1]]=(a[x[1]]||0)+1,a),{}));
+}
+await r.quit();
+EOF
+node ./qpeek.mjs"#;
+        let home = Path::new("/home/user");
+        let ctx = Ctx {
+            cwd: home,
+            home,
+            protected: &[],
+        };
+        let r = classify(cmd, &ctx);
+        assert!(r.level < Level::Confirm, "{r:?}");
+        assert_eq!(segments(cmd).unwrap().len(), 3, "{:?}", segments(cmd));
     }
 
     #[test]

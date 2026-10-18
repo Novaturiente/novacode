@@ -254,12 +254,79 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
+/// Allowed values of the string keys that take one of a fixed set.
+pub const CHOICES: &[(&str, &[&str])] = &[
+    ("thinking", &["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
+    ("cacheRetention", &["short", "long"]),
+    (
+        "tools.<name>.exposure",
+        &["listed", "codemode", "codemode-only", "deferred", "hidden"],
+    ),
+    ("ui.thinking", &["collapsed", "full", "hidden"]),
+    ("ui.icons", &["nerd", "unicode"]),
+    ("ui.images", &["auto", "kitty", "iterm2", "sixel", "halfblocks", "off"]),
+    ("ui.panel.host", &["inline", "tmux", "auto"]),
+];
+
+fn matches(pattern: &str, key: &str) -> bool {
+    let (a, b): (Vec<_>, Vec<_>) = (pattern.split('.').collect(), key.split('.').collect());
+    a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| x.starts_with('<') || x == y)
+}
+
+/// Problems in a merged settings value: unknown keys, wrong types, values outside a
+/// fixed set. Objects documented as a whole (`providers`, `hooks`, …) aren't looked into.
+pub fn check(v: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    walk(v, "", &mut out);
+    out
+}
+
+fn walk(v: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+    use serde_json::Value;
+    if !path.is_empty()
+        && let Some((k, ty, ..)) = KEYS.iter().find(|(k, ..)| matches(k, path))
+    {
+        let ok = match *ty {
+            "string" => v.is_string(),
+            "number" => v.is_number(),
+            "bool" => v.is_boolean(),
+            _ => v.is_object(),
+        };
+        if !ok {
+            out.push(format!("`{path}`: expected a {ty}, got {v}; using the default"));
+        } else if let (Some((_, allowed)), Some(s)) = (CHOICES.iter().find(|(c, _)| *c == *k), v.as_str())
+            && !allowed.contains(&s)
+        {
+            out.push(format!(
+                "`{path}`: `{s}` is not one of {}; using the default",
+                allowed.join(", ")
+            ));
+        }
+        return;
+    }
+    let prefix = |k: &str| {
+        let n = if path.is_empty() { 0 } else { path.split('.').count() };
+        let parts: Vec<_> = k.split('.').collect();
+        parts.len() > n && matches(&parts[..n].join("."), path)
+    };
+    match v {
+        Value::Object(m) if path.is_empty() || KEYS.iter().any(|(k, ..)| prefix(k)) => {
+            for (k, child) in m {
+                let p = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
+                walk(child, &p, out);
+            }
+        }
+        _ => out.push(format!("`{path}`: unknown setting (see docs/config.md)")),
+    }
+}
+
 /// Whether `key` is in [`KEYS`]; a `<name>` segment matches any one segment.
 pub fn documented(key: &str) -> bool {
-    KEYS.iter().any(|(k, ..)| {
-        let (a, b): (Vec<_>, Vec<_>) = (k.split('.').collect(), key.split('.').collect());
-        a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| x.starts_with('<') || x == y)
-    })
+    KEYS.iter().any(|(k, ..)| matches(k, key))
 }
 
 /// The Markdown reference in `docs/config.md`.
@@ -296,5 +363,32 @@ mod tests {
             "docs/config.md is stale: run with UPDATE_SNAPSHOTS=1"
         );
         assert!(documented("tools.bash.exposure") && !documented("tools.bash"));
+    }
+
+    #[test]
+    fn check_finds_unknown_keys_types_and_choices() {
+        let v = serde_json::json!({
+            "ui": {"icons": "bogus", "theme": "light", "panel": {"auto": "yes"}},
+            "thinking": "super", "maxTokens": "x", "bogusKey": 1,
+            "providers": {"x": {"apiKey": "k"}},
+            "tools": {"bash": {"exposure": "codemode"}, "read": {"exposure": "nope"}},
+            "memory": {"enabled": true, "typo": 1}
+        });
+        let p = check(&v);
+        let has = |s: &str| p.iter().any(|m| m.contains(s));
+        assert!(
+            has("`ui.icons`: `bogus`") && has("`thinking`: `super`") && has("`maxTokens`: expected a number"),
+            "{p:?}"
+        );
+        assert!(
+            has("`ui.panel.auto`: expected a bool") && has("`bogusKey`: unknown") && has("`memory.typo`: unknown"),
+            "{p:?}"
+        );
+        assert!(
+            has("`tools.read.exposure`: `nope`") && !has("tools.bash") && !has("providers") && !has("ui.theme"),
+            "{p:?}"
+        );
+        assert_eq!(p.len(), 7, "{p:?}");
+        assert!(check(&serde_json::json!({"model": "claude/x", "ui": {"turnCollapse": false}})).is_empty());
     }
 }

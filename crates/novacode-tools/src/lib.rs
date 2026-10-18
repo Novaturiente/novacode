@@ -60,7 +60,8 @@ impl ToolOutput {
 pub enum Exposure {
     /// Declared to the model.
     Listed,
-    /// Callable only from codemode scripts (L7.5).
+    /// Callable only from codemode scripts (L7.5). `codemode` is pi's spelling.
+    #[serde(alias = "codemode")]
     CodemodeOnly,
     /// Found through `tool_search` (L5.17).
     Deferred,

@@ -7,18 +7,18 @@
 
  Running the tests.
 
- ● bash  $ cargo test  2.3s
+ ● bash $ cargo test  2.3s
    see what fails
-   … 1 more line
-   test a ... ok
-   test b ... FAILED
-   assertion failed: 1 == 2
-   [exit code 101]
+ ▏ … (1 more line, ctrl+o to expand)
+ ▏ test a ... ok
+ ▏ test b ... FAILED
+ ▏ assertion failed: 1 == 2
+ ▏ [exit code 101]
 
- ● edit  src/lib.rs
-   Edited src/lib.rs
-   12- assert_eq!(1, 2);
-   12+ assert_eq!(2, 2);
+ ● edit src/lib.rs
+ ▏ Edited src/lib.rs
+ ▏ 12- assert_eq!(1, 2);
+ ▏ 12+ assert_eq!(2, 2);
 
  Fixed: the assertion in src/lib.rs compared 1 with 2.
 

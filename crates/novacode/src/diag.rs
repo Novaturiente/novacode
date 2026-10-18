@@ -17,6 +17,17 @@ pub fn install_crash_hook(paths: &Paths) {
     let redactor = crate::export_redactor(paths);
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // `novacode models | head`: the reader left. Rust ignores SIGPIPE, so println!
+        // panics; quit quietly like a normal CLI (exit code 141 = SIGPIPE).
+        let msg = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        if msg.contains("failed printing to std") && msg.contains("Broken pipe") {
+            std::process::exit(141);
+        }
         let bt = std::backtrace::Backtrace::force_capture();
         let thread = std::thread::current().name().unwrap_or("?").to_string();
         let text = format!(

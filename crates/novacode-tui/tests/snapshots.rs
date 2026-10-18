@@ -194,6 +194,76 @@ fn run_events(app: &mut App) {
 }
 
 #[test]
+fn back_to_back_thinking_reads_as_one_block() {
+    let (mut a, _rx) = app(vec![]);
+    a.on_agent(AgentEvent::Message(Message::user("go")));
+    let th = |t: &str| Block::Thinking {
+        text: t.into(),
+        replay: None,
+    };
+    a.on_agent(AgentEvent::Message(assistant(
+        vec![
+            th("Checking the doc revealed.\n\nI spot an error."),
+            th("The rows aren't related."),
+            Block::text("done"),
+        ],
+        StopReason::Stop,
+    )));
+    a.on_agent(AgentEvent::Settled);
+    a.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT));
+    let folded = screen(&mut a, 60, 20);
+    assert_eq!(folded.matches('∴').count(), 1, "{folded}");
+    a.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    let full = screen(&mut a, 60, 20);
+    assert_eq!(full.matches('∴').count(), 1, "{full}");
+    assert!(
+        full.contains("revealed.") && !full.contains("revealed.I") && full.contains("  I spot"),
+        "{full}"
+    );
+}
+
+#[test]
+fn tools_show_like_pi() {
+    let (mut a, _rx) = app(vec![]);
+    a.on_agent(AgentEvent::AgentStart);
+    a.on_agent(AgentEvent::Message(Message::user("ask and spawn")));
+    let report = (1..=14)
+        .map(|i| format!("report line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for (id, name, args, out) in [
+        (
+            "q",
+            "ask_user",
+            json!({"questions": [{"question": "Which database?", "options": [{"label": "pg"}]}, {"question": "Name?", "options": []}]}),
+            "Q: Which database?\nA: pg\nQ: Name?\nA: nova".to_string(),
+        ),
+        ("s", "agent", json!({"action": "read", "id": "a10"}), report),
+        (
+            "c",
+            "codemode",
+            json!({"code": "const a = await tools.read({path: 'x'});\ntext(a);"}),
+            "hello from x".to_string(),
+        ),
+    ] {
+        a.on_agent(AgentEvent::Message(assistant(
+            vec![call(id, name, args)],
+            StopReason::ToolUse,
+        )));
+        a.on_agent(AgentEvent::Message(result(id, name, &out, false)));
+    }
+    a.on_agent(AgentEvent::Settled);
+    a.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT));
+    snapshot("tools_like_pi", &screen(&mut a, 70, 40));
+    a.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    let full = screen(&mut a, 70, 60);
+    assert!(
+        full.contains("report line 14") && !full.contains("more lines"),
+        "{full}"
+    );
+}
+
+#[test]
 fn collapsed_and_expanded_turn() {
     let (mut a, _rx) = app(vec![]);
     run_events(&mut a);
@@ -335,10 +405,10 @@ fn slash_commands_pickers_and_pager() {
     key(&mut a, KeyCode::Char('s'), KeyModifiers::NONE);
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(rx.try_recv().unwrap(), Cmd::SetModel("claude/sonnet".into()));
-    // Ctrl+O shows the last tool's full output; Esc closes.
+    // Ctrl+O shows every tool's output in full, inline; again folds it.
     key(&mut a, KeyCode::Char('o'), KeyModifiers::CONTROL);
-    assert!(screen(&mut a, 60, 16).contains("12+ assert_eq!(2, 2);"));
-    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(a.tr.tools_full);
+    key(&mut a, KeyCode::Char('o'), KeyModifiers::CONTROL);
     // Alt+/ lists keys, filterable.
     key(&mut a, KeyCode::Char('/'), KeyModifiers::ALT);
     for c in "model".chars() {

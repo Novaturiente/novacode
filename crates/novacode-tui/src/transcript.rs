@@ -134,6 +134,10 @@ pub struct Transcript {
     pub thinking: Thinking,
     /// Key that shows thinking in full, named on folded thinking lines.
     pub thinking_hint: String,
+    /// Ctrl+O (pi's tools.expand): every tool's output shown in full.
+    pub tools_full: bool,
+    /// Key that does that, named under cut tool output.
+    pub tools_hint: String,
     /// Stream pacer (L9.7): bytes of each live block shown so far.
     pub(crate) live_shown: Vec<usize>,
     /// Tallest an open image may be, in rows (the transcript height); 0 = this
@@ -304,6 +308,12 @@ impl Transcript {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
+                // A saved reminder (`!cmd`, process exit, schedule, report) replayed from the
+                // session: one quiet line, as it looked live, not the model-facing markup.
+                if let Some(line) = reminder_line(&text) {
+                    self.notice(line, false);
+                    return;
+                }
                 for t in &mut self.turns {
                     if !t.done {
                         t.done = true;
@@ -405,6 +415,13 @@ impl Transcript {
         }
     }
 
+    pub fn set_tools_full(&mut self, on: bool) {
+        self.tools_full = on;
+        for t in &mut self.turns {
+            t.touch();
+        }
+    }
+
     pub fn set_thinking(&mut self, th: Thinking) {
         self.thinking = th;
         for t in &mut self.turns {
@@ -472,7 +489,16 @@ impl Transcript {
                 .as_ref()
                 .is_some_and(|c| c.width == width && c.expanded == turn.expanded);
             if !fresh {
-                turn.cache = Some(lay_turn(turn, width, theme, thinking, &self.thinking_hint, images));
+                let tools = (self.tools_full, self.tools_hint.as_str());
+                turn.cache = Some(lay_turn(
+                    turn,
+                    width,
+                    theme,
+                    thinking,
+                    &self.thinking_hint,
+                    images,
+                    tools,
+                ));
             }
             let c = turn.cache.as_ref().unwrap();
             if i > 0 {
@@ -520,7 +546,15 @@ fn images_of(content: &[Block]) -> impl Iterator<Item = Item> + '_ {
     })
 }
 
-fn lay_turn(turn: &Turn, width: usize, t: &Theme, thinking: Thinking, hint: &str, image_rows: usize) -> Layout {
+fn lay_turn(
+    turn: &Turn,
+    width: usize,
+    t: &Theme,
+    thinking: Thinking,
+    hint: &str,
+    image_rows: usize,
+    tools: (bool, &str),
+) -> Layout {
     let mut lines = Vec::new();
     let mut toggles = Vec::new();
     let mut imgs = Vec::new();
@@ -573,7 +607,7 @@ fn lay_turn(turn: &Turn, width: usize, t: &Theme, thinking: Thinking, hint: &str
                     .collect();
                 lines.extend(lay_assistant(&blocks, width, t, false, thinking, hint));
             }
-            Item::Tool(tool) => lines.extend(lay_tool(tool, width, t)),
+            Item::Tool(tool) => lines.extend(lay_tool(tool, width, t, tools)),
             Item::Image(img) => {
                 let size = if img.w > 0 {
                     format!(" {}×{}", img.w, img.h)
@@ -697,7 +731,18 @@ fn lay_assistant(
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::default()];
     let mut after_thinking = false;
+    // Thinking that arrives as several blocks in a row (interleaved thinking) reads as one.
+    let mut merged: Vec<(BlockKind, String)> = Vec::new();
     for (kind, text) in blocks {
+        match merged.last_mut() {
+            Some((BlockKind::Thinking, prev)) if *kind == BlockKind::Thinking => {
+                prev.push_str("\n\n");
+                prev.push_str(text.trim());
+            }
+            _ => merged.push((*kind, text.clone())),
+        }
+    }
+    for (kind, text) in &merged {
         // One blank line between thinking and the reply text below it.
         if *kind == BlockKind::Text && std::mem::take(&mut after_thinking) {
             lines.push(Line::default());
@@ -706,12 +751,20 @@ fn lay_assistant(
         match kind {
             BlockKind::Thinking if thinking == Thinking::Hidden => {}
             BlockKind::Thinking if thinking == Thinking::Full => {
-                lines.extend(wrap::wrap(
-                    vec![Span::styled(sanitize(text.trim()), t.thinking)],
-                    width,
-                    &[Span::styled("∴ ", t.thinking)],
-                    &[Span::raw("  ")],
-                ));
+                // Line by line: `wrap::wrap` runs lines together, which glued paragraphs.
+                for (i, l) in text.trim().lines().enumerate() {
+                    if l.trim().is_empty() {
+                        lines.push(Line::default());
+                        continue;
+                    }
+                    let first = if i == 0 { "∴ " } else { "  " };
+                    lines.extend(wrap::wrap(
+                        vec![Span::styled(sanitize(l), t.thinking)],
+                        width,
+                        &[Span::styled(first, t.thinking)],
+                        &[Span::raw("  ")],
+                    ));
+                }
             }
             // L9.7: by default thinking shows as one collapsed line.
             BlockKind::Thinking => {
@@ -750,11 +803,42 @@ pub fn summary(name: &str, args: &Value) -> String {
         }
         "find" => s("pattern"),
         "apply_patch" => "patch".into(),
-        _ => {
-            let j = args.to_string();
-            if j == "{}" { String::new() } else { j }
+        "ask_user" => {
+            let qs = args.get("questions").and_then(Value::as_array);
+            let first = qs
+                .and_then(|q| q.first())
+                .and_then(|q| q.get("question"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            match qs.map_or(0, Vec::len) {
+                0 | 1 => format!("\"{first}\""),
+                n => format!("\"{first}\" (+{} more)", n - 1),
+            }
         }
+        "codemode" => match args.get("transaction").and_then(Value::as_bool) {
+            Some(true) => "transaction".into(),
+            _ => String::new(),
+        },
+        _ => key_values(args),
     }
+}
+
+/// pi's header form: `action="read" id="a10" ids=["a1","a2"]`, in argument order.
+fn key_values(args: &Value) -> String {
+    let Some(m) = args.as_object() else {
+        return args.to_string();
+    };
+    m.iter()
+        .filter(|(k, _)| k.as_str() != "intent")
+        .map(|(k, v)| {
+            let v = match v {
+                Value::String(s) => format!("\"{}\"", s.lines().next().unwrap_or("")),
+                v => v.to_string(),
+            };
+            format!("{k}={v}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `+`/`-` for unified-diff lines and the edit tool's `42+ new` / `42- old` lines.
@@ -769,7 +853,12 @@ fn diff_sign(l: &str) -> Option<char> {
     }
 }
 
-fn lay_tool(tool: &Tool, width: usize, t: &Theme) -> Vec<Line<'static>> {
+/// Rows of a tool's output shown before "… N more lines" (pi shows about this many).
+const BODY_ROWS: usize = 10;
+/// Cap for Ctrl+O's full view, so a huge output can't stall layout.
+const FULL_ROWS: usize = 2000;
+
+fn lay_tool(tool: &Tool, width: usize, t: &Theme, (full, hint): (bool, &str)) -> Vec<Line<'static>> {
     let (dot, st) = match (tool.done, tool.is_error) {
         (false, _) => ("◌", t.warn),
         (true, false) => ("●", t.ok),
@@ -777,8 +866,8 @@ fn lay_tool(tool: &Tool, width: usize, t: &Theme) -> Vec<Line<'static>> {
     };
     let mut head = vec![
         Span::styled(format!("{dot} "), st),
-        Span::styled(tool.name.clone(), t.accent),
-        Span::raw("  "),
+        Span::styled(tool.name.clone(), t.accent.add_modifier(ratatui::style::Modifier::BOLD)),
+        Span::raw(" "),
         Span::styled(sanitize(&summary(&tool.name, &tool.args)), t.text),
     ];
     if let Some(ms) = tool.duration_ms.filter(|ms| *ms >= 1000) {
@@ -790,6 +879,36 @@ fn lay_tool(tool: &Tool, width: usize, t: &Theme) -> Vec<Line<'static>> {
             vec![Span::styled(format!("  {}", sanitize(intent)), t.dim)],
             width,
         ));
+    }
+    let plural = |n: usize| if n == 1 { "line" } else { "lines" };
+    let bar = [Span::styled("▏ ", t.border)];
+    let more = |n: usize, what: &str| {
+        let key = if hint.is_empty() {
+            String::new()
+        } else {
+            format!(", {hint} to expand")
+        };
+        Line::styled(format!("▏ … ({n} more {what}{key})"), t.dim)
+    };
+    // codemode: the script itself, then what it printed.
+    if tool.name == "codemode"
+        && let Some(code) = tool.args.get("code").and_then(Value::as_str)
+    {
+        let code: Vec<&str> = code.trim_end().lines().collect();
+        let n = if full {
+            code.len().min(FULL_ROWS)
+        } else {
+            code.len().min(6)
+        };
+        for l in &code[..n] {
+            lines.push(wrap::truncate(
+                vec![bar[0].clone(), Span::styled(sanitize(l), t.code)],
+                width,
+            ));
+        }
+        if n < code.len() {
+            lines.push(more(code.len() - n, "lines of code"));
+        }
     }
     if let Some(ui) = &tool.ui {
         lines.extend(ui.iter().take(TOOL_UI_ROWS).map(|l| {
@@ -812,24 +931,51 @@ fn lay_tool(tool: &Tool, width: usize, t: &Theme) -> Vec<Line<'static>> {
     // Bash shows the tail (where errors are); edits show the head of the diff.
     let (shown, skipped_before, skipped_after) = match tool.name.as_str() {
         "edit" | "write" | "apply_patch" => {
-            let n = all.len().min(OUTPUT_TAIL * 2);
+            let n = if full {
+                all.len().min(FULL_ROWS)
+            } else {
+                all.len().min(OUTPUT_TAIL * 2)
+            };
             (&all[..n], 0, all.len() - n)
         }
-        "read" if !tool.is_error => {
+        "read" if !tool.is_error && !full => {
             lines.push(Line::styled(
                 format!("  {} line{}", all.len(), if all.len() == 1 { "" } else { "s" }),
                 t.dim,
             ));
             return lines;
         }
-        _ => {
+        _ if full => {
+            let n = all.len().min(FULL_ROWS);
+            (&all[..n], 0, all.len() - n)
+        }
+        // Commands: the tail, where errors are.
+        "bash" | "process" => {
             let n = all.len().min(OUTPUT_TAIL);
             (&all[all.len() - n..], all.len() - n, 0)
         }
+        // Everything else (agent, ask_user, codemode, MCP, …): the start, wrapped, like pi.
+        _ => {
+            let st = if tool.is_error { t.error } else { t.text };
+            let mut rows = Vec::new();
+            let mut used = 0;
+            for l in &all {
+                let w = wrap::wrap(vec![Span::styled(l.to_string(), st)], width, &bar, &bar);
+                if rows.len() + w.len() > BODY_ROWS && !rows.is_empty() {
+                    break;
+                }
+                rows.extend(w);
+                used += 1;
+            }
+            lines.extend(rows);
+            if used < all.len() {
+                lines.push(more(all.len() - used, plural(all.len() - used)));
+            }
+            return lines;
+        }
     };
-    let more = |n: usize| Line::styled(format!("  … {n} more line{}", if n == 1 { "" } else { "s" }), t.dim);
     if skipped_before > 0 {
-        lines.push(more(skipped_before));
+        lines.push(more(skipped_before, plural(skipped_before)));
     }
     for l in shown {
         let st = if tool.is_error {
@@ -841,10 +987,13 @@ fn lay_tool(tool: &Tool, width: usize, t: &Theme) -> Vec<Line<'static>> {
                 None => t.dim,
             }
         };
-        lines.push(wrap::truncate(vec![Span::styled(format!("  {l}"), st)], width));
+        lines.push(wrap::truncate(
+            vec![bar[0].clone(), Span::styled(l.to_string(), st)],
+            width,
+        ));
     }
     if skipped_after > 0 {
-        lines.push(more(skipped_after));
+        lines.push(more(skipped_after, plural(skipped_after)));
     }
     lines
 }
@@ -879,6 +1028,41 @@ fn with_sources(text: &str, replay: Option<&novacode_types::Replay>) -> String {
         out.push_str(&format!("\n- [{title}]({url})"));
     }
     out
+}
+
+/// The one-line form of a `<system-reminder>` user message, or `None` for a real prompt.
+fn reminder_line(text: &str) -> Option<String> {
+    let body = text.trim().strip_prefix("<system-reminder>")?;
+    let body = body.trim().trim_end_matches("</system-reminder>").trim();
+    if let Some(rest) = body.strip_prefix("The user ran `")
+        && let Some((cmd, _)) = rest.split_once('`')
+    {
+        return Some(format!("$ {cmd}"));
+    }
+    let first = body.lines().next().unwrap_or_default();
+    let mut line: String = first.chars().take(100).collect();
+    if first.chars().count() > 100 || body.lines().count() > 1 {
+        line.push('…');
+    }
+    Some(line)
+}
+
+#[cfg(test)]
+mod reminder_tests {
+    use super::reminder_line;
+
+    #[test]
+    fn reminders_replay_as_one_line() {
+        assert_eq!(
+            reminder_line("<system-reminder>\nThe user ran `echo SECRET42` in /tmp. Output:\n```\nSECRET42\n```\n</system-reminder>").as_deref(),
+            Some("$ echo SECRET42")
+        );
+        assert_eq!(
+            reminder_line("<system-reminder>\n[schedule s1 fired] ping\n</system-reminder>").as_deref(),
+            Some("[schedule s1 fired] ping")
+        );
+        assert_eq!(reminder_line("fix the <system-reminder> bug"), None);
+    }
 }
 
 #[cfg(test)]

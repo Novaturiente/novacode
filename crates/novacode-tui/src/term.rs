@@ -71,8 +71,11 @@ pub fn enter() -> std::io::Result<Term> {
         )?;
         KITTY.store(true, Ordering::Relaxed);
     }
-    let mut t = Terminal::new(CrosstermBackend::new(out))?;
-    t.clear()?;
+    // Not `Terminal::clear()`: it queries the cursor position and waits on stdin for the
+    // reply, which a still-draining event reader of the previous run can swallow (2 s
+    // timeout, then exit) after /clone, /rewind, /fork. Fullscreen needs no cursor.
+    execute!(out, terminal::Clear(terminal::ClearType::All))?;
+    let t = Terminal::new(CrosstermBackend::new(out))?;
     Ok(t)
 }
 

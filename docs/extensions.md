@@ -54,7 +54,7 @@ The default export gets the frozen `novacode` object (also `globalThis.novacode`
 
 Every call sends data; novacode draws it in every window, including attached ones and the tmux panel.
 
-- **`setStatus(key, text | segments, {style?})`**: a status-line segment, shown as `ext:<key>`. `null` text removes it.
+- **`setStatus(key, text | segments, {style?})`**: a status-line segment showing the text. Its id is `ext:<key>`, for placing it in `ui.statusline` rows. `null` text removes it.
 - **`setWidget(key, lines, {below?})`**: lines above the editor, or below it with `below`.
 - **`setHeader(lines)`** / **`setFooter(lines)`**: lines above the transcript, or in place of the status line.
 - **`setEditor({title?, border?})`**: a title and border colour for the editor box.

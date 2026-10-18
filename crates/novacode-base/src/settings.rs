@@ -85,6 +85,14 @@ impl Settings {
         }
     }
 
+    /// Unknown keys, wrong types and bad values across the merged settings (`doctor`).
+    pub fn check(&self) -> Vec<Diagnostic> {
+        crate::settings_doc::check(&self.merged)
+            .into_iter()
+            .map(|message| Diagnostic { file: None, message })
+            .collect()
+    }
+
     pub fn diagnostics(&self) -> Vec<Diagnostic> {
         self.diagnostics.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }

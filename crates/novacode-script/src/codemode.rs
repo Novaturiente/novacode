@@ -90,7 +90,9 @@ const PRELUDE: &str = r#"
   globalThis.__EXIT = EXIT;
   const call = async (name, args) => {
     // Async frames are lost after the await, so note the script's line now.
-    const site = (/script\.js:\d+/.exec(new Error().stack || "") || [""])[0];
+    // The wrapper adds one line; name the model's own line (caught errors skip fix_lines).
+    const m = /script\.js:(\d+)/.exec(new Error().stack || "");
+    const site = m ? `line ${Math.max(1, Number(m[1]) - 1)}` : "";
     const r = parse(await bridge.call(String(name), stringify(args === undefined ? {} : args)));
     if (!r.ok) { const e = new Error(`${name}: ${r.error}${site ? ` (at ${site})` : ""}`); e.tool = name; throw e; }
     return r.value;
@@ -649,6 +651,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn errors_name_the_line_and_limits_hold() {
+        // A caught tool error names the model's line too.
+        let o = go("let m;\ntry { await tools.fail({}); } catch (e) { m = e.message; }\nreturn m;").await;
+        assert_eq!(o.result, Some(json!("fail: boom (at line 2)")));
         let o = go("const x = 1;\n\nawait tools.fail({});").await;
         let e = o.error.unwrap();
         assert!(e.contains("fail: boom") && e.contains("line 3"), "{e}");
