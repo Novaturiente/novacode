@@ -352,6 +352,7 @@ struct Child {
     report: Option<String>,
     log: VecDeque<String>,
     tokens: u64,
+    tool_calls: u32,
     /// The report was handed over (by `wait` or as a reminder).
     delivered: bool,
 }
@@ -372,6 +373,8 @@ pub struct Supervisor {
     defs: Vec<Def>,
     small_model: Option<String>,
     waiting: Mutex<usize>,
+    /// Nerd Font glyphs in the panel rows (`ui.icons`).
+    nerd: bool,
 }
 
 pub struct Setup {
@@ -385,6 +388,7 @@ pub struct Setup {
     pub small_model: Option<String>,
     /// The child binary (tests use a fake); default: this one.
     pub exe: Option<PathBuf>,
+    pub nerd: bool,
 }
 
 impl Supervisor {
@@ -406,6 +410,7 @@ impl Supervisor {
             timeout: Duration::from_secs(s.timeout_min * 60),
             small_model: s.small_model,
             waiting: Mutex::new(0),
+            nerd: s.nerd,
         });
         // Stall and timeout watchdog (L10.1: 10 min without activity, 45 min in all).
         let weak = Arc::downgrade(&sup);
@@ -442,15 +447,27 @@ impl Supervisor {
     /// Show a child in the Agent tab (L9.16 Subagents).
     fn publish(&self, c: &Child) {
         let Some(h) = self.handle() else { return };
-        let mut detail = Vec::new();
-        if let Some(l) = c.log.back() {
-            detail.push(l.clone());
+        // Like the tmux swarm pane: type + id, then the title, then tokens and tool
+        // calls; while it works, what it's doing.
+        let (bot, db, wrench) = if self.nerd {
+            ("\u{f06a9} ", "\u{f01bc} ", "\u{f0ad} ")
+        } else {
+            ("", "", "tools ")
+        };
+        let mut detail = vec![c.title.clone()];
+        if c.tokens > 0 || c.tool_calls > 0 {
+            detail.push(format!("{db}{}k  {wrench}{}", c.tokens.div_ceil(1000), c.tool_calls));
+        }
+        if !c.status.finished()
+            && let Some(l) = c.log.back()
+        {
+            detail.push(format!("› {l}"));
         }
         let node = Node {
             id: c.n.clone(),
             parent: None,
-            label: c.title.clone(),
-            tag: Some(format!("{} · {}", c.n, c.agent)),
+            label: format!("{bot}{}", c.agent),
+            tag: Some(c.n.clone()),
             status: Some(c.status.word().into()),
             icon: None,
             dim: c.status.finished(),
@@ -548,6 +565,7 @@ impl Supervisor {
             report: None,
             log: VecDeque::new(),
             tokens: 0,
+            tool_calls: 0,
             delivered: false,
         });
         drop(g);
@@ -728,6 +746,7 @@ impl Supervisor {
                     .unwrap_or_default();
                 self.with(n, |c| {
                     c.last_activity = Instant::now();
+                    c.tool_calls += 1;
                     c.log.push_back(format!("{name} {what}").trim().to_string());
                     if c.log.len() > 200 {
                         c.log.pop_front();
@@ -1259,6 +1278,7 @@ mod tests {
             timeout_min: 45,
             small_model: None,
             exe: Some(fake_child(&tmp)),
+            nerd: false,
         });
         let spawn = |task: &str, after: &[&str]| {
             sup.spawn(serde_json::from_value(json!({"task": task, "after": after, "model": "p/m"})).unwrap())

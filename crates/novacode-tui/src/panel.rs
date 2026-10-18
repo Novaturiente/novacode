@@ -120,6 +120,11 @@ pub struct Panel {
     /// Inner size at the last draw (sent with region keys).
     pub size: (u16, u16),
     stats: Stats,
+    /// Agent-tab work was unfinished at the last tick: new work re-opens a panel the
+    /// user closed by hand.
+    was_pending: bool,
+    /// `ui.panel.auto: false` (or the tmux pane hosts it): never opens by itself.
+    pub never_auto: bool,
 }
 
 #[derive(Default)]
@@ -207,6 +212,8 @@ impl Default for Panel {
             nerd: true,
             size: (0, 0),
             stats: Stats::default(),
+            was_pending: false,
+            never_auto: false,
         }
     }
 }
@@ -296,6 +303,16 @@ impl Panel {
             }
             UiOp::Publish { tab, source, node } => {
                 self.publish(tab, source, (**node).clone(), Some(ext));
+                if tab == "agent"
+                    && source == "subagents"
+                    && let Some(s) = self.tab("agent").map(|t| t.source("subagents"))
+                {
+                    let (n, live) = (s.nodes.len(), s.nodes.iter().filter(|n| !n.dim).count());
+                    s.title = Some(match live {
+                        0 => format!("Subagents · {n}"),
+                        _ => format!("Subagents · {live} running of {n}"),
+                    });
+                }
                 self.offer(tab);
             }
             UiOp::Remove { tab, source, id } => {
@@ -455,7 +472,6 @@ impl Panel {
                 // Checkboxes, not the play/stop glyphs other nodes use.
                 n.icon = Some(format!("todo:{status}"));
                 n.dim = status == "dropped" || status == "done";
-                n.tag = Some(format!("#{id}"));
                 n.order = Some(id as f64);
                 let (start, end) = (i["started_ms"].as_u64(), i["done_ms"].as_u64());
                 n.time = match (status, start, end) {
@@ -477,6 +493,11 @@ impl Panel {
             .collect();
         let done = items.iter().filter(|i| i["status"] == "done").count();
         let live = items.iter().filter(|i| i["status"] != "dropped").count();
+        // A finished plan leaves the panel (pi): only open work is shown.
+        let open = items
+            .iter()
+            .any(|i| matches!(i["status"].as_str(), Some("pending" | "active")));
+        let nodes = if open { nodes } else { Vec::new() };
         if let Some(t) = self.tab("agent") {
             t.source("todos").progress = Some((done, live));
         }
@@ -590,16 +611,21 @@ impl Panel {
     /// a todo or subagent is unfinished; it closes 5 s after they all finish.
     /// Every other tab is opened by hand (Ctrl+Alt+P).
     pub fn tick(&mut self) {
-        if let Some(p) = self.pinned {
-            self.visible = p;
-            return;
-        }
         let pending = self.tabs.iter().find(|t| t.name == "agent").is_some_and(|t| {
             t.sources
                 .iter()
                 .flat_map(|s| &s.nodes)
                 .any(|n| !matches!(n.status.as_deref(), Some("done" | "stopped" | "failed")))
         });
+        // Closed by hand: stays closed for this batch of work, opens again for the next.
+        if pending && !self.was_pending && self.pinned == Some(false) && !self.never_auto {
+            self.pinned = None;
+        }
+        self.was_pending = pending;
+        if let Some(p) = self.pinned {
+            self.visible = p;
+            return;
+        }
         if pending {
             if !self.visible {
                 self.shown = Some("agent".into());
@@ -735,6 +761,13 @@ impl Panel {
         out
     }
 
+    /// The shown node tab has rows with actions: a selection is drawn and moved.
+    /// Otherwise up/down just scroll.
+    fn interactive(&self) -> bool {
+        self.current()
+            .is_some_and(|t| t.sources.iter().flat_map(|s| &s.nodes).any(|n| !n.actions.is_empty()))
+    }
+
     /// A key while focused. `None` = not handled here.
     pub fn key(&mut self, key: &str) -> Option<Option<PanelAction>> {
         let tab = self.current()?.clone();
@@ -756,6 +789,8 @@ impl Panel {
             "tab" => self.cycle(false),
             "shift+tab" => self.cycle(true),
             "up" | "k" => self.sel = self.sel.saturating_sub(1),
+            // Without a selection this scrolls; render clamps it to the text.
+            "down" | "j" if !self.interactive() => self.sel += 1,
             "down" | "j" => self.sel = (self.sel + 1).min(n.saturating_sub(1)),
             k => {
                 let act = if k == "enter" {
@@ -828,8 +863,12 @@ impl Panel {
                 .collect(),
             None => {
                 let n = self.rows().len();
-                self.sel = self.sel.min(n.saturating_sub(1));
-                let (rows, nerd, focused, sel) = (self.rows(), self.nerd, self.focused, self.sel);
+                let interactive = self.interactive();
+                if interactive {
+                    self.sel = self.sel.min(n.saturating_sub(1));
+                }
+                let (rows, nerd, sel) = (self.rows(), self.nerd, self.sel);
+                let focused = self.focused && interactive;
                 let now = now_ms();
                 let mut out = Vec::new();
                 let mut sel_line = 0;
@@ -856,8 +895,11 @@ impl Panel {
                         out.push(crate::wrap::truncate(h, w));
                     }
                     let (g, gs) = glyph(n.icon.as_deref(), n.status.as_deref(), nerd, theme);
-                    let label_style = if n.dim {
+                    let todo = n.icon.as_deref().is_some_and(|i| i.starts_with("todo:"));
+                    let label_style = if n.dim && todo {
                         theme.dim.add_modifier(Modifier::CROSSED_OUT)
+                    } else if n.dim {
+                        theme.text
                     } else {
                         theme.text.add_modifier(Modifier::BOLD)
                     };
@@ -868,6 +910,10 @@ impl Panel {
                     ];
                     if let Some(t) = &n.tag {
                         left.push(Span::styled(format!(" {t}"), theme.dim));
+                    }
+                    // Todos sit flat under their heading, like pi's list; trees keep guides.
+                    if n.icon.as_deref().is_some_and(|i| i.starts_with("todo:")) {
+                        left[0] = Span::raw(" ");
                     }
                     let (right, rs) = match n.time {
                         Some(t) => {
@@ -897,7 +943,11 @@ impl Panel {
                     let has_kids = rows
                         .get(i + 1)
                         .is_some_and(|x| x.node.parent.as_deref() == Some(n.id.as_str()));
-                    let pad = format!("{}{}", r.below, if has_kids { "│ " } else { "  " });
+                    let flat = n.icon.as_deref().is_some_and(|i| i.starts_with("todo:"));
+                    let pad = match flat {
+                        true => "   ".to_string(),
+                        false => format!("{}{}", r.below, if has_kids { "│ " } else { "  " }),
+                    };
                     for (k, d) in n.detail.iter().enumerate() {
                         let mut v = vec![Span::styled(pad.clone(), theme.border)];
                         if k == 0
@@ -914,7 +964,7 @@ impl Panel {
                     out.push(Line::styled(" (empty)", theme.dim));
                 }
                 // Keys for the selected row while focused (pi viewer footer).
-                let footer = focused.then(|| {
+                let footer = self.focused.then(|| {
                     let mut k: Vec<String> = rows
                         .get(sel)
                         .map(|r| {
@@ -925,12 +975,25 @@ impl Panel {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    k.push("⇥ tab".into());
+                    k.push(
+                        if interactive {
+                            "⇥ tab"
+                        } else {
+                            "↑↓ scroll  ⇥ tab"
+                        }
+                        .into(),
+                    );
                     k.push("esc back".into());
                     k.join("  ")
                 });
                 let room = body.height as usize - footer.is_some() as usize;
-                let start = sel_line.saturating_sub(room / 2).min(out.len().saturating_sub(room));
+                let max_start = out.len().saturating_sub(room);
+                let start = if interactive {
+                    sel_line.saturating_sub(room / 2).min(max_start)
+                } else {
+                    self.sel = self.sel.min(max_start);
+                    self.sel
+                };
                 let mut out: Vec<Line> = out.into_iter().skip(start).take(room).collect();
                 if let Some(f) = footer {
                     out.resize(room, Line::raw(""));
@@ -1019,6 +1082,39 @@ pub fn spans(l: &ULine, t: &Theme) -> Vec<Span<'static>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn closed_by_hand_reopens_for_new_work_and_plain_tabs_scroll() {
+        let mut p = Panel::default();
+        let op = |v: serde_json::Value| serde_json::from_value::<UiOp>(v).unwrap();
+        let sub = |id: &str, status: &str| {
+            op(json!({"op": "publish", "tab": "agent", "source": "subagents",
+                "node": {"id": id, "label": "scout", "status": status, "dim": status == "done"}}))
+        };
+        p.apply("agents", &sub("a1", "running"));
+        p.tick();
+        assert!(p.visible, "a running subagent opens the panel");
+        assert_eq!(
+            p.tab("agent").unwrap().source("subagents").title.as_deref(),
+            Some("Subagents · 1 running of 1")
+        );
+        p.toggle();
+        p.tick();
+        assert!(!p.visible, "closed by hand stays closed for this work");
+        p.apply("agents", &sub("a1", "done"));
+        p.tick();
+        p.apply("agents", &sub("a2", "running"));
+        p.tick();
+        assert!(p.visible, "new work opens it again");
+        // Usage has no actions: no selection, j/k scroll.
+        p.shown = Some("files".into());
+        p.stats.files.insert("a.rs".into(), "read");
+        p.refresh(0, None);
+        assert!(!p.interactive());
+        p.focused = true;
+        assert_eq!(p.key("j"), Some(None));
+        assert_eq!(p.sel, 1, "scroll offset, clamped when drawn");
+    }
 
     #[test]
     fn tabs_sources_and_priority() {

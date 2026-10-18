@@ -108,6 +108,7 @@ impl Todo {
         let mut g = self.items.lock().unwrap();
         let mut v = g.clone();
         let next = |v: &Vec<Item>| v.iter().map(|i| i.id).max().unwrap_or(0) + 1;
+        let fresh = a.set.is_none() && a.add.as_ref().is_some_and(|x| !x.is_empty());
         if let Some(set) = a.set {
             v = set
                 .into_iter()
@@ -121,6 +122,11 @@ impl Todo {
                     done_ms: None,
                 })
                 .collect();
+        }
+        // Adding to a finished plan starts the next one (pi), so old ticks don't linger.
+        let open = |v: &Vec<Item>| v.iter().any(|i| matches!(i.status, Status::Pending | Status::Active));
+        if fresh && !open(&v) {
+            v.clear();
         }
         for text in a.add.unwrap_or_default() {
             let id = next(&v);
@@ -181,7 +187,9 @@ impl Tool for Todo {
     }
     fn guidelines(&self) -> &[&str] {
         &[
-            "Use `todo` for work with 3 or more steps; mark an item done only when its check passes, and finish one item and start the next in the same call.",
+            "Use `todo` for work with 3+ steps or when the user gives a list of tasks; skip it for trivial or conversational requests.",
+            "Batch: one `todo` call can finish the last item and start the next (`done:[2], start:3, note:'writing tests'`). Put that call in the same message as the first real tool call of the next step; never spend a turn only on todo.",
+            "Don't mark an item done while its tests fail or the work is partial; add an item for the blocker instead.",
         ]
     }
     fn execute<'a>(&'a self, args: Value, _ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput> {
@@ -223,6 +231,11 @@ mod tests {
             text(&o)
         );
         assert!(t.execute(json!({"done": [9]}), &c).await.is_error);
+        // A finished plan makes way for the next one.
+        let f = Todo::default();
+        f.execute(json!({"set": ["a"]}), &c).await;
+        f.execute(json!({"done": [1]}), &c).await;
+        assert_eq!(text(&f.execute(json!({"add": ["b"]}), &c).await), "0/1 done\n○ #1 b");
         // Resume: the stored result's details bring the list back.
         let history = vec![Message::ToolResult {
             call_id: "c".into(),

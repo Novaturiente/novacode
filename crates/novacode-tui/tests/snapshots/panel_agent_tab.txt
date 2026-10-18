@@ -1,9 +1,9 @@
                                                                       │  Agent
                                                                       │  Todos 1/3 ▰▰▰▱▱▱▱▱▱▱
-                                                                      │  ├─✓ read the code #1
-                                                                      │  ├─◐ write the panel #2
-                                                                      │  │   ▸ rendering
-                                                                      │  └─○ test it #3
+                                                                      │  ✓ read the code
+                                                                      │  ◐ write the panel
+                                                                      │    ▸ rendering
+                                                                      │  ○ test it
                                                                       │
                                                                       │
                                                                       │

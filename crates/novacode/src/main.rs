@@ -1006,6 +1006,7 @@ impl Ctx {
                 timeout_min: s.get("agents.timeoutMinutes").unwrap_or(45),
                 small_model: small,
                 exe: None,
+                nerd: s.get::<String>("ui.icons").as_deref() != Some("unicode"),
             });
             all.push(Arc::new(agents::AgentTool::new(sup)));
         }

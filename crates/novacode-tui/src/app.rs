@@ -354,6 +354,7 @@ impl App {
         }
         if !init.panel_auto {
             panel.pinned.get_or_insert(false);
+            panel.never_auto = true;
         }
         for m in std::mem::take(&mut init.history) {
             panel.on_agent(&AgentEvent::Message(m.clone()), init.window_tokens, init.price.as_ref());
@@ -499,6 +500,11 @@ impl App {
         self.dirty = true;
         self.panel
             .on_agent(&ev, self.init.window_tokens, self.init.price.as_ref());
+        // Open at once on new todos (subagents: in `ui_op`), even while this session
+        // is idle (the 1 s ticker only runs while busy or shown).
+        if matches!(ev, AgentEvent::Message(Message::ToolResult { .. })) {
+            self.panel.tick();
+        }
         match &ev {
             AgentEvent::AgentStart => self.task_started = Some(Instant::now()),
             AgentEvent::Settled => self.task_started = None,
@@ -660,7 +666,10 @@ impl App {
                 self.shortcuts.retain(|(k, _)| k != key);
                 self.shortcuts.push((key.clone(), ext.to_string()));
             }
-            _ => self.panel.apply(ext, &op),
+            _ => {
+                self.panel.apply(ext, &op);
+                self.panel.tick();
+            }
         }
     }
 
@@ -895,6 +904,15 @@ impl App {
             }
             Some(A::KeysHelp) => self.overlay = Some(Overlay::Pager(Pager::keys_help(&self.keymap, &self.theme))),
             Some(A::MessageCopy) => self.copy_reply(),
+            Some(A::InputCopy) => {
+                let t = self.editor.full_text();
+                if t.is_empty() {
+                    self.flash("nothing to copy");
+                } else {
+                    crate::term::copy(&t);
+                    self.flash(format!("copied the input ({} chars)", t.chars().count()));
+                }
+            }
             Some(A::Background) => self.send(Cmd::Background),
             Some(A::PasteImage) => match crate::term::paste() {
                 Some(crate::term::Pasted::Image(path)) => {

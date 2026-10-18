@@ -45,6 +45,7 @@ pub enum A {
     ExternalEditor,
     FollowUp,
     MessageCopy,
+    InputCopy,
     PasteImage,
     Background,
     PanelToggle,
@@ -95,6 +96,7 @@ defs! {
     ExternalEditor, "app.editor.external", App, ["ctrl+g"], "Edit the prompt in $EDITOR";
     FollowUp, "app.message.followUp", App, ["alt+enter"], "Queue as a follow-up";
     MessageCopy, "app.message.copy", App, ["ctrl+x"], "Copy the last reply";
+    InputCopy, "app.input.copy", App, ["alt+c"], "Copy what's in the input box";
     PasteImage, "app.clipboard.pasteImage", App, ["ctrl+v"], "Paste an image (or text) from the clipboard";
     Background, "app.process.background", App, ["ctrl+alt+b"], "Move running commands to the process manager";
     PanelToggle, "app.panel.toggle", App, ["ctrl+alt+p"], "Show or hide the side panel";

@@ -815,6 +815,40 @@ pub fn summary(name: &str, args: &Value) -> String {
                 n => format!("\"{first}\" (+{} more)", n - 1),
             }
         }
+        "todo" => {
+            let ids = |k: &str| {
+                args.get(k)
+                    .and_then(Value::as_array)
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(" "))
+            };
+            let n = |k: &str| args.get(k).and_then(Value::as_array).map_or(0, Vec::len);
+            let mut p = Vec::new();
+            if n("set") > 0 {
+                p.push(format!("plan of {}", n("set")));
+            }
+            if n("add") > 0 {
+                p.push(format!("add {}", n("add")));
+            }
+            if let Some(d) = ids("done") {
+                p.push(format!("done {d}"));
+            }
+            if let Some(d) = ids("drop") {
+                p.push(format!("drop {d}"));
+            }
+            if let Some(i) = args.get("start").and_then(Value::as_u64) {
+                p.push(format!("start #{i}"));
+            }
+            if p.is_empty() { "list".into() } else { p.join(" · ") }
+        }
+        "agent" if args.get("action").and_then(Value::as_str) == Some("spawn") => {
+            let s = |k: &str| args.get(k).and_then(Value::as_str);
+            format!(
+                "spawn {} \"{}\"",
+                s("agent").unwrap_or("worker"),
+                s("title").or(s("task")).unwrap_or("").lines().next().unwrap_or("")
+            )
+        }
         "codemode" => match args.get("transaction").and_then(Value::as_bool) {
             Some(true) => "transaction".into(),
             _ => String::new(),

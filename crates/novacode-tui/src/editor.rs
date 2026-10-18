@@ -256,12 +256,19 @@ impl Editor {
         }
     }
 
-    fn submit_text(&mut self) -> String {
-        let mut out = std::mem::take(&mut self.text);
+    /// The input with collapsed pastes put back (what submitting would send).
+    pub fn full_text(&self) -> String {
+        let mut out = self.text.clone();
         for (i, p) in self.pastes.iter().enumerate().rev() {
             let marker = format!("[paste #{} +{} lines]", i + 1, p.lines().count());
             out = out.replace(&marker, p);
         }
+        out
+    }
+
+    fn submit_text(&mut self) -> String {
+        let out = self.full_text();
+        self.text.clear();
         self.clear();
         self.undo.clear();
         if !out.trim().is_empty() && self.history.last() != Some(&out) {
