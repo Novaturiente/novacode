@@ -205,6 +205,10 @@ enum McpCmd {
     },
     /// Remove a server from ~/.novacode/mcp.json.
     Remove { name: String },
+    /// Log in to an HTTP server that uses OAuth (opens the browser).
+    Login { name: String },
+    /// Forget a server's OAuth login.
+    Logout { name: String },
 }
 
 fn parse_mode(s: &str) -> Result<Mode, String> {
@@ -318,6 +322,52 @@ async fn mcp_command(paths: &Paths, what: McpCmd) -> anyhow::Result<ExitCode> {
             }
             mcp::edit_global(paths.home(), &name, Some(v.into()))?;
             eprintln!("added `{name}` to {}", paths.home().join("mcp.json").display());
+            Ok(ExitCode::SUCCESS)
+        }
+        McpCmd::Login { name } => {
+            let cwd = std::env::current_dir()?;
+            let trusted = trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &cwd, false);
+            let (servers, _) = mcp::load(paths.home(), &cwd, trusted);
+            let Some(s) = servers.into_iter().find(|s| s.name == name) else {
+                bail!("no MCP server `{name}` (see `novacode mcp list`)");
+            };
+            let Some(url) = s.config.url.as_deref().map(mcp::expand) else {
+                bail!("`{name}` is a local (stdio) server; only HTTP servers use OAuth");
+            };
+            let listener =
+                tokio::net::TcpListener::bind(("127.0.0.1", s.config.oauth.callback_port.unwrap_or(0))).await?;
+            let redirect = format!("http://127.0.0.1:{}/callback", listener.local_addr()?.port());
+            let pending = novacode_core::mcp_oauth::begin(&url, &s.config.oauth, &redirect)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            eprintln!(
+                "Open this URL and approve novacode:\n\n{}\n\nnovacode catches the redirect on {redirect}. On another machine, paste the URL the browser ends on:",
+                pending.url
+            );
+            let _ = std::process::Command::new("xdg-open")
+                .arg(&pending.url)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            let (code, state) = catch_or_paste(Some(listener)).await?;
+            if state.as_deref() != Some(pending.state.as_str()) {
+                bail!("OAuth state mismatch; start the login again");
+            }
+            novacode_core::mcp_oauth::finish(paths.home(), &name, pending, &code)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            eprintln!("logged in to `{name}`; new sessions use it");
+            Ok(ExitCode::SUCCESS)
+        }
+        McpCmd::Logout { name } => {
+            if novacode_core::mcp_oauth::remove(paths.home(), &name)
+                .await
+                .map_err(anyhow::Error::msg)?
+            {
+                eprintln!("logged out of `{name}`");
+            } else {
+                eprintln!("no login saved for `{name}`");
+            }
             Ok(ExitCode::SUCCESS)
         }
         McpCmd::Remove { name } => {
@@ -1826,8 +1876,11 @@ async fn login(store: &AuthStore, provider: &str, account: &str) -> anyhow::Resu
 /// Wait for an OAuth redirect on `127.0.0.1:port`, or a pasted redirect URL on stdin,
 /// whichever comes first (L2.13). Returns (code, state).
 async fn loopback_or_paste(port: u16) -> anyhow::Result<(String, Option<String>)> {
+    catch_or_paste(tokio::net::TcpListener::bind(("127.0.0.1", port)).await.ok()).await
+}
+
+async fn catch_or_paste(listener: Option<tokio::net::TcpListener>) -> anyhow::Result<(String, Option<String>)> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.ok();
     let caught = async {
         let Some(l) = listener else {
             return std::future::pending().await;

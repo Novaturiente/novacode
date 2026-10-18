@@ -9,6 +9,7 @@ pub mod extensions;
 pub mod hooks;
 pub mod image_gen;
 pub mod mcp;
+pub mod mcp_oauth;
 pub mod memory;
 pub mod metrics;
 pub mod packages;

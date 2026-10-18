@@ -48,6 +48,9 @@ pub struct ServerConfig {
     /// Seconds without progress before a call fails (default 120).
     #[serde(default)]
     pub timeout: Option<u64>,
+    /// OAuth client settings for servers without dynamic registration.
+    #[serde(default)]
+    pub oauth: crate::mcp_oauth::OAuthConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -72,7 +75,7 @@ pub struct Configured {
 }
 
 /// `${VAR}` / `${VAR:-default}` from the environment (Claude Code's format).
-fn expand(s: &str) -> String {
+pub fn expand(s: &str) -> String {
     let mut out = String::new();
     let mut rest = s;
     while let Some(i) = rest.find("${") {
@@ -160,6 +163,9 @@ enum Transport {
         headers: BTreeMap<String, String>,
         session: Mutex<Option<String>>,
         http: reqwest::Client,
+        /// Bearer tokens from `novacode mcp login`; unused when headers set Authorization.
+        auth: Option<crate::mcp_oauth::Auth>,
+        name: String,
     },
 }
 
@@ -229,10 +235,76 @@ impl Conn {
             headers,
             session,
             http,
+            auth,
+            name,
         } = &self.transport
         else {
             unreachable!()
         };
+        let mut token = match auth {
+            Some(a) => a.token().await?,
+            None => None,
+        };
+        let mut retried = false;
+        let resp = loop {
+            let resp = self.post(url, headers, session, http, &msg, token.as_deref()).await?;
+            // 401, or 403 asking for more scope: refresh once, else say how to log in.
+            let insufficient = resp.status().as_u16() == 403
+                && resp
+                    .headers()
+                    .get("www-authenticate")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|h| h.contains("insufficient_scope"));
+            if resp.status().as_u16() != 401 && !insufficient {
+                break resp;
+            }
+            let Some(a) = auth else { break resp };
+            match (&token, retried) {
+                (Some(t), false) if !insufficient => {
+                    retried = true;
+                    match a.refresh(t).await {
+                        Ok(t) => token = Some(t),
+                        Err(e) => return Err(format!("{e}; run `novacode mcp login {name}`")),
+                    }
+                }
+                _ if insufficient => {
+                    return Err(format!(
+                        "the server wants more permissions; run `novacode mcp login {name}` again"
+                    ));
+                }
+                _ => return Err(format!("the server needs a login; run `novacode mcp login {name}`")),
+            }
+        };
+        if let Some(s) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+            *session.lock().unwrap() = Some(s.to_string());
+        }
+        let status = resp.status();
+        let Some(id) = id else { return Ok(Value::Null) };
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let hint = if status.as_u16() == 401 {
+                " (set an Authorization header, or run `novacode mcp login`)"
+            } else {
+                ""
+            };
+            return Err(format!(
+                "HTTP {}{hint}: {}",
+                status.as_u16(),
+                body.chars().take(300).collect::<String>()
+            ));
+        }
+        self.read_answer(resp, id, idle).await
+    }
+
+    async fn post(
+        &self,
+        url: &str,
+        headers: &BTreeMap<String, String>,
+        session: &Mutex<Option<String>>,
+        http: &reqwest::Client,
+        msg: &Value,
+        token: Option<&str>,
+    ) -> Result<reqwest::Response, String> {
         let mut req = http
             .post(url)
             .header("accept", "application/json, text/event-stream")
@@ -245,25 +317,15 @@ impl Conn {
         if let Some(s) = session.lock().unwrap().clone() {
             req = req.header("mcp-session-id", s);
         }
-        let resp = req.send().await.map_err(|e| e.to_string())?;
-        if let Some(s) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
-            *session.lock().unwrap() = Some(s.to_string());
+        if let Some(t) = token
+            && !headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"))
+        {
+            req = req.bearer_auth(t);
         }
-        let status = resp.status();
-        let Some(id) = id else { return Ok(Value::Null) };
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            let hint = if status.as_u16() == 401 {
-                " (OAuth isn't supported yet; set an Authorization header)"
-            } else {
-                ""
-            };
-            return Err(format!(
-                "HTTP {}{hint}: {}",
-                status.as_u16(),
-                body.chars().take(300).collect::<String>()
-            ));
-        }
+        req.send().await.map_err(|e| e.to_string())
+    }
+
+    async fn read_answer(&self, resp: reqwest::Response, id: u64, idle: Duration) -> Result<Value, String> {
         let sse = resp
             .headers()
             .get("content-type")
@@ -395,6 +457,7 @@ pub struct Hub {
     cache_dir: PathBuf,
     log_dir: PathBuf,
     cwd: PathBuf,
+    home: PathBuf,
 }
 
 impl Hub {
@@ -422,6 +485,7 @@ impl Hub {
             cache_dir,
             log_dir: home.join("logs"),
             cwd: cwd.to_path_buf(),
+            home: home.to_path_buf(),
         });
         for s in &hub.servers {
             let (hub, s) = (hub.clone(), s.clone());
@@ -468,6 +532,8 @@ impl Hub {
                 headers: s.config.headers.clone(),
                 session: Mutex::new(None),
                 http: novacode_ai::http::client(),
+                auth: Some(crate::mcp_oauth::Auth::new(&self.home, &s.name, &expand(url))),
+                name: s.name.clone(),
             },
             None => spawn_stdio(&s.config, &self.cwd, &self.log_dir.join(format!("mcp-{}.log", s.name)))?,
         };
