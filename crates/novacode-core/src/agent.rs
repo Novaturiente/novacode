@@ -130,6 +130,8 @@ struct Shared {
     warm_wake: Notify,
     /// `/compact` was asked for; the owner compacts when idle.
     compact: Mutex<bool>,
+    /// The session's prompts as a tree, refreshed with the report (for `/tree`).
+    prompts: Mutex<Vec<crate::session::PromptNode>>,
 }
 
 /// Warmer state, reset by every real request.
@@ -275,6 +277,7 @@ impl Agent {
 
     fn update_report(&self) {
         use novacode_types::estimate;
+        *self.shared.prompts.lock().unwrap() = self.store.prompts();
         let sections: Vec<(String, u64)> = self
             .store
             .sections()
@@ -1096,6 +1099,11 @@ impl SessionHandle {
         self.events.subscribe()
     }
     /// Where the context goes, as of the last finished run.
+    /// Prompts of the session as a tree, as of the last run (L4.3).
+    pub fn prompts(&self) -> Vec<crate::session::PromptNode> {
+        self.shared.prompts.lock().unwrap().clone()
+    }
+
     pub fn context(&self) -> ContextReport {
         let mut r = self.shared.report.lock().unwrap().clone();
         // The warmer acts between runs: read its state now, not at the last run's end.

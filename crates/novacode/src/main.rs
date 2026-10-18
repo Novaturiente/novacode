@@ -702,6 +702,7 @@ fn ago(t: std::time::SystemTime) -> String {
 /// The TUI, one session at a time; /resume and /new swap the session in place.
 async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> anyhow::Result<ExitCode> {
     let mut notices = Vec::new();
+    let mut draft = String::new();
     loop {
         let (ui_tx, ui_rx) = mpsc::unbounded_channel();
         let approver: Arc<dyn Approver> = Arc::new(TuiApprover(ui_tx.clone()));
@@ -848,6 +849,31 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
                         });
                     }
                     Cmd::Compact => h.compact(),
+                    Cmd::ListPrompts(action) => {
+                        let tree = matches!(action, novacode_tui::app::BranchAction::Tree);
+                        let mut nodes: Vec<_> = h.prompts().into_iter().filter(|p| tree || p.on_branch).collect();
+                        if !tree {
+                            nodes.reverse();
+                        }
+                        let items = nodes
+                            .into_iter()
+                            .map(|p| PickItem {
+                                label: if tree {
+                                    format!(
+                                        "{}{} {}",
+                                        "  ".repeat(p.depth),
+                                        if p.on_branch { "●" } else { "○" },
+                                        p.text
+                                    )
+                                } else {
+                                    p.text
+                                },
+                                detail: novacode_core::memory::utc_minute(p.ts_ms) + "Z",
+                                value: p.id,
+                            })
+                            .collect();
+                        let _ = ui_tx.send(UiEvent::Branch(action, items));
+                    }
                     Cmd::Quit => break,
                 }
             }
@@ -884,6 +910,7 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
             price,
             spent,
             commands,
+            draft: std::mem::take(&mut draft),
         };
         let res = novacode_tui::run(init, erx, ui_rx, ctx_tx).await;
         handle.abort();
@@ -892,8 +919,15 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
         // /new and /resume keep the model; the level comes from the session (or settings).
         model = current.lock().unwrap().0.clone();
         let prev = agent.store.path().map(Path::to_path_buf);
+        let res = res?;
+        if let Exit::Branch(action, at) = &res {
+            let (s, err) = branch(ctx, agent.store, *action, at.as_deref(), &mut draft);
+            store = s;
+            notices.extend(err);
+            continue;
+        }
         drop(agent);
-        let next = match res? {
+        let next = match res {
             Exit::Quit => {
                 if prev.as_ref().is_some_and(|p| p.exists()) {
                     eprintln!("resume with: novacode -r {}", &id[..id.len().min(13)]);
@@ -901,6 +935,7 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
                 return Ok(ExitCode::SUCCESS);
             }
             Exit::New => Ok(Store::create(&ctx.paths, &ctx.cwd, ctx.cli.no_session)),
+            Exit::Branch(..) => unreachable!("handled above"),
             Exit::Resume(path) => Store::open(Path::new(&path)),
         };
         store = match next {
@@ -913,6 +948,56 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
                 }
             }
         };
+    }
+}
+
+/// `/tree`, `/rewind`, `/fork`, `/clone` (L4.3): move the leaf or fork a new
+/// session. A taken-back prompt goes into `draft`. On error the store comes back.
+fn branch(
+    ctx: &Ctx,
+    mut store: Store,
+    action: novacode_tui::app::BranchAction,
+    at: Option<&str>,
+    draft: &mut String,
+) -> (Store, Option<String>) {
+    use novacode_tui::app::BranchAction as A;
+    let Some(at) = at else {
+        let Some(leaf) = store.branch().last().map(|e| e.id.clone()) else {
+            return (store, Some("nothing to clone yet".into()));
+        };
+        return match store.fork(&ctx.paths, &leaf) {
+            Ok(s) => (s, None),
+            Err(e) => (store, Some(format!("clone failed: {e}"))),
+        };
+    };
+    let Some(e) = store.entries().iter().find(|e| e.id == at).cloned() else {
+        return (store, Some("that prompt is gone".into()));
+    };
+    let Some(parent) = e.parent.clone() else {
+        return (store, Some("can't go before the start of the session".into()));
+    };
+    if let novacode_core::session::EntryKind::Message {
+        message: novacode_types::Message::User { content },
+    } = &e.kind
+    {
+        *draft = content
+            .iter()
+            .filter_map(|b| match b {
+                novacode_types::Block::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    match action {
+        A::Fork | A::Clone => match store.fork(&ctx.paths, &parent) {
+            Ok(s) => (s, None),
+            Err(e) => (store, Some(format!("fork failed: {e}"))),
+        },
+        A::Tree | A::Rewind => match store.set_leaf(&parent) {
+            Ok(()) => (store, None),
+            Err(e) => (store, Some(format!("could not move there: {e}"))),
+        },
     }
 }
 

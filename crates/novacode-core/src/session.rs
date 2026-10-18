@@ -7,7 +7,7 @@ use novacode_base::storage::{self, FileLock};
 use novacode_base::{new_id, paths::Paths};
 use novacode_types::{Block, Message};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -289,7 +289,36 @@ impl Store {
         Ok(())
     }
 
-    /// Entries from the root to the leaf.
+    /// Move the leaf to `target` (L4.3): the next message branches from there.
+    pub fn set_leaf(&mut self, target: &str) -> Result<(), StoreError> {
+        if !self.index.contains_key(target) {
+            return Err(StoreError::NotFound(target.into()));
+        }
+        self.append(EntryKind::Leaf { target: target.into() })?;
+        Ok(())
+    }
+
+    /// A new session holding the root→`at` path of this one (L4.3 fork and
+    /// clone), written at once. Entry ids are kept, so notes and recall still work.
+    pub fn fork(&self, paths: &Paths, at: &str) -> Result<Store, StoreError> {
+        let mut path: Vec<Entry> = Vec::new();
+        let mut cur = Some(at);
+        while let Some(id) = cur {
+            let i = *self.index.get(id).ok_or_else(|| StoreError::NotFound(id.into()))?;
+            path.push(self.entries[i].clone());
+            cur = self.entries[i].parent.as_deref();
+        }
+        path.reverse();
+        let mut s = Store::create(paths, &self.header.cwd, self.path.is_none());
+        for e in path {
+            s.push(e);
+        }
+        if let Some(p) = s.path.clone() {
+            s.materialise(&p)?;
+        }
+        Ok(s)
+    }
+
     /// The current branch, root first.
     pub fn branch(&self) -> Vec<&Entry> {
         self.path_to_leaf()
@@ -453,6 +482,75 @@ fn project(path: &[&Entry]) -> Vec<Message> {
     out
 }
 
+/// One user prompt in the session tree, for `/tree` and `/rewind` (L4.3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromptNode {
+    pub id: String,
+    /// Where the leaf goes to redo this prompt: its parent.
+    pub parent: Option<String>,
+    /// Indent: the number of branch points above it.
+    pub depth: usize,
+    pub text: String,
+    /// On the current branch.
+    pub on_branch: bool,
+    pub ts_ms: u64,
+}
+
+impl Store {
+    /// Every user prompt in the file as a tree, depth-first, older siblings first.
+    pub fn prompts(&self) -> Vec<PromptNode> {
+        let on: std::collections::HashSet<&str> = self.path_to_leaf().iter().map(|e| e.id.as_str()).collect();
+        let prompt_text = |e: &Entry| match &e.kind {
+            EntryKind::Message {
+                message: Message::User { content },
+            } => Some(
+                content
+                    .iter()
+                    .find_map(|b| match b {
+                        Block::Text { text, .. } => Some(text.lines().next().unwrap_or("").to_string()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "[image]".into()),
+            ),
+            _ => None,
+        };
+        // Each prompt's nearest prompt ancestor.
+        let up = |e: &Entry| {
+            let mut cur = e.parent.as_deref();
+            while let Some(id) = cur {
+                let p = &self.entries[self.index[id]];
+                if prompt_text(p).is_some() {
+                    return Some(p.id.as_str());
+                }
+                cur = p.parent.as_deref();
+            }
+            None
+        };
+        let mut kids: BTreeMap<Option<&str>, Vec<&Entry>> = BTreeMap::new();
+        for e in &self.entries {
+            if prompt_text(e).is_some() {
+                kids.entry(up(e)).or_default().push(e);
+            }
+        }
+        let mut out = Vec::new();
+        let mut stack: Vec<(&Entry, usize)> = kids.get(&None).into_iter().flatten().rev().map(|e| (*e, 0)).collect();
+        while let Some((e, depth)) = stack.pop() {
+            out.push(PromptNode {
+                id: e.id.clone(),
+                parent: e.parent.clone(),
+                depth,
+                text: prompt_text(e).unwrap_or_default(),
+                on_branch: on.contains(e.id.as_str()),
+                ts_ms: e.ts_ms,
+            });
+            let ch = kids.get(&Some(e.id.as_str())).cloned().unwrap_or_default();
+            let d = if ch.len() > 1 { depth + 1 } else { depth };
+            stack.extend(ch.into_iter().rev().map(|c| (c, d)));
+        }
+        out
+    }
+}
+
 /// Session files for a cwd, newest (last written) first.
 pub fn list(paths: &Paths, cwd: &Path) -> Vec<PathBuf> {
     let mut files: Vec<(SystemTime, PathBuf)> = std::fs::read_dir(dir_for(paths, cwd))
@@ -552,6 +650,55 @@ mod tests {
                 thinking_level: None,
             }),
         }
+    }
+
+    #[test]
+    fn branch_tree_and_fork() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::new(home.path());
+        let mut s = Store::create(&paths, home.path(), false);
+        s.append(msg("one")).unwrap();
+        s.append(reply("r1")).unwrap();
+        let two = s.append(msg("two")).unwrap();
+        s.append(reply("r2")).unwrap();
+        // Redo "two" differently: leaf back to its parent, then a new prompt.
+        let parent = s
+            .entries()
+            .iter()
+            .find(|e| e.id == two)
+            .unwrap()
+            .parent
+            .clone()
+            .unwrap();
+        s.set_leaf(&parent).unwrap();
+        s.append(msg("two again")).unwrap();
+        s.append(reply("r2b")).unwrap();
+        // "one" has two prompt children, so they indent.
+        let t: Vec<(usize, String, bool)> = s
+            .prompts()
+            .iter()
+            .map(|p| (p.depth, p.text.clone(), p.on_branch))
+            .collect();
+        assert_eq!(
+            t,
+            [
+                (0, "one".into(), true),
+                (1, "two".into(), false),
+                (1, "two again".into(), true)
+            ]
+        );
+        assert!(!format!("{:?}", s.projection()).contains("\"two\""));
+        // A reopened file lands on the same branch.
+        let file = s.path().unwrap().to_path_buf();
+        drop(s);
+        let s = Store::open(&file).unwrap();
+        assert!(format!("{:?}", s.projection()).contains("two again"));
+        // Fork at "one"'s reply: a new file with just that path.
+        let at = s.prompts()[0].id.clone();
+        let f = s.fork(&paths, &at).unwrap();
+        assert_ne!(f.id(), s.id());
+        assert_eq!(f.projection().len(), 1);
+        assert!(f.path().unwrap().exists());
     }
 
     #[test]

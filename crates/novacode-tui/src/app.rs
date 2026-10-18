@@ -37,6 +37,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/keys", "show keybindings"),
     ("/context", "where the context window goes"),
     ("/compact", "replace older messages with the memory notes"),
+    ("/tree", "go to any prompt of the session tree"),
+    ("/rewind", "go back to before a prompt of this branch"),
+    ("/fork", "new session up to a prompt of this branch"),
+    ("/clone", "new session with this whole branch"),
     ("/copy", "copy the last reply"),
     ("/quit", "quit"),
 ];
@@ -66,6 +70,8 @@ pub struct Init {
     pub spent: f64,
     /// Extra slash commands for completion: prompt templates and `/skill:name` (L4.10, L4.11).
     pub commands: Vec<(String, String)>,
+    /// Editor text to start with (a prompt taken back by `/rewind` or `/tree`).
+    pub draft: String,
 }
 
 /// What the UI asks of the session.
@@ -81,6 +87,8 @@ pub enum Cmd {
     SetThinking(ThinkingLevel),
     ListModels,
     ListSessions,
+    /// The host answers with [`UiEvent::Branch`].
+    ListPrompts(BranchAction),
     /// The host answers with [`UiEvent::Page`].
     Context,
     Compact,
@@ -97,6 +105,8 @@ pub enum UiEvent {
     Approve(ApproveReq),
     Models(Result<Vec<PickItem>, String>),
     Sessions(Vec<PickItem>),
+    /// Prompts to pick for `/tree`, `/rewind` or `/fork`; values are entry ids.
+    Branch(BranchAction, Vec<PickItem>),
     Notice {
         text: String,
         error: bool,
@@ -122,6 +132,21 @@ pub enum Exit {
     /// Session id or path picked in /resume.
     Resume(String),
     New,
+    /// Branch at a prompt (its entry id), or at the leaf for `/clone` (L4.3).
+    Branch(BranchAction, Option<String>),
+}
+
+/// What picking a prompt does (L4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchAction {
+    /// `/tree`: move to any prompt of any branch, its text back in the editor.
+    Tree,
+    /// `/rewind`: back to a prompt of this branch, its text back in the editor.
+    Rewind,
+    /// `/fork`: a new session up to a prompt of this branch.
+    Fork,
+    /// `/clone`: a new session with this whole branch.
+    Clone,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -156,6 +181,7 @@ enum Overlay {
     Models(Picker),
     Thinking(Picker),
     Sessions(Picker),
+    Branch(BranchAction, Picker),
     Pager(Pager),
 }
 
@@ -233,7 +259,13 @@ impl App {
         Self {
             theme: std::mem::take(&mut init.theme),
             tr,
-            editor: Editor::with_history(history),
+            editor: {
+                let mut e = Editor::with_history(history);
+                if !init.draft.is_empty() {
+                    e.set_text(&init.draft);
+                }
+                e
+            },
             keymap: std::mem::take(&mut init.keymap),
             tx,
             init,
@@ -280,6 +312,15 @@ impl App {
             UiEvent::Models(Err(e)) => self.tr.notice(format!("could not list models: {e}"), true),
             UiEvent::Sessions(items) if items.is_empty() => self.flash("no other sessions in this folder"),
             UiEvent::Sessions(items) => self.overlay = Some(Overlay::Sessions(Picker::new("Resume session", items))),
+            UiEvent::Branch(_, items) if items.is_empty() => self.flash("no prompts yet"),
+            UiEvent::Branch(a, items) => {
+                let title = match a {
+                    BranchAction::Tree => "Session tree: go to a prompt (● = current branch)",
+                    BranchAction::Rewind => "Rewind to before a prompt",
+                    BranchAction::Fork | BranchAction::Clone => "Fork a new session before a prompt",
+                };
+                self.overlay = Some(Overlay::Branch(a, Picker::new(title, items)));
+            }
             UiEvent::Notice { text, error } => self.tr.notice(text, error),
             UiEvent::Page { title, text } => self.overlay = Some(Overlay::Pager(Pager::new(title, &text, &self.theme))),
             UiEvent::Thinking { level, note } => {
@@ -446,18 +487,21 @@ impl App {
                         self.overlay = None;
                     }
                 }
-                Overlay::Models(p) | Overlay::Sessions(p) | Overlay::Thinking(p) => match p.handle(k, &self.keymap) {
-                    Picked::Pending => {}
-                    Picked::Cancel => self.overlay = None,
-                    Picked::Value(v) => {
-                        let o = self.overlay.take();
-                        match o {
-                            Some(Overlay::Models(_)) => self.set_model(&v),
-                            Some(Overlay::Thinking(_)) => self.set_thinking(&v),
-                            _ => self.exit = Some(Exit::Resume(v)),
+                Overlay::Models(p) | Overlay::Sessions(p) | Overlay::Thinking(p) | Overlay::Branch(_, p) => {
+                    match p.handle(k, &self.keymap) {
+                        Picked::Pending => {}
+                        Picked::Cancel => self.overlay = None,
+                        Picked::Value(v) => {
+                            let o = self.overlay.take();
+                            match o {
+                                Some(Overlay::Models(_)) => self.set_model(&v),
+                                Some(Overlay::Thinking(_)) => self.set_thinking(&v),
+                                Some(Overlay::Branch(a, _)) => self.exit = Some(Exit::Branch(a, Some(v))),
+                                _ => self.exit = Some(Exit::Resume(v)),
+                            }
                         }
                     }
-                },
+                }
             }
             return;
         }
@@ -776,6 +820,10 @@ impl App {
                 "/copy" => self.copy_reply(),
                 "/context" => self.send(Cmd::Context),
                 "/compact" => self.send(Cmd::Compact),
+                "/tree" => self.send(Cmd::ListPrompts(BranchAction::Tree)),
+                "/rewind" => self.send(Cmd::ListPrompts(BranchAction::Rewind)),
+                "/fork" => self.send(Cmd::ListPrompts(BranchAction::Fork)),
+                "/clone" => self.exit = Some(Exit::Branch(BranchAction::Clone, None)),
                 _ => {}
             }
             return;
@@ -1011,7 +1059,7 @@ impl App {
 
         let t = &self.theme;
         match &self.overlay {
-            Some(Overlay::Models(p) | Overlay::Sessions(p) | Overlay::Thinking(p)) => {
+            Some(Overlay::Models(p) | Overlay::Sessions(p) | Overlay::Thinking(p) | Overlay::Branch(_, p)) => {
                 p.render(f, dialog::centered(main, 70, 70, 20), t)
             }
             Some(Overlay::Pager(p)) => p.render(f, dialog::centered(main, 90, 90, main.height), t),
