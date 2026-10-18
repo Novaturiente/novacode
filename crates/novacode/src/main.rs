@@ -743,6 +743,7 @@ fn git_branch(cwd: &Path) -> Option<String> {
 }
 
 async fn login(store: &AuthStore, provider: &str) -> anyhow::Result<ExitCode> {
+    // Default browser via xdg-open; the URL is always printed too, for headless or another browser.
     let open = |url: &str| {
         let _ = std::process::Command::new("xdg-open")
             .arg(url)
@@ -779,6 +780,7 @@ async fn login(store: &AuthStore, provider: &str) -> anyhow::Result<ExitCode> {
                 "Open this URL and sign in with Google:\n\n{url}\n\nnovacode catches the redirect on localhost:{}. On another machine, paste the URL the browser ends on:",
                 antigravity::PORT
             );
+            open(&url);
             let (code, got_state) = loopback_or_paste(antigravity::PORT).await?;
             if got_state.as_deref() != Some(state.as_str()) {
                 bail!("OAuth state mismatch; start the login again");
