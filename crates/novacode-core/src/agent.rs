@@ -37,10 +37,25 @@ pub struct Config {
     pub cache: CacheRetention,
     pub window_tokens: u64,
     pub thinking: ThinkingLevel,
+    /// The model takes images (L2.15).
+    pub images: bool,
     /// Where cut tool output is spilled in full.
     pub spill_dir: PathBuf,
     /// Masks novacode's own secrets in tool output (L6.6).
     pub redactor: Redactor,
+}
+
+/// A model change, possibly to another provider (L2.11): everything that
+/// depends on the model travels together.
+pub struct Switch {
+    pub provider: String,
+    pub model: String,
+    pub adapter: Arc<dyn Adapter>,
+    pub window_tokens: u64,
+    pub max_tokens: u32,
+    pub images: bool,
+    /// Already clamped to what the new model supports.
+    pub thinking: ThinkingLevel,
 }
 
 pub struct Agent {
@@ -73,8 +88,8 @@ struct Shared {
     cancel: Mutex<Option<CancellationToken>>,
     notify: Notify,
     closed: Mutex<bool>,
-    /// Model id to switch to at the start of the next run (same provider).
-    next_model: Mutex<Option<String>>,
+    /// Route to switch to at the start of the next run.
+    next_model: Mutex<Option<Switch>>,
     next_thinking: Mutex<Option<ThinkingLevel>>,
 }
 
@@ -218,15 +233,24 @@ impl Agent {
     /// Run until the model stops and nothing is queued.
     pub async fn run(&mut self) {
         let next = self.shared.next_model.lock().unwrap().take();
-        if let Some(m) = next
-            && m != self.cfg.model
-        {
-            // Recorded in the session (L2.11); the next request is a full cache miss.
-            self.cfg.model = m;
-            self.add(EntryKind::ModelChange {
-                provider: self.cfg.provider.clone(),
-                model: self.cfg.model.clone(),
-            });
+        if let Some(s) = next {
+            if (&s.provider, &s.model) != (&self.cfg.provider, &self.cfg.model) {
+                // Recorded in the session (L2.11); the next request is a full cache miss.
+                self.add(EntryKind::ModelChange {
+                    provider: s.provider.clone(),
+                    model: s.model.clone(),
+                });
+            }
+            self.adapter = s.adapter;
+            self.cfg.provider = s.provider;
+            self.cfg.model = s.model;
+            self.cfg.window_tokens = s.window_tokens;
+            self.cfg.max_tokens = s.max_tokens;
+            self.cfg.images = s.images;
+            let mut slot = self.shared.next_thinking.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(s.thinking);
+            }
         }
         let next = self.shared.next_thinking.lock().unwrap().take();
         if let Some(level) = next
@@ -342,6 +366,8 @@ impl Agent {
                 max_tokens: self.cfg.max_tokens,
                 cache: self.cfg.cache,
                 thinking: Some(self.cfg.thinking),
+                images: self.cfg.images,
+                session: Some(self.store.id().to_string()),
             };
             let mut rx = self.adapter.stream(req, cancel.child_token());
             let mut fin = None;
@@ -556,9 +582,9 @@ impl SessionHandle {
             c.cancel();
         }
     }
-    /// Switch model (same provider) from the next run on.
-    pub fn set_model(&self, model: impl Into<String>) {
-        *self.shared.next_model.lock().unwrap() = Some(model.into());
+    /// Switch model (any provider) from the next run on.
+    pub fn set_model(&self, switch: Switch) {
+        *self.shared.next_model.lock().unwrap() = Some(switch);
     }
     /// Thinking level from the next run on (L2.16).
     pub fn set_thinking(&self, level: ThinkingLevel) {

@@ -1,0 +1,154 @@
+//! Model choice across providers (L2.10, L2.11): limits, switching, the
+//! picker list and `novacode models`.
+
+use futures_util::future::join_all;
+use novacode_ai::connect::{Providers, Route};
+use novacode_ai::trace::Trace;
+use novacode_base::settings::Settings;
+use novacode_core::agent::Switch;
+use novacode_tui::dialog::PickItem;
+use novacode_types::ThinkingLevel;
+use std::process::ExitCode;
+
+/// Settings that cap what the catalog says.
+#[derive(Clone, Copy)]
+pub struct Limits {
+    max_tokens: Option<u32>,
+    window: Option<u64>,
+}
+
+impl Limits {
+    pub fn new(s: &Settings) -> Self {
+        Self {
+            max_tokens: s.get("maxTokens"),
+            window: s.get("contextWindow"),
+        }
+    }
+
+    /// (context window, max output tokens) for a route.
+    pub fn of(&self, r: &Route) -> (u64, u32) {
+        let window = self.window.unwrap_or(r.info.context);
+        let max = self.max_tokens.unwrap_or(16_384).min(r.info.output.max(1024) as u32);
+        (window, max)
+    }
+}
+
+/// Everything the agent needs to move to `spec` (another provider is fine).
+pub async fn switch(
+    p: &Providers,
+    spec: &str,
+    level: ThinkingLevel,
+    limits: Limits,
+    trace: Option<Trace>,
+) -> anyhow::Result<(Switch, Route)> {
+    let route = p.resolve(spec)?;
+    let (adapter, _) = p.adapter(&route.provider, trace).await?;
+    let (window_tokens, max_tokens) = limits.of(&route);
+    let switch = Switch {
+        provider: route.provider.clone(),
+        model: route.model.clone(),
+        adapter,
+        window_tokens,
+        max_tokens,
+        images: route.info.images,
+        thinking: route.clamp(route.level.unwrap_or(level)),
+    };
+    Ok((switch, route))
+}
+
+/// Live model lists of every connected provider, plus errors worth showing.
+pub async fn list(p: &Providers, current: &str) -> (Vec<PickItem>, Vec<String>) {
+    let connected: Vec<_> = p.profiles.values().filter(|pr| p.connected(pr)).collect();
+    let lists = join_all(connected.iter().map(|pr| async move {
+        let ids = match p.adapter(&pr.id, None).await {
+            Ok((a, _)) => a.list_models().await,
+            Err(e) => Err(e.to_string()),
+        };
+        (*pr, ids)
+    }))
+    .await;
+    let mut items = Vec::new();
+    let mut errors = Vec::new();
+    for (pr, ids) in lists {
+        let ids = match ids {
+            Ok(ids) => ids,
+            // Local servers that aren't running are not an error worth a notice.
+            Err(_) if pr.key_optional => continue,
+            Err(e) => {
+                errors.push(format!("{}: {e}", pr.id));
+                continue;
+            }
+        };
+        for id in ids {
+            let value = format!("{}/{id}", pr.id);
+            let info = p.catalog.get(pr.catalog_id(), &id);
+            let mut detail = info.map(|i| format!("{}k", i.context / 1000)).unwrap_or_default();
+            if value == current {
+                detail = format!("current · {detail}");
+            }
+            items.push(PickItem {
+                label: value.clone(),
+                detail,
+                value,
+            });
+        }
+    }
+    // The current provider first, then by name.
+    let cur = current.split_once('/').map_or("", |(p, _)| p);
+    items.sort_by_key(|i| (!i.value.starts_with(&format!("{cur}/")), i.value.clone()));
+    (items, errors)
+}
+
+/// `novacode models [filter]`: connected providers' models with their metadata.
+pub async fn command(p: &Providers, filter: Option<String>, all: bool) -> anyhow::Result<ExitCode> {
+    let f = filter.unwrap_or_default().to_lowercase();
+    if all {
+        // Every provider novacode knows, connected or not.
+        for pr in p.profiles.values() {
+            let state = if p.connected(pr) { "connected" } else { "" };
+            let env = pr
+                .env
+                .first()
+                .map(String::as_str)
+                .unwrap_or(if pr.oauth() { "login" } else { "" });
+            if pr.id.contains(&f) || pr.name.to_lowercase().contains(&f) {
+                println!("{:24} {:32} {:28} {state}", pr.id, pr.name, env);
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let (items, errors) = list(p, "").await;
+    for e in &errors {
+        eprintln!("warning: {e}");
+    }
+    let mut shown = 0;
+    for it in items.iter().filter(|i| i.value.to_lowercase().contains(&f)) {
+        let (prov, id) = it.value.split_once('/').unwrap_or_default();
+        let info = p.profiles.get(prov).map(|pr| p.catalog.info(pr.catalog_id(), id));
+        let Some(i) = info else { continue };
+        let cost = i
+            .cost
+            .map(|c| format!("${}/{} per M", c.input, c.output))
+            .unwrap_or_default();
+        let think = if i.reasoning { "thinking" } else { "" };
+        let img = if i.images { "images" } else { "" };
+        let ctx = if i.known {
+            format!("{}k", i.context / 1000)
+        } else {
+            "?".into()
+        };
+        println!("{:52} {:>6}  {:8} {:6} {cost}", it.value, ctx, think, img);
+        shown += 1;
+    }
+    if shown == 0 {
+        eprintln!(
+            "no models{}; `novacode models --all` lists providers and how to connect them",
+            if f.is_empty() {
+                String::new()
+            } else {
+                format!(" match `{f}`")
+            }
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}

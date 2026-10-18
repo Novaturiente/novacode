@@ -1,0 +1,463 @@
+{
+ "claude": {
+  "name": "Claude Pro/Max",
+  "api": "anthropic",
+  "auth": "oauth",
+  "catalog": "anthropic",
+  "login": true
+ },
+ "anthropic": {
+  "name": "Anthropic API",
+  "api": "anthropic",
+  "baseUrl": "https://api.anthropic.com",
+  "env": [
+   "ANTHROPIC_API_KEY"
+  ]
+ },
+ "minimax": {
+  "name": "MiniMax (minimax.io)",
+  "api": "anthropic",
+  "baseUrl": "https://api.minimax.io/anthropic",
+  "env": [
+   "MINIMAX_API_KEY"
+  ]
+ },
+ "minimax-coding-plan": {
+  "name": "MiniMax Token Plan (minimax.io)",
+  "api": "anthropic",
+  "baseUrl": "https://api.minimax.io/anthropic",
+  "env": [
+   "MINIMAX_API_KEY"
+  ]
+ },
+ "openrouter": {
+  "name": "OpenRouter",
+  "api": "openai-chat",
+  "baseUrl": "https://openrouter.ai/api/v1",
+  "env": [
+   "OPENROUTER_API_KEY"
+  ],
+  "compat": {
+   "thinkingFormat": "openrouter",
+   "cacheControl": "anthropic"
+  }
+ },
+ "deepseek": {
+  "name": "DeepSeek",
+  "api": "openai-chat",
+  "baseUrl": "https://api.deepseek.com",
+  "env": [
+   "DEEPSEEK_API_KEY"
+  ],
+  "compat": {
+   "thinkingFormat": "deepseek",
+   "reasoningContentOnAssistant": true
+  }
+ },
+ "groq": {
+  "name": "Groq",
+  "api": "openai-chat",
+  "baseUrl": "https://api.groq.com/openai/v1",
+  "env": [
+   "GROQ_API_KEY"
+  ]
+ },
+ "xai": {
+  "name": "xAI",
+  "api": "openai-chat",
+  "baseUrl": "https://api.x.ai/v1",
+  "env": [
+   "XAI_API_KEY"
+  ],
+  "compat": {
+   "reasoningEffort": false
+  }
+ },
+ "mistral": {
+  "name": "Mistral",
+  "api": "openai-chat",
+  "baseUrl": "https://api.mistral.ai/v1",
+  "env": [
+   "MISTRAL_API_KEY"
+  ],
+  "compat": {
+   "reasoningEffort": false
+  }
+ },
+ "cerebras": {
+  "name": "Cerebras",
+  "api": "openai-chat",
+  "baseUrl": "https://api.cerebras.ai/v1",
+  "env": [
+   "CEREBRAS_API_KEY"
+  ]
+ },
+ "togetherai": {
+  "name": "Together AI",
+  "api": "openai-chat",
+  "baseUrl": "https://api.together.xyz/v1",
+  "env": [
+   "TOGETHER_API_KEY"
+  ]
+ },
+ "fireworks-ai": {
+  "name": "Fireworks AI",
+  "api": "openai-chat",
+  "baseUrl": "https://api.fireworks.ai/inference/v1",
+  "env": [
+   "FIREWORKS_API_KEY"
+  ]
+ },
+ "deepinfra": {
+  "name": "Deep Infra",
+  "api": "openai-chat",
+  "baseUrl": "https://api.deepinfra.com/v1/openai",
+  "env": [
+   "DEEPINFRA_API_KEY"
+  ]
+ },
+ "moonshotai": {
+  "name": "Moonshot AI",
+  "api": "openai-chat",
+  "baseUrl": "https://api.moonshot.ai/v1",
+  "env": [
+   "MOONSHOT_API_KEY"
+  ],
+  "compat": {
+   "reasoningContentOnAssistant": true
+  }
+ },
+ "moonshotai-cn": {
+  "name": "Moonshot AI (China)",
+  "api": "openai-chat",
+  "baseUrl": "https://api.moonshot.cn/v1",
+  "env": [
+   "MOONSHOT_API_KEY"
+  ],
+  "compat": {
+   "reasoningContentOnAssistant": true
+  }
+ },
+ "kimi-code-plan-global": {
+  "name": "Kimi For Coding (kimi.ai)",
+  "api": "openai-chat",
+  "baseUrl": "https://api.kimi.ai/coding/v1",
+  "env": [
+   "KIMI_API_KEY"
+  ],
+  "compat": {
+   "reasoningContentOnAssistant": true
+  }
+ },
+ "zai": {
+  "name": "Z.AI",
+  "api": "openai-chat",
+  "baseUrl": "https://api.z.ai/api/paas/v4",
+  "env": [
+   "ZHIPU_API_KEY"
+  ],
+  "compat": {
+   "thinkingFormat": "zai"
+  }
+ },
+ "zai-coding-plan": {
+  "name": "Z.AI Coding Plan",
+  "api": "openai-chat",
+  "baseUrl": "https://api.z.ai/api/coding/paas/v4",
+  "env": [
+   "ZHIPU_API_KEY"
+  ],
+  "compat": {
+   "thinkingFormat": "zai"
+  }
+ },
+ "zhipuai": {
+  "name": "Zhipu AI",
+  "api": "openai-chat",
+  "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
+  "env": [
+   "ZHIPU_API_KEY"
+  ],
+  "compat": {
+   "thinkingFormat": "zai"
+  }
+ },
+ "nvidia": {
+  "name": "Nvidia",
+  "api": "openai-chat",
+  "baseUrl": "https://integrate.api.nvidia.com/v1",
+  "env": [
+   "NVIDIA_API_KEY"
+  ]
+ },
+ "huggingface": {
+  "name": "Hugging Face",
+  "api": "openai-chat",
+  "baseUrl": "https://router.huggingface.co/v1",
+  "env": [
+   "HF_TOKEN"
+  ]
+ },
+ "alibaba": {
+  "name": "Alibaba",
+  "api": "openai-chat",
+  "baseUrl": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+  "env": [
+   "DASHSCOPE_API_KEY"
+  ],
+  "compat": {
+   "thinkingFormat": "qwen"
+  }
+ },
+ "alibaba-coding-plan": {
+  "name": "Alibaba Coding Plan",
+  "api": "openai-chat",
+  "baseUrl": "https://coding-intl.dashscope.aliyuncs.com/v1",
+  "env": [
+   "ALIBABA_CODING_PLAN_API_KEY"
+  ],
+  "compat": {
+   "thinkingFormat": "qwen"
+  }
+ },
+ "perplexity": {
+  "name": "Perplexity",
+  "api": "openai-chat",
+  "baseUrl": "https://api.perplexity.ai",
+  "env": [
+   "PERPLEXITY_API_KEY"
+  ],
+  "compat": {
+   "reasoningEffort": false
+  }
+ },
+ "cohere": {
+  "name": "Cohere",
+  "api": "openai-chat",
+  "baseUrl": "https://api.cohere.ai/compatibility/v1",
+  "env": [
+   "COHERE_API_KEY"
+  ],
+  "compat": {
+   "reasoningEffort": false
+  }
+ },
+ "baseten": {
+  "name": "Baseten",
+  "api": "openai-chat",
+  "baseUrl": "https://inference.baseten.co/v1",
+  "env": [
+   "BASETEN_API_KEY"
+  ]
+ },
+ "nebius": {
+  "name": "Nebius Token Factory",
+  "api": "openai-chat",
+  "baseUrl": "https://api.tokenfactory.nebius.com/v1",
+  "env": [
+   "NEBIUS_API_KEY"
+  ]
+ },
+ "novita-ai": {
+  "name": "Novita AI",
+  "api": "openai-chat",
+  "baseUrl": "https://api.novita.ai/openai",
+  "env": [
+   "NOVITA_API_KEY"
+  ]
+ },
+ "siliconflow": {
+  "name": "SiliconFlow",
+  "api": "openai-chat",
+  "baseUrl": "https://api.siliconflow.com/v1",
+  "env": [
+   "SILICONFLOW_API_KEY"
+  ]
+ },
+ "sambanova": {
+  "name": "SambaNova",
+  "api": "openai-chat",
+  "baseUrl": "https://api.sambanova.ai/v1",
+  "env": [
+   "SAMBANOVA_API_KEY"
+  ]
+ },
+ "lmstudio": {
+  "name": "LMStudio",
+  "api": "openai-chat",
+  "baseUrl": "http://127.0.0.1:1234/v1",
+  "env": [
+   "LMSTUDIO_API_KEY"
+  ],
+  "keyOptional": true
+ },
+ "ollama-cloud": {
+  "name": "Ollama Cloud",
+  "api": "openai-chat",
+  "baseUrl": "https://ollama.com/v1",
+  "env": [
+   "OLLAMA_API_KEY"
+  ]
+ },
+ "opencode": {
+  "name": "OpenCode",
+  "api": "openai-chat",
+  "baseUrl": "https://opencode.ai/inference/openai/v1",
+  "env": [
+   "OPENCODE_API_KEY"
+  ]
+ },
+ "requesty": {
+  "name": "Requesty",
+  "api": "openai-chat",
+  "baseUrl": "https://router.requesty.ai/v1",
+  "env": [
+   "REQUESTY_API_KEY"
+  ]
+ },
+ "chutes": {
+  "name": "Chutes",
+  "api": "openai-chat",
+  "baseUrl": "https://llm.chutes.ai/v1",
+  "env": [
+   "CHUTES_API_KEY"
+  ]
+ },
+ "scaleway": {
+  "name": "Scaleway",
+  "api": "openai-chat",
+  "baseUrl": "https://api.scaleway.ai/v1",
+  "env": [
+   "SCALEWAY_API_KEY"
+  ]
+ },
+ "ovhcloud": {
+  "name": "OVHcloud AI Endpoints",
+  "api": "openai-chat",
+  "baseUrl": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+  "env": [
+   "OVHCLOUD_API_KEY"
+  ]
+ },
+ "inception": {
+  "name": "Inception",
+  "api": "openai-chat",
+  "baseUrl": "https://api.inceptionlabs.ai/v1",
+  "env": [
+   "INCEPTION_API_KEY"
+  ]
+ },
+ "morph": {
+  "name": "Morph",
+  "api": "openai-chat",
+  "baseUrl": "https://api.morphllm.com/v1",
+  "env": [
+   "MORPH_API_KEY"
+  ]
+ },
+ "friendli": {
+  "name": "Friendli",
+  "api": "openai-chat",
+  "baseUrl": "https://api.friendli.ai/serverless/v1",
+  "env": [
+   "FRIENDLI_TOKEN"
+  ]
+ },
+ "llama": {
+  "name": "Llama",
+  "api": "openai-chat",
+  "baseUrl": "https://api.llama.com/compat/v1",
+  "env": [
+   "LLAMA_API_KEY"
+  ]
+ },
+ "stepfun": {
+  "name": "StepFun (China)",
+  "api": "openai-chat",
+  "baseUrl": "https://api.stepfun.com/v1",
+  "env": [
+   "STEPFUN_API_KEY"
+  ]
+ },
+ "xiaomi": {
+  "name": "Xiaomi",
+  "api": "openai-chat",
+  "baseUrl": "https://api.xiaomimimo.com/v1",
+  "env": [
+   "XIAOMI_API_KEY"
+  ]
+ },
+ "poe": {
+  "name": "Poe",
+  "api": "openai-chat",
+  "baseUrl": "https://api.poe.com/v1",
+  "env": [
+   "POE_API_KEY"
+  ]
+ },
+ "wandb": {
+  "name": "CoreWeave",
+  "api": "openai-chat",
+  "baseUrl": "https://api.inference.wandb.ai/v1",
+  "env": [
+   "WANDB_API_KEY"
+  ]
+ },
+ "synthetic": {
+  "name": "Synthetic",
+  "api": "openai-chat",
+  "baseUrl": "https://api.synthetic.new/openai/v1",
+  "env": [
+   "SYNTHETIC_API_KEY"
+  ]
+ },
+ "zenmux": {
+  "name": "ZenMux",
+  "api": "openai-chat",
+  "baseUrl": "https://zenmux.ai/api/v1",
+  "env": [
+   "ZENMUX_API_KEY"
+  ]
+ },
+ "302ai": {
+  "name": "302.AI",
+  "api": "openai-chat",
+  "baseUrl": "https://api.302.ai/v1",
+  "env": [
+   "302AI_API_KEY"
+  ]
+ },
+ "nano-gpt": {
+  "name": "NanoGPT",
+  "api": "openai-chat",
+  "baseUrl": "https://nano-gpt.com/api/v1",
+  "env": [
+   "NANO_GPT_API_KEY"
+  ]
+ },
+ "helicone": {
+  "name": "Helicone",
+  "api": "openai-chat",
+  "baseUrl": "https://ai-gateway.helicone.ai/v1",
+  "env": [
+   "HELICONE_API_KEY"
+  ]
+ },
+ "vultr": {
+  "name": "Vultr",
+  "api": "openai-chat",
+  "baseUrl": "https://api.vultrinference.com/v1",
+  "env": [
+   "VULTR_API_KEY"
+  ]
+ },
+ "ollama": {
+  "name": "Ollama (local)",
+  "api": "openai-chat",
+  "baseUrl": "http://127.0.0.1:11434/v1",
+  "env": [
+   "OLLAMA_API_KEY"
+  ],
+  "keyOptional": true
+ }
+}

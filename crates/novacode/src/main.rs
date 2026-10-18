@@ -4,8 +4,8 @@ use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use futures_util::future::BoxFuture;
 use novacode_ai::adapter::CacheRetention;
-use novacode_ai::anthropic::{Anthropic, Auth, OAuthProfile};
 use novacode_ai::auth::{self, AuthStore, DEFAULT_ACCOUNT, claude};
+use novacode_ai::connect::Providers;
 use novacode_ai::trace::Trace;
 use novacode_base::redact::Redactor;
 use novacode_base::{logging, new_id, paths::Paths, settings, settings::Settings};
@@ -24,6 +24,8 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot};
+
+mod models;
 
 #[derive(Parser, Clone)]
 #[command(name = "novacode", version, about = "An agent harness")]
@@ -68,6 +70,14 @@ enum Command {
     Login { provider: String },
     /// Remove a stored login.
     Logout { provider: String },
+    /// List models of connected providers (with a filter); --all lists every provider; --refresh updates the catalog.
+    Models {
+        filter: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        refresh: bool,
+    },
     /// Trust a folder's project config (default: the current folder); --revoke to distrust it.
     Trust {
         path: Option<std::path::PathBuf>,
@@ -121,6 +131,20 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             );
             return Ok(ExitCode::SUCCESS);
         }
+        Some(Command::Models { filter, all, refresh }) => {
+            let cache = novacode_ai::connect::cache_path(paths.home());
+            if refresh {
+                match novacode_ai::catalog::refresh(&cache).await {
+                    Ok(true) => eprintln!("catalog updated from models.dev"),
+                    Ok(false) => eprintln!("catalog already up to date"),
+                    Err(e) => eprintln!("warning: catalog refresh failed: {e}"),
+                }
+            }
+            let cwd = std::env::current_dir()?;
+            let trusted = trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &cwd, false);
+            let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
+            return models::command(&Providers::load(paths.home(), &settings), filter, all).await;
+        }
         Some(Command::Trust { path, revoke }) => {
             let dir = std::fs::canonicalize(path.unwrap_or(std::env::current_dir()?))?;
             let trust = TrustStore::new(paths.home().join("trust.json"));
@@ -163,16 +187,27 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         }
     }
     let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
+    let providers = Arc::new(Providers::load(paths.home(), &settings));
     let model = match cli.model.clone().or_else(|| settings.get::<String>("model")) {
         Some(m) => m,
-        None if interactive => onboard(&paths, &auth_store, &settings).await?,
+        None if interactive => onboard(&paths, &providers).await?,
         None => bail!("no model: pass -m provider/model or set \"model\" in settings"),
     };
+    // L2.10: refresh model metadata in the background; used from the next start.
+    let cache = novacode_ai::connect::cache_path(paths.home());
+    if interactive && novacode_ai::catalog::stale(&cache) {
+        tokio::spawn(async move {
+            if let Err(e) = novacode_ai::catalog::refresh(&cache).await {
+                tracing::warn!(error = %e, "catalog refresh failed");
+            }
+        });
+    }
+    drop(auth_store);
     let ctx = Ctx {
         paths,
         cwd,
         settings,
-        auth: auth_store,
+        providers,
         cli,
     };
     let store = if let Some(prefix) = &ctx.cli.resume {
@@ -201,49 +236,28 @@ struct Ctx {
     paths: Paths,
     cwd: std::path::PathBuf,
     settings: Settings,
-    auth: AuthStore,
+    providers: Arc<Providers>,
     cli: Cli,
 }
 
 impl Ctx {
-    async fn auth(&self, provider: &str) -> anyhow::Result<(Auth, Option<String>)> {
-        let s = &self.settings;
-        Ok(match provider {
-            claude::PROVIDER => {
-                let d = OAuthProfile::default();
-                let get = |k: &str, def: String| s.get::<String>(&format!("providers.claude.{k}")).unwrap_or(def);
-                let profile = OAuthProfile {
-                    user_agent: get("userAgent", d.user_agent),
-                    betas: get("betas", d.betas),
-                    billing_header: get("billingHeader", d.billing_header),
-                    identity: get("identity", d.identity),
-                };
-                let access_token = self.auth.access_token(claude::PROVIDER, DEFAULT_ACCOUNT).await?;
-                (Auth::OAuth { access_token, profile }, None)
-            }
-            "anthropic" => {
-                let raw = s
-                    .get::<String>("providers.anthropic.apiKey")
-                    .unwrap_or_else(|| "$ANTHROPIC_API_KEY".into());
-                let key = auth::resolve_key(&raw)?;
-                (Auth::ApiKey(key.clone()), Some(key))
-            }
-            other => bail!("unknown provider `{other}` (M1 supports claude, anthropic)"),
+    fn trace(&self) -> Option<Trace> {
+        self.cli.trace.then(|| Trace {
+            path: self.paths.logs().join(format!("trace-{}.jsonl", new_id())),
         })
     }
 
+    /// Build the agent for `model` (`provider/model[:level]`). Returns the resolved `provider/model`.
     async fn agent(
         &self,
         store: Store,
         model: &str,
         approver: Option<Arc<dyn Approver>>,
-    ) -> anyhow::Result<(Agent, Arc<Anthropic>)> {
-        let (model, level) = split_level(model);
-        let (provider, model_id) = model
-            .split_once('/')
-            .context("model must be provider/model, e.g. claude/claude-opus-5-5")?;
+    ) -> anyhow::Result<(Agent, String)> {
+        let route = self.providers.resolve(model)?;
         // `model:level` wins, then the session's own level (resume), then settings.
-        let level = level
+        let level = route
+            .level
             .or(store.last_thinking())
             .or_else(|| {
                 self.settings
@@ -251,15 +265,13 @@ impl Ctx {
                     .and_then(|l| ThinkingLevel::parse(&l))
             })
             .unwrap_or_default();
-        let (auth, api_key) = self.auth(provider).await?;
-        let trace = self.cli.trace.then(|| Trace {
-            path: self.paths.logs().join(format!("trace-{}.jsonl", new_id())),
-        });
+        let trace = self.trace();
         if let Some(t) = &trace
             && approver.is_none()
         {
             eprintln!("trace: {}", t.path.display());
         }
+        let (adapter, api_key) = self.providers.adapter(&route.provider, trace).await?;
         let s = &self.settings;
         let perms: Permissions = s.get("permissions").unwrap_or_default();
         let mut policy = Policy::new(
@@ -273,18 +285,19 @@ impl Ctx {
         if let Some(p) = &self.cli.profile {
             policy = policy.with_profile(p).map_err(anyhow::Error::msg)?;
         }
+        let (window_tokens, max_tokens) = models::Limits::new(s).of(&route);
         let cfg = Config {
             cwd: self.cwd.clone(),
-            provider: provider.to_string(),
-            model: model_id.to_string(),
-            max_tokens: s.get("maxTokens").unwrap_or(16_384),
+            provider: route.provider.clone(),
+            model: route.model.clone(),
+            max_tokens,
             cache: match s.get::<String>("cacheRetention").as_deref() {
                 Some("long") => CacheRetention::Long,
                 _ => CacheRetention::Short,
             },
-            // shortcut: fixed window until the model catalog (M5, L2.10).
-            window_tokens: self.window_tokens(),
-            thinking: novacode_ai::anthropic::clamp_thinking(model_id, level),
+            window_tokens,
+            thinking: route.clamp(level),
+            images: route.info.images,
             spill_dir: self.paths.home().join("spill"),
             redactor: {
                 let auth_path = self.paths.home().join("auth.json");
@@ -295,23 +308,12 @@ impl Ctx {
                 })
             },
         };
-        let adapter = Arc::new(Anthropic::new(auth, trace));
-        let mut agent = Agent::new(
-            adapter.clone(),
-            novacode_tools::builtins(false),
-            store,
-            cfg,
-            Arc::new(LocalEnv),
-        )
-        .with_policy(policy);
+        let mut agent =
+            Agent::new(adapter, novacode_tools::builtins(false), store, cfg, Arc::new(LocalEnv)).with_policy(policy);
         if let Some(a) = approver {
             agent = agent.with_approver(a);
         }
-        Ok((agent, adapter))
-    }
-
-    fn window_tokens(&self) -> u64 {
-        self.settings.get("contextWindow").unwrap_or(200_000)
+        Ok((agent, route.spec()))
     }
 }
 
@@ -445,9 +447,10 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
     loop {
         let (ui_tx, ui_rx) = mpsc::unbounded_channel();
         let approver: Arc<dyn Approver> = Arc::new(TuiApprover(ui_tx.clone()));
-        let (agent, adapter) = ctx.agent(store, &model, Some(approver)).await?;
+        let (agent, spec) = ctx.agent(store, &model, Some(approver)).await?;
         let history = agent.store.projection();
         let level = agent.config().thinking;
+        let window_tokens = agent.config().window_tokens;
         let id = agent.store.id().to_string();
         let (handle, task) = agent::spawn(agent);
         let (etx, erx) = mpsc::unbounded_channel();
@@ -467,9 +470,11 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
         });
         let (ctx_tx, mut crx) = mpsc::unbounded_channel();
         let h = handle.clone();
-        let current = Arc::new(std::sync::Mutex::new(model.clone()));
+        // The resolved `provider/model` and the level in use, kept for /resume and /new.
+        let current = Arc::new(std::sync::Mutex::new((spec.clone(), level)));
         let cur = current.clone();
         let (paths, cwd, this_id) = (ctx.paths.clone(), ctx.cwd.clone(), id.clone());
+        let (providers, limits, trace) = (ctx.providers.clone(), models::Limits::new(&ctx.settings), ctx.trace());
         tokio::spawn(async move {
             while let Some(c) = crx.recv().await {
                 match c {
@@ -477,24 +482,42 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
                     Cmd::Steer(t) => h.steer(t),
                     Cmd::Abort => h.abort(),
                     Cmd::SetModel(m) => {
-                        let mut cur = cur.lock().unwrap();
-                        let provider = cur.split_once('/').map_or("", |(p, _)| p).to_string();
-                        *cur = format!("{provider}/{m}");
-                        h.set_model(m);
+                        let (p, tx, cur, h, trace) =
+                            (providers.clone(), ui_tx.clone(), cur.clone(), h.clone(), trace.clone());
+                        tokio::spawn(async move {
+                            let level = cur.lock().unwrap().1;
+                            match models::switch(&p, &m, level, limits, trace).await {
+                                Ok((sw, route)) => {
+                                    let ev = UiEvent::ModelSet {
+                                        model: route.spec(),
+                                        window_tokens: sw.window_tokens,
+                                        level: sw.thinking,
+                                    };
+                                    *cur.lock().unwrap() = (route.spec(), sw.thinking);
+                                    h.set_model(sw);
+                                    let _ = tx.send(ev);
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(UiEvent::Notice {
+                                        text: format!("model not changed: {e:#}"),
+                                        error: true,
+                                    });
+                                }
+                            }
+                        });
                     }
                     Cmd::SetThinking(l) => {
-                        let cur = cur.lock().unwrap().clone();
-                        let id = split_level(&cur).0.split_once('/').map_or("", |(_, m)| m).to_string();
-                        let level = novacode_ai::anthropic::clamp_thinking(&id, l);
+                        let spec = cur.lock().unwrap().0.clone();
+                        let Ok(route) = providers.resolve(&spec) else { continue };
+                        let level = route.clamp(l);
+                        cur.lock().unwrap().1 = level;
                         h.set_thinking(level);
                         let mut note = format!("thinking → {} from the next message", level.as_str());
                         if level != l {
-                            note += &format!(" ({id} has no `{}`)", l.as_str());
+                            note += &format!(" ({} has no `{}`)", route.model, l.as_str());
                         }
                         // L1.7: say what the change costs, never block.
-                        note += if novacode_ai::anthropic::thinking_style(&id)
-                            == novacode_ai::anthropic::ThinkingStyle::Managed
-                        {
+                        note += if route.thinking_change_keeps_cache() {
                             "; the cache is kept"
                         } else {
                             "; the cache starts over"
@@ -502,21 +525,20 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
                         let _ = ui_tx.send(UiEvent::Thinking { level, note });
                     }
                     Cmd::ListModels => {
-                        let (adapter, tx, cur) = (adapter.clone(), ui_tx.clone(), cur.lock().unwrap().clone());
+                        let (p, tx, cur) = (providers.clone(), ui_tx.clone(), cur.lock().unwrap().0.clone());
                         tokio::spawn(async move {
-                            let provider = cur.split_once('/').map_or("", |(p, _)| p).to_string();
-                            let r = adapter.list_models().await.map(|ids| {
-                                ids.into_iter()
-                                    .map(|id| {
-                                        let value = format!("{provider}/{id}");
-                                        PickItem {
-                                            detail: if value == cur { "current".into() } else { String::new() },
-                                            label: id,
-                                            value,
-                                        }
-                                    })
-                                    .collect()
-                            });
+                            let (items, errors) = models::list(&p, &cur).await;
+                            for e in errors {
+                                let _ = tx.send(UiEvent::Notice {
+                                    text: format!("models: {e}"),
+                                    error: true,
+                                });
+                            }
+                            let r = if items.is_empty() {
+                                Err("no connected provider listed any model".into())
+                            } else {
+                                Ok(items)
+                            };
                             let _ = tx.send(UiEvent::Models(r));
                         });
                     }
@@ -547,10 +569,10 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
             }
         });
         let init = novacode_tui::Init {
-            model: split_level(&model).0.to_string(),
+            model: spec.clone(),
             cwd: ctx.cwd.display().to_string(),
             branch: git_branch(&ctx.cwd),
-            window_tokens: ctx.window_tokens(),
+            window_tokens,
             history,
             keymap: {
                 let (km, warn) = load_keymap(&ctx.paths);
@@ -578,7 +600,8 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
         handle.abort();
         handle.shutdown();
         let agent = task.await?;
-        model = current.lock().unwrap().clone();
+        // /new and /resume keep the model; the level comes from the session (or settings).
+        model = current.lock().unwrap().0.clone();
         let prev = agent.store.path().map(Path::to_path_buf);
         drop(agent);
         let next = match res? {
@@ -648,67 +671,51 @@ fn ask_trust(store: &TrustStore, cwd: &Path) -> anyhow::Result<bool> {
 }
 
 /// L11.6 first run: connect (subscription first), pick a model, save it.
-async fn onboard(paths: &Paths, auth_store: &AuthStore, settings: &Settings) -> anyhow::Result<String> {
-    let logged_in = auth_store.has(claude::PROVIDER);
-    let env_key = std::env::var("ANTHROPIC_API_KEY").is_ok();
-    let item = |label: &str, detail: &str, value: &str| PickItem {
-        label: label.into(),
-        detail: detail.into(),
+async fn onboard(paths: &Paths, p: &Providers) -> anyhow::Result<String> {
+    let item = |label: String, detail: String, value: &str| PickItem {
+        label,
+        detail,
         value: value.into(),
     };
-    let body = ["Welcome to novacode. How should it reach a model? (More providers arrive in M5.)".to_string()];
-    let provider = novacode_tui::prompt::select(
-        "Connect",
-        &body,
-        vec![
-            item(
-                "Claude Pro/Max subscription",
-                if logged_in {
-                    "logged in"
-                } else {
-                    "log in with your browser"
-                },
-                claude::PROVIDER,
-            ),
-            item(
-                "Anthropic API key",
-                if env_key {
-                    "found ANTHROPIC_API_KEY"
-                } else {
-                    "set ANTHROPIC_API_KEY first"
-                },
-                "anthropic",
-            ),
-        ],
-    )?
-    .context("setup cancelled; run novacode again, or pass -m provider/model")?;
-    match provider.as_str() {
-        claude::PROVIDER if !logged_in => {
-            login(auth_store, claude::PROVIDER).await?;
-        }
-        "anthropic" if !env_key && settings.get::<String>("providers.anthropic.apiKey").is_none() => {
-            bail!("set ANTHROPIC_API_KEY (or providers.anthropic.apiKey in settings) and run novacode again")
-        }
-        _ => {}
+    let mut items = Vec::new();
+    // Subscriptions first, then every provider whose key is already set.
+    for pr in p.profiles.values().filter(|pr| pr.oauth()) {
+        let state = if p.connected(pr) {
+            "logged in"
+        } else {
+            "log in with your browser"
+        };
+        items.push(item(format!("{} subscription", pr.name), state.into(), &pr.id));
     }
-    let ctx_auth = match provider.as_str() {
-        claude::PROVIDER => Auth::OAuth {
-            access_token: auth_store.access_token(claude::PROVIDER, DEFAULT_ACCOUNT).await?,
-            profile: OAuthProfile::default(),
-        },
-        _ => Auth::ApiKey(auth::resolve_key(
-            &settings
-                .get::<String>("providers.anthropic.apiKey")
-                .unwrap_or_else(|| "$ANTHROPIC_API_KEY".into()),
-        )?),
-    };
-    let ids = Anthropic::new(ctx_auth, None)
+    for pr in p
+        .profiles
+        .values()
+        .filter(|pr| !pr.oauth() && !pr.key_optional && p.connected(pr))
+    {
+        let how = pr
+            .api_key
+            .as_ref()
+            .map_or_else(|| format!("found {}", pr.env.join("/")), |_| "key in settings".into());
+        items.push(item(pr.name.clone(), how, &pr.id));
+    }
+    let body = [
+        "Welcome to novacode. How should it reach a model?".to_string(),
+        "API-key providers appear here once their key env var is set (see `novacode models --all`).".into(),
+    ];
+    let provider = novacode_tui::prompt::select("Connect", &body, items)?
+        .context("setup cancelled; run novacode again, or pass -m provider/model")?;
+    let pr = p.profile(&provider)?;
+    if pr.oauth() && !p.connected(pr) {
+        login(&p.auth, &provider).await?;
+    }
+    let (adapter, _) = p.adapter(&provider, None).await?;
+    let ids = adapter
         .list_models()
         .await
         .map_err(|e| anyhow::anyhow!("could not list models: {e}. Pass -m {provider}/<model> instead."))?;
     let items = ids
         .into_iter()
-        .map(|id| item(&id, "", &format!("{provider}/{id}")))
+        .map(|id| item(id.clone(), String::new(), &format!("{provider}/{id}")))
         .collect();
     let body = ["Pick a default model. It is saved to settings.json; /model changes it later.".to_string()];
     let model = novacode_tui::prompt::select("Model", &body, items)?.context("setup cancelled")?;
@@ -754,12 +761,4 @@ async fn login(store: &AuthStore, provider: &str) -> anyhow::Result<ExitCode> {
     store.put(claude::PROVIDER, DEFAULT_ACCOUNT, cred).await?;
     eprintln!("logged in to claude");
     Ok(ExitCode::SUCCESS)
-}
-
-/// `provider/model:level` → (`provider/model`, level). A suffix that isn't a level stays part of the id.
-fn split_level(model: &str) -> (&str, Option<ThinkingLevel>) {
-    match model.rsplit_once(':') {
-        Some((m, l)) if ThinkingLevel::parse(l).is_some() => (m, ThinkingLevel::parse(l)),
-        _ => (model, None),
-    }
 }

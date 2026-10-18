@@ -67,7 +67,7 @@ pub enum Cmd {
     /// Delivered before the next model call of the running turn (L3.7).
     Steer(String),
     Abort,
-    /// Model id (same provider), from the next run on.
+    /// `provider/model`, from the next run on; the host answers with [`UiEvent::ModelSet`] or a notice.
     SetModel(String),
     /// From the next message on; the host answers with [`UiEvent::Thinking`].
     SetThinking(ThinkingLevel),
@@ -89,6 +89,12 @@ pub enum UiEvent {
     Thinking {
         level: ThinkingLevel,
         note: String,
+    },
+    /// A model switch was accepted: the resolved `provider/model`, its context window and level.
+    ModelSet {
+        model: String,
+        window_tokens: u64,
+        level: ThinkingLevel,
     },
 }
 
@@ -255,6 +261,22 @@ impl App {
             UiEvent::Sessions(items) => self.overlay = Some(Overlay::Sessions(Picker::new("Resume session", items))),
             UiEvent::Notice { text, error } => self.tr.notice(text, error),
             UiEvent::Thinking { level, note } => {
+                self.init.level = level;
+                self.tr.notice(note, false);
+            }
+            UiEvent::ModelSet {
+                model,
+                window_tokens,
+                level,
+            } => {
+                // L1.7: a model change re-sends the whole prompt uncached; say so, never block.
+                let est = self.usage.map_or(0, |u| u.prompt_total());
+                let mut note = format!("model → {model} · {} from the next message", level.as_str());
+                if est > 0 && model != self.init.model {
+                    note += &format!(" (the cache starts over: ~{}k tokens re-sent)", est / 1000);
+                }
+                self.init.model = model;
+                self.init.window_tokens = window_tokens;
                 self.init.level = level;
                 self.tr.notice(note, false);
             }
@@ -614,34 +636,14 @@ impl App {
     }
 
     fn set_model(&mut self, model: &str) {
-        let (provider, id) = match model.split_once('/') {
-            Some((p, m)) => (p.to_string(), m.to_string()),
-            None => (
-                self.init.model.split_once('/').map_or("", |(p, _)| p).to_string(),
-                model.to_string(),
-            ),
-        };
-        let current = self.init.model.split_once('/').map_or("", |(p, _)| p);
-        if provider != current {
-            self.tr.notice(
-                format!("switching provider mid-session arrives in M5; restart with -m {provider}/{id}"),
-                true,
-            );
-            return;
-        }
-        self.init.model = format!("{provider}/{id}");
-        // L1.7: a model change re-sends the whole prompt uncached; say so, never block.
-        let est = self.usage.map_or(0, |u| u.prompt_total());
-        let note = if est > 0 {
-            format!(
-                "model → {id} from the next message (the cache starts over: ~{}k tokens re-sent)",
-                est / 1000
-            )
+        // A bare id means the current provider.
+        let spec = if model.contains('/') {
+            model.to_string()
         } else {
-            format!("model → {id}")
+            let provider = self.init.model.split_once('/').map_or("", |(p, _)| p);
+            format!("{provider}/{model}")
         };
-        self.tr.notice(note, false);
-        self.send(Cmd::SetModel(id));
+        self.send(Cmd::SetModel(spec));
     }
 
     fn toggle_thinking(&mut self) {

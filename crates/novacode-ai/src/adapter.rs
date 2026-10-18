@@ -28,12 +28,20 @@ pub struct Request {
     pub cache: CacheRetention,
     /// `None` = send no thinking setting (the model's default).
     pub thinking: Option<ThinkingLevel>,
+    /// The model takes images; otherwise they become a placeholder (L2.15).
+    pub images: bool,
+    /// Session id, for providers that key their cache on it (L2.17).
+    pub session: Option<String>,
 }
 
 /// One wire protocol. Stateless per call: `stream` never fails, it reports
 /// failure as a terminal [`StreamEvent::Error`] (L2.1, "the loop never throws").
 pub trait Adapter: Send + Sync {
     fn stream(&self, req: Request, cancel: CancellationToken) -> mpsc::Receiver<StreamEvent>;
+    /// Model ids this account can use right now (the live list, L2.10).
+    fn list_models(&self) -> futures_util::future::BoxFuture<'_, Result<Vec<String>, String>> {
+        Box::pin(async { Err("this provider has no model list".to_string()) })
+    }
 }
 
 /// Bound on queued events: a slow consumer back-pressures the adapter (principle 5).
@@ -79,6 +87,10 @@ impl Builder {
             started: false,
             thinking_level: None,
         }
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
     }
 
     async fn send(&self, ev: StreamEvent) {

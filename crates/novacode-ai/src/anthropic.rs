@@ -2,11 +2,12 @@
 //! (OAuth) profiles (L2.1), cache markers (L2.17), retry before content (L2.18),
 //! overflow detection (L2.19) and redacted tracing (L2.24).
 
-use crate::adapter::{Adapter, Builder, CacheRetention, EVENT_BUFFER, Request};
+use crate::adapter::{Adapter, Builder, CacheRetention, Request};
+use crate::http::{self, Failure, Wire};
 use crate::retry;
-use crate::sse::SseParser;
+use crate::sse::SseEvent;
 use crate::trace::Trace;
-use futures_util::StreamExt;
+use crate::transform::{self, Target};
 use novacode_types::{Block, BlockKind, ErrorKind, Message, StopReason, StreamEvent, ThinkingLevel, Usage};
 use serde_json::{Map, Value, json};
 use std::time::Duration;
@@ -15,9 +16,6 @@ use tokio_util::sync::CancellationToken;
 
 pub const PROVIDER: &str = "anthropic";
 const API_VERSION: &str = "2023-06-01";
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Time allowed between any two chunks (also covers time to first byte).
-const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Vendor-controlled values for the Claude subscription. Bundled defaults;
 /// overridable in settings because Anthropic changes them (L2.1).
@@ -56,20 +54,25 @@ pub struct Anthropic {
     base_url: String,
     auth: Auth,
     trace: Option<Trace>,
+    /// Replay namespace: `anthropic` for Claude (key or subscription), the vendor id otherwise.
+    provider: String,
 }
 
 impl Anthropic {
     pub fn new(auth: Auth, trace: Option<Trace>) -> Self {
-        let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .unwrap_or_default();
         Self {
-            http,
+            http: http::client(),
             base_url: "https://api.anthropic.com".into(),
             auth,
             trace,
+            provider: PROVIDER.into(),
         }
+    }
+
+    /// An Anthropic-compatible vendor (e.g. MiniMax): its own replay namespace.
+    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = provider.into();
+        self
     }
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
@@ -143,12 +146,11 @@ impl Anthropic {
 
 impl Adapter for Anthropic {
     fn stream(&self, req: Request, cancel: CancellationToken) -> mpsc::Receiver<StreamEvent> {
-        let (tx, rx) = mpsc::channel(EVENT_BUFFER);
         let oauth_profile = match &self.auth {
             Auth::OAuth { profile, .. } => Some(profile.clone()),
             Auth::ApiKey(_) => None,
         };
-        let body = serde_json::to_vec(&build_body(&req, oauth_profile.as_ref())).unwrap_or_default();
+        let body = serde_json::to_vec(&build_body(&req, oauth_profile.as_ref(), &self.provider)).unwrap_or_default();
         let effort = in_conversation_effort(&req.model, req.thinking);
         // Mid-conversation effort needs these two betas (as pi sends them).
         let betas: &[&str] = if effort.is_some() {
@@ -160,97 +162,13 @@ impl Adapter for Anthropic {
             &[]
         };
         let request = self.http_request(&body, betas);
-        let trace = self.trace.clone();
-        tokio::spawn(async move {
-            let mut b = Builder::new(tx, PROVIDER, &req.model);
-            b.thinking_level = effort;
-            if let Some(t) = &trace {
-                t.request(&request, &body);
-            }
-            tokio::select! {
-                _ = cancel.cancelled() => b.fail(ErrorKind::Aborted, "aborted").await,
-                r = run(request, &mut b, trace.as_ref()) => match r {
-                    Ok(stop) => b.finish(stop).await,
-                    Err((kind, msg)) => b.fail(kind, msg).await,
-                },
-            }
-        });
-        rx
+        let (mut b, rx) = http::channel(&self.provider, &req.model);
+        b.thinking_level = effort;
+        http::drive(b, rx, request, body, self.trace.clone(), cancel, State::default)
     }
-}
 
-type Failure = (ErrorKind, String);
-
-/// Send with retries before any content, then stream.
-async fn run(request: reqwest::RequestBuilder, b: &mut Builder, trace: Option<&Trace>) -> Result<StopReason, Failure> {
-    let mut attempt = 0;
-    loop {
-        let Some(req) = request.try_clone() else {
-            return Err((ErrorKind::Other, "request not cloneable".into()));
-        };
-        let failure = match req.send().await {
-            Err(e) => Some((None, None, (ErrorKind::Transient, format!("network error: {e}")))),
-            Ok(resp) if !resp.status().is_success() => {
-                let status = resp.status().as_u16();
-                let headers = resp.headers().clone();
-                let text = resp.text().await.unwrap_or_default();
-                if let Some(t) = trace {
-                    t.response_error(status, &text);
-                }
-                Some((Some(status), Some(headers.clone()), classify(status, &headers, &text)))
-            }
-            Ok(resp) => match stream_body(resp, b, trace).await {
-                Ok(stop) => return Ok(stop),
-                // Mid-stream failures are not retried here; the loop decides (L4.6).
-                Err(f) if b.started => return Err(f),
-                Err(f) => Some((None, None, f)),
-            },
-        };
-        let Some((status, headers, f)) = failure else {
-            unreachable!()
-        };
-        if !retry::should_retry(status, headers.as_ref()) || !f.0.is_retryable() {
-            return Err(f);
-        }
-        let server = headers.as_ref().and_then(retry::retry_after);
-        let Some(d) = retry::delay(attempt, server) else {
-            return Err(f);
-        };
-        tracing::warn!(attempt, ?d, error = %f.1, "anthropic: retrying");
-        b.rollback().await;
-        tokio::time::sleep(d).await;
-        attempt += 1;
-    }
-}
-
-async fn stream_body(resp: reqwest::Response, b: &mut Builder, trace: Option<&Trace>) -> Result<StopReason, Failure> {
-    let mut body = resp.bytes_stream();
-    let mut sse = SseParser::default();
-    let mut st = State::default();
-    loop {
-        let chunk = match tokio::time::timeout(IDLE_TIMEOUT, body.next()).await {
-            Err(_) => return Err((ErrorKind::Transient, "stream idle timeout".into())),
-            Ok(None) => break,
-            Ok(Some(Err(e))) => return Err((ErrorKind::Transient, format!("stream error: {e}"))),
-            Ok(Some(Ok(c))) => c,
-        };
-        for ev in sse.push(&chunk) {
-            if let Some(t) = trace {
-                t.sse(&ev);
-            }
-            if let Some(stop) = on_event(&ev.event, &ev.data, b, &mut st).await? {
-                return Ok(stop);
-            }
-        }
-    }
-    if let Some(ev) = sse.finish()
-        && let Some(stop) = on_event(&ev.event, &ev.data, b, &mut st).await?
-    {
-        return Ok(stop);
-    }
-    match st.stop {
-        Some(stop) => Ok(stop),
-        None => Err((ErrorKind::Transient, "stream ended before message_stop".into())),
+    fn list_models(&self) -> futures_util::future::BoxFuture<'_, Result<Vec<String>, String>> {
+        Box::pin(Anthropic::list_models(self))
     }
 }
 
@@ -260,67 +178,81 @@ struct State {
     usage: Usage,
 }
 
-/// Handle one SSE event; `Some(stop)` ends the stream.
-async fn on_event(event: &str, data: &str, b: &mut Builder, st: &mut State) -> Result<Option<StopReason>, Failure> {
-    if data.is_empty() {
-        return Ok(None);
+impl Wire for State {
+    fn classify(status: u16, headers: &reqwest::header::HeaderMap, body: &str) -> Failure {
+        classify(status, headers, body)
     }
-    let v: Value = serde_json::from_str(data).map_err(|e| (ErrorKind::Transient, format!("bad event json: {e}")))?;
-    let kind = v["type"].as_str().unwrap_or(event);
-    let index = v["index"].as_u64().unwrap_or(0) as usize;
-    match kind {
-        "message_start" => {
-            let m = &v["message"];
-            b.response_id = m["id"].as_str().map(String::from);
-            read_usage(&m["usage"], &mut st.usage);
-            b.usage(st.usage).await;
-        }
-        "content_block_start" => {
-            let cb = &v["content_block"];
-            match cb["type"].as_str().unwrap_or_default() {
-                "text" => b.start(index, BlockKind::Text, "", "").await,
-                "thinking" => b.start(index, BlockKind::Thinking, "", "").await,
-                "redacted_thinking" => {
-                    b.start(index, BlockKind::Thinking, "", "").await;
-                    b.set_replay(index, json!({ "redacted": cb["data"] }));
-                }
-                "tool_use" => {
-                    let id = cb["id"].as_str().unwrap_or_default();
-                    let name = cb["name"].as_str().unwrap_or_default();
-                    b.start(index, BlockKind::ToolCall, id, name).await;
-                }
-                _ => b.start_native(index, cb.clone()), // server tools etc., replayed verbatim
-            }
-        }
-        "content_block_delta" => {
-            let d = &v["delta"];
-            match d["type"].as_str().unwrap_or_default() {
-                "text_delta" => b.delta(index, d["text"].as_str().unwrap_or_default()).await,
-                "thinking_delta" => b.delta(index, d["thinking"].as_str().unwrap_or_default()).await,
-                "input_json_delta" => b.delta(index, d["partial_json"].as_str().unwrap_or_default()).await,
-                "signature_delta" => b.set_replay(index, json!({ "signature": d["signature"] })),
-                _ => {}
-            }
-        }
-        "content_block_stop" => b.end(index).await,
-        "message_delta" => {
-            read_usage(&v["usage"], &mut st.usage);
-            b.usage(st.usage).await;
-            st.stop = Some(match v["delta"]["stop_reason"].as_str() {
-                Some("tool_use") => StopReason::ToolUse,
-                Some("max_tokens") | Some("model_context_window_exceeded") => StopReason::Length,
-                _ => StopReason::Stop, // end_turn, stop_sequence, pause_turn, refusal
-            });
-        }
-        "message_stop" => return Ok(Some(st.stop.clone().unwrap_or(StopReason::Stop))),
-        "error" => {
-            let e = &v["error"];
-            let msg = e["message"].as_str().unwrap_or(data).to_string();
-            return Err((error_kind(e["type"].as_str().unwrap_or_default(), &msg), msg));
-        }
-        _ => {} // ping
+
+    async fn at_eof(&mut self, _b: &mut Builder) -> Result<StopReason, Failure> {
+        self.stop
+            .clone()
+            .ok_or((ErrorKind::Transient, "stream ended before message_stop".into()))
     }
-    Ok(None)
+
+    /// Handle one SSE event; `Some(stop)` ends the stream.
+    async fn on_event(&mut self, ev: &SseEvent, b: &mut Builder) -> Result<Option<StopReason>, Failure> {
+        let (event, data, st) = (ev.event.as_str(), ev.data.as_str(), self);
+        if data.is_empty() {
+            return Ok(None);
+        }
+        let v: Value =
+            serde_json::from_str(data).map_err(|e| (ErrorKind::Transient, format!("bad event json: {e}")))?;
+        let kind = v["type"].as_str().unwrap_or(event);
+        let index = v["index"].as_u64().unwrap_or(0) as usize;
+        match kind {
+            "message_start" => {
+                let m = &v["message"];
+                b.response_id = m["id"].as_str().map(String::from);
+                read_usage(&m["usage"], &mut st.usage);
+                b.usage(st.usage).await;
+            }
+            "content_block_start" => {
+                let cb = &v["content_block"];
+                match cb["type"].as_str().unwrap_or_default() {
+                    "text" => b.start(index, BlockKind::Text, "", "").await,
+                    "thinking" => b.start(index, BlockKind::Thinking, "", "").await,
+                    "redacted_thinking" => {
+                        b.start(index, BlockKind::Thinking, "", "").await;
+                        b.set_replay(index, json!({ "redacted": cb["data"] }));
+                    }
+                    "tool_use" => {
+                        let id = cb["id"].as_str().unwrap_or_default();
+                        let name = cb["name"].as_str().unwrap_or_default();
+                        b.start(index, BlockKind::ToolCall, id, name).await;
+                    }
+                    _ => b.start_native(index, cb.clone()), // server tools etc., replayed verbatim
+                }
+            }
+            "content_block_delta" => {
+                let d = &v["delta"];
+                match d["type"].as_str().unwrap_or_default() {
+                    "text_delta" => b.delta(index, d["text"].as_str().unwrap_or_default()).await,
+                    "thinking_delta" => b.delta(index, d["thinking"].as_str().unwrap_or_default()).await,
+                    "input_json_delta" => b.delta(index, d["partial_json"].as_str().unwrap_or_default()).await,
+                    "signature_delta" => b.set_replay(index, json!({ "signature": d["signature"] })),
+                    _ => {}
+                }
+            }
+            "content_block_stop" => b.end(index).await,
+            "message_delta" => {
+                read_usage(&v["usage"], &mut st.usage);
+                b.usage(st.usage).await;
+                st.stop = Some(match v["delta"]["stop_reason"].as_str() {
+                    Some("tool_use") => StopReason::ToolUse,
+                    Some("max_tokens") | Some("model_context_window_exceeded") => StopReason::Length,
+                    _ => StopReason::Stop, // end_turn, stop_sequence, pause_turn, refusal
+                });
+            }
+            "message_stop" => return Ok(Some(st.stop.clone().unwrap_or(StopReason::Stop))),
+            "error" => {
+                let e = &v["error"];
+                let msg = e["message"].as_str().unwrap_or(data).to_string();
+                return Err((error_kind(e["type"].as_str().unwrap_or_default(), &msg), msg));
+            }
+            _ => {} // ping
+        }
+        Ok(None)
+    }
 }
 
 fn read_usage(u: &Value, usage: &mut Usage) {
@@ -475,7 +407,16 @@ pub fn in_conversation_effort(model: &str, level: Option<ThinkingLevel>) -> Opti
 }
 
 /// Build the JSON body. Pure and deterministic (L1.7 rule 3): same request, same bytes.
-pub fn build_body(req: &Request, oauth: Option<&OAuthProfile>) -> Value {
+pub fn build_body(req: &Request, oauth: Option<&OAuthProfile>, ns: &str) -> Value {
+    let history = transform::for_target(
+        &req.messages,
+        &Target {
+            provider: ns,
+            model: &req.model,
+            images: req.images,
+            normalize_id: Some(transform::safe_id),
+        },
+    );
     let cache = match req.cache {
         CacheRetention::Short => json!({ "type": "ephemeral" }),
         CacheRetention::Long => json!({ "type": "ephemeral", "ttl": "1h" }),
@@ -486,14 +427,14 @@ pub fn build_body(req: &Request, oauth: Option<&OAuthProfile>) -> Value {
         system.push(json!({ "type": "text", "text": p.identity }));
     }
     // Anthropic has no mid-conversation system role: merge every System message, in order (L1.1).
-    for m in &req.messages {
+    for m in &history {
         if let Message::System { text } = m
             && !text.is_empty()
         {
             system.push(json!({ "type": "text", "text": text }));
         }
     }
-    let (mut messages, levels) = convert_messages(&req.messages);
+    let (mut messages, levels) = convert_messages(&history, ns);
     let tools: Vec<Value> = req
         .tools
         .iter()
@@ -596,7 +537,7 @@ fn place_cache_markers(system: &mut [Value], messages: &mut [Value], cache: &Val
 }
 
 /// Wire messages, plus the recorded effort of each assistant one (for mid-conversation effort).
-fn convert_messages(messages: &[Message]) -> (Vec<Value>, Vec<Option<String>>) {
+fn convert_messages(messages: &[Message], ns: &str) -> (Vec<Value>, Vec<Option<String>>) {
     let mut out: Vec<Value> = Vec::new();
     let mut levels: Vec<Option<String>> = Vec::new();
     let mut push = |role: &str, blocks: Vec<Value>, level: Option<&String>| {
@@ -619,10 +560,10 @@ fn convert_messages(messages: &[Message]) -> (Vec<Value>, Vec<Option<String>>) {
             Message::System { .. } | Message::Custom { .. } => {}
             Message::User { content } => push("user", content.iter().filter_map(user_block).collect(), None),
             Message::Assistant(a) => {
-                let same = a.provider == PROVIDER;
+                let same = a.provider == ns;
                 push(
                     "assistant",
-                    a.content.iter().filter_map(|b| assistant_block(b, same)).collect(),
+                    a.content.iter().filter_map(|b| assistant_block(b, ns, same)).collect(),
                     a.thinking_level.as_ref().filter(|_| same),
                 )
             }
@@ -657,9 +598,9 @@ fn user_block(b: &Block) -> Option<Value> {
     }
 }
 
-fn assistant_block(b: &Block, same_provider: bool) -> Option<Value> {
+fn assistant_block(b: &Block, ns: &str, same_provider: bool) -> Option<Value> {
     let replay_data =
-        |r: &Option<novacode_types::Replay>| r.as_ref().filter(|r| r.provider == PROVIDER).map(|r| r.data.clone());
+        |r: &Option<novacode_types::Replay>| r.as_ref().filter(|r| r.provider == ns).map(|r| r.data.clone());
     match b {
         Block::Text { text, .. } if !text.is_empty() => Some(json!({ "type": "text", "text": text })),
         Block::Thinking { text, replay } => {
@@ -671,7 +612,7 @@ fn assistant_block(b: &Block, same_provider: bool) -> Option<Value> {
             Some(json!({ "type": "thinking", "thinking": text, "signature": data.get("signature")? }))
         }
         Block::ToolCall(c) => Some(json!({ "type": "tool_use", "id": c.id, "name": c.name, "input": c.arguments })),
-        Block::ProviderNative { provider, item } if same_provider && provider == PROVIDER => Some(item.clone()),
+        Block::ProviderNative { provider, item } if same_provider && provider == ns => Some(item.clone()),
         _ => None,
     }
 }
@@ -690,6 +631,8 @@ mod tests {
             max_tokens: 100,
             cache: CacheRetention::Short,
             thinking: None,
+            images: true,
+            session: None,
         }
     }
 
@@ -721,11 +664,11 @@ mod tests {
         let mut r = req(vec![Message::user("a")]);
         r.model = "claude-sonnet-4-5".into();
         r.thinking = Some(Medium);
-        let b = build_body(&r, None);
+        let b = build_body(&r, None, PROVIDER);
         assert_eq!(b["thinking"], json!({ "type": "enabled", "budget_tokens": 8192 }));
         assert_eq!(b["max_tokens"], json!(100 + 8192));
         r.model = "claude-opus-4-8".into();
-        let b = build_body(&r, None);
+        let b = build_body(&r, None, PROVIDER);
         assert_eq!(b["output_config"], json!({ "effort": "medium" }));
     }
 
@@ -734,7 +677,7 @@ mod tests {
         let mut first = req(vec![Message::user("a")]);
         first.model = "claude-opus-5-5".into();
         first.thinking = Some(ThinkingLevel::High);
-        let b1 = build_body(&first, None);
+        let b1 = build_body(&first, None, PROVIDER);
         let m1 = b1["messages"].as_array().unwrap();
         assert_eq!(m1.last().unwrap()["output_config"], json!({ "effort": "high" }));
 
@@ -753,7 +696,7 @@ mod tests {
         let mut second = first.clone();
         second.messages.extend([Message::Assistant(reply), Message::user("c")]);
         second.thinking = Some(ThinkingLevel::Low);
-        let b2 = build_body(&second, None);
+        let b2 = build_body(&second, None, PROVIDER);
         let m2 = b2["messages"].as_array().unwrap();
         let roles: Vec<&str> = m2.iter().map(|m| m["role"].as_str().unwrap()).collect();
         assert_eq!(roles, ["user", "system", "assistant", "user", "system"]);
@@ -810,7 +753,7 @@ mod tests {
             description: "Read".into(),
             schema: json!({"type": "object"}),
         }];
-        let body = build_body(&r, None);
+        let body = build_body(&r, None, PROVIDER);
         let want = json!({
             "model": "claude-x", "max_tokens": 100,
             "system": [{"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral"}}],
@@ -831,7 +774,7 @@ mod tests {
         assert_eq!(body, want);
         assert_eq!(
             serde_json::to_vec(&body).unwrap(),
-            serde_json::to_vec(&build_body(&r, None)).unwrap()
+            serde_json::to_vec(&build_body(&r, None, PROVIDER)).unwrap()
         );
     }
 
@@ -839,7 +782,7 @@ mod tests {
     fn oauth_system_blocks_and_long_ttl() {
         let mut r = req(vec![Message::user("hi")]);
         r.cache = CacheRetention::Long;
-        let body = build_body(&r, Some(&OAuthProfile::default()));
+        let body = build_body(&r, Some(&OAuthProfile::default()), PROVIDER);
         let sys = body["system"].as_array().unwrap();
         assert!(
             sys[0]["text"]

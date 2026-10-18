@@ -297,8 +297,14 @@ fn slash_commands_pickers_and_pager() {
         key(&mut a, KeyCode::Char(c), KeyModifiers::NONE);
     }
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
-    assert_eq!(rx.try_recv().unwrap(), Cmd::SetModel("haiku".into()));
-    assert!(screen(&mut a, 60, 30).contains("model → haiku"));
+    assert_eq!(rx.try_recv().unwrap(), Cmd::SetModel("claude/haiku".into()));
+    a.on_ui(UiEvent::ModelSet {
+        model: "claude/haiku".into(),
+        window_tokens: 200_000,
+        level: ThinkingLevel::Medium,
+    });
+    let s = screen(&mut a, 60, 30);
+    assert!(s.contains("model → claude/haiku · medium"), "{s}");
     // Ctrl+L asks for models; the picker filters and picks.
     key(&mut a, KeyCode::Char('l'), KeyModifiers::CONTROL);
     assert_eq!(rx.try_recv().unwrap(), Cmd::ListModels);
@@ -313,7 +319,7 @@ fn slash_commands_pickers_and_pager() {
     snapshot("model_picker", &screen(&mut a, 60, 16));
     key(&mut a, KeyCode::Char('s'), KeyModifiers::NONE);
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
-    assert_eq!(rx.try_recv().unwrap(), Cmd::SetModel("sonnet".into()));
+    assert_eq!(rx.try_recv().unwrap(), Cmd::SetModel("claude/sonnet".into()));
     // Ctrl+O shows the last tool's full output; Esc closes.
     key(&mut a, KeyCode::Char('o'), KeyModifiers::CONTROL);
     assert!(screen(&mut a, 60, 16).contains("12+ assert_eq!(2, 2);"));

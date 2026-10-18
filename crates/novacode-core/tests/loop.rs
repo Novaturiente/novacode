@@ -43,6 +43,7 @@ fn cfg(cwd: &Path, home: &Path) -> Config {
         max_tokens: 1000,
         cache: CacheRetention::Short,
         window_tokens: 200_000,
+        images: true,
         thinking: Default::default(),
         spill_dir: home.join("spill"),
         redactor: Default::default(),
@@ -71,7 +72,7 @@ async fn drive(agent: Agent, prompts: &[&str]) -> (Agent, Vec<AgentEvent>) {
 
 /// Anthropic body bytes per message with cache markers removed (markers move by design).
 fn wire_messages(r: &Request) -> Vec<String> {
-    let mut body = build_body(r, None);
+    let mut body = build_body(r, None, "anthropic");
     fn strip(v: &mut Value) {
         match v {
             Value::Object(o) => {
@@ -159,7 +160,10 @@ async fn tools_session_and_cache_prefix() {
             b.len() > a.len() && b[..a.len()] == a[..],
             "request is not a prefix of the next"
         );
-        assert_eq!(build_body(&w[0], None)["system"], build_body(&w[1], None)["system"]);
+        assert_eq!(
+            build_body(&w[0], None, "anthropic")["system"],
+            build_body(&w[1], None, "anthropic")["system"]
+        );
     }
 
     // Resume from disk: the projection equals what was sent plus the final reply.
