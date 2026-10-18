@@ -4,6 +4,7 @@ pub mod logging;
 pub mod paths;
 pub mod redact;
 pub mod settings;
+pub mod settings_doc;
 pub mod storage;
 
 /// New time-sortable id (UUIDv7, L0.8).

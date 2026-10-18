@@ -445,6 +445,34 @@ fn bridge<'js>(ctx: &rquickjs::Ctx<'js>, shared: &Arc<Shared>) -> rquickjs::Resu
 
 #[cfg(test)]
 mod tests {
+
+    /// docs/extensions.md lists every function of the API objects (L11.8).
+    #[test]
+    fn docs_cover_the_api() {
+        let doc = include_str!("../../../docs/extensions.md");
+        let api = &PRELUDE[PRELUDE.find("const api = Object.freeze({").unwrap()..];
+        let mut names = Vec::new();
+        for l in api.lines() {
+            let t = l.trim_start();
+            let indent = l.len() - t.len();
+            if indent != 4 && indent != 6 {
+                continue;
+            }
+            let name: String = t.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+            let rest = &t[name.len()..];
+            if !name.is_empty()
+                && ((rest.starts_with('(') && t.ends_with('{'))
+                    || rest.starts_with(": (")
+                    || rest.starts_with(": async"))
+            {
+                names.push(name);
+            }
+        }
+        assert!(names.len() > 20, "{names:?}");
+        let missing: Vec<_> = names.iter().filter(|n| !doc.contains(&format!("{n}("))).collect();
+        assert!(missing.is_empty(), "undocumented in docs/extensions.md: {missing:?}");
+    }
+
     use super::*;
 
     struct Host(Mutex<Vec<String>>);

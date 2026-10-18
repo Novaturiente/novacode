@@ -13,6 +13,7 @@ novacode-core.workspace = true
 novacode-tui.workspace = true
 novacode-tools.workspace = true
 anyhow.workspace = true
+regex = "1"
 tracing.workspace = true
 novacode-ai.workspace = true
 novacode-types.workspace = true

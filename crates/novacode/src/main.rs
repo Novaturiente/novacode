@@ -27,6 +27,7 @@ use tokio::sync::{broadcast, mpsc};
 
 mod activity;
 mod agents;
+mod diag;
 mod doctor;
 mod host;
 mod hub;
@@ -35,6 +36,7 @@ mod schedule;
 mod serve;
 mod stats;
 mod status;
+mod usage;
 mod wire;
 
 #[derive(Parser, Clone)]
@@ -49,6 +51,9 @@ struct Cli {
     /// Record the raw request and stream (redacted) to <home>/logs/trace-<id>.jsonl.
     #[arg(long)]
     trace: bool,
+    /// Time each startup phase, print the table and exit before the session starts (L11.3).
+    #[arg(long)]
+    profile_startup: bool,
     /// Report tool calls, stop reason, token/cache usage and the session file on stderr.
     #[arg(short, long)]
     verbose: bool,
@@ -96,6 +101,23 @@ struct Cli {
 enum AuthCmd {
     /// Each login and key: where it comes from and whether its token is valid.
     Status,
+}
+
+#[derive(Subcommand, Clone)]
+enum DebugCmd {
+    /// Write novacode-debug-<ms>.tar.gz: logs, crash logs, settings and the newest
+    /// session here (or --session ID, or --no-session), secrets masked.
+    Bundle {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        no_session: bool,
+        #[arg(long, short)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Panic on purpose, to check the crash log.
+    #[command(hide = true)]
+    Crash,
 }
 
 #[derive(Subcommand, Clone)]
@@ -164,6 +186,11 @@ enum Command {
         #[arg(long, value_name = "TEMPLATE")]
         format: Option<String>,
     },
+    /// Diagnostics: `debug bundle` packs logs, settings and a session, secrets masked (L11.3).
+    Debug {
+        #[command(subcommand)]
+        what: DebugCmd,
+    },
     /// Dev metrics report (needs `debug.metrics`): the latest session, one by id prefix, or --all.
     Stats {
         session: Option<String>,
@@ -231,10 +258,13 @@ fn main() -> ExitCode {
         Ok(p) => p,
         Err(e) => return fail(e.into()),
     };
+    diag::mark("parse args");
     let _log = match logging::init(&paths, cli.trace) {
         Ok(g) => g,
         Err(e) => return fail(e.into()),
     };
+    diag::install_crash_hook(&paths);
+    diag::mark("logging");
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => return fail(e.into()),
@@ -473,6 +503,25 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
             return serve::attach_loop(&paths, &session, || tui_base(&paths, &settings), true).await;
         }
+        Some(Command::Debug {
+            what:
+                DebugCmd::Bundle {
+                    session,
+                    no_session,
+                    out,
+                },
+        }) => {
+            let cwd = std::env::current_dir()?;
+            let file = match (session, no_session) {
+                (_, true) => None,
+                (Some(p), _) => Some(session::find(&paths, &cwd, &p)?),
+                (None, _) => session::list(&paths, &cwd).into_iter().next(),
+            };
+            let out = diag::bundle(&paths, &cwd, file.as_deref(), out)?;
+            println!("{}", out.display());
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Command::Debug { what: DebugCmd::Crash }) => panic!("test crash (novacode debug crash)"),
         Some(Command::Stats { session, all, turns }) => {
             std::process::exit(stats::run(paths.home(), session.as_deref(), all, turns));
         }
@@ -551,7 +600,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     if cli.bg.is_some() && std::env::var_os("NOVACODE_BG_CHILD").is_none() {
         return spawn_bg();
     }
-    let headless = cli.bg.is_some() || cli.rpc;
+    let headless = cli.bg.is_some() || cli.rpc || cli.profile_startup;
     let mut prompt = cli.print.clone();
     let stdin = std::io::stdin();
     if headless {
@@ -562,6 +611,9 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             if !piped.trim().is_empty() {
                 *p = format!("{p}\n\n{piped}");
             }
+        }
+        if p.trim().is_empty() {
+            bail!("-p needs a prompt (an argument or piped stdin)");
         }
     } else if !stdin.is_terminal() || !std::io::stdout().is_terminal() {
         bail!("interactive mode needs a terminal; use -p PROMPT for pipes and scripts");
@@ -581,7 +633,9 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         }
     }
     let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
+    diag::mark("trust + settings");
     let mut providers = Providers::load(paths.home(), &settings);
+    diag::mark("providers + catalog");
     let chosen = cli.model.clone().or_else(|| settings.get::<String>("model"));
     if let Some(k) = cli.api_key.clone() {
         let Some(provider) = chosen
@@ -629,6 +683,15 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     } else {
         Store::create(&ctx.paths, &ctx.cwd, ctx.cli.no_session)
     };
+    diag::mark("open session");
+    if ctx.cli.profile_startup {
+        let (agent, _) = ctx.agent(store, &model, None, None, None).await?;
+        diag::mark("agent ready");
+        drop(agent);
+        eprint!("{}", diag::profile());
+        eprintln!("  (MCP servers keep connecting in the background; the first frame follows at once)");
+        return Ok(ExitCode::SUCCESS);
+    }
     if headless {
         return serve_headless(&ctx, store, model).await;
     }
@@ -810,6 +873,7 @@ impl Ctx {
             eprintln!("trace: {}", t.path.display());
         }
         let (adapter, api_key) = self.providers.adapter(&route.provider, trace).await?;
+        diag::mark("connect provider");
         let s = &self.settings;
         let perms: Permissions = s.get("permissions").unwrap_or_default();
         let mut policy = Policy::new(
@@ -995,6 +1059,7 @@ impl Ctx {
             &self.paths.home().join("logs"),
         )
         .await;
+        diag::mark("tools + extensions");
         if let Some(a) = &asker {
             exts.set_asker(a.clone());
         }
@@ -1029,6 +1094,7 @@ impl Ctx {
         }
         let window = cfg.window_tokens;
         let worker = memory_on.then(|| self.memory_worker(&route, adapter.clone()));
+        diag::mark("mcp config + tool list");
         let mut agent = Agent::new(adapter, tools, store, cfg, Arc::new(LocalEnv))
             .with_shared_policy(policy)
             .with_modes(modes)

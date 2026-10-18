@@ -65,6 +65,11 @@ impl Settings {
     /// Typed value at a dotted key. A wrong-typed value is reported and
     /// treated as unset, so one bad field never resets the others.
     pub fn get<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
+        // Keeps docs/config.md complete: every key read must be in the reference table.
+        debug_assert!(
+            crate::settings_doc::documented(key),
+            "settings key `{key}` is not in settings_doc::KEYS"
+        );
         let v = lookup(&self.merged, key)?;
         match T::deserialize(v) {
             Ok(t) => Some(t),
@@ -255,9 +260,9 @@ mod tests {
     #[test]
     fn bad_field_does_not_reset_others() {
         let (_d, g, _p) = files();
-        fs::write(&g, r#"{ "retries": "lots", "model": "a" }"#).unwrap();
+        fs::write(&g, r#"{ "maxTokens": "lots", "model": "a" }"#).unwrap();
         let s = Settings::load(&g, None, false);
-        assert_eq!(s.get::<u32>("retries").unwrap_or(3), 3);
+        assert_eq!(s.get::<u32>("maxTokens").unwrap_or(3), 3);
         assert_eq!(s.get::<String>("model").as_deref(), Some("a"));
         assert_eq!(s.diagnostics().len(), 1);
     }

@@ -35,12 +35,21 @@ pub struct Host {
 }
 
 /// Mode commands (L10.7), handled here so they work in every window and over RPC.
+/// Mode commands plus /usage and /debug, all handled in Host::handle.
 pub const MODE_COMMANDS: &[(&str, &str)] = &[
     (
         "/plan",
         "plan mode on/off (read-only until a plan is approved); /plan <task> starts planning it",
     ),
     ("/mode", "switch mode preset: /mode <name>, /mode off, /mode lists them"),
+    (
+        "/usage",
+        "tokens and cost per route, cache warming, memory workers, subscription windows",
+    ),
+    (
+        "/debug",
+        "route, cache, queues, processes, MCP and log paths, for bug reports",
+    ),
 ];
 
 impl Host {
@@ -50,6 +59,29 @@ impl Host {
         let steer = matches!(c, Cmd::Steer(_));
         match c {
             Cmd::Prompt(t) | Cmd::Steer(t) if t.starts_with('!') => self.user_shell(&t, ui).await,
+            Cmd::Prompt(t) | Cmd::Steer(t) if t.trim() == "/usage" => {
+                let (me, ui) = (self.clone(), ui.clone());
+                tokio::spawn(async move {
+                    let file = session::dir_for(&me.paths, &me.cwd).join(format!("{}.jsonl", me.id));
+                    let entries = novacode_core::export::read(&file).map(|(_, e)| e).unwrap_or_default();
+                    let cur = me.cur.lock().unwrap().0.clone();
+                    let text = format!(
+                        "{}\n{}",
+                        crate::usage::report(&me.providers, &entries),
+                        crate::usage::quotas(me.paths.home(), &me.providers, &cur).await
+                    );
+                    let _ = ui.send(UiEvent::Page {
+                        title: "Usage".into(),
+                        text,
+                    });
+                });
+            }
+            Cmd::Prompt(t) | Cmd::Steer(t) if t.trim() == "/debug" => {
+                let _ = ui.send(UiEvent::Page {
+                    title: "Debug".into(),
+                    text: self.debug_text(),
+                });
+            }
             Cmd::Prompt(t) | Cmd::Steer(t) if is_mode_command(&t) => {
                 if let Some(task) = self.mode_command(&t, ui) {
                     Box::pin(self.handle(Cmd::Prompt(task), ui, local)).await;
@@ -459,6 +491,84 @@ impl Host {
         }
     }
 
+    /// `/debug` (L11.3): what a bug report needs, no secrets.
+    fn debug_text(&self) -> String {
+        use std::fmt::Write;
+        let st = self.hub.state();
+        let ctx = self.hub.handle.context();
+        let mut s = String::new();
+        let _ = writeln!(s, "novacode {}  pid {}", env!("CARGO_PKG_VERSION"), std::process::id());
+        let _ = writeln!(s, "session   {}", st.session);
+        let _ = writeln!(s, "file      {}", st.file.as_deref().unwrap_or("(none: --no-session)"));
+        let _ = writeln!(
+            s,
+            "cwd       {}  branch {}",
+            st.cwd,
+            st.branch.as_deref().unwrap_or("-")
+        );
+        let _ = writeln!(
+            s,
+            "route     {} · {:?}  window {}",
+            st.model, st.level, st.window_tokens
+        );
+        let _ = writeln!(
+            s,
+            "activity  {:?} {}  busy {}",
+            st.activity.state, st.activity.detail, st.busy
+        );
+        let _ = writeln!(
+            s,
+            "context   {} tokens ({:.1}%)",
+            st.context_tokens,
+            st.context_tokens as f64 * 100.0 / st.window_tokens.max(1) as f64
+        );
+        let _ = writeln!(
+            s,
+            "cache     hit {:.0}%  last read {} write {}  last miss {}",
+            st.cache.hit_pct,
+            st.cache.last_read,
+            st.cache.last_write,
+            st.cache.last_miss.as_deref().unwrap_or("-")
+        );
+        let _ = writeln!(s, "warmer    {}", ctx.warm);
+        let _ = writeln!(
+            s,
+            "tokens    in {} out {} cache rd {} wr {}",
+            st.tokens.input, st.tokens.output, st.tokens.cache_read, st.tokens.cache_write
+        );
+        let queued = self.hub.handle.prompts().len();
+        let _ = writeln!(s, "prompts   {queued} on the tree");
+        match &self.processes {
+            Some(p) => {
+                let list = p.list();
+                let _ = writeln!(s, "processes {} ({} running)", list.len(), p.running());
+                for i in list {
+                    let _ = writeln!(s, "  {}", serde_json::to_string(&i).unwrap_or_default());
+                }
+            }
+            None => s.push_str("processes off\n"),
+        }
+        match &self.mcp {
+            Some(h) => {
+                for (name, st, n, _) in h.status() {
+                    let _ = writeln!(s, "mcp       {name} {st:?} {n} tools");
+                }
+            }
+            None => s.push_str("mcp       none\n"),
+        }
+        let logs = self.paths.logs();
+        let _ = writeln!(s, "logs      {}", logs.display());
+        let crashes = std::fs::read_dir(&logs)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("crash-"))
+            .count();
+        let _ = writeln!(s, "crashes   {crashes} crash logs");
+        s.push_str("\nFor a report: `novacode debug bundle` packs logs and this session, secrets masked.\n");
+        s
+    }
+
     pub fn export(&self, html: bool) -> anyhow::Result<PathBuf> {
         let file = session::dir_for(&self.paths, &self.cwd).join(format!("{}.jsonl", self.id));
         export_session(&self.paths, &file, html, None)
@@ -467,5 +577,5 @@ impl Host {
 
 fn is_mode_command(t: &str) -> bool {
     let first = t.split_whitespace().next().unwrap_or_default();
-    MODE_COMMANDS.iter().any(|(c, _)| *c == first)
+    matches!(first, "/plan" | "/mode")
 }
