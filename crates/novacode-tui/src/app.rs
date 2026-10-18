@@ -990,6 +990,11 @@ impl App {
             return;
         }
         self.anchor = None;
+        // `!cmd` runs in the host now, even mid-turn; it never becomes a user message (L5.15).
+        if text.starts_with('!') {
+            self.send(Cmd::Prompt(text));
+            return;
+        }
         if self.busy {
             self.pending.push(text.clone());
             self.send(if steer { Cmd::Steer(text) } else { Cmd::Prompt(text) });

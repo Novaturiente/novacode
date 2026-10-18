@@ -456,12 +456,22 @@ fn lay_turn(turn: &Turn, width: usize, t: &Theme, thinking: Thinking, hint: &str
             Item::Tool(tool) => lines.extend(lay_tool(tool, width, t)),
             Item::Notice { text, error } => {
                 let st = if *error { t.error } else { t.dim };
-                lines.extend(wrap::wrap(
-                    vec![Span::styled(sanitize(text), st)],
-                    width,
-                    &[Span::styled(if *error { "! " } else { "· " }, st)],
-                    &[Span::raw("  ")],
-                ));
+                // Multi-line notices (`!cmd` output) keep their lines.
+                for (i, l) in text.lines().enumerate() {
+                    let first = if i > 0 {
+                        "  "
+                    } else if *error {
+                        "! "
+                    } else {
+                        "· "
+                    };
+                    lines.extend(wrap::wrap(
+                        vec![Span::styled(sanitize(l), st)],
+                        width,
+                        &[Span::styled(first, st)],
+                        &[Span::raw("  ")],
+                    ));
+                }
             }
         }
     }

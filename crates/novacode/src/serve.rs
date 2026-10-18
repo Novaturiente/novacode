@@ -120,6 +120,10 @@ async fn dispatch(host: &Arc<Host>, cmd: ClientCmd, ui: &mpsc::UnboundedSender<U
         Ok(Value::Null)
     };
     match cmd {
+        ClientCmd::Prompt { text } if text.starts_with('!') => {
+            host.user_shell(&text, ui).await;
+            Ok(json!({ "disposition": "handled" }))
+        }
         ClientCmd::Prompt { text } if text.starts_with('/') && host.slash(&text).is_some() => {
             let cmd = host.slash(&text).unwrap()?;
             host.handle(cmd, ui, false).await;

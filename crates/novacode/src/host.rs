@@ -37,6 +37,7 @@ impl Host {
         let h = &self.hub.handle;
         let steer = matches!(c, Cmd::Steer(_));
         match c {
+            Cmd::Prompt(t) | Cmd::Steer(t) if t.starts_with('!') => self.user_shell(&t, ui).await,
             Cmd::Prompt(t) | Cmd::Steer(t) => {
                 let (blocks, notes) = attach(t, self.cwd.clone(), &self.inputs).await;
                 for n in notes {
@@ -264,6 +265,72 @@ impl Host {
             .collect();
         v.extend(self.inputs.commands().0);
         v
+    }
+
+    /// `!cmd` / `!!cmd` (L5.15): the user runs a command. Its output is shown; with
+    /// one `!` it also reaches the model at its next call, without starting a turn.
+    pub async fn user_shell(&self, text: &str, ui: &UnboundedSender<UiEvent>) {
+        let quiet = text.starts_with("!!");
+        let cmd = text.trim_start_matches('!').trim().to_string();
+        if cmd.is_empty() {
+            return;
+        }
+        let cwd = PathBuf::from(self.hub.state().cwd);
+        let run = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(&cmd)
+            .current_dir(&cwd)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        let (code, out) = match tokio::time::timeout(std::time::Duration::from_secs(120), run).await {
+            Ok(Ok(o)) => {
+                let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+                s.push_str(&String::from_utf8_lossy(&o.stderr));
+                (o.status.code(), s)
+            }
+            Ok(Err(e)) => (None, format!("could not run: {e}")),
+            Err(_) => (
+                None,
+                "[killed after 120s; use the process manager for long commands]".into(),
+            ),
+        };
+        let out = out.trim_end();
+        // shortcut: the context copy keeps the last 30k chars; the full output isn't kept anywhere.
+        let tail: String = {
+            let n = out.chars().count();
+            out.chars().skip(n.saturating_sub(30_000)).collect()
+        };
+        let status = match code {
+            Some(0) => String::new(),
+            Some(c) => format!(" (exit {c})"),
+            None => " (killed)".into(),
+        };
+        let shown: Vec<&str> = out.lines().collect();
+        let skip = shown.len().saturating_sub(40);
+        let mut note = format!(
+            "$ {cmd}{status}{}",
+            if quiet { "  · not sent to the model" } else { "" }
+        );
+        if skip > 0 {
+            note += &format!("\n… {skip} lines above");
+        }
+        for l in &shown[skip..] {
+            note += &format!("\n{l}");
+        }
+        let _ = ui.send(UiEvent::Notice {
+            text: note,
+            error: code != Some(0),
+        });
+        if !quiet {
+            self.hub.handle.remind(
+                format!(
+                    "The user ran `{cmd}` in {}{status}. Output:\n```\n{tail}\n```",
+                    cwd.display()
+                ),
+                false,
+            );
+        }
     }
 
     pub fn export(&self, html: bool) -> anyhow::Result<PathBuf> {
