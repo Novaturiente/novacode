@@ -539,7 +539,13 @@ fn lay_assistant(
     hint: &str,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::default()];
+    let mut after_thinking = false;
     for (kind, text) in blocks {
+        // One blank line between thinking and the reply text below it.
+        if *kind == BlockKind::Text && std::mem::take(&mut after_thinking) {
+            lines.push(Line::default());
+        }
+        after_thinking = *kind == BlockKind::Thinking && thinking != Thinking::Hidden;
         match kind {
             BlockKind::Thinking if thinking == Thinking::Hidden => {}
             BlockKind::Thinking if thinking == Thinking::Full => {

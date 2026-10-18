@@ -3,8 +3,8 @@
  ╰──────────────────────────────────────────────╯
 
  ∴ thinking… · 3 words · ctrl+t to show
- The loop has **three
 
+ The loop has **three
  ⏵ queued: use tests
 ╭────────────────────────────────────────────────╮
 │                                                │
