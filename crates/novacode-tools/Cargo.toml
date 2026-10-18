@@ -24,6 +24,12 @@ ignore = "0.4"
 globset = "0.4"
 nix = { version = "0.30", features = ["signal"] }
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico"], optional = true }
+
+[features]
+default = ["images"]
+# Convert and shrink images (L2.22). Off: only images that already fit are sent.
+images = ["dep:image"]
 
 [dev-dependencies]
 tempfile.workspace = true

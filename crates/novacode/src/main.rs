@@ -236,7 +236,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         Some(prompt) => {
             // Nobody to approve: asks become refusals, risky commands need a justification.
             let (agent, _) = ctx.agent(store, &model, None).await?;
-            print_mode(agent, prompt, ctx.cli.verbose).await
+            print_mode(agent, prompt, ctx.cwd.clone(), ctx.cli.verbose).await
         }
     }
 }
@@ -329,7 +329,15 @@ impl Ctx {
     }
 }
 
-async fn print_mode(agent: Agent, prompt: String, verbose: bool) -> anyhow::Result<ExitCode> {
+/// Attach the images a prompt mentions (`@shot.png`, L2.22), off the async threads.
+async fn attach(text: String, cwd: std::path::PathBuf) -> (Vec<novacode_types::Block>, Vec<String>) {
+    let fallback = text.clone();
+    tokio::task::spawn_blocking(move || novacode_tools::image::attach(&text, &cwd))
+        .await
+        .unwrap_or_else(|_| (vec![novacode_types::Block::text(fallback)], vec![]))
+}
+
+async fn print_mode(agent: Agent, prompt: String, cwd: std::path::PathBuf, verbose: bool) -> anyhow::Result<ExitCode> {
     let (handle, task) = agent::spawn(agent);
     let mut events = handle.subscribe();
     let on_ctrl_c = handle.clone();
@@ -338,7 +346,11 @@ async fn print_mode(agent: Agent, prompt: String, verbose: bool) -> anyhow::Resu
             on_ctrl_c.abort();
         }
     });
-    handle.prompt(prompt);
+    let (blocks, notes) = attach(prompt, cwd).await;
+    for n in notes {
+        eprintln!("{n}");
+    }
+    handle.prompt_content(blocks);
     // stdout gets only the final answer (L8.4); progress goes to stderr with -v.
     let mut last = None;
     let stop = loop {
@@ -490,9 +502,20 @@ async fn interactive_loop(ctx: &Ctx, mut store: Store, mut model: String) -> any
         let (providers, limits, trace) = (ctx.providers.clone(), models::Limits::new(&ctx.settings), ctx.trace());
         tokio::spawn(async move {
             while let Some(c) = crx.recv().await {
+                let steer = matches!(c, Cmd::Steer(_));
                 match c {
-                    Cmd::Prompt(t) => h.prompt(t),
-                    Cmd::Steer(t) => h.steer(t),
+                    Cmd::Prompt(t) | Cmd::Steer(t) => {
+                        let (blocks, notes) = attach(t, cwd.clone()).await;
+                        for n in notes {
+                            let error = !n.starts_with("attached");
+                            let _ = ui_tx.send(UiEvent::Notice { text: n, error });
+                        }
+                        if steer {
+                            h.steer_content(blocks)
+                        } else {
+                            h.prompt_content(blocks)
+                        }
+                    }
                     Cmd::Abort => h.abort(),
                     Cmd::SetModel(m) => {
                         let (p, tx, cur, h, trace) =

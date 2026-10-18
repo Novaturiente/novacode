@@ -457,6 +457,15 @@ impl App {
             },
             Some(A::KeysHelp) => self.overlay = Some(Overlay::Pager(Pager::keys_help(&self.keymap, &self.theme))),
             Some(A::MessageCopy) => self.copy_reply(),
+            Some(A::PasteImage) => match crate::term::paste() {
+                Some(crate::term::Pasted::Image(path)) => {
+                    self.editor.insert(&format!("@{} ", path.display()));
+                }
+                Some(crate::term::Pasted::Text(t)) => self.editor.paste(&t),
+                None => self
+                    .tr
+                    .notice("nothing to paste (no wl-paste/xclip, or an empty clipboard)", true),
+            },
             Some(A::ExternalEditor) => self.external_editor = true,
             Some(A::HistorySearch) => self.editor.search_history(),
             Some(A::FollowUp) => {

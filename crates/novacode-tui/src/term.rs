@@ -159,3 +159,89 @@ pub fn copy(text: &str) {
         std::thread::spawn(move || child.wait());
     }
 }
+
+pub enum Pasted {
+    /// A clipboard image saved to a temp file; the prompt mentions it as `@path`.
+    Image(std::path::PathBuf),
+    Text(String),
+}
+
+/// Read the clipboard (Ctrl+V, L2.22): an image if it has one, else text.
+/// Wayland via wl-paste, X11 via xclip; every call is capped at 2s.
+pub fn paste() -> Option<Pasted> {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let types = if wayland {
+        run("wl-paste", &["--list-types"])?
+    } else {
+        run("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"])?
+    };
+    let types = String::from_utf8_lossy(&types);
+    if let Some(t) = image_type(&types) {
+        let bytes = if wayland {
+            run("wl-paste", &["--type", t])
+        } else {
+            run("xclip", &["-selection", "clipboard", "-t", t, "-o"])
+        }?;
+        let ext = t.strip_prefix("image/").unwrap_or("png").replace("jpeg", "jpg");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis();
+        let path = std::env::temp_dir().join(format!("novacode-clip-{}-{stamp}.{ext}", std::process::id()));
+        std::fs::write(&path, bytes).ok()?;
+        return Some(Pasted::Image(path));
+    }
+    let text = if wayland {
+        run("wl-paste", &["--no-newline"])
+    } else {
+        run("xclip", &["-selection", "clipboard", "-o"])
+    }?;
+    Some(Pasted::Text(String::from_utf8_lossy(&text).into_owned()))
+}
+
+/// The best image type on offer: formats providers take, before ones to convert.
+fn image_type(types: &str) -> Option<&str> {
+    let types: Vec<&str> = types.lines().map(str::trim).collect();
+    ["image/png", "image/jpeg", "image/webp", "image/gif"]
+        .into_iter()
+        .find(|t| types.contains(t))
+        .or_else(|| types.iter().copied().find(|t| t.starts_with("image/")))
+}
+
+fn run(cmd: &str, args: &[&str]) -> Option<Vec<u8>> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut out = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut out, &mut buf);
+        let _ = tx.send(buf);
+    });
+    let got = rx.recv_timeout(std::time::Duration::from_secs(2));
+    let _ = child.kill();
+    let status = child.wait().ok()?;
+    let buf = got.ok()?;
+    (status.success() || !buf.is_empty())
+        .then_some(buf)
+        .filter(|b| !b.is_empty())
+}
+
+#[cfg(test)]
+mod paste_tests {
+    #[test]
+    fn picks_the_best_image_type() {
+        assert_eq!(
+            super::image_type("text/plain\nimage/bmp\nimage/png\n"),
+            Some("image/png")
+        );
+        assert_eq!(super::image_type("image/bmp\nTARGETS"), Some("image/bmp"));
+        assert_eq!(super::image_type("text/plain\nUTF8_STRING"), None);
+    }
+}

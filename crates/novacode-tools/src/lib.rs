@@ -5,6 +5,7 @@ pub mod edit;
 pub mod env;
 pub mod files;
 pub mod guard;
+pub mod image;
 pub mod patch;
 pub mod read;
 pub mod search;

@@ -1,7 +1,6 @@
 //! read (L5.4): text with offset/limit and a continuation hint; images as image blocks.
 
 use crate::{Tool, ToolCtx, ToolOutput, guard, parse, schema_for};
-use base64::Engine;
 use futures_util::future::BoxFuture;
 use novacode_types::Block;
 use schemars::JsonSchema;
@@ -21,24 +20,12 @@ struct Args {
 }
 
 const MAX_LINE: usize = 2000;
-const MAX_IMAGE: u64 = 5 * 1024 * 1024;
-
-fn image_mime(bytes: &[u8]) -> Option<&'static str> {
-    match bytes {
-        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
-        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
-        [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
-        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
-        _ => None,
-    }
-}
-
 impl Tool for Read {
     fn name(&self) -> &str {
         "read"
     }
     fn description(&self) -> &str {
-        "Read a file. Text output is cut at 2000 lines or 50KB; use offset/limit to page. Images (png, jpeg, gif, webp) are returned as images."
+        "Read a file. Text output is cut at 2000 lines or 50KB; use offset/limit to page. Images are returned as images (converted and shrunk to fit when needed)."
     }
     fn schema(&self) -> Value {
         schema_for::<Args>()
@@ -62,22 +49,17 @@ impl Tool for Read {
             };
             let real = ctx.env.canonical(&path).await;
             ctx.files.saw(&real, meta.mtime_ms);
-            // shortcut: images are sent as-is (size-capped); normalise/resize with L2.22 in M5.
-            if let Some(mime) = image_mime(&bytes) {
-                if meta.len > MAX_IMAGE {
-                    return ToolOutput::error(format!("image is {} bytes; the limit is {MAX_IMAGE}", meta.len));
-                }
-                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                return ToolOutput {
-                    content: vec![
-                        Block::text(format!("Image {}:", a.path)),
-                        Block::Image {
-                            mime_type: mime.into(),
-                            data,
-                        },
-                    ],
-                    is_error: false,
-                    details: None,
+            if crate::image::is_image(&bytes) {
+                return match crate::image::normalize(&bytes) {
+                    Ok(img) => ToolOutput {
+                        content: vec![
+                            Block::text(format!("Image {} ({}):", a.path, img.describe())),
+                            img.block(),
+                        ],
+                        is_error: false,
+                        details: None,
+                    },
+                    Err(e) => ToolOutput::error(format!("{}: {e}", a.path)),
                 };
             }
             if bytes.iter().take(8000).any(|&b| b == 0) {

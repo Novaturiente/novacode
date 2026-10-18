@@ -80,8 +80,9 @@ pub struct Agent {
 
 #[derive(Default)]
 struct Queues {
-    steering: VecDeque<String>,
-    follow_up: VecDeque<String>,
+    /// User content: text, plus any attached images (L2.22).
+    steering: VecDeque<Vec<Block>>,
+    follow_up: VecDeque<Vec<Block>>,
 }
 
 #[derive(Default)]
@@ -230,9 +231,9 @@ impl Agent {
         });
     }
 
-    fn take_queued(&self, steering_only: bool) -> Vec<String> {
+    fn take_queued(&self, steering_only: bool) -> Vec<Vec<Block>> {
         let mut q = self.shared.queues.lock().unwrap();
-        let mut out: Vec<String> = q.steering.drain(..).collect();
+        let mut out: Vec<Vec<Block>> = q.steering.drain(..).collect();
         if !steering_only {
             out.extend(q.follow_up.drain(..));
         }
@@ -274,9 +275,9 @@ impl Agent {
         let mut rec = Recovery::default();
         let mut steering_only = false;
         let stop = loop {
-            for text in self.take_queued(steering_only) {
+            for content in self.take_queued(steering_only) {
                 self.add(EntryKind::Message {
-                    message: Message::user(text),
+                    message: Message::User { content },
                 });
             }
             steering_only = true;
@@ -601,12 +602,19 @@ impl SessionHandle {
     }
     /// Queue a prompt; delivered when the agent is idle or after the current run (follow-up).
     pub fn prompt(&self, text: impl Into<String>) {
-        self.shared.queues.lock().unwrap().follow_up.push_back(text.into());
+        self.prompt_content(vec![Block::text(text.into())]);
+    }
+    /// A prompt with images or other blocks.
+    pub fn prompt_content(&self, content: Vec<Block>) {
+        self.shared.queues.lock().unwrap().follow_up.push_back(content);
         self.shared.notify.notify_one();
     }
     /// Delivered before the next model call of the running turn (L3.7).
     pub fn steer(&self, text: impl Into<String>) {
-        self.shared.queues.lock().unwrap().steering.push_back(text.into());
+        self.steer_content(vec![Block::text(text.into())]);
+    }
+    pub fn steer_content(&self, content: Vec<Block>) {
+        self.shared.queues.lock().unwrap().steering.push_back(content);
         self.shared.notify.notify_one();
     }
     pub fn abort(&self) {
