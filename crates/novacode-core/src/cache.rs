@@ -28,7 +28,9 @@ pub fn miss(prev: &Sent, provider: &str, req: &Request, usage: &Usage, ttl: Opti
         return None;
     }
     // Everything the previous request sent was cached (the marker sits on its last message).
-    let expected = prev.usage.prompt_total();
+    // Capped by this request's own size: a reply with server-run tools (web search) sums
+    // usage over several internal passes, so its total counts the prefix twice.
+    let expected = prev.usage.prompt_total().min(usage.prompt_total());
     let noise = (expected / 20).max(1024);
     if usage.cache_read + noise >= expected {
         return None;
@@ -157,6 +159,15 @@ mod tests {
     }
 
     #[test]
+    fn server_tool_usage_is_not_a_miss() {
+        // Live numbers: a reply with a server-side search, then a fully cached follow-up.
+        let mut prev = sent(req("opus", &["a"]), 3);
+        prev.usage = usage(9_452, 18_796, 6);
+        let next = req("opus", &["a", "b"]);
+        assert_eq!(miss(&prev, "claude", &next, &usage(18_796, 112, 4), None), None);
+    }
+
+    #[test]
     fn misses_name_their_cause() {
         let ttl = Some(Duration::from_secs(300));
         let prev = sent(req("opus", &["a", "b"]), 30);
@@ -174,7 +185,9 @@ mod tests {
             "expired: 6m since the last request, lifetime 5m"
         );
         assert!(m(&next, &prev).starts_with("evicted"));
-        let lost = miss(&prev, "claude", &next, &usage(20_000, 0, 4), ttl).unwrap().lost;
+        let lost = miss(&prev, "claude", &next, &usage(20_000, 30_100, 4), ttl)
+            .unwrap()
+            .lost;
         assert_eq!(lost, 30_010);
         // A provider that reports no caching never "misses".
         let mut quiet = prev.clone();
