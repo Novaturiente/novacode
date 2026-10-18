@@ -4,7 +4,7 @@ use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use futures_util::future::BoxFuture;
 use novacode_ai::adapter::CacheRetention;
-use novacode_ai::auth::{self, AuthStore, DEFAULT_ACCOUNT, claude};
+use novacode_ai::auth::{self, AuthStore, DEFAULT_ACCOUNT, claude, codex};
 use novacode_ai::connect::Providers;
 use novacode_ai::trace::Trace;
 use novacode_base::redact::Redactor;
@@ -66,7 +66,7 @@ struct Cli {
 
 #[derive(Subcommand, Clone)]
 enum Command {
-    /// Log in to a subscription provider (claude).
+    /// Log in to a subscription provider (claude, codex).
     Login { provider: String },
     /// Remove a stored login.
     Logout { provider: String },
@@ -743,22 +743,37 @@ fn git_branch(cwd: &Path) -> Option<String> {
 }
 
 async fn login(store: &AuthStore, provider: &str) -> anyhow::Result<ExitCode> {
-    if provider != claude::PROVIDER {
-        bail!("unknown login provider `{provider}` (M1 supports: claude)");
-    }
-    let (verifier, challenge) = auth::pkce();
-    let url = claude::authorize_url(&verifier, &challenge);
-    eprintln!("Open this URL, sign in, then paste the code shown:\n\n{url}\n");
-    let _ = std::process::Command::new("xdg-open")
-        .arg(&url)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    eprint!("code: ");
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    let cred = claude::exchange(&line, &verifier).await?;
-    store.put(claude::PROVIDER, DEFAULT_ACCOUNT, cred).await?;
-    eprintln!("logged in to claude");
+    let open = |url: &str| {
+        let _ = std::process::Command::new("xdg-open")
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    };
+    let cred = match provider {
+        claude::PROVIDER => {
+            let (verifier, challenge) = auth::pkce();
+            let url = claude::authorize_url(&verifier, &challenge);
+            eprintln!("Open this URL, sign in, then paste the code shown:\n\n{url}\n");
+            open(&url);
+            eprint!("code: ");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            claude::exchange(&line, &verifier).await?
+        }
+        codex::PROVIDER => {
+            let d = codex::start().await?;
+            eprintln!(
+                "Open {} and enter the code\n\n    {}\n\nWaiting for you to approve (Ctrl+C to cancel)…",
+                codex::VERIFY_URL,
+                d.user_code
+            );
+            open(codex::VERIFY_URL);
+            codex::finish(&d).await?
+        }
+        _ => bail!("unknown login provider `{provider}` (logins: claude, codex)"),
+    };
+    store.put(provider, DEFAULT_ACCOUNT, cred).await?;
+    eprintln!("logged in to {provider}");
     Ok(ExitCode::SUCCESS)
 }

@@ -6,6 +6,7 @@ use crate::anthropic::{self, Anthropic, OAuthProfile};
 use crate::auth::{self, AuthError, AuthStore, DEFAULT_ACCOUNT};
 use crate::catalog::{self, Api, Catalog, ModelInfo, Profile};
 use crate::openai_chat::{Compat, OpenAiChat};
+use crate::openai_responses;
 use crate::trace::Trace;
 use novacode_base::settings::Settings;
 use novacode_types::ThinkingLevel;
@@ -164,8 +165,31 @@ impl Providers {
                     OpenAiChat::new(&p.id, &p.base_url, key.clone(), compat, trace).with_headers(p.headers.clone()),
                 )
             }
-            // shortcut: M5b/M5c build these adapters.
-            Api::OpenAiResponses | Api::Gemini => {
+            Api::OpenAiResponses => {
+                let auth = if p.oauth() {
+                    openai_responses::Auth::Codex {
+                        access_token: self.auth.access_token(&p.id, DEFAULT_ACCOUNT).await?,
+                        originator: p.extra_str("originator").unwrap_or_else(|| "novacode".into()),
+                    }
+                } else {
+                    openai_responses::Auth::ApiKey(
+                        key.clone().ok_or_else(|| setup(format!("{} needs an API key", p.id)))?,
+                    )
+                };
+                let raw = if p.compat.is_null() {
+                    Value::Object(Default::default())
+                } else {
+                    p.compat.clone()
+                };
+                let compat =
+                    serde_json::from_value(raw).map_err(|e| setup(format!("providers.{}.compat: {e}", p.id)))?;
+                Arc::new(
+                    openai_responses::OpenAiResponses::new(&p.id, &p.base_url, auth, compat, trace)
+                        .with_headers(p.headers.clone()),
+                )
+            }
+            // shortcut: M5c builds this adapter.
+            Api::Gemini => {
                 return Err(setup(format!("the {:?} adapter for {} isn't built yet", p.api, p.id)));
             }
         };

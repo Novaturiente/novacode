@@ -142,6 +142,14 @@ impl Builder {
         }
     }
 
+    /// Text streamed so far into an open block.
+    pub fn partial_text(&self, index: usize) -> Option<&str> {
+        self.open
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, p)| p.text.as_str())
+    }
+
     pub fn set_replay(&mut self, index: usize, data: serde_json::Value) {
         let provider = self.provider.clone();
         if let Some(p) = self.partial(index) {

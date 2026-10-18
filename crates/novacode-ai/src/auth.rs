@@ -146,7 +146,10 @@ impl AuthStore {
         if cred.expires_ms > now_ms() + REFRESH_MARGIN.as_millis() as u64 {
             return Ok(cred.access);
         }
-        let fresh = claude::refresh(&cred.refresh).await?;
+        let fresh = match provider {
+            codex::PROVIDER => codex::refresh(&cred.refresh).await?,
+            _ => claude::refresh(&cred.refresh).await?,
+        };
         let mut f = self.read()?;
         f.providers
             .entry(provider.into())
@@ -218,7 +221,7 @@ pub mod claude {
         format!("{AUTHORIZE_URL}?{}", qs.join("&"))
     }
 
-    fn encode(s: &str) -> String {
+    pub(crate) fn encode(s: &str) -> String {
         s.bytes()
             .map(|b| match b {
                 b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
@@ -297,9 +300,164 @@ pub mod claude {
     }
 }
 
+/// ChatGPT Plus/Pro (Codex) OAuth: device-code login (works over SSH), refresh,
+/// and the account id from the token (L2.13).
+pub mod codex {
+    use super::*;
+
+    pub const PROVIDER: &str = "codex";
+    const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+    const AUTH: &str = "https://auth.openai.com";
+    const DEVICE_REDIRECT: &str = "https://auth.openai.com/deviceauth/callback";
+    pub const VERIFY_URL: &str = "https://auth.openai.com/codex/device";
+
+    pub struct Device {
+        id: String,
+        pub user_code: String,
+        interval: u64,
+    }
+
+    fn http() -> reqwest::Client {
+        reqwest::Client::new()
+    }
+
+    pub async fn start() -> Result<Device, AuthError> {
+        let v = post_json(
+            &format!("{AUTH}/api/accounts/deviceauth/usercode"),
+            json!({ "client_id": CLIENT_ID }),
+        )
+        .await?;
+        let interval = match &v["interval"] {
+            serde_json::Value::String(s) => s.trim().parse().unwrap_or(5),
+            n => n.as_u64().unwrap_or(5),
+        };
+        Ok(Device {
+            id: v["device_auth_id"].as_str().unwrap_or_default().into(),
+            user_code: v["user_code"].as_str().unwrap_or_default().into(),
+            interval,
+        })
+    }
+
+    /// Poll until the user approves (15 min max), then exchange for tokens.
+    pub async fn finish(d: &Device) -> Result<OAuthCredential, AuthError> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15 * 60);
+        let mut wait = Duration::from_secs(d.interval.max(1));
+        let (code, verifier) = loop {
+            tokio::time::sleep(wait).await;
+            if std::time::Instant::now() > deadline {
+                return Err(AuthError::Http("login timed out".into()));
+            }
+            let resp = http()
+                .post(format!("{AUTH}/api/accounts/deviceauth/token"))
+                .timeout(Duration::from_secs(30))
+                .header("content-type", "application/json")
+                .body(json!({ "device_auth_id": d.id, "user_code": d.user_code }).to_string())
+                .send()
+                .await
+                .map_err(|e| AuthError::Http(e.to_string()))?;
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            if (200..300).contains(&status) {
+                break (
+                    v["authorization_code"].as_str().unwrap_or_default().to_string(),
+                    v["code_verifier"].as_str().unwrap_or_default().to_string(),
+                );
+            }
+            let code = v["error"]["code"].as_str().or(v["error"].as_str()).unwrap_or_default();
+            match (status, code) {
+                (403 | 404, _) | (_, "deviceauth_authorization_pending") => {}
+                (_, "slow_down") => wait += Duration::from_secs(5),
+                _ => return Err(AuthError::Http(format!("device login failed ({status}): {text}"))),
+            }
+        };
+        token(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", CLIENT_ID),
+            ("code", &code),
+            ("code_verifier", &verifier),
+            ("redirect_uri", DEVICE_REDIRECT),
+        ])
+        .await
+    }
+
+    pub async fn refresh(refresh_token: &str) -> Result<OAuthCredential, AuthError> {
+        token(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", CLIENT_ID),
+        ])
+        .await
+    }
+
+    /// The ChatGPT account id inside the access token (a JWT claim).
+    pub fn account_id(access: &str) -> Option<String> {
+        let payload = access.split('.').nth(1)?;
+        let bytes = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        v["https://api.openai.com/auth"]["chatgpt_account_id"]
+            .as_str()
+            .map(String::from)
+    }
+
+    async fn post_json(url: &str, body: serde_json::Value) -> Result<serde_json::Value, AuthError> {
+        let resp = http()
+            .post(url)
+            .timeout(Duration::from_secs(30))
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| AuthError::Http(e.to_string()))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(AuthError::Http(format!("{url} returned {status}: {text}")));
+        }
+        serde_json::from_str(&text).map_err(|e| AuthError::Http(format!("bad response: {e}")))
+    }
+
+    async fn token(form: &[(&str, &str)]) -> Result<OAuthCredential, AuthError> {
+        let body: Vec<String> = form.iter().map(|(k, v)| format!("{k}={}", claude::encode(v))).collect();
+        let resp = http()
+            .post(format!("{AUTH}/oauth/token"))
+            .timeout(Duration::from_secs(30))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(body.join("&"))
+            .send()
+            .await
+            .map_err(|e| AuthError::Http(format!("token request failed: {e}")))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(AuthError::Http(format!("token endpoint returned {status}: {text}")));
+        }
+        #[derive(Deserialize)]
+        struct T {
+            access_token: String,
+            refresh_token: String,
+            expires_in: u64,
+        }
+        let t: T = serde_json::from_str(&text).map_err(|e| AuthError::Http(format!("bad token response: {e}")))?;
+        Ok(OAuthCredential {
+            access: t.access_token,
+            refresh: t.refresh_token,
+            expires_ms: now_ms() + t.expires_in * 1000,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_account_id_from_jwt() {
+        let claims = json!({ "https://api.openai.com/auth": { "chatgpt_account_id": "acc-1" } });
+        let tok = format!("h.{}.s", URL_SAFE_NO_PAD.encode(claims.to_string()));
+        assert_eq!(codex::account_id(&tok).as_deref(), Some("acc-1"));
+        assert_eq!(codex::account_id("garbage"), None);
+    }
 
     #[test]
     fn pkce_and_paste_parsing() {
