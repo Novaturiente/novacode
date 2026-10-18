@@ -74,6 +74,23 @@ pub enum EntryKind {
         #[serde(default)]
         model: String,
     },
+    /// Reflector output: lasting facts, up to the observer watermark `covers` (L4.5).
+    Reflections {
+        reflections: Vec<crate::memory::Reflection>,
+        covers: String,
+        #[serde(default)]
+        usage: novacode_types::Usage,
+        #[serde(default)]
+        model: String,
+    },
+    /// Notes the dropper took out of active memory; they stay recallable (L4.5).
+    Drops {
+        ids: Vec<String>,
+        #[serde(default)]
+        usage: novacode_types::Usage,
+        #[serde(default)]
+        model: String,
+    },
     /// The conversation before `first_kept` is replaced for the model by `system`
     /// (the full prompt at this point) and `summary` (L4.5). Old entries stay.
     Compaction {

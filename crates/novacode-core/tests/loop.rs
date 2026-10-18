@@ -731,6 +731,8 @@ async fn long_session_compacts_from_notes() {
             keep_recent: 2500,
             compact_at: 7000,
             chunk_tokens: 3000,
+            reflect_after: u64::MAX,
+            pool_target: u64::MAX,
         },
     );
     let prompts: Vec<String> = (0..8).map(|i| format!("task {i} {big}")).collect();
@@ -778,14 +780,14 @@ async fn long_session_compacts_from_notes() {
     assert!(total < 7000, "{total} tokens after compaction");
 }
 
-/// When the observer can't run, compaction still frees the context and says so.
+/// When the observer can't run, the session model summarises the gap instead.
 #[tokio::test]
 async fn compaction_without_notes_falls_back() {
     use novacode_core::memory::{Settings, Worker};
     let work = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let big = "lorem ipsum ".repeat(300);
-    let main = Faux::new((0..5).map(|i| FauxReply::text(&format!("answer {i} {big}"))));
+    let main = Faux::new((0..8).map(|i| FauxReply::text(&format!("answer {i} {big}"))));
     let observer = Faux::new((0..20).map(|_| FauxReply::Fail(ErrorKind::Auth, "no login".into())));
     let store = Store::create(&Paths::new(home.path()), work.path(), false);
     let agent = Agent::new(
@@ -806,6 +808,8 @@ async fn compaction_without_notes_falls_back() {
             keep_recent: 2500,
             compact_at: 6000,
             chunk_tokens: 3000,
+            reflect_after: u64::MAX,
+            pool_target: u64::MAX,
         },
     );
     let prompts: Vec<String> = (0..5).map(|i| format!("task {i} {big}")).collect();
@@ -814,11 +818,62 @@ async fn compaction_without_notes_falls_back() {
     assert!(events.iter().any(|e| matches!(
         e,
         AgentEvent::Compacted {
-            fallback: true,
+            fallback: false,
             notes: 0,
             ..
         }
     )));
     let p = format!("{:?}", agent.store.projection());
-    assert!(p.contains("No notes were available"));
+    assert!(p.contains("Summary of the earlier conversation"), "{p}");
+}
+
+/// The reflector keeps only supports that name active notes; the dropper's
+/// proposals are capped by code to what brings the pool back to its target.
+#[tokio::test]
+async fn reflector_and_dropper_respect_their_budgets() {
+    use novacode_core::memory::{Note, Relevance, Worker, drop_notes, note_id, pool_tokens, reflect};
+    let note = |c: &str, r, ts| Note {
+        id: note_id(c),
+        content: c.into(),
+        relevance: r,
+        kind: "change".into(),
+        sources: vec!["e".into()],
+        ts_ms: ts,
+    };
+    let notes = vec![
+        note("User prefers tabs", Relevance::Critical, 1),
+        note("ran cargo test, passed", Relevance::Low, 2),
+        note("read src/lib.rs", Relevance::Low, 3),
+        note("chose sqlx over diesel", Relevance::High, 4),
+    ];
+    let ids: Vec<String> = notes.iter().map(|n| n.id.clone()).collect();
+    let tool = |name: &str, args: Value| FauxReply::Message {
+        blocks: vec![call("t", name, args)],
+        stop: StopReason::ToolUse,
+        usage: Usage::default(),
+    };
+    let faux = Faux::new([
+        tool(
+            "record_reflections",
+            json!({"reflections": [
+                {"content": "User prefers tabs and chose sqlx", "supports": [ids[0], ids[3], "bogus00000000"]},
+                {"content": "no support", "supports": ["bogus00000000"]},
+            ]}),
+        ),
+        tool("drop_notes", json!({"ids": [ids[2], ids[1], ids[0]]})),
+    ]);
+    let w = Worker {
+        adapter: Arc::new(faux),
+        provider: "faux".into(),
+        model: "small".into(),
+    };
+    let (refl, _) = reflect(&w, &[], &notes, "s").await.unwrap();
+    assert_eq!(refl.len(), 1);
+    assert_eq!(refl[0].supports, vec![ids[0].clone(), ids[3].clone()]);
+    // Target: one note's worth below the pool, so at most one drop is allowed.
+    let target = pool_tokens(&notes) - pool_tokens(&notes) / notes.len() as u64;
+    let (dropped, _) = drop_notes(&w, &refl, &notes, target, "s").await.unwrap();
+    // Cited-by-a-reflection goes first: the tabs note, even though it's critical,
+    // because the reflection keeps its meaning; the rest is capped away.
+    assert_eq!(dropped, vec![ids[0].clone()]);
 }

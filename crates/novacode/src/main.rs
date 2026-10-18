@@ -501,6 +501,12 @@ impl Ctx {
             if let Some(v) = s.get("memory.compactAtTokens") {
                 m.compact_at = v;
             }
+            if let Some(v) = s.get("memory.reflectAfterTokens") {
+                m.reflect_after = v;
+            }
+            if let Some(v) = s.get("memory.poolTargetTokens") {
+                m.pool_target = v;
+            }
             agent = agent.with_memory(w.await, m);
         }
         if let Some(a) = approver {

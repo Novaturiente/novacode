@@ -100,7 +100,9 @@ struct Memory {
 /// What a background observer run produced.
 struct ObserverRun {
     covers: String,
-    result: Result<(Vec<crate::memory::Note>, Usage), String>,
+    /// Entries to store (notes, then reflections and drops), even when a later step failed.
+    entries: Vec<EntryKind>,
+    error: Option<String>,
 }
 
 #[derive(Default)]
@@ -388,24 +390,17 @@ impl Agent {
             return;
         };
         let Ok(run) = task.await else { return };
-        let model = format!("{}/{}", m.worker.provider, m.worker.model);
-        match run.result {
-            // A branch switch while it ran: the notes belong to another branch.
-            Ok(_) if !self.store.branch().iter().any(|e| e.id == run.covers) => {}
-            Ok((notes, usage)) => {
-                self.add(EntryKind::Notes {
-                    notes,
-                    covers: run.covers,
-                    usage,
-                    model,
-                });
+        // A branch switch while it ran: the notes belong to another branch.
+        if self.store.branch().iter().any(|e| e.id == run.covers) {
+            for e in run.entries {
+                self.add(e);
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "memory observer");
-                self.emit(AgentEvent::Stream(StreamEvent::Notice(format!(
-                    "memory observer failed: {e}"
-                ))));
-            }
+        }
+        if let Some(e) = run.error {
+            tracing::warn!(error = %e, "memory observer");
+            self.emit(AgentEvent::Stream(StreamEvent::Notice(format!(
+                "memory observer failed: {e}"
+            ))));
         }
     }
 
@@ -431,13 +426,67 @@ impl Agent {
             return;
         }
         let known = crate::memory::notes(&path);
+        let active = crate::memory::active_notes(&path);
+        let refl = crate::memory::reflections(&path);
+        let end = path
+            .iter()
+            .position(|e| e.id == chunk.covers)
+            .map_or(path.len(), |i| i + 1);
+        let reflect_due =
+            crate::memory::tokens(&path, crate::memory::reflect_mark(&path), end) >= m.settings.reflect_after;
+        let pool_target = m.settings.pool_target;
         let (worker, session) = (m.worker.clone(), self.store.id().to_string());
         let notify = self.shared.clone();
         let covers = chunk.covers.clone();
         let task = tokio::spawn(async move {
-            let result = crate::memory::observe(&worker, &known, &chunk, &session).await;
+            use crate::memory;
+            let model = format!("{}/{}", worker.provider, worker.model);
+            let mut run = ObserverRun {
+                covers: covers.clone(),
+                entries: vec![],
+                error: None,
+            };
+            // Observer, then reflector when due, then dropper when the pool is over budget.
+            match memory::observe(&worker, &known, &chunk, &session).await {
+                Ok((notes, usage)) => {
+                    let mut active = active;
+                    active.extend(notes.iter().cloned());
+                    run.entries.push(EntryKind::Notes {
+                        notes,
+                        covers: covers.clone(),
+                        usage,
+                        model: model.clone(),
+                    });
+                    if reflect_due {
+                        match memory::reflect(&worker, &refl, &active, &session).await {
+                            Ok((new, usage)) => {
+                                let made = !new.is_empty();
+                                let mut refl = refl;
+                                refl.extend(new.iter().cloned());
+                                run.entries.push(EntryKind::Reflections {
+                                    reflections: new,
+                                    covers,
+                                    usage,
+                                    model: model.clone(),
+                                });
+                                if made && memory::pool_tokens(&active) > pool_target {
+                                    match memory::drop_notes(&worker, &refl, &active, pool_target, &session).await {
+                                        Ok((ids, usage)) if !ids.is_empty() => {
+                                            run.entries.push(EntryKind::Drops { ids, usage, model })
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => run.error = Some(format!("dropper: {e}")),
+                                    }
+                                }
+                            }
+                            Err(e) => run.error = Some(format!("reflector: {e}")),
+                        }
+                    }
+                }
+                Err(e) => run.error = Some(e),
+            }
             notify.notify.notify_one();
-            ObserverRun { covers, result }
+            run
         });
         if let Some(m) = self.memory.as_mut() {
             m.task = Some(task);
@@ -499,24 +548,38 @@ impl Agent {
                 }
             }
         }
-        if let Some(e) = &failed {
-            self.emit(AgentEvent::Stream(StreamEvent::Notice(format!(
-                "memory observer failed while catching up ({e}); compacting with the notes there are"
-            ))));
-        }
         let path = self.store.branch();
         let cut_i = path.iter().position(|e| e.id == cut).unwrap_or(path.len());
+        // The observer couldn't cover everything: the main model summarises the gap.
+        let mut summary_text = None;
+        if let Some(e) = &failed {
+            let wm = memory::watermark(&path).max(from);
+            let gap = memory::chunk(&path, wm, cut_i, self.cfg.window_tokens / 2);
+            self.emit(AgentEvent::Stream(StreamEvent::Notice(format!(
+                "memory observer failed while catching up ({e}); summarising {}k tokens with the session model",
+                gap.tokens / 1000
+            ))));
+            match memory::summarize(&self.adapter, &self.cfg.model, &gap, self.store.id()).await {
+                Ok((t, _)) => summary_text = Some(t),
+                Err(e) => self.emit(AgentEvent::Stream(StreamEvent::Notice(format!(
+                    "summary failed too ({e}); dropping the older messages"
+                )))),
+            }
+        }
+        let path = self.store.branch();
         let pos = |id: &str| path.iter().position(|e| e.id == id);
-        let notes: Vec<memory::Note> = memory::notes(&path)
+        let notes: Vec<memory::Note> = memory::active_notes(&path)
             .into_iter()
             .filter(|n| n.sources.iter().any(|s| pos(s).is_some_and(|i| i < cut_i)))
             .collect();
+        let refl = memory::reflections(&path);
         let (read, changed) = memory::files(&path[..cut_i]);
         let dropped = path[from..cut_i]
             .iter()
             .filter(|e| matches!(e.kind, EntryKind::Message { .. }))
             .count();
-        let summary = memory::render_summary(&notes, &read, &changed, dropped);
+        let summary = memory::render_summary(&refl, &notes, summary_text.as_deref(), &read, &changed, dropped);
+        let fallback = notes.is_empty() && refl.is_empty() && summary_text.is_none();
         let system = crate::prompt::render(&self.store.sections());
         let n = notes.len();
         self.add(EntryKind::Compaction {
@@ -532,7 +595,7 @@ impl Agent {
             tokens_before,
             tokens_after,
             notes: n,
-            fallback: n == 0,
+            fallback,
         });
         self.update_report();
         true

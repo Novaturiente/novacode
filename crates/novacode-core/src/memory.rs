@@ -58,6 +58,10 @@ pub struct Settings {
     pub compact_at: u64,
     /// Largest chunk sent to the observer in one call.
     pub chunk_tokens: u64,
+    /// New conversation tokens before the reflector runs.
+    pub reflect_after: u64,
+    /// Active notes the dropper prunes back to, in tokens.
+    pub pool_target: u64,
 }
 
 impl Settings {
@@ -67,6 +71,8 @@ impl Settings {
             keep_recent: 20_000,
             compact_at: (window * 8 / 10).min(400_000),
             chunk_tokens: 30_000,
+            reflect_after: 20_000,
+            pool_target: 10_000,
         }
     }
 }
@@ -403,14 +409,31 @@ pub const SUMMARY_INTRO: &str = "The conversation before this point was compacte
 Treat them as past records. When notes conflict, the newer one holds. Work a note marks as completed should not be redone unless the user asks. When you need the exact source behind a note, call the recall tool with its id; don't use recall as a search.";
 
 /// The text the model gets in place of the compacted conversation.
-pub fn render_summary(notes: &[Note], read: &[String], changed: &[String], dropped_messages: usize) -> String {
+pub fn render_summary(
+    refl: &[Reflection],
+    notes: &[Note],
+    fallback: Option<&str>,
+    read: &[String],
+    changed: &[String],
+    dropped_messages: usize,
+) -> String {
     let mut s = String::from(SUMMARY_INTRO);
-    if notes.is_empty() {
+    if !refl.is_empty() {
+        s.push_str("\n\n## Lasting facts\n");
+        for r in refl {
+            let _ = writeln!(s, "[{}] {}", r.id, r.content);
+        }
+        s.pop();
+    }
+    if let Some(f) = fallback {
+        let _ = write!(s, "\n\n## Summary of the earlier conversation\n{}", f.trim());
+    }
+    if notes.is_empty() && fallback.is_none() && refl.is_empty() {
         let _ = write!(
             s,
             "\n\nNo notes were available: {dropped_messages} earlier messages were removed without a summary. Ask the user if you need what they held."
         );
-    } else {
+    } else if !notes.is_empty() {
         s.push_str("\n\n## Notes\n");
         for n in notes {
             s.push_str(&note_line(n));
@@ -451,6 +474,259 @@ pub fn cut_point(path: &[&Entry], from: usize, keep: u64) -> Option<usize> {
         i -= 1;
     }
     (i > from && is_user(path[i])).then_some(i)
+}
+
+/// A lasting fact distilled from several notes by the reflector.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Reflection {
+    pub id: String,
+    pub content: String,
+    /// Note ids whose meaning this reflection preserves.
+    pub supports: Vec<String>,
+}
+
+pub const REFLECTOR_PROMPT: &str = "You are the reflector for a coding agent's memory. You get the lasting facts already distilled (reflections) and the active notes. Distil NEW lasting facts with the record_reflections tool: user preferences, constraints and corrections; decisions and their reasons; finished outcomes that must not be redone; long-lived blockers; project goals and invariants.
+
+- Be stingy. Recording nothing is fine. Don't turn each note into a reflection; combine notes into one durable conclusion, or keep a single note's durable user assertion, decision or completion.
+- Leave working state, files inspected, commands run and failed attempts as notes.
+- Don't reword existing reflections.
+- content: one line of plain prose, leading with the fact, keeping exact names, paths and reasons.
+- supports: ids of the notes whose meaning the reflection fully keeps. Only those: a later step may drop the notes you list.";
+
+pub const DROPPER_PROMPT: &str = "You prune a coding agent's memory. You get the reflections and the active notes, each note marked with how many reflections cite it. Propose notes to drop with the drop_notes tool. The default is KEEP; when unsure, keep.
+
+Drop, in this order: notes whose meaning a reflection already keeps; notes a newer note supersedes; routine low-signal notes. Prefer older notes. Never drop a note that alone carries a user preference, correction or constraint, a completion, an exact identifier, path, command or error message, a decision, a date, or an open blocker. Stay under the maximum given; it is a limit, not a target.";
+
+fn reflect_tool() -> ToolDef {
+    ToolDef {
+        name: "record_reflections".into(),
+        description: "Record new lasting facts.".into(),
+        schema: json!({
+            "type": "object",
+            "properties": {"reflections": {"type": "array", "items": {"type": "object", "properties": {
+                "content": {"type": "string"},
+                "supports": {"type": "array", "items": {"type": "string"}}
+            }, "required": ["content", "supports"]}}},
+            "required": ["reflections"]
+        }),
+    }
+}
+
+fn drop_tool() -> ToolDef {
+    ToolDef {
+        name: "drop_notes".into(),
+        description: "Drop notes from active memory.".into(),
+        schema: json!({
+            "type": "object",
+            "properties": {"ids": {"type": "array", "items": {"type": "string"}}},
+            "required": ["ids"]
+        }),
+    }
+}
+
+/// All reflections on the branch.
+pub fn reflections(path: &[&Entry]) -> Vec<Reflection> {
+    path.iter()
+        .filter_map(|e| match &e.kind {
+            EntryKind::Reflections { reflections, .. } => Some(reflections.iter().cloned()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// Notes not dropped, oldest first.
+pub fn active_notes(path: &[&Entry]) -> Vec<Note> {
+    let dropped: std::collections::HashSet<&String> = path
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EntryKind::Drops { ids, .. } => Some(ids.iter()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    notes(path).into_iter().filter(|n| !dropped.contains(&n.id)).collect()
+}
+
+/// Index in `path` after the conversation the reflector last looked at.
+pub fn reflect_mark(path: &[&Entry]) -> usize {
+    let pos = |id: &str| path.iter().position(|e| e.id == id);
+    path.iter()
+        .rev()
+        .find_map(|e| match &e.kind {
+            EntryKind::Reflections { covers, .. } => pos(covers),
+            _ => None,
+        })
+        .map_or(0, |i| i + 1)
+}
+
+pub fn pool_tokens(notes: &[Note]) -> u64 {
+    notes.iter().map(|n| estimate::text(&note_line(n))).sum()
+}
+
+async fn ask(
+    w: &Worker,
+    system: &str,
+    user: String,
+    tool: ToolDef,
+    session: &str,
+) -> Result<(Vec<Value>, Usage), String> {
+    let name = tool.name.clone();
+    let req = Request {
+        model: w.model.clone(),
+        messages: vec![
+            Message::System { text: system.into() },
+            Message::User {
+                content: vec![Block::text(user)],
+            },
+        ],
+        tools: vec![tool],
+        max_tokens: 8192,
+        cache: CacheRetention::Short,
+        thinking: None,
+        images: false,
+        session: Some(format!("{session}-memory")),
+    };
+    let mut rx = w.adapter.stream(req, CancellationToken::new());
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            StreamEvent::Done(m) => {
+                let args = m
+                    .tool_calls()
+                    .filter(|t| t.name == name)
+                    .map(|t| t.arguments.clone())
+                    .collect();
+                return Ok((args, m.usage));
+            }
+            StreamEvent::Error(m) => return Err(m.error_message.unwrap_or_else(|| format!("{:?}", m.stop))),
+            _ => {}
+        }
+    }
+    Err("memory worker stream ended without a result".into())
+}
+
+fn cites(n: &Note, refl: &[Reflection]) -> usize {
+    refl.iter().filter(|r| r.supports.contains(&n.id)).count()
+}
+
+fn pool_text(refl: &[Reflection], notes: &[Note]) -> String {
+    let mut s = String::from("Reflections:\n");
+    if refl.is_empty() {
+        s.push_str("(none)\n");
+    }
+    for r in refl {
+        let _ = writeln!(s, "[{}] {}", r.id, r.content);
+    }
+    s.push_str("\nActive notes:\n");
+    for n in notes {
+        let _ = writeln!(s, "{} [cited by {}]", note_line(n), cites(n, refl));
+    }
+    s
+}
+
+/// New reflections; supports must name active notes.
+pub async fn reflect(
+    w: &Worker,
+    refl: &[Reflection],
+    notes: &[Note],
+    session: &str,
+) -> Result<(Vec<Reflection>, Usage), String> {
+    let (calls, usage) = ask(w, REFLECTOR_PROMPT, pool_text(refl, notes), reflect_tool(), session).await?;
+    let mut out: Vec<Reflection> = Vec::new();
+    for args in calls {
+        for r in args["reflections"].as_array().into_iter().flatten() {
+            let content = r["content"]
+                .as_str()
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let supports: Vec<String> = r["supports"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str())
+                .map(|v| v.trim_matches(['[', ']']).to_string())
+                .filter(|id| notes.iter().any(|n| &n.id == id))
+                .collect();
+            let id = note_id(&content);
+            if content.is_empty() || supports.is_empty() || refl.iter().chain(&out).any(|x| x.id == id) {
+                continue;
+            }
+            out.push(Reflection { id, content, supports });
+        }
+    }
+    Ok((out, usage))
+}
+
+/// Notes to drop. The model proposes; code caps the count so the pool only
+/// goes back to `target`, preferring notes most cited, least relevant, oldest.
+pub async fn drop_notes(
+    w: &Worker,
+    refl: &[Reflection],
+    notes: &[Note],
+    target: u64,
+    session: &str,
+) -> Result<(Vec<String>, Usage), String> {
+    let total = pool_tokens(notes);
+    let avg = (total / notes.len().max(1) as u64).max(1);
+    let max = total.saturating_sub(target).div_ceil(avg) as usize;
+    if max == 0 {
+        return Ok((vec![], Usage::default()));
+    }
+    let user = format!(
+        "{}\nThe active notes hold about {total} tokens; the target is {target}. Maximum drops allowed: {max}.",
+        pool_text(refl, notes)
+    );
+    let (calls, usage) = ask(w, DROPPER_PROMPT, user, drop_tool(), session).await?;
+    let mut picked: Vec<&Note> = calls
+        .iter()
+        .flat_map(|a| a["ids"].as_array().cloned().unwrap_or_default())
+        .filter_map(|v| v.as_str().map(|s| s.trim_matches(['[', ']']).to_string()))
+        .filter_map(|id| notes.iter().find(|n| n.id == id))
+        .collect();
+    picked.sort_by_key(|n| (std::cmp::Reverse(cites(n, refl)), n.relevance, n.ts_ms));
+    picked.dedup_by_key(|n| n.id.clone());
+    picked.truncate(max);
+    Ok((picked.into_iter().map(|n| n.id.clone()).collect(), usage))
+}
+
+pub const SUMMARY_PROMPT: &str = "Summarise this part of a coding agent's conversation so the agent can continue the work without it. Keep: the user's goals, preferences and corrections; decisions and their reasons; what was completed (so it isn't redone); open problems and next steps; exact file paths, identifiers, commands and error messages. Plain text with short sections, no preamble.";
+
+/// Fallback summary by the session's main model, when there are no notes.
+pub async fn summarize(
+    adapter: &Arc<dyn Adapter>,
+    model: &str,
+    c: &Chunk,
+    session: &str,
+) -> Result<(String, Usage), String> {
+    let req = Request {
+        model: model.into(),
+        messages: vec![
+            Message::System {
+                text: SUMMARY_PROMPT.into(),
+            },
+            Message::User {
+                content: vec![Block::text(c.text.clone())],
+            },
+        ],
+        tools: vec![],
+        max_tokens: 8192,
+        cache: CacheRetention::Short,
+        thinking: None,
+        images: false,
+        session: Some(format!("{session}-summary")),
+    };
+    let mut rx = adapter.stream(req, CancellationToken::new());
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            StreamEvent::Done(m) if !m.text().trim().is_empty() => return Ok((m.text(), m.usage)),
+            StreamEvent::Done(_) => return Err("empty summary".into()),
+            StreamEvent::Error(m) => return Err(m.error_message.unwrap_or_else(|| format!("{:?}", m.stop))),
+            _ => {}
+        }
+    }
+    Err("summary stream ended without a result".into())
 }
 
 /// `recall(id)`: a note and the raw entries it came from (L4.5). Reads the
@@ -495,6 +771,16 @@ impl novacode_tools::Tool for Recall {
                 .filter_map(|l| serde_json::from_str(l).ok())
                 .collect();
             let id = a.id.trim().trim_matches(['[', ']']);
+            let path: Vec<&Entry> = entries.iter().collect();
+            if let Some(r) = reflections(&path).into_iter().find(|r| r.id == id) {
+                let all = notes(&path);
+                let mut s = format!("[{}] {}\n\nBased on notes:", r.id, r.content);
+                for n in all.iter().filter(|n| r.supports.contains(&n.id)) {
+                    let _ = write!(s, "\n{}", note_line(n));
+                }
+                s.push_str("\n\nRecall a note id for its source messages.");
+                return novacode_tools::ToolOutput::text(s);
+            }
             let Some(note) = entries
                 .iter()
                 .filter_map(|e| match &e.kind {
