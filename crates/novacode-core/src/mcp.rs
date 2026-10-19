@@ -99,7 +99,13 @@ pub fn project_file(cwd: &Path) -> Option<PathBuf> {
 pub fn load(home: &Path, cwd: &Path, trusted: bool) -> (Vec<Configured>, Vec<String>) {
     let mut out: BTreeMap<String, Configured> = BTreeMap::new();
     let mut warnings = Vec::new();
-    let mut files = vec![home.join("mcp.json")];
+    // Later files win a name: packages' servers, then yours, then the project's.
+    let mut files: Vec<PathBuf> = crate::packages::enabled(home, cwd, trusted)
+        .into_iter()
+        .rev()
+        .map(|p| p.dir.join("mcp.json"))
+        .collect();
+    files.push(home.join("mcp.json"));
     if trusted && let Some(p) = project_file(cwd) {
         files.push(p);
     }

@@ -65,7 +65,7 @@ Project settings, extensions, skills and MCP servers load only in folders you tr
 
 ## Commands
 
-`login`, `logout`, `auth status`, `models`, `doctor`, `export`, `attach`, `panel`, `agents`, `stop`, `status`, `debug bundle`, `stats`, `install`/`uninstall`/`update`/`packages`, `mcp`, `import claude`, `trust`. Use `novacode <command> --help` for details.
+`login`, `logout`, `auth status`, `models`, `doctor`, `export`, `attach`, `panel`, `agents`, `stop`, `status`, `debug bundle`, `stats`, `install`/`uninstall`/`packages` (`update`, `install`), `mcp`, `import claude`, `trust`. Use `novacode <command> --help` for details.
 
 ## Reporting a bug
 

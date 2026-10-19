@@ -8,7 +8,29 @@ novacode runs extensions in three forms. All of them reach files and commands th
 | **Process** (any language, JSON-RPC on stdio) | settings `processExtensions.<name>: {command, args, env}` | Bigger plugins, or code in Python/Go/Rust |
 | **Command hooks** | settings `hooks` | One shell command per event (see `docs/config.md`) |
 
-Packages (`novacode install <git-url|path>`) bundle `extensions/`, `skills/` and `prompts/` folders.
+## Packages
+
+A package is a folder or git repo with any of `extensions/`, `skills/`, `prompts/`, `agents/`, `themes/` and an `mcp.json` (Claude Code format; your own and the project's servers win a name).
+
+```sh
+novacode install https://github.com/you/pack.git   # cloned; its commit is pinned
+novacode install ~/code/my-pack                     # linked: edits apply at once
+novacode packages                                   # list (disabled ones say why)
+novacode packages update [name]                     # pull and move the pin
+novacode uninstall pack
+```
+
+Pins live in `~/.novacode/packages.lock.json`. Copy that file to another machine and installs there get the same commits.
+
+An optional `novacode-package.json` says which extension API the package was written for:
+
+```json
+{ "name": "pack", "version": "1.2.0", "apiVersion": [1, 2] }
+```
+
+`apiVersion` is a number or `[min, max]`. If this novacode's API isn't in the range, the package is disabled with a notice instead of breaking at runtime.
+
+**Project packages.** A repo can list the packages its team uses in `.novacode/packages.json` (`{"packages": {"name": "git-url"}}`) and commit `.novacode/packages.lock.json`. In a trusted folder, novacode asks once whether to install the missing ones into `.novacode/packages/` (add that folder to `.gitignore`); `novacode packages install` does it any time. Nothing is installed without asking.
 
 ## Skills, agents and commands from other tools
 

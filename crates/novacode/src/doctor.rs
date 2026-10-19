@@ -135,7 +135,7 @@ pub async fn doctor(
     // Same name in two folders: the earlier one loads (L7.12). Not a failure.
     println!("skills, prompts, agents");
     if shadowed.is_empty() {
-        println!("  ✓ nothing shadowed");
+        println!("  ✓ nothing shadowed or disabled");
     }
     for s in shadowed {
         println!("  · {s}");
