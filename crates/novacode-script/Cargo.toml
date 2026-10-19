@@ -8,7 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-rquickjs = { version = "0.14", features = ["futures"] }
+rquickjs = { version = "0.14", features = ["futures", "loader"] }
 oxc_allocator = "0.154"
 oxc_parser = "0.154"
 oxc_semantic = "0.154"

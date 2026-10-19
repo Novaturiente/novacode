@@ -29,7 +29,9 @@ export default (nc) => {
 };
 ```
 
-The default export gets the frozen `novacode` object (also `globalThis.novacode`). Types are stripped, so TypeScript works as is. Setup has 5 s of JS time. Each extension has its own memory limit.
+The default export gets the frozen `novacode` object (also `globalThis.novacode`). Types are stripped, so TypeScript works as is.
+
+**Imports.** An extension can import its own files with relative paths (`import { x } from "./lib/util"`). The extension can be `.ts`, `.js` or a folder with `index.ts`. Imports resolve inside the folder that holds the entry file and can't reach outside it. Bare package names (`import "lodash"`) are refused: npm packages expect Node, which QuickJS doesn't have. Write a process extension for those. Setup has 5 s of JS time. Each extension has its own memory limit.
 
 ## API v1
 

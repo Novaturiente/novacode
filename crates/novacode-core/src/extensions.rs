@@ -54,28 +54,6 @@ pub fn discover(dirs: &[PathBuf]) -> Vec<(String, PathBuf)> {
     out
 }
 
-fn fnv(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in bytes {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
-/// TypeScript stripped once per source version (L7.2 compile-on-change cache).
-fn compiled(src: &str, cache: &Path) -> String {
-    let key = format!("{:016x}-{}", fnv(src.as_bytes()), env!("CARGO_PKG_VERSION"));
-    let path = cache.join(format!("{key}.js"));
-    if let Ok(js) = std::fs::read_to_string(&path) {
-        return js;
-    }
-    let js = novacode_script::ts::to_js(src, true);
-    let _ = std::fs::create_dir_all(cache);
-    let _ = novacode_base::storage::write_atomic(&path, js.as_bytes(), novacode_base::storage::Durability::Fast);
-    js
-}
-
 /// The host side of the `novacode` object (API v1).
 struct Host {
     name: String,
@@ -370,7 +348,8 @@ impl Extensions {
                 home: home.into(),
                 sink: sink.clone(),
             });
-            match Extension::load(&name, compiled(&src, cache), host, 64 << 20).await {
+            let js = novacode_script::ts::cached(&src, cache);
+            match Extension::load(&name, js, host, 64 << 20, Some((path.clone(), cache.to_path_buf()))).await {
                 Ok(ext) => loaded.push(Arc::new(Loaded {
                     ext,
                     path,
@@ -793,6 +772,41 @@ mod tests {
             matches!(rx.try_recv().unwrap(), AgentEvent::Ui { op: novacode_types::ui::UiOp::Status { text: Some(t), style: Some(st), .. }, .. } if t == "key x" && st == "warn"),
             "segments join; their style is kept"
         );
+    }
+
+    /// L7.10: relative imports inside the extension's folder, TypeScript too; nothing outside it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relative_imports_stay_inside_the_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let ext = d.path().join("ext");
+        let w = |p: &str, s: &str| {
+            let f = ext.join(p);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, s).unwrap();
+        };
+        w(
+            "multi/lib/util.ts",
+            "export const shout = (s: string): string => s.toUpperCase();",
+        );
+        w("multi/lib/index.ts", "export { shout } from './util';");
+        w(
+            "multi/index.ts",
+            "import { shout } from './lib';\nexport default (nc: any) => nc.registerCommand('shout', { handler: (a: string) => shout(a) });",
+        );
+        w("secret.js", "export const x = 1;");
+        w(
+            "escape/index.js",
+            "import { x } from '../secret.js';\nexport default () => {};",
+        );
+        w("bare/index.js", "import _ from 'lodash';\nexport default () => {};");
+        let exts = Extensions::load(std::slice::from_ref(&ext), d.path(), d.path(), &d.path().join("cache")).await;
+        assert_eq!(exts.command("/shout hey").await, Some(Ok("HEY".into())));
+        let failed: std::collections::BTreeMap<_, _> = exts.failed.iter().cloned().collect();
+        assert!(
+            failed["escape"].contains("outside the extension's folder"),
+            "{failed:?}"
+        );
+        assert!(failed["bare"].contains("only relative imports"), "{failed:?}");
     }
 
     #[tokio::test]

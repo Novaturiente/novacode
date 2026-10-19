@@ -17,6 +17,7 @@ use rquickjs::{
     AsyncContext, AsyncRuntime, CatchResultExt, Function, Module, Object, Promise, Value as JsValue, prelude::Async,
 };
 use serde_json::{Value, json};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -203,11 +204,14 @@ impl Backend for Extension {
 
 impl Extension {
     /// Load `js` (already TypeScript-stripped, an ES module) and run its setup.
+    /// `imports` = (entry file, strip cache): relative imports resolve inside the
+    /// entry's folder (L7.10). `None` = no imports.
     pub async fn load(
         name: &str,
         js: String,
         host: Arc<dyn ExtHost>,
         memory_bytes: usize,
+        imports: Option<(PathBuf, PathBuf)>,
     ) -> Result<Arc<Extension>, String> {
         let (tx, rx) = mpsc::unbounded_channel::<Req>();
         let (ltx, lrx) = oneshot::channel();
@@ -223,7 +227,7 @@ impl Extension {
                         return;
                     }
                 };
-                rt.block_on(thread(n, js, host, outer, memory_bytes, ltx, rx));
+                rt.block_on(thread(n, js, host, outer, memory_bytes, imports, ltx, rx));
             })
             .map_err(|e| e.to_string())?;
         let reg = tokio::time::timeout(Duration::from_secs(10), lrx)
@@ -267,12 +271,14 @@ struct Shared {
     stopped: AtomicBool,
 }
 
+#[allow(clippy::too_many_arguments)] // private thread entry, one caller
 async fn thread(
     name: String,
     js: String,
     host: Arc<dyn ExtHost>,
     outer: tokio::runtime::Handle,
     memory_bytes: usize,
+    imports: Option<(PathBuf, PathBuf)>,
     loaded: oneshot::Sender<Result<Registration, String>>,
     mut rx: mpsc::UnboundedReceiver<Req>,
 ) {
@@ -294,12 +300,22 @@ async fn thread(
             d != 0 && s.start.elapsed().as_millis() as u64 > d
         })))
         .await;
+        // The entry's module name is its real path, so imports resolve next to it.
+        let file = match &imports {
+            Some((entry, cache)) => {
+                let entry = std::fs::canonicalize(entry).map_err(|e| e.to_string())?;
+                let root = entry.parent().unwrap_or(Path::new("/")).to_path_buf();
+                rt.set_loader(Imports { root: root.clone() }, Imports { root: cache.clone() })
+                    .await;
+                entry.display().to_string()
+            }
+            None => format!("{name}.js"),
+        };
         let ctx = AsyncContext::full(&rt).await.map_err(|e| e.to_string())?;
         // Setup gets 5s of JS time.
         shared
             .deadline
             .store(shared.start.elapsed().as_millis() as u64 + 5000, Ordering::Relaxed);
-        let file = format!("{name}.js");
         let r = ctx
             .async_with(async |ctx| -> Result<(), String> {
                 let bridge = bridge(&ctx, &shared).map_err(|e| e.to_string())?;
@@ -453,6 +469,67 @@ fn bridge<'js>(ctx: &rquickjs::Ctx<'js>, shared: &Arc<Shared>) -> rquickjs::Resu
     Ok(b)
 }
 
+/// Relative imports (L7.10). As the resolver, `root` is the extension's folder and
+/// a resolved file must stay inside it; as the loader, `root` is the strip cache.
+/// No bare names: npm packages need Node built-ins QuickJS lacks (use a process extension).
+struct Imports {
+    root: PathBuf,
+}
+
+impl rquickjs::loader::Resolver for Imports {
+    fn resolve<'js>(
+        &mut self,
+        _ctx: &rquickjs::Ctx<'js>,
+        base: &str,
+        name: &str,
+        _attrs: Option<rquickjs::loader::ImportAttributes<'js>>,
+    ) -> rquickjs::Result<String> {
+        let fail = |why: &str| rquickjs::Error::new_resolving_message(base, name, why.to_string());
+        if !name.starts_with("./") && !name.starts_with("../") {
+            return Err(fail("only relative imports (./ or ../) inside the extension's folder"));
+        }
+        let mut p = Path::new(base).parent().unwrap_or(Path::new("/")).to_path_buf();
+        for c in Path::new(name).components() {
+            match c {
+                Component::ParentDir => {
+                    p.pop();
+                }
+                Component::Normal(s) => p.push(s),
+                _ => {}
+            }
+        }
+        let candidates = [
+            p.clone(),
+            p.with_extension("ts"),
+            p.with_extension("js"),
+            p.join("index.ts"),
+            p.join("index.js"),
+        ];
+        let found = candidates
+            .iter()
+            .find(|c| c.is_file())
+            .ok_or_else(|| fail("file not found"))?;
+        let real = std::fs::canonicalize(found).map_err(|e| fail(&e.to_string()))?;
+        if !real.starts_with(&self.root) {
+            return Err(fail("outside the extension's folder"));
+        }
+        Ok(real.display().to_string())
+    }
+}
+
+impl rquickjs::loader::Loader for Imports {
+    fn load<'js>(
+        &mut self,
+        ctx: &rquickjs::Ctx<'js>,
+        name: &str,
+        _attrs: Option<rquickjs::loader::ImportAttributes<'js>>,
+    ) -> rquickjs::Result<Module<'js, rquickjs::module::Declared>> {
+        let src =
+            std::fs::read_to_string(name).map_err(|e| rquickjs::Error::new_loading_message(name, e.to_string()))?;
+        Module::declare(ctx.clone(), name, crate::ts::cached(&src, &self.root))
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -505,6 +582,7 @@ mod tests {
             crate::ts::to_js(js, true),
             Arc::new(Host(Mutex::default())),
             32 << 20,
+            None,
         )
         .await
     }

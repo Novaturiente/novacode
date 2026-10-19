@@ -9,6 +9,33 @@ use oxc_span::SourceType;
 use oxc_transformer::{TransformOptions, Transformer};
 use std::path::Path;
 
+fn fnv(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// [`to_js`] for a module, stripped once per source version (L7.2 compile-on-change
+/// cache): keyed by the source hash and the novacode version, in `cache`.
+pub fn cached(src: &str, cache: &Path) -> String {
+    let key = format!("{:016x}-{}", fnv(src.as_bytes()), env!("CARGO_PKG_VERSION"));
+    let path = cache.join(format!("{key}.js"));
+    if let Ok(js) = std::fs::read_to_string(&path) {
+        return js;
+    }
+    let js = to_js(src, true);
+    let _ = std::fs::create_dir_all(cache);
+    // Write then rename, so a reader never sees half a file.
+    let tmp = cache.join(format!("{key}.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, &js).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+    js
+}
+
 /// `src` as runnable JavaScript. JS that parses is returned as is; otherwise it
 /// is parsed as TypeScript and printed without types (line numbers then refer to
 /// the printed code: shortcut, add a source map when that confuses models).
