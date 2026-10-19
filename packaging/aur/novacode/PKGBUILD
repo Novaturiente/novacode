@@ -9,6 +9,8 @@ url="https://github.com/OWNER/novacode"
 license=('MIT OR Apache-2.0')
 depends=('gcc-libs' 'glibc')
 makedepends=('cargo' 'git')
+# makepkg's -flto turns the C deps (ring, SQLite, QuickJS) into GCC bitcode rust-lld can't link.
+options=('!lto')
 optdepends=('git: packages and worktrees' 'python: example provider programs')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
