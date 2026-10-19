@@ -173,6 +173,16 @@ struct Shared {
     prompts: Mutex<Vec<crate::session::PromptNode>>,
     /// What extensions read and call from outside the owner task (L7.11).
     ext: Mutex<ExtView>,
+    /// `novacode.state` entries: what the branch holds plus what extensions added
+    /// since (`pending`, written to the session by the owner task).
+    ext_state: Mutex<ExtState>,
+}
+
+#[derive(Default)]
+struct ExtState {
+    /// (extension, kind, data) on the current branch, oldest first.
+    live: Vec<(String, String, serde_json::Value)>,
+    pending: Vec<(String, String, serde_json::Value)>,
 }
 
 /// Refreshed with the report: extension handlers run while the owner is busy, so
@@ -447,6 +457,20 @@ impl Agent {
             images: self.cfg.images,
             session: Some(self.store.id().to_string()),
         };
+        {
+            let mut st = self.shared.ext_state.lock().unwrap();
+            let mut live: Vec<_> = self
+                .store
+                .branch()
+                .into_iter()
+                .filter_map(|e| match &e.kind {
+                    EntryKind::ExtState { ext, kind, data } => Some((ext.clone(), kind.clone(), data.clone())),
+                    _ => None,
+                })
+                .collect();
+            live.extend(st.pending.iter().cloned());
+            st.live = live;
+        }
         *self.shared.ext.lock().unwrap() = ExtView {
             history: Arc::new(history),
             route: Some((self.adapter.clone(), template)),
@@ -671,6 +695,14 @@ impl Agent {
     }
 
     /// Store a finished observer run; with `wait`, wait for a running one.
+    /// Write the `novacode.state` entries extensions added since the last flush.
+    fn flush_ext_state(&mut self) {
+        let pending = std::mem::take(&mut self.shared.ext_state.lock().unwrap().pending);
+        for (ext, kind, data) in pending {
+            self.add(EntryKind::ExtState { ext, kind, data });
+        }
+    }
+
     async fn collect_notes(&mut self, wait: bool) {
         let Some(m) = self.memory.as_mut() else { return };
         let Some(task) = m.task.take_if(|t| wait || t.is_finished()) else {
@@ -981,6 +1013,7 @@ impl Agent {
         );
         exts.spawn_events(self.events.subscribe());
         let (a, b, c) = (self.shared.clone(), self.shared.clone(), self.shared.clone());
+        let (d, e, f) = (self.shared.clone(), self.shared.clone(), self.shared.clone());
         exts.connect(crate::extensions::SessionApi {
             messages: Arc::new(move || a.ext.lock().unwrap().history.clone()),
             complete: Arc::new(
@@ -1020,6 +1053,35 @@ impl Agent {
                         None => ToolOutput::error("the session isn't ready yet"),
                     }
                 })
+            }),
+            state_append: Arc::new(move |ext: &str, kind: &str, data: serde_json::Value| {
+                let mut st = d.ext_state.lock().unwrap();
+                let item = (ext.to_string(), kind.to_string(), data);
+                st.live.push(item.clone());
+                st.pending.push(item);
+                drop(st);
+                d.notify.notify_one();
+            }),
+            state_entries: Arc::new(move |ext: &str, kind: &str| {
+                e.ext_state
+                    .lock()
+                    .unwrap()
+                    .live
+                    .iter()
+                    .filter(|(x, k, _)| x == ext && k == kind)
+                    .map(|(_, _, v)| v.clone())
+                    .collect()
+            }),
+            send: Arc::new(move |text: String, steer: bool| {
+                let mut q = f.queues.lock().unwrap();
+                let content = vec![Block::text(text)];
+                if steer {
+                    q.steering.push_back(content);
+                } else {
+                    q.follow_up.push_back(content);
+                }
+                drop(q);
+                f.notify.notify_one();
             }),
         });
         self.extensions = Some(exts);
@@ -1144,6 +1206,7 @@ impl Agent {
                     message: Message::User { content },
                 });
             }
+            self.flush_ext_state();
             let notes: Vec<(String, String)> = {
                 let mut q = self.shared.queues.lock().unwrap();
                 q.wake = false;
@@ -1506,9 +1569,12 @@ impl Agent {
                                 });
                             }
                         });
+                        let started = hooks.start(&call.name, &ctx.cwd).await;
                         let mut out =
                             pipeline::run(tool.as_ref(), args.clone(), accept, &ctx, &spill, budget, &redactor).await;
-                        hooks.after_tool(&call.name, &args, &mut out).await;
+                        hooks
+                            .after_tool(&call.id, &call.name, &args, &ctx.cwd, started, &mut out)
+                            .await;
                         out
                     }
                 };
@@ -1874,6 +1940,7 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
                 let q = agent.shared.queues.lock().unwrap();
                 !q.steering.is_empty() || !q.follow_up.is_empty() || q.wake
             };
+            agent.flush_ext_state();
             agent.collect_notes(false).await;
             if let Some(name) = agent.shared.rename.lock().unwrap().take() {
                 log_err(

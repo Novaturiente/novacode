@@ -65,8 +65,11 @@ impl Nested for Runner {
             if let Some(refusal) = pipeline::authorize(&policy, approver.as_ref(), &call.name, &args, &ctx.cwd).await {
                 return refusal;
             }
+            let started = hooks.start(&call.name, &ctx.cwd).await;
             let mut out = pipeline::run(tool.as_ref(), args.clone(), accept, &ctx, &spill, budget, &redactor).await;
-            hooks.after_tool(&call.name, &args, &mut out).await;
+            hooks
+                .after_tool(&call.id, &call.name, &args, &ctx.cwd, started, &mut out)
+                .await;
             out
         })
     }

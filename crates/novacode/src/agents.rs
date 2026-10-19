@@ -26,7 +26,9 @@ use tokio::sync::{Notify, mpsc};
 /// Children may spawn children; theirs may not (L10.1 depth 2).
 pub const MAX_DEPTH: u32 = 2;
 /// Reports longer than this reach the model cut, with an `agent read` pointer.
-const REPORT_CUT: usize = 600;
+/// Reports are written terse (see the task preamble), so most arrive whole; only
+/// a runaway one is cut, saving the parent an `agent read` call per child.
+const REPORT_CUT: usize = 6000;
 
 /// This process's place in an agent tree, from the environment its parent set.
 #[derive(Debug, Clone, Default)]
@@ -383,6 +385,8 @@ pub struct Supervisor {
     waiting: Mutex<usize>,
     /// Nerd Font glyphs in the panel rows (`ui.icons`).
     nerd: bool,
+    /// Print mode: nobody reads notices, so every report wakes the parent.
+    unattended: bool,
 }
 
 pub struct Setup {
@@ -399,6 +403,7 @@ pub struct Setup {
     /// The child binary (tests use a fake); default: this one.
     pub exe: Option<PathBuf>,
     pub nerd: bool,
+    pub unattended: bool,
 }
 
 impl Supervisor {
@@ -421,6 +426,7 @@ impl Supervisor {
             small_model: s.small_model,
             waiting: Mutex::new(0),
             nerd: s.nerd,
+            unattended: s.unattended,
         });
         // Stall and timeout watchdog (L10.1: 10 min without activity, 45 min in all).
         let weak = Arc::downgrade(&sup);
@@ -621,7 +627,10 @@ impl Supervisor {
                     let first = format!(
                         "You are subagent \"{}\" (agent {}, depth {}), started by another novacode agent. \
                          Do the task below. Your final message is your report to it: what you did, what you \
-                         found with file paths, and anything left open.\n\n{}",
+                         found with file paths, and anything left open. Write the report terse, for an agent, \
+                         not a person: fragments, no preamble or pleasantries, no restating the task. Keep every \
+                         fact the parent needs (paths, line numbers, names, numbers, commands, errors quoted \
+                         exactly); drop only filler.\n\n{}",
                         c.title,
                         c.agent,
                         self.place.depth + 1,
@@ -888,6 +897,7 @@ impl Supervisor {
         }) else {
             return;
         };
+        let notify = if self.unattended { Notify_::Wake } else { notify };
         let head = format!("subagent {n} \"{title}\" {} after {}", status.word(), dur(secs * 1000));
         if let Some(h) = self.handle() {
             let first = report.lines().find(|l| !l.trim().is_empty()).unwrap_or_default();
@@ -905,6 +915,16 @@ impl Supervisor {
             }
         }
         self.start_ready();
+    }
+
+    /// Children not finished yet (print mode waits for them).
+    pub fn pending(&self) -> usize {
+        self.children
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| !c.status.finished())
+            .count()
     }
 
     fn stop(self: &Arc<Self>, n: &str, why: &str) -> bool {
@@ -1304,6 +1324,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let sup = Supervisor::new(Setup {
             slot: HubSlot::default(),
+            unattended: false,
             me: "ROOT".into(),
             home: tmp.clone(),
             cwd: tmp.clone(),

@@ -13,8 +13,12 @@ novacode.registerCommand: function/2
 novacode.registerShortcut: function/2
 novacode.registerTool: function/1
 novacode.remind: function/2
+novacode.sendMessage: function/2
 novacode.session.messages: function/0
+novacode.settings.get: function/1
 novacode.spawnAgent: function/2
+novacode.state.append: function/2
+novacode.state.entries: function/1
 novacode.ui.ask: function/1
 novacode.ui.closeTab: function/1
 novacode.ui.confirm: function/1
@@ -35,7 +39,7 @@ novacode.ui.version: number
 
 ## script: what handlers receive (payload keys)
 before_tool: ["args","cwd","tool"]
-after_tool: ["args","isError","output","tool"]
+after_tool: ["args","callId","durationMs","isError","output","tool","touched"]
 input: ["source","text"]
 before_request: ["contextTokens","cwd","lastUser","model","provider"]
 ui_key: ["height","key","node","tab","width"]
@@ -60,7 +64,7 @@ command: "string"
 ## process extensions: requests sent (method, params keys, payload keys)
 {"method": "command", "params": ["args", "name"], "payload": "str"}
 {"method": "event", "params": ["event", "payload"], "payload": ["args", "cwd", "tool"]}
-{"method": "initialize", "params": ["apiVersion", "cwd", "session"], "payload": "NoneType"}
+{"method": "initialize", "params": ["apiVersion", "cwd", "home", "session", "settings"], "payload": "NoneType"}
 {"method": "tool", "params": ["args", "cwd", "name", "session"], "payload": ["a"]}
 
 ## provider programs: requests sent (method, params keys)

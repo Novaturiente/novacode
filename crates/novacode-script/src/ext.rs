@@ -112,6 +112,17 @@ const PRELUDE: &str = r#"
     complete: (req) => call("complete", req),
     // A subagent through the agent tool (same limits); resolves to {id}.
     spawnAgent: (task, opts) => call("spawnAgent", { task, opts: opts ?? {} }),
+    // A real user message: `deliverAs` "steer" (into the running turn) or "followUp" (after it, or now when idle).
+    sendMessage: (text, opts) => call("sendMessage", { text: fmt(text), deliverAs: opts?.deliverAs ?? "followUp" }),
+    settings: Object.freeze({
+      // Merged settings at `path` (dotted; omit for all). `extensions.<your name>` is your own block.
+      get: (path) => call("settings", { path: path ?? null }),
+    }),
+    // Entries kept in the session file (never sent to the model), on the current branch.
+    state: Object.freeze({
+      append: (kind, data) => call("stateAppend", { kind: String(kind), data: data ?? null }),
+      entries: (kind) => call("stateEntries", { kind: String(kind) }),
+    }),
     notify: (text) => call("notify", { text: fmt(text) }),
     // A note for the model, saved and sent at the next model call; `wake` starts a run when idle.
     remind: (text, opts) => call("remind", { text: fmt(text), wake: !!(opts && opts.wake) }),
@@ -176,6 +187,10 @@ const PRELUDE: &str = r#"
 /// script extension here, a process extension in the core (L7.2 tier 2).
 pub trait Backend: Send + Sync {
     fn name(&self) -> &str;
+    /// Its own event-handler timeout (a process extension's `initialize` may ask for one).
+    fn hook_timeout(&self) -> Option<Duration> {
+        None
+    }
     fn reg(&self) -> &Registration;
     fn invoke<'a>(
         &'a self,

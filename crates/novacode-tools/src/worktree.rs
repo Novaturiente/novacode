@@ -189,6 +189,10 @@ impl Tool for EnterWorktree {
     fn name(&self) -> &str {
         "enter_worktree"
     }
+    /// Rarely needed: found through tool_search, so it costs no tokens per call.
+    fn exposure(&self) -> crate::Exposure {
+        crate::Exposure::Deferred
+    }
     fn description(&self) -> &str {
         "Create (or reuse) a git worktree at <repo>/.worktrees/<name> on branch worktree-<name> and move this session into it, so large changes don't touch the main checkout. Root .env files are copied in."
     }
@@ -229,6 +233,10 @@ struct ExitArgs {}
 impl Tool for ExitWorktree {
     fn name(&self) -> &str {
         "exit_worktree"
+    }
+    /// Rarely needed: found through tool_search, so it costs no tokens per call.
+    fn exposure(&self) -> crate::Exposure {
+        crate::Exposure::Deferred
     }
     fn description(&self) -> &str {
         "Leave the current git worktree and move this session back to the main checkout. The user is asked whether to keep or remove it (removal refuses uncommitted changes and keeps unmerged branches). Commit your work first."

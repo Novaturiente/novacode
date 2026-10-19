@@ -62,6 +62,11 @@ impl Settings {
         }
     }
 
+    /// The whole merged settings (extensions' `settings.get`).
+    pub fn merged(&self) -> &Value {
+        &self.merged
+    }
+
     /// Typed value at a dotted key. A wrong-typed value is reported and
     /// treated as unset, so one bad field never resets the others.
     pub fn get<T: DeserializeOwned>(&self, key: &str) -> Option<T> {

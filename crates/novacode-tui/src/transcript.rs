@@ -376,7 +376,11 @@ impl Transcript {
                 ..
             } => {
                 if let Some(t) = self.tool(call_id) {
-                    t.output = text_of(content);
+                    // An edit keeps its diff out of the model's context; show it here.
+                    t.output = details
+                        .as_ref()
+                        .and_then(|d| d["diff"].as_str())
+                        .map_or_else(|| text_of(content), String::from);
                     t.is_error = *is_error;
                     t.done = true;
                     t.ui = details

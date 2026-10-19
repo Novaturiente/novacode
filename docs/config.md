@@ -22,6 +22,8 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `processExtensions` | object | {} | Long-running JSON-RPC extensions: `<name>: {command, args, env}`. |
 | `modes` | object | {} | Mode presets: `<name>: {prompt, readOnly, tools}`; `plan` is built in. |
 | `checkpoints.enabled` | bool | true | File checkpoints per prompt, for `/rewind` (L4.15). |
+| `extensions.<name>` | object |  | Settings of extension `<name>`: a process extension gets them in `initialize`, any extension through `novacode.settings.get("extensions.<name>")` (L7). |
+| `security.maskSecrets` | bool | false | Also mask well-known secret shapes in tool output (GitHub/AWS/OpenAI/Anthropic/Slack/Google tokens, private keys, `*_TOKEN=`/`*_SECRET=` values) before the model sees them (L6.6). Your own logins are always masked. |
 | `memory.enabled` | bool | true | Observer notes and compaction from notes (L4.5). |
 | `memory.model` | string | the profile's small model | Model for the observer, reflector and dropper. |
 | `memory.observeAfterTokens` | number | 10000 | New tokens before the observer runs. |
@@ -34,11 +36,6 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `memory.indexChars` | number | 2000 | Character cap of that index. |
 | `agents.stallMinutes` | number | 10 | A subagent silent this long is stopped. |
 | `agents.timeoutMinutes` | number | 45 | A subagent running this long is stopped. |
-| `lsp.enabled` | bool | true | After edit/write/apply_patch, language servers report the errors the change left (in the tool result). |
-| `lsp.waitMs` | number | 3000 | Longest wait for a language server per tool call. |
-| `lsp.severity` | string | `error` | `warning` lists warnings too. |
-| `lsp.maxItems` | number | 10 | Most problems listed per file. |
-| `lsp.servers` | object | built-ins on PATH | By name: `{command, args, extensions, rootMarkers}` adds or replaces one, `false` turns it off. Built-ins: rust (rust-analyzer), typescript, python (pyright), go (gopls), c (clangd). |
 | `goal.audit` | bool | true | `/goal` completion is checked by the `auditor` subagent before it counts. |
 | `goal.auditModel` | string | the session's model | Model of the goal auditor (`provider/model[:level]`). |
 | `goal.maxRuns` | number | 30 | Automatic continuations of a goal before it pauses (per start or `/goal resume`). |

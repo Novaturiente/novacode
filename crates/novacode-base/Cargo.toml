@@ -14,6 +14,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+regex = "1"
 jsonc-parser = { version = "0.34", features = ["serde", "cst"] }
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

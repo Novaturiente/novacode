@@ -12,6 +12,9 @@ pub enum Level {
     Low,
     /// Destroys data or history in bulk; needs the user (or a justification headless).
     Confirm,
+    /// Rewrites or deletes shared state off this machine (a remote's history), which
+    /// no local checkpoint can undo: asks even in auto mode.
+    Shared,
     /// Targets the system, the home folder or credentials; never runs.
     Catastrophic,
 }
@@ -669,10 +672,10 @@ fn git(args: &[String]) -> Risk {
     let confirm = |why: &str| Risk::new(Level::Confirm, why);
     match sub.as_str() {
         "push" if has("-f") || has("--force") || rest.iter().any(|r| r.starts_with('+')) => {
-            confirm("git push --force rewrites the remote's history")
+            Risk::new(Level::Shared, "git push --force rewrites the remote's history")
         }
         "push" if has("--delete") || has("-d") || rest.iter().any(|r| r.starts_with(':')) => {
-            confirm("git push deletes a remote branch")
+            Risk::new(Level::Shared, "git push deletes a remote branch")
         }
         "reset" if has("--hard") => confirm("git reset --hard discards uncommitted changes"),
         "clean"
@@ -854,8 +857,8 @@ mod tests {
             ("find . -name '*.tmp' -delete", Confirm),
             ("find . -exec rm {} \\;", Confirm),
             ("git reset --hard HEAD~3", Confirm),
-            ("git push --force", Confirm),
-            ("git push origin +main", Confirm),
+            ("git push --force", Shared),
+            ("git push origin +main", Shared),
             ("git clean -fdx", Confirm),
             ("git checkout -- .", Confirm),
             ("git branch -D feature", Confirm),

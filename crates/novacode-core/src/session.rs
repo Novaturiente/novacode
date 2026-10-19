@@ -119,6 +119,12 @@ pub enum EntryKind {
     Leaf {
         target: String,
     },
+    /// An extension's own data (`novacode.state.append`), kept on the branch. Not sent.
+    ExtState {
+        ext: String,
+        kind: String,
+        data: serde_json::Value,
+    },
     /// Injected text (nudges, reminders), sent as a `<system-reminder>` user message (L4.12).
     CustomMessage {
         kind: String,

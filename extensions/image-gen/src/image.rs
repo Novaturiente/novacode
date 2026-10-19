@@ -3,15 +3,9 @@
 //! their paths come back, so they cost no tokens until the model `read`s one.
 
 use base64::Engine;
-use futures_util::future::BoxFuture;
 use novacode_ai::auth::{AuthStore, DEFAULT_ACCOUNT, antigravity};
-use novacode_ai::connect::Providers;
-use novacode_tools::{Tool, ToolCtx, ToolOutput};
-use schemars::JsonSchema;
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 const MODELS: [&str; 3] = [
@@ -22,21 +16,27 @@ const MODELS: [&str; 3] = [
 const RATIOS: [&str; 10] = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"];
 
 pub struct GenerateImage {
-    pub auth: Arc<AuthStore>,
-    pub providers: Arc<Providers>,
+    pub auth: AuthStore,
+    /// A Gemini API key (settings `apiKey`, or GEMINI_API_KEY / GOOGLE_API_KEY).
+    pub key: Option<String>,
 }
 
-#[derive(Deserialize, JsonSchema)]
-struct Args {
-    /// What to draw: subject, style, composition, text to show.
-    prompt: String,
-    /// One of 1:1 (default), 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9.
-    aspect_ratio: Option<String>,
-    /// How many images (1–4, default 1).
-    n: Option<usize>,
-    /// Images to edit or take after (paths).
-    #[serde(default)]
-    inputs: Vec<String>,
+/// The tool as the extension declares it in `initialize`.
+pub fn declaration() -> Value {
+    json!({
+        "name": "generate_image",
+        "description": "Generate (or edit) images from a text prompt with a Gemini image model. Saves them under .novacode/images/ and returns their paths; `read` one to look at it.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": { "type": "string", "description": "What to draw: subject, style, composition, text to show." },
+                "aspect_ratio": { "type": "string", "description": "One of 1:1 (default), 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9." },
+                "n": { "type": "integer", "description": "How many images (1–4, default 1)." },
+                "inputs": { "type": "array", "items": { "type": "string" }, "description": "Images to edit or take after (paths)." }
+            },
+            "required": ["prompt"]
+        }
+    })
 }
 
 fn body(prompt: &str, ratio: &str, inputs: &[(String, String)]) -> Value {
@@ -87,7 +87,7 @@ impl GenerateImage {
                     "request": b,
                     "requestType": "image_gen",
                     "userAgent": "antigravity",
-                    "requestId": format!("image_gen/{}/1", novacode_base::new_id()),
+                    "requestId": format!("image_gen/{}/1", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())),
                 });
                 let r = http
                     .post(format!("{}/v1internal:generateContent", antigravity::ENDPOINT))
@@ -115,7 +115,7 @@ impl GenerateImage {
                 }
             }
         }
-        if let Some(key) = self.providers.api_key("google") {
+        if let Some(key) = &self.key {
             let model = "gemini-2.5-flash-image";
             let r = http
                 .post(format!(
@@ -174,87 +174,82 @@ fn save(dir: &Path, stem: &str, i: usize, mime: &str, data: &str) -> Result<Path
     Ok(p)
 }
 
-impl Tool for GenerateImage {
-    fn name(&self) -> &str {
-        "generate_image"
-    }
-    fn description(&self) -> &str {
-        "Generate (or edit) images from a text prompt with a Gemini image model. Saves them under .novacode/images/ and returns their paths; `read` one to look at it."
-    }
-    fn schema(&self) -> Value {
-        novacode_tools::schema_for::<Args>()
-    }
-    fn large_output(&self) -> bool {
-        false
-    }
-    fn execute<'a>(&'a self, args: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput> {
-        Box::pin(async move {
-            let a: Args = match novacode_tools::parse(args) {
-                Ok(a) => a,
-                Err(e) => return e,
-            };
-            let ratio = a.aspect_ratio.as_deref().unwrap_or("1:1");
-            if !RATIOS.contains(&ratio) {
-                return ToolOutput::error(format!("aspect_ratio must be one of {}", RATIOS.join(", ")));
-            }
-            let mut inputs = Vec::new();
-            for p in &a.inputs {
-                let path = ctx.path(p);
-                match std::fs::read(&path) {
-                    Ok(b) => inputs.push((
-                        novacode_tools::image::sniff(&b).unwrap_or("image/png").to_string(),
-                        base64::engine::general_purpose::STANDARD.encode(b),
-                    )),
-                    Err(e) => return ToolOutput::error(format!("{}: {e}", path.display())),
-                }
-            }
-            let b = body(&a.prompt, ratio, &inputs);
-            let n = a.n.unwrap_or(1).clamp(1, 4);
-            let runs = futures_util::future::join_all((0..n).map(|_| self.one(&b))).await;
-            let stem = format!("{}-{}", novacode_core_ts(), slug(&a.prompt));
-            let dir = ctx.cwd.join(".novacode").join("images");
-            let (mut saved, mut notes, mut errors, mut used) = (Vec::new(), Vec::new(), Vec::new(), String::new());
-            for r in runs {
-                match r {
-                    Ok((imgs, text, model)) => {
-                        used = model;
-                        notes.extend(text);
-                        for (mime, data) in imgs {
-                            match save(&dir, &stem, saved.len() + 1, &mime, &data) {
-                                Ok(p) => saved.push(p),
-                                Err(e) => errors.push(e),
-                            }
-                        }
-                    }
-                    Err(e) => errors.push(e),
-                }
-            }
-            if saved.is_empty() {
-                return ToolOutput::error(format!("no image generated: {}", errors.join("; ")));
-            }
-            let mut out = format!("Saved {} image(s) with {used}:\n", saved.len());
-            for p in &saved {
-                out += &format!("{}\n", p.strip_prefix(&ctx.cwd).unwrap_or(p).display());
-            }
-            if !notes.is_empty() {
-                out += &format!("\nModel notes: {}", notes.join(" "));
-            }
-            if !errors.is_empty() {
-                out += &format!("\nFailed: {}", errors.join("; "));
-            }
-            ToolOutput {
-                details: Some(json!({ "images": saved })),
-                ..ToolOutput::text(out.trim_end().to_string())
-            }
-        })
+fn sniff(b: &[u8]) -> &'static str {
+    match b {
+        [0xFF, 0xD8, ..] => "image/jpeg",
+        [b'G', b'I', b'F', ..] => "image/gif",
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
+        _ => "image/png",
     }
 }
 
-/// UTC timestamp for file names (yyyymmdd-hhmmss).
-fn novacode_core_ts() -> String {
-    let s = crate::session::now_ms() / 1000;
-    let m = crate::memory::utc_minute(s * 1000);
-    format!("{}{:02}", m.replace(['-', ':', ' ', 'T'], ""), s % 60)
+impl GenerateImage {
+    /// One `tool` call: `args` as the model sent them, `cwd` the session folder.
+    /// Returns the `{content, isError, details}` the extension answers with.
+    pub async fn run(&self, args: &Value, cwd: &Path) -> Value {
+        let err = |e: String| json!({ "content": e, "isError": true });
+        let Some(prompt) = args["prompt"].as_str() else {
+            return err("prompt is required".into());
+        };
+        let ratio = args["aspect_ratio"].as_str().unwrap_or("1:1");
+        if !RATIOS.contains(&ratio) {
+            return err(format!("aspect_ratio must be one of {}", RATIOS.join(", ")));
+        }
+        let mut inputs = Vec::new();
+        for p in args["inputs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            let path = cwd.join(p);
+            match std::fs::read(&path) {
+                Ok(b) => inputs.push((
+                    sniff(&b).to_string(),
+                    base64::engine::general_purpose::STANDARD.encode(b),
+                )),
+                Err(e) => return err(format!("{}: {e}", path.display())),
+            }
+        }
+        let b = body(prompt, ratio, &inputs);
+        let n = args["n"].as_u64().unwrap_or(1).clamp(1, 4);
+        let runs = futures_util::future::join_all((0..n).map(|_| self.one(&b))).await;
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let stem = format!("{secs}-{}", slug(prompt));
+        let dir = cwd.join(".novacode").join("images");
+        let (mut saved, mut notes, mut errors, mut used) = (Vec::new(), Vec::new(), Vec::new(), String::new());
+        for r in runs {
+            match r {
+                Ok((imgs, text, model)) => {
+                    used = model;
+                    notes.extend(text);
+                    for (mime, data) in imgs {
+                        match save(&dir, &stem, saved.len() + 1, &mime, &data) {
+                            Ok(p) => saved.push(p),
+                            Err(e) => errors.push(e),
+                        }
+                    }
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+        if saved.is_empty() {
+            return err(format!("no image generated: {}", errors.join("; ")));
+        }
+        let mut out = format!("Saved {} image(s) with {used}:\n", saved.len());
+        for p in &saved {
+            out += &format!("{}\n", p.strip_prefix(cwd).unwrap_or(p).display());
+        }
+        if !notes.is_empty() {
+            out += &format!("\nModel notes: {}", notes.join(" "));
+        }
+        if !errors.is_empty() {
+            out += &format!("\nFailed: {}", errors.join("; "));
+        }
+        json!({ "content": out.trim_end(), "details": { "images": saved } })
+    }
 }
 
 #[cfg(test)]

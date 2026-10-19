@@ -221,6 +221,10 @@ impl Tool for ScheduleTool {
     fn name(&self) -> &str {
         "schedule"
     }
+    /// Rarely needed: found through tool_search, so it costs no tokens per call.
+    fn exposure(&self) -> novacode_tools::Exposure {
+        novacode_tools::Exposure::Deferred
+    }
     fn description(&self) -> &str {
         "Send yourself a message later, inside this session: add {message, in?: \"10m\" | at?: \"14:30\", every?: \"30m\"}, list, cancel {id}. \
          It starts a turn when due, and fires on resume if the session was closed. For checking back on long jobs or periodic tasks."

@@ -34,7 +34,9 @@ impl Tool for Edit {
         "edit"
     }
     fn guidelines(&self) -> &[&str] {
-        &["Change files with `edit`, not with sed, perl or scripts run through bash."]
+        &[
+            "Change files with `edit`, not with sed, perl or scripts run through bash (strictly forbidden unless no tool can do it). Put all changes to one file in one call's `edits`; changes to several files go in parallel calls in one message.",
+        ]
     }
     fn description(&self) -> &str {
         "Replace text in a file. Each old_text must match exactly one place in the current file (whitespace-tolerant fallback). All edits apply together or none do."
@@ -56,9 +58,10 @@ impl Tool for Edit {
             }
             let path = ctx.path(&a.path);
             let g = ctx.files.lock(ctx, &path).await;
-            if let Some(stale) = ctx.files.check_stale(ctx, &g.path).await {
-                return ToolOutput::error(stale);
-            }
+            // Changed since the last read (a formatter, the model's own bash, the user):
+            // each old_text matching exactly once still proves what it replaces, so
+            // apply and say so instead of costing a read-and-retry round trip.
+            let stale = ctx.files.check_stale(ctx, &g.path).await;
             let bytes = match ctx.env.read(&path).await {
                 Ok(b) => b,
                 Err(e) => return ToolOutput::error(format!("cannot read {}: {e}", a.path)),
@@ -67,21 +70,43 @@ impl Tool for Edit {
                 return ToolOutput::error(format!("{} is not UTF-8 text", a.path));
             };
             let pairs: Vec<(String, String)> = a.edits.into_iter().map(|e| (e.old_text, e.new_text)).collect();
-            let (new, diff) = match apply_edits(&raw, &pairs) {
+            let (new, diff, summary) = match apply_edits(&raw, &pairs) {
                 Ok(r) => r,
-                Err(e) => return ToolOutput::error(format!("{}: {e}. No edits were applied.", a.path)),
+                Err(e) => {
+                    let why = stale.map_or(String::new(), |s| format!(" {s}"));
+                    return ToolOutput::error(format!("{}: {e}. No edits were applied.{why}", a.path));
+                }
             };
             if let Err(e) = ctx.env.write(&path, new.as_bytes()).await {
                 return ToolOutput::error(format!("cannot write {}: {e}", a.path));
             }
             ctx.files.record(ctx, &g.path).await;
-            ToolOutput::text(format!("Edited {}\n{diff}", a.path))
+            let note = if stale.is_some() {
+                " (it had changed on disk since your last read; the edits matched its current text)"
+            } else {
+                ""
+            };
+            // The model wrote every line of an exact edit, so echoing them back only
+            // fills the context; the full diff goes to the screen (details.diff).
+            let text = match summary {
+                Some(at) => format!("Edited {}{note}: {at}", a.path),
+                None => format!(
+                    "Edited {}{note} (matched ignoring whitespace/quotes; check the result)\n{diff}",
+                    a.path
+                ),
+            };
+            ToolOutput {
+                details: Some(serde_json::json!({ "diff": diff })),
+                ..ToolOutput::text(text)
+            }
         })
     }
 }
 
 /// Apply all edits to `raw`, returning the new file text and a compact diff.
-pub fn apply_edits(raw: &str, edits: &[(String, String)]) -> Result<(String, String), String> {
+/// The third value is a one-line summary for the model, or `None` when a fuzzy
+/// match replaced text other than what the model sent (then it needs the diff).
+pub fn apply_edits(raw: &str, edits: &[(String, String)]) -> Result<(String, String, Option<String>), String> {
     let (bom, body) = raw.strip_prefix(BOM).map_or(("", raw), |b| (BOM, b));
     let crlf = body.contains("\r\n");
     let text = if crlf {
@@ -90,12 +115,14 @@ pub fn apply_edits(raw: &str, edits: &[(String, String)]) -> Result<(String, Str
         body.to_string()
     };
     let mut ranges: Vec<(Range<usize>, String)> = Vec::new();
+    let mut fuzzy = false;
     for (i, (old, new)) in edits.iter().enumerate() {
         let (old, new) = (old.replace("\r\n", "\n"), new.replace("\r\n", "\n"));
         if old.is_empty() {
             return Err(format!("edit {}: old_text is empty", i + 1));
         }
         let r = find_unique(&text, &old).map_err(|e| format!("edit {}: {e}", i + 1))?;
+        fuzzy |= text[r.clone()] != old;
         ranges.push((r, new));
     }
     ranges.sort_by_key(|(r, _)| r.start);
@@ -104,8 +131,17 @@ pub fn apply_edits(raw: &str, edits: &[(String, String)]) -> Result<(String, Str
     }
     let mut out = text.clone();
     let mut diff = String::new();
+    let mut spots = Vec::new();
     for (r, new) in ranges.iter().rev() {
         let line = text[..r.start].matches('\n').count() + 1;
+        spots.insert(
+            0,
+            format!(
+                "line {line} (-{} +{})",
+                text[r.clone()].lines().count(),
+                new.lines().count()
+            ),
+        );
         let mut hunk = String::new();
         for l in text[r.clone()].lines() {
             hunk.push_str(&format!("{line}- {l}\n"));
@@ -117,7 +153,7 @@ pub fn apply_edits(raw: &str, edits: &[(String, String)]) -> Result<(String, Str
         out.replace_range(r.clone(), new);
     }
     let out = if crlf { out.replace('\n', "\r\n") } else { out };
-    Ok((format!("{bom}{out}"), diff))
+    Ok((format!("{bom}{out}"), diff, (!fuzzy).then(|| spots.join(", "))))
 }
 
 fn find_unique(text: &str, old: &str) -> Result<Range<usize>, String> {
@@ -187,15 +223,52 @@ mod tests {
     #[test]
     fn exact_multi_crlf_bom() {
         let src = "\u{feff}a\r\nb\r\nc\r\n";
-        let (out, diff) = apply_edits(src, &[e("a", "A"), e("c\n", "C\nD\n")]).unwrap();
+        let (out, diff, summary) = apply_edits(src, &[e("a", "A"), e("c\n", "C\nD\n")]).unwrap();
         assert_eq!(out, "\u{feff}A\r\nb\r\nC\r\nD\r\n");
+        assert_eq!(summary.as_deref(), Some("line 1 (-1 +1), line 3 (-1 +2)"));
         assert!(diff.starts_with("1- a\n1+ A\n3- c\n"));
+    }
+
+    #[tokio::test]
+    async fn edits_in_a_row_and_after_outside_changes() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.txt");
+        std::fs::write(&f, "one\ntwo\nthree\n").unwrap();
+        let c = ctx(d.path());
+        let edit = |o: &str, n: &str| json!({"path": "a.txt", "edits": [{"old_text": o, "new_text": n}]});
+        crate::read::Read.execute(json!({"path": "a.txt"}), &c).await;
+        // Two edits of one file in a row: the second sees the first's own write as seen.
+        let r = Edit.execute(edit("one", "1"), &c).await;
+        assert!(!r.is_error && !text(&r).contains("changed on disk"), "{}", text(&r));
+        assert!(!Edit.execute(edit("two", "2"), &c).await.is_error);
+        // Changed behind its back (e.g. `sed -i` through bash), mtime moves.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&f, "1\n2\nTHREE\n").unwrap();
+        let r = Edit.execute(edit("THREE", "3"), &c).await;
+        assert!(
+            !r.is_error && text(&r).contains("changed on disk since your last read"),
+            "{}",
+            text(&r)
+        );
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "1\n2\n3\n");
+        // Changed again, and the old text is gone: refused, with both reasons.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&f, "x\n").unwrap();
+        let r = Edit.execute(edit("3", "three"), &c).await;
+        assert!(
+            r.is_error && text(&r).contains("not found") && text(&r).contains("Read it again"),
+            "{}",
+            text(&r)
+        );
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "x\n");
     }
 
     #[test]
     fn fuzzy_and_failures() {
         let src = "fn x() {   \n    say(\u{201C}hi\u{201D});\n}\n";
-        let (out, _) = apply_edits(src, &[e("fn x() {\n    say(\"hi\");", "fn y() {\n    say(\"yo\");")]).unwrap();
+        let (out, _, summary) =
+            apply_edits(src, &[e("fn x() {\n    say(\"hi\");", "fn y() {\n    say(\"yo\");")]).unwrap();
+        assert_eq!(summary, None, "fuzzy: the model gets the diff");
         assert_eq!(out, "fn y() {\n    say(\"yo\");\n}\n");
         assert!(apply_edits("a a", &[e("a", "b")]).unwrap_err().contains("2 places"));
         assert!(apply_edits("abc", &[e("zz", "b")]).unwrap_err().contains("not found"));
@@ -216,6 +289,11 @@ mod tests {
         assert_eq!(std::fs::read_to_string(d.path().join("f")).unwrap(), "one\ntwo\n");
         let ok = json!({"path": "f", "edits": [{"old_text": "two", "new_text": "2"}]});
         let o = Edit.execute(ok, &c).await;
-        assert_eq!(text(&o), "Edited f\n2- two\n2+ 2\n");
+        assert_eq!(text(&o), "Edited f: line 2 (-1 +1)");
+        assert_eq!(
+            o.details.unwrap()["diff"],
+            "2- two\n2+ 2\n",
+            "the screen still gets the diff"
+        );
     }
 }

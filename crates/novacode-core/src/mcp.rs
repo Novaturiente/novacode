@@ -505,24 +505,24 @@ impl Hub {
         if let Some(c) = slot.as_ref() {
             return Some(c.clone());
         }
-        let _ = s.status.send(Status::Connecting);
+        let _ = s.status.send_replace(Status::Connecting);
         let r = tokio::time::timeout(CONNECT_TIMEOUT, self.handshake(s)).await;
         match r {
             Ok(Ok((conn, tools))) => {
                 let path = self.cache_dir.join(format!("{}.json", s.name));
                 let _ = novacode_base::storage::write_json(&path, &tools, novacode_base::storage::Durability::Fast);
                 *s.tools.lock().unwrap() = tools;
-                let _ = s.status.send(Status::Ready);
+                let _ = s.status.send_replace(Status::Ready);
                 *slot = Some(conn.clone());
                 Some(conn)
             }
             Ok(Err(e)) => {
                 tracing::warn!(server = %s.name, "MCP connect failed: {e}");
-                let _ = s.status.send(Status::Failed(e));
+                let _ = s.status.send_replace(Status::Failed(e));
                 None
             }
             Err(_) => {
-                let _ = s.status.send(Status::Failed(format!(
+                let _ = s.status.send_replace(Status::Failed(format!(
                     "no answer within {}s",
                     CONNECT_TIMEOUT.as_secs()
                 )));
@@ -645,7 +645,7 @@ impl Hub {
         {
             // Reconnect on the next call.
             *s.conn.lock().await = None;
-            let _ = s.status.send(Status::Failed(e.clone()));
+            let _ = s.status.send_replace(Status::Failed(e.clone()));
         }
         r
     }
@@ -782,7 +782,11 @@ for line in sys.stdin:
         assert_eq!(servers.len(), 1);
         assert_eq!(warn.len(), 1);
         let hub = Hub::start(servers.clone(), home.path(), home.path());
-        hub.settle().await;
+        // Nobody watches the status while it connects: settle must still see it finish.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::timeout(Duration::from_secs(5), hub.settle())
+            .await
+            .expect("settle saw the finished connect");
         let tools = hub.tools();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name(), "calc__add");

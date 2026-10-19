@@ -54,12 +54,36 @@ pub fn discover(dirs: &[PathBuf]) -> Vec<(String, PathBuf)> {
     out
 }
 
-/// The host side of the `novacode` object (API v1).
-struct Host {
+/// The host side of the `novacode` object (API v1); process extensions reach it through `host` requests.
+pub struct Host {
     name: String,
     cwd: PathBuf,
     home: PathBuf,
     sink: Arc<Sink>,
+    /// The merged settings, for `settings.get`.
+    settings: Arc<Value>,
+}
+
+impl Host {
+    pub fn sink(&self) -> Arc<Sink> {
+        self.sink.clone()
+    }
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+    /// `extensions.<name>` of the settings: an extension's own block.
+    pub fn settings_of(&self, name: &str) -> Value {
+        self.settings["extensions"][name].clone()
+    }
+    pub fn new(name: &str, cwd: &Path, home: &Path, sink: Arc<Sink>, settings: Arc<Value>) -> Self {
+        Host {
+            name: name.into(),
+            cwd: cwd.into(),
+            home: home.into(),
+            sink,
+            settings,
+        }
+    }
 }
 
 /// A saved reminder for the model: (extension name, text, wake an idle session).
@@ -78,6 +102,14 @@ pub struct SessionApi {
     >,
     /// A tool call through the session's pipeline (rules, approvals, hooks).
     pub call_tool: Arc<dyn Fn(String, Value) -> BoxFuture<'static, ToolOutput> + Send + Sync>,
+    /// Save `(extension, kind, data)` in the session file.
+    #[allow(clippy::type_complexity)]
+    pub state_append: Arc<dyn Fn(&str, &str, Value) + Send + Sync>,
+    /// The data an extension saved under `kind`, oldest first, on the current branch.
+    #[allow(clippy::type_complexity)]
+    pub state_entries: Arc<dyn Fn(&str, &str) -> Vec<Value> + Send + Sync>,
+    /// A user message: `steer` into the running turn, else after it (or now when idle).
+    pub send: Arc<dyn Fn(String, bool) + Send + Sync>,
 }
 
 /// Where extensions reach their session, filled in when it attaches.
@@ -134,11 +166,12 @@ fn notice(events: &OnceLock<broadcast::Sender<AgentEvent>>, text: String) {
 
 impl ExtHost for Host {
     fn call(&self, op: String, args: Value) -> BoxFuture<'static, Result<Value, String>> {
-        let (name, cwd, home, sink) = (
+        let (name, cwd, home, sink, settings) = (
             self.name.clone(),
             self.cwd.clone(),
             self.home.clone(),
             self.sink.clone(),
+            self.settings.clone(),
         );
         Box::pin(async move {
             let path = |p: &Value| -> Result<PathBuf, String> {
@@ -281,6 +314,48 @@ impl ExtHost for Host {
                     // arrive through the agent tool's `notify`.
                     Ok(json!({ "id": id }))
                 }
+                "settings" => {
+                    let mut v = &*settings;
+                    for k in args["path"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .split('.')
+                        .filter(|k| !k.is_empty())
+                    {
+                        v = &v[k];
+                    }
+                    Ok(v.clone())
+                }
+                "stateAppend" => {
+                    let api = sink.session.get().ok_or("state.append: no session yet")?;
+                    let kind = args["kind"]
+                        .as_str()
+                        .filter(|k| !k.is_empty())
+                        .ok_or("state.append: kind is required")?;
+                    (api.state_append)(&name, kind, args["data"].clone());
+                    Ok(Value::Null)
+                }
+                "stateEntries" => {
+                    let api = sink.session.get().ok_or("state.entries: no session yet")?;
+                    Ok(Value::Array((api.state_entries)(
+                        &name,
+                        args["kind"].as_str().unwrap_or_default(),
+                    )))
+                }
+                "sendMessage" => {
+                    let api = sink.session.get().ok_or("sendMessage: no session yet")?;
+                    let text = args["text"]
+                        .as_str()
+                        .filter(|t| !t.trim().is_empty())
+                        .ok_or("sendMessage: text is empty")?;
+                    let steer = match args["deliverAs"].as_str().unwrap_or("followUp") {
+                        "steer" => true,
+                        "followUp" => false,
+                        d => return Err(format!("sendMessage: deliverAs `{d}` is not steer or followUp")),
+                    };
+                    (api.send)(text.to_string(), steer);
+                    Ok(Value::Null)
+                }
                 _ => Err(format!("unknown operation `{op}`")),
             }
         })
@@ -306,10 +381,11 @@ pub struct Extensions {
 
 impl Extensions {
     pub async fn load(dirs: &[PathBuf], cwd: &Path, home: &Path, cache: &Path) -> Arc<Extensions> {
-        Self::load_all(dirs, &[], cwd, home, cache, "", Path::new("")).await
+        Self::load_all(dirs, &[], cwd, home, cache, "", Path::new(""), Value::Null).await
     }
 
     /// Script extensions from `dirs`, then process extensions (`(name, config)`, L7.2 tier 2).
+    #[allow(clippy::too_many_arguments)]
     pub async fn load_all(
         dirs: &[PathBuf],
         procs: &[(String, crate::process_ext::Config)],
@@ -318,13 +394,16 @@ impl Extensions {
         cache: &Path,
         session: &str,
         log_dir: &Path,
+        settings: Value,
     ) -> Arc<Extensions> {
         let sink: Arc<Sink> = Arc::default();
+        let settings = Arc::new(settings);
         let mut loaded = Vec::new();
         let mut failed = Vec::new();
         for (name, c) in procs {
             let log = log_dir.join(format!("ext-{name}.log"));
-            match crate::process_ext::ProcessExt::start(name, c, cwd, session, &log, sink.clone()).await {
+            let host = Arc::new(Host::new(name, cwd, home, sink.clone(), settings.clone()));
+            match crate::process_ext::ProcessExt::start(name, c, cwd, session, &log, host).await {
                 Ok(ext) => loaded.push(Arc::new(Loaded {
                     ext: ext as Arc<dyn Backend>,
                     path: PathBuf::from(&c.command),
@@ -342,12 +421,7 @@ impl Extensions {
                     continue;
                 }
             };
-            let host = Arc::new(Host {
-                name: name.clone(),
-                cwd: cwd.into(),
-                home: home.into(),
-                sink: sink.clone(),
-            });
+            let host = Arc::new(Host::new(&name, cwd, home, sink.clone(), settings.clone()));
             let js = novacode_script::ts::cached(&src, cache);
             match Extension::load(&name, js, host, 64 << 20, Some((path.clone(), cache.to_path_buf()))).await {
                 Ok(ext) => loaded.push(Arc::new(Loaded {
@@ -400,6 +474,10 @@ impl Extensions {
         if l.off.load(Ordering::Relaxed) {
             return Err(format!("extension `{}` is disabled", l.ext.name()));
         }
+        let timeout = match l.ext.hook_timeout() {
+            Some(t) if timeout == HOOK_TIMEOUT => t,
+            _ => timeout,
+        };
         match l.ext.invoke(handler, payload, timeout).await {
             Ok(v) => {
                 l.throws.store(0, Ordering::Relaxed);
@@ -629,21 +707,42 @@ impl Handler for Extensions {
         })
     }
 
-    fn after_tool<'a>(&'a self, tool: &'a str, args: &'a Value, out: &'a ToolOutput) -> BoxFuture<'a, Option<String>> {
+    fn wants_touched(&self) -> bool {
+        self.handlers("after_tool").next().is_some()
+    }
+
+    fn after_tool<'a>(
+        &'a self,
+        tool: &'a str,
+        args: &'a Value,
+        out: &'a ToolOutput,
+        run: &'a crate::hooks::Run,
+    ) -> BoxFuture<'a, Option<crate::hooks::After>> {
         Box::pin(async move {
             let handlers: Vec<_> = self.handlers("after_tool").collect();
             if handlers.is_empty() {
                 return None;
             }
             let text = text_of(out);
-            let payload = json!({ "tool": tool, "args": args, "isError": out.is_error, "output": text.chars().take(16_000).collect::<String>() });
+            let mut payload = json!({ "tool": tool, "args": args, "isError": out.is_error, "output": text.chars().take(16_000).collect::<String>() });
+            if let (Value::Object(p), Value::Object(r)) = (&mut payload, run.json()) {
+                p.extend(r);
+            }
+            // shortcut: every handler sees the original result; the last replace/isError wins. Chain them if two extensions ever need to.
+            let mut all = crate::hooks::After::default();
             let mut fb = Vec::new();
             for (l, h) in handlers {
-                if let Ok(Value::String(s)) = self.invoke(l, h, &payload, HOOK_TIMEOUT).await {
-                    fb.push(s);
+                let Ok(v) = self.invoke(l, h, &payload, HOOK_TIMEOUT).await else {
+                    continue;
+                };
+                if let Some(a) = crate::hooks::After::from_json(&v) {
+                    fb.extend(a.append);
+                    all.replace = a.replace.or(all.replace);
+                    all.is_error = a.is_error.or(all.is_error);
                 }
             }
-            (!fb.is_empty()).then(|| fb.join("\n"))
+            all.append = (!fb.is_empty()).then(|| fb.join("\n"));
+            (all != crate::hooks::After::default()).then_some(all)
         })
     }
 }

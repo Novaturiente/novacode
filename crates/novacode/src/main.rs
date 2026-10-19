@@ -773,6 +773,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         cli,
         trusted,
         goals: Default::default(),
+        sup: Default::default(),
     };
     let store = if let Some(prefix) = &ctx.cli.resume {
         Store::open(&session::find(&ctx.paths, &ctx.cwd, prefix)?)?
@@ -801,9 +802,14 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         None => interactive_loop(ctx, store, model).await,
         Some(prompt) => {
             // Nobody to approve: asks become refusals, risky commands need a justification.
-            let (agent, _) = ctx.agent(store, &model, None, None, None).await?;
+            // A hub with no windows still carries subagents (L10.1): they report back by waking the run.
+            let slot = hub::HubSlot::default();
+            let (agent, _) = ctx.agent(store, &model, None, None, Some(slot.clone())).await?;
+            let sup = ctx.sup.lock().unwrap().take();
             print_mode(
                 agent,
+                slot,
+                sup,
                 prompt,
                 ctx.cwd.clone(),
                 ctx.inputs(),
@@ -827,6 +833,8 @@ struct Ctx {
     trusted: bool,
     /// The goals of the agent just built, for its Host (`agent()` returns only the agent).
     goals: std::sync::Mutex<Option<Arc<goals::Goals>>>,
+    /// The subagent supervisor of the last agent built (print mode waits for its children).
+    sup: std::sync::Mutex<Option<Arc<agents::Supervisor>>>,
 }
 
 impl Ctx {
@@ -1031,6 +1039,7 @@ impl Ctx {
                     s.extend(api_key.clone().map(|k| (k, "API key".to_string())));
                     s
                 })
+                .with_patterns(s.get("security.maskSecrets").unwrap_or(false))
             },
         };
         let memory_on = s.get("memory.enabled").unwrap_or(true);
@@ -1041,10 +1050,6 @@ impl Ctx {
         all.push(Arc::new(novacode_core::classifier::Classify::new(
             self.providers.clone(),
         )));
-        all.push(Arc::new(novacode_core::image_gen::GenerateImage {
-            auth: Arc::new(AuthStore::new(self.paths.home().join("auth.json"))),
-            providers: self.providers.clone(),
-        }));
         all.push(Arc::new(novacode_core::web::WebSearch {
             auth: Arc::new(AuthStore::new(self.paths.home().join("auth.json"))),
             providers: self.providers.clone(),
@@ -1066,7 +1071,7 @@ impl Ctx {
         // Subagents (L10.1): not below the depth limit, and only with windows/RPC to report to.
         let place = agents::Place::from_env();
         // `schedule` (L10.5): fires into a live session, so only with windows/RPC.
-        if let Some(slot) = &slot {
+        if let Some(slot) = slot.as_ref().filter(|_| approver.is_some()) {
             let sched = schedule::Schedule::from_history(&store.projection());
             sched.run(slot.clone());
             all.push(Arc::new(schedule::ScheduleTool(sched)));
@@ -1092,7 +1097,9 @@ impl Ctx {
                 small_model: small,
                 exe: None,
                 nerd: s.get::<String>("ui.icons").as_deref() != Some("unicode"),
+                unattended: approver.is_none(),
             });
+            *self.sup.lock().unwrap() = Some(sup.clone());
             // Goals (/goal): audited by the `auditor` subagent.
             let g = goals::Goals::new(
                 self.paths.home().join("goals").join(format!("{}.json", store.id())),
@@ -1153,6 +1160,7 @@ impl Ctx {
             &self.paths.home().join("cache").join("extensions"),
             store.id(),
             &self.paths.home().join("logs"),
+            s.merged().clone(),
         )
         .await;
         diag::mark("tools + extensions");
@@ -1185,7 +1193,7 @@ impl Ctx {
                 .iter()
                 .map(|t| novacode_core::pipeline::def(t.as_ref()))
                 .collect();
-            tools.push(Arc::new(novacode_tools::toolsearch::ToolSearch { tools: defs }));
+            tools.push(Arc::new(novacode_tools::toolsearch::ToolSearch::new(defs)));
             tools.push(Arc::new(novacode_tools::toolsearch::Call));
         }
         let window = cfg.window_tokens;
@@ -1202,12 +1210,15 @@ impl Ctx {
         }
         // Command hooks (L7.1), then extension handlers; none inside a hook's own novacode (recursion guard).
         // File claims first (L10.1): two agents of one tree never edit the same file.
-        let mut handlers: Vec<Arc<dyn novacode_core::hooks::Handler>> = vec![Arc::new(agents::Claims::new(
-            &serve::run_dir(&self.paths),
-            agent.store.id(),
-            place,
-            &self.cwd,
-        ))];
+        let mut handlers: Vec<Arc<dyn novacode_core::hooks::Handler>> = vec![
+            Arc::new(agents::Claims::new(
+                &serve::run_dir(&self.paths),
+                agent.store.id(),
+                place,
+                &self.cwd,
+            )),
+            Arc::new(novacode_core::hooks::BashWrites),
+        ];
         if !novacode_core::hooks::disabled() {
             let hook_cfg: novacode_core::hooks::Config = s.get("hooks").unwrap_or_default();
             let cmds = Arc::new(novacode_core::hooks::Commands {
@@ -1220,25 +1231,9 @@ impl Ctx {
                 handlers.push(cmds);
             }
         }
-        // Diagnostics after edits (language servers), last so hooks see the plain result.
-        let d = novacode_core::lsp::Config::default();
-        let lsp_cfg = novacode_core::lsp::Config {
-            enabled: s.get("lsp.enabled").unwrap_or(d.enabled),
-            wait_ms: s.get("lsp.waitMs").unwrap_or(d.wait_ms),
-            severity: s.get("lsp.severity").unwrap_or(d.severity),
-            max_items: s.get("lsp.maxItems").unwrap_or(d.max_items),
-            servers: s.get("lsp.servers").unwrap_or_default(),
-        };
-        let (lsp, lsp_warn) = novacode_core::lsp::Lsp::new(lsp_cfg, &self.cwd, &self.paths.home().join("logs"));
-        for w in lsp_warn {
-            tracing::warn!("{w}");
-        }
         if !exts.is_empty() || !exts.failed.is_empty() {
             handlers.push(exts.clone());
             agent = agent.with_extensions(exts);
-        }
-        if lsp.has_servers() {
-            handlers.push(lsp);
         }
         if !handlers.is_empty() {
             agent = agent.with_hooks(Arc::new(novacode_core::hooks::Hooks { handlers }));
@@ -1329,8 +1324,11 @@ async fn attach(text: String, cwd: std::path::PathBuf, inputs: &Inputs) -> (Vec<
         .unwrap_or_else(|_| (vec![novacode_types::Block::text(fallback)], vec![]))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn print_mode(
     agent: Agent,
+    slot: hub::HubSlot,
+    sup: Option<Arc<agents::Supervisor>>,
     prompt: String,
     cwd: std::path::PathBuf,
     inputs: Inputs,
@@ -1350,6 +1348,9 @@ async fn print_mode(
     let exts = agent.extensions().cloned();
     let (handle, task) = agent::spawn(agent);
     let mut events = handle.subscribe();
+    let hub = hub::Hub::start(handle.clone(), Vec::new(), state.clone(), None);
+    hub.unattended.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = slot.0.set(Arc::downgrade(&hub));
     let mut out_json = json.then(std::io::stdout);
     if let Some(o) = &mut out_json {
         o.write_all(
@@ -1387,6 +1388,7 @@ async fn print_mode(
     handle.prompt_content(blocks);
     // stdout gets only the final answer (L8.4); progress goes to stderr with -v.
     let mut last = None;
+    let mut end = None;
     let stop = loop {
         let ev = events.recv().await;
         if let (Some(o), Ok(e)) = (&mut out_json, &ev) {
@@ -1405,11 +1407,16 @@ async fn print_mode(
             }) => {
                 eprintln!("retry {attempt} in {delay_ms}ms: {message}")
             }
-            Ok(AgentEvent::AgentEnd { stop }) => break stop,
+            Ok(AgentEvent::AgentEnd { stop }) => end = Some(stop),
+            // Done when nothing is queued and no subagent is still out: its report would start another run.
+            Ok(AgentEvent::Settled) if end.is_some() && sup.as_ref().is_none_or(|s| s.pending() == 0) => {
+                break end.take().unwrap_or(StopReason::Stop);
+            }
             Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
             Err(broadcast::error::RecvError::Closed) => bail!("session ended unexpectedly"),
         }
     };
+    drop(hub);
     handle.shutdown();
     let agent = task.await?;
     let msg = last.context("no reply")?;
@@ -1434,8 +1441,11 @@ async fn print_mode(
     Ok(match stop {
         StopReason::Stop | StopReason::ToolUse | StopReason::Length => ExitCode::SUCCESS,
         StopReason::Aborted => ExitCode::from(130),
-        StopReason::Error { kind } => {
-            eprintln!("novacode: {kind:?}: {}", msg.error_message.unwrap_or_default());
+        StopReason::Error { .. } => {
+            eprintln!(
+                "novacode: {}",
+                msg.error_message.unwrap_or_else(|| "request failed".into())
+            );
             ExitCode::from(1)
         }
     })

@@ -1884,6 +1884,7 @@ name = "novacode-base"
 version = "0.1.0"
 dependencies = [
  "jsonc-parser",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

@@ -65,6 +65,24 @@ impl Live {
     }
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 374685000 → "4d 8h"; 5400000 → "1h 30m"; 90000 → "1m".
+fn human(ms: u64) -> String {
+    let m = ms / 60_000;
+    let (d, h, m) = (m / 1440, m / 60 % 24, m % 60);
+    match (d, h) {
+        (0, 0) => format!("{}m", m.max(1)),
+        (0, _) => format!("{h}h {m}m"),
+        _ => format!("{d}d {h}h"),
+    }
+}
+
 /// An account is used up: rotating beats waiting.
 fn exhausted(stop: &StopReason) -> bool {
     match stop {
@@ -119,7 +137,7 @@ impl Inner {
             };
             let mut rx = a.stream(req.clone(), cancel.clone());
             let mut forwarded = false;
-            while let Some(ev) = rx.recv().await {
+            while let Some(mut ev) = rx.recv().await {
                 if let StreamEvent::Error(m) = &ev
                     && !forwarded
                     && tried + 1 < n
@@ -140,8 +158,42 @@ impl Inner {
                         to = %self.accounts[next],
                         "account exhausted, rotating"
                     );
+                    let wait = match &m.stop {
+                        StopReason::Error {
+                            kind:
+                                ErrorKind::RateLimit {
+                                    retry_after_ms: Some(ms),
+                                },
+                        } => *ms,
+                        _ => 3_600_000, // quota without a reset time: try again in an hour
+                    };
+                    self.providers
+                        .auth
+                        .mark_exhausted(&self.provider, &self.accounts[i], now_ms() + wait);
                     self.current.store(next, Ordering::Relaxed);
                     continue 'accounts;
+                }
+                // Last account out too: say when it resets and how to add one.
+                if let StreamEvent::Error(m) = &mut ev
+                    && !forwarded
+                    && exhausted(&m.stop)
+                {
+                    let wait = match &m.stop {
+                        StopReason::Error {
+                            kind:
+                                ErrorKind::RateLimit {
+                                    retry_after_ms: Some(ms),
+                                },
+                        } => format!("resets in {}", human(*ms)),
+                        _ => "quota used up".into(),
+                    };
+                    m.error_message = Some(format!(
+                        "{} account `{}`: {} ({wait}). Add another account with `novacode login {} --account <name>`, or switch model with /model.",
+                        self.provider,
+                        self.accounts[i],
+                        m.error_message.as_deref().unwrap_or("rate limited"),
+                        self.provider
+                    ));
                 }
                 forwarded = true;
                 if tx.send(ev).await.is_err() {
@@ -266,6 +318,8 @@ mod tests {
             "{:?}",
             m.error_message
         );
+        // Another process starts on `work`: the exhaustion was saved.
+        assert_eq!(p.auth.accounts("sub"), ["work", "default"]);
         // The next request goes straight to `work`: no notice, no quota error.
         let m = collect(a.stream(req.clone(), CancellationToken::new())).await;
         assert_eq!(
@@ -287,5 +341,8 @@ mod tests {
         }));
         assert!(exhausted(&rl(3_600_000)), "an hour-long limit rotates");
         assert!(!exhausted(&rl(2_000)), "a short limit waits");
+        assert_eq!(human(374_685_000), "4d 8h");
+        assert_eq!(human(5_400_000), "1h 30m");
+        assert_eq!(human(1_000), "1m");
     }
 }

@@ -92,6 +92,9 @@ The default export gets the frozen `novacode` object (also `globalThis.novacode`
 - **`spawnAgent(task, opts?)`**: a subagent through the `agent` tool, with the same depth limit, file claims and approvals. `opts` takes the tool's spawn fields (`title`, `agent`, `model`, `cwd`, `after`, `notify`, `worktree`). The Subagents panel shows `[ext:<name>]` before its title. Resolves to `{id}`; the report arrives the way `notify` says (default: it wakes the model).
 - **`notify(text)`**: a notice in every window. The model doesn't see it.
 - **`remind(text, {wake?})`**: a note for the model, saved and sent with the next model call. `wake` starts a run when the session is idle. Use it for anything the model must remember.
+- **`sendMessage(text, {deliverAs?})`**: a real user message, saved like a typed one. `deliverAs: "steer"` puts it into the running turn; `"followUp"` (the default) sends it after the turn, or at once when the session is idle.
+- **`settings.get(path?)`**: the merged settings at a dotted `path` (all of them when left out). Keep your own under `extensions.<your name>`.
+- **`state.append(kind, data)`** and **`state.entries(kind)`**: your extension's data, kept in the session file and never sent to the model. `entries` returns what you appended under `kind` on the current branch, oldest first, so state follows `/rewind` and `/tree`.
 - **`log(...args)`**: writes to `~/.novacode/logs/ext-<name>.log`. `console.*` goes there too.
 
 ### UI (`novacode.ui`, version 1)
@@ -114,7 +117,7 @@ Styles are theme token names (`accent`, `dim`, `error`, …) or `#rrggbb`. A lin
 | Event | Payload | Return |
 |---|---|---|
 | `before_tool` | `{tool, args, cwd}` | `{block: reason}` refuses the call, `{args}` rewrites it. The first block wins. |
-| `after_tool` | `{tool, args, output, isError}` | A string is appended to the result as feedback. |
+| `after_tool` | `{tool, args, output, isError, callId, durationMs, touched}` | A string is appended to the result as feedback. `{append?, replace?, isError?}` also replaces the result text or sets its error flag. `touched` lists the absolute paths the call changed or read: the `path` of edit/write/read, the files of an apply_patch, and the files a `bash` command changed (seen from git status before and after; outside a git repo, none). |
 | `input` | `{text, source: prompt\|steer}` | `{text}` rewrites the prompt before it is saved, `{handled: true}` swallows it. |
 | `before_request` | `{provider, model, cwd, contextTokens, lastUser}` | A string, a list of strings or `{append}`: unsaved text sent after the cached prefix, for current state such as the time or git status. |
 | `ui_key` | `{tab, node, key, width, height}` | Handled by your code. |
@@ -124,7 +127,23 @@ Handlers fail open: an error or a timeout (10 s) leaves things as they were.
 
 ## Process extensions
 
-A long-running program that reads and writes line-delimited JSON-RPC 2.0 on stdio. novacode sends `initialize {apiVersion, cwd, session}` and expects `{tools, commands, events}` back within 10 s. After that it sends `tool`, `command` and `event` requests with the same payloads as above. The extension may send the notifications `notify {text}`, `log {text}`, `remind {text, wake}` and `ui {op, …}`. The `ui` ops are `status`, `widget`, `footer`, `header`, `editor`, `open_tab`, `show_tab`, `close_tab`, `source`, `publish`, `unpublish`, `region` and `shortcut`, with the fields listed in `api-v1.snap`. `session.messages`, `complete` and `spawnAgent` are script-only for now. stderr goes to `~/.novacode/logs/ext-<name>.log`.
+A long-running program that reads and writes line-delimited JSON-RPC 2.0 on stdio. Turn one on in settings:
+
+```json
+{ "processExtensions": { "lsp": { "command": "novacode-lsp", "args": [], "env": {} } },
+  "extensions": { "lsp": { "waitMs": 3000 } } }
+```
+
+- **Start.** novacode sends `initialize {apiVersion, cwd, session, home, settings}` (`settings` is your `extensions.<name>` block) and expects `{tools, commands, events, timeoutMs?}` back within 10 s. `timeoutMs` (up to 60 000) replaces the 10 s limit for your event handlers, for work like waiting on a language server.
+- **Calls.** After that it sends `tool`, `command` and `event` requests with the same payloads as above.
+- **Notifications you may send:** `notify {text}`, `log {text}`, `remind {text, wake}` and `ui {op, …}`. The `ui` ops are `status`, `widget`, `footer`, `header`, `editor`, `open_tab`, `show_tab`, `close_tab`, `source`, `publish`, `unpublish`, `region` and `shortcut`, with the fields listed in `api-v1.snap`.
+- **Calling novacode.** Send a request `host {op, args}` (with your own `id`) to use anything a script can: `exec {command, timeout?}`, `readFile {path}`, `writeFile {path, text}`, `ask {questions}`, `messages`, `complete {…}`, `spawnAgent {task, opts}`, `settings {path?}`, `stateAppend {kind, data}`, `stateEntries {kind}`, `sendMessage {text, deliverAs?}`. The answer is a normal JSON-RPC result or error.
+- **Stop.** Before the process group is killed it gets a `shutdown` notification and 2 s to exit.
+- stderr goes to `~/.novacode/logs/ext-<name>.log`.
+
+**Example: image generation.** [`extensions/image-gen`](../extensions/image-gen) adds a `generate_image` tool (Gemini image models through `novacode login antigravity`, or a key in `extensions.image-gen.apiKey` / `GEMINI_API_KEY`). Install with `cargo install --locked --path extensions/image-gen` and add `"processExtensions": {"image-gen": {"command": "novacode-image-gen"}}`.
+
+**Example: language-server diagnostics.** [`extensions/lsp`](../extensions/lsp) is a process extension that reports the errors an edit (or a `bash` command) left in the touched files. It isn't part of novacode: install it with `cargo install --locked --path extensions/lsp`, then add the `processExtensions.lsp` entry above.
 
 ## Custom providers
 

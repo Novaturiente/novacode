@@ -20,6 +20,11 @@ impl Tool for Write {
     fn name(&self) -> &str {
         "write"
     }
+    fn guidelines(&self) -> &[&str] {
+        &[
+            "Create files with `write`, never with heredocs, `cat >`, `tee` or scripts run through bash: that is strictly forbidden unless no tool can do the job (binary or generated output). For several files make several calls in one message (they run in parallel), or use one codemode script (`transaction: true` undoes them all if it fails).",
+        ]
+    }
     fn description(&self) -> &str {
         "Create or overwrite a file with the given content. Creates missing parent directories. Prefer edit for changes to existing files."
     }

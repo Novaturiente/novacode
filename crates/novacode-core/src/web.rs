@@ -95,6 +95,10 @@ impl Tool for WebFetch {
     fn name(&self) -> &str {
         "web_fetch"
     }
+    /// Rarely needed: found through tool_search, so it costs no tokens per call.
+    fn exposure(&self) -> novacode_tools::Exposure {
+        novacode_tools::Exposure::Deferred
+    }
     fn description(&self) -> &str {
         "Fetch a web page or file over http(s) and return it as markdown (or plain text / raw html). Downloads stop at 5 MB."
     }
@@ -423,6 +427,10 @@ fn list(items: Option<&Vec<Value>>, title: &str, url: &str, snippet: &str) -> St
 impl Tool for WebSearch {
     fn name(&self) -> &str {
         "web_search"
+    }
+    /// Rarely needed: found through tool_search, so it costs no tokens per call.
+    fn exposure(&self) -> novacode_tools::Exposure {
+        novacode_tools::Exposure::Deferred
     }
     fn description(&self) -> &str {
         "Search the web for current information, docs and facts. Returns a short evidence brief with numbered sources (or a list of results). Pass `urls` to have specific pages read as part of the answer."

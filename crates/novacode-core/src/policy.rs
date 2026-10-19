@@ -302,11 +302,12 @@ impl Policy {
                     ));
                 }
                 // Auto mode never asks, like pi (user choice, revision L6.2): only the
-                // catastrophic list above and the user's own ask/deny rules stop a command.
+                // catastrophic list, `Shared` (remote history, revision 2026-10-19) and the
+                // user's own ask/deny rules stop a command.
                 Level::Confirm if self.perms.mode == Mode::Auto => {
                     tracing::info!(command, reason = %r.reason, "risky command run in auto mode");
                 }
-                Level::Confirm => {
+                Level::Confirm | Level::Shared => {
                     if interactive {
                         // The user already approved this exact command; don't ask twice.
                         if self.session_commands.lock().unwrap().contains(command) {
@@ -460,6 +461,12 @@ mod tests {
         assert_eq!(check(&auto, "bash", bash("rm -rf target"), true), Verdict::Allow);
         assert_eq!(check(&auto, "bash", bash("git reset --hard"), false), Verdict::Allow);
         assert!(denied(&check(&auto, "bash", bash("rm -rf ~"), false)));
+        // Remote history can't be checkpointed: asks even in auto mode, needs a justification headless.
+        assert!(matches!(
+            check(&auto, "bash", bash("git push --force origin HEAD:main"), true),
+            Verdict::Ask { risky: true, .. }
+        ));
+        assert!(denied(&check(&auto, "bash", bash("git push -f"), false)));
         // The user's own ask rules still ask.
         let rule = policy(json!({ "ask": ["Bash(rm:*)"] }));
         assert!(matches!(

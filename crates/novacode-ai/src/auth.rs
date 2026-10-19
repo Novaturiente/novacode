@@ -141,8 +141,39 @@ impl AuthStore {
                     .unwrap_or_default()
             })
             .unwrap_or_default();
-        a.sort_by_key(|x| (x != DEFAULT_ACCOUNT, x.clone()));
+        // Accounts still inside a saved rate-limit window go last, so a new process
+        // doesn't spend its first request on an account known to be exhausted.
+        let until = self.exhausted();
+        let now = now_ms();
+        a.sort_by_key(|x| {
+            let out = until.get(&format!("{provider}/{x}")).is_some_and(|&t| t > now);
+            (out, x != DEFAULT_ACCOUNT, x.clone())
+        });
         a
+    }
+
+    fn exhausted_path(&self) -> PathBuf {
+        self.path.with_file_name("exhausted.json")
+    }
+
+    /// `provider/account` → epoch ms when the account's limit resets.
+    fn exhausted(&self) -> BTreeMap<String, u64> {
+        std::fs::read_to_string(self.exhausted_path())
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    /// Remember that an account is out until `until_ms` (L2.14), for other processes.
+    // shortcut: read-modify-write without the auth lock; two processes marking at once can lose one entry, which only costs one extra 429.
+    pub fn mark_exhausted(&self, provider: &str, account: &str, until_ms: u64) {
+        let now = now_ms();
+        let mut m = self.exhausted();
+        m.retain(|_, &mut t| t > now);
+        m.insert(format!("{provider}/{account}"), until_ms);
+        if let Ok(t) = serde_json::to_string_pretty(&m) {
+            let _ = storage::write_atomic(&self.exhausted_path(), t.as_bytes(), storage::Durability::Durable);
+        }
     }
 
     /// Remove one account, or every account of the provider when `account` is None.

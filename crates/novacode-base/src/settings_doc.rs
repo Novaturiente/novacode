@@ -101,6 +101,18 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "File checkpoints per prompt, for `/rewind` (L4.15).",
     ),
     (
+        "extensions.<name>",
+        "object",
+        "",
+        "Settings of extension `<name>`: a process extension gets them in `initialize`, any extension through `novacode.settings.get(\"extensions.<name>\")` (L7).",
+    ),
+    (
+        "security.maskSecrets",
+        "bool",
+        "false",
+        "Also mask well-known secret shapes in tool output (GitHub/AWS/OpenAI/Anthropic/Slack/Google tokens, private keys, `*_TOKEN=`/`*_SECRET=` values) before the model sees them (L6.6). Your own logins are always masked.",
+    ),
+    (
         "memory.enabled",
         "bool",
         "true",
@@ -166,26 +178,6 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "number",
         "45",
         "A subagent running this long is stopped.",
-    ),
-    (
-        "lsp.enabled",
-        "bool",
-        "true",
-        "After edit/write/apply_patch, language servers report the errors the change left (in the tool result).",
-    ),
-    (
-        "lsp.waitMs",
-        "number",
-        "3000",
-        "Longest wait for a language server per tool call.",
-    ),
-    ("lsp.severity", "string", "`error`", "`warning` lists warnings too."),
-    ("lsp.maxItems", "number", "10", "Most problems listed per file."),
-    (
-        "lsp.servers",
-        "object",
-        "built-ins on PATH",
-        "By name: `{command, args, extensions, rootMarkers}` adds or replaces one, `false` turns it off. Built-ins: rust (rust-analyzer), typescript, python (pyright), go (gopls), c (clangd).",
     ),
     (
         "goal.audit",
@@ -302,7 +294,6 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
 pub const CHOICES: &[(&str, &[&str])] = &[
     ("thinking", &["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
     ("cacheRetention", &["short", "long"]),
-    ("lsp.severity", &["error", "warning"]),
     (
         "tools.<name>.exposure",
         &["listed", "codemode", "codemode-only", "deferred", "hidden"],

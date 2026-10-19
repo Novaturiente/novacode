@@ -13,6 +13,28 @@ use serde_json::{Value, json};
 
 pub struct ToolSearch {
     pub tools: Vec<ToolDef>,
+    description: String,
+}
+
+/// Names shown up front, so the model knows a deferred tool exists without searching blind.
+const NAMED: usize = 30;
+
+impl ToolSearch {
+    pub fn new(tools: Vec<ToolDef>) -> Self {
+        let mut names: Vec<&str> = tools.iter().take(NAMED).map(|t| t.name.as_str()).collect();
+        let more = tools.len().saturating_sub(NAMED);
+        let more = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        names.sort_unstable();
+        let description = format!(
+            "Find more tools by what they do. Not listed up front: {}{more}. Search here when none of your tools fits. Found tools become callable.",
+            names.join(", ")
+        );
+        ToolSearch { tools, description }
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -71,7 +93,7 @@ impl Tool for ToolSearch {
         "tool_search"
     }
     fn description(&self) -> &str {
-        "Find more tools by what they do. Many tools are not listed up front; search here when none of your tools fits. Found tools become callable."
+        &self.description
     }
     fn schema(&self) -> Value {
         schema_for::<Args>()
@@ -180,7 +202,7 @@ mod tests {
         let r = rank(&tools, "github issues");
         assert_eq!(r[0].0.name, "github__list_issues");
         assert_eq!(r.len(), 1);
-        let t = ToolSearch { tools };
+        let t = ToolSearch::new(tools);
         let d = tempfile::tempdir().unwrap();
         let mut c = ctx(d.path());
         let o = t.execute(json!({"query": "fetch page"}), &c).await;

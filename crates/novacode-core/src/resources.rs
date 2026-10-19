@@ -160,33 +160,66 @@ fn scan(dir: &Path, root: bool, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The `skills` prompt section body; empty when no skill is listed.
+/// Longest skill description in the prompt; the full text stays in its file.
+const DESCRIPTION_CAP: usize = 200;
+
+/// The `skills` prompt section body; empty when no skill is listed. Compact: one
+/// line per skill, grouped by folder so paths aren't repeated, descriptions capped
+/// (it is resent with every model call).
 pub fn render_skills(skills: &[Skill]) -> String {
     let listed: Vec<&Skill> = skills.iter().filter(|s| !s.hidden).collect();
     if listed.is_empty() {
         return String::new();
     }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let show = |p: &Path| match home.as_deref().and_then(|h| p.strip_prefix(h).ok()) {
+        Some(r) => format!("~/{}", r.display()),
+        None => p.display().to_string(),
+    };
     let mut s = String::from(
-        "The following skills provide specialized instructions for specific tasks.\nUse the read tool to load a skill's file when the task matches its description.\nWhen a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n\n<available_skills>",
+        "Skills: specialized instructions for specific tasks. When a task matches one, read its file first: `<folder>/<name>/SKILL.md`, or the path in brackets. Resolve relative paths in it against the skill's own folder.",
     );
+    let mut folder: Option<&Path> = None;
     for k in listed {
-        s.push_str(&format!(
-            "\n  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>",
-            xml(&k.name),
-            xml(&k.description),
-            xml(&k.path.display().to_string())
-        ));
+        // `<folder>/<name>/SKILL.md` is implied; anything else shows its path.
+        let implied = k.path.file_name().is_some_and(|f| f == "SKILL.md")
+            && k.path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|d| d.to_string_lossy() == k.name);
+        let group = if implied {
+            k.path.parent().and_then(Path::parent)
+        } else {
+            k.path.parent()
+        };
+        if group != folder {
+            folder = group;
+            s.push_str(&format!("\n{}/", group.map(show).unwrap_or_default()));
+        }
+        let at = if implied {
+            String::new()
+        } else {
+            format!(
+                " [{}]",
+                k.path
+                    .strip_prefix(group.unwrap_or(Path::new("")))
+                    .unwrap_or(&k.path)
+                    .display()
+            )
+        };
+        s.push_str(&format!("\n- {}{at}: {}", k.name, cap(&k.description)));
     }
-    s.push_str("\n</available_skills>");
     s
 }
 
-fn xml(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+/// Whitespace collapsed, cut at a word boundary under [`DESCRIPTION_CAP`].
+fn cap(d: &str) -> String {
+    let d = d.split_whitespace().collect::<Vec<_>>().join(" ");
+    if d.chars().count() <= DESCRIPTION_CAP {
+        return d;
+    }
+    let cut: String = d.chars().take(DESCRIPTION_CAP).collect();
+    format!("{}…", cut.rsplit_once(' ').map_or(cut.as_str(), |(a, _)| a))
 }
 
 /// Templates from `dirs` (top-level `.md` files), earlier folders winning ([`Seen`]).
@@ -419,7 +452,19 @@ mod tests {
         assert_eq!(warn.len(), 1, "only the missing description: {warn:?}");
         assert_eq!(shadowed.len(), 1, "the other alpha, for doctor: {shadowed:?}");
         let r = render_skills(&s);
-        assert!(r.contains("<name>zeta</name>") && r.contains("last &lt;b&gt;"));
+        assert!(
+            r.contains("\n- zeta: last <b>") && r.contains("\n- loose [loose.md]: a root .md file"),
+            "{r}"
+        );
+        assert_eq!(
+            r.matches(&format!("\n{}/", a.display())).count(),
+            1,
+            "one folder line: {r}"
+        );
+        assert!(
+            cap(&"word ".repeat(100)).ends_with("word…")
+                && cap(&"word ".repeat(100)).chars().count() <= DESCRIPTION_CAP + 1
+        );
         assert!(!r.contains("secret"), "hidden skills aren't listed");
         let x = expand("/skill:secret do it", &s, &[]);
         assert!(

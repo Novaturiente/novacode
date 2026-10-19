@@ -12,6 +12,13 @@
 //!
 //! extension → novacode (notifications): `notify {text}`, `remind {text, wake}` (a saved note for the model),
 //! `ui {op, …}` (a UI op, L9 UI API), `log {text}`. Keys come back as the `ui_key` event.
+//!
+//! extension → novacode (requests): `host {op, args}`, any operation a script extension has
+//! (`exec`, `readFile`, `messages`, `complete`, `spawnAgent`, `settings`, `stateAppend`, …).
+//!
+//! `initialize` also gets `home` and `settings` (`extensions.<name>`); its result may set
+//! `timeoutMs` (event handlers, up to 60 s). Before the process is killed it gets a
+//! `shutdown` notification and 2 s to exit.
 
 use futures_util::future::BoxFuture;
 use novacode_script::ext::{Backend, CommandReg, Failure, Registration, ToolReg};
@@ -38,6 +45,8 @@ type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
 pub struct ProcessExt {
     name: String,
+    /// Event handler timeout asked for in `initialize`.
+    pub timeout: Option<Duration>,
     reg: Registration,
     /// Handler id → (kind, name).
     routes: Vec<(&'static str, String)>,
@@ -49,8 +58,15 @@ pub struct ProcessExt {
 
 impl Drop for ProcessExt {
     fn drop(&mut self) {
+        let _ = self
+            .tx
+            .send(json!({ "jsonrpc": "2.0", "method": "shutdown", "params": {} }).to_string());
         if let Some(pid) = self.pid {
-            novacode_tools::process::kill_group_now(pid);
+            // shortcut: a detached thread; if novacode exits first the child only gets stdin EOF, which is enough for a well-behaved one.
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(2));
+                novacode_tools::process::kill_group_now(pid);
+            });
         }
     }
 }
@@ -62,8 +78,10 @@ impl ProcessExt {
         cwd: &Path,
         session: &str,
         log: &Path,
-        sink: Arc<crate::extensions::Sink>,
+        host: Arc<crate::extensions::Host>,
     ) -> Result<Arc<ProcessExt>, String> {
+        use novacode_script::ext::ExtHost as _;
+        let sink = host.sink();
         let mut p = tokio::process::Command::new(&c.command);
         p.args(&c.args)
             .envs(&c.env)
@@ -95,7 +113,7 @@ impl ProcessExt {
             }
         });
         let pending: Pending = Arc::default();
-        let (p2, n2) = (pending.clone(), name.to_string());
+        let (p2, n2, tx2, host2) = (pending.clone(), name.to_string(), tx.clone(), host.clone());
         tokio::spawn(async move {
             let _child = child;
             let mut lines = BufReader::new(stdout).lines();
@@ -103,6 +121,22 @@ impl ProcessExt {
                 let Ok(v) = serde_json::from_str::<Value>(&l) else {
                     continue;
                 };
+                // A request from the extension: run the host operation, answer with the same id.
+                if v["method"] == "host" && !v["id"].is_null() {
+                    let (host, tx, id) = (host2.clone(), tx2.clone(), v["id"].clone());
+                    let (op, args) = (
+                        v["params"]["op"].as_str().unwrap_or_default().to_string(),
+                        v["params"]["args"].clone(),
+                    );
+                    tokio::spawn(async move {
+                        let reply = match host.call(op, args).await {
+                            Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
+                            Err(e) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": e } }),
+                        };
+                        let _ = tx.send(reply.to_string());
+                    });
+                    continue;
+                }
                 if let Some(id) = v["id"].as_u64() {
                     if let Some(done) = p2.lock().unwrap().remove(&id) {
                         let r = match v.get("error") {
@@ -143,6 +177,7 @@ impl ProcessExt {
         });
         let mut me = ProcessExt {
             name: name.into(),
+            timeout: None,
             reg: Registration::default(),
             routes: Vec::new(),
             tx,
@@ -153,10 +188,19 @@ impl ProcessExt {
         let init = me
             .request(
                 "initialize",
-                json!({ "apiVersion": novacode_script::ext::API_VERSION, "cwd": cwd, "session": session }),
+                json!({
+                    "apiVersion": novacode_script::ext::API_VERSION,
+                    "cwd": cwd,
+                    "session": session,
+                    "home": host.home(),
+                    "settings": host.settings_of(name),
+                }),
                 Duration::from_secs(10),
             )
             .await?;
+        me.timeout = init["timeoutMs"]
+            .as_u64()
+            .map(|ms| Duration::from_millis(ms.clamp(1, 60_000)));
         for t in init["tools"].as_array().into_iter().flatten() {
             let n = t["name"].as_str().unwrap_or_default().to_string();
             me.reg.tools.push(ToolReg {
@@ -216,6 +260,9 @@ impl Backend for ProcessExt {
     fn name(&self) -> &str {
         &self.name
     }
+    fn hook_timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
     fn reg(&self) -> &Registration {
         &self.reg
     }
@@ -256,11 +303,17 @@ import json, sys
 def send(m): print(json.dumps(m), flush=True)
 for line in sys.stdin:
     m = json.loads(line); p = m.get("params", {})
+    if "id" not in m and m.get("method") == "shutdown": break
+    if m.get("method") is None: continue  # an answer to our host request, read below
     if m["method"] == "initialize":
-        r = {"tools": [{"name": "py_upper", "description": "upper", "parameters": {"type": "object"}}], "commands": [{"name": "/pyhi", "description": "hi"}], "events": ["before_tool"]}
+        greeting = p["settings"]["greeting"]
+        r = {"timeoutMs": 20000, "tools": [{"name": "py_upper", "description": "upper", "parameters": {"type": "object"}}], "commands": [{"name": "/pyhi", "description": "hi"}], "events": ["before_tool"]}
     elif m["method"] == "tool": r = p["args"]["t"].upper()
     elif m["method"] == "command":
-        send({"jsonrpc": "2.0", "method": "notify", "params": {"text": "ran"}}); r = "hi " + p["args"]
+        send({"jsonrpc": "2.0", "method": "notify", "params": {"text": "ran"}})
+        send({"jsonrpc": "2.0", "id": "h1", "method": "host", "params": {"op": "settings", "args": {"path": "extensions.py.greeting"}}})
+        ans = json.loads(sys.stdin.readline())
+        r = greeting + " " + p["args"] + " " + ans["result"]
     elif m["method"] == "event": r = {"block": "py says no"} if p["payload"]["tool"] == "bash" else None
     send({"jsonrpc": "2.0", "id": m["id"], "result": r})
 "#;
@@ -272,18 +325,27 @@ for line in sys.stdin:
         let sink: Arc<crate::extensions::Sink> = Arc::default();
         let (tx, mut rx) = tokio::sync::broadcast::channel(4);
         let _ = sink.events.set(tx);
+        let host = Arc::new(crate::extensions::Host::new(
+            "py",
+            d.path(),
+            d.path(),
+            sink,
+            Arc::new(json!({"extensions": {"py": {"greeting": "hey"}}})),
+        ));
         let c = Config {
             command: "python3".into(),
             args: vec![d.path().join("e.py").display().to_string()],
             ..Default::default()
         };
-        let e = ProcessExt::start("py", &c, d.path(), "s", &d.path().join("log"), sink)
+        let e = ProcessExt::start("py", &c, d.path(), "s", &d.path().join("log"), host)
             .await
             .unwrap();
         let t = Duration::from_secs(5);
         assert_eq!(e.reg.tools[0].name, "py_upper");
         assert_eq!(e.invoke(0, &json!({"args": {"t": "ab"}}), t).await, Ok(json!("AB")));
-        assert_eq!(e.invoke(1, &json!("nova"), t).await, Ok(json!("hi nova")));
+        assert_eq!(e.timeout, Some(Duration::from_secs(20)));
+        // `greeting` came in initialize's settings, the last word through a host call.
+        assert_eq!(e.invoke(1, &json!("nova"), t).await, Ok(json!("hey nova hey")));
         assert!(
             matches!(rx.recv().await.unwrap(), AgentEvent::Stream(StreamEvent::Notice { text }) if text == "[py] ran")
         );

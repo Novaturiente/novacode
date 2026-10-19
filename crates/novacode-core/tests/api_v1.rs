@@ -43,6 +43,7 @@ for line in sys.stdin:
     p = m.get("params", {})
     log.write(json.dumps({"method": m["method"], "params": keys(p),
         "payload": keys(p.get("payload", p.get("args")))}) + "\n"); log.flush()
+    if "id" not in m: continue
     r = {"tools": [{"name": "ptool", "description": "", "parameters": {"type": "object"}}],
          "commands": [{"name": "pcmd", "description": ""}], "events": ["before_tool"]} if m["method"] == "initialize" else None
     print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": r}), flush=True)
@@ -173,6 +174,7 @@ async fn api_v1_surface() {
         &d.path().join("cache"),
         "s",
         d.path(),
+        json!({}),
     )
     .await;
     assert!(exts.failed.is_empty(), "{:?}", exts.failed);
@@ -182,7 +184,12 @@ async fn api_v1_surface() {
 
     // Drive every entry point once.
     exts.before_tool("read", &json!({"path": "a"})).await;
-    exts.after_tool("read", &json!({"path": "a"}), &ToolOutput::text("out"))
+    let run = novacode_core::hooks::Run {
+        call_id: "c1".into(),
+        duration_ms: 5,
+        touched: vec![d.path().join("a")],
+    };
+    exts.after_tool("read", &json!({"path": "a"}), &ToolOutput::text("out"), &run)
         .await;
     exts.input("hi", false).await;
     exts.before_request("p", "m", 1, Some("hi".into())).await;
@@ -274,18 +281,31 @@ async fn session_complete_and_spawn() {
              const m = await nc.session.messages();
              const c = await nc.complete({ system: "be short", messages: [{ role: "user", content: "sum up" }], maxTokens: 50 });
              const s = await nc.spawnAgent("review it", { notify: "quiet" });
-             return `${m.length} ${m[0].role} | ${c.text} | ${s.id}`;
+             await nc.state.append("note", { n: 1 });
+             await nc.state.append("note", { n: 2 });
+             const st = await nc.state.entries("note");
+             const mine = await nc.settings.get("extensions.e.color");
+             await nc.sendMessage("follow up please");
+             return `${m.length} ${m[0].role} | ${c.text} | ${s.id} | ${st.map((x) => x.n).join(",")} ${mine}`;
            } });"#,
     )
     .unwrap();
-    let faux = Faux::new([FauxReply::text("hello there"), FauxReply::text("a summary")]);
+    let faux = Faux::new([
+        FauxReply::text("hello there"),
+        FauxReply::text("a summary"),
+        FauxReply::text("followed up"),
+    ]);
     let paths = novacode_base::paths::Paths::new(home.path());
     let store = novacode_core::session::Store::create(&paths, work.path(), false);
-    let exts = Extensions::load(
+    let exts = Extensions::load_all(
         std::slice::from_ref(&dir),
+        &[],
         work.path(),
         home.path(),
         &home.path().join("cache"),
+        "",
+        home.path(),
+        json!({"extensions": {"e": {"color": "teal"}}}),
     )
     .await;
     let fake = Arc::new(FakeAgentTool(Default::default()));
@@ -329,10 +349,34 @@ async fn session_complete_and_spawn() {
     h.prompt("hi");
     while !matches!(rx.recv().await.unwrap(), AgentEvent::AgentEnd { .. }) {}
     let out = exts.command("/go").await.unwrap().unwrap();
+    // sendMessage (followUp) starts a run on the idle session.
+    while !matches!(rx.recv().await.unwrap(), AgentEvent::AgentEnd { .. }) {}
     h.shutdown();
-    task.await.unwrap();
+    let agent = task.await.unwrap();
 
-    assert_eq!(out, "2 user | a summary | child1");
+    assert_eq!(out, "2 user | a summary | child1 | 1,2 teal");
+    let saved: Vec<_> = agent
+        .store
+        .entries()
+        .iter()
+        .filter_map(|e| match &e.kind {
+            novacode_core::session::EntryKind::ExtState { ext, kind, data } => {
+                Some((ext.clone(), kind.clone(), data["n"].clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        saved,
+        [
+            ("e".into(), "note".into(), json!(1)),
+            ("e".into(), "note".into(), json!(2))
+        ]
+    );
+    assert!(
+        agent.store.projection().iter().any(|m| matches!(m, Message::User { content } if content.iter().any(|b| matches!(b, novacode_types::Block::Text { text, .. } if text == "follow up please")))),
+        "the message was sent as the user's"
+    );
     let req = faux.requests.lock().unwrap()[1].clone();
     assert!(
         matches!(&req.messages[0], Message::System { text } if text == "be short"),

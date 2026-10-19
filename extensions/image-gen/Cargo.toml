@@ -1,0 +1,21 @@
+[package]
+name = "novacode-image-gen"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.97"
+description = "novacode process extension: the generate_image tool (Gemini image models)"
+
+# Not part of novacode's workspace or distribution: built and installed on its own.
+[workspace]
+
+[dependencies]
+# For the Antigravity login (token refresh) and the shared HTTP client.
+novacode-ai = { path = "../../crates/novacode-ai" }
+base64 = "0.22"
+futures-util = "0.3"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-std", "io-util"] }
+
+[dev-dependencies]
+tempfile = "3"

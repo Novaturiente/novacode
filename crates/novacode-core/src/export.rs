@@ -266,6 +266,10 @@ impl novacode_tools::Tool for SessionSearch {
     fn name(&self) -> &str {
         "session_search"
     }
+    /// Rarely needed: found through tool_search, so it costs no tokens per call.
+    fn exposure(&self) -> novacode_tools::Exposure {
+        novacode_tools::Exposure::Deferred
+    }
     fn description(&self) -> &str {
         "Search earlier novacode sessions (this folder's, or all projects') for messages containing all the given words. Returns matching snippets with session ids and dates."
     }

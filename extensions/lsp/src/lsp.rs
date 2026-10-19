@@ -1,19 +1,17 @@
 //! Diagnostics after edits: language servers tell the model what its edit broke.
 //!
 //! Designed for novacode rather than ported from pi-lens:
-//! - One job: after `edit`/`write`/`apply_patch`, the errors in the touched
-//!   files go into that tool's result (stored once, so the cache holds).
+//! - One job: after `edit`/`write`/`apply_patch` (or a `bash` command that changed
+//!   files), the errors in the touched files go into that tool's result (stored
+//!   once, so the cache holds).
 //! - Real language servers, started lazily and kept warm. A `read` already
 //!   starts the server and opens the file, so its errors are known before the
 //!   edit and only what changed is worth saying.
-//! - Bounded: waits at most `lsp.waitMs` per call, lists at most
-//!   `lsp.maxItems`, and stays silent when nothing changed.
-//! - Configurable: `lsp.enabled`, `lsp.waitMs`, `lsp.severity`, `lsp.maxItems`,
-//!   and `lsp.servers.<name>` to add, replace or turn off (`false`) a server.
+//! - Bounded: waits at most `waitMs` per call, lists at most `maxItems`, and
+//!   stays silent when nothing changed.
+//! - Configurable (`extensions.lsp` in settings): `enabled`, `waitMs`, `severity`,
+//!   `maxItems`, and `servers.<name>` to add, replace or turn off (`false`) a server.
 
-use crate::hooks::Handler;
-use futures_util::future::BoxFuture;
-use novacode_tools::ToolOutput;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -468,7 +466,7 @@ impl Lsp {
         let _ = std::fs::create_dir_all(&self.logs);
         let c = Client::start(s, &root, &self.logs.join(format!("lsp-{name}.log"))).await;
         if let Err(e) = &c {
-            tracing::warn!(%e, "language server");
+            eprintln!("language server {name}: {e}");
         }
         g.insert((name.to_string(), root), c.clone());
         c
@@ -557,55 +555,24 @@ impl Lsp {
     }
 }
 
-/// Paths a tool call touched: `path`, or the files named in an apply_patch.
-fn touched(tool: &str, args: &Value, cwd: &Path) -> Vec<PathBuf> {
-    let abs = |p: &str| {
-        let p = Path::new(p);
-        if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
-    };
-    match tool {
-        "edit" | "write" | "read" => args["path"].as_str().map(abs).into_iter().collect(),
-        "apply_patch" => {
-            let text = args["patch"].as_str().or(args["input"].as_str()).unwrap_or_default();
-            text.lines()
-                .filter_map(|l| {
-                    l.strip_prefix("*** Update File: ")
-                        .or_else(|| l.strip_prefix("*** Add File: "))
-                        .or_else(|| l.strip_prefix("*** Move to: "))
-                })
-                .map(|p| abs(p.trim()))
-                .collect()
+impl Lsp {
+    /// One `after_tool` event: `touched` from novacode; `read` only warms the
+    /// server and learns the file's current errors, so the edit after it reports
+    /// only what changed.
+    pub async fn after_tool(&self, tool: &str, is_error: bool, touched: Vec<PathBuf>) -> Option<String> {
+        if !self.has_servers() || is_error {
+            return None;
         }
-        _ => Vec::new(),
-    }
-}
-
-impl Handler for Lsp {
-    fn label(&self) -> &str {
-        "diagnostics"
-    }
-
-    fn after_tool<'a>(&'a self, tool: &'a str, args: &'a Value, out: &'a ToolOutput) -> BoxFuture<'a, Option<String>> {
-        Box::pin(async move {
-            if !self.has_servers() || out.is_error {
-                return None;
-            }
-            let paths = touched(tool, args, &self.cwd);
-            if paths.is_empty() {
-                return None;
-            }
-            if tool == "read" {
-                // Warm the server and learn the file's current errors, off the
-                // read's path: the edit that follows then reports only changes.
-                let paths: Vec<PathBuf> = paths.into_iter().filter(|p| self.server_for(p).is_some()).collect();
-                if !paths.is_empty() {
-                    // shortcut: holds the read for up to waitMs on first open; move to a background task if it shows in timings.
-                    self.check(&paths, true).await;
-                }
-                return None;
-            }
-            self.check(&paths, false).await
-        })
+        let paths: Vec<PathBuf> = touched.into_iter().filter(|p| self.server_for(p).is_some()).collect();
+        if paths.is_empty() {
+            return None;
+        }
+        if tool == "read" {
+            // shortcut: holds the read for up to waitMs on first open; answer early and finish in a task if it shows in timings.
+            self.check(&paths, true).await;
+            return None;
+        }
+        self.check(&paths, false).await
     }
 }
 
@@ -614,17 +581,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uris_round_trip_and_patch_paths() {
+    fn uris_round_trip() {
         let p = Path::new("/tmp/a b/ü.rs");
         assert_eq!(uri(p), "file:///tmp/a%20b/%C3%BC.rs");
         assert_eq!(path_of(&uri(p)), p);
-        let cwd = Path::new("/w");
-        let args =
-            json!({"patch": "*** Begin Patch\n*** Update File: src/a.rs\n@@\n*** Add File: b.py\n+x\n*** End Patch"});
-        assert_eq!(
-            touched("apply_patch", &args, cwd),
-            vec![PathBuf::from("/w/src/a.rs"), PathBuf::from("/w/b.py")]
-        );
     }
 
     #[test]

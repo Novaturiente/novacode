@@ -51,6 +51,8 @@ pub struct Hub {
     /// Fires after every state change (the run file and sinks follow it).
     pub changed: tokio::sync::watch::Sender<State>,
     focused: std::sync::atomic::AtomicBool,
+    /// Print mode: no window will ever answer, so approvals and questions are refused at once.
+    pub unattended: std::sync::atomic::AtomicBool,
 }
 
 fn activity_state(busy: bool, blocked: bool) -> ActState {
@@ -90,6 +92,7 @@ impl Hub {
             next_approval: 1.into(),
             changed: tokio::sync::watch::channel(state).0,
             focused: true.into(),
+            unattended: false.into(),
         });
         let h = Arc::downgrade(&hub);
         tokio::spawn(async move {
@@ -357,6 +360,9 @@ impl Hub {
 
     /// Ask every window; the first answer wins and the others drop the card.
     async fn ask(self: &Arc<Self>, req: ApprovalRequest) -> Answer {
+        if self.unattended.load(std::sync::atomic::Ordering::Relaxed) {
+            return Answer::Deny(Some("nobody can approve in print mode".into()));
+        }
         let id = self.next_approval.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let detail = match req.args.get("command").or_else(|| req.args.get("path")) {
             Some(serde_json::Value::String(s)) => s.clone(),
@@ -429,6 +435,9 @@ impl Hub {
 
     /// `ask_user` in every window; the first answer (or dismissal) wins.
     async fn ask_user(self: &Arc<Self>, questions: Vec<Question>) -> Option<Vec<Reply>> {
+        if self.unattended.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
         let id = self.next_approval.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let msg = ServerMsg::Ask {
             id,
