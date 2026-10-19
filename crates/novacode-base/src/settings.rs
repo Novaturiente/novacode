@@ -186,6 +186,11 @@ fn insert(v: &mut Value, key: &str, new: Value) {
         .insert(parts[parts.len() - 1].to_string(), new);
 }
 
+/// JSON with comments (settings, mcp.json) as a value; `None` when it doesn't parse.
+pub fn parse_jsonc(text: &str) -> Option<Value> {
+    jsonc_parser::parse_to_serde_value::<Value>(text, &ParseOptions::default()).ok()
+}
+
 /// Set one dotted key in a settings file, keeping comments and formatting.
 /// Refuses to touch a file that doesn't parse, so a hand-edit isn't lost.
 pub fn set(path: &Path, key: &str, value: &Value) -> io::Result<()> {

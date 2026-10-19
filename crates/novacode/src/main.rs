@@ -32,6 +32,7 @@ mod doctor;
 mod goals;
 mod host;
 mod hub;
+mod import;
 mod models;
 mod schedule;
 mod serve;
@@ -221,11 +222,33 @@ enum Command {
         #[command(subcommand)]
         what: McpCmd,
     },
+    /// Copy Claude Code's hooks, MCP servers, permission rules and model, once (shows the changes first).
+    Import {
+        #[command(subcommand)]
+        what: ImportCmd,
+    },
+    /// Run a Claude Code hook as a novacode hook (written by `novacode import claude`).
+    #[command(hide = true)]
+    ClaudeHook {
+        event: String,
+        matcher: String,
+        command: String,
+    },
     /// Trust a folder's project config (default: the current folder); --revoke to distrust it.
     Trust {
         path: Option<std::path::PathBuf>,
         #[arg(long)]
         revoke: bool,
+    },
+}
+
+#[derive(clap::Subcommand, Clone)]
+enum ImportCmd {
+    /// From ~/.claude/settings.json and ~/.claude.json.
+    Claude {
+        /// Apply without asking.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -548,6 +571,19 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             return models::command(&Arc::new(Providers::load(paths.home(), &settings)), filter, all).await;
         }
         Some(Command::Mcp { what }) => return mcp_command(&paths, what).await,
+        Some(Command::ClaudeHook {
+            event,
+            matcher,
+            command,
+        }) => {
+            return Ok(import::hook(&event, &matcher, &command));
+        }
+        Some(Command::Import {
+            what: ImportCmd::Claude { yes },
+        }) => {
+            let settings = Settings::load(&paths.settings(), None, false);
+            return import::run(&paths, &Providers::load(paths.home(), &settings), yes);
+        }
         Some(Command::Install { source, name }) => {
             let n =
                 novacode_core::packages::install(paths.home(), &source, name.as_deref()).map_err(anyhow::Error::msg)?;

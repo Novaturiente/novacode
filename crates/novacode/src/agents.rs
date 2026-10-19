@@ -117,25 +117,6 @@ fn builtins() -> Vec<Def> {
     ]
 }
 
-/// Claude Code's tool names, as novacode's (agent files from `.claude/agents`, L7.12).
-fn tool_name(t: &str) -> String {
-    match t {
-        "Read" => "read",
-        "Write" => "write",
-        "Edit" | "MultiEdit" => "edit",
-        "Bash" => "bash",
-        "Grep" => "grep",
-        "Glob" => "find",
-        "LS" => "ls",
-        "WebFetch" => "web_fetch",
-        "WebSearch" => "web_search",
-        "TodoWrite" => "todo",
-        "Task" => "agent",
-        t => return t.to_string(),
-    }
-    .to_string()
-}
-
 /// Agent files from `dirs` (first wins a name, L7.12), then the built-ins.
 /// Returns the shadowed files too (for `doctor`).
 pub fn defs(dirs: &[PathBuf]) -> (Vec<Def>, Vec<String>) {
@@ -165,7 +146,7 @@ pub fn defs(dirs: &[PathBuf]) -> (Vec<Def>, Vec<String>) {
             }
             let tools = fm.get("tools").map(|v| {
                 v.split(',')
-                    .map(|s| tool_name(s.trim()))
+                    .map(|s| crate::import::nova_tool(s.trim()))
                     .filter(|s| !s.is_empty())
                     .collect()
             });

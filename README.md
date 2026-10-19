@@ -26,6 +26,8 @@ novacode -p "fix the failing test"   # print mode: only the final answer on stdo
 
 A model is `provider/model[:thinking]`. `novacode models` lists what your logins and keys can use.
 
+Coming from Claude Code? Your skills, agents and commands in `~/.claude` load as they are. Run `novacode import claude` once to copy your hooks, MCP servers, permission rules and model. It shows the changes and asks before writing anything.
+
 ## In the TUI
 
 | Key or command | What it does |
@@ -63,7 +65,7 @@ Project settings, extensions, skills and MCP servers load only in folders you tr
 
 ## Commands
 
-`login`, `logout`, `auth status`, `models`, `doctor`, `export`, `attach`, `panel`, `agents`, `stop`, `status`, `debug bundle`, `stats`, `install`/`uninstall`/`update`/`packages`, `mcp`, `trust`. Use `novacode <command> --help` for details.
+`login`, `logout`, `auth status`, `models`, `doctor`, `export`, `attach`, `panel`, `agents`, `stop`, `status`, `debug bundle`, `stats`, `install`/`uninstall`/`update`/`packages`, `mcp`, `import claude`, `trust`. Use `novacode <command> --help` for details.
 
 ## Reporting a bug
 
