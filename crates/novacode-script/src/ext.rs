@@ -8,7 +8,7 @@
 //! - `registerCommand(name, { description, handler(args) })`
 //! - `on(event, handler)`: `before_tool` (return `{ block }` or `{ args }`),
 //!   `after_tool` (return feedback text), or any session event type (observe).
-//! - `exec(command, { timeout? })`, `readFile(path)`, `writeFile(path, text)`,
+//! - `exec(command, { timeout? })`, `fs.read(path)`, `fs.write(path, text)`, `session.messages()`, `complete(req)`, `spawnAgent(task, opts)`,
 //!   `notify(text)`, `remind(text, {wake})`, `log(...)`, `apiVersion`.
 //!   Events include `input` and the tail-only `before_request`.
 
@@ -26,7 +26,7 @@ pub const API_VERSION: u32 = 1;
 
 /// What the extension's `novacode.*` calls reach on the host side.
 pub trait ExtHost: Send + Sync + 'static {
-    /// `op` is `exec`, `readFile`, `writeFile`, `notify`, `remind` or `log`.
+    /// `op` is `exec`, `readFile`, `writeFile`, `notify`, `remind`, `log`, `ui`, `ask`, `messages`, `complete` or `spawnAgent`.
     fn call(&self, op: String, args: Value) -> BoxFuture<'static, Result<Value, String>>;
 }
 
@@ -99,8 +99,18 @@ const PRELUDE: &str = r#"
     },
     on(event, fn) { bridge.reg("event", JSON.stringify({ event: String(event), handler: add(fn, "handler") })); },
     exec: (command, opts) => call("exec", { command, timeout: opts?.timeout }),
-    readFile: (path) => call("readFile", { path }),
-    writeFile: (path, text) => call("writeFile", { path, text }),
+    fs: Object.freeze({
+      read: (path) => call("readFile", { path }),
+      write: (path, text) => call("writeFile", { path, text }),
+    }),
+    session: Object.freeze({
+      // The conversation as of the last finished run, without the system prompt.
+      messages: () => call("messages"),
+    }),
+    // One model call on the session's provider and login: {messages: [{role, content}], system?, maxTokens?}.
+    complete: (req) => call("complete", req),
+    // A subagent through the agent tool (same limits); resolves to {id}.
+    spawnAgent: (task, opts) => call("spawnAgent", { task, opts: opts ?? {} }),
     notify: (text) => call("notify", { text: fmt(text) }),
     // A note for the model, saved and sent at the next model call; `wake` starts a run when idle.
     remind: (text, opts) => call("remind", { text: fmt(text), wake: !!(opts && opts.wake) }),
@@ -140,8 +150,8 @@ const PRELUDE: &str = r#"
       closeTab: (name) => call("ui", { op: "close_tab", name }),
       setSource: (tab, id, o) => call("ui", { op: "source", tab, id, title: o?.title ?? null, order: o?.order ?? 0, newest_first: !!o?.newestFirst }),
       publish: (tab, source, node) => call("ui", { op: "publish", tab, source, node }),
-      remove: (tab, source, id) => call("ui", { op: "remove", tab, source, id: id ?? null }),
-      region: (tab, lines) => call("ui", { op: "region", tab, lines }),
+      unpublish: (tab, source, id) => call("ui", { op: "unpublish", tab, source, id: id ?? null }),
+      setRegion: (tab, lines) => call("ui", { op: "region", tab, lines }),
     }),
     registerShortcut(key, s) {
       const fn = typeof s === "function" ? s : s?.handler;

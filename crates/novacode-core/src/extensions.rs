@@ -6,7 +6,7 @@ use crate::hooks::{Gate, Handler};
 use futures_util::future::BoxFuture;
 use novacode_script::ext::{Backend, ExtHost, Extension, Failure};
 use novacode_tools::{Exposure, Tool, ToolCtx, ToolOutput};
-use novacode_types::{AgentEvent, Block, StreamEvent};
+use novacode_types::{AgentEvent, AssistantMessage, Block, Message, StreamEvent};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -76,7 +76,7 @@ fn compiled(src: &str, cache: &Path) -> String {
     js
 }
 
-/// The host side of `novacode.exec/readFile/writeFile/notify/log`.
+/// The host side of the `novacode` object (API v1).
 struct Host {
     name: String,
     cwd: PathBuf,
@@ -87,9 +87,25 @@ struct Host {
 /// A saved reminder for the model: (extension name, text, wake an idle session).
 pub type Reminder = Arc<dyn Fn(&str, String, bool) + Send + Sync>;
 
+/// What extensions may read and call in their session (API v1, L7.11), set by the agent.
+pub struct SessionApi {
+    /// The conversation as of the last refresh, system prompt left out.
+    pub messages: Arc<dyn Fn() -> Arc<Vec<Message>> + Send + Sync>,
+    /// One model call on the session's provider and login: (system, messages, max tokens).
+    #[allow(clippy::type_complexity)]
+    pub complete: Arc<
+        dyn Fn(Option<String>, Vec<Message>, Option<u32>) -> BoxFuture<'static, Result<AssistantMessage, String>>
+            + Send
+            + Sync,
+    >,
+    /// A tool call through the session's pipeline (rules, approvals, hooks).
+    pub call_tool: Arc<dyn Fn(String, Value) -> BoxFuture<'static, ToolOutput> + Send + Sync>,
+}
+
 /// Where extensions reach their session, filled in when it attaches.
 #[derive(Default)]
 pub struct Sink {
+    pub session: OnceLock<SessionApi>,
     pub events: OnceLock<broadcast::Sender<AgentEvent>>,
     pub remind: OnceLock<Reminder>,
     /// Who answers `nc.ui.ask/select/confirm/input`: the session's windows (L5.21 form).
@@ -229,6 +245,64 @@ impl ExtHost for Host {
                     tracing::info!(extension = %name, "{}", args["text"].as_str().unwrap_or_default());
                     Ok(Value::Null)
                 }
+                "messages" => {
+                    let api = sink.session.get().ok_or("session.messages: no session yet")?;
+                    Ok(serde_json::to_value(&*(api.messages)()).unwrap_or_default())
+                }
+                "complete" => {
+                    let api = sink.session.get().ok_or("complete: no session yet")?;
+                    let messages = args["messages"]
+                        .as_array()
+                        .ok_or("complete: messages is required")?
+                        .iter()
+                        .map(|m| {
+                            let text = m["content"]
+                                .as_str()
+                                .ok_or("complete: each message needs text content")?;
+                            match m["role"].as_str() {
+                                Some("user") => Ok(Message::user(text)),
+                                Some("assistant") => Ok(Message::Assistant(AssistantMessage {
+                                    content: vec![Block::text(text)],
+                                    stop: novacode_types::StopReason::Stop,
+                                    usage: Default::default(),
+                                    provider: String::new(),
+                                    model: String::new(),
+                                    response_id: None,
+                                    error_message: None,
+                                    thinking_level: None,
+                                })),
+                                _ => Err("complete: role must be user or assistant"),
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let system = args["system"].as_str().map(String::from);
+                    let max = args["maxTokens"].as_u64().map(|n| n.min(u32::MAX as u64) as u32);
+                    let m = (api.complete)(system, messages, max).await?;
+                    Ok(json!({ "text": m.text(), "usage": m.usage, "model": m.model }))
+                }
+                "spawnAgent" => {
+                    let api = sink.session.get().ok_or("spawnAgent: no session yet")?;
+                    let task = args["task"].as_str().ok_or("spawnAgent: task is required")?;
+                    let mut a = match &args["opts"] {
+                        Value::Object(o) => o.clone(),
+                        _ => Default::default(),
+                    };
+                    a.insert("action".into(), json!("spawn"));
+                    a.insert("task".into(), json!(task));
+                    // The Subagents panel shows which extension started it.
+                    let title = a.get("title").and_then(Value::as_str).unwrap_or(task);
+                    let title = format!("[ext:{name}] {}", title.chars().take(50).collect::<String>());
+                    a.insert("title".into(), json!(title));
+                    let out = (api.call_tool)("agent".into(), Value::Object(a)).await;
+                    let id = out.details.as_ref().and_then(|d| d["id"].as_str()).map(String::from);
+                    let Some(id) = id.filter(|_| !out.is_error) else {
+                        return Err(text_of(&out));
+                    };
+                    // shortcut: no wait; one handler runs at a time per extension, so waiting
+                    // would freeze it (and its wall-clock timeout would disable it). Reports
+                    // arrive through the agent tool's `notify`.
+                    Ok(json!({ "id": id }))
+                }
                 _ => Err(format!("unknown operation `{op}`")),
             }
         })
@@ -249,6 +323,7 @@ pub struct Extensions {
     /// (name, error) of extensions that failed to load.
     pub failed: Vec<(String, String)>,
     sink: Arc<Sink>,
+    cwd: PathBuf,
 }
 
 impl Extensions {
@@ -305,7 +380,12 @@ impl Extensions {
                 Err(e) => failed.push((name, e)),
             }
         }
-        Arc::new(Extensions { loaded, failed, sink })
+        Arc::new(Extensions {
+            loaded,
+            failed,
+            sink,
+            cwd: cwd.into(),
+        })
     }
 
     /// Route notices (disabled extensions, `novacode.notify`) to the session's events.
@@ -315,6 +395,11 @@ impl Extensions {
         for (n, e) in &self.failed {
             notice(&self.sink.events, format!("extension `{n}` failed to load: {e}"));
         }
+    }
+
+    /// `session.messages()`, `complete()` and `spawnAgent()` reach this session.
+    pub fn connect(&self, api: SessionApi) {
+        let _ = self.sink.session.set(api);
     }
 
     /// Dialogs from extensions go to the session's windows.
@@ -455,7 +540,20 @@ impl Extensions {
     /// `before_request` handlers (tail-only, L3.5): each may return text (a string, a
     /// list, or `{append}`) to send after the cached prefix of this one request. It's
     /// never stored, so early history can't change and the cache holds. Fails open.
-    pub async fn before_request(&self, payload: &Value) -> Vec<String> {
+    pub async fn before_request(
+        &self,
+        provider: &str,
+        model: &str,
+        context_tokens: u64,
+        last_user: Option<String>,
+    ) -> Vec<String> {
+        let payload = &json!({
+            "provider": provider,
+            "model": model,
+            "cwd": self.cwd,
+            "contextTokens": context_tokens,
+            "lastUser": last_user,
+        });
         let mut out = Vec::new();
         for (l, h) in self.handlers("before_request").collect::<Vec<_>>() {
             let Ok(r) = self.invoke(l, h, payload, HOOK_TIMEOUT).await else {
@@ -530,7 +628,12 @@ impl Handler for Extensions {
             for (l, h) in self.handlers("before_tool").collect::<Vec<_>>() {
                 // Fail open: a broken handler never blocks the call.
                 let Ok(r) = self
-                    .invoke(l, h, &json!({ "tool": tool, "args": args }), HOOK_TIMEOUT)
+                    .invoke(
+                        l,
+                        h,
+                        &json!({ "tool": tool, "args": args, "cwd": self.cwd }),
+                        HOOK_TIMEOUT,
+                    )
                     .await
                 else {
                     continue;

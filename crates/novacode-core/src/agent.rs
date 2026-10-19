@@ -171,6 +171,20 @@ struct Shared {
     rename: Mutex<Option<String>>,
     /// The session's prompts as a tree, refreshed with the report (for `/tree`).
     prompts: Mutex<Vec<crate::session::PromptNode>>,
+    /// What extensions read and call from outside the owner task (L7.11).
+    ext: Mutex<ExtView>,
+}
+
+/// Refreshed with the report: extension handlers run while the owner is busy, so
+/// they read this copy instead of asking the owner (which could deadlock).
+#[derive(Default)]
+struct ExtView {
+    /// The conversation as of the last refresh, without the system prompt.
+    history: Arc<Vec<Message>>,
+    /// The session's adapter and a request template (model, limits, session id).
+    route: Option<(Arc<dyn Adapter>, Request)>,
+    /// The pipeline runner and a context for extension tool calls (`spawnAgent`).
+    tools: Option<(Arc<crate::codemode::Runner>, ToolCtx)>,
 }
 
 impl Shared {
@@ -358,6 +372,9 @@ impl Agent {
             .take_while(|m| matches!(m, Message::System { .. }))
             .count();
         let messages = projection[lead..].iter().map(estimate::message).sum();
+        if self.extensions.is_some() {
+            self.refresh_ext(projection[lead..].to_vec());
+        }
         let warm = if self.cfg.warm {
             self.shared.warm.lock().unwrap().status.clone()
         } else {
@@ -369,6 +386,71 @@ impl Agent {
             messages,
             window: self.cfg.window_tokens,
             warm,
+        };
+    }
+
+    /// The pipeline for nested calls (codemode, extensions): every tool but codemode,
+    /// with the same rules, approvals and hooks as the model's own calls (L3.11).
+    fn runner(&self, budget: Budget) -> Arc<crate::codemode::Runner> {
+        let mut tools: Vec<Arc<dyn Tool>> = self
+            .tools
+            .iter()
+            .chain(&self.deferred)
+            .chain(&self.scripted)
+            .filter(|t| t.name() != crate::codemode::NAME)
+            .cloned()
+            .collect();
+        if let Some(hub) = &self.mcp {
+            for t in hub.tools() {
+                if t.exposure() != novacode_tools::Exposure::Hidden && !tools.iter().any(|x| x.name() == t.name()) {
+                    tools.push(t);
+                }
+            }
+        }
+        Arc::new(crate::codemode::Runner {
+            tools,
+            policy: self.policy.clone(),
+            approver: self.approver.clone(),
+            spill_dir: self.cfg.spill_dir.clone(),
+            redactor: self.cfg.redactor.clone(),
+            budget,
+            seq: Default::default(),
+            hooks: self.hooks.clone(),
+        })
+    }
+
+    /// New copy of what extensions see (`session.messages()`, `complete()`, `spawnAgent()`).
+    fn refresh_ext(&self, history: Vec<Message>) {
+        let budget = Budget {
+            window_tokens: self.cfg.window_tokens,
+            used_tokens: novacode_types::estimate::context(&history),
+        };
+        let ctx = ToolCtx {
+            cwd: self.cfg.cwd.clone(),
+            env: self.env.clone(),
+            cancel: CancellationToken::new(),
+            updates: None,
+            files: self.files.clone(),
+            session_id: self.store.id().to_string(),
+            processes: self.processes.clone(),
+            native_tools: false,
+            nested: None,
+        };
+        let template = Request {
+            tail: Vec::new(),
+            model: self.cfg.model.clone(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            max_tokens: self.cfg.max_tokens,
+            cache: CacheRetention::Short,
+            thinking: None,
+            images: self.cfg.images,
+            session: Some(self.store.id().to_string()),
+        };
+        *self.shared.ext.lock().unwrap() = ExtView {
+            history: Arc::new(history),
+            route: Some((self.adapter.clone(), template)),
+            tools: Some((self.runner(budget), ctx)),
         };
     }
 
@@ -898,6 +980,48 @@ impl Agent {
             Arc::new(move |name: &str, text: String, wake: bool| shared.remind(&format!("ext:{name}"), text, wake)),
         );
         exts.spawn_events(self.events.subscribe());
+        let (a, b, c) = (self.shared.clone(), self.shared.clone(), self.shared.clone());
+        exts.connect(crate::extensions::SessionApi {
+            messages: Arc::new(move || a.ext.lock().unwrap().history.clone()),
+            complete: Arc::new(
+                move |system: Option<String>, messages: Vec<Message>, max: Option<u32>| {
+                    let route = b.ext.lock().unwrap().route.clone();
+                    Box::pin(async move {
+                        let (adapter, mut req) = route.ok_or("complete: the session isn't ready yet")?;
+                        req.messages = system
+                            .map(|text| Message::System { text })
+                            .into_iter()
+                            .chain(messages)
+                            .collect();
+                        if let Some(m) = max {
+                            req.max_tokens = req.max_tokens.min(m.max(1));
+                        }
+                        let mut rx = adapter.stream(req, CancellationToken::new());
+                        let mut done = None;
+                        while let Some(ev) = rx.recv().await {
+                            if let StreamEvent::Done(m) | StreamEvent::Error(m) = ev {
+                                done = Some(m);
+                            }
+                        }
+                        let m = done.ok_or("complete: the provider stream ended without a result")?;
+                        match m.stop {
+                            StopReason::Error { .. } => Err(m.error_message.unwrap_or_else(|| "request failed".into())),
+                            _ => Ok(m),
+                        }
+                    })
+                },
+            ),
+            call_tool: Arc::new(move |name: String, args: serde_json::Value| {
+                let tools = c.ext.lock().unwrap().tools.clone();
+                Box::pin(async move {
+                    use novacode_tools::Nested;
+                    match tools {
+                        Some((runner, ctx)) => runner.call(name, args, ctx).await,
+                        None => ToolOutput::error("the session isn't ready yet"),
+                    }
+                })
+            }),
+        });
         self.extensions = Some(exts);
         self
     }
@@ -1146,13 +1270,12 @@ impl Agent {
             ),
             _ => None,
         });
-        exts.before_request(&serde_json::json!({
-            "provider": self.cfg.provider,
-            "model": self.cfg.model,
-            "cwd": self.cfg.cwd,
-            "contextTokens": novacode_types::estimate::context(&messages),
-            "lastUser": last_user,
-        }))
+        exts.before_request(
+            &self.cfg.provider,
+            &self.cfg.model,
+            novacode_types::estimate::context(&messages),
+            last_user,
+        )
         .await
     }
 
@@ -1348,31 +1471,7 @@ impl Agent {
             .iter()
             .any(|(_, p)| matches!(p, Prepared::Ready(t, ..) if t.name() == crate::codemode::NAME))
         {
-            let mut tools: Vec<Arc<dyn Tool>> = self
-                .tools
-                .iter()
-                .chain(&self.deferred)
-                .chain(&self.scripted)
-                .filter(|t| t.name() != crate::codemode::NAME)
-                .cloned()
-                .collect();
-            if let Some(hub) = &self.mcp {
-                for t in hub.tools() {
-                    if t.exposure() != novacode_tools::Exposure::Hidden && !tools.iter().any(|x| x.name() == t.name()) {
-                        tools.push(t);
-                    }
-                }
-            }
-            base.nested = Some(Arc::new(crate::codemode::Runner {
-                tools,
-                policy: self.policy.clone(),
-                approver: self.approver.clone(),
-                spill_dir: self.cfg.spill_dir.clone(),
-                redactor: self.cfg.redactor.clone(),
-                budget,
-                seq: Default::default(),
-                hooks: self.hooks.clone(),
-            }));
+            base.nested = Some(self.runner(budget));
         }
         let one = |call: &ToolCall, p: &Prepared| {
             let events = self.events.clone();
@@ -1735,6 +1834,8 @@ async fn process_bridge(
 
 /// Start the owner task. It is the only code that changes the session.
 pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
+    // Every builder step is done: extensions can see and call the session from now on.
+    agent.update_report();
     let handle = SessionHandle {
         shared: agent.shared.clone(),
         events: agent.events.clone(),

@@ -1155,7 +1155,10 @@ impl Tool for AgentTool {
             match args["action"].as_str().unwrap_or_default() {
                 "spawn" => match serde_json::from_value::<SpawnArgs>(args.clone()) {
                     Ok(a) => match s.spawn(a) {
-                        Ok(n) => ToolOutput::text(format!("started {n}; its report arrives when it's done")),
+                        Ok(n) => ToolOutput {
+                            details: Some(serde_json::json!({ "id": n })),
+                            ..ToolOutput::text(format!("started {n}; its report arrives when it's done"))
+                        },
                         Err(e) => ToolOutput::error(e),
                     },
                     Err(e) => ToolOutput::error(format!("spawn: {e}")),

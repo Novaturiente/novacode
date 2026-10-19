@@ -519,6 +519,7 @@ pub mod ui {
             node: Box<Node>,
         },
         /// Remove a node, or (no id) clear the source.
+        #[serde(rename = "unpublish")]
         Remove {
             tab: String,
             source: String,
