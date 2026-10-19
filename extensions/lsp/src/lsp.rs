@@ -14,9 +14,9 @@
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -178,6 +178,8 @@ pub struct Diag {
     pub col: u32,
     pub severity: u8,
     pub message: String,
+    /// Who found it: `rust-analyzer` for its own checks, `rustc` for cargo check.
+    pub source: String,
 }
 
 #[derive(Default)]
@@ -196,6 +198,14 @@ struct Client {
     changed: Notify,
     /// uri → version of open documents.
     open: Mutex<HashMap<String, i32>>,
+    /// Work-done progress tokens still running (`$/progress` begin without end).
+    progress: Mutex<HashSet<String>>,
+    /// rust-analyzer's `experimental/serverStatus`: false while it loads or indexes.
+    quiescent: Mutex<Option<bool>>,
+    /// rust-analyzer's health message when not "ok" (e.g. no std sources).
+    unhealthy: Mutex<Option<String>>,
+    /// `unhealthy` was told to the model.
+    warned: AtomicBool,
     _child: Mutex<tokio::process::Child>,
 }
 
@@ -222,6 +232,10 @@ impl Client {
             published: Mutex::default(),
             changed: Notify::new(),
             open: Mutex::default(),
+            progress: Mutex::default(),
+            quiescent: Mutex::default(),
+            unhealthy: Mutex::default(),
+            warned: AtomicBool::new(false),
             _child: Mutex::new(child),
         });
         tokio::spawn(read_loop(Arc::downgrade(&c), BufReader::new(stdout)));
@@ -237,7 +251,9 @@ impl Client {
                         "synchronization": { "didSave": true },
                         "publishDiagnostics": { "versionSupport": true }
                     },
-                    "workspace": { "configuration": true, "workspaceFolders": true }
+                    "workspace": { "configuration": true, "workspaceFolders": true },
+                    "window": { "workDoneProgress": true },
+                    "experimental": { "serverStatusNotification": true }
                 }
             }),
         );
@@ -305,25 +321,48 @@ impl Client {
         Some(u)
     }
 
-    /// Wait for a publish for `uri` newer than `since`, then a short quiet spell
-    /// for follow-ups (servers often publish twice), all within `budget`.
-    async fn settle(&self, uri: &str, since: u64, budget: Duration) {
+    /// While rust-analyzer is unhealthy (no std sources, broken workspace) its own
+    /// type checks are wrong; cargo check's (`rustc`) still hold.
+    fn trusted(&self, diags: Vec<Diag>) -> Vec<Diag> {
+        if self.unhealthy.lock().unwrap().is_none() {
+            return diags;
+        }
+        diags.into_iter().filter(|d| d.source != "rust-analyzer").collect()
+    }
+
+    /// No background work running. Diagnostics published while a server is still
+    /// loading the project are wrong (rust-analyzer without its sysroot says
+    /// "cannot index into `&[u8]`"), so only these count.
+    fn ready(&self) -> bool {
+        self.progress.lock().unwrap().is_empty() && *self.quiescent.lock().unwrap() != Some(false)
+    }
+
+    /// Wait until the server is ready and has published for `uri` after `since`,
+    /// then a short quiet spell for follow-ups (servers often publish twice), all
+    /// within `budget`. False: still loading when the budget ran out.
+    async fn settle(&self, uri: &str, since: u64, budget: Duration) -> bool {
         let end = tokio::time::Instant::now() + budget;
         let mut seen = since;
         loop {
             let n = self.changed.notified();
             let now = self.snapshot(uri).0;
+            if !self.ready() {
+                if tokio::time::timeout_at(end, n).await.is_err() {
+                    return self.ready();
+                }
+                continue;
+            }
             if now > seen {
                 seen = now;
                 // Something arrived: give stragglers 300 ms, not the whole budget.
                 let quiet = (tokio::time::Instant::now() + Duration::from_millis(300)).min(end);
                 if tokio::time::timeout_at(quiet, n).await.is_err() {
-                    return;
+                    return self.ready();
                 }
                 continue;
             }
             if tokio::time::timeout_at(end, n).await.is_err() {
-                return;
+                return self.ready();
             }
         }
     }
@@ -382,6 +421,23 @@ async fn read_loop(c: std::sync::Weak<Client>, mut r: BufReader<tokio::process::
                 };
                 c.send(json!({ "jsonrpc": "2.0", "id": id, "result": result })).await;
             }
+            (None, Some("$/progress")) => {
+                let p = &msg["params"];
+                let token = p["token"].to_string();
+                match p["value"]["kind"].as_str() {
+                    Some("begin") => c.progress.lock().unwrap().insert(token),
+                    Some("end") => c.progress.lock().unwrap().remove(&token),
+                    _ => continue,
+                };
+                c.changed.notify_waiters();
+            }
+            (None, Some("experimental/serverStatus")) => {
+                let p = &msg["params"];
+                *c.quiescent.lock().unwrap() = p["quiescent"].as_bool();
+                *c.unhealthy.lock().unwrap() =
+                    (p["health"] != "ok").then(|| p["message"].as_str().unwrap_or("unhealthy").to_string());
+                c.changed.notify_waiters();
+            }
             (None, Some("textDocument/publishDiagnostics")) => {
                 let p = &msg["params"];
                 let u = p["uri"].as_str().unwrap_or_default().to_string();
@@ -394,6 +450,7 @@ async fn read_loop(c: std::sync::Weak<Client>, mut r: BufReader<tokio::process::
                         col: d["range"]["start"]["character"].as_u64().unwrap_or(0) as u32 + 1,
                         severity: d["severity"].as_u64().unwrap_or(1) as u8,
                         message: one_line(d["message"].as_str().unwrap_or_default()),
+                        source: d["source"].as_str().unwrap_or_default().to_string(),
                     })
                     .collect();
                 diags.sort();
@@ -497,9 +554,24 @@ impl Lsp {
             if c.sync(path, &ext).await.is_none() {
                 continue;
             }
-            c.settle(&u, before, budget).await;
+            if !c.settle(&u, before, budget).await {
+                // Saying nothing would read as "no errors"; old diagnostics stay as the baseline.
+                if !baseline_only {
+                    let rel = path.strip_prefix(&self.cwd).unwrap_or(path).display().to_string();
+                    report.push(format!("{rel}: not checked, {name} is still loading the project"));
+                }
+                continue;
+            }
+            if let Some(m) = c.unhealthy.lock().unwrap().as_deref()
+                && !c.warned.swap(true, Ordering::Relaxed)
+            {
+                report.push(format!(
+                    "({name}: {}; only cargo check errors are shown)",
+                    one_line(m)
+                ));
+            }
             if baseline_only {
-                let diags = c.snapshot(&u).1;
+                let diags = c.trusted(c.snapshot(&u).1);
                 self.told.lock().unwrap().insert(u, diags);
                 continue;
             }
@@ -508,6 +580,7 @@ impl Lsp {
                 let p = c.published.lock().unwrap();
                 p.iter().map(|(k, v)| (k.clone(), v.diags.clone())).collect()
             };
+            let pubs: Vec<(String, Vec<Diag>)> = pubs.into_iter().map(|(k, d)| (k, c.trusted(d))).collect();
             for (file, diags) in pubs {
                 let shown: Vec<Diag> = diags.into_iter().filter(|d| d.severity <= max_sev).collect();
                 let mut told = self.told.lock().unwrap();
@@ -601,6 +674,23 @@ mod tests {
         assert!(list.iter().all(|(n, _)| n != "rust"));
         assert!(list.iter().any(|(n, _)| n == "sh"));
         assert_eq!(warn.len(), 1, "{warn:?}");
+    }
+
+    /// rust-analyzer publishes bogus errors (no sysroot yet: "cannot index into
+    /// `&[u8]`") while it loads; a cold check must wait or say it didn't check.
+    #[tokio::test]
+    async fn rust_analyzer_cold_start_reports_no_false_errors() {
+        if !on_path("rust-analyzer") {
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("Cargo.toml"), "[package]\nname = \"t\"\nedition = \"2021\"\n").unwrap();
+        std::fs::create_dir(d.path().join("src")).unwrap();
+        let f = d.path().join("src/lib.rs");
+        std::fs::write(&f, "pub fn first(b: &[u8]) -> u8 { b[0] }\n").unwrap();
+        let (lsp, _) = Lsp::new(Config::default(), d.path(), &d.path().join("logs"));
+        let r = lsp.check(std::slice::from_ref(&f), false).await;
+        assert!(!r.unwrap_or_default().contains("cannot index"));
     }
 
     /// A real server, when this machine has one: an edit that breaks the file is reported.
