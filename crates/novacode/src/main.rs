@@ -467,7 +467,11 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             if matches!(cli.command, Some(Command::Doctor)) {
                 let (km, mut problems) = load_keymap(&paths);
                 problems.extend(km.conflicts());
-                return Ok(doctor::doctor(&p, &settings, problems).await);
+                let dirs = |k, c| resource_dirs(&paths, &cwd, &settings, trusted, k, c);
+                let mut shadowed = novacode_core::resources::skills(&dirs("skills", "skills")).2;
+                shadowed.extend(novacode_core::resources::templates(&dirs("prompts", "commands")).1);
+                shadowed.extend(agents::defs(&dirs("agents", "agents")).1);
+                return Ok(doctor::doctor(&p, &settings, problems, shadowed).await);
             }
             return Ok(doctor::auth_status(&p));
         }
@@ -753,37 +757,16 @@ impl Ctx {
         self.settings.diagnostics().into_iter().map(|d| d.message).collect()
     }
 
-    /// Skill folders, first wins (L4.10): project (trusted only), novacode's, then the shared `~/.agents`.
-    /// `.claude/skills` is never scanned (user requirement).
-    fn skill_dirs(&self) -> Vec<std::path::PathBuf> {
-        let mut d = Vec::new();
-        if self.trusted {
-            d.push(Paths::project_dir(&self.cwd).join("skills"));
-        }
-        d.push(self.paths.home().join("skills"));
-        if let Some(h) = std::env::var_os("HOME") {
-            d.push(Path::new(&h).join(".agents/skills"));
-        }
-        d.extend(
-            novacode_core::packages::list(self.paths.home())
-                .into_iter()
-                .map(|p| p.dir.join("skills")),
-        );
-        d
+    fn resource_dirs(&self, kind: &str, claude: &str) -> Vec<std::path::PathBuf> {
+        resource_dirs(&self.paths, &self.cwd, &self.settings, self.trusted, kind, claude)
     }
 
-    /// Prompt-template folders, project first (L4.11).
+    fn skill_dirs(&self) -> Vec<std::path::PathBuf> {
+        self.resource_dirs("skills", "skills")
+    }
+
     fn template_dirs(&self) -> Vec<std::path::PathBuf> {
-        let mut d = vec![
-            Paths::project_dir(&self.cwd).join("prompts"),
-            self.paths.home().join("prompts"),
-        ];
-        d.extend(
-            novacode_core::packages::list(self.paths.home())
-                .into_iter()
-                .map(|p| p.dir.join("prompts")),
-        );
-        d
+        self.resource_dirs("prompts", "commands")
     }
 
     fn inputs(&self) -> Inputs {
@@ -897,7 +880,8 @@ impl Ctx {
         // A subagent: its definition's tools and role prompt (L10.1).
         let def = match &self.cli.agent {
             Some(name) => Some(
-                agents::defs(self.paths.home(), &self.cwd, self.trusted)
+                agents::defs(&self.resource_dirs("agents", "agents"))
+                    .0
                     .into_iter()
                     .find(|d| &d.name == name)
                     .with_context(|| format!("no agent definition `{name}`"))?,
@@ -1009,6 +993,7 @@ impl Ctx {
                 home: self.paths.home().to_path_buf(),
                 cwd: self.cwd.clone(),
                 trusted: self.trusted,
+                agent_dirs: self.resource_dirs("agents", "agents"),
                 stall_min: s.get("agents.stallMinutes").unwrap_or(10),
                 timeout_min: s.get("agents.timeoutMinutes").unwrap_or(45),
                 small_model: small,
@@ -1216,13 +1201,14 @@ impl Inputs {
             return text.to_string();
         }
         let skills = resources::skills(&self.skills).0;
-        resources::expand(text, &skills, &resources::templates(&self.templates))
+        resources::expand(text, &skills, &resources::templates(&self.templates).0)
     }
 
     /// Slash completions for the editor, and warnings about broken skills.
     fn commands(&self) -> (Vec<(String, String)>, Vec<String>) {
-        let (skills, warn) = resources::skills(&self.skills);
+        let (skills, warn, _) = resources::skills(&self.skills);
         let mut c: Vec<(String, String)> = resources::templates(&self.templates)
+            .0
             .into_iter()
             .map(|t| (format!("/{}", t.name), t.description))
             .collect();
@@ -1609,6 +1595,45 @@ fn quota_task(host: Arc<host::Host>) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+/// Folders for one resource kind, first wins (L7.12): project `.novacode`, project
+/// `.claude`, `~/.novacode`, `~/.claude`, `~/.agents` (skills only), then packages.
+/// `.claude` folders unless `compat.claude` is false; project folders when trusted
+/// (prompt templates are plain text: the project's own `prompts` loads either way).
+/// `claude` is the folder's name under `.claude` (`commands` for templates).
+fn resource_dirs(
+    paths: &Paths,
+    cwd: &Path,
+    settings: &Settings,
+    trusted: bool,
+    kind: &str,
+    claude: &str,
+) -> Vec<std::path::PathBuf> {
+    let compat = settings.get::<bool>("compat.claude").unwrap_or(true);
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let mut d = Vec::new();
+    if trusted || kind == "prompts" {
+        d.push(Paths::project_dir(cwd).join(kind));
+    }
+    if trusted && compat {
+        d.push(cwd.join(".claude").join(claude));
+    }
+    d.push(paths.home().join(kind));
+    if let Some(h) = &home {
+        if compat {
+            d.push(h.join(".claude").join(claude));
+        }
+        if kind == "skills" {
+            d.push(h.join(".agents/skills"));
+        }
+    }
+    d.extend(
+        novacode_core::packages::list(paths.home())
+            .into_iter()
+            .map(|p| p.dir.join(kind)),
+    );
+    d
 }
 
 /// `--bg` (the child) and `--rpc`: a session with no window of its own.

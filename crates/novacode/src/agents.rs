@@ -117,15 +117,32 @@ fn builtins() -> Vec<Def> {
     ]
 }
 
-/// Built-ins, then `~/.novacode/agents`, then the project's (trusted only); later wins a name.
-pub fn defs(home: &Path, cwd: &Path, trusted: bool) -> Vec<Def> {
-    let mut all: BTreeMap<String, Def> = builtins().into_iter().map(|d| (d.name.clone(), d)).collect();
-    let mut dirs = vec![home.join("agents")];
-    if trusted {
-        dirs.push(cwd.join(".novacode").join("agents"));
+/// Claude Code's tool names, as novacode's (agent files from `.claude/agents`, L7.12).
+fn tool_name(t: &str) -> String {
+    match t {
+        "Read" => "read",
+        "Write" => "write",
+        "Edit" | "MultiEdit" => "edit",
+        "Bash" => "bash",
+        "Grep" => "grep",
+        "Glob" => "find",
+        "LS" => "ls",
+        "WebFetch" => "web_fetch",
+        "WebSearch" => "web_search",
+        "TodoWrite" => "todo",
+        "Task" => "agent",
+        t => return t.to_string(),
     }
+    .to_string()
+}
+
+/// Agent files from `dirs` (first wins a name, L7.12), then the built-ins.
+/// Returns the shadowed files too (for `doctor`).
+pub fn defs(dirs: &[PathBuf]) -> (Vec<Def>, Vec<String>) {
+    let mut all: BTreeMap<String, Def> = BTreeMap::new();
+    let mut seen = novacode_core::resources::Seen::default();
     for dir in dirs {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
             .into_iter()
             .flatten()
             .flatten()
@@ -143,24 +160,24 @@ pub fn defs(home: &Path, cwd: &Path, trusted: bool) -> Vec<Def> {
                 .cloned()
                 .or_else(|| f.file_stem().map(|s| s.to_string_lossy().to_string()))
                 .unwrap_or_default();
-            if name.is_empty() {
+            if name.is_empty() || !seen.admit("agent", &name, &f) {
                 continue;
             }
-            let list = |k: &str| {
-                fm.get(k).map(|v| {
-                    v.split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect()
-                })
-            };
+            let tools = fm.get("tools").map(|v| {
+                v.split(',')
+                    .map(|s| tool_name(s.trim()))
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            });
+            // Claude Code's `inherit` and bare family names aren't routes: use the parent's model.
+            let model = fm.get("model").filter(|m| m.contains('/') || *m == "small").cloned();
             all.insert(
                 name.clone(),
                 Def {
                     name,
                     description: fm.get("description").cloned().unwrap_or_default(),
-                    tools: list("tools"),
-                    model: fm.get("model").cloned(),
+                    tools,
+                    model,
                     thinking: fm.get("thinking").cloned(),
                     prompt: body.trim().to_string(),
                     replace: fm
@@ -171,7 +188,10 @@ pub fn defs(home: &Path, cwd: &Path, trusted: bool) -> Vec<Def> {
             );
         }
     }
-    all.into_values().collect()
+    for d in builtins() {
+        all.entry(d.name.clone()).or_insert(d);
+    }
+    (all.into_values().collect(), seen.shadowed)
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +410,8 @@ pub struct Setup {
     pub home: PathBuf,
     pub cwd: PathBuf,
     pub trusted: bool,
+    /// Agent-file folders, first wins (L7.12).
+    pub agent_dirs: Vec<PathBuf>,
     pub stall_min: u64,
     pub timeout_min: u64,
     pub small_model: Option<String>,
@@ -406,7 +428,7 @@ impl Supervisor {
             slot: s.slot,
             place: Place::from_env(),
             me: s.me,
-            defs: defs(&s.home, &s.cwd, s.trusted),
+            defs: defs(&s.agent_dirs).0,
             home: s.home,
             cwd: s.cwd,
             trusted: s.trusted,
@@ -1305,6 +1327,7 @@ mod tests {
             home: tmp.clone(),
             cwd: tmp.clone(),
             trusted: false,
+            agent_dirs: vec![],
             stall_min: 10,
             timeout_min: 45,
             small_model: None,
@@ -1357,7 +1380,25 @@ mod tests {
             "---\nname: docs\ndescription: writes docs\ntools: read, write\nmode: replace\n---\nYou write docs.",
         )
         .unwrap();
-        let d = defs(&tmp, &tmp, false);
+        // A Claude Code agent file: its tool names and `model: inherit` are mapped.
+        std::fs::create_dir_all(tmp.join("claude")).unwrap();
+        std::fs::write(
+            tmp.join("claude/rev.md"),
+            "---\nname: rev\ndescription: reviews\ntools: Read, Grep, Glob\nmodel: sonnet\n---\nReview.",
+        )
+        .unwrap();
+        // Same file through a symlink: once, silently. Same name elsewhere: first wins, reported.
+        std::os::unix::fs::symlink(tmp.join("claude/rev.md"), tmp.join("agents/rev.md")).unwrap();
+        std::fs::write(tmp.join("claude/docs.md"), "---\ndescription: other docs\n---\nx").unwrap();
+        let (d, shadowed) = defs(&[tmp.join("agents"), tmp.join("claude")]);
+        assert_eq!(shadowed.len(), 1, "{shadowed:?}");
+        assert!(shadowed[0].contains("claude/docs.md"), "{shadowed:?}");
+        let rev = d.iter().find(|d| d.name == "rev").unwrap();
+        assert_eq!(
+            rev.tools.as_deref(),
+            Some(&["read".to_string(), "grep".to_string(), "find".to_string()][..])
+        );
+        assert_eq!(rev.model, None, "`sonnet` isn't a route: use the parent's model");
         let docs = d.iter().find(|d| d.name == "docs").unwrap();
         assert_eq!(
             docs.tools.as_deref(),

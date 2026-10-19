@@ -5,8 +5,39 @@
 //! (progressive disclosure). `/skill:name args` inlines one by hand. Templates
 //! are `/name args` shortcuts with bash-style argument placeholders.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+
+/// One loader rule for skills, templates and agents (L7.12): the same real file
+/// (a symlink, two folders pointing at one place) counts once, silently; a
+/// different file with a name already taken loses to the earlier folder, and is
+/// listed in `shadowed` for `novacode doctor` instead of a warning on every start.
+#[derive(Default)]
+pub struct Seen {
+    files: HashSet<PathBuf>,
+    names: BTreeMap<String, PathBuf>,
+    pub shadowed: Vec<String>,
+}
+
+impl Seen {
+    /// Whether `name` at `path` should load.
+    pub fn admit(&mut self, kind: &str, name: &str, path: &Path) -> bool {
+        let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if !self.files.insert(real.clone()) {
+            return false;
+        }
+        if let Some(first) = self.names.get(name) {
+            self.shadowed.push(format!(
+                "{kind} `{name}`: {} is shadowed by {}",
+                real.display(),
+                first.display()
+            ));
+            return false;
+        }
+        self.names.insert(name.to_string(), real);
+        true
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Skill {
@@ -57,11 +88,13 @@ pub fn frontmatter(text: &str) -> (BTreeMap<String, String>, &str) {
     (map, body)
 }
 
-/// Skills from `dirs`, earlier folders winning a name clash. Sorted by name, so
-/// the prompt renders the same every time. Returns warnings too.
-pub fn skills(dirs: &[PathBuf]) -> (Vec<Skill>, Vec<String>) {
+/// Skills from `dirs`, earlier folders winning a name clash ([`Seen`]). Sorted by
+/// name, so the prompt renders the same every time. Returns problems to show
+/// (a skill without a description) and the shadowed ones (for `doctor`).
+pub fn skills(dirs: &[PathBuf]) -> (Vec<Skill>, Vec<String>, Vec<String>) {
     let mut found: BTreeMap<String, Skill> = BTreeMap::new();
     let mut warn = Vec::new();
+    let mut seen = Seen::default();
     for dir in dirs {
         let mut files = Vec::new();
         scan(dir, true, &mut files);
@@ -83,12 +116,7 @@ pub fn skills(dirs: &[PathBuf]) -> (Vec<Skill>, Vec<String>) {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default()
             });
-            if let Some(old) = found.get(&name) {
-                warn.push(format!(
-                    "skill `{name}` in {} is shadowed by {}",
-                    path.display(),
-                    old.path.display()
-                ));
+            if !seen.admit("skill", &name, &path) {
                 continue;
             }
             found.insert(
@@ -102,7 +130,7 @@ pub fn skills(dirs: &[PathBuf]) -> (Vec<Skill>, Vec<String>) {
             );
         }
     }
-    (found.into_values().collect(), warn)
+    (found.into_values().collect(), warn, seen.shadowed)
 }
 
 /// pi's discovery: a folder with `SKILL.md` is one skill (no deeper); otherwise
@@ -161,12 +189,16 @@ fn xml(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// Templates from `dirs` (top-level `.md` files), earlier folders winning.
-pub fn templates(dirs: &[PathBuf]) -> Vec<Template> {
+/// Templates from `dirs` (top-level `.md` files), earlier folders winning ([`Seen`]).
+/// Returns the shadowed ones too (for `doctor`).
+pub fn templates(dirs: &[PathBuf]) -> (Vec<Template>, Vec<String>) {
     let mut found: BTreeMap<String, Template> = BTreeMap::new();
+    let mut seen = Seen::default();
     for dir in dirs {
         let Ok(rd) = std::fs::read_dir(dir) else { continue };
-        for p in rd.flatten().map(|e| e.path()) {
+        let mut files: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        files.sort();
+        for p in files {
             if p.extension().is_none_or(|e| e != "md") || !p.is_file() {
                 continue;
             }
@@ -174,7 +206,7 @@ pub fn templates(dirs: &[PathBuf]) -> Vec<Template> {
                 continue;
             };
             let name = p.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-            if found.contains_key(&name) {
+            if !seen.admit("prompt", &name, &p) {
                 continue;
             }
             let (fm, body) = frontmatter(&text);
@@ -197,7 +229,7 @@ pub fn templates(dirs: &[PathBuf]) -> Vec<Template> {
             );
         }
     }
-    found.into_values().collect()
+    (found.into_values().collect(), seen.shadowed)
 }
 
 /// Expand `/skill:name args` and `/template args`; anything else is returned as is.
@@ -378,11 +410,14 @@ mod tests {
         );
         w(b.join("alpha/SKILL.md"), "---\ndescription: shadowed\n---\n");
         w(b.join("nodesc/SKILL.md"), "---\nname: x\n---\n");
-        let (s, warn) = skills(&[a.clone(), b]);
+        // The same folder twice (a symlink): loaded once, nothing reported.
+        std::os::unix::fs::symlink(&a, d.path().join("link")).unwrap();
+        let (s, warn, shadowed) = skills(&[a.clone(), d.path().join("link"), b]);
         let names: Vec<&str> = s.iter().map(|k| k.name.as_str()).collect();
         assert_eq!(names, ["alpha", "loose", "secret", "zeta"]);
         assert_eq!(s[0].description, "first");
-        assert_eq!(warn.len(), 2, "{warn:?}");
+        assert_eq!(warn.len(), 1, "only the missing description: {warn:?}");
+        assert_eq!(shadowed.len(), 1, "the other alpha, for doctor: {shadowed:?}");
         let r = render_skills(&s);
         assert!(r.contains("<name>zeta</name>") && r.contains("last &lt;b&gt;"));
         assert!(!r.contains("secret"), "hidden skills aren't listed");

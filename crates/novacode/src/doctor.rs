@@ -70,7 +70,12 @@ pub fn auth_status(p: &Providers) -> ExitCode {
 
 /// Check every connected provider (a model-list call: free, but it proves the
 /// credential and the endpoint), plus settings and key-binding problems.
-pub async fn doctor(p: &Arc<Providers>, settings: &Settings, key_problems: Vec<String>) -> ExitCode {
+pub async fn doctor(
+    p: &Arc<Providers>,
+    settings: &Settings,
+    key_problems: Vec<String>,
+    shadowed: Vec<String>,
+) -> ExitCode {
     let mut failed = false;
     println!("providers");
     let connected: Vec<_> = p.profiles.values().filter(|pr| p.connected(pr)).collect();
@@ -126,6 +131,14 @@ pub async fn doctor(p: &Arc<Providers>, settings: &Settings, key_problems: Vec<S
     for k in key_problems {
         failed = true;
         println!("  ✗ {k}");
+    }
+    // Same name in two folders: the earlier one loads (L7.12). Not a failure.
+    println!("skills, prompts, agents");
+    if shadowed.is_empty() {
+        println!("  ✓ nothing shadowed");
+    }
+    for s in shadowed {
+        println!("  · {s}");
     }
     if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }

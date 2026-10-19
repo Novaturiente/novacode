@@ -5,6 +5,12 @@
 /// (key, type, default, what it does). `<name>` matches one path segment.
 pub const KEYS: &[(&str, &str, &str, &str)] = &[
     (
+        "compat.claude",
+        "bool",
+        "true",
+        "Also load skills, agents and commands from `~/.claude` and a trusted project's `.claude`. novacode's own folders win a name.",
+    ),
+    (
         "model",
         "string",
         "picked at first run",
@@ -381,6 +387,8 @@ pub fn render() -> String {
          | Key | Type | Default | What it does |\n|---|---|---|---|\n",
     );
     for (k, t, d, w) in KEYS {
+        // A bare `|` in a cell would split the table row.
+        let (d, w) = (d.replace('|', "\\|"), w.replace('|', "\\|"));
         s.push_str(&format!("| `{k}` | {t} | {d} | {w} |\n"));
     }
     s

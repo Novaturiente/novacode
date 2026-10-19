@@ -537,7 +537,7 @@ mod tests {
     #[test]
     fn docs_cover_the_api() {
         let doc = include_str!("../../../docs/extensions.md");
-        let api = &PRELUDE[PRELUDE.find("const api = Object.freeze({").unwrap()..];
+        let api = PRELUDE.split_once("const api = Object.freeze({").unwrap().1;
         let mut names = Vec::new();
         for l in api.lines() {
             let t = l.trim_start();

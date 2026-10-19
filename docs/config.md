@@ -6,6 +6,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
+| `compat.claude` | bool | true | Also load skills, agents and commands from `~/.claude` and a trusted project's `.claude`. novacode's own folders win a name. |
 | `model` | string | picked at first run | Default `provider/model[:level]`, e.g. `claude/claude-opus-5-5:medium`. |
 | `thinking` | string | `medium` | Default thinking level: off, minimal, low, medium, high, xhigh, max. |
 | `maxTokens` | number | 16384 | Output cap per reply, clamped to the model's limit. |
@@ -14,7 +15,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `cache.warm` | bool | false | Keep the prompt cache alive with 1-token replays while it pays off (L2.17). |
 | `providers` | object | {} | Per-provider overrides: `providers.<id>.apiKey`, `baseUrl`, headers, compat flags. |
 | `models` | object | {} | Per-model catalog overrides: `models.<provider>/<id>.contextWindow`, costs, … |
-| `permissions` | object | auto mode | Global only. `mode` auto|ask|read-only, `allow`/`ask`/`deny` rules like `Bash(git push:*)`, `protected`, `profiles`. |
+| `permissions` | object | auto mode | Global only. `mode` auto\|ask\|read-only, `allow`/`ask`/`deny` rules like `Bash(git push:*)`, `protected`, `profiles`. |
 | `tools.<name>.exposure` | string | per tool | listed, codemode, deferred or hidden: how a tool reaches the model. |
 | `hooks` | object | {} | Command hooks: `beforeTool`, `afterTool`, `events.<type>`, `timeoutMs` (L7.1). |
 | `hooks.onActivity` | string | unset | Shell command run on working/blocked/idle changes, State JSON on stdin. |

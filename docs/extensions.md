@@ -10,6 +10,21 @@ novacode runs extensions in three forms. All of them reach files and commands th
 
 Packages (`novacode install <git-url|path>`) bundle `extensions/`, `skills/` and `prompts/` folders.
 
+## Skills, agents and commands from other tools
+
+Skills (`SKILL.md`), agent files and prompt templates load from these folders. The first folder that has a name wins:
+
+1. the project's `.novacode/` (trusted folders only, except `prompts/`, which is plain text);
+2. the project's `.claude/` (trusted folders only);
+3. `~/.novacode/`;
+4. `~/.claude/`;
+5. `~/.agents/skills` (skills only);
+6. installed packages.
+
+Under `.claude/`, templates are read from `commands/`, as in Claude Code. In agent files, Claude Code's tool names (`Read`, `Glob`, `Task`, …) are mapped to novacode's, and `model: sonnet` or `inherit` uses the parent's model. Set `compat.claude: false` to skip the `.claude` folders.
+
+Nothing loads twice. The same file reached through two folders or a symlink counts once. A different file with a name that's already taken is skipped, and `novacode doctor` lists it. Claude Code hooks, MCP servers and permissions are not read from `.claude/settings.json`; `novacode import claude` copies them once, after showing you the changes.
+
 `/reload` loads changes. An extension that hangs, runs out of memory or throws 3 times in a row is disabled with a notice until the next `/reload`.
 
 ## A script extension
