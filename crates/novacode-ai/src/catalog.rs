@@ -33,6 +33,9 @@ pub enum Api {
     /// GitHub Copilot: picks one of the three wires per model.
     #[serde(rename = "copilot")]
     Copilot,
+    /// A program on stdio (L7.6, `process.rs`): `command`, `args`, `env` in the profile.
+    #[serde(rename = "process")]
+    Process,
 }
 
 /// A provider profile: mostly data (L2.1). Bundled ones can be changed and new

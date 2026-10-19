@@ -62,3 +62,7 @@ command: "string"
 {"method": "event", "params": ["event", "payload"], "payload": ["args", "cwd", "tool"]}
 {"method": "initialize", "params": ["apiVersion", "cwd", "session"], "payload": "NoneType"}
 {"method": "tool", "params": ["args", "cwd", "name", "session"], "payload": ["a"]}
+
+## provider programs: requests sent (method, params keys)
+{"method": "initialize", "params": ["apiVersion", "provider"]}
+{"method": "stream", "params": ["maxTokens", "messages", "model", "session", "thinking", "tools"]}

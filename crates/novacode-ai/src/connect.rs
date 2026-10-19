@@ -100,6 +100,9 @@ impl Providers {
 
     /// Has a login, a configured key, a key in the env, or needs none.
     pub fn connected(&self, p: &Profile) -> bool {
+        if p.api == Api::Process {
+            return true;
+        }
         if p.oauth() {
             return self.auth.has(&p.id);
         }
@@ -155,6 +158,12 @@ impl Providers {
         trace: Option<Trace>,
     ) -> Result<(Arc<dyn Adapter>, Option<String>), ConnectError> {
         let p = self.profile(provider)?;
+        if p.api == Api::Process {
+            let raw = Value::Object(p.extra.clone().into_iter().collect());
+            let c = serde_json::from_value(raw)
+                .map_err(|e| setup(format!("providers.{}: a process provider needs `command`: {e}", p.id)))?;
+            return Ok((Arc::new(crate::process::Process::new(&p.id, c)), None));
+        }
         let key = if p.oauth() { None } else { self.key(p)? };
         let adapter: Arc<dyn Adapter> = match p.api {
             Api::Anthropic => {
@@ -244,6 +253,7 @@ impl Providers {
                 let token = self.auth.access_token(&p.id, account).await?;
                 Arc::new(crate::copilot::Copilot::new(token, trace))
             }
+            Api::Process => unreachable!("handled above"),
         };
         Ok((adapter, key))
     }

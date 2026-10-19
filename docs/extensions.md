@@ -86,3 +86,24 @@ Handlers fail open: an error or a timeout (10 s) leaves things as they were.
 ## Process extensions
 
 A long-running program that reads and writes line-delimited JSON-RPC 2.0 on stdio. novacode sends `initialize {apiVersion, cwd, session}` and expects `{tools, commands, events}` back within 10 s. After that it sends `tool`, `command` and `event` requests with the same payloads as above. The extension may send the notifications `notify {text}`, `log {text}`, `remind {text, wake}` and `ui {op, …}`. The `ui` ops are `status`, `widget`, `footer`, `header`, `editor`, `open_tab`, `show_tab`, `close_tab`, `source`, `publish`, `unpublish`, `region` and `shortcut`, with the fields listed in `api-v1.snap`. `session.messages`, `complete` and `spawnAgent` are script-only for now. stderr goes to `~/.novacode/logs/ext-<name>.log`.
+
+## Custom providers
+
+A provider that novacode doesn't know can be any program that speaks line-delimited JSON-RPC 2.0 on stdio. Add it to settings:
+
+```jsonc
+"providers": {
+  "mine": { "api": "process", "command": "python3", "args": ["/path/to/provider.py"], "env": {} }
+}
+```
+
+Then pick `mine/<model>` like any other model. The program is started on the first call and serves the whole session. It needs no key; it handles its own credentials.
+
+| Direction | Message | Shape |
+|---|---|---|
+| novacode → program | `initialize` (request) | `{apiVersion, provider}` → `{models?: [id]}` (the list shown for `/model`) |
+| novacode → program | `stream` (request) | `{model, messages, tools, maxTokens, thinking, session}` → `{stop: stop\|tool_use\|length}`, or a JSON-RPC error `{message, data?: {kind}}` where `kind` is `rate_limit`, `overflow`, `auth`, `transient`, … (retries follow the kind) |
+| program → novacode | `event` (notification) | `{id, event}` with `event` one of `{type: "text", delta}`, `{type: "thinking", delta}`, `{type: "tool_call", id, name, arguments}`, `{type: "usage", input, output, cacheRead?, cacheWrite?}` |
+| novacode → program | `cancel` (notification) | `{id}`: the user stopped the call |
+
+`messages` and `tools` are novacode's own JSON, the same as `session.messages()`. stderr goes to novacode's stderr. Project settings only apply in trusted folders, so a repo can't start a provider program on its own.

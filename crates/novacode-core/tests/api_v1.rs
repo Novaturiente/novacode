@@ -220,6 +220,9 @@ async fn api_v1_surface() {
         out += &format!("{l}\n");
     }
 
+    out += "\n## provider programs: requests sent (method, params keys)\n";
+    out += &provider_requests(d.path()).await;
+
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/api-v1.snap");
     if std::env::var_os("UPDATE_SNAPSHOTS").is_some() || !path.exists() {
         std::fs::write(&path, &out).unwrap();
@@ -347,4 +350,42 @@ async fn session_complete_and_spawn() {
     assert_eq!(args["task"], "review it");
     assert_eq!(args["notify"], "quiet");
     assert_eq!(args["title"], "[ext:e] review it", "tagged with the extension's name");
+}
+
+/// A provider program (L7.6) that logs what it is sent and answers with one text event.
+const PROVIDER: &str = r#"
+import json, sys
+log = open(sys.argv[1], "a")
+for line in sys.stdin:
+    m = json.loads(line)
+    log.write(json.dumps({"method": m["method"], "params": sorted(m.get("params", {}))}) + "\n"); log.flush()
+    if "id" not in m: continue
+    if m["method"] == "stream":
+        print(json.dumps({"jsonrpc": "2.0", "method": "event", "params": {"id": m["id"], "event": {"type": "text", "delta": "ok"}}}), flush=True)
+    print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": {"models": []} if m["method"] == "initialize" else {"stop": "stop"}}), flush=True)
+"#;
+
+async fn provider_requests(dir: &std::path::Path) -> String {
+    use novacode_ai::adapter::{Adapter, CacheRetention, Request, collect};
+    let f = dir.join("prov.py");
+    let log = dir.join("prov.log");
+    std::fs::write(&f, PROVIDER).unwrap();
+    let p = novacode_ai::process::Process::new(
+        "mine",
+        serde_json::from_value(json!({"command": "python3", "args": [f, log]})).unwrap(),
+    );
+    let req = Request {
+        model: "m".into(),
+        messages: vec![novacode_types::Message::user("hi")],
+        tools: vec![],
+        max_tokens: 10,
+        cache: CacheRetention::Short,
+        thinking: None,
+        images: false,
+        session: None,
+        tail: vec![],
+    };
+    let m = collect(p.stream(req, Default::default())).await;
+    assert_eq!(m.text(), "ok");
+    std::fs::read_to_string(&log).unwrap()
 }
