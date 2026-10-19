@@ -78,6 +78,12 @@ struct Cli {
     /// Run as this subagent definition (L10.1): its tools, role prompt and model.
     #[arg(long, hide = true)]
     agent: Option<String>,
+    /// A subagent's tools, comma-separated (set by its parent; default: its definition's).
+    #[arg(long, hide = true)]
+    tools: Option<String>,
+    /// A subagent's MCP servers, comma-separated (default: its definition's, else none).
+    #[arg(long, hide = true)]
+    mcp: Option<String>,
     /// Trust this folder's project config for this run only (L6.3).
     #[arg(long)]
     trust: bool,
@@ -866,6 +872,13 @@ impl Ctx {
         self.resource_dirs("skills", "skills")
     }
 
+    /// Agent definitions with the user's `agents.<name>` settings applied.
+    fn agent_defs(&self) -> Vec<agents::Def> {
+        let mut d = agents::defs(&self.resource_dirs("agents", "agents")).0;
+        agents::configure(&mut d, |name| self.settings.get(&format!("agents.{name}")));
+        d
+    }
+
     fn template_dirs(&self) -> Vec<std::path::PathBuf> {
         self.resource_dirs("prompts", "commands")
     }
@@ -978,20 +991,28 @@ impl Ctx {
         if let Some(p) = &self.cli.profile {
             policy = policy.with_profile(p).map_err(anyhow::Error::msg)?;
         }
-        // A subagent: its definition's tools and role prompt (L10.1).
+        // A subagent: its role prompt, and only its tools and MCP servers (L10.1).
+        let defs = self.agent_defs();
         let def = match &self.cli.agent {
             Some(name) => Some(
-                agents::defs(&self.resource_dirs("agents", "agents"))
-                    .0
-                    .into_iter()
+                defs.iter()
                     .find(|d| &d.name == name)
+                    .cloned()
                     .with_context(|| format!("no agent definition `{name}`"))?,
             ),
             None => None,
         };
-        if let Some(t) = def.as_ref().and_then(|d| d.tools.clone()) {
-            policy = policy.with_tools(t);
-        }
+        let csv = |s: &String| -> Vec<String> {
+            s.split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(String::from)
+                .collect()
+        };
+        let allowed: Option<Vec<String>> = self.cli.tools.as_ref().map(csv).or_else(|| def.as_ref()?.tools.clone());
+        let granted: Option<Vec<String>> = def
+            .as_ref()
+            .map(|d| self.cli.mcp.as_ref().map_or_else(|| d.mcp.clone(), csv));
         let (window_tokens, max_tokens) = models::Limits::new(s).of(&route);
         // Cross-session memory (L10.4); `memory.store: false` turns it off.
         let memories = s
@@ -1076,6 +1097,13 @@ impl Ctx {
             sched.run(slot.clone());
             all.push(Arc::new(schedule::ScheduleTool(sched)));
         }
+        // MCP servers (L5.12): a subagent starts only the ones granted to it (L10.1).
+        let (mut servers, mcp_warnings) = novacode_core::mcp::load(self.paths.home(), &self.cwd, self.trusted);
+        if let Some(g) = &granted {
+            servers.retain(|c| g.contains(&c.name));
+        }
+        let server_names: Vec<String> = servers.iter().map(|c| c.name.clone()).collect();
+        let mut supervisor = None;
         if let Some(slot) = slot
             && place.depth < agents::MAX_DEPTH
         {
@@ -1091,7 +1119,9 @@ impl Ctx {
                 home: self.paths.home().to_path_buf(),
                 cwd: self.cwd.clone(),
                 trusted: self.trusted,
-                agent_dirs: self.resource_dirs("agents", "agents"),
+                defs: defs.clone(),
+                parent_picks: s.get("agents.parentPicksTools").unwrap_or(true),
+                servers: server_names.clone(),
                 stall_min: s.get("agents.stallMinutes").unwrap_or(10),
                 timeout_min: s.get("agents.timeoutMinutes").unwrap_or(45),
                 small_model: small,
@@ -1110,6 +1140,7 @@ impl Ctx {
             );
             all.push(Arc::new(goals::GoalTool(g.clone())));
             *self.goals.lock().unwrap() = Some(g);
+            supervisor = Some(sup.clone());
             all.push(Arc::new(agents::AgentTool::new(sup)));
         }
         // Mode presets and plan mode (L10.7).
@@ -1168,7 +1199,6 @@ impl Ctx {
             exts.set_asker(a.clone());
         }
         all.extend(exts.tools());
-        let (servers, mcp_warnings) = novacode_core::mcp::load(self.paths.home(), &self.cwd, self.trusted);
         let described: Vec<(String, String)> = servers
             .iter()
             .filter(|s| s.config.exposure != Some(novacode_tools::Exposure::Hidden))
@@ -1182,11 +1212,28 @@ impl Ctx {
         if let Some(h) = &mcp {
             all.extend(h.tools());
         }
+        let is_mcp = |n: &str| {
+            server_names
+                .iter()
+                .any(|s| n.strip_prefix(s.as_str()).is_some_and(|r| r.starts_with("__")))
+        };
+        // A subagent is built with only its tools (L10.1), so scripts and `call` can't reach others.
+        if let Some(allow) = &allowed {
+            all.retain(|t| allow.iter().any(|a| a == t.name()) || is_mcp(t.name()));
+        }
         let novacode_tools::Exposed {
             listed: mut tools,
             deferred,
             scripted,
         } = novacode_tools::exposed(all, |name| self.settings.get(&format!("tools.{name}.exposure")));
+        if let Some(sup) = &supervisor {
+            let own = tools
+                .iter()
+                .chain(&deferred)
+                .chain(&scripted)
+                .map(|t| t.name().to_string());
+            sup.set_own_tools(own.filter(|n| !is_mcp(n)).collect());
+        }
         // Deferred tools (L5.17): found by tool_search, run in-line once announced or through `call`.
         if !deferred.is_empty() {
             let defs = deferred

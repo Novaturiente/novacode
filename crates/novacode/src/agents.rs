@@ -67,8 +67,10 @@ impl Place {
 pub struct Def {
     pub name: String,
     pub description: String,
-    /// Only these tools may run (the rest are refused, not hidden: siblings share a prefix).
+    /// Its default tools; None: all of the parent's. The child is built with only these.
     pub tools: Option<Vec<String>>,
+    /// MCP servers it gets by default (`agents.<name>.mcp`); none otherwise.
+    pub mcp: Vec<String>,
     /// `provider/model`, or `small` for the provider's small model.
     pub model: Option<String>,
     pub thinking: Option<String>,
@@ -82,6 +84,7 @@ fn builtins() -> Vec<Def> {
         name: name.into(),
         description: description.into(),
         tools: tools.map(|t| t.iter().map(|s| s.to_string()).collect()),
+        mcp: Vec::new(),
         model: model.map(str::to_string),
         thinking: None,
         prompt: prompt.into(),
@@ -160,6 +163,7 @@ pub fn defs(dirs: &[PathBuf]) -> (Vec<Def>, Vec<String>) {
                     name,
                     description: fm.get("description").cloned().unwrap_or_default(),
                     tools,
+                    mcp: Vec::new(),
                     model,
                     thinking: fm.get("thinking").cloned(),
                     prompt: body.trim().to_string(),
@@ -175,6 +179,91 @@ pub fn defs(dirs: &[PathBuf]) -> (Vec<Def>, Vec<String>) {
         all.entry(d.name.clone()).or_insert(d);
     }
     (all.into_values().collect(), seen.shadowed)
+}
+
+/// The user's per-type settings (`agents.<name>`).
+#[derive(Debug, Default, Deserialize)]
+pub struct AgentCfg {
+    pub tools: Option<Vec<String>>,
+    pub mcp: Option<Vec<String>>,
+}
+
+/// Apply `agents.<name>` settings: they replace a definition's tools and MCP servers.
+pub fn configure(defs: &mut [Def], cfg: impl Fn(&str) -> Option<AgentCfg>) {
+    for d in defs {
+        let Some(c) = cfg(&d.name) else { continue };
+        if let Some(t) = c.tools {
+            d.tools = Some(t.iter().map(|s| crate::import::nova_tool(s.trim())).collect());
+        }
+        if let Some(m) = c.mcp {
+            d.mcp = m;
+        }
+    }
+}
+
+/// What a child gets (L10.1): the parent's pick when the user allows it, else its
+/// type's defaults; never a tool the parent lacks (`own`; None: not known). MCP
+/// servers only when granted. Returns (tools, servers, notes for the parent).
+pub fn grant(
+    def: &Def,
+    pick_tools: Option<Vec<String>>,
+    pick_mcp: Option<Vec<String>>,
+    parent_picks: bool,
+    own: Option<&[String]>,
+    servers: &[String],
+) -> (Option<Vec<String>>, Vec<String>, Vec<String>) {
+    let mut notes = Vec::new();
+    let (pick_tools, pick_mcp) = if parent_picks {
+        (pick_tools, pick_mcp)
+    } else {
+        if pick_tools.is_some() || pick_mcp.is_some() {
+            notes.push("`tools`/`mcp` ignored: the user sets subagent tools (agents.parentPicksTools is off)".into());
+        }
+        (None, None)
+    };
+    let picked = pick_tools.is_some();
+    let pick_tools = pick_tools.map(|t| t.iter().map(|s| crate::import::nova_tool(s.trim())).collect());
+    let mut tools = pick_tools
+        .or_else(|| def.tools.clone())
+        .or_else(|| own.map(<[String]>::to_vec));
+    if let (Some(t), Some(own)) = (tools.as_mut(), own) {
+        let (keep, lack): (Vec<String>, Vec<String>) = std::mem::take(t).into_iter().partition(|n| own.contains(n));
+        if picked && !lack.is_empty() {
+            let hint = if lack.iter().any(|n| n.contains("__")) {
+                " (MCP tools come with `mcp: [server]`)"
+            } else {
+                ""
+            };
+            notes.push(format!("not given, you don't have them: {}{hint}", lack.join(", ")));
+        }
+        *t = keep;
+    }
+    let granted = pick_mcp.is_some();
+    let (mcp, unknown): (Vec<String>, Vec<String>) = pick_mcp
+        .unwrap_or_else(|| def.mcp.clone())
+        .into_iter()
+        .partition(|s| servers.contains(s));
+    if granted && !unknown.is_empty() {
+        notes.push(format!(
+            "no MCP server {}; configured: {}",
+            unknown.join(", "),
+            if servers.is_empty() {
+                "none".into()
+            } else {
+                servers.join(", ")
+            }
+        ));
+    }
+    // MCP tools run through codemode unless configured as listed.
+    if !mcp.is_empty()
+        && let Some(t) = tools.as_mut()
+        && !t.iter().any(|n| n == "codemode")
+        && own.is_none_or(|o| o.iter().any(|n| n == "codemode"))
+    {
+        t.push("codemode".into());
+        notes.push("added codemode: MCP tools run through it".into());
+    }
+    (tools, mcp, notes)
 }
 
 // ---------------------------------------------------------------------------
@@ -347,6 +436,9 @@ struct Child {
     model: String,
     task: String,
     cwd: PathBuf,
+    /// Its tools and MCP servers (kept for resumes); None: all of its process's.
+    tools: Option<Vec<String>>,
+    mcp: Vec<String>,
     notify: Notify_,
     after: Vec<String>,
     status: Status,
@@ -381,6 +473,12 @@ pub struct Supervisor {
     stall: Duration,
     timeout: Duration,
     defs: Vec<Def>,
+    /// The model may pick a child's tools and MCP servers (`agents.parentPicksTools`).
+    parent_picks: bool,
+    /// MCP servers this session may hand on.
+    servers: Vec<String>,
+    /// This session's own tool names (MCP ones aside): a child never gets more.
+    own: std::sync::OnceLock<Vec<String>>,
     small_model: Option<String>,
     waiting: Mutex<usize>,
     /// Nerd Font glyphs in the panel rows (`ui.icons`).
@@ -395,8 +493,10 @@ pub struct Setup {
     pub home: PathBuf,
     pub cwd: PathBuf,
     pub trusted: bool,
-    /// Agent-file folders, first wins (L7.12).
-    pub agent_dirs: Vec<PathBuf>,
+    /// Agent definitions, settings applied (`defs` + `configure`).
+    pub defs: Vec<Def>,
+    pub parent_picks: bool,
+    pub servers: Vec<String>,
     pub stall_min: u64,
     pub timeout_min: u64,
     pub small_model: Option<String>,
@@ -414,7 +514,10 @@ impl Supervisor {
             slot: s.slot,
             place: Place::from_env(),
             me: s.me,
-            defs: defs(&s.agent_dirs).0,
+            defs: s.defs,
+            parent_picks: s.parent_picks,
+            servers: s.servers,
+            own: std::sync::OnceLock::new(),
             home: s.home,
             cwd: s.cwd,
             trusted: s.trusted,
@@ -450,6 +553,11 @@ impl Supervisor {
             }
         });
         sup
+    }
+
+    /// This session's tool names, once its tool list is built (children get no more).
+    pub fn set_own_tools(&self, names: Vec<String>) {
+        let _ = self.own.set(names);
     }
 
     fn handle(&self) -> Option<novacode_core::agent::SessionHandle> {
@@ -525,16 +633,20 @@ impl Supervisor {
 
     /// Run the `auditor` agent on `task` and return its whole report (the goal tool).
     pub async fn audit(self: &Arc<Self>, task: String, title: String, model: Option<String>) -> Result<String, String> {
-        let id = self.spawn(SpawnArgs {
-            task,
-            title: Some(title),
-            agent: Some("auditor".into()),
-            model,
-            cwd: None,
-            after: Vec::new(),
-            notify: Notify_::Quiet,
-            worktree: false,
-        })?;
+        let id = self
+            .spawn(SpawnArgs {
+                task,
+                title: Some(title),
+                agent: Some("auditor".into()),
+                model,
+                cwd: None,
+                after: Vec::new(),
+                notify: Notify_::Quiet,
+                worktree: false,
+                tools: None,
+                mcp: None,
+            })?
+            .0;
         self.wait(vec![id.clone()], false, self.timeout).await;
         let g = self.children.lock().unwrap();
         let c = g.iter().find(|c| c.n == id).ok_or("the auditor vanished")?;
@@ -544,7 +656,8 @@ impl Supervisor {
         }
     }
 
-    fn spawn(self: &Arc<Self>, a: SpawnArgs) -> Result<String, String> {
+    /// Start (or queue) a child; returns its id and notes about its tools.
+    fn spawn(self: &Arc<Self>, a: SpawnArgs) -> Result<(String, Vec<String>), String> {
         if self.place.depth >= MAX_DEPTH {
             return Err(format!("subagents can't spawn below depth {MAX_DEPTH}"));
         }
@@ -564,6 +677,14 @@ impl Supervisor {
         {
             model = format!("{model}:{t}");
         }
+        let (tools, mcp, notes) = grant(
+            def,
+            a.tools,
+            a.mcp,
+            self.parent_picks,
+            self.own.get().map(Vec::as_slice),
+            &self.servers,
+        );
         let mut cwd = match &a.cwd {
             Some(c) => at(&self.cwd, c),
             None => self.cwd.clone(),
@@ -588,6 +709,8 @@ impl Supervisor {
             model,
             task: a.task,
             cwd,
+            tools,
+            mcp,
             notify: a.notify,
             after: a.after,
             status: Status::Queued,
@@ -607,7 +730,7 @@ impl Supervisor {
         });
         drop(g);
         self.start_ready();
-        Ok(n)
+        Ok((n, notes))
     }
 
     /// Start every queued child whose `after` agents are all done.
@@ -661,7 +784,7 @@ impl Supervisor {
 
     /// Run child `n` until it settles: start it (or resume `session`), send `prompt`.
     async fn run(self: Arc<Self>, n: String, prompt: Option<String>, session: Option<String>) {
-        let Some((model, agent, cwd, title)) = self.with(&n, |c| {
+        let Some((model, agent, cwd, title, tools, mcp)) = self.with(&n, |c| {
             c.status = Status::Starting;
             c.started = Some(Instant::now());
             c.started_ms = novacode_core::session::now_ms();
@@ -669,12 +792,23 @@ impl Supervisor {
             c.report = None;
             c.delivered = false;
             c.last_activity = Instant::now();
-            (c.model.clone(), c.agent.clone(), c.cwd.clone(), c.title.clone())
+            (
+                c.model.clone(),
+                c.agent.clone(),
+                c.cwd.clone(),
+                c.title.clone(),
+                c.tools.clone(),
+                c.mcp.clone(),
+            )
         }) else {
             return;
         };
         let mut cmd = tokio::process::Command::new(&self.exe);
         cmd.arg("--rpc").args(["-m", &model]).args(["--agent", &agent]);
+        if let Some(t) = &tools {
+            cmd.arg(format!("--tools={}", t.join(",")));
+        }
+        cmd.arg(format!("--mcp={}", mcp.join(",")));
         if self.trusted {
             cmd.arg("--trust");
         }
@@ -1098,6 +1232,8 @@ struct SpawnArgs {
     notify: Notify_,
     #[serde(default)]
     worktree: bool,
+    tools: Option<Vec<String>>,
+    mcp: Option<Vec<String>>,
 }
 
 pub struct AgentTool {
@@ -1110,17 +1246,46 @@ impl AgentTool {
         let agents: Vec<String> = sup
             .defs
             .iter()
-            .map(|d| format!("- {}: {}", d.name, d.description))
+            .map(|d| {
+                let mut kit = d.tools.as_ref().map_or("all your tools".into(), |t| t.join(", "));
+                if !d.mcp.is_empty() {
+                    kit += &format!("; mcp: {}", d.mcp.join(", "));
+                }
+                format!("- {} [{kit}]: {}", d.name, d.description)
+            })
             .collect();
+        let (pick, tools) = if sup.parent_picks {
+            let mcp = if sup.servers.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " MCP servers are off unless you grant them with `mcp` (it calls them through codemode; \
+                     say in the task which server tool to use first): {}.",
+                    sup.servers.join(", ")
+                )
+            };
+            (
+                ", tools?: [names], mcp?: [servers]",
+                format!(
+                    "A subagent sees only its tools: its type's (in brackets below), or `tools` picked from \
+                     your own. Give what the task needs (one that must build or test needs bash).{mcp}"
+                ),
+            )
+        } else {
+            (
+                "",
+                "A subagent sees only its type's tools (in brackets below).".to_string(),
+            )
+        };
         AgentTool {
             description: format!(
                 "Run subagents: separate novacode sessions that work in the background and report back.\n\
-                 Actions: spawn {{task, title?, agent?, model?, cwd?, after?: [ids], notify?: wake|next|quiet, worktree?}} → id; \
+                 Actions: spawn {{task, title?, agent?, model?, cwd?, after?: [ids], notify?: wake|next|quiet, worktree?{pick}}} → id; \
                  list; status {{id}}; log {{id, limit?}}; read {{id, offset?, limit?}} (full report); \
                  send {{id, message}} (steers a running agent, resumes a finished one); \
                  wait {{ids?, any?, timeout?}} (blocks until reports arrive, default all, 600 s); stop {{id}}.\n\
                  Reports arrive by themselves (notify wake starts a turn); don't poll. \
-                 Two agents never edit the same file: the second is refused.\nAgents:\n{}",
+                 Two agents never edit the same file: the second is refused.\n{tools}\nAgents:\n{}",
                 agents.join("\n")
             ),
             sup,
@@ -1150,6 +1315,8 @@ impl Tool for AgentTool {
                 "after": {"type": "array", "items": {"type": "string"}, "description": "spawn: start when these agents are done."},
                 "notify": {"type": "string", "enum": ["wake", "next", "quiet"]},
                 "worktree": {"type": "boolean", "description": "spawn: work in a new git worktree (.worktrees/); you merge its branch."},
+                "tools": {"type": "array", "items": {"type": "string"}, "description": "spawn: its tools, from yours (default: its type's)."},
+                "mcp": {"type": "array", "items": {"type": "string"}, "description": "spawn: MCP servers it may use (default: none)."},
                 "message": {"type": "string"},
                 "any": {"type": "boolean"},
                 "timeout": {"type": "number", "description": "wait: seconds (default 600)."},
@@ -1178,9 +1345,14 @@ impl Tool for AgentTool {
             match args["action"].as_str().unwrap_or_default() {
                 "spawn" => match serde_json::from_value::<SpawnArgs>(args.clone()) {
                     Ok(a) => match s.spawn(a) {
-                        Ok(n) => ToolOutput {
+                        Ok((n, notes)) => ToolOutput {
                             details: Some(serde_json::json!({ "id": n })),
-                            ..ToolOutput::text(format!("started {n}; its report arrives when it's done"))
+                            ..ToolOutput::text(
+                                std::iter::once(format!("started {n}; its report arrives when it's done"))
+                                    .chain(notes)
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                            )
                         },
                         Err(e) => ToolOutput::error(e),
                     },
@@ -1329,7 +1501,9 @@ mod tests {
             home: tmp.clone(),
             cwd: tmp.clone(),
             trusted: false,
-            agent_dirs: vec![],
+            defs: defs(&[]).0,
+            parent_picks: true,
+            servers: vec![],
             stall_min: 10,
             timeout_min: 45,
             small_model: None,
@@ -1339,6 +1513,7 @@ mod tests {
         let spawn = |task: &str, after: &[&str]| {
             sup.spawn(serde_json::from_value(json!({"task": task, "after": after, "model": "p/m"})).unwrap())
                 .unwrap()
+                .0
         };
         // Three quick spawns: each starts exactly once; c waits for a.
         let (a, b) = (spawn("task A", &[]), spawn("task B", &[]));
@@ -1370,6 +1545,50 @@ mod tests {
         let out = sup.wait(vec![a.clone()], false, Duration::from_secs(20)).await;
         assert!(out.contains(":: again"), "{out}");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn child_tools_from_defaults_settings_and_picks() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let mut d = defs(&[]).0;
+        configure(&mut d, |n| {
+            (n == "reviewer").then(|| AgentCfg {
+                tools: Some(s(&["Read", "bash"])),
+                mcp: Some(s(&["codegraph"])),
+            })
+        });
+        let by = |n: &str| d.iter().find(|x| x.name == n).unwrap().clone();
+        let own = s(&["read", "grep", "bash", "edit", "codemode", "web_fetch"]);
+        let servers = s(&["codegraph", "context7"]);
+        let g = |def: &Def, t: Option<&[&str]>, m: Option<&[&str]>, picks: bool| {
+            grant(def, t.map(s), m.map(s), picks, Some(&own), &servers)
+        };
+        // Type defaults, bounded by the parent's own tools (scout's find/ls/todo aren't there).
+        let (t, m, notes) = g(&by("scout"), None, None, true);
+        assert_eq!((t, m, notes.len()), (Some(s(&["read", "grep"])), vec![], 0));
+        // No list: everything the parent has.
+        assert_eq!(g(&by("worker"), None, None, true).0, Some(own.clone()));
+        // Settings replace the defaults (Claude names mapped) and grant MCP, which adds codemode.
+        let (t, m, notes) = g(&by("reviewer"), None, None, true);
+        assert_eq!(t, Some(s(&["read", "bash", "codemode"])));
+        assert_eq!((m, notes.len()), (s(&["codegraph"]), 1));
+        // The parent widens beyond the type, never beyond itself; unknown names are noted.
+        let (t, m, notes) = g(
+            &by("scout"),
+            Some(&["read", "edit", "write", "x__y"]),
+            Some(&["nope"]),
+            true,
+        );
+        assert_eq!((t, m), (Some(s(&["read", "edit"])), vec![]));
+        assert!(
+            notes[0].contains("write, x__y") && notes[0].contains("mcp"),
+            "{notes:?}"
+        );
+        assert!(notes[1].contains("no MCP server nope"), "{notes:?}");
+        // The user turned picking off: defaults, and the parent is told why.
+        let (t, _, notes) = g(&by("scout"), Some(&["edit"]), None, false);
+        assert_eq!(t, Some(s(&["read", "grep"])));
+        assert!(notes[0].contains("parentPicksTools"), "{notes:?}");
     }
 
     #[test]

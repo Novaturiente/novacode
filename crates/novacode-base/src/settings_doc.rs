@@ -180,6 +180,24 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "A subagent running this long is stopped.",
     ),
     (
+        "agents.parentPicksTools",
+        "bool",
+        "true",
+        "The model may pick a subagent's tools (`tools`) and MCP servers (`mcp`) when it spawns one, from its own. Off: only the type's tools.",
+    ),
+    (
+        "agents.<name>.tools",
+        "list",
+        "the agent file's",
+        "Default tools of subagent type `<name>` (built-ins too); a subagent sees only its tools.",
+    ),
+    (
+        "agents.<name>.mcp",
+        "list",
+        "[]",
+        "MCP servers subagent type `<name>` gets by default (subagents start none otherwise).",
+    ),
+    (
         "goal.audit",
         "bool",
         "true",
@@ -326,6 +344,7 @@ fn walk(v: &serde_json::Value, path: &str, out: &mut Vec<String>) {
             "string" => v.is_string(),
             "number" => v.is_number(),
             "bool" => v.is_boolean(),
+            "list" => v.is_array(),
             _ => v.is_object(),
         };
         if !ok {
@@ -428,5 +447,11 @@ mod tests {
         );
         assert_eq!(p.len(), 7, "{p:?}");
         assert!(check(&serde_json::json!({"model": "claude/x", "ui": {"turnCollapse": false}})).is_empty());
+        let agents = serde_json::json!({"agents": {"stallMinutes": 5, "parentPicksTools": false,
+            "scout": {"tools": ["read"], "mcp": "codegraph"}}});
+        assert_eq!(
+            check(&agents),
+            vec!["`agents.scout.mcp`: expected a list, got \"codegraph\"; using the default"]
+        );
     }
 }
