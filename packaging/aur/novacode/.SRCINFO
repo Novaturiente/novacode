@@ -1,0 +1,18 @@
+pkgbase = novacode
+	pkgdesc = A lightweight, fast, extensible coding agent harness
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/OWNER/novacode
+	arch = x86_64
+	arch = aarch64
+	license = MIT OR Apache-2.0
+	makedepends = cargo
+	makedepends = git
+	depends = gcc-libs
+	depends = glibc
+	optdepends = git: packages and worktrees
+	optdepends = python: example provider programs
+	source = novacode-0.1.0.tar.gz::https://github.com/OWNER/novacode/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = SKIP
+
+pkgname = novacode

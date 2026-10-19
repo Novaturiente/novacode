@@ -1,0 +1,42 @@
+# Maintainer: Your Name <you@example.com>
+# shortcut: placeholders (maintainer, OWNER, sha256sums) until the first release.
+pkgname=novacode
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="A lightweight, fast, extensible coding agent harness"
+arch=('x86_64' 'aarch64')
+url="https://github.com/OWNER/novacode"
+license=('MIT OR Apache-2.0')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo' 'git')
+optdepends=('git: packages and worktrees' 'python: example provider programs')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  # `novacode update` then points at the AUR instead of replacing the binary.
+  NOVACODE_INSTALL=aur cargo build --frozen --release -p novacode
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  ./target/release/novacode --version
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/novacode "$pkgdir/usr/bin/novacode"
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 docs/extensions.md "$pkgdir/usr/share/doc/$pkgname/extensions.md"
+  install -Dm644 docs/config.md "$pkgdir/usr/share/doc/$pkgname/config.md"
+}

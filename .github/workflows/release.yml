@@ -1,0 +1,66 @@
+# Tag vX.Y.Z → budgets checked (scripts/bench.sh), static builds per target,
+# checksums, a GitHub release. Binaries are built with NOVACODE_INSTALL=release so
+# `novacode update` may replace them (L11.1, L11.7, L11.12).
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p novacode
+      - run: scripts/bench.sh
+  build:
+    needs: bench
+    strategy:
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, cross: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, cross: true }
+          - { target: aarch64-apple-darwin, os: macos-14, cross: false }
+    runs-on: ${{ matrix.os }}
+    env:
+      NOVACODE_INSTALL: release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: matrix.cross
+        run: cargo install cross --locked
+      - if: matrix.cross
+        # cross runs the build in a container; pass the install kind through.
+        run: CROSS_CONTAINER_OPTS="-e NOVACODE_INSTALL=release" cross build --release --locked -p novacode --target ${{ matrix.target }}
+      - if: ${{ !matrix.cross }}
+        run: cargo build --release --locked -p novacode --target ${{ matrix.target }}
+      - name: package
+        shell: bash
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          a="novacode-$v-${{ matrix.target }}.tar.gz"
+          tar -czf "$a" -C "target/${{ matrix.target }}/release" novacode
+          (command -v sha256sum >/dev/null && sha256sum "$a" || shasum -a 256 "$a") > "$a.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: novacode-*.tar.gz*
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes novacode-*

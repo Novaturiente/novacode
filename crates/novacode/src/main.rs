@@ -38,6 +38,7 @@ mod schedule;
 mod serve;
 mod stats;
 mod status;
+mod update;
 mod usage;
 mod wire;
 
@@ -214,6 +215,8 @@ enum Command {
     },
     /// Remove an installed package.
     Uninstall { name: String },
+    /// Update novacode itself (release installs; AUR and source builds say how to update).
+    Update,
     /// Installed packages; `packages update [name]` moves pins to the newest commit,
     /// `packages install` installs what this project's .novacode/packages.json declares.
     Packages {
@@ -596,6 +599,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             let settings = Settings::load(&paths.settings(), None, false);
             return import::run(&paths, &Providers::load(paths.home(), &settings), yes);
         }
+        Some(Command::Update) => return update::run().await,
         Some(Command::Install { source, name }) => {
             let store = novacode_core::packages::Store::global(paths.home());
             let n = store

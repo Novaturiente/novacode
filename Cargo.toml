@@ -5,16 +5,18 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "MIT OR Apache-2.0"
+rust-version = "1.97"
 
 [workspace.dependencies]
 novacode-base = { path = "crates/novacode-base" }
 novacode-types = { path = "crates/novacode-types" }
 novacode-ai = { path = "crates/novacode-ai" }
-novacode-tools = { path = "crates/novacode-tools" }
+# Feature gates (L11.7) are chosen by the binary: see crates/novacode/Cargo.toml.
+novacode-tools = { path = "crates/novacode-tools", default-features = false }
 novacode-script = { path = "crates/novacode-script" }
 novacode-core = { path = "crates/novacode-core" }
-novacode-tui = { path = "crates/novacode-tui" }
+novacode-tui = { path = "crates/novacode-tui", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"

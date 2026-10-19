@@ -69,7 +69,7 @@ done
 row "start, 20 extensions" "$best" $START_MS ms
 
 read -r rss0 anon0 cpu0 < <(idle "$TMP/h0")
-read -r rss20 anon20 _ < <(idle "$TMP/h20")
+read -r _ anon20 _ < <(idle "$TMP/h20")
 row "idle session RSS" "$rss0" $IDLE_MB MB
 # A child shares the binary's code pages with its parent (page cache); its own cost is anonymous memory.
 row "subagent child (anon RSS)" "$anon0" $CHILD_MB MB

@@ -3,9 +3,17 @@ name = "novacode"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+default = ["images", "highlight"]
+# Images: shrinking before sending (tools) and showing them in the terminal (tui).
+images = ["novacode-tools/images", "novacode-tui/images"]
+# Syntax highlighting in code blocks.
+highlight = ["novacode-tui/highlight"]
 
 [dependencies]
 novacode-base.workspace = true
@@ -20,6 +28,8 @@ novacode-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 futures-util.workspace = true
+reqwest.workspace = true
+sha2 = "0.10"
 clap.workspace = true
 tokio = { workspace = true, features = ["signal", "net"] }
 
