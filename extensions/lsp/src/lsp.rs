@@ -565,10 +565,7 @@ impl Lsp {
             if let Some(m) = c.unhealthy.lock().unwrap().as_deref()
                 && !c.warned.swap(true, Ordering::Relaxed)
             {
-                report.push(format!(
-                    "({name}: {}; only cargo check errors are shown)",
-                    one_line(m)
-                ));
+                report.push(format!("({name}: {}; only cargo check errors are shown)", one_line(m)));
             }
             if baseline_only {
                 let diags = c.trusted(c.snapshot(&u).1);
@@ -684,7 +681,11 @@ mod tests {
             return;
         }
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("Cargo.toml"), "[package]\nname = \"t\"\nedition = \"2021\"\n").unwrap();
+        std::fs::write(
+            d.path().join("Cargo.toml"),
+            "[package]\nname = \"t\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
         std::fs::create_dir(d.path().join("src")).unwrap();
         let f = d.path().join("src/lib.rs");
         std::fs::write(&f, "pub fn first(b: &[u8]) -> u8 { b[0] }\n").unwrap();
