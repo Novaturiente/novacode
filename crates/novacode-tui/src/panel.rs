@@ -227,6 +227,13 @@ impl Panel {
         self.tabs.iter_mut().find(|t| t.name == name)
     }
 
+    /// Subagents still running (the `agents` status segment).
+    pub fn live_subagents(&self) -> usize {
+        let tab = self.tabs.iter().find(|t| t.name == "agent");
+        tab.and_then(|t| t.sources.iter().find(|s| s.id == "subagents"))
+            .map_or(0, |s| s.nodes.iter().filter(|n| !n.dim).count())
+    }
+
     pub fn current(&self) -> Option<&Tab> {
         let name = self.shown.as_deref()?;
         self.tabs.iter().find(|t| t.name == name)
@@ -1098,6 +1105,7 @@ mod tests {
         p.apply("agents", &sub("a1", "running"));
         p.tick();
         assert!(p.visible, "a running subagent opens the panel");
+        assert_eq!(p.live_subagents(), 1);
         assert_eq!(
             p.tab("agent").unwrap().source("subagents").title.as_deref(),
             Some("Subagents · 1 running of 1")

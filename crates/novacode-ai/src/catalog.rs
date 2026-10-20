@@ -53,9 +53,9 @@ pub struct Profile {
     /// `oauth` = a subscription login in auth.json; otherwise an API key.
     #[serde(default)]
     pub auth: Option<String>,
-    /// Env vars tried for the key, in order.
+    /// Env vars tried for the key, in order; for `api: process`, a map of variables for the program.
     #[serde(default)]
-    pub env: Vec<String>,
+    pub env: Env,
     /// Key value or `$VAR` / `!command` (L2.12), from settings.
     #[serde(default)]
     pub api_key: Option<String>,
@@ -73,6 +73,41 @@ pub struct Profile {
     /// Other profile values (e.g. the Claude subscription's `userAgent`, `betas`).
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// A profile's `env`: a list of key variable names, or (process providers) a map of
+/// variables to set. Derefs to the names, so key lookups read it as a list.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(from = "EnvForm")]
+pub struct Env {
+    pub names: Vec<String>,
+    pub vars: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EnvForm {
+    Names(Vec<String>),
+    Vars(BTreeMap<String, String>),
+}
+
+impl From<EnvForm> for Env {
+    fn from(f: EnvForm) -> Self {
+        match f {
+            EnvForm::Names(names) => Env {
+                names,
+                ..Env::default()
+            },
+            EnvForm::Vars(vars) => Env { vars, ..Env::default() },
+        }
+    }
+}
+
+impl std::ops::Deref for Env {
+    type Target = [String];
+    fn deref(&self) -> &[String] {
+        &self.names
+    }
 }
 
 impl Profile {
@@ -425,6 +460,17 @@ fn touch(p: &Path) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn profile_env_is_a_list_of_names_or_a_map_of_vars() {
+        let p: Profile = serde_json::from_str(r#"{"api": "openai-chat", "env": ["A_KEY", "B_KEY"]}"#).unwrap();
+        assert_eq!(
+            (p.env.first().map(String::as_str), p.env.vars.len()),
+            (Some("A_KEY"), 0)
+        );
+        let p: Profile = serde_json::from_str(r#"{"api": "process", "command": "x", "env": {"X": "1"}}"#).unwrap();
+        assert!(p.env.is_empty() && p.env.vars["X"] == "1");
+    }
+
     use super::*;
     use serde_json::json;
 

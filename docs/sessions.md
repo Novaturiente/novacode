@@ -115,7 +115,7 @@ It prints the session id and returns. Other flags such as `-m` work as usual. `-
 
 | Command | What it does |
 |---|---|
-| `novacode agents` | List live sessions: id, state (`working` or `idle`), whether it is background, model and folder. |
+| `novacode agents` | List live sessions: id, state (`working`, `blocked` when it waits for an answer, or `idle`), whether it is background, model and folder. |
 | `novacode attach <id>` | Open a window on a live session. |
 | `novacode status` | One-line status of a live session. Shows this tmux pane's session, else the newest in this folder. |
 | `novacode status --all` | Every live session. |

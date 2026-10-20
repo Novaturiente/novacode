@@ -343,7 +343,7 @@ Segments:
 | `bg` | Number of background processes. |
 | `queue` | Queued messages. |
 | `mcp` | MCP servers ready. |
-| `agents` | Reserved. It has no value today, so it shows nothing. |
+| `agents` | `agents N` while N subagents are running; hidden otherwise. |
 | `wtpath` | Name of the git worktree, when you are in one. |
 | `ext` | All status segments from extensions (`ext:<key>` for one). |
 

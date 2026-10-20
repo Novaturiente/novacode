@@ -55,7 +55,12 @@ async fn handle(method: &Value, p: &Value, lsp: &OnceLock<Arc<lsp::Lsp>>) -> Val
             });
             let wait = cfg.wait_ms;
             let cwd = PathBuf::from(p["cwd"].as_str().unwrap_or("."));
-            let logs = PathBuf::from(p["home"].as_str().unwrap_or("/tmp")).join(".novacode/logs");
+            // NOVACODE_HOME is inherited from novacode; else ~/.novacode.
+            let logs = std::env::var_os("NOVACODE_HOME")
+                .filter(|h| !h.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(p["home"].as_str().unwrap_or("/tmp")).join(".novacode"))
+                .join("logs");
             let (l, warn) = lsp::Lsp::new(cfg, &cwd, &logs);
             for w in warn {
                 eprintln!("{w}");
@@ -75,7 +80,7 @@ async fn handle(method: &Value, p: &Value, lsp: &OnceLock<Arc<lsp::Lsp>>) -> Val
                 .collect();
             let tool = e["tool"].as_str().unwrap_or_default();
             match l.after_tool(tool, e["isError"] == true, touched).await {
-                // novacode tags appended feedback with the handler's label.
+                // novacode shows appended feedback as `[hook] <text>`.
                 Some(text) => json!({ "append": format!("diagnostics: {text}") }),
                 None => Value::Null,
             }

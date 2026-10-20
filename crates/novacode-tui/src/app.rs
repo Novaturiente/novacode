@@ -1687,6 +1687,10 @@ impl App {
         if !self.procs.is_empty() {
             v.insert("bg".into(), Value_::text(format!("⚙ {}", self.procs.len()), t.accent));
         }
+        let agents = self.panel.live_subagents();
+        if agents > 0 {
+            v.insert("agents".into(), Value_::text(format!("agents {agents}"), t.accent));
+        }
         if self.ctx > 0 {
             let pct = self.ctx as f64 * 100.0 / self.init.window_tokens.max(1) as f64;
             let st = match pct {

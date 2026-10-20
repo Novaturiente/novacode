@@ -407,10 +407,13 @@ async fn mcp_command(paths: &Paths, what: McpCmd) -> anyhow::Result<ExitCode> {
                 }
                 (None, None) => anyhow::bail!("give a command after `--`, or --url"),
             }
-            let env: serde_json::Map<String, serde_json::Value> = env
+            let env = env
                 .iter()
-                .filter_map(|kv| kv.split_once('=').map(|(k, val)| (k.to_string(), val.into())))
-                .collect();
+                .map(|kv| match kv.split_once('=') {
+                    Some((k, val)) if !k.is_empty() => Ok((k.to_string(), serde_json::Value::from(val))),
+                    _ => Err(anyhow::anyhow!("--env needs KEY=VALUE, got `{kv}`")),
+                })
+                .collect::<anyhow::Result<serde_json::Map<_, _>>>()?;
             if !env.is_empty() {
                 v.insert("env".into(), env.into());
             }

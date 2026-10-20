@@ -168,7 +168,7 @@ novacode --profile scout
 
 ## Permissions are global only
 
-`permissions` and `trust` are read from `~/.novacode/settings.json` only. A project's `.novacode/settings.json` cannot widen what the agent may do, even when the folder is trusted.
+`permissions` is read from `~/.novacode/settings.json` only. (Which folders you trust is kept in `~/.novacode/trust.json`, never in settings.) A project's `.novacode/settings.json` cannot widen what the agent may do, even when the folder is trusted.
 
 ## Project trust
 

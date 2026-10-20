@@ -291,13 +291,13 @@ A provider that novacode doesn't know can be any program that speaks line-delimi
 
 ```jsonc
 "providers": {
-  "mine": { "api": "process", "command": "python3", "args": ["/path/to/provider.py"] }
+  "mine": { "api": "process", "command": "python3", "args": ["/path/to/provider.py"], "env": {} }
 }
 ```
 
 Then pick `mine/<model>` like any other model. The program is started on the first call and serves the whole session. It needs no key; it handles its own credentials.
 
-Don't add an `env` map: for a process provider it currently makes the whole provider entry invalid, and novacode then reports `unknown provider`. To set variables, start the program through `env`: `"command": "env", "args": ["MY_VAR=1", "python3", "/path/to/provider.py"]`.
+To set variables for the program, add `"env": {"MY_VAR": "1"}`.
 
 | Direction | Message | Shape |
 |---|---|---|

@@ -112,7 +112,9 @@ novacode logout claude --account work   # remove one account later
 
 For one-off scripted runs, `--api-key` with `-m provider/model` needs no stored login at all.
 
-### "invalid_grant" or a login that stops working
+### "The login has expired or was revoked" (`invalid_grant`)
+
+The provider refused the saved refresh token, so only a new login helps. The message names the command, for example `novacode login claude --account work`. If you have more than one account for that provider, novacode skips the broken one and uses the next, with a notice.
 
 Subscription logins use a refresh token that the provider replaces each time it is used. If you copy or share one `auth.json` between several `NOVACODE_HOME` folders (or machines), whichever copy refreshes first makes the others' token invalid. They then fail with a token error such as `invalid_grant`.
 

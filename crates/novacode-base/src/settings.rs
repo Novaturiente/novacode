@@ -16,7 +16,7 @@ const MIGRATIONS: &[(&str, &str)] = &[];
 
 /// Top-level keys a project file may not set (L0.6).
 /// shortcut: names fixed with the L6 work in M3; add keys there as they appear.
-const GLOBAL_ONLY: &[&str] = &["permissions", "trust"];
+const GLOBAL_ONLY: &[&str] = &["permissions"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {

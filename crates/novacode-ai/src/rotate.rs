@@ -130,6 +130,16 @@ impl Inner {
                 Ok(a) => a,
                 Err(e) => {
                     let msg = format!("{} account `{}`: {e}", self.provider, self.accounts[i]);
+                    // A broken login (e.g. a revoked refresh token) shouldn't block a working account.
+                    if tried + 1 < n {
+                        let next = (i + 1) % n;
+                        let note = format!("{msg}; switched to account `{}`", self.accounts[next]);
+                        if tx.send(StreamEvent::Notice { text: note }).await.is_err() {
+                            return;
+                        }
+                        self.current.store(next, Ordering::Relaxed);
+                        continue 'accounts;
+                    }
                     return Builder::new(tx, &self.provider, &req.model)
                         .fail(ErrorKind::Auth, msg)
                         .await;
@@ -261,6 +271,57 @@ mod tests {
             "HTTP/1.1 {status}\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    #[tokio::test]
+    async fn a_broken_login_moves_on_to_the_next_account() {
+        let ok = http(
+            "200 OK",
+            "text/event-stream",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        );
+        let url = server(vec![ok]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let sub = format!(
+            r#"{{ "providers": {{ "sub": {{ "name": "Sub", "api": "openai-chat", "auth": "oauth", "baseUrl": "{url}" }} }} }}"#
+        );
+        std::fs::write(&path, sub).unwrap();
+        let p = Arc::new(Providers::load(dir.path(), &Settings::load(&path, None, false)));
+        let cred = OAuthCredential {
+            access: "b".into(),
+            refresh: "r".into(),
+            expires_ms: u64::MAX / 2,
+            project: None,
+        };
+        p.auth.put("sub", "work", cred).await.unwrap();
+        let (first, _) = p.adapter_for("sub", "work", None).await.unwrap();
+        // `gone` has no usable login (as after a revoked refresh token).
+        let a = Live::new(p.clone(), "sub", vec!["gone".into(), "work".into()], None, first);
+        let req = Request {
+            tail: Vec::new(),
+            model: "m".into(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 10,
+            cache: CacheRetention::Short,
+            thinking: None,
+            images: false,
+            session: None,
+        };
+        let mut rx = a.stream(req, CancellationToken::new());
+        let first = rx.recv().await.unwrap();
+        assert!(
+            matches!(&first, StreamEvent::Notice { text: n } if n.contains("account `gone`") && n.contains("switched to account `work`")),
+            "{first:?}"
+        );
+        let m = collect(rx).await;
+        assert_eq!(
+            (m.stop, a.account()),
+            (StopReason::Stop, "work".to_string()),
+            "{:?}",
+            m.error_message
+        );
     }
 
     #[tokio::test]

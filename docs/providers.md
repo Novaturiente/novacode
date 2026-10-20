@@ -208,7 +208,7 @@ novacode -m vllm/Qwen/Qwen3-Coder-30B-A3B-Instruct
 | `keyOptional` | `true` if the server needs no key. Otherwise set `apiKey` or export a key |
 | `apiKey` | Key, `$VAR` or `!command` |
 | `headers` | Extra HTTP headers, an object of strings |
-| `env` | A list of env var names to try for the key, in order, e.g. `["VLLM_KEY"]`. (Not for `process` providers.) |
+| `env` | A list of env var names to try for the key, in order, e.g. `["VLLM_KEY"]`. For `process` providers, a map of variables to set for the program instead. |
 | `compat` | Quirk flags for the wire format, see below. Read by `openai-chat` (and, with other flags, `openai-responses`). |
 | `command`, `args` | For `process` providers only. See [Your own provider program](#your-own-provider-program). |
 
@@ -259,7 +259,7 @@ A provider can be any program that speaks JSON-RPC on stdio. Set `"api": "proces
 | `command` | Program to start. Required. |
 | `args` | List of arguments. |
 
-`env` is not supported for these providers yet. To set variables, wrap the command: `"command": "env", "args": ["MY_VAR=x", "python3", "/path/to/provider.py"]`.
+`env` here is a map of variables set for the program, e.g. `"env": {"MY_VAR": "x"}`.
 
 Project settings only apply in folders you trust, so a repository can't start a provider program on its own.
 

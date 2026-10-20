@@ -262,7 +262,7 @@ The id is printed to stdout; the other lines go to stderr. The session runs in i
 
 | Command | What it does |
 |---|---|
-| `novacode agents` | List live sessions: id, state (`working` or `idle`), whether it's `bg`, model and folder |
+| `novacode agents` | List live sessions: id, state (`working`, `blocked` when it waits for an answer, or `idle`), whether it's `bg`, model and folder |
 | `novacode attach ID` | Open a window on a live session. Leaving only detaches; the session keeps running. An id prefix is enough. |
 | `novacode status` | Status of this tmux pane's session, else this folder's newest one |
 | `novacode status --session ID` | One live session, by id prefix |
@@ -273,7 +273,7 @@ The id is printed to stdout; the other lines go to stderr. The session runs in i
 
 `status` fields are: `session state detail model level ctx ctx_tokens window hit read write miss cost 5h week branch project cwd bg`. It exits with `1` when there is no live session, which makes it easy to use in scripts and in a tmux status line (`#(novacode status --format '{state}')`).
 
-A background session that needs an approval waits in the `blocked` state until you attach and answer. Give it allow rules or `--mode read-only` if you want it to run on its own. (`novacode agents` shows only `working` or `idle`; use `status` to see `blocked`.)
+A background session that needs an approval waits in the `blocked` state until you attach and answer. Give it allow rules or `--mode read-only` if you want it to run on its own.
 
 ## Reacting to what the agent does
 

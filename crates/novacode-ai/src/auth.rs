@@ -19,6 +19,9 @@ pub enum AuthError {
     NotLoggedIn(String),
     #[error("{0}")]
     Http(String),
+    /// The provider refused the refresh token (`invalid_grant`): only a new login helps.
+    #[error("the {0} login{1} has expired or was revoked; log in again with `novacode login {0}{2}`")]
+    Expired(String, String, String),
     #[error("auth file: {0}")]
     Io(#[from] std::io::Error),
     #[error("api key: {0}")]
@@ -253,12 +256,13 @@ impl AuthStore {
         if cred.expires_ms > now_ms() + REFRESH_MARGIN.as_millis() as u64 {
             return Ok(cred);
         }
-        let mut fresh = match provider {
-            codex::PROVIDER => codex::refresh(&cred.refresh).await?,
-            antigravity::PROVIDER => antigravity::refresh(&cred.refresh).await?,
-            copilot::PROVIDER => copilot::exchange(&cred.refresh).await?,
-            _ => claude::refresh(&cred.refresh).await?,
+        let refreshed = match provider {
+            codex::PROVIDER => codex::refresh(&cred.refresh).await,
+            antigravity::PROVIDER => antigravity::refresh(&cred.refresh).await,
+            copilot::PROVIDER => copilot::exchange(&cred.refresh).await,
+            _ => claude::refresh(&cred.refresh).await,
         };
+        let mut fresh = refreshed.map_err(|e| expired(e, provider, account))?;
         if fresh.refresh.is_empty() {
             fresh.refresh = cred.refresh.clone(); // Google keeps the old refresh token
         }
@@ -270,6 +274,21 @@ impl AuthStore {
             .insert(account.into(), fresh.clone());
         write(&self.path, &f)?;
         Ok(fresh)
+    }
+}
+
+/// A refused refresh token becomes [`AuthError::Expired`], naming the login command.
+fn expired(e: AuthError, provider: &str, account: &str) -> AuthError {
+    match e {
+        AuthError::Http(t) if t.contains("invalid_grant") => {
+            let (named, flag) = if account == DEFAULT_ACCOUNT {
+                (String::new(), String::new())
+            } else {
+                (format!(" (account `{account}`)"), format!(" --account {account}"))
+            };
+            AuthError::Expired(provider.into(), named, flag)
+        }
+        e => e,
     }
 }
 
@@ -892,6 +911,25 @@ mod tests {
         );
         assert_eq!(claude::parse_pasted("abc"), ("abc".into(), None));
         assert!(claude::authorize_url(&v, &c).contains("scope=org%3Acreate_api_key%20user%3Aprofile"));
+    }
+
+    #[test]
+    fn invalid_grant_names_the_login_command() {
+        let e = || AuthError::Http(r#"token endpoint returned 400 Bad Request: {"error": "invalid_grant"}"#.into());
+        assert_eq!(
+            expired(e(), "claude", DEFAULT_ACCOUNT).to_string(),
+            "the claude login has expired or was revoked; log in again with `novacode login claude`"
+        );
+        assert!(
+            expired(e(), "claude", "eec").to_string().contains("(account `eec`)")
+                && expired(e(), "claude", "eec")
+                    .to_string()
+                    .ends_with("`novacode login claude --account eec`")
+        );
+        assert!(matches!(
+            expired(AuthError::Http("timeout".into()), "claude", "x"),
+            AuthError::Http(_)
+        ));
     }
 
     #[tokio::test]

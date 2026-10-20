@@ -142,10 +142,30 @@ impl Providers {
         if !p.oauth() {
             return self.adapter_for(provider, DEFAULT_ACCOUNT, trace).await;
         }
-        let accounts = self.auth.accounts(provider);
-        let first = accounts.first().map(String::as_str).unwrap_or(DEFAULT_ACCOUNT);
-        // Build the first account now, so a missing or broken login shows at connect time.
-        let (a, _) = self.adapter_for(provider, first, trace.clone()).await?;
+        let mut accounts = self.auth.accounts(provider);
+        if accounts.is_empty() {
+            accounts.push(DEFAULT_ACCOUNT.into());
+        }
+        // Build an account now, so a missing or broken login shows at connect time. A broken
+        // one (e.g. a revoked refresh token) is skipped while another account still works.
+        let mut first_err = None;
+        let mut built = None;
+        for (i, account) in accounts.iter().enumerate() {
+            match self.adapter_for(provider, account, trace.clone()).await {
+                Ok((a, _)) => {
+                    built = Some((i, a));
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(%provider, %account, "login unusable, trying the next account: {e}");
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        let Some((i, a)) = built else {
+            return Err(first_err.expect("at least one account was tried"));
+        };
+        accounts.rotate_left(i);
         let live = crate::rotate::Live::new(self.clone(), provider, accounts, trace, a);
         Ok((Arc::new(live), None))
     }
@@ -159,7 +179,9 @@ impl Providers {
     ) -> Result<(Arc<dyn Adapter>, Option<String>), ConnectError> {
         let p = self.profile(provider)?;
         if p.api == Api::Process {
-            let raw = Value::Object(p.extra.clone().into_iter().collect());
+            let mut raw: serde_json::Map<String, Value> = p.extra.clone().into_iter().collect();
+            raw.insert("env".into(), serde_json::to_value(&p.env.vars).unwrap_or_default());
+            let raw = Value::Object(raw);
             let c = serde_json::from_value(raw)
                 .map_err(|e| setup(format!("providers.{}: a process provider needs `command`: {e}", p.id)))?;
             return Ok((Arc::new(crate::process::Process::new(&p.id, c)), None));

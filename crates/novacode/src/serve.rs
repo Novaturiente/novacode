@@ -410,7 +410,11 @@ pub fn agents(paths: &Paths) -> std::process::ExitCode {
         println!(
             "{:<15} {:<8} {:<4} {:<34} {}",
             &s.session[..s.session.len().min(13)],
-            if s.busy { "working" } else { "idle" },
+            match s.activity.state {
+                crate::wire::ActState::Blocked => "blocked",
+                _ if s.busy => "working",
+                _ => "idle",
+            },
             if f.bg { "yes" } else { "" },
             format!("{}:{}", s.model, s.level.as_str()),
             s.cwd
