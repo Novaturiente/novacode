@@ -233,7 +233,7 @@ enum Command {
         #[arg(long = "ref")]
         git_ref: Option<String>,
     },
-    /// Remove an installed package.
+    /// Remove an installed package, by name or by the URL/path it was installed from.
     Uninstall { name: String },
     /// Update novacode itself (release installs; AUR and source builds say how to update).
     Update,
@@ -680,7 +680,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Some(Command::Uninstall { name }) => {
-            novacode_core::packages::Store::global(paths.home())
+            let name = novacode_core::packages::Store::global(paths.home())
                 .uninstall(&name)
                 .map_err(anyhow::Error::msg)?;
             eprintln!("removed `{name}`");

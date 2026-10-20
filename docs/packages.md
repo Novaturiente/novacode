@@ -78,6 +78,7 @@ Nothing changes under you. A package stays at its recorded commit until you run 
 ```sh
 novacode packages                 # list what's installed
 novacode uninstall my-pack        # remove it
+novacode uninstall https://github.com/you/my-pack.git   # or by the URL or path you installed from
 ```
 
 `novacode packages` shows each package with its version (`git v5.3.2`, or `→ /path` for a linked folder), what kind it is, what it adds, and which hook events it runs. A package that can't load shows `(disabled: …)` with the reason. Hooks or hook events novacode doesn't support are listed as `not supported`.

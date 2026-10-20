@@ -164,22 +164,33 @@ impl Store {
     }
 
     /// Remove a package: unlink a local one, delete a clone, drop its pin.
-    pub fn uninstall(&self, name: &str) -> Result<(), String> {
+    /// `what` is its name, or the URL/path it was installed from. Returns the name.
+    pub fn uninstall(&self, what: &str) -> Result<String, String> {
+        let lock = self.read_lock();
+        let norm = |s: &str| s.trim_end_matches('/').trim_end_matches(".git").to_string();
+        let local = std::fs::canonicalize(what).ok();
         let p = self
             .list()
             .into_iter()
-            .find(|p| p.name == name)
-            .ok_or(format!("`{name}` is not installed"))?;
+            .find(|p| p.name == what)
+            .or_else(|| {
+                self.list().into_iter().find(|p| {
+                    lock.get(&p.name).is_some_and(|pin| norm(&pin.source) == norm(what))
+                        || (local.is_some() && p.link.as_ref().and_then(|l| std::fs::canonicalize(l).ok()) == local)
+                })
+            })
+            .ok_or(format!("`{what}` is not installed (see `novacode packages`)"))?;
+        let name = p.name.clone();
         if p.link.is_some() {
             std::fs::remove_file(&p.dir).map_err(|e| e.to_string())?;
         } else {
             std::fs::remove_dir_all(&p.dir).map_err(|e| e.to_string())?;
         }
-        let mut lock = self.read_lock();
-        if lock.remove(name).is_some() {
+        let mut lock = lock;
+        if lock.remove(&name).is_some() {
             self.write_lock(&lock)?;
         }
-        Ok(())
+        Ok(name)
     }
 
     /// Move every clone (or one) to its latest release, or a followed branch to
@@ -609,8 +620,10 @@ mod tests {
         assert!(s2.install(&url, Some("bad"), Want::Ref("nope")).await.is_err());
         assert!(!s2.dir.join("bad").exists(), "a failed install leaves nothing");
 
-        store.uninstall("local").unwrap();
-        store.uninstall("cloned").unwrap();
+        // By the path or URL it was installed from, not only by name.
+        assert_eq!(store.uninstall(src.path().to_str().unwrap()).unwrap(), "local");
+        assert_eq!(store.uninstall(&format!("{url}/")).unwrap(), "cloned");
+        assert!(store.uninstall("cloned").is_err());
         assert!(store.list().is_empty() && store.read_lock().is_empty());
         assert!(src.path().join("skills").is_dir(), "the linked source is untouched");
     }
