@@ -7,7 +7,6 @@ use sha2::{Digest, Sha256};
 use std::process::ExitCode;
 
 /// `owner/name` of the GitHub repo that publishes releases.
-// shortcut: placeholder until the repo exists; set it before the first release.
 pub const REPO: &str = "Novaturiente/novacode";
 
 pub fn install_kind() -> &'static str {
@@ -52,7 +51,7 @@ pub async fn run() -> anyhow::Result<ExitCode> {
         }
         _ => {
             println!(
-                "this is a source build; update with `git pull && cargo install --locked --path crates/novacode`."
+                "this is a source build; update with `git pull && cargo install --locked --path crates/novacode` in your checkout, or rerun `cargo install --locked --force --git https://github.com/Novaturiente/novacode novacode`."
             );
             return Ok(ExitCode::SUCCESS);
         }

@@ -12,26 +12,26 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `maxTokens` | number | 16384 | Output cap per reply, clamped to the model's limit. |
 | `contextWindow` | number | from the catalog | Use a smaller context window than the model has. |
 | `cacheRetention` | string | `short` | `long` asks for 1h (Anthropic) or 24h (OpenAI) prompt caching. |
-| `cache.warm` | bool | false | Keep the prompt cache alive with 1-token replays while it pays off (L2.17). |
+| `cache.warm` | bool | false | Keep the prompt cache alive with 1-token replays while it pays off. |
 | `providers` | object | {} | Per-provider overrides: `providers.<id>.apiKey`, `baseUrl`, headers, compat flags. |
 | `models` | object | {} | Per-model catalog overrides: `models.<provider>/<id>.contextWindow`, costs, … |
 | `permissions` | object | auto mode | Global only. `mode` auto\|ask\|read-only, `allow`/`ask`/`deny` rules like `Bash(git push:*)`, `protected`, `profiles`. |
 | `tools.<name>.exposure` | string | per tool | listed, codemode, deferred or hidden: how a tool reaches the model. |
-| `hooks` | object | {} | Command hooks: `beforeTool`, `afterTool`, `events.<type>`, `timeoutMs` (L7.1). |
+| `hooks` | object | {} | Command hooks: `beforeTool`, `afterTool`, `events.<type>`, `timeoutMs`. |
 | `hooks.onActivity` | string | unset | Shell command run on working/blocked/idle changes, State JSON on stdin. |
 | `processExtensions` | object | {} | Long-running JSON-RPC extensions: `<name>: {command, args, env}`. |
 | `modes` | object | {} | Mode presets: `<name>: {prompt, readOnly, tools}`; `plan` is built in. |
-| `checkpoints.enabled` | bool | true | File checkpoints per prompt, for `/rewind` (L4.15). |
-| `extensions.<name>` | object |  | Settings of extension `<name>`: a process extension gets them in `initialize`, any extension through `novacode.settings.get("extensions.<name>")` (L7). |
-| `security.maskSecrets` | bool | false | Also mask well-known secret shapes in tool output (GitHub/AWS/OpenAI/Anthropic/Slack/Google tokens, private keys, `*_TOKEN=`/`*_SECRET=` values) before the model sees them (L6.6). Your own logins are always masked. |
-| `memory.enabled` | bool | true | Observer notes and compaction from notes (L4.5). |
+| `checkpoints.enabled` | bool | true | File checkpoints per prompt, for `/rewind`. |
+| `extensions.<name>` | object |  | Settings of extension `<name>`: a process extension gets them in `initialize`, any extension through `novacode.settings.get("extensions.<name>")`. |
+| `security.maskSecrets` | bool | false | Also mask well-known secret shapes in tool output (GitHub/AWS/OpenAI/Anthropic/Slack/Google tokens, private keys, `*_TOKEN=`/`*_SECRET=` values) before the model sees them. Your own logins are always masked. |
+| `memory.enabled` | bool | true | Observer notes, compaction from notes and the `recall` tool. |
 | `memory.model` | string | the profile's small model | Model for the observer, reflector and dropper. |
 | `memory.observeAfterTokens` | number | 10000 | New tokens before the observer runs. |
 | `memory.keepRecentTokens` | number | 20000 | Tokens kept verbatim after a compaction. |
 | `memory.compactAtTokens` | number | min(80% of window, 400k) | Context size that triggers auto-compaction. |
 | `memory.reflectAfterTokens` | number | 20000 | New observer tokens before the reflector runs. |
 | `memory.poolTargetTokens` | number | 10000 | Size the dropper trims active notes down to. |
-| `memory.store` | bool | true | Cross-session memory (SQLite) and its start-of-session index (L10.4). |
+| `memory.store` | bool | true | Cross-session memory (SQLite) and its start-of-session index. |
 | `memory.indexItems` | number | 15 | Memory items in the session-start index. |
 | `memory.indexChars` | number | 2000 | Character cap of that index. |
 | `agents.stallMinutes` | number | 10 | A subagent silent this long is stopped. |
@@ -42,7 +42,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `goal.audit` | bool | true | `/goal` completion is checked by the `auditor` subagent before it counts. |
 | `goal.auditModel` | string | the session's model | Model of the goal auditor (`provider/model[:level]`). |
 | `goal.maxRuns` | number | 30 | Automatic continuations of a goal before it pauses (per start or `/goal resume`). |
-| `web.native` | bool | false | Use the model's own web search when it has one (L2.23). |
+| `web.native` | bool | false | Use the model's own web search when it has one. |
 | `web.searxngUrl` | string | unset | SearXNG instance for `web_search`, the last fallback. |
 | `debug.metrics` | bool | false | Per-session timing JSONL in `~/.novacode/metrics/` for `novacode stats`. |
 | `notifications.enabled` | bool | true | OSC 777 notification when a turn ends unwatched or needs you. |

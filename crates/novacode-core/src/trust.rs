@@ -17,7 +17,11 @@ const PROJECT_CONFIG: &[&str] = &[
     ".novacode/settings.json",
     ".novacode/extensions",
     ".novacode/skills",
+    ".novacode/agents",
     ".mcp.json",
+    ".claude/skills",
+    ".claude/agents",
+    ".claude/commands",
 ];
 
 impl TrustStore {

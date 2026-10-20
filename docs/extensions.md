@@ -20,7 +20,7 @@ novacode packages update [name]                     # pull and move the pin
 novacode uninstall pack
 ```
 
-Pins live in `~/.novacode/packages.lock.json`. Copy that file to another machine and installs there get the same commits.
+Pins live in `~/.novacode/packages.lock.json` and record which commit each package is at. `novacode install` always takes the newest commit; only project packages (below) install at their locked commits.
 
 An optional `novacode-package.json` says which extension API the package was written for:
 

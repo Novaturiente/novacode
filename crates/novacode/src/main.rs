@@ -54,7 +54,7 @@ struct Cli {
     /// Record the raw request and stream (redacted) to <home>/logs/trace-<id>.jsonl.
     #[arg(long)]
     trace: bool,
-    /// Time each startup phase, print the table and exit before the session starts (L11.3).
+    /// Time each startup phase, print the table and exit before the session starts.
     #[arg(long)]
     profile_startup: bool,
     /// Report tool calls, stop reason, token/cache usage and the session file on stderr.
@@ -69,13 +69,13 @@ struct Cli {
     /// Don't save this session.
     #[arg(long)]
     no_session: bool,
-    /// Permission mode for this session: auto, ask or read-only (L6.1).
+    /// Permission mode for this session: auto, ask or read-only.
     #[arg(long, value_parser = parse_mode)]
     mode: Option<Mode>,
-    /// Restrict tools to a named profile, e.g. scout (L6.4).
+    /// Restrict tools to a named profile, e.g. scout.
     #[arg(long)]
     profile: Option<String>,
-    /// Run as this subagent definition (L10.1): its tools, role prompt and model.
+    /// Run as this subagent definition: its tools, role prompt and model.
     #[arg(long, hide = true)]
     agent: Option<String>,
     /// A subagent's tools, comma-separated (set by its parent; default: its definition's).
@@ -84,19 +84,19 @@ struct Cli {
     /// A subagent's MCP servers, comma-separated (default: its definition's, else none).
     #[arg(long, hide = true)]
     mcp: Option<String>,
-    /// Trust this folder's project config for this run only (L6.3).
+    /// Trust this folder's project config for this run only.
     #[arg(long)]
     trust: bool,
-    /// Don't load AGENTS.md / CLAUDE.md context files (L4.9).
+    /// Don't load AGENTS.md / CLAUDE.md context files.
     #[arg(long)]
     no_context_files: bool,
-    /// With -p: write the wire protocol's JSONL events to stdout instead of the answer (L8.5).
+    /// With -p: write the wire protocol's JSONL events to stdout instead of the answer.
     #[arg(long, requires = "print")]
     json: bool,
-    /// Serve the wire protocol on stdin/stdout: JSONL commands in, events out (L8.6).
+    /// Serve the wire protocol on stdin/stdout: JSONL commands in, events out.
     #[arg(long, conflicts_with = "print")]
     rpc: bool,
-    /// Run in the background with no window; prints the session id. Attach with `novacode attach` (L8.13).
+    /// Run in the background with no window; prints the session id. Attach with `novacode attach`.
     #[arg(long, value_name = "PROMPT", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["print", "rpc"])]
     bg: Option<String>,
     /// API key for the model's provider, for this run only (ahead of saved and env keys).
@@ -136,23 +136,30 @@ enum DebugCmd {
 enum Command {
     /// Log in to a subscription (claude, codex, antigravity, copilot), or save an
     /// API key for any other provider (openrouter, openai, google, …).
-    /// Several subscription accounts (--account work) rotate when one runs out (L2.14).
+    /// Several subscription accounts (--account work) rotate when one runs out.
     Login {
+        /// claude, codex, antigravity, copilot, or an API-key provider (openrouter, openai, …)
         provider: String,
+        /// Account name, for several logins to one subscription (they rotate when one runs out)
         #[arg(long, default_value = DEFAULT_ACCOUNT)]
         account: String,
     },
     /// Remove a stored login (one account with --account, else all of them).
     Logout {
+        /// The provider to log out of
         provider: String,
+        /// Only this account (default: every account of the provider)
         #[arg(long)]
         account: Option<String>,
     },
     /// List models of connected providers (with a filter); --all lists every provider; --refresh updates the catalog.
     Models {
+        /// Show only models whose provider/id contains this text
         filter: Option<String>,
+        /// Every provider in the catalog, not only connected ones
         #[arg(long)]
         all: bool,
+        /// Download the newest model catalog first
         #[arg(long)]
         refresh: bool,
     },
@@ -174,7 +181,7 @@ enum Command {
     },
     /// Open another window on a live session (leaving only detaches)
     Attach { session: String },
-    /// The side panel of a live session, full screen (the tmux panel pane, L9.18)
+    /// The side panel of a live session, full screen (what the tmux panel pane shows)
     Panel {
         #[arg(long)]
         session: String,
@@ -183,7 +190,7 @@ enum Command {
     Agents,
     /// End a live session, a background one included
     Stop { session: String },
-    /// Status of a live session: this pane's, else this folder's newest (L8.15)
+    /// Status of a live session: this pane's, else this folder's newest
     Status {
         /// Session id prefix.
         #[arg(long)]
@@ -198,7 +205,7 @@ enum Command {
         #[arg(long, value_name = "TEMPLATE")]
         format: Option<String>,
     },
-    /// Diagnostics: `debug bundle` packs logs, settings and a session, secrets masked (L11.3).
+    /// Diagnostics: `debug bundle` packs logs, settings and a session, secrets masked.
     Debug {
         #[command(subcommand)]
         what: DebugCmd,
@@ -213,7 +220,7 @@ enum Command {
         turns: bool,
     },
     /// Install a package (extensions/, skills/, prompts/, agents/, themes/, mcp.json) from a git URL
-    /// (its commit pinned in ~/.novacode/packages.lock.json) or a local folder (linked) (L7.7).
+    /// (its commit pinned in ~/.novacode/packages.lock.json) or a local folder (linked).
     Install {
         source: String,
         #[arg(long)]
@@ -229,7 +236,7 @@ enum Command {
         #[command(subcommand)]
         what: Option<PkgCmd>,
     },
-    /// MCP servers: list (connects to each), add, remove (L7.4).
+    /// MCP servers: list (connects to each), add, remove.
     Mcp {
         #[command(subcommand)]
         what: McpCmd,
@@ -835,7 +842,7 @@ struct Ctx {
     providers: Arc<Providers>,
     quirks: Arc<novacode_ai::schema::Quirks>,
     cli: Cli,
-    /// Project config loads (L6.3): gates project skills.
+    /// Project config loads: gates project skills.
     trusted: bool,
     /// The goals of the agent just built, for its Host (`agent()` returns only the agent).
     goals: std::sync::Mutex<Option<Arc<goals::Goals>>>,
@@ -844,7 +851,7 @@ struct Ctx {
 }
 
 impl Ctx {
-    /// `/reload` (L8.10): read trust, settings and provider config again. CLI flags stay.
+    /// `/reload`: read trust, settings and provider config again. CLI flags stay.
     fn reload(&mut self) -> Vec<String> {
         // A `novacode trust` since start applies; no prompt here.
         self.trusted = trust::resolve(
@@ -896,7 +903,7 @@ impl Ctx {
         })
     }
 
-    /// The observer's model (L4.5): `memory.model`, else the provider's small
+    /// The observer's model: `memory.model`, else the provider's small
     /// model, else the session's own. A worker that can't connect falls back to it.
     async fn memory_worker(
         &self,
@@ -1543,7 +1550,7 @@ pub(crate) struct TuiBase {
     images: String,
 }
 
-/// `ui.panel.host` (L9.18): `tmux` (or `auto` inside tmux) opens the panel as a split
+/// `ui.panel.host`: `tmux` (or `auto` inside tmux) opens the panel as a split
 /// pane running `novacode panel --session <id>`. Returns the pane id to close at the end.
 fn tmux_panel(settings: &Settings, session: &str, home: &Path) -> Option<String> {
     let host = settings
@@ -1635,7 +1642,7 @@ fn tui_base(paths: &Paths, settings: &Settings) -> TuiBase {
     }
 }
 
-/// Build the agent, start its owner task and hub, and put it on its socket (L8.13).
+/// Build the agent, start its owner task and hub, and put it on its socket.
 async fn start_session(
     ctx: &Ctx,
     store: Store,
@@ -1733,7 +1740,7 @@ async fn start_session(
     Ok((live, task))
 }
 
-/// Keep `State.quota` current: at start and after each task (L8.15).
+/// Keep `State.quota` current: at start and after each task.
 fn quota_task(host: Arc<host::Host>) -> tokio::task::JoinHandle<()> {
     let mut changed = host.hub.changed.subscribe();
     tokio::spawn(async move {
@@ -1757,7 +1764,7 @@ fn quota_task(host: Arc<host::Host>) -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// Folders for one resource kind, first wins (L7.12): project `.novacode`, project
+/// Folders for one resource kind, first wins: project `.novacode`, project
 /// `.claude`, `~/.novacode`, `~/.claude`, `~/.agents` (skills only), then packages.
 /// `.claude` folders unless `compat.claude` is false; project folders when trusted
 /// (prompt templates are plain text: the project's own `prompts` loads either way).
@@ -1840,7 +1847,7 @@ async fn serve_headless(ctx: &Ctx, store: Store, model: String) -> anyhow::Resul
     Ok(ExitCode::SUCCESS)
 }
 
-/// `/restart` (L8.10): exec the binary on disk again, resuming this session.
+/// `/restart`: exec the binary on disk again, resuming this session.
 /// Returns only if exec failed.
 /// After a rebuild or update, Linux names the running binary `<path> (deleted)`; the
 /// new binary sits at `<path>`, which is what /restart is for.
@@ -2115,7 +2122,7 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
     }
 }
 
-/// `/tree`, `/rewind`, `/fork`, `/clone` (L4.3): move the leaf or fork a new
+/// `/tree`, `/rewind`, `/fork`, `/clone`: move the leaf or fork a new
 /// session. A taken-back prompt goes into `draft`. On error the store comes back.
 fn branch(
     ctx: &Ctx,
@@ -2170,7 +2177,7 @@ fn export_redactor(paths: &Paths) -> Redactor {
     Redactor::new(move || AuthStore::new(auth_path.clone()).secrets())
 }
 
-/// Write a session's branch as JSONL or HTML (L4.14), secrets masked (L6.6).
+/// Write a session's branch as JSONL or HTML, secrets masked.
 fn export_session(
     paths: &Paths,
     file: &Path,
@@ -2197,7 +2204,7 @@ fn export_session(
 }
 
 /// L6.3: four choices, asked once per folder that has project config.
-/// A trusted project declares packages that aren't installed (L7.7): ask once per
+/// A trusted project declares packages that aren't installed: ask once per
 /// project, never install silently. The answer is kept in `~/.novacode/project-packages.json`.
 fn project_packages(paths: &Paths, cwd: &Path, interactive: bool) -> anyhow::Result<()> {
     let missing = novacode_core::packages::missing(cwd);
@@ -2507,7 +2514,7 @@ async fn login(store: &AuthStore, provider: &str, account: &str) -> anyhow::Resu
 }
 
 /// Wait for an OAuth redirect on `127.0.0.1:port`, or a pasted redirect URL on stdin,
-/// whichever comes first (L2.13). Returns (code, state).
+/// whichever comes first. Returns (code, state).
 async fn loopback_or_paste(port: u16) -> anyhow::Result<(String, Option<String>)> {
     catch_or_paste(tokio::net::TcpListener::bind(("127.0.0.1", port)).await.ok()).await
 }

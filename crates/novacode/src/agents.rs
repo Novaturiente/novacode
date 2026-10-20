@@ -150,8 +150,10 @@ pub fn defs(dirs: &[PathBuf]) -> (Vec<Def>, Vec<String>) {
                 continue;
             }
             let tools = fm.get("tools").map(|v| {
-                v.split(',')
-                    .map(|s| crate::import::nova_tool(s.trim()))
+                // `Read, Grep` or a flow list `[Read, "Grep"]`.
+                v.trim_matches(|c| c == '[' || c == ']')
+                    .split(',')
+                    .map(|s| crate::import::nova_tool(s.trim().trim_matches(|c| c == '"' || c == '\'')))
                     .filter(|s| !s.is_empty())
                     .collect()
             });
@@ -1605,7 +1607,7 @@ mod tests {
         std::fs::create_dir_all(tmp.join("claude")).unwrap();
         std::fs::write(
             tmp.join("claude/rev.md"),
-            "---\nname: rev\ndescription: reviews\ntools: Read, Grep, Glob\nmodel: sonnet\n---\nReview.",
+            "---\nname: rev\ndescription: reviews\ntools: [Read, \"Grep\", Glob]\nmodel: sonnet\n---\nReview.",
         )
         .unwrap();
         // Same file through a symlink: once, silently. Same name elsewhere: first wins, reported.

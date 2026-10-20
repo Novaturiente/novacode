@@ -1,4 +1,4 @@
-//! Every settings key novacode reads (L11.8). `docs/config.md` is generated from
+//! Every settings key novacode reads. `docs/config.md` is generated from
 //! this table (a test fails when it is stale), and in debug builds
 //! `Settings::get` panics on a key missing here, so the docs can't drift.
 
@@ -44,7 +44,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "cache.warm",
         "bool",
         "false",
-        "Keep the prompt cache alive with 1-token replays while it pays off (L2.17).",
+        "Keep the prompt cache alive with 1-token replays while it pays off.",
     ),
     (
         "providers",
@@ -74,7 +74,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "hooks",
         "object",
         "{}",
-        "Command hooks: `beforeTool`, `afterTool`, `events.<type>`, `timeoutMs` (L7.1).",
+        "Command hooks: `beforeTool`, `afterTool`, `events.<type>`, `timeoutMs`.",
     ),
     (
         "hooks.onActivity",
@@ -98,25 +98,25 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "checkpoints.enabled",
         "bool",
         "true",
-        "File checkpoints per prompt, for `/rewind` (L4.15).",
+        "File checkpoints per prompt, for `/rewind`.",
     ),
     (
         "extensions.<name>",
         "object",
         "",
-        "Settings of extension `<name>`: a process extension gets them in `initialize`, any extension through `novacode.settings.get(\"extensions.<name>\")` (L7).",
+        "Settings of extension `<name>`: a process extension gets them in `initialize`, any extension through `novacode.settings.get(\"extensions.<name>\")`.",
     ),
     (
         "security.maskSecrets",
         "bool",
         "false",
-        "Also mask well-known secret shapes in tool output (GitHub/AWS/OpenAI/Anthropic/Slack/Google tokens, private keys, `*_TOKEN=`/`*_SECRET=` values) before the model sees them (L6.6). Your own logins are always masked.",
+        "Also mask well-known secret shapes in tool output (GitHub/AWS/OpenAI/Anthropic/Slack/Google tokens, private keys, `*_TOKEN=`/`*_SECRET=` values) before the model sees them. Your own logins are always masked.",
     ),
     (
         "memory.enabled",
         "bool",
         "true",
-        "Observer notes and compaction from notes (L4.5).",
+        "Observer notes, compaction from notes and the `recall` tool.",
     ),
     (
         "memory.model",
@@ -158,7 +158,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "memory.store",
         "bool",
         "true",
-        "Cross-session memory (SQLite) and its start-of-session index (L10.4).",
+        "Cross-session memory (SQLite) and its start-of-session index.",
     ),
     (
         "memory.indexItems",
@@ -219,7 +219,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "web.native",
         "bool",
         "false",
-        "Use the model's own web search when it has one (L2.23).",
+        "Use the model's own web search when it has one.",
     ),
     (
         "web.searxngUrl",
