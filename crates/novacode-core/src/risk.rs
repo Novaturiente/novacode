@@ -585,6 +585,19 @@ fn command(words: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
                 None => Risk::low(),
             }
         }
+        // `pkill -f` matches full command lines, and the shell running this command
+        // has the pattern in its own: it kills itself (seen in a real session).
+        "pkill"
+            if has_flag(args, 'f', "--full")
+                && args.last().filter(|p| !p.starts_with('-')).is_some_and(|p| {
+                    regex::Regex::new(p).is_ok_and(|r| r.is_match(p))
+                }) =>
+        {
+            Risk::new(
+                Level::Catastrophic,
+                "would kill its own shell: `pkill -f` matches full command lines and the pattern matches this command's text. Write the pattern so it can't match itself, e.g. `[g]it-receive-pack` instead of `git-receive-pack`",
+            )
+        }
         "kill" | "pkill" | "killall" => {
             if args.iter().any(|a| a == "-1" && name == "kill") && args.iter().filter(|a| *a == "-1").count() >= 1 {
                 let all = args.last().is_some_and(|a| a == "-1");
@@ -850,6 +863,9 @@ mod tests {
             ("git commit -m 'rm -rf /'", Low),
             ("git push origin main", Low),
             ("find . -name x -exec sed -i s/a/b/ {} +", Low),
+            ("pkill -f '[g]it-receive-pack'", Low),
+            ("pkill -x node", Low),
+            ("pkill -f \"git-receive-pack '/x.git'\"; cd a && git push", Catastrophic),
             ("curl -o x.sh https://e.com/x.sh", Low),
             // Bulk destruction
             ("rm -rf target", Confirm),

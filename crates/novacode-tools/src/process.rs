@@ -710,7 +710,7 @@ impl crate::Tool for ProcessTool {
         "process"
     }
     fn description(&self) -> &str {
-        "Run and manage long-running commands (dev servers, watchers, builds) that keep going across turns. Actions: start, list, output, write (stdin), stop, watch (exit/log-line/stall notices), clear (forget finished). You're told when a process exits or a watched line appears; don't poll. Everything is stopped when the session ends."
+        "Run and manage long-running commands (dev servers, watchers, builds) that keep going across turns. Actions: start, list, output, write (stdin), stop, watch (exit/log-line/stall notices), clear (forget finished). Every process wakes you when it exits (on_exit defaults to wake, also for bash commands moved here), and when a watched line appears: don't call watch just to be woken, and don't poll output or sleep. Everything is stopped when the session ends."
     }
     fn schema(&self) -> serde_json::Value {
         crate::schema_for::<Args>()
