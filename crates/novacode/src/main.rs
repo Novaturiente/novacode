@@ -749,6 +749,27 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     }
     let interactive = prompt.is_none() && !headless;
 
+    // A resumed session continues in the folder it was last in (worktree moves
+    // included), so trust, settings and the shell wrapper follow it.
+    let here = std::env::current_dir()?;
+    let resumed = if let Some(prefix) = &cli.resume {
+        Some(Store::open(&session::find(&paths, &here, prefix)?)?)
+    } else if cli.r#continue {
+        let last = session::list(&paths, &here)
+            .into_iter()
+            .next()
+            .context("no earlier session in this folder")?;
+        Some(Store::open(&last)?)
+    } else {
+        None
+    };
+    if let Some(dir) = resumed.as_ref().map(Store::last_cwd)
+        && dir != here
+        && dir.is_dir()
+    {
+        std::env::set_current_dir(&dir)?;
+        eprintln!("resuming in {}", dir.display());
+    }
     if let Some(name) = &cli.worktree {
         let name = if name.is_empty() { chrono_name() } else { name.clone() };
         let (path, msg) =
@@ -813,16 +834,9 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         goals: Default::default(),
         sup: Default::default(),
     };
-    let store = if let Some(prefix) = &ctx.cli.resume {
-        Store::open(&session::find(&ctx.paths, &ctx.cwd, prefix)?)?
-    } else if ctx.cli.r#continue {
-        let last = session::list(&ctx.paths, &ctx.cwd)
-            .into_iter()
-            .next()
-            .context("no earlier session in this folder")?;
-        Store::open(&last)?
-    } else {
-        Store::create(&ctx.paths, &ctx.cwd, ctx.cli.no_session)
+    let store = match resumed {
+        Some(s) => s,
+        None => Store::create(&ctx.paths, &ctx.cwd, ctx.cli.no_session),
     };
     diag::mark("open session");
     if ctx.cli.profile_startup {
@@ -1887,13 +1901,18 @@ fn restart(id: &str) -> anyhow::Error {
     use std::os::unix::process::CommandExt;
     let mut args = Vec::new();
     let mut skip = false;
+    // `-w` takes an optional name: drop the next arg only if it isn't a flag.
+    let mut skip_name = false;
     for a in std::env::args().skip(1) {
-        if std::mem::take(&mut skip) {
+        if std::mem::take(&mut skip) || std::mem::take(&mut skip_name) && !a.starts_with('-') {
             continue;
         }
         match a.as_str() {
             "-c" | "--continue" => {}
             "-r" | "--resume" => skip = true,
+            // The resumed session's folder decides where it runs (worktree included).
+            "-w" | "--worktree" => skip_name = true,
+            s if s.starts_with("--worktree=") || s.starts_with("-w") && s.len() > 2 => {}
             s if s.starts_with("--resume=") => {}
             _ => args.push(a),
         }
@@ -2188,7 +2207,20 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
             }
             Exit::New => Ok(Store::create(&ctx.paths, &ctx.cwd, ctx.cli.no_session)),
             Exit::Branch(..) | Exit::Rewind { .. } | Exit::Reload | Exit::Restart => unreachable!("handled above"),
-            Exit::Resume(path) => Store::open(Path::new(&path)),
+            Exit::Resume(path) => match Store::open(Path::new(&path)) {
+                Ok(s) => {
+                    let dir = s.last_cwd();
+                    if dir.is_dir() && Some(&dir) != std::env::current_dir().ok().as_ref() {
+                        // Another folder: start over there so its trust, settings and context files load.
+                        std::env::set_current_dir(&dir)?;
+                        let id = s.header.id.clone();
+                        drop(s); // release the session lock before exec
+                        return Err(restart(&id));
+                    }
+                    Ok(s)
+                }
+                e => e,
+            },
         };
         store = match next {
             Ok(s) => s,

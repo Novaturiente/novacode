@@ -31,6 +31,10 @@ pub enum EntryKind {
         message: Message,
     },
     /// Hide (`replace: None`) or replace an earlier entry's message for the model (L4.6).
+    /// The session moved to another folder (`/worktree`, enter_worktree); resume goes back there.
+    Cwd {
+        cwd: PathBuf,
+    },
     ContextEdit {
         target: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -423,6 +427,18 @@ impl Store {
         })
     }
 
+    /// Folder to resume in: the newest recorded move that still exists, else the start folder.
+    pub fn last_cwd(&self) -> PathBuf {
+        self.path_to_leaf()
+            .into_iter()
+            .rev()
+            .find_map(|e| match &e.kind {
+                EntryKind::Cwd { cwd } if cwd.is_dir() => Some(cwd.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.header.cwd.clone())
+    }
+
     /// Last recorded model, as (provider, model).
     pub fn last_model(&self) -> Option<(String, String)> {
         self.entries.iter().rev().find_map(|e| match &e.kind {
@@ -735,6 +751,28 @@ mod tests {
         assert_ne!(f.id(), s.id());
         assert_eq!(f.projection().len(), 1);
         assert!(f.path().unwrap().exists());
+    }
+
+    #[test]
+    fn resume_follows_the_last_existing_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let paths = Paths::new(home.path());
+        let start = home.path().to_path_buf();
+        let mut s = Store::create(&paths, &start, false);
+        s.append(msg("hi")).unwrap();
+        s.append(reply("hello")).unwrap();
+        assert_eq!(s.last_cwd(), start);
+        s.append(EntryKind::Cwd { cwd: wt.path().into() }).unwrap();
+        s.append(EntryKind::Cwd {
+            cwd: "/gone/worktree".into(),
+        })
+        .unwrap();
+        let file = s.path().unwrap().to_path_buf();
+        drop(s);
+        let s = Store::open(&file).unwrap();
+        // A removed worktree is skipped for the newest folder that still exists.
+        assert_eq!(s.last_cwd(), wt.path());
     }
 
     #[test]

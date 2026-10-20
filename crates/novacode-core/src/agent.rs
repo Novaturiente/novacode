@@ -1709,6 +1709,7 @@ impl Agent {
         if self.checkpoints.is_some() {
             self.checkpoints = crate::checkpoint::resolve(&dir, &self.cfg.prompt.home);
         }
+        self.add(EntryKind::Cwd { cwd: dir.clone() });
         let text = format!("The working directory is now {}.", dir.display());
         self.add(EntryKind::CustomMessage {
             kind: "env".into(),

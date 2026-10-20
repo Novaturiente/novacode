@@ -29,6 +29,8 @@ One novacode process owns a session file at a time. Opening a session that is op
 
 When you quit, novacode prints `resume with: novacode -r <id>` if the session was saved. If it ended inside a worktree, the hint is `novacode -w <name> -r <id>`, which reopens it there from anywhere in the repo.
 
+**A session remembers its folder.** When it moves (`/worktree`, `-w`, or the model's `enter_worktree`/`exit_worktree`), the new folder is saved in the session. `-r` and `-c` start in the folder the session was last in, wherever you run them from, so trust, project settings and context files are that folder's. If that folder is gone (a removed worktree), it uses the newest earlier folder that still exists, else the one it started in. `/resume` to a session that is in another folder restarts novacode there. With [`shell-init`](#worktrees) your shell ends up in that folder when you quit.
+
 Inside the UI:
 
 | Command | What it does |
@@ -154,7 +156,7 @@ An attached window can't run commands that swap or rebuild the session: `/resume
 
 ## Restart
 
-`/restart` restarts novacode and resumes the same session. Use it after you rebuild or update the binary. Attached windows reconnect by themselves. Your `-c` or `-r` flags are replaced by a `-r` for this session, and your other flags are kept.
+`/restart` restarts novacode and resumes the same session. Use it after you rebuild or update the binary. Attached windows reconnect by themselves. Your `-c`, `-r` and `-w` flags are replaced by a `-r` for this session, and your other flags are kept.
 
 ## See also
 

@@ -209,6 +209,23 @@ impl Transcript {
         });
     }
 
+    /// Rewrite the newest notice starting with `prefix` (a process's start line becomes
+    /// its end line); a new notice when there is none.
+    pub fn renotice(&mut self, prefix: &str, text: String, error: bool) {
+        for turn in self.turns.iter_mut().rev() {
+            for item in turn.items.iter_mut().rev() {
+                if let Item::Notice { text: t, error: e } = item
+                    && t.starts_with(prefix)
+                {
+                    (*t, *e) = (text, error);
+                    turn.cache = None;
+                    return;
+                }
+            }
+        }
+        self.notice(text, error);
+    }
+
     /// Esc before the first reply: drop the last turn if it is only the prompt (and notices).
     pub fn take_back(&mut self) {
         if let Some(t) = self.turns.last()
@@ -1110,6 +1127,23 @@ fn reminder_line(text: &str) -> Option<String> {
 #[cfg(test)]
 mod reminder_tests {
     use super::reminder_line;
+
+    #[test]
+    fn a_process_end_rewrites_its_start_line() {
+        let mut tr = super::Transcript::default();
+        tr.notice("⚙ proc_6 web: running in the process manager (/ps)", false);
+        tr.notice("⚙ proc_63 x: running", false);
+        tr.renotice("⚙ proc_6 ", "⚙ proc_6 web: stopped".into(), false);
+        let texts: Vec<_> = tr.turns[0]
+            .items
+            .iter()
+            .map(|i| match i {
+                super::Item::Notice { text, .. } => text.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert_eq!(texts, ["⚙ proc_6 web: stopped", "⚙ proc_63 x: running"]);
+    }
 
     #[test]
     fn reminders_replay_as_one_line() {

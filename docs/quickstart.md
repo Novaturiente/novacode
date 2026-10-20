@@ -133,7 +133,7 @@ Both exit with `1` when nothing is connected. Without a model, a `-p` run fails 
 | `--bg [PROMPT]` | Run in the background and print the session id |
 | `-m`, `--model provider/model[:thinking]` | Model for this run |
 | `-c`, `--continue` | Continue the newest session in this folder |
-| `-r`, `--resume ID` | Resume a session by id prefix |
+| `-r`, `--resume ID` | Resume a session by id prefix, in the folder it was last in |
 | `--no-session` | Don't save this session |
 | `-w`, `--worktree [NAME]` | Start in git worktree `.worktrees/NAME` (made if missing; no NAME: `wt-MMDD-HHMM`) |
 | `--mode auto\|ask\|read-only` | Permission mode |

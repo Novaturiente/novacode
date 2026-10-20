@@ -651,8 +651,11 @@ impl App {
                     (_, Some(c)) => format!("exited with code {c}"),
                     (_, None) => "killed".into(),
                 };
-                self.tr
-                    .notice(format!("⚙ {id} {name}: {how}"), !stopped && code != Some(0));
+                self.tr.renotice(
+                    &format!("⚙ {id} "),
+                    format!("⚙ {id} {name}: {how}"),
+                    !stopped && code != Some(0),
+                );
                 self.procs.remove(&id);
             }
             AgentEvent::Compacted {
