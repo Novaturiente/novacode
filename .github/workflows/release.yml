@@ -1,6 +1,7 @@
-# Tag vX.Y.Z → budgets checked (scripts/bench.sh), static builds per target,
-# checksums, a GitHub release. Binaries are built with NOVACODE_INSTALL=release so
-# `novacode update` may replace them (L11.1, L11.7, L11.12).
+# Tag vX.Y.Z → budgets checked (scripts/bench.sh) alongside static builds
+# per target, checksums, a GitHub release. Binaries are built with
+# NOVACODE_INSTALL=release so `novacode update` may replace them
+# (L11.1, L11.7, L11.12).
 name: release
 on:
   push:
@@ -18,8 +19,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked -p novacode
       - run: scripts/bench.sh
+  # Runs alongside bench; publish waits for both, so an over-budget build
+  # is still never released.
   build:
-    needs: bench
     strategy:
       matrix:
         include:
@@ -36,8 +38,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
       - if: matrix.cross
-        run: cargo install cross --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
       - if: matrix.cross
         # cross runs the build in a container; pass the install kind through.
         run: CROSS_CONTAINER_OPTS="-e NOVACODE_INSTALL=release" cross build --release --locked -p novacode --target ${{ matrix.target }}
@@ -55,7 +62,7 @@ jobs:
           name: ${{ matrix.target }}
           path: novacode-*.tar.gz*
   publish:
-    needs: build
+    needs: [bench, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
