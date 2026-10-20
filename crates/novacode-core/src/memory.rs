@@ -450,31 +450,60 @@ pub fn render_summary(
     s.trim_end().to_string()
 }
 
-/// Where to cut: the start of the earliest user message such that at least
-/// `keep` tokens of conversation come after it. `None` when nothing would be cut.
+/// Where to cut (pi's rule): the first user or assistant message at or after the
+/// point where `keep` tokens of conversation remain, so a long turn can be split.
+/// Tool results are never a cut: they stay with the call before them. `None` when
+/// nothing would be cut.
 pub fn cut_point(path: &[&Entry], from: usize, keep: u64) -> Option<usize> {
     let mut kept = 0;
     let mut i = path.len();
-    while i > from {
+    loop {
+        if i <= from {
+            return None;
+        }
         i -= 1;
         kept += tokens(path, i, i + 1);
         if kept >= keep {
             break;
         }
     }
-    // Move back to a user message, so a tool call is never split from its result.
-    let is_user = |e: &Entry| {
+    let valid = |e: &Entry| {
         matches!(
             &e.kind,
             EntryKind::Message {
-                message: Message::User { .. }
+                message: Message::User { .. } | Message::Assistant(_)
             }
         )
     };
-    while i > from && !is_user(path[i]) {
-        i -= 1;
+    // Trailing tool results bigger than `keep`: keep their call too.
+    let cut = (i..path.len())
+        .find(|&j| valid(path[j]))
+        .or_else(|| (from + 1..i).rev().find(|&j| valid(path[j])))?;
+    (cut > from).then_some(cut)
+}
+
+/// The prompt of the turn a cut splits, word for word; `None` when the cut is at
+/// a user message. shortcut: a steering message sent mid-turn counts as the prompt;
+/// collect the turn's earlier user messages too if that loses requests.
+pub fn split_prompt(path: &[&Entry], cut: usize) -> Option<String> {
+    let user = |e: &Entry| match &e.kind {
+        EntryKind::Message {
+            message: Message::User { content },
+        } => Some(content.clone()),
+        _ => None,
+    };
+    if user(path[cut]).is_some() {
+        return None;
     }
-    (i > from && is_user(path[i])).then_some(i)
+    let content = path[..cut].iter().rev().find_map(|e| user(e))?;
+    let text: Vec<String> = content
+        .into_iter()
+        .filter_map(|b| match b {
+            Block::Text { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect();
+    (!text.is_empty()).then(|| text.join("\n"))
 }
 
 /// A lasting fact distilled from several notes by the reflector.

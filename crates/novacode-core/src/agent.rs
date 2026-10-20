@@ -935,7 +935,13 @@ impl Agent {
             .iter()
             .filter(|e| matches!(e.kind, EntryKind::Message { .. }))
             .count();
-        let summary = memory::render_summary(&refl, &notes, summary_text.as_deref(), &read, &changed, dropped);
+        let mut summary = memory::render_summary(&refl, &notes, summary_text.as_deref(), &read, &changed, dropped);
+        // The cut split a turn: the request being worked on stays word for word.
+        if let Some(p) = memory::split_prompt(&path, cut_i) {
+            summary.push_str(&format!(
+                "\n\n## Request in progress\nThe conversation below continues the turn started by this user message:\n{p}"
+            ));
+        }
         let fallback = notes.is_empty() && refl.is_empty() && summary_text.is_none();
         let system = crate::prompt::render(&self.store.sections());
         let n = notes.len();

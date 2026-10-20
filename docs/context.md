@@ -101,6 +101,8 @@ While you work, a small background "observer" reads the new part of the conversa
 
 When the context gets close to full, novacode **compacts**. It keeps your most recent messages as they are and replaces everything older with a summary built from the notes (lasting facts first, then notes, then the files that were read and changed). If the notes lag behind the cut point, the observer first catches up with extra calls to the worker model (`memory.model`, else the provider's small model, else the session model). If that fails, the session model summarises the gap instead. If both fail, the older messages are dropped and the summary says "No notes were available"; the model is told to ask you if it needs what they held.
 
+The system prompt (instructions, tool rules, project files, skills) is never compacted; only the conversation is. The cut can fall inside a long turn, between two of the model's replies (a tool call always stays with its result). When it does, the prompt that started that turn is copied word for word into the summary, so the model still knows exactly what it is working on.
+
 Each note has an id. The model can call the `recall` tool with a note id to get the original messages behind it.
 
 Compaction runs by itself in three cases:

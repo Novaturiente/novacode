@@ -589,9 +589,10 @@ fn command(words: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
         // has the pattern in its own: it kills itself (seen in a real session).
         "pkill"
             if has_flag(args, 'f', "--full")
-                && args.last().filter(|p| !p.starts_with('-')).is_some_and(|p| {
-                    regex::Regex::new(p).is_ok_and(|r| r.is_match(p))
-                }) =>
+                && args
+                    .last()
+                    .filter(|p| !p.starts_with('-'))
+                    .is_some_and(|p| regex::Regex::new(p).is_ok_and(|r| r.is_match(p))) =>
         {
             Risk::new(
                 Level::Catastrophic,

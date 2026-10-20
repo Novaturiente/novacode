@@ -31,7 +31,9 @@ impl Tool for Read {
         schema_for::<Args>()
     }
     fn guidelines(&self) -> &[&str] {
-        &["Use `read` to look at files, not cat, head, tail or sed in bash: it pages with offset/limit instead of cutting the output."]
+        &[
+            "Use `read` to look at files, not cat, head, tail or sed in bash: it pages with offset/limit instead of cutting the output.",
+        ]
     }
     fn execute<'a>(&'a self, args: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {

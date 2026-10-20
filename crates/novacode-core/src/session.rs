@@ -505,13 +505,16 @@ fn project(path: &[&Entry]) -> Vec<Message> {
             Some(Some(r)) => (*r).clone(),
             None => msg,
         };
-        if let Message::User { content } = &mut msg
+        // The summary opens the first kept user message; a cut at an assistant
+        // message (split turn) gets a user message of its own before it.
+        if !matches!(msg, Message::System { .. })
             && let Some(s) = summary.take()
         {
-            content.insert(
-                0,
-                Block::text(format!("<compaction-summary>\n{s}\n</compaction-summary>")),
-            );
+            let b = Block::text(format!("<compaction-summary>\n{s}\n</compaction-summary>"));
+            match &mut msg {
+                Message::User { content } => content.insert(0, b),
+                _ => out.push(Message::User { content: vec![b] }),
+            }
         }
         out.push(msg);
     }

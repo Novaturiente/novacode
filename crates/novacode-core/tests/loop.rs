@@ -844,6 +844,65 @@ async fn compaction_without_notes_falls_back() {
     assert!(p.contains("Summary of the earlier conversation"), "{p}");
 }
 
+/// One prompt followed by many tool calls (the novabrowser session): `/compact`
+/// cuts inside the turn instead of keeping all of it, and the prompt stays word
+/// for word in the summary, which gets a user message of its own.
+#[tokio::test]
+async fn compact_splits_one_long_turn_and_keeps_its_prompt() {
+    use novacode_core::memory::{Settings, Worker};
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    // Each call prints ~1k tokens.
+    let bash = |i: usize| {
+        let cmd = format!("echo out{i}; head -c 4000 /dev/zero | tr '\\0' x");
+        tools_reply(vec![call(&format!("b{i}"), "bash", json!({ "command": cmd }))])
+    };
+    let mut replies: Vec<FauxReply> = (0..10).map(bash).collect();
+    replies.push(FauxReply::text("done"));
+    let observer = Faux::new((0..20).map(notes_reply));
+    let store = Store::create(&Paths::new(home.path()), work.path(), false);
+    let agent = Agent::new(
+        Arc::new(Faux::new(replies)),
+        novacode_tools::builtins(false),
+        store,
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_memory(
+        Worker {
+            adapter: Arc::new(observer),
+            provider: "faux".into(),
+            model: "small".into(),
+        },
+        Settings {
+            observe_after: 1_000_000,
+            keep_recent: 2500,
+            compact_at: u64::MAX,
+            chunk_tokens: 3000,
+            reflect_after: u64::MAX,
+            pool_target: u64::MAX,
+        },
+    );
+    let (mut agent, _) = drive(agent, &["add a --profile flag"]).await;
+    assert!(agent.compact("you asked for it").await, "nothing was compacted");
+    let after = agent.store.projection();
+    let p = format!("{after:?}");
+    assert!(!p.contains("out0"), "the turn's early tool output is compacted away");
+    assert!(p.contains("out9"), "the recent tool output is kept");
+    let Message::User { content } = &after[1] else {
+        panic!("{:?}", after[1])
+    };
+    let summary = format!("{content:?}");
+    assert!(
+        summary.contains("compaction-summary")
+            && summary.contains("Request in progress")
+            && summary.contains("add a --profile flag"),
+        "{summary}"
+    );
+    assert_eq!(content.len(), 1, "the summary has a user message of its own");
+    assert!(matches!(&after[2], Message::Assistant(_)), "{:?}", after[2]);
+}
+
 /// The reflector keeps only supports that name active notes; the dropper's
 /// proposals are capped by code to what brings the pool back to its target.
 #[tokio::test]
