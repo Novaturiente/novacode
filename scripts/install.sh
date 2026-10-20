@@ -1,10 +1,10 @@
 #!/bin/sh
 # Install the latest novacode release (L11.7):
-#   curl -fsSL https://raw.githubusercontent.com/OWNER/novacode/master/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Novaturiente/novacode/main/scripts/install.sh | sh
 # Puts `novacode` in $NOVACODE_BIN_DIR (default ~/.local/bin). Verifies the checksum.
 # Never touches ~/.novacode. Update later with `novacode update`.
 set -eu
-repo="${NOVACODE_REPO:-OWNER/novacode}" # shortcut: placeholder until the repo exists
+repo="${NOVACODE_REPO:-Novaturiente/novacode}"
 bin_dir="${NOVACODE_BIN_DIR:-$HOME/.local/bin}"
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) target=x86_64-unknown-linux-musl ;;

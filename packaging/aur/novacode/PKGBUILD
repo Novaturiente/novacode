@@ -1,11 +1,11 @@
-# Maintainer: Your Name <you@example.com>
-# shortcut: placeholders (maintainer, OWNER, sha256sums) until the first release.
+# Maintainer: Novaturiente
+# shortcut: sha256sums SKIP until the first release; set them with updpkgsums.
 pkgname=novacode
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="A lightweight, fast, extensible coding agent harness"
 arch=('x86_64' 'aarch64')
-url="https://github.com/OWNER/novacode"
+url="https://github.com/Novaturiente/novacode"
 license=('MIT OR Apache-2.0')
 depends=('gcc-libs' 'glibc')
 makedepends=('cargo' 'git')

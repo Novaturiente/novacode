@@ -1,17 +1,17 @@
-# Maintainer: Your Name <you@example.com>
-# shortcut: placeholders (maintainer, OWNER, sha256sums) until the first release.
+# Maintainer: Novaturiente
+# shortcut: sha256sums SKIP until the first release; set them with updpkgsums.
 pkgname=novacode-bin
 _name=novacode
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="A lightweight, fast, extensible coding agent harness (prebuilt static binary)"
 arch=('x86_64' 'aarch64')
-url="https://github.com/OWNER/novacode"
+url="https://github.com/Novaturiente/novacode"
 license=('MIT OR Apache-2.0')
 provides=("$_name")
 conflicts=("$_name")
-source=("LICENSE-MIT::https://raw.githubusercontent.com/OWNER/novacode/v$pkgver/LICENSE-MIT"
-        "LICENSE-APACHE::https://raw.githubusercontent.com/OWNER/novacode/v$pkgver/LICENSE-APACHE")
+source=("LICENSE-MIT::https://raw.githubusercontent.com/Novaturiente/novacode/v$pkgver/LICENSE-MIT"
+        "LICENSE-APACHE::https://raw.githubusercontent.com/Novaturiente/novacode/v$pkgver/LICENSE-APACHE")
 source_x86_64=("$_name-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/$_name-$pkgver-x86_64-unknown-linux-musl.tar.gz")
 source_aarch64=("$_name-$pkgver-aarch64.tar.gz::$url/releases/download/v$pkgver/$_name-$pkgver-aarch64-unknown-linux-musl.tar.gz")
 sha256sums=('SKIP' 'SKIP')

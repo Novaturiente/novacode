@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 /// `owner/name` of the GitHub repo that publishes releases.
 // shortcut: placeholder until the repo exists; set it before the first release.
-pub const REPO: &str = "OWNER/novacode";
+pub const REPO: &str = "Novaturiente/novacode";
 
 pub fn install_kind() -> &'static str {
     option_env!("NOVACODE_INSTALL").unwrap_or("source")
