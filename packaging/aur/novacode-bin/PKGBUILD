@@ -2,7 +2,7 @@
 # shortcut: sha256sums SKIP until the first release; set them with updpkgsums.
 pkgname=novacode-bin
 _name=novacode
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc="A lightweight, fast, extensible coding agent harness (prebuilt static binary)"
 arch=('x86_64' 'aarch64')
