@@ -1,6 +1,6 @@
-# novacode
+<p align="center"><img src="logos/export/star/logo.svg" alt="novacode" width="480"></p>
 
-A coding agent for your terminal, in one small Rust binary.
+<p align="center">A coding agent for your terminal, in one small Rust binary.</p>
 
 novacode reads and edits your code, runs commands, and works through tasks with you, like Claude Code, pi or Codex. It uses the subscriptions you already pay for (Claude Pro/Max, ChatGPT/Codex, Antigravity, GitHub Copilot) or an API key for about 50 providers, including local models. Your existing Claude Code skills, agents and commands load without moving any files.
 
