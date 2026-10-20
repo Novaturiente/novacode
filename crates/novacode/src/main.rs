@@ -69,6 +69,10 @@ struct Cli {
     /// Don't save this session.
     #[arg(long)]
     no_session: bool,
+    /// Start in git worktree <repo>/.worktrees/NAME on branch worktree-NAME, made if missing
+    /// (no NAME: a new one named from the time). With -r, reopens a session that was in it.
+    #[arg(short = 'w', long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+    worktree: Option<String>,
     /// Permission mode for this session: auto, ask or read-only.
     #[arg(long, value_parser = parse_mode)]
     mode: Option<Mode>,
@@ -258,6 +262,13 @@ enum Command {
         path: Option<std::path::PathBuf>,
         #[arg(long)]
         revoke: bool,
+    },
+    /// Print a shell function that follows the session's folder (e.g. a worktree) when
+    /// novacode exits. Add to your rc: `novacode shell-init fish | source` (fish) or
+    /// `eval "$(novacode shell-init zsh)"` (zsh, bash).
+    ShellInit {
+        #[arg(value_parser = ["fish", "zsh", "bash"])]
+        shell: String,
     },
 }
 
@@ -708,6 +719,10 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             }
             return Ok(ExitCode::SUCCESS);
         }
+        Some(Command::ShellInit { shell }) => {
+            print!("{}", if shell == "fish" { SHELL_FISH } else { SHELL_SH });
+            return Ok(ExitCode::SUCCESS);
+        }
         None => {}
     }
     // --bg: start a detached copy of this command and report its session id.
@@ -734,6 +749,13 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     }
     let interactive = prompt.is_none() && !headless;
 
+    if let Some(name) = &cli.worktree {
+        let name = if name.is_empty() { chrono_name() } else { name.clone() };
+        let (path, msg) =
+            novacode_tools::worktree::create(&std::env::current_dir()?, &name).map_err(anyhow::Error::msg)?;
+        std::env::set_current_dir(&path)?;
+        eprintln!("{msg}");
+    }
     let cwd = std::env::current_dir()?;
     let trust_store = TrustStore::new(paths.home().join("trust.json"));
     let mut trusted = trust::resolve(&trust_store, &cwd, cli.trust);
@@ -1885,6 +1907,45 @@ fn restart(id: &str) -> anyhow::Error {
 }
 
 /// `--bg`: re-run this command detached, wait for its session id, print it.
+/// Quitting inside a worktree: keep it (Enter) or remove it. Asked on the terminal after the TUI closed.
+fn ask_remove(h: &novacode_tools::worktree::Here) -> bool {
+    eprint!("Leaving {}.\nKeep the worktree? [Y/n] ", h.summary());
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    matches!(line.trim(), "n" | "N" | "no")
+}
+
+/// `-w` without a name: `wt-MMDD-HHMM` (UTC).
+fn chrono_name() -> String {
+    let t = novacode_core::memory::utc_minute(session::now_ms());
+    format!("wt-{}{}-{}{}", &t[5..7], &t[8..10], &t[11..13], &t[14..16])
+}
+
+const SHELL_FISH: &str = r#"function novacode --wraps novacode --description 'novacode; cd to the session folder on exit'
+    set -l f (mktemp)
+    NOVACODE_CWD_FILE=$f command novacode $argv
+    set -l st $status
+    set -l d (cat $f 2>/dev/null)
+    rm -f $f
+    if test -n "$d" -a -d "$d" -a "$d" != "$PWD"
+        cd $d
+    end
+    return $st
+end
+"#;
+
+const SHELL_SH: &str = r#"novacode() {
+    local f st d
+    f=$(mktemp) || return
+    NOVACODE_CWD_FILE="$f" command novacode "$@"
+    st=$?
+    d=$(cat "$f" 2>/dev/null)
+    rm -f "$f"
+    if [ -n "$d" ] && [ -d "$d" ] && [ "$d" != "$PWD" ]; then cd "$d" || true; fi
+    return $st
+}
+"#;
+
 fn spawn_bg() -> anyhow::Result<ExitCode> {
     use std::io::BufRead;
     use std::os::unix::process::CommandExt;
@@ -2103,8 +2164,25 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
         drop(agent);
         let next = match res {
             Exit::Quit => {
+                // The agent keeps the process cwd on the session's folder (worktree moves included).
+                let mut dir = std::env::current_dir().unwrap_or_else(|_| ctx.cwd.clone());
+                let mut wt = novacode_tools::worktree::here(&dir)
+                    .ok()
+                    .and_then(|h| h.name().map(|n| (h, n)));
+                if let Some((h, _)) = &wt
+                    && ask_remove(h)
+                {
+                    eprintln!("{}", novacode_tools::worktree::remove(h).trim());
+                    dir = h.main().to_path_buf();
+                    wt = None;
+                }
                 if prev.as_ref().is_some_and(|p| p.exists()) {
-                    eprintln!("resume with: novacode -r {}", &id[..id.len().min(13)]);
+                    let w = wt.map(|(_, n)| format!("-w {n} ")).unwrap_or_default();
+                    eprintln!("resume with: novacode {w}-r {}", &id[..id.len().min(13)]);
+                }
+                // `novacode shell-init`'s function cd's here after we exit.
+                if let Some(f) = std::env::var_os("NOVACODE_CWD_FILE") {
+                    let _ = std::fs::write(f, dir.as_os_str().as_encoded_bytes());
                 }
                 return Ok(ExitCode::SUCCESS);
             }

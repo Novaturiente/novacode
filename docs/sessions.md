@@ -27,7 +27,7 @@ One novacode process owns a session file at a time. Opening a session that is op
 | `novacode -r <id>` | Resume a session by id prefix, or by the path of a `.jsonl` file. It looks in this folder first, then in every folder, and takes the first match. |
 | `novacode --no-session` | Don't save this session. |
 
-When you quit, novacode prints `resume with: novacode -r <id>` if the session was saved.
+When you quit, novacode prints `resume with: novacode -r <id>` if the session was saved. If it ended inside a worktree, the hint is `novacode -w <name> -r <id>`, which reopens it there from anywhere in the repo.
 
 Inside the UI:
 
@@ -38,6 +38,31 @@ Inside the UI:
 | `/name <text>` | Name this session. The name shows in the `/resume` list; without one, the first prompt does. |
 
 `--no-session` also applies to `/new`. With it, no file is written, and file rewind is not available (see below).
+
+## Worktrees
+
+A git worktree is a second checkout of the same repo in another folder, on its own branch. Work there doesn't touch your main checkout. novacode keeps them in `<repo>/.worktrees/<name>` on branch `worktree-<name>`, hides the folder from `git status` (through `.git/info/exclude`), and copies root `.env` files in.
+
+| How | What it does |
+|---|---|
+| `novacode -w <name>` | Create (or reuse) the worktree and start the session in it. No name: `wt-MMDD-HHMM` (UTC). Works from inside another worktree too. |
+| `/worktree` | List the repo's worktrees: branch, uncommitted files, commits not in the main checkout. `*` marks this session's. |
+| `/worktree <name>` | Move this session into that worktree, creating it if needed. |
+| `/worktree exit` | Move back to the main checkout and keep the worktree. |
+| `/worktree remove` | Move back and remove it. Git refuses if there are uncommitted changes; an unmerged branch is kept. |
+| `enter_worktree`, `exit_worktree` | The same, as tools the model can call (see [tools](tools.md#enter_worktree-and-exit_worktree)). |
+
+**Quitting inside a worktree** asks `Keep the worktree? [Y/n]` on the terminal. `Enter` keeps it; `n` removes it the same way `/worktree remove` does.
+
+**Your shell can follow.** A program can't change its parent shell's folder, so novacode writes its final folder to `$NOVACODE_CWD_FILE` and a small shell function `cd`s there. Add one line to your shell's config:
+
+```sh
+novacode shell-init fish | source          # ~/.config/fish/config.fish
+eval "$(novacode shell-init zsh)"          # ~/.zshrc
+eval "$(novacode shell-init bash)"         # ~/.bashrc
+```
+
+After that, quitting a session that ended in a worktree leaves your shell in that worktree (or in the main checkout if you removed it).
 
 ## Branches
 

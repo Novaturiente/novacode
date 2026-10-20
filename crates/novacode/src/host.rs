@@ -310,6 +310,40 @@ impl Host {
             }
             Cmd::Focus(f) => self.hub.set_focus(f),
             Cmd::Rename(name) => self.hub.handle.rename(name.trim()),
+            Cmd::Worktree(arg) => {
+                let (h, ui) = (self.hub.handle.clone(), ui.clone());
+                // The session's folder: the agent keeps the process cwd in step (move_to).
+                let cwd = std::env::current_dir().unwrap_or_else(|_| self.cwd.clone());
+                tokio::task::spawn_blocking(move || {
+                    use novacode_tools::worktree;
+                    let ev = |r: Result<String, String>| match r {
+                        Ok(text) => UiEvent::Notice { text, error: false },
+                        Err(text) => UiEvent::Notice { text, error: true },
+                    };
+                    let _ = ui.send(match arg.trim() {
+                        "" => match worktree::list(&cwd) {
+                            Ok(text) => UiEvent::Page {
+                                title: "Worktrees".into(),
+                                text,
+                            },
+                            Err(e) => ev(Err(e)),
+                        },
+                        a @ ("exit" | "remove") => ev(worktree::here(&cwd).map(|w| {
+                            let note = if a == "remove" {
+                                worktree::remove(&w)
+                            } else {
+                                format!(" Worktree kept at {}.", w.top().display())
+                            };
+                            h.move_to(w.main().to_path_buf());
+                            format!("back in the main checkout {}.{note}", w.main().display())
+                        })),
+                        name => ev(worktree::create(&cwd, name).map(|(path, msg)| {
+                            h.move_to(path);
+                            msg
+                        })),
+                    });
+                });
+            }
             Cmd::Btw(q) => {
                 let (h, ui) = (self.hub.handle.clone(), ui.clone());
                 let _ = ui.send(UiEvent::Notice {
@@ -415,6 +449,7 @@ impl Host {
             "/context" => Cmd::Context,
             "/mcp" => Cmd::Mcp,
             "/name" if !arg.is_empty() => Cmd::Rename(arg.into()),
+            "/worktree" => Cmd::Worktree(arg.into()),
             "/btw" if !arg.is_empty() => Cmd::Btw(arg.into()),
             "/export" => Cmd::Export(arg == "html"),
             "/model" if !arg.is_empty() => Cmd::SetModel(arg.into()),

@@ -135,6 +135,7 @@ Both exit with `1` when nothing is connected. Without a model, a `-p` run fails 
 | `-c`, `--continue` | Continue the newest session in this folder |
 | `-r`, `--resume ID` | Resume a session by id prefix |
 | `--no-session` | Don't save this session |
+| `-w`, `--worktree [NAME]` | Start in git worktree `.worktrees/NAME` (made if missing; no NAME: `wt-MMDD-HHMM`) |
 | `--mode auto\|ask\|read-only` | Permission mode |
 | `--profile NAME` | Limit tools to a named profile, e.g. `scout` |
 | `--trust` | Trust this folder's project config for this run |
@@ -167,6 +168,7 @@ Both exit with `1` when nothing is connected. Without a model, a `-p` run fails 
 | `import claude [--yes]` | Copy Claude Code settings once |
 | `trust [PATH] [--revoke]` | Trust (or distrust) a folder's project config |
 | `update` | Update novacode itself |
+| `shell-init fish\|zsh\|bash` | Print a shell function that follows the session's folder on exit |
 
 Details for `-p`, `--json`, `--rpc`, `--bg` and exit codes are in [automation](automation.md); the rest are on the pages linked from [Next steps](#next-steps).
 

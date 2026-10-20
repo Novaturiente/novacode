@@ -47,6 +47,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/btw", "side question: /btw <question>, not kept in the conversation"),
     ("/name", "name this session: /name <text>"),
     (
+        "/worktree",
+        "git worktrees: list, /worktree <name> to enter or create, /worktree exit or remove to leave",
+    ),
+    (
         "/login",
         "log in: /login <provider> (claude, codex, antigravity, copilot, or an API-key provider)",
     ),
@@ -132,6 +136,8 @@ pub enum Cmd {
     Mcp,
     /// `/name` (L4.4).
     Rename(String),
+    /// `/worktree [name|exit|remove]` (L5.22): the host lists, enters or leaves.
+    Worktree(String),
     /// `/btw <question>`: a side answer, shown as a page, never stored.
     Btw(String),
     /// Alt+Up: take back the newest queued message; `true` = a steer. The host
@@ -1254,6 +1260,7 @@ impl App {
                 "/btw" => self.flash("usage: /btw <question>"),
                 "/name" if !arg.is_empty() => self.send(Cmd::Rename(arg.to_string())),
                 "/name" => self.flash("usage: /name <text>"),
+                "/worktree" => self.send(Cmd::Worktree(arg.to_string())),
                 "/login" if !arg.is_empty() => self.login = Some(arg.to_string()),
                 "/login" => self.flash("usage: /login <provider>, e.g. /login claude"),
                 "/context" => self.send(Cmd::Context),

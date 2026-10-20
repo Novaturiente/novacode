@@ -614,6 +614,9 @@ pub async fn attach(
                 Cmd::Rename(name) => ClientCmd::Prompt {
                     text: format!("/name {name}"),
                 },
+                Cmd::Worktree(arg) => ClientCmd::Prompt {
+                    text: format!("/worktree {arg}"),
+                },
                 Cmd::ExtKey {
                     ext,
                     tab,

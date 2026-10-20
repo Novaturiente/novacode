@@ -67,7 +67,7 @@ The pane closes when the session's window closes. See [config](config.md) for al
 
 | What | How |
 |---|---|
-| New line | `Shift+Enter` or `Ctrl+J`. |
+| New line | `Shift+Enter`, `Ctrl+J`, or `\` then `Enter` (the backslash is dropped). |
 | Send | `Enter`. |
 | Move and delete | Emacs-style keys (`Ctrl+A`, `Ctrl+E`, `Ctrl+W`, `Ctrl+K`, `Ctrl+Y`…). Full list below. |
 | Undo | `Ctrl+-`. |
@@ -78,7 +78,7 @@ The pane closes when the session's window closes. See [config](config.md) for al
 | Copy the input | `Alt+C`. |
 | Clear | `Ctrl+C` clears the editor. `Esc` twice quickly does too. |
 
-`Shift+Enter` needs a terminal that supports the Kitty keyboard protocol. Elsewhere use `Ctrl+J`.
+`Shift+Enter` needs a terminal that supports the Kitty keyboard protocol, or tmux with `set -s extended-keys on` (novacode turns on xterm's modifyOtherKeys there). Elsewhere use `Ctrl+J` or `\` + `Enter`, which work in every terminal.
 
 Big pastes (more than 5 lines or 1000 characters) collapse to a marker like `[paste #1 +40 lines]`. The full text is sent when you submit.
 
@@ -126,6 +126,7 @@ Type `/` to see the list. A line that is only `/something` unknown to novacode i
 | `/resume` | Resume another session from this folder. |
 | `/new` | Start a new session. |
 | `/name <text>` | Name this session. |
+| `/worktree [name \| exit \| remove]` | Git worktrees: list them, enter or create `.worktrees/<name>`, or go back to the main checkout keeping or removing this one. See [sessions](sessions.md#worktrees). |
 | `/tree` | Jump to any prompt in the session tree. |
 | `/rewind` | Go back to before a prompt of this branch, with files. |
 | `/fork` | New session up to before a prompt. |

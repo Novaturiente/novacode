@@ -99,9 +99,10 @@ struct EnterArgs {
 }
 
 /// Create (or reuse) `<repo>/.worktrees/<name>` on branch `worktree-<name>`.
+/// Works from inside another worktree too: the folder is always under the main checkout.
 pub fn create(cwd: &Path, name: &str) -> Result<(PathBuf, String), String> {
     enter(
-        cwd,
+        &repo(cwd)?.main,
         &EnterArgs {
             name: name.into(),
             base: None,
@@ -185,6 +186,106 @@ fn enter(cwd: &Path, a: &EnterArgs) -> Result<(PathBuf, String), String> {
     Ok((path, msg))
 }
 
+/// The linked worktree `cwd` is in: what leaving it would lose.
+pub struct Here {
+    r: Repo,
+    pub branch: String,
+    pub dirty: usize,
+    pub ahead: String,
+}
+
+impl Here {
+    pub fn top(&self) -> &Path {
+        &self.r.top
+    }
+    pub fn main(&self) -> &Path {
+        &self.r.main
+    }
+    /// `<name>` when this is novacode's own `<main>/.worktrees/<name>`, so `-w <name>` reopens it.
+    pub fn name(&self) -> Option<String> {
+        (self.r.top.parent()? == self.r.main.join(".worktrees"))
+            .then(|| self.r.top.file_name().map(|n| n.to_string_lossy().into_owned()))?
+    }
+    pub fn summary(&self) -> String {
+        format!(
+            "{} ({}): {} uncommitted file(s), {} commit(s) not in the main checkout",
+            self.r.top.display(),
+            if self.branch.is_empty() {
+                "detached"
+            } else {
+                &self.branch
+            },
+            self.dirty,
+            self.ahead
+        )
+    }
+}
+
+pub fn here(cwd: &Path) -> Result<Here, String> {
+    let r = repo(cwd)?;
+    if !r.linked {
+        return Err("not inside a linked worktree".into());
+    }
+    let branch = git(&r.top, &["branch", "--show-current"]).unwrap_or_default();
+    // The .env copies made on entry aren't the user's changes.
+    let copies = env_copies(&r);
+    let dirty = git(&r.top, &["status", "--porcelain"])
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !copies.iter().any(|c| l.trim_start_matches("?? ") == c))
+        .count();
+    let main_head = git(&r.main, &["rev-parse", "HEAD"])?;
+    let ahead = git(&r.top, &["rev-list", "--count", &format!("{main_head}..HEAD")]).unwrap_or_default();
+    Ok(Here {
+        r,
+        branch,
+        dirty,
+        ahead,
+    })
+}
+
+/// Remove the worktree (git refuses uncommitted changes; an unmerged branch is kept).
+/// Returns what happened, starting with a space.
+pub fn remove(h: &Here) -> String {
+    let (top, main) = (&h.r.top, &h.r.main);
+    for c in env_copies(&h.r) {
+        let _ = std::fs::remove_file(top.join(c));
+    }
+    match git(main, &["worktree", "remove", &top.to_string_lossy()]) {
+        Err(e) => format!(" Worktree NOT removed: {e}"),
+        Ok(_) if h.branch.is_empty() => " Worktree removed.".into(),
+        Ok(_) if git(main, &["branch", "-d", &h.branch]).is_ok() => {
+            format!(" Worktree and branch {} removed.", h.branch)
+        }
+        Ok(_) => format!(" Worktree removed; branch {} kept (not merged).", h.branch),
+    }
+}
+
+/// `/worktree`: every worktree of the repo with its branch and state; `*` = `cwd`'s.
+pub fn list(cwd: &Path) -> Result<String, String> {
+    let r = repo(cwd)?;
+    let mut out = String::new();
+    for block in git(&r.main, &["worktree", "list", "--porcelain"])?.split("\n\n") {
+        let Some(path) = block.lines().find_map(|l| l.strip_prefix("worktree ")) else {
+            continue;
+        };
+        let branch = block
+            .lines()
+            .find_map(|l| l.strip_prefix("branch refs/heads/"))
+            .unwrap_or("detached");
+        let p = Path::new(path);
+        let state = match here(p) {
+            Ok(h) => format!("{} uncommitted, {} ahead", h.dirty, h.ahead),
+            Err(_) if p == r.main => "main checkout".into(),
+            Err(e) => e,
+        };
+        let mark = if p == r.top { "*" } else { " " };
+        out += &format!("{mark} {path}  [{branch}]  {state}\n");
+    }
+    out += "\n/worktree <name> enters or creates one · /worktree exit leaves · /worktree remove leaves and removes";
+    Ok(out)
+}
+
 impl Tool for EnterWorktree {
     fn name(&self) -> &str {
         "enter_worktree"
@@ -253,25 +354,8 @@ impl Tool for ExitWorktree {
     fn execute<'a>(&'a self, _args: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
             let cwd = ctx.cwd.clone();
-            let info = tokio::task::spawn_blocking(move || -> Result<_, String> {
-                let r = repo(&cwd)?;
-                if !r.linked {
-                    return Err("not inside a linked worktree".into());
-                }
-                let branch = git(&r.top, &["branch", "--show-current"]).unwrap_or_default();
-                // The .env copies made on entry aren't the user's changes.
-                let copies = env_copies(&r);
-                let dirty = git(&r.top, &["status", "--porcelain"])
-                    .unwrap_or_default()
-                    .lines()
-                    .filter(|l| !copies.iter().any(|c| l.trim_start_matches("?? ") == c))
-                    .count();
-                let main_head = git(&r.main, &["rev-parse", "HEAD"])?;
-                let ahead = git(&r.top, &["rev-list", "--count", &format!("{main_head}..HEAD")]).unwrap_or_default();
-                Ok((r, branch, dirty, ahead))
-            })
-            .await;
-            let (r, branch, dirty, ahead) = match info {
+            let info = tokio::task::spawn_blocking(move || here(&cwd)).await;
+            let h = match info {
                 Ok(Ok(x)) => x,
                 Ok(Err(e)) => return ToolOutput::error(e),
                 Err(e) => return ToolOutput::error(e.to_string()),
@@ -279,12 +363,9 @@ impl Tool for ExitWorktree {
             let remove = match &self.0 {
                 None => false,
                 Some(asker) => {
+                    let dirty = h.dirty;
                     let q = Question {
-                        question: format!(
-                            "Leave {} ({}): {dirty} uncommitted file(s), {ahead} commit(s) not in the main checkout. Keep or remove the worktree?",
-                            r.top.display(),
-                            if branch.is_empty() { "detached" } else { &branch }
-                        ),
+                        question: format!("Leave {}. Keep or remove the worktree?", h.summary()),
                         header: Some("Worktree".into()),
                         options: vec![
                             Choice {
@@ -310,31 +391,15 @@ impl Tool for ExitWorktree {
                     }
                 }
             };
-            let (top, main) = (r.top.clone(), r.main.clone());
-            let copies = env_copies(&r);
+            let main = h.r.main.clone();
             let note = if remove {
-                tokio::task::spawn_blocking(move || {
-                    for c in copies {
-                        let _ = std::fs::remove_file(top.join(c));
-                    }
-                    match git(&main, &["worktree", "remove", &top.to_string_lossy()]) {
-                        Err(e) => format!(" Worktree NOT removed: {e}"),
-                        Ok(_) if branch.is_empty() => " Worktree removed.".into(),
-                        Ok(_) if git(&main, &["branch", "-d", &branch]).is_ok() => {
-                            format!(" Worktree and branch {branch} removed.")
-                        }
-                        Ok(_) => format!(" Worktree removed; branch {branch} kept (not merged)."),
-                    }
-                })
-                .await
-                .unwrap_or_default()
+                tokio::task::spawn_blocking(move || self::remove(&h))
+                    .await
+                    .unwrap_or_default()
             } else {
-                format!(" Worktree kept at {}.", r.top.display())
+                format!(" Worktree kept at {}.", h.r.top.display())
             };
-            set_cwd(
-                format!("Back in the main checkout {}.{note}", r.main.display()),
-                &r.main,
-            )
+            set_cwd(format!("Back in the main checkout {}.{note}", main.display()), &main)
         })
     }
 }
@@ -388,6 +453,15 @@ mod tests {
         assert!(wt.exists());
         // Entering again reuses it.
         assert!(text(&EnterWorktree.execute(json!({"name": "fix-x"}), &c).await).contains("existing"));
+        // `-w` / `/worktree` from inside a worktree resolve against the main checkout.
+        assert_eq!(create(&wt, "fix-x").unwrap().0, wt);
+        assert_eq!(here(&wt).unwrap().name().as_deref(), Some("fix-x"));
+        assert!(here(&root).is_err());
+        let l = list(&wt).unwrap();
+        assert!(
+            l.contains(&format!("* {}  [worktree-fix-x]  0 uncommitted", wt.display())),
+            "{l}"
+        );
         // Removal: the unchanged .env copy doesn't count as work and doesn't block it.
         struct Remove;
         impl Asker for Remove {

@@ -169,6 +169,8 @@ struct Shared {
     compact: Mutex<bool>,
     /// `/name`: written between runs (L4.4).
     rename: Mutex<Option<String>>,
+    /// `/worktree`: the folder to move the session to, between runs.
+    move_to: Mutex<Option<PathBuf>>,
     /// The session's prompts as a tree, refreshed with the report (for `/tree`).
     prompts: Mutex<Vec<crate::session::PromptNode>>,
     /// What extensions read and call from outside the owner task (L7.11).
@@ -1847,6 +1849,12 @@ impl SessionHandle {
         self.shared.notify.notify_one();
     }
 
+    /// Move the session to another folder (`/worktree`), as `enter_worktree` does; applied between runs.
+    pub fn move_to(&self, dir: PathBuf) {
+        *self.shared.move_to.lock().unwrap() = Some(dir);
+        self.shared.notify.notify_one();
+    }
+
     /// Take back the newest queued message that hasn't reached the model yet (pi's
     /// Alt+Up). `steer` picks the steering queue, else the follow-ups.
     pub fn dequeue(&self, steer: bool) -> bool {
@@ -1951,6 +1959,10 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
                 agent.emit(AgentEvent::Stream(StreamEvent::Notice {
                     text: format!("session named \"{name}\""),
                 }));
+            }
+            let dir = agent.shared.move_to.lock().unwrap().take();
+            if let Some(dir) = dir {
+                agent.move_to(dir);
             }
             if std::mem::take(&mut *agent.shared.compact.lock().unwrap()) {
                 if agent.memory.is_none() {
