@@ -70,6 +70,10 @@ pub fn enter() -> std::io::Result<Term> {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )?;
         KITTY.store(true, Ordering::Relaxed);
+    } else {
+        // tmux ignores the kitty push but honours xterm modifyOtherKeys (with
+        // `extended-keys on`), which still gets Shift+Enter through as CSI 13;2u.
+        execute!(out, crossterm::style::Print("\x1b[>4;1m"))?;
     }
     // Not `Terminal::clear()`: it queries the cursor position and waits on stdin for the
     // reply, which a still-draining event reader of the previous run can swallow (2 s
@@ -84,6 +88,8 @@ pub fn restore() {
     let mut out = stdout();
     if KITTY.swap(false, Ordering::Relaxed) {
         let _ = queue!(out, PopKeyboardEnhancementFlags);
+    } else {
+        let _ = queue!(out, crossterm::style::Print("\x1b[>4m"));
     }
     let _ = queue!(
         out,

@@ -388,6 +388,11 @@ impl Editor {
         }
         match a {
             Some(A::NewLine) => self.insert("\n"),
+            // `\` then Enter: a newline on any terminal, like Claude Code and pi.
+            Some(A::Submit) if self.text[..self.cursor].ends_with('\\') => {
+                self.delete(self.cursor - 1, self.cursor, false);
+                self.insert("\n");
+            }
             Some(A::Submit) => {
                 if let Some(t) = self.take() {
                     return Action::Submit(t);
@@ -519,6 +524,14 @@ mod tests {
         typ(&mut e, "é😀");
         key(&mut e, KeyCode::Backspace, KeyModifiers::NONE);
         assert_eq!(e.text(), "hello é");
+    }
+
+    #[test]
+    fn backslash_enter_is_a_newline() {
+        let mut e = Editor::default();
+        typ(&mut e, "a\\");
+        assert!(matches!(key(&mut e, KeyCode::Enter, KeyModifiers::NONE), Action::None));
+        assert_eq!(e.text(), "a\n");
     }
 
     #[test]
