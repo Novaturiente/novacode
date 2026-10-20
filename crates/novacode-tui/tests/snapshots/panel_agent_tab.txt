@@ -13,4 +13,4 @@ build 3/5                                                             │
 ╭ deploy mode ───────────────────────────────────────────────────────╮│
 │                                                                    ││
 ╰────────────────────────────────────────────────────────────────────╯│
- ⠋ working            ▲ deploying  claude/opus · medium  proj  ⎇ main │
+ ⠋ working                   ▲ deploying  opus · medium  proj  ⎇ main │

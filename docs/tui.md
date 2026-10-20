@@ -334,11 +334,11 @@ Segments:
 | Segment | Shows |
 |---|---|
 | `activity` | `ready`, a spinner while working, or what it waits for. |
-| `model` | Model and thinking level. |
+| `model` | Model id (without the provider, like pi) and thinking level. |
 | `thinking` | Thinking level alone. |
 | `cwd`, `git` | Folder and branch. |
 | `ctx` | Context window used, in percent. |
-| `cache` | Prompt cache hit rate. |
+| `cache` | Prompt cache hit rate for the whole session: cached prompt tokens over all prompt tokens so far. The Usage tab has the last request's rate. |
 | `usage_5h`, `usage_week` | Subscription usage windows. |
 | `cost` | Money spent this session on API-key routes. |
 | `turn_time`, `session_time` | Time of the current turn and of the session. |

@@ -11,4 +11,4 @@
 ╭──────────────────────────────────────────────────────────╮
 │                                                          │
 ╰──────────────────────────────────────────────────────────╯
- ? waiting for … ctx 0%  claude/opus · medium  proj  ⎇ main
+ ? waiting for your ap… ctx 0%  opus · medium  proj  ⎇ main

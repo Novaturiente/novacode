@@ -309,6 +309,8 @@ pub struct App {
     activity: String,
     pub spinner: usize,
     usage: Option<Usage>,
+    /// Session cache hits: (cache_read, prompt tokens) summed over every reply.
+    cache_total: (u64, u64),
     /// Context in use: the last reply's usage plus estimates since (L2.21).
     ctx: u64,
     /// Steering messages sent but not yet delivered.
@@ -375,6 +377,7 @@ impl App {
         };
         let mut history = Vec::new();
         let mut usage = None;
+        let mut cache_total = (0, 0);
         let ctx = novacode_types::estimate::context(&init.history);
         let mut panel = crate::panel::Panel::default();
         panel.nerd = init.nerd_icons;
@@ -395,6 +398,8 @@ impl App {
                 && a.usage.prompt_total() > 0
             {
                 usage = Some(a.usage);
+                cache_total.0 += a.usage.cache_read;
+                cache_total.1 += a.usage.prompt_total();
             }
             tr.on_message(&m);
         }
@@ -423,6 +428,7 @@ impl App {
             activity: String::new(),
             spinner: 0,
             usage,
+            cache_total,
             ctx,
             pending: Vec::new(),
             anchor: None,
@@ -595,6 +601,8 @@ impl App {
                 if let Message::Assistant(a) = &m {
                     if a.usage.prompt_total() > 0 {
                         self.usage = Some(a.usage);
+                        self.cache_total.0 += a.usage.cache_read;
+                        self.cache_total.1 += a.usage.prompt_total();
                     }
                     if a.stop == StopReason::Aborted {
                         self.tr.notice("interrupted", false);
@@ -1747,8 +1755,8 @@ impl App {
                     pct: Some(pct),
                 },
             );
-            if let Some(u) = self.usage.filter(|u| u.prompt_total() > 0) {
-                let hit = u.cache_read as f64 * 100.0 / u.prompt_total() as f64;
+            if self.cache_total.1 > 0 {
+                let hit = self.cache_total.0 as f64 * 100.0 / self.cache_total.1 as f64;
                 v.insert(
                     "cache".into(),
                     Value_ {
@@ -1776,7 +1784,15 @@ impl App {
             "model".into(),
             Value_ {
                 spans: vec![
-                    Span::styled(self.init.model.clone(), t.accent),
+                    // pi's footer: the model id without its provider.
+                    Span::styled(
+                        self.init
+                            .model
+                            .split_once('/')
+                            .map_or(&*self.init.model, |(_, m)| m)
+                            .to_string(),
+                        t.accent,
+                    ),
                     Span::styled(format!(" · {}", self.init.level.as_str()), t.dim),
                 ],
                 pct: None,

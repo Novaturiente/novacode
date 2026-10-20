@@ -89,6 +89,8 @@ pub struct Agent {
     memory: Option<Memory>,
     /// A compaction happened since the last request: its miss is deliberate.
     compacted: bool,
+    /// Kept replies carry usage from before a compaction: estimate the context instead.
+    usage_stale: bool,
     /// Where file checkpoints go (L4.15); `None` = off.
     checkpoints: Option<crate::checkpoint::Repo>,
     /// The run's snapshot, taken while the model thinks; awaited before any tool runs.
@@ -347,6 +349,7 @@ impl Agent {
             quirks: Arc::new(Quirks::ephemeral()),
             memory: None,
             compacted,
+            usage_stale: compacted,
             checkpoints: None,
             processes: None,
             deferred: Vec::new(),
@@ -693,7 +696,11 @@ impl Agent {
     }
 
     fn context_tokens(&self) -> u64 {
-        novacode_types::estimate::context(&self.store.projection())
+        let p = self.store.projection();
+        if self.usage_stale {
+            return p.iter().map(novacode_types::estimate::message).sum();
+        }
+        novacode_types::estimate::context(&p)
     }
 
     /// Store a finished observer run; with `wait`, wait for a running one.
@@ -940,6 +947,7 @@ impl Agent {
             notes: n,
         });
         self.compacted = true;
+        self.usage_stale = true;
         let tokens_after = self.context_tokens();
         self.emit(AgentEvent::Compacted {
             tokens_before,
@@ -1141,6 +1149,13 @@ impl Agent {
     }
 
     fn add(&mut self, kind: EntryKind) -> String {
+        if let EntryKind::Message {
+            message: Message::Assistant(a),
+        } = &kind
+            && a.usage.prompt_total() > 0
+        {
+            self.usage_stale = false;
+        }
         let ev = match &kind {
             EntryKind::Message { message } => Some(message.clone()),
             EntryKind::CustomMessage { .. } => None,

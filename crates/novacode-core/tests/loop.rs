@@ -785,7 +785,15 @@ async fn compaction_without_notes_falls_back() {
     let work = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let big = "lorem ipsum ".repeat(300);
-    let main = Faux::new((0..8).map(|i| FauxReply::text(&format!("answer {i} {big}"))));
+    // Real usage that grows with the prompt: after compaction the kept reply's usage is stale.
+    let main = Faux::new((0..8).map(|i| FauxReply::Message {
+        blocks: vec![Block::text(format!("answer {i} {big}"))],
+        stop: StopReason::Stop,
+        usage: Usage {
+            input: 1500 * (i + 1),
+            ..Default::default()
+        },
+    }));
     let observer = Faux::new((0..20).map(|_| FauxReply::Fail(ErrorKind::Auth, "no login".into())));
     let store = Store::create(&Paths::new(home.path()), work.path(), false);
     let agent = Agent::new(
@@ -821,6 +829,17 @@ async fn compaction_without_notes_falls_back() {
             ..
         }
     )));
+    // The context after compaction is estimated, not the last reply's pre-compaction usage.
+    for e in &events {
+        if let AgentEvent::Compacted {
+            tokens_before,
+            tokens_after,
+            ..
+        } = e
+        {
+            assert!(tokens_after < tokens_before, "{tokens_after} >= {tokens_before}");
+        }
+    }
     let p = format!("{:?}", agent.store.projection());
     assert!(p.contains("Summary of the earlier conversation"), "{p}");
 }

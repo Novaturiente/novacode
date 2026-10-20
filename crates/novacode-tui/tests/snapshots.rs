@@ -584,7 +584,7 @@ fn thinking_level_cycle_and_picker() {
     });
     let s = screen(&mut a, 70, 12);
     assert!(
-        s.contains("claude/opus · high") && s.contains("the cache is kept"),
+        s.contains("opus · high") && !s.contains("claude/opus") && s.contains("the cache is kept"),
         "{s}"
     );
     typ(&mut a, "/thinking");

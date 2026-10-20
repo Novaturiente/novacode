@@ -9,4 +9,4 @@
 ╭────────────────────────────────────────────────╮
 │                                                │
 ╰────────────────────────────────────────────────╯
- ⠋ writing     ctx 0%  claude/opus · medium  proj
+ ⠋ writing    ctx 0%  opus · medium  proj  ⎇ main
