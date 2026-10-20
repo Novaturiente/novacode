@@ -4,15 +4,17 @@
 
 novacode reads and edits your code, runs commands, and works through tasks with you, like Claude Code, pi or Codex. It uses the subscriptions you already pay for (Claude Pro/Max, ChatGPT/Codex, Antigravity, GitHub Copilot) or an API key for about 50 providers, including local models. Your existing Claude Code skills, agents and commands load without moving any files.
 
-> **Status:** early release (0.1). Linux is the main platform. macOS builds exist but are not tested yet. Windows is not supported; use WSL.
+> **Status:** early release (0.1). Linux is the main platform. macOS builds exist but are not tested yet. Windows is not supported; use WSL. Release binaries and AUR packages arrive with the first release; until then, build from source (below and in [docs/install.md](docs/install.md)).
 
 ## Install
+
+Once the first release is out:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Novaturiente/novacode/main/scripts/install.sh | sh
 ```
 
-Other ways (AUR, `cargo install`, building from source) are in [docs/install.md](docs/install.md).
+Today, build from source: `cargo install --locked --git https://github.com/Novaturiente/novacode novacode` (needs Rust 1.97+, a C compiler and git). All the ways to install (AUR, building from a checkout) are in [docs/install.md](docs/install.md).
 
 ## First run
 
@@ -27,10 +29,10 @@ The first start asks you to log in, pick a model, and decide whether to trust th
 novacode "fix the failing test"        # start with a prompt
 novacode -c                            # continue the newest session in this folder
 novacode -p "summarise src/lib.rs"     # print mode: answer on stdout, then exit
-novacode -m codex/gpt-5.6-luna:high    # pick a model: provider/model[:thinking]
+novacode -m codex/gpt-5.5:high    # pick a model: provider/model[:thinking]
 ```
 
-The full walk-through is in [docs/quickstart.md](docs/quickstart.md).
+The full walk-through and a list of every flag and subcommand are in [docs/quickstart.md](docs/quickstart.md).
 
 ## What it does
 
@@ -77,7 +79,7 @@ The full walk-through is in [docs/quickstart.md](docs/quickstart.md).
 | `~/.novacode/sessions/` | Your sessions. |
 | `~/.novacode/logs/` | Logs and crash logs. |
 
-Set `NOVACODE_HOME` to use a different folder than `~/.novacode`.
+Set `NOVACODE_HOME` to use a different folder than `~/.novacode`. The full list of files is in [docs/install.md](docs/install.md).
 
 ## Reporting a bug
 

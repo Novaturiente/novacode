@@ -30,11 +30,11 @@ novacode reads these fields. Others (for example `allowed-tools` or `license`) a
 
 | Field | Required | Meaning |
 |---|---|---|
-| `description` | yes | What the skill does and when to use it. A `SKILL.md` without one is skipped, and novacode warns about it. Long descriptions are cut to 1024 characters. |
-| `name` | no | The skill's name. Defaults to the folder name. |
-| `disable-model-invocation` | no | Set to `true` to hide the skill from the model. Only you can use it, with `/skill:name`. |
+| `description` | yes | What the skill does and when to use it. A `SKILL.md` without one is skipped, and novacode warns about it. A loose `.md` file without one is skipped silently. Long descriptions are cut to 1024 characters. |
+| `name` | no | The skill's name. Defaults to the folder name (or the file name for a loose `.md`). If it differs from the folder name, the system prompt shows the file's path next to it. |
+| `disable-model-invocation` | no | Set to `true` (exactly) to hide the skill from the model. Only you can use it, with `/skill:name`. |
 
-The frontmatter is a simple `key: value` block between two `---` lines. Quoted values and `|` / `>` multi-line values work. Nested maps are skipped.
+The frontmatter is a simple `key: value` block. It must start on the very first line of the file, between two `---` lines; only the first block is read. Quoted values and `|` / `>` multi-line values work. Nested maps are skipped.
 
 ### Where skills are found
 
@@ -84,7 +84,7 @@ Type `/skill:` and the name, then anything you want to add:
 /skill:release-notes for v2.3
 ```
 
-novacode inlines the skill's text (without the frontmatter) into your message, then your extra text after it. This also works for skills with `disable-model-invocation: true`. The editor completes `/skill:` names for you.
+novacode inlines the skill's text (without the frontmatter) into your message, in a `<skill name=… location=…>` block that says references are relative to the skill's folder, then your extra text after it. This also works for skills with `disable-model-invocation: true`. The editor completes `/skill:` names for you.
 
 ### Shadowed skills
 
@@ -144,7 +144,7 @@ Everything after `/name` is split into words. Quotes group words (`"the auth mod
 
 Substituted values are not expanded again. A `$` that matches none of these is left as it is, except that a number after it (like the `$5` in `cost $5`) is read as an argument.
 
-A name that is not a known template is sent to the model as typed.
+A name that is not a known template is sent to the model as typed. The same goes for an unknown `/skill:` name.
 
 ## See also
 

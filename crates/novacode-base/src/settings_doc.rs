@@ -50,31 +50,31 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "providers",
         "object",
         "{}",
-        "Per-provider overrides: `providers.<id>.apiKey`, `baseUrl`, headers, compat flags.",
+        "Add a provider or change a bundled one: `providers.<id>.{api, name, baseUrl, auth, env, apiKey, keyOptional, catalog, headers, compat}`, merged field by field over the bundled profile. See docs/providers.md.",
     ),
     (
         "models",
         "object",
         "{}",
-        "Per-model catalog overrides: `models.<provider>/<id>.contextWindow`, costs, …",
+        "Per-model catalog overrides, keyed `\"<provider>/<id>\"`: `contextWindow`, `maxTokens`, `images`, `reasoning` (bools), `name`, `cost`. See docs/providers.md.",
     ),
     (
         "permissions",
         "object",
         "auto mode",
-        "Global only. `mode` auto|ask|read-only, `allow`/`ask`/`deny` rules like `Bash(git push:*)`, `protected`, `profiles`.",
+        "Global only. `mode` auto|ask|read-only; `allow`/`ask`/`deny` lists of rules like `Bash(git push:*)`; `protected: {commands, paths}`; `profiles.<name>.tools`, named tool sets. See docs/security.md.",
     ),
     (
         "tools.<name>.exposure",
         "string",
         "per tool",
-        "listed, codemode, deferred or hidden: how a tool reaches the model.",
+        "How a tool reaches the model: `listed` (declared to it), `codemode` (alias `codemode-only`: only codemode scripts call it), `deferred` (found through `tool_search`) or `hidden` (user and UI only).",
     ),
     (
         "hooks",
         "object",
         "{}",
-        "Command hooks: `beforeTool`, `afterTool`, `events.<type>`, `timeoutMs`.",
+        "Command hooks: `beforeTool`, `afterTool` and `events.<type>`, each a command or a list; `timeoutMs` (default 5000) limits `beforeTool`, `afterTool` gets twice that. See docs/automation.md.",
     ),
     (
         "hooks.onActivity",
@@ -86,7 +86,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "processExtensions",
         "object",
         "{}",
-        "Long-running JSON-RPC extensions: `<name>: {command, args, env}`.",
+        "Long-running JSON-RPC extensions in any language: `<name>: {command, args, env}`. See docs/extensions.md.",
     ),
     (
         "modes",
@@ -103,7 +103,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
     (
         "extensions.<name>",
         "object",
-        "",
+        "unset",
         "Settings of extension `<name>`: a process extension gets them in `initialize`, any extension through `novacode.settings.get(\"extensions.<name>\")`.",
     ),
     (
@@ -267,19 +267,19 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "ui.userMessage",
         "object",
         "rounded box",
-        "`border`, `borderColor`, `text`, `paddingX`, `paddingY` of your messages.",
+        "Your messages' box: `border` (rounded, single, heavy, double, ascii, none), `borderColor` and `text` (`#rrggbb` or `{fg, bg, bold, italic, …}`), `paddingX` (1), `paddingY` (0).",
     ),
     (
         "ui.statusline",
         "object",
         "built-in rows",
-        "`placement` and `rows` of segments (activity, ctx, cache, model, …).",
+        "`placement` and `rows` of segments (activity, ctx, cache, model, …). Segment names are in docs/tui.md.",
     ),
     (
         "ui.icons",
         "string",
         "`nerd`",
-        "`unicode` when your font has no Nerd Font glyphs.",
+        "`unicode` when your font has no Nerd Font glyphs; any other value means `nerd`.",
     ),
     (
         "ui.images",
@@ -297,14 +297,14 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "ui.panel.host",
         "string",
         "`inline`",
-        "inline, tmux or auto: draw the panel in novacode or in a tmux pane.",
+        "inline, tmux or auto: draw the panel in novacode or in a tmux pane. `tmux` and `auto` only take effect inside tmux.",
     ),
     ("ui.panel.tmuxWidth", "string", "`30%`", "Width of the tmux panel pane."),
     (
         "ui.slow",
         "bool",
-        "detected",
-        "Lower frame rate and animations (SSH, busy machine).",
+        "on over SSH or when the load average is above the core count",
+        "Lower frame rate and animations.",
     ),
 ];
 
@@ -401,6 +401,19 @@ pub fn render() -> String {
         let (d, w) = (d.replace('|', "\\|"), w.replace('|', "\\|"));
         s.push_str(&format!("| `{k}` | {t} | {d} | {w} |\n"));
     }
+    s.push_str(
+        "\nOther files in `~/.novacode`: logins and keys in `auth.json`, MCP servers in `mcp.json` \
+         ([mcp](mcp.md)), trusted folders in `trust.json` ([security](security.md)). The full list is \
+         in [install](install.md).\n\n\
+         ## Environment variables\n\n\
+         | Variable | What it does |\n|---|---|\n\
+         | `NOVACODE_HOME` | Use this folder instead of `~/.novacode`. |\n\
+         | `NOVACODE_LOG` | Log level or filter, e.g. `debug` ([troubleshooting](troubleshooting.md)). |\n\
+         | `NOVACODE_HOOKS_DISABLED` | Any value turns command hooks off ([automation](automation.md)). |\n\
+         | Provider keys (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, …) | API keys, see [providers](providers.md). |\n\
+         | `BRAVE_API_KEY`, `GEMINI_API_KEY` | Web search engines ([tools](tools.md)). |\n\
+         | `VISUAL`, `EDITOR` | The editor `Ctrl+G` opens. Terminal variables are in [tui](tui.md). |\n",
+    );
     s
 }
 

@@ -34,6 +34,7 @@ Extensions can add tabs too (see [extensions](extensions.md)).
 | `Ctrl+Alt+P` | Show or hide the panel. |
 | `Ctrl+Alt+F` | Give the panel the keys. `Esc` or `q` gives them back. |
 | `Up`/`Down` (or `k`/`j`) | Move in the focused panel. |
+| `Enter` | Run the action of the selected row (used by extension tabs). |
 
 The panel needs a terminal at least 100 columns wide. On a narrower screen it stays hidden and open todos show as a short block above the editor instead. Its width is a quarter of the screen, at least 40 columns and at most half.
 
@@ -89,7 +90,7 @@ The path stays in your message and the model reads the file with its tools. Imag
 
 ### Paste an image
 
-`Ctrl+V` pastes an image from the clipboard. novacode saves it to a file and inserts `@<path>` in the editor. If the clipboard holds text, the text is pasted. This needs `wl-paste` (Wayland) or `xclip` (X11).
+`Ctrl+V` pastes an image from the clipboard. novacode saves it to a file and inserts `@<path>` in the editor. If the clipboard holds text, the text is pasted. This needs `wl-paste` (used when `WAYLAND_DISPLAY` is set) or `xclip` (X11). Copying also goes through the terminal (OSC 52) and, on Wayland, `wl-copy`.
 
 ### Typing while the model works
 
@@ -138,7 +139,7 @@ Type `/` to see the list. A line that is only `/something` unknown to novacode i
 | `/debug` | Route, cache, queues, processes, MCP and log paths, for bug reports. |
 | `/ps` | Processes in the process manager, with their latest output. |
 | `/mcp` | MCP servers: status and tool counts. See [mcp](mcp.md). |
-| `/login <provider>` | Log in without leaving novacode. See [providers](providers.md). |
+| `/login <provider>` | Log in without handing over the session: novacode runs `novacode login <provider>` in your terminal and comes back. Several accounts need `novacode login --account` on the command line. See [providers](providers.md). |
 | `/keys` (or `/help`) | Show the key bindings. |
 | `/reload` | Re-read settings, keys, theme, skills, extensions, MCP servers and context files. |
 | `/restart` | Restart novacode (for example after a rebuild) and resume this session. |
@@ -146,13 +147,15 @@ Type `/` to see the list. A line that is only `/something` unknown to novacode i
 
 Session commands are explained in [sessions](sessions.md).
 
+In a window opened with `novacode attach`, `/resume`, `/new`, `/tree`, `/rewind`, `/fork`, `/clone`, `/reload`, `/restart` and `/login` work only in the session's own window. Over `--rpc` more of them are limited, see [automation](automation.md#slash-commands-over-rpc).
+
 ### Modes and goals
 
 | Command | What it does |
 |---|---|
 | `/plan` | Plan mode on or off: read-only until you approve a plan. `/plan <task>` turns it on and sends the task. |
 | `/mode <name>` | Switch to a mode preset. `/mode off` leaves it. `/mode` alone lists them. |
-| `/goal <objective>` | Work until the objective is done. `/goal` shows the current goal. Also `/goal pause`, `resume`, `clear` and `audit on` / `audit off`. |
+| `/goal <objective>` | Work until the objective is done. `/goal` shows the current goal. Also `/goal pause`, `resume`, `clear` and `audit on` / `audit off`. See [subagents](subagents.md#goals). |
 
 An active mode shows in the status line (`⏸ <name> mode`).
 
@@ -271,7 +274,7 @@ Create `~/.novacode/keybindings.json` (or `$NOVACODE_HOME/keybindings.json`). It
 
 | Value | Theme |
 |---|---|
-| `auto` (default) | Dark or light, by asking your terminal for its background color. Dark if it does not answer. |
+| `auto` (default) | Dark or light, by asking your terminal for its background color. If it does not answer, `COLORFGBG` is used, else dark. |
 | `dark` or `catppuccin-mocha` | Catppuccin Mocha. |
 | `light` or `catppuccin-latte` | Catppuccin Latte. |
 | any other name | `~/.novacode/themes/<name>.json`, or `themes/<name>.json` in an installed [package](packages.md). |
@@ -340,6 +343,7 @@ Segments:
 | `bg` | Number of background processes. |
 | `queue` | Queued messages. |
 | `mcp` | MCP servers ready. |
+| `agents` | Reserved. It has no value today, so it shows nothing. |
 | `wtpath` | Name of the git worktree, when you are in one. |
 | `ext` | All status segments from extensions (`ext:<key>` for one). |
 
@@ -353,6 +357,20 @@ A segment can also be an object: `{"id": "ctx", "format": "context {}", "style":
 | `ui.images` | `auto` (default), `kitty`, `iterm2`, `sixel`, `halfblocks`, `off` | How images in the transcript are drawn. `auto` picks by terminal: Kitty, Ghostty and Konsole use Kitty graphics; WezTerm and iTerm2 use iTerm2; foot and mlterm use Sixel; anything else uses half-blocks. `off` shows a one-line placeholder. |
 | `ui.slow` | bool | Fewer frames and a slower spinner. Default: on over SSH or when the machine load is above its core count. |
 | `notifications.enabled` | bool, default true | When a turn ends, or novacode needs you, while you are not looking at it, send a terminal notification (OSC 777). In tmux it goes to every attached client, so it reaches you over SSH too. |
+
+The terminal also decides some things through environment variables:
+
+| Variable | Used for |
+|---|---|
+| `COLORFGBG` | Light or dark detection under `ui.theme: auto`, when the terminal doesn't answer |
+| `COLORTERM` | `truecolor` turns on 24-bit colors |
+| `TERM`, `TERM_PROGRAM`, `KITTY_WINDOW_ID`, `GHOSTTY_RESOURCES_DIR`, `KONSOLE_VERSION`, `WEZTERM_EXECUTABLE` | Picking the image protocol under `ui.images: auto` |
+| `WAYLAND_DISPLAY` | Clipboard tools: `wl-copy` / `wl-paste` instead of `xclip` |
+| `SSH_CONNECTION`, `SSH_TTY` | Count as a slow terminal (see `ui.slow`) |
+| `TMUX`, `TMUX_PANE` | tmux panel host and `tmux.agentState`. See [automation](automation.md#tmux-agent-state) |
+| `VISUAL`, `EDITOR` | `Ctrl+G` external editor |
+
+novacode also reports its state to herdr when it runs inside it ([automation](automation.md#herdr)).
 
 See [config](config.md) for the full settings table.
 

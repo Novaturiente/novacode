@@ -18,7 +18,7 @@ The prompt is built from named sections, always in this order. A section is left
 | 8 | `environment` | Working directory, date, git branch and HEAD, and how many files were changed at session start. |
 | 9 | `mode` | The active mode preset, if any. |
 
-`SYSTEM.md` replaces the built-in preamble. `APPEND_SYSTEM.md` adds to it. Both live in novacode's home folder (`~/.novacode`, or `$NOVACODE_HOME` if you set it). Empty files are ignored.
+`SYSTEM.md` replaces the built-in preamble. `APPEND_SYSTEM.md` adds to it. Both live in novacode's home folder (`~/.novacode`, or `$NOVACODE_HOME` if you set it). Empty files are ignored. They are read again whenever the prompt is rebuilt, so an edit shows up as a section update.
 
 A subagent definition can either replace the preamble or add an `agent` section. See [subagents](subagents.md).
 
@@ -99,11 +99,17 @@ There are two kinds of memory. They solve different problems.
 
 While you work, a small background "observer" reads the new part of the conversation and writes short notes: decisions, fixes, preferences. The notes are saved in the session file. They are not sent to the main model while the context still fits.
 
-When the context gets close to full, novacode **compacts**. It keeps your most recent messages as they are and replaces everything older with a summary built from the notes (lasting facts first, then notes, then the files that were read and changed). Because the notes already exist, compaction usually needs no extra model call. If the observer fails, the session model summarises the gap instead.
+When the context gets close to full, novacode **compacts**. It keeps your most recent messages as they are and replaces everything older with a summary built from the notes (lasting facts first, then notes, then the files that were read and changed). If the notes lag behind the cut point, the observer first catches up with extra calls to the worker model (`memory.model`, else the provider's small model, else the session model). If that fails, the session model summarises the gap instead. If both fail, the older messages are dropped and the summary says "No notes were available"; the model is told to ask you if it needs what they held.
 
 Each note has an id. The model can call the `recall` tool with a note id to get the original messages behind it.
 
-Compaction runs by itself when the context reaches the threshold. You can also run it by hand:
+Compaction runs by itself in three cases:
+
+- After a turn ends, when the context has reached `memory.compactAtTokens`.
+- In the middle of a turn, when the context reaches 95% of the window (only if `compactAtTokens` is below the window).
+- When the provider rejects a request as too long: novacode compacts and retries once. If nothing can be compacted, you get "the context is too long and nothing could be compacted".
+
+You can also run it by hand:
 
 ```
 /compact
@@ -111,7 +117,7 @@ Compaction runs by itself when the context reaches the threshold. You can also r
 
 If everything already fits in the part kept as is, `/compact` says so and does nothing.
 
-Two more background steps keep the notes small. A "reflector" turns notes into lasting facts, and a "dropper" removes notes that those facts already cover.
+Two more background steps keep the notes small. They run in the same background pass as the observer, after it. A "reflector" turns notes into lasting facts, and a "dropper" removes notes that those facts already cover. The dropper only runs when the reflector made new facts and the active notes are over `memory.poolTargetTokens`.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -120,7 +126,7 @@ Two more background steps keep the notes small. A "reflector" turns notes into l
 | `memory.observeAfterTokens` | `10000` | New tokens before the observer runs. |
 | `memory.keepRecentTokens` | `20000` | Tokens kept word for word after a compaction. |
 | `memory.compactAtTokens` | 80% of the window, at most 400000 | Context size that triggers automatic compaction. |
-| `memory.reflectAfterTokens` | `20000` | New note tokens before the reflector runs. |
+| `memory.reflectAfterTokens` | `20000` | New conversation tokens since the reflector last looked, before it runs again. |
 | `memory.poolTargetTokens` | `10000` | Size the dropper trims active notes down to. |
 
 ### Cross-session memory
@@ -135,7 +141,9 @@ The model has a `memory` tool with three actions:
 
 Project memories belong to the project (the main repo, so worktrees share them). Global memories apply everywhere. Lasting facts from the reflector are also saved as project memories.
 
-At session start, novacode writes a short index of saved memories into the prompt: pinned items first, then the most used, then the newest. It is written once and does not change during the session.
+At session start, novacode writes a short index of saved memories into the prompt. In each store, pinned items come first, then the most used, then the newest. Project items are listed before global ones. Each line is cut at 300 characters. It is written once and does not change during the session.
+
+`search` looks in both stores; a word of one character is ignored, and any other word may match. Project items win ties.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -143,7 +151,7 @@ At session start, novacode writes a short index of saved memories into the promp
 | `memory.indexItems` | `15` | Most items in the start-of-session index. |
 | `memory.indexChars` | `2000` | Character cap for that index. |
 
-The files are `~/.novacode/memory/global.db` and `~/.novacode/memory/projects/<key>.db`. You can delete them to wipe memory.
+The files are `~/.novacode/memory/global.db` and `~/.novacode/memory/projects/<key>.db`. `<key>` is a 16-digit hash of the project's root folder. You can delete the files to wipe memory.
 
 ### Searching old sessions
 
@@ -158,7 +166,7 @@ The `session_search` tool finds words in messages of earlier sessions. It search
 }
 ```
 
-- `memory.enabled: false` stops the observer and compaction, and removes the `recall` tool. `/compact` then says compaction is off, and a full context is no longer compacted for you.
+- `memory.enabled: false` stops the observer, reflector and compaction, and removes the `recall` tool. `/compact` then says compaction is off, and a full context is no longer compacted for you. Facts from the reflector are not saved either. `recall` is also missing with `--no-session`.
 - `memory.store: false` removes the `memory` tool and the start-of-session index.
 
 You can turn off one without the other.

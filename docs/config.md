@@ -13,16 +13,16 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `contextWindow` | number | from the catalog | Use a smaller context window than the model has. |
 | `cacheRetention` | string | `short` | `long` asks for 1h (Anthropic) or 24h (OpenAI) prompt caching. |
 | `cache.warm` | bool | false | Keep the prompt cache alive with 1-token replays while it pays off. |
-| `providers` | object | {} | Per-provider overrides: `providers.<id>.apiKey`, `baseUrl`, headers, compat flags. |
-| `models` | object | {} | Per-model catalog overrides: `models.<provider>/<id>.contextWindow`, costs, … |
-| `permissions` | object | auto mode | Global only. `mode` auto\|ask\|read-only, `allow`/`ask`/`deny` rules like `Bash(git push:*)`, `protected`, `profiles`. |
-| `tools.<name>.exposure` | string | per tool | listed, codemode, deferred or hidden: how a tool reaches the model. |
-| `hooks` | object | {} | Command hooks: `beforeTool`, `afterTool`, `events.<type>`, `timeoutMs`. |
+| `providers` | object | {} | Add a provider or change a bundled one: `providers.<id>.{api, name, baseUrl, auth, env, apiKey, keyOptional, catalog, headers, compat}`, merged field by field over the bundled profile. See docs/providers.md. |
+| `models` | object | {} | Per-model catalog overrides, keyed `"<provider>/<id>"`: `contextWindow`, `maxTokens`, `images`, `reasoning` (bools), `name`, `cost`. See docs/providers.md. |
+| `permissions` | object | auto mode | Global only. `mode` auto\|ask\|read-only; `allow`/`ask`/`deny` lists of rules like `Bash(git push:*)`; `protected: {commands, paths}`; `profiles.<name>.tools`, named tool sets. See docs/security.md. |
+| `tools.<name>.exposure` | string | per tool | How a tool reaches the model: `listed` (declared to it), `codemode` (alias `codemode-only`: only codemode scripts call it), `deferred` (found through `tool_search`) or `hidden` (user and UI only). |
+| `hooks` | object | {} | Command hooks: `beforeTool`, `afterTool` and `events.<type>`, each a command or a list; `timeoutMs` (default 5000) limits `beforeTool`, `afterTool` gets twice that. See docs/automation.md. |
 | `hooks.onActivity` | string | unset | Shell command run on working/blocked/idle changes, State JSON on stdin. |
-| `processExtensions` | object | {} | Long-running JSON-RPC extensions: `<name>: {command, args, env}`. |
+| `processExtensions` | object | {} | Long-running JSON-RPC extensions in any language: `<name>: {command, args, env}`. See docs/extensions.md. |
 | `modes` | object | {} | Mode presets: `<name>: {prompt, readOnly, tools}`; `plan` is built in. |
 | `checkpoints.enabled` | bool | true | File checkpoints per prompt, for `/rewind`. |
-| `extensions.<name>` | object |  | Settings of extension `<name>`: a process extension gets them in `initialize`, any extension through `novacode.settings.get("extensions.<name>")`. |
+| `extensions.<name>` | object | unset | Settings of extension `<name>`: a process extension gets them in `initialize`, any extension through `novacode.settings.get("extensions.<name>")`. |
 | `security.maskSecrets` | bool | false | Also mask well-known secret shapes in tool output (GitHub/AWS/OpenAI/Anthropic/Slack/Google tokens, private keys, `*_TOKEN=`/`*_SECRET=` values) before the model sees them. Your own logins are always masked. |
 | `memory.enabled` | bool | true | Observer notes, compaction from notes and the `recall` tool. |
 | `memory.model` | string | the profile's small model | Model for the observer, reflector and dropper. |
@@ -50,11 +50,24 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `ui.theme` | string | `auto` | auto, catppuccin-mocha, catppuccin-latte or a file in `~/.novacode/themes`. |
 | `ui.turnCollapse` | bool | true | Fold finished turns to one line (Alt+O toggles). |
 | `ui.thinking` | string | `collapsed` | How thinking shows: collapsed, full or hidden. |
-| `ui.userMessage` | object | rounded box | `border`, `borderColor`, `text`, `paddingX`, `paddingY` of your messages. |
-| `ui.statusline` | object | built-in rows | `placement` and `rows` of segments (activity, ctx, cache, model, …). |
-| `ui.icons` | string | `nerd` | `unicode` when your font has no Nerd Font glyphs. |
+| `ui.userMessage` | object | rounded box | Your messages' box: `border` (rounded, single, heavy, double, ascii, none), `borderColor` and `text` (`#rrggbb` or `{fg, bg, bold, italic, …}`), `paddingX` (1), `paddingY` (0). |
+| `ui.statusline` | object | built-in rows | `placement` and `rows` of segments (activity, ctx, cache, model, …). Segment names are in docs/tui.md. |
+| `ui.icons` | string | `nerd` | `unicode` when your font has no Nerd Font glyphs; any other value means `nerd`. |
 | `ui.images` | string | `auto` | Image protocol: auto, kitty, iterm2, sixel, halfblocks or off. |
 | `ui.panel.auto` | bool | true | Open the side panel by itself while todos or subagents run. |
-| `ui.panel.host` | string | `inline` | inline, tmux or auto: draw the panel in novacode or in a tmux pane. |
+| `ui.panel.host` | string | `inline` | inline, tmux or auto: draw the panel in novacode or in a tmux pane. `tmux` and `auto` only take effect inside tmux. |
 | `ui.panel.tmuxWidth` | string | `30%` | Width of the tmux panel pane. |
-| `ui.slow` | bool | detected | Lower frame rate and animations (SSH, busy machine). |
+| `ui.slow` | bool | on over SSH or when the load average is above the core count | Lower frame rate and animations. |
+
+Other files in `~/.novacode`: logins and keys in `auth.json`, MCP servers in `mcp.json` ([mcp](mcp.md)), trusted folders in `trust.json` ([security](security.md)). The full list is in [install](install.md).
+
+## Environment variables
+
+| Variable | What it does |
+|---|---|
+| `NOVACODE_HOME` | Use this folder instead of `~/.novacode`. |
+| `NOVACODE_LOG` | Log level or filter, e.g. `debug` ([troubleshooting](troubleshooting.md)). |
+| `NOVACODE_HOOKS_DISABLED` | Any value turns command hooks off ([automation](automation.md)). |
+| Provider keys (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, …) | API keys, see [providers](providers.md). |
+| `BRAVE_API_KEY`, `GEMINI_API_KEY` | Web search engines ([tools](tools.md)). |
+| `VISUAL`, `EDITOR` | The editor `Ctrl+G` opens. Terminal variables are in [tui](tui.md). |

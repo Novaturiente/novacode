@@ -14,9 +14,11 @@ Every part is optional. Use the folder names exactly as shown.
 | `agents/` | Subagent definitions (see [subagents](subagents.md)) |
 | `themes/` | Themes (`<name>.json`, picked with `ui.theme`) |
 | `mcp.json` | MCP servers, in Claude Code's `mcpServers` format (see [mcp](mcp.md)) |
-| `novacode-package.json` | Optional manifest: name, version and the extension API it needs |
+| `novacode-package.json` | Optional manifest. Only `apiVersion` is read (see [API version check](#api-version-check)) |
 
 npm packages are not supported. A package comes from a git URL or a local folder.
+
+A package can't carry process extensions or settings. Process extensions (and custom providers) come only from your settings; see [extensions](extensions.md).
 
 ## Install
 
@@ -27,7 +29,7 @@ novacode install ~/code/my-pack                       # link a local folder
 novacode install ~/code/my-pack --name mine          # choose the name
 ```
 
-The package name is the last part of the path without `.git` (`my-pack` above). Use `--name` when you want another name. If a package of that name is already installed, the command stops and tells you to uninstall it first.
+The package name is the last part of the path without `.git` (`my-pack` above), and it is the folder name under `packages/`. A name can't contain `/` or start with a dot. Use `--name` when you want another name. If a package of that name is already installed, the command stops and tells you to uninstall it first.
 
 Installs go to `~/.novacode/packages/<name>`. New sessions load the package; run `/reload` in a running session to pick it up.
 
@@ -99,9 +101,11 @@ novacode packages install
 
 ## Which one wins
 
-A package never overrides your own files. For skills, prompts and agents, the first folder with a name wins: your project's `.novacode/`, the project's `.claude/`, `~/.novacode/`, `~/.claude/`, `~/.agents/skills` (skills only), and last the packages. Project packages come before your global packages. See [extensions](extensions.md) for the full order.
+A package never overrides your own files. For skills, prompts and agents, the first folder with a name wins: your project's `.novacode/`, the project's `.claude/`, `~/.novacode/`, `~/.claude/`, `~/.agents/skills` (skills only), and last the packages. Project packages come before your global packages. [Skills](skills.md#where-skills-are-found) has the full order.
 
-For MCP servers, packages are loaded first, then `~/.novacode/mcp.json`, then the project's `.mcp.json`. Later files win a server name.
+When two packages use the same skill, prompt or agent name, the first one wins and the other is skipped without a message. `novacode doctor` lists what was skipped. Extension files that clash are settled the same way: your project, then `~/.novacode`, then packages.
+
+For MCP servers, packages are loaded first, then `~/.novacode/mcp.json`, then the project's `.mcp.json`. Later files win a server name. Between packages, a project package beats a global one, and within the same scope the name that comes first alphabetically wins. See [mcp](mcp.md).
 
 Themes are found in `~/.novacode/themes` first. If your `ui.theme` name isn't there, novacode looks in your installed (global) packages. Themes in project packages are not searched.
 
@@ -110,8 +114,10 @@ Themes are found in `~/.novacode/themes` first. If your `ui.theme` name isn't th
 An extension talks to novacode through a versioned API (currently `1`). A package can say which version it was written for in `novacode-package.json`:
 
 ```json
-{ "name": "my-pack", "version": "1.2.0", "apiVersion": [1, 2] }
+{ "apiVersion": [1, 2] }
 ```
+
+Other keys, such as `name` and `version`, are allowed but ignored. The package's name is always its folder name.
 
 `apiVersion` is a number (`1`) or a `[min, max]` pair. If this novacode's API is outside the range, the package is not loaded. `novacode packages` and `novacode doctor` show why, for example `it needs extension API 2, this novacode has 1`. Without a manifest, or without `apiVersion`, the package always loads. A manifest that isn't valid JSON, or an `apiVersion` that isn't whole numbers, also disables the package with a reason.
 
@@ -121,7 +127,7 @@ An extension talks to novacode through a versioned API (currently `1`). A packag
 
    ```text
    my-pack/
-   ├── novacode-package.json
+   ├── novacode-package.json      # optional
    ├── skills/
    │   └── release-notes/
    │       └── SKILL.md
@@ -143,6 +149,8 @@ An extension talks to novacode through a versioned API (currently `1`). A packag
      }
    }
    ```
+
+   The server starts in the user's session folder, not in your package folder, and there is no variable for the package path. Use commands that are on the `PATH`.
 
 3. Try it from the folder while you work. The link means every edit applies at once:
 

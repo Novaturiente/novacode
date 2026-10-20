@@ -16,13 +16,15 @@ The file is append-only and holds a tree of messages, not a flat list. That is w
 
 Session ids are long. You only need the start of one (the first 13 characters are shown in listings).
 
+One novacode process owns a session file at a time. Opening a session that is open elsewhere fails with "session X is open in another novacode process". Use `novacode attach <id>` instead (see [Background sessions](#background-sessions)). If the last line of a file is half written after a crash, novacode repairs it on open and skips lines it cannot read.
+
 ## Start, continue and resume
 
 | Command | What it does |
 |---|---|
 | `novacode` | New session. |
 | `novacode -c` | Continue the most recent session in this folder. |
-| `novacode -r <id>` | Resume a session by id prefix. It also finds sessions from other folders. |
+| `novacode -r <id>` | Resume a session by id prefix, or by the path of a `.jsonl` file. It looks in this folder first, then in every folder, and takes the first match. |
 | `novacode --no-session` | Don't save this session. |
 
 When you quit, novacode prints `resume with: novacode -r <id>` if the session was saved.
@@ -68,15 +70,15 @@ The prompt text comes back into the editor so you can change it and send it agai
 
 novacode takes a snapshot before each prompt, if the session is saved and `checkpoints.enabled` is true (the default).
 
-**In a git repository.** The whole working tree is snapshot: tracked changes, deletions and untracked files up to 1 MB each. Your index, HEAD and branches are never touched. The snapshots are loose objects in the repo's own object store, so `git gc` can remove them after about two weeks. Rewind then tells you the snapshot is gone. Untracked files over 1 MB are left as they are, and the result message lists them.
+**In a git repository.** The whole working tree is snapshot: tracked changes, deletions and untracked files up to 1 MB each. Files that git ignores are not snapshot and rewind does not touch them. Your index, HEAD and branches are never touched. The snapshots are loose objects in the repo's own object store, so `git gc` can remove them after about two weeks. Rewind then tells you the snapshot is gone. Untracked files over 1 MB are left as they are, and the result message lists them.
 
-**Outside git.** There is no folder snapshot. novacode keeps a private copy of each file the first time its own edit or write tools change it, in `~/.novacode/checkpoints/`. Only those changes can be rewound. Changes made by shell commands are not covered.
+**Outside git.** There is no folder snapshot. novacode keeps a private copy of each file the first time its own edit or write tools change it, in `~/.novacode/checkpoints/` (a private git repo per folder, so `git` must be installed; nothing prunes it). Only those changes can be rewound. Changes made by shell commands are not covered.
 
 Rewinding files deletes files that did not exist at that point and rewrites the others, so check your work first. The first entry of the `/rewind` list is **Undo the last file rewind** when there is one. That undo list only lives while novacode runs.
 
 ## Compact
 
-`/compact` replaces older messages with the memory notes, to free context. It runs at once, or as soon as the running turn ends. novacode also compacts by itself when the context gets large. Use `/context` to see where the window goes. Tuning is in `memory.*` settings; see [config](config.md).
+`/compact` replaces older messages with the memory notes, to free context. It runs at once, or as soon as the running turn ends. novacode also compacts by itself when the context gets large (see [Context](context.md#session-memory-and-compaction) for when). Use `/context` to see where the window goes. Tuning is in `memory.*` settings; see [config](config.md).
 
 ## Export
 
@@ -97,7 +99,9 @@ novacode export 0195f3a1 --html      # by id prefix, as HTML
 novacode export -o review.html --html
 ```
 
-Without `-o` the file is `novacode-<first 13 characters of the id>.jsonl` (or `.html`) in the current folder, and the path is printed. JSONL has one message per line.
+Without `-o` the file is `novacode-<first 13 characters of the id>.jsonl` (or `.html`) in the current folder (not the session folder), and the path is printed. `/export` does the same.
+
+JSONL has one message per line, with a `ts_ms` timestamp added. Only this branch's messages are written: memory notes, compaction and checkpoint entries are left out. HTML shows thinking, tool calls and results, with errors marked. Masking covers your saved logins, and also token patterns if `security.maskSecrets` is on. See [Security](security.md#secrets).
 
 ## Background sessions
 

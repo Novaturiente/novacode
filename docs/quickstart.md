@@ -11,16 +11,16 @@ cd ~/code/my-project
 novacode
 ```
 
-novacode needs a terminal. For pipes and scripts use `-p` (see below).
+novacode needs a terminal (stdin and stdout must both be one), or it stops with "interactive mode needs a terminal". For pipes and scripts use `-p` (see below).
 
 ### 1. Connect
 
 If you have no default model yet, a picker asks how novacode should reach a model:
 
-- **Subscriptions** (Claude, Codex, Antigravity, Copilot) are always listed. Pick one and novacode starts the login (a browser sign-in). Details are in [providers](providers.md).
-- **API-key providers** show up in the list only when their key is already set, for example `OPENROUTER_API_KEY` in your environment. `novacode models --all` lists every provider and its env var.
+- **Subscriptions** (Claude, Codex, Antigravity, Copilot) are always listed. Pick one that you are not logged in to yet and novacode starts the login, then lists its models. novacode prints a sign-in URL and tries to open it with `xdg-open`. On macOS or a machine with no browser, open the printed URL yourself. Details are in [providers](providers.md).
+- **API-key providers** show up in the list only when their key is already set: in your environment (for example `OPENROUTER_API_KEY`) or saved with `novacode login <provider>`. `novacode models --all` lists every provider and its env var.
 
-Press Esc to cancel. To skip the picker, pass a model: `novacode -m provider/model`.
+Press Esc to cancel. novacode then exits with "setup cancelled"; run it again. To skip the picker, pass a model: `novacode -m provider/model`, or `provider/model:thinking` such as `-m codex/gpt-5.5:high`.
 
 ### 2. Pick a model
 
@@ -53,7 +53,7 @@ novacode reads files and runs tools on its own. In the default `auto` mode it as
 @src/main.rs why does this return early?
 ```
 
-Start a line with `!` to run a shell command yourself. The model sees its output on its next call; use `!!` to keep the output from the model:
+Start a line with `!` to run a shell command yourself. It runs, shows its output, and the model sees that output on its next call. Use `!!` to run it without telling the model:
 
 ```text
 !git status
@@ -63,14 +63,14 @@ Start a line with `!` to run a shell command yourself. The model sees its output
 
 | Key | Does |
 |---|---|
-| Enter | Send (while the model works, it steers the current turn) |
+| Enter | Send (while the model works, your message is added to the current turn) |
 | Alt+Enter | Queue the message as a follow-up |
 | Shift+Enter or Ctrl+J | New line |
 | Esc | Stop the running turn |
 | Ctrl+C | Clear the input, stop the turn, or quit on a second press |
 | Ctrl+D | Quit when the input is empty |
 | Ctrl+L | Pick a model |
-| Shift+Tab | Next thinking level |
+| Shift+Tab | Next thinking level (how much the model reasons before it answers; see [tui](tui.md)) |
 | Ctrl+R | Search prompt history |
 | Ctrl+G | Edit the prompt in `$EDITOR` |
 | Alt+/ | Show all key bindings |
@@ -109,7 +109,7 @@ novacode -p "list the public functions in src/lib.rs"
 git diff | novacode -p "write a commit message for this diff"
 ```
 
-Piped input is added after the prompt. There is nobody to approve actions in this mode, so requests that would ask you are refused. Add `-m provider/model` to choose a model, and see [automation](automation.md) for `--json` and other options.
+`-p` needs a prompt argument. Piped input is added after the prompt. There is nobody to approve actions in this mode, so requests that would ask you are refused. Add `-m provider/model` to choose a model, and see [automation](automation.md) for `--json` and other options.
 
 ## Check your setup
 
@@ -117,6 +117,58 @@ Piped input is added after the prompt. There is nobody to approve actions in thi
 novacode auth status   # which logins and keys novacode sees
 novacode doctor        # checks every connected provider and your settings
 ```
+
+Both exit with `1` when nothing is connected. Without a model, a `-p` run fails with `no model: pass -m provider/model or set "model" in settings`. More in [troubleshooting](troubleshooting.md).
+
+## Command line reference
+
+`novacode [OPTIONS] [PROMPT] [COMMAND]`. `novacode --help` and `novacode <command> --help` print the same from the binary.
+
+| Flag | Does |
+|---|---|
+| `PROMPT` | Start the interactive session with this prompt |
+| `-p`, `--print PROMPT` | Print mode: answer on stdout, then exit |
+| `--json` | With `-p`: write JSON event lines instead of the answer |
+| `--rpc` | Speak the JSON protocol on stdin/stdout (not with `-p`) |
+| `--bg [PROMPT]` | Run in the background and print the session id |
+| `-m`, `--model provider/model[:thinking]` | Model for this run |
+| `-c`, `--continue` | Continue the newest session in this folder |
+| `-r`, `--resume ID` | Resume a session by id prefix |
+| `--no-session` | Don't save this session |
+| `--mode auto\|ask\|read-only` | Permission mode |
+| `--profile NAME` | Limit tools to a named profile, e.g. `scout` |
+| `--trust` | Trust this folder's project config for this run |
+| `--no-context-files` | Don't load `AGENTS.md` / `CLAUDE.md` |
+| `--api-key KEY` | API key for this run only |
+| `-v`, `--verbose` | Tool calls and token usage on stderr |
+| `--trace` | Record the raw request and stream to a log file |
+| `--profile-startup` | Print startup timings and exit |
+| `-V`, `--version`, `-h`, `--help` | Version and help |
+
+| Command | Does |
+|---|---|
+| `login PROVIDER [--account NAME]` | Log in to a subscription, or save an API key |
+| `logout PROVIDER [--account NAME]` | Remove a login |
+| `models [FILTER] [--all] [--refresh]` | List models; `--refresh` updates the catalog |
+| `auth status` | Show logins and keys |
+| `doctor` | Check providers, settings and key bindings |
+| `export [SESSION] [--html] [-o FILE]` | Export a session as JSONL or HTML |
+| `agents` | List live sessions |
+| `attach ID` | Open a window on a live session |
+| `panel --session ID` | The side panel of a live session, full screen |
+| `status [--session ID] [--all] [--json] [--format T]` | State of a live session |
+| `stop ID` | End a live session |
+| `debug bundle` | Pack logs, settings and a session for a bug report |
+| `stats [SESSION] [--all] [--turns]` | Timing report (needs `debug.metrics`) |
+| `install SOURCE [--name N]` | Install a package from a git URL or folder |
+| `uninstall NAME` | Remove a package |
+| `packages [update [NAME] \| install]` | List, update or install packages |
+| `mcp list \| add \| remove \| login \| logout` | Manage MCP servers |
+| `import claude [--yes]` | Copy Claude Code settings once |
+| `trust [PATH] [--revoke]` | Trust (or distrust) a folder's project config |
+| `update` | Update novacode itself |
+
+Details for `-p`, `--json`, `--rpc`, `--bg` and exit codes are in [automation](automation.md); the rest are on the pages linked from [Next steps](#next-steps).
 
 ## Next steps
 

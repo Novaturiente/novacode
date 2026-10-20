@@ -6,7 +6,7 @@ This page lists the tools novacode gives you to find out what went wrong, where 
 
 | Tool | What it tells you |
 |---|---|
-| `novacode doctor` | Checks every connected provider (one model-list call each), your settings files, your key bindings, and skills, prompts, agents and packages that were skipped or disabled. Exits with a failure code if something is wrong. |
+| `novacode doctor` | Checks every connected provider (one model-list call each), your settings files, your key bindings, and skills, prompts, agents and packages that were skipped or disabled. Exits with a failure code if a provider, setting or key has a problem. |
 | `novacode auth status` | Each login and key, where it comes from, and whether its token is valid |
 | `/debug` (in a session) | Session id and file, route, context and cache numbers, queued prompts, processes, MCP server status, the log folder and how many crash logs exist |
 | `novacode mcp list` | Connects to every MCP server and shows `ready` or `failed: <reason>` |
@@ -27,6 +27,8 @@ skills, prompts, agents
   ✓ nothing shadowed or disabled
 ```
 
+`✓` is fine and `✗` is a problem (exit code 1). `-` is a local provider whose server isn't running (not a problem). `·` is a skill, prompt or agent that was skipped or shadowed (not a problem).
+
 ## Flags for one run
 
 | Flag | What it does |
@@ -45,10 +47,10 @@ Logs are in `~/.novacode/logs/` (or `$NOVACODE_HOME/logs`).
 
 | File | What it holds |
 |---|---|
-| `novacode.log.<date>` | The main log, one file per day |
+| `novacode.log.<date>` | The main log, one file per day. Extension `log()`, `console.*` and process-extension `log` lines land here too, tagged `extension=<name>` |
 | `crash-<time>-<pid>.log` | Written when novacode panics: the message, a backtrace and the last log lines, with secrets masked. The terminal is restored first and the file's path is printed. |
 | `mcp-<server>.log` | The stderr of a local (stdio) MCP server |
-| `ext-<name>.log` | Output of a script extension (`console.*` and `log()`) |
+| `ext-<name>.log` | The stderr of a process extension, emptied at each start |
 | `trace-<id>.jsonl` | Written by `--trace` |
 | `cache-misses*` | Notes on why the prompt cache missed |
 
@@ -80,6 +82,8 @@ Without metrics files, `stats` tells you to turn the setting on first.
 
 ## Common problems
 
+In print mode (`-p`) novacode exits `0` on success, `1` on an error and `130` when aborted. See [automation](automation.md).
+
 ### "Account is exhausted" or rate limit errors
 
 If you have a subscription and it hits its limit, the message says when it resets, for example `claude account `default`: … (resets in 3h 20m). Add another account with `novacode login claude --account <name>`, or switch model with /model.`
@@ -97,14 +101,14 @@ novacode logout claude --account work   # remove one account later
 
 ### Login on a machine with no browser
 
-`novacode login` always prints the URL, so you can open it on another machine.
+`novacode login` always prints the URL, so you can open it on another machine. It only tries to open a browser with `xdg-open`, so on macOS you always open the URL yourself.
 
 | Provider | What to do |
 |---|---|
 | `codex`, `copilot` | You get a short code and a URL. Open the URL on any device, enter the code and approve. It works over SSH. |
 | `claude` | Open the URL anywhere, sign in, then paste the code you're shown into the terminal. |
 | `antigravity` | Open the URL anywhere. When the browser ends on a `localhost` page that fails to load, copy that full address and paste it into the terminal. |
-| API-key providers (`openrouter`, `openai`, …) | `novacode login <provider>` asks for the key. You can pipe it: `echo "$KEY" \| novacode login openrouter`. Or skip the login and set the provider's environment variable. |
+| API-key providers (`openrouter`, `openai`, …) | `novacode login <provider>` asks for the key. You can pipe it: `echo "$KEY" \| novacode login openrouter`. novacode first checks the key with a model-list call. If the check fails it asks "save it anyway? [y/N]"; with piped input it saves nothing. Or skip the login and set the provider's environment variable. |
 
 For one-off scripted runs, `--api-key` with `-m provider/model` needs no stored login at all.
 
@@ -181,7 +185,7 @@ Use `false` to force the full frame rate.
 
 ### Something looks stuck
 
-Press Esc to abort the turn. Open another terminal and run `novacode agents` to see live sessions and `novacode status` to see what the session is doing. `novacode stop <id>` ends one. `/debug` shows running processes and queued prompts.
+Press Esc to abort the turn. Open another terminal and run `novacode agents` to see live sessions (ids and prefixes work) and `novacode status` to see what the session is doing (it exits 1 with "no live session" if there is none for this terminal; try `--all`). `novacode stop <id>` ends one. `/debug` shows running processes and queued prompts.
 
 ## Report a bug
 

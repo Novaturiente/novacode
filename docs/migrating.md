@@ -19,7 +19,7 @@ novacode reads these Claude Code files directly. You don't copy anything.
 Rules for these folders:
 
 - novacode's own folders win. If `~/.novacode/skills/review` and `~/.claude/skills/review` both exist, the novacode one is used. `novacode doctor` lists the ones that were skipped.
-- A project's `.claude/` folder (skills, agents, commands) loads only when you [trust](security.md) the folder. `~/.claude` always loads.
+- A project's `.claude/` folder (skills, agents, commands) loads only when you [trust](security.md) the folder (`novacode trust`). In an untrusted folder it is ignored and novacode prints one `note:` line. `~/.claude` always loads.
 - To turn all of this off, set `compat.claude` to `false`. See [config](config.md).
 
 ### CLAUDE.md and AGENTS.md
@@ -43,7 +43,7 @@ novacode import claude          # show the changes, then ask [y/N]
 novacode import claude --yes    # apply without asking
 ```
 
-It reads `~/.claude/settings.json` and `~/.claude.json`. It prints every change, plus a list of what it left out and why. Without `--yes` it asks; if input isn't a terminal it only prints the changes and says "run with --yes to apply". Before writing, it saves a backup next to each file it changes (`settings.json.bak`, `mcp.json.bak`). Running it again adds nothing that is already there.
+It reads `~/.claude/settings.json` and `~/.claude.json` in your real home folder (`$HOME`, even if `NOVACODE_HOME` is set). If there is nothing new it says "nothing to import". It prints every change, plus a list of what it left out and why. Without `--yes` it asks; if input isn't a terminal it only prints the changes and says "run with --yes to apply". Before writing, it saves a backup next to each file it changes (`settings.json.bak`, `mcp.json.bak`). Running it again adds nothing that is already there.
 
 What it copies:
 

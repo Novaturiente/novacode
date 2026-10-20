@@ -23,11 +23,13 @@ novacode prints the URL (and tries to open your browser with `xdg-open`). Then i
 
 The first run picker (see [quickstart](quickstart.md)) starts these logins for you.
 
+Inside a session, `/login <provider>` hands the terminal to `novacode login`. It has no `--account` form, so add extra accounts from the command line. The models of these providers come from the matching catalog entry (`claude` from `anthropic`, `codex` from `openai`, `antigravity` from `google`, `copilot` from `github-copilot`). Copilot login also prints `enabled models: …` after it turns on the Copilot models for your account.
+
 ### Logging in on a machine without a browser
 
 Every login works over SSH. Open the printed URL on any device.
 
-- **claude**: after you approve, the page shows a code. Paste it at the `code:` prompt.
+- **claude**: after you approve, the page shows a code. Paste it at the `code:` prompt. The full callback URL works too.
 - **codex** and **copilot**: enter the printed code on the page. novacode keeps polling until you approve. Nothing to paste.
 - **antigravity**: novacode listens on `localhost:51121` for the redirect. On a remote machine the browser's redirect to `localhost` will fail to load. That is fine: copy the full URL the browser ended on and paste it into the terminal.
 
@@ -68,6 +70,22 @@ The columns are the provider id, its name, the main env var, and `connected` if 
 | `mistral` | `MISTRAL_API_KEY` |
 | `xai` | `XAI_API_KEY` |
 | `togetherai` | `TOGETHER_API_KEY` |
+
+Some others have names you might not guess:
+
+| Provider | Env var |
+|---|---|
+| `zai`, `zai-coding-plan`, `zhipuai` | `ZHIPU_API_KEY` |
+| `alibaba` | `DASHSCOPE_API_KEY` |
+| `moonshotai`, `moonshotai-cn` | `MOONSHOT_API_KEY` |
+| `kimi-code-plan-global` | `KIMI_API_KEY` |
+| `minimax`, `minimax-coding-plan` | `MINIMAX_API_KEY` |
+| `huggingface` | `HF_TOKEN` |
+| `friendli` | `FRIENDLI_TOKEN` |
+| `fireworks-ai` | `FIREWORKS_API_KEY` |
+| `ollama-cloud` | `OLLAMA_API_KEY` (address `https://ollama.com/v1`) |
+
+About 55 providers are bundled, among them `cerebras`, `nvidia`, `perplexity`, `cohere`, `helicone`, `nebius`, `sambanova`, `scaleway`, `poe` and `opencode`. Most use the pattern `<NAME>_API_KEY`. The list above shows the rest.
 
 ### Give novacode a key
 
@@ -145,7 +163,7 @@ Levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. The default i
 
 ## Local models
 
-Ollama and LM Studio are built in and need no key:
+Ollama and LM Studio are built in and need no key. If you set `OLLAMA_API_KEY` or `LMSTUDIO_API_KEY`, it is used:
 
 | Provider | Default address |
 |---|---|
@@ -190,10 +208,27 @@ novacode -m vllm/Qwen/Qwen3-Coder-30B-A3B-Instruct
 | `keyOptional` | `true` if the server needs no key. Otherwise set `apiKey` or export a key |
 | `apiKey` | Key, `$VAR` or `!command` |
 | `headers` | Extra HTTP headers, an object of strings |
-| `env` | Env var names to read the key from |
-| `compat` | Quirks flags for the wire format, for example `thinkingFormat`, `maxTokensField`, `developerRole` |
+| `env` | A list of env var names to try for the key, in order, e.g. `["VLLM_KEY"]`. (Not for `process` providers.) |
+| `compat` | Quirk flags for the wire format, see below. Read by `openai-chat` (and, with other flags, `openai-responses`). |
+| `command`, `args` | For `process` providers only. See [Your own provider program](#your-own-provider-program). |
 
-A model novacode has no data for gets defaults: 128k context, 16k output. Set real numbers per model:
+`compat` flags for `openai-chat` (all optional). `openai-responses` has only `noMaxTokens` (the endpoint rejects `max_output_tokens`) and `noEffortNone` (thinking `off` can't be sent as effort `none`).
+
+| Flag | Meaning |
+|---|---|
+| `thinkingFormat` | How thinking is switched on: `openai` (default), `openrouter`, `deepseek`, `zai`, `qwen` or `none` |
+| `maxTokensField` | `max_tokens` (default) or `max_completion_tokens` |
+| `developerRole` | Send instructions as `developer` instead of `system` |
+| `reasoningEffort` | `false` if the server rejects `reasoning_effort` (default true) |
+| `reasoningContentOnAssistant` | Always send `reasoning_content` on assistant messages (DeepSeek, Kimi) |
+| `thinkingAsText` | Send earlier thinking back as plain text |
+| `toolResultName` | Put the tool `name` on tool results |
+| `streamUsage` | Ask for usage in the stream (default true) |
+| `cacheControl` | `anthropic`: add cache markers to content parts (OpenRouter to Claude or Gemini) |
+| `midConvoSystem` | The server accepts `system` messages mid-conversation |
+| `promptCacheKey` | Send the session id as `prompt_cache_key` |
+
+A model novacode has no data for gets defaults: 128k context, 16k output, images and thinking on. Set real numbers per model:
 
 ```json
 {
@@ -202,6 +237,8 @@ A model novacode has no data for gets defaults: 128k context, 16k output. Set re
   }
 }
 ```
+
+Fields of a `models` entry (all optional): `contextWindow` (or `context`), `maxTokens` (or `output`), `images`, `reasoning`, `name` and `cost`. This works for models novacode already knows too.
 
 Settings in `providers` also override built-in providers field by field, for example a different `baseUrl` or extra `headers` for `openai`.
 
@@ -216,6 +253,13 @@ A provider can be any program that speaks JSON-RPC on stdio. Set `"api": "proces
   }
 }
 ```
+
+| Field | Meaning |
+|---|---|
+| `command` | Program to start. Required. |
+| `args` | List of arguments. |
+
+`env` is not supported for these providers yet. To set variables, wrap the command: `"command": "env", "args": ["MY_VAR=x", "python3", "/path/to/provider.py"]`.
 
 Project settings only apply in folders you trust, so a repository can't start a provider program on its own.
 

@@ -20,7 +20,7 @@ cat error.log | novacode -p "what went wrong?"
 
 Only the answer goes to stdout, so you can pipe it. Notices and retries go to stderr. Add `-v` to also print each tool call, the token and cache usage and the session file path to stderr.
 
-An empty prompt with nothing piped fails with `-p needs a prompt`. Print mode needs a model: pass `-m provider/model` or set `model` in settings. Without one it stops with `no model`. (Interactive runs pick one for you; headless runs don't.)
+An empty prompt with nothing piped fails with `-p needs a prompt`. Print mode needs a model: pass `-m provider/model` or set `model` in settings. Without one it stops with `no model: pass -m provider/model or set "model" in settings`. `--bg` and `--rpc` do the same. Only interactive runs pick one for you.
 
 ### Exit codes
 
@@ -28,7 +28,7 @@ An empty prompt with nothing piped fails with `-p needs a prompt`. Print mode ne
 |---|---|
 | `0` | The run finished (stopped normally, hit the length limit, or stopped to use tools) |
 | `1` | The model request failed, or novacode could not start (a bad flag, no model, no login) |
-| `130` | The run was aborted (Ctrl+C) |
+| `130` | The run was aborted (for example Ctrl+C) |
 
 ```sh
 if novacode -p "does the build pass? answer yes or no" > answer.txt; then
@@ -55,6 +55,7 @@ novacode --mode read-only -p "list the TODOs in this repo"
 |---|---|
 | `-m provider/model[:level]` | Choose the model, e.g. `codex/gpt-5.5:high` |
 | `--api-key KEY` | API key for the model's provider, this run only. Needs `-m provider/model`. It comes ahead of saved and environment keys. |
+| `--trace` | Record the raw request and stream (secrets removed) to `~/.novacode/logs/trace-<id>.jsonl`. See [troubleshooting](troubleshooting.md). |
 | `--no-session` | Don't save this run as a session |
 | `-c` / `-r ID` | Continue the newest session in this folder / resume one by id prefix |
 | `--mode auto\|ask\|read-only` | Permission mode for this run |
@@ -64,6 +65,8 @@ novacode --mode read-only -p "list the TODOs in this repo"
 | `-v`, `--verbose` | Tool calls, stop reason and token usage on stderr |
 
 Project config (project settings, extensions, hooks, project MCP servers) loads only in [trusted](security.md) folders. A script never gets the trust question, so in CI either run `novacode trust` once on the checkout or pass `--trust` when you want the repo's config to apply. Without it, novacode prints a note to stderr and ignores project config.
+
+`novacode "prompt"` without `-p` starts the interactive window with that first prompt.
 
 Your `AGENTS.md` and `CLAUDE.md` files still load. `--api-key` is hidden from crash logs.
 
@@ -140,7 +143,7 @@ Send one JSON object per line. Add an `id` (any string) to a command to get a `r
 
 | Command | Fields | What it does |
 |---|---|---|
-| `prompt` | `text` | Start a run, or queue it as a follow-up if one is running. A `/command` runs that command instead. Response data: `{"disposition": "started" \| "queued" \| "handled"}` |
+| `prompt` | `text` | Start a run, or queue it as a follow-up if one is running. A `!cmd` line runs a shell command. A built-in `/command` runs that command instead (see [Slash commands](#slash-commands-over-rpc)). Response data: `{"disposition": "started" \| "queued" \| "handled"}` |
 | `steer` | `text` | Send a message to the running turn before its next model call |
 | `abort` | | Stop the running turn |
 | `set_model` | `model` | `provider/model[:level]` |
@@ -149,16 +152,45 @@ Send one JSON object per line. Add an `id` (any string) to a command to get a `r
 | `get_context` | | Response data: the `/context` report as `{"text": …}` |
 | `list_models` | | Answered with a `ui` message of models |
 | `export` | `html` (optional) | Write the session to a file. Response data: `{"path": …}` |
-| `get_state` | | Response data: the session state (also `get_status`) |
+| `get_state` | | Response data: the session state, the same record as `hello.state` (also `get_status`). See [State](#the-state-record). |
 | `get_messages` | | Response data: `{"messages": […]}` |
 | `get_commands` | | Response data: `{"commands": [{"name", "description"}]}` |
 | `approval` | `approval`, `answer` | Answer a permission question |
 | `answer` | `ask`, `replies` | Answer questions from the model |
+| `ext_key` | `ext`, `key`, `tab?`, `node?`, `width?`, `height?` | Send a key or panel action to a script [extension](extensions.md). No data comes back. |
 | `register_tools` | `tools` | Tools your client runs (see below) |
 | `tool_result` | `call`, `content`, `is_error` | The result of a `tool_call` |
 | `shutdown` | | End the session |
 
 A line that isn't a valid command gets `{"type":"response","command":"parse","ok":false,"error":"bad command: …"}`.
+
+### Slash commands over RPC
+
+`prompt` text starting with `/` runs the command in the session instead of going to the model. These work: `/compact`, `/context`, `/mcp`, `/name <text>`, `/btw <q>`, `/export [html]`, `/model <id>`, `/thinking <level>`, `/plan`, `/mode`, `/goal`, `/usage`, `/debug`, plus skills, prompt templates and extension commands. `get_commands` lists them.
+
+These need the session's own window and answer with an error such as `/resume works only in the session's own window`: `/resume`, `/new`, `/tree`, `/rewind`, `/fork`, `/clone`, `/reload`, `/restart`, `/login`, `/keys`, `/copy`, `/ps`, `/quit`. `/model` and `/thinking` without an argument (the pickers) fail the same way. The session-changing ones also don't work in a window opened with `novacode attach`.
+
+### The state record
+
+`hello.state`, `get_state` and `state` messages carry the same record:
+
+| Field | Meaning |
+|---|---|
+| `session`, `cwd`, `model`, `level` | Session id, folder, `provider/model`, thinking level |
+| `window_tokens`, `context_tokens` | Context window size and tokens in use |
+| `busy` | A run is in progress |
+| `activity` | `{state, detail}`: `working`, `blocked` or `idle`, and what it is doing |
+| `spent`, `price?` | USD spent on API-key routes, and the route's prices |
+| `tokens` | Token totals for the session |
+| `cache` | `{last_read, last_write, hit_pct, last_miss?}` |
+| `quota?` | Subscription usage windows, when the route has them |
+| `file?` | Session file (absent with `--no-session`) |
+| `branch?`, `project?` | Git branch and repo name |
+| `started_ms`, `task_started_ms?` | Unix milliseconds: session start, running task start |
+| `processes` | Commands running in the process manager |
+| `mcp?` | `[ready, configured]` MCP servers |
+
+Fields marked `?` are left out when they have no value.
 
 ### A short session
 
@@ -210,6 +242,8 @@ When the model asks the user something (`ask`), reply with one entry per questio
 {"type":"answer","ask":4,"replies":null}
 ```
 
+Each reply is `{question, chosen: [labels], text?}`. `text` is what the user typed instead of, or as well as, picking.
+
 ### Tools that your client runs
 
 Send `register_tools` with a list of `{name, description, parameters}` (parameters is a JSON Schema). The model sees them from the next run. When the model calls one, you get `{"type":"tool_call","id":7,"name":"…","args":{…}}`. Reply with `{"type":"tool_result","call":7,"content":"…","is_error":false}`.
@@ -231,6 +265,7 @@ The id is printed to stdout; the other lines go to stderr. The session runs in i
 | `novacode agents` | List live sessions: id, state (`working` or `idle`), whether it's `bg`, model and folder |
 | `novacode attach ID` | Open a window on a live session. Leaving only detaches; the session keeps running. An id prefix is enough. |
 | `novacode status` | Status of this tmux pane's session, else this folder's newest one |
+| `novacode status --session ID` | One live session, by id prefix |
 | `novacode status --all` | Every live session |
 | `novacode status --json` | The full record as JSON lines |
 | `novacode status --format TEMPLATE` | A template, e.g. `'{state} {ctx}% {5h}'` |
@@ -238,7 +273,7 @@ The id is printed to stdout; the other lines go to stderr. The session runs in i
 
 `status` fields are: `session state detail model level ctx ctx_tokens window hit read write miss cost 5h week branch project cwd bg`. It exits with `1` when there is no live session, which makes it easy to use in scripts and in a tmux status line (`#(novacode status --format '{state}')`).
 
-A background session that needs an approval waits in the `blocked` state until you attach and answer. Give it allow rules or `--mode read-only` if you want it to run on its own.
+A background session that needs an approval waits in the `blocked` state until you attach and answer. Give it allow rules or `--mode read-only` if you want it to run on its own. (`novacode agents` shows only `working` or `idle`; use `status` to see `blocked`.)
 
 ## Reacting to what the agent does
 
@@ -262,7 +297,7 @@ The command gets the full state as JSON on stdin, and these environment variable
 | `NOVACODE_CWD` | Working folder |
 | `NOVACODE_MODEL` | `provider/model` |
 
-The command is killed after 10 seconds.
+The command is killed after 10 seconds. Its output is discarded.
 
 ### tmux agent state
 
@@ -277,11 +312,15 @@ Inside tmux, a session in its own window sets these options on its pane, so your
 | `@agent_project` | The repo name |
 | `@agent_bg` | How many background processes are running (unset when none) |
 
-Turn it off with `tmux.agentState: false`. When a turn ends or needs you while the pane is unwatched, novacode also sends a terminal notification (`notifications.enabled`). `--bg` and `--rpc` sessions have no pane, so they don't set these options; use `novacode status` or `hooks.onActivity` for them.
+These need `$TMUX_PANE`. Turn it off with `tmux.agentState: false`. When a turn ends or needs you while the pane is unwatched, novacode also sends a terminal notification (`notifications.enabled`). `--bg` and `--rpc` sessions have no pane, so they don't set these options; use `novacode status` or `hooks.onActivity` for them.
+
+### herdr
+
+If novacode runs inside herdr (a terminal workspace manager for agents), it reports its state there too. It does this when `HERDR_ENV=1` and `HERDR_SOCKET_PATH` and `HERDR_PANE_ID` are set. You don't configure anything.
 
 ### Command hooks
 
-The `hooks` setting runs shell commands around tool calls and on session events. Each command runs with `sh -c`, gets JSON on stdin, and has `NOVACODE_HOOK_EVENT`, `NOVACODE_SESSION_ID`, `NOVACODE_CWD` and (for tool hooks) `NOVACODE_TOOL` set.
+The `hooks` setting runs shell commands around tool calls and on session events. Each command runs with `sh -c`, gets JSON on stdin, and has `NOVACODE_HOOK_EVENT`, `NOVACODE_SESSION_ID`, `NOVACODE_CWD` and (for tool hooks) `NOVACODE_TOOL` set. `NOVACODE_HOOKS_DISABLED=1` is set too, see below.
 
 ```json
 {

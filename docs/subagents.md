@@ -59,6 +59,7 @@ There is no separate `resume` action: `send` to a finished agent resumes its ses
 - **File claims.** Two agents never edit the same file. A subagent that tries `edit`, `write` or `apply_patch` on a file another live agent holds is refused with a message naming the holder. A claim passes down from parent to child. Claims of dead processes are dropped.
 - **Stall and timeout.** A subagent with no activity for `agents.stallMinutes` (default 10) is stopped. One that runs longer than `agents.timeoutMinutes` (default 45) is stopped.
 - **Questions and approvals.** If a subagent needs to ask you something or needs an approval, it shows up in your session.
+- **Print mode.** In `-p` runs nobody can approve, so every subagent's `notify` is forced to `wake`.
 
 ### Watching them
 
@@ -95,7 +96,7 @@ Frontmatter fields:
 |---|---|
 | `name` | Type name. Default: the file name without `.md`. |
 | `description` | Shown to the model so it can pick the type. |
-| `tools` | Comma-separated tool names. Leave it out to give all of the parent's tools. |
+| `tools` | Comma-separated tool names, or a list like `[Read, Grep]`. Leave it out to give all of the parent's tools. |
 | `model` | `provider/model` or `small`. Any other value (such as Claude Code's `inherit` or `sonnet`) is ignored and the parent's model is used. |
 | `thinking` | Thinking level, added to the model as `model:level`. |
 | `mode` | `replace`: the file's text replaces the built-in subagent preamble instead of being added after it. `systemPromptMode: replace` also works. |
@@ -119,6 +120,8 @@ The text after the frontmatter is the agent's role prompt.
 | `Task` | `agent` |
 
 Other names (for example `mcp__server__tool`) pass through unchanged.
+
+novacode sets a few variables for its subagent processes (`NOVACODE_AGENT_DEPTH`, `NOVACODE_AGENT_CHAIN`, `NOVACODE_AGENT_TITLE`, `NOVACODE_BG_CHILD`). They are internal; don't set them.
 
 ### Settings
 
@@ -208,7 +211,7 @@ The model drafts one clear objective and 1–5 criteria (a test passes, a comman
 |---|---|
 | `/goal` or `/goal status` | Show the goal, its state and criteria. |
 | `/goal <objective>` | Start a goal. |
-| `/goal pause` | Stop the loop. |
+| `/goal pause` | Stop the loop (only while the goal is active or blocked). |
 | `/goal resume` | Continue a paused or blocked goal (resets the run counter). |
 | `/goal clear` | Drop the goal. |
 | `/goal audit on` / `off` | Turn the completion audit on or off for this goal. |
@@ -238,9 +241,9 @@ Goals need a window or an RPC client. They're not available in a subagent at max
 
 ## Todo and schedule
 
-**`todo`** is the model's task list. Actions in one call: `set` (replace the list), `add`, `start` (the item being worked on), `note`, `done`, `drop`. The list shows in the side panel and is kept in the session.
+**`todo`** is the model's task list. One call can combine these fields: `set` (replace the list), `add`, `start` (number of the item being worked on), `note`, `done` and `drop` (item numbers). The list shows in the side panel and is kept in the session.
 
-**`schedule`** lets the model message itself later, inside the current session: `add` with `message` and `in` (`90s`, `10m`, `2h`, `1h30m`) or `at` (`HH:MM`, local time), optionally `every` to repeat; `list`; `cancel` with `id`. A due message starts a turn. If the session was closed, due items fire when you resume it. There is no system cron. `schedule` is found through `tool_search`, so it costs nothing until needed.
+**`schedule`** lets the model message itself later, inside the current session: `add` with `message` and `in` (`90s`, `10m`, `2h`, `1h30m`) or `at` (`HH:MM`, local time), optionally `every` to repeat (at least `1m`; `every` alone starts after one interval); `list`; `cancel` with `id`. A due message starts a turn. If the session was closed, due items fire when you resume it. There is no system cron. `schedule` is found through `tool_search`, so it costs nothing until needed.
 
 ## See also
 

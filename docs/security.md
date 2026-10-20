@@ -17,12 +17,14 @@ What the guard rails do:
 
 What they do not do: stop a command the gate does not recognise, or stop code that a program you allowed runs on its own.
 
+**Extensions are trusted code.** Tools an [extension](extensions.md) adds go through the rules below like any tool. But the extension's own actions are not held to them. Its `exec` call only refuses Catastrophic commands: no approval cards, no `allow`/`deny` rules, no read-only mode, and your `protected` lists do not apply. Its file read and write calls are not checked at all, and absolute paths work. Only install extensions you trust.
+
 ## Permission modes
 
 | Mode | What happens |
 |---|---|
 | `auto` (default) | Everything runs, except what the risk gate or your rules stop. |
-| `ask` | You approve every file change (`write`, `edit`, `apply_patch`) and every `bash` command that is not read-only. |
+| `ask` | You approve every file change (`write`, `edit`) and every `bash` command that is not read-only. |
 | `read-only` | No file changes. `bash` only runs read-only commands such as `ls`, `cat`, `grep`, `git status`. |
 
 Set the mode for one run:
@@ -40,7 +42,9 @@ Or set it for good in `~/.novacode/settings.json`:
 }
 ```
 
-Plan mode (a built-in mode preset) is read-only too.
+Plan mode (a built-in mode preset) is read-only too. Your own `modes.<name>` presets can also set `readOnly: true` or limit the tools a mode may use. Switch with `/plan` and `/mode`; see [TUI](tui.md).
+
+Use `--api-key` to give a key for one run only. It is masked like your saved logins.
 
 ## The command risk gate
 
@@ -52,13 +56,17 @@ Every `bash` command is split into simple commands (including ones inside `$(...
 | Low | Changes something ordinary. | writing a file, running a program |
 | Confirm | Destroys data or history in bulk. | `rm -rf target`, `git reset --hard`, `git clean -fd`, `git branch -D`, `find -delete`, `curl ... \| sh`, `sudo ...`, `dd`, `chmod -R` |
 | Shared | Rewrites or deletes history on a remote, which no local undo can fix. | `git push --force`, `git push origin +main`, `git push --delete` |
-| Catastrophic | Targets the system, your home folder or credentials. **Never runs.** | `rm -rf /`, `rm -rf ~`, writing to `/dev/sda`, `mkfs`, `kill -1`, fork bombs, anything that deletes or overwrites `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.config/gcloud`, `~/.password-store` or `~/.novacode` |
+| Catastrophic | Targets the system, your home folder or credentials. **Never runs.** | `rm -rf /`, `rm -rf ~`, writing to `/dev/sda`, `mkfs` on a device, `kill -1` (as the last argument), fork bombs, anything that deletes or overwrites `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.config/gcloud`, `~/.password-store` or `~/.novacode` |
+
+System folders count too: `/`, `/bin`, `/boot`, `/dev`, `/etc`, `/home`, `/lib`, `/lib64`, `/opt`, `/proc`, `/root`, `/sbin`, `/srv`, `/sys`, `/usr`, `/var`, and your home folder itself.
+
+More commands that count as Confirm: `git checkout -- .` and `git checkout -f`, `git restore` (unless only `--staged`), `git stash drop` and `clear`, `git filter-branch`, `git worktree remove -f`, `truncate`, `shred`, `wipefs`, `mkfs` and `fdisk` (when the target is not a device or protected), `shutdown`, `reboot`, `crontab -r`, `docker prune`, and `find -exec rm`. A command it cannot parse, or one nested more than 4 levels deep, is Confirm too. `git push origin :branch` is Shared, like `--delete`.
 
 What each level does depends on the mode:
 
 - **Catastrophic**: refused in every mode. The model is told to do it another way or ask you to run it yourself.
 - **Shared**: asks you, even in `auto` mode.
-- **Confirm**: asks you in `ask` and `read-only` mode. In `auto` mode it runs without asking (it is logged).
+- **Confirm**: asks you in `ask` and `read-only` mode. In `auto` mode it runs without asking (it is logged). In `read-only` mode it is then refused anyway, because only Safe commands run there.
 - **Safe / Low**: no gate action.
 
 You can add folders to the protected set and ban commands outright:
@@ -74,11 +82,11 @@ You can add folders to the protected set and ban commands outright:
 }
 ```
 
-A protected command never runs. Protected paths are treated like credentials: destroying or overwriting them is Catastrophic.
+A protected command never runs. It matches the command name (so `/usr/bin/sudo` too) and any other word of the command (so `env sudo ls`). Protected paths are treated like credentials: destroying or overwriting them is Catastrophic.
 
 ### When nobody can approve
 
-In print mode (`-p`) and other runs with no one to answer a question, a held command cannot be approved. novacode gives the model one way forward: call `bash` again with the same command and a `justification` field (at least 12 characters) that says why it is safe. If the justification is there, the command runs and the reason is logged. Without it, the command is refused. This applies to Confirm and Shared commands.
+In print mode (`-p`) and other runs with no one to answer a question, a held command cannot be approved. novacode gives the model one way forward: call `bash` again with the same command and a `justification` field (at least 12 characters) that says why it is safe. If the justification is there, the command runs and the reason is logged. Without it, the command is refused. This only works for commands held by the risk gate (Confirm and Shared). It does not work for a call held by an `ask` rule or by `ask` mode.
 
 ## Approval dialogs
 
@@ -92,9 +100,9 @@ When something needs your approval, a card shows the tool, the command or path, 
 | `n` | Deny. You can type a reason, then Enter; the model sees it. |
 | Esc or Ctrl+C | Deny without a reason. |
 
-"Session" for a risk-gated command means that exact command. "Always" saves a rule such as `Bash(git push:*)` (the first two words of the command) or `Edit(<path>)` to `permissions.allow`.
+"Session" for a risk-gated command means that exact command. For other calls, `a` and `A` use a rule such as `Bash(git push:*)` (the first two words of the command) or `Edit(<path>)`; `A` also saves it to `permissions.allow`.
 
-In print mode there is nobody to approve. A call that would need approval is not run, and the model is told to use an allow rule or run interactively.
+In print mode there is nobody to approve. A call that would need approval is not run, and the model is told to use an allow rule or run interactively (or, for a risk-gate hold, to add a `justification`).
 
 ## Permission rules
 
@@ -116,16 +124,16 @@ Rules go in `permissions.allow`, `permissions.ask` and `permissions.deny`. A rul
 | `Bash(git status)` | Exactly that command. |
 | `Bash(git push:*)` | `git push` and anything starting with `git push `. |
 | `Read(path)`, `Write(path)`, `Edit(path)`, `Grep(path)`, `Find(path)`, `Ls(path)` | The tool's `path` argument, as a glob (`*`, `**`, `?`). Matched against the path as given and against its absolute form. `~/` expands to your home folder. |
-| Any other tool name | The whole tool (no pattern). |
+| Any other tool name | The whole tool (no pattern). A rule with a pattern, such as `Mcp(x)`, never matches these tools. |
 
-Bash commands are matched per simple command. A `deny` or `ask` rule fires if **any** part of a chained command matches. An `allow` rule only fires if **all** parts match, so `Bash(git status)` does not allow `git status && rm -rf x`.
+Bash commands are matched per simple command. Commands are split at `;`, `&&`, `||`, `|`, `&` and newlines, and compared with quotes removed (`git commit -m "a b"` is compared as `git commit -m a b`). A leading `FOO=1` stays in the text, so `Bash(git status)` does not match `FOO=1 git status`. A `deny` or `ask` rule fires if **any** part of a chained command matches. An `allow` rule only fires if **all** parts match, so `Bash(git status)` does not allow `git status && rm -rf x`.
 
 Order of checks for each call:
 
-1. Profile (tool not available: refused).
+1. Profile, or the tool list of a mode preset (tool not available: refused).
 2. `deny` rules.
 3. Protected commands, then the risk gate.
-4. Read-only mode.
+4. Read-only mode (or a read-only mode preset). `allow` rules do not get around it.
 5. `allow` rules (and what you approved this session).
 6. `ask` rules.
 7. `ask` mode.
@@ -143,7 +151,7 @@ A profile limits which tools a run may use.
 novacode --profile scout
 ```
 
-`scout` and `reviewer` are built in: they allow `read`, `grep`, `find` and `ls` only. Define your own under `permissions.profiles`:
+`scout` and `reviewer` are built in and identical: they allow `read`, `grep`, `find` and `ls` only. Subagents are limited the same way (see [Subagents](subagents.md)). Define your own under `permissions.profiles`:
 
 ```json
 {
@@ -160,7 +168,7 @@ novacode --profile scout
 
 ## Permissions are global only
 
-`permissions` is read from `~/.novacode/settings.json` only. A project's `.novacode/settings.json` cannot widen what the agent may do, even when the folder is trusted.
+`permissions` and `trust` are read from `~/.novacode/settings.json` only. A project's `.novacode/settings.json` cannot widen what the agent may do, even when the folder is trusted.
 
 ## Project trust
 
@@ -169,12 +177,13 @@ A project folder can ship config that changes settings and runs code. novacode o
 - `.novacode/settings.json` (and with it, hooks)
 - `.novacode/extensions`
 - `.novacode/skills`
+- `.novacode/agents`
 - `.mcp.json`
-- project-level Claude Code config under `.claude` (when `compat.claude` is on)
+- project-level Claude Code config under `.claude`: `skills`, `agents` and `commands` (when `compat.claude` is on)
 
 `AGENTS.md` and `CLAUDE.md` are plain text and always load.
 
-The first time you open a folder that has such config, an interactive session asks:
+The first time you open a folder that has any of these, an interactive session asks:
 
 - Trust this folder
 - Trust the parent folder
@@ -188,11 +197,11 @@ Manage trust from the command line:
 ```sh
 novacode trust                 # trust the current folder
 novacode trust ~/work          # trust another folder and everything below it
-novacode trust --revoke        # distrust the current folder
+novacode trust --revoke        # distrust the current folder (stored as an explicit "no")
 novacode --trust               # trust this folder for this run only
 ```
 
-Without a stored decision, a folder is untrusted. In print mode there is no prompt: the project config is ignored, and a note on stderr says so. Run `/reload` in a session to pick up a `novacode trust` you ran meanwhile.
+`--revoke` writes a "no" for that folder, which also beats trust inherited from a parent folder. Without a stored decision at the folder or any parent, a folder is untrusted and the prompt appears. In print mode there is no prompt: the project config is ignored, and a note on stderr says so. Run `/reload` in a session to pick up a `novacode trust` you ran meanwhile.
 
 ## Secrets
 
@@ -207,6 +216,7 @@ Without a stored decision, a folder is untrusted. In print mode there is no prom
 
 - Logins are stored in `~/.novacode/auth.json`, created with mode `0600` (owner read and write only).
 - MCP OAuth tokens are stored in `~/.novacode/mcp-auth.json`, also `0600`.
+- Spill files and exports are masked the same way. See [Sessions](sessions.md).
 
 Masking changes what the model reads. It does not stop a command you allow from sending a secret somewhere.
 
@@ -228,4 +238,5 @@ Open an issue on the project's GitHub repository (Novaturiente/novacode). Do not
 - [Extensions](extensions.md)
 - [MCP](mcp.md)
 - [Automation](automation.md)
+- [Migrating](migrating.md): `novacode import claude` converts Claude Code permission rules.
 - [Troubleshooting](troubleshooting.md)

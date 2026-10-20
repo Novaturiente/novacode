@@ -29,13 +29,26 @@ This page lists the tools the model can call, what each one does, how output is 
 | `session_search` | Search earlier sessions. (deferred) |
 | `classify` | Classifier models, reached from scripts only. |
 
-Some tools only exist when they make sense. `agent` and `goal` need a live window or RPC client and are not available below the subagent depth limit. `ask_user`, `enter_plan_mode` and `plan_complete` need someone to answer. `schedule` needs a live session. `session_search` needs a saved session. `recall` needs memory on.
+Some tools only exist when they make sense. `agent` and `goal` need a live window or RPC client and are not available below the subagent depth limit. `ask_user`, `enter_plan_mode` and `plan_complete` need someone to answer. `schedule` needs a live window or RPC client. `session_search` needs a saved session. `recall` needs `memory.enabled` and a saved session (so not with `--no-session`).
 
 Every call, including calls from `codemode` scripts, goes through the same permission check and hooks. See [Security](security.md).
 
+### How calls run
+
+- Calls in one reply run at the same time, and their results are added in order. If any call in the reply is one that must run alone (`ask_user`, `tool_search`, `schedule`, the worktree tools, the plan tools), the whole reply runs one call at a time.
+- Permission checks and approval cards happen first, one card at a time.
+- An unknown tool name gets a "did you mean" hint. String arguments are fixed to the type the schema wants (`"5"` becomes 5, `"true"` becomes true). Arguments that are not valid JSON are not run; the model is told to resend.
+
 ### Output caps
 
-Output that reaches the model is cut at **2000 lines or 50 KB**. When it is cut, the full text is saved to a file and the result tells the model where. `bash` keeps the end of the output; most other tools keep the start. Output too big for the context window is refused unless the model passes `accept_large_output`.
+Output that reaches the model is cut at **2000 lines or 50 KB**. When it is cut, the full text is saved to `~/.novacode/spill/<session id>-<call id>.txt` (secrets already masked) and the result tells the model where. `bash` keeps the end of the output; most other tools keep the start.
+
+Two limits protect the context window:
+
+- Output over 30% of the window, or over 50,000 tokens, is refused unless the model passes `accept_large_output: true`.
+- Output that would take the context past 90% of the window is refused even with it. The model is told to narrow the query or ask you to compact.
+
+`accept_large_output` is only offered on tools that can return a lot (`read`, `grep`, `find`, `ls`, `bash`, `process`, the web tools and so on), not on `write`, `edit`, `todo`, `ask_user` and similar.
 
 ### read
 
@@ -45,15 +58,17 @@ Output that reaches the model is cut at **2000 lines or 50 KB**. When it is cut,
 | `offset` | First line, 1-based. |
 | `limit` | Max lines (capped at 2000). |
 
-Lines longer than 2000 characters are clipped. When more is left, the result says which `offset` to continue with. Images come back as images, converted and shrunk to fit if needed. Binary files are refused.
+Lines longer than 2000 characters are clipped. A read is also cut at 50 KB. When more is left, the result says which `offset` to continue with. An `offset` past the end is an error. Images come back as images, converted and shrunk to fit if needed. Binary files (a NUL byte near the start) are refused. A directory is an error: use `ls`.
 
 ### write
 
-Params: `path`, `content`. Creates missing folders. If the file changed on disk since the agent last read it, the write is refused so it does not overwrite your edit.
+Params: `path`, `content`. Creates missing folders. If the file changed on disk since the agent last read or wrote it, the write is refused so it does not overwrite your edit. A file the agent never read in this session is overwritten without that check.
 
 ### edit
 
-Params: `path`, `edits` (a list of `old_text` / `new_text`). Each `old_text` must match exactly one place. If an exact match fails, a whitespace and quote tolerant match is tried. All edits apply together or none do. CRLF line endings and a BOM are kept.
+Params: `path`, `edits` (a list of `old_text` / `new_text`). Each `old_text` must match exactly one place. If an exact match fails, a whitespace and quote tolerant match is tried. All edits apply together or none do. CRLF line endings and a BOM are kept. If the file changed on disk since the agent last read it, `edit` still applies when every `old_text` matches exactly once, and the result says the file had changed. Only a failed match adds "changed on disk since you last read it". Edits to the same file run one at a time. The result is a short diff.
+
+`apply_patch` (a patch-format tool that can replace `edit` for some models) exists in the code but is not turned on in any release path yet, so the model does not see it.
 
 ### bash
 
@@ -61,10 +76,12 @@ Params: `path`, `edits` (a list of `old_text` / `new_text`). Each `old_text` mus
 |---|---|
 | `command` | Run with `bash -c` in the working directory. |
 | `timeout` | Seconds. Default 120, max 600. |
-| `description` | One short sentence on why; shown to you. |
+| `intent` | One short sentence on why; shown to you. |
 | `justification` | Only when the safety check asks for it with nobody to approve. See [Security](security.md). |
 
-stdout and stderr are merged. stdin is closed, so interactive programs fail instead of hanging. A command that passes its timeout is not killed: it moves to the process manager and keeps running, and the model gets its id.
+stdout and stderr are merged. stdin is closed, so interactive programs fail instead of hanging. The command sees `NOVACODE_SESSION_ID`. In memory, only the last 4 MB of output is kept.
+
+A command that passes its timeout is not killed: it moves to the process manager and keeps running, and the model gets its id. If it is still running at twice the timeout, you are asked whether to keep it. (Without a process manager, such as in some embedded runs, it is killed at the timeout.)
 
 ### grep, find, ls
 
@@ -73,16 +90,29 @@ All three respect `.gitignore`.
 | Tool | Params | Default cap |
 |---|---|---|
 | `grep` | `pattern` (Rust regex, or literal text with `literal`), `path`, `glob`, `ignore_case`, `context` lines, `limit` | 100 matches; the real total is reported |
-| `find` | `pattern` (glob, e.g. `**/*.rs`; a pattern with no `/` matches file names anywhere), `path`, `limit` | 1000 results |
+| `find` | `pattern` (glob, e.g. `**/*.rs`; a pattern with no `/` matches file names anywhere), `path`, `limit` | 1000 results (limit 1 to 5000) |
 | `ls` | `path`, `limit` | 500 entries; sorted, directories end in `/`, dotfiles included |
+
+`grep` limit is 1 to 1000, and match lines are clipped at 500 characters. All three only search the local file system.
 
 ### todo
 
-A small task list. One call can set the whole list, add items, mark ids done or cancelled, and start one id with a note. A call with no fields shows the list. The list is saved with the session and comes back on resume.
+A small task list. A call with no fields shows the list. The list is saved with the session and comes back on resume.
+
+| Param | Meaning |
+|---|---|
+| `set` | Replace the whole list with these strings. |
+| `add` | Append strings. |
+| `done` | Ids to mark done. |
+| `drop` | Ids to cancel. |
+| `start` | The id being worked on now (only one is active). |
+| `note` | What the started item is doing. |
+
+The list shows `done/total` first, then one line per item: `○` pending, `◐` active, `✓` done, `✗` dropped.
 
 ### ask_user
 
-Asks you one or more questions in one form. Each has 2 to 6 choices (one can be marked recommended), and a question can allow several picks. You can always type your own answer.
+Asks you one or more questions in one form. Each has 2 to 6 choices (one can be marked recommended, and each can have a `description` and a `preview`), and a question can allow several picks with `multi`. You can always type your own answer. If you dismiss the form, the model is told to ask in chat instead.
 
 ### agent and goal
 
@@ -94,7 +124,7 @@ Asks you one or more questions in one form. Each has 2 to 6 choices (one can be 
 
 ### memory and recall
 
-`memory` has three actions: `remember` (save a lasting fact, with optional `scope` of `project` or `global`), `search` and `forget`. `recall` takes one note id from a compaction summary and returns the exact source behind it. See [Context](context.md).
+`memory` has three actions: `remember` (save a lasting fact, with optional `scope` of `project` or `global`, `kind` and `pin`), `search` (`query`, `limit` default 10, max 50) and `forget` (by id). `recall` takes one note id from a compaction summary and returns the exact source behind it. See [Context](context.md).
 
 ### web_fetch and web_search
 
@@ -104,17 +134,17 @@ Asks you one or more questions in one form. Each has 2 to 6 choices (one can be 
 
 ### enter_worktree and exit_worktree
 
-`enter_worktree` (param `name`, optional start point) creates or reuses `<repo>/.worktrees/<name>` on branch `worktree-<name>`, copies root `.env` files in, and moves the session there. `exit_worktree` moves back and asks you whether to keep or remove it. Removal refuses uncommitted changes and keeps unmerged branches.
+`enter_worktree` (params `name` in kebab-case, and `base`, a commit or branch, default `HEAD`) creates or reuses `<repo>/.worktrees/<name>` on branch `worktree-<name>`, copies root `.env` files in, and moves the session there. `exit_worktree` (no params) moves back and asks you whether to keep or remove it; with nobody to ask, it keeps it. Removal refuses uncommitted changes and keeps unmerged branches.
 
 ### schedule and session_search
 
-`schedule` has `add` (a `message` plus `in` like `10m`, or `at` like `14:30`, and optional `every`), `list` and `cancel`. A due message starts a turn, and fires on resume if the session was closed.
+`schedule` has `action` `add` (a `message` plus `in` like `90s`, `10m`, `1h30m`, or `at` as local `HH:MM` for the next time it occurs, and optional `every` for a repeat interval), `list` and `cancel` (with `id`). A due message starts a turn, and fires on resume if the session was closed.
 
-`session_search` finds earlier messages that contain all your words. Params: `query`, `all_projects` (default: this folder only), `limit` (default 20).
+`session_search` finds earlier messages that contain all your words. Params: `query`, `all_projects` (default: this folder only), `limit` (default 20, max 100). The current session is skipped. Hits are grouped by session.
 
 ## Deferred tools and tool_search
 
-Every listed tool costs tokens on every request. Rarely used tools are **deferred**: they stay out of the request. Instead the model gets `tool_search`, whose description names the deferred tools. It searches them by what they do and returns their descriptions and schemas (`query`, optional `limit`, default 5).
+Every listed tool costs tokens on every request. Rarely used tools are **deferred**: they stay out of the request. Instead the model gets `tool_search`, whose description names the deferred tools. It searches them by what they do and returns their descriptions and schemas (`query`, optional `limit`, default 5, max 20).
 
 Once a tool is found:
 
@@ -133,7 +163,7 @@ Change how a tool reaches the model with `tools.<name>.exposure` in settings:
 |---|---|
 | `listed` | Declared in every request. |
 | `deferred` | Found through `tool_search`. |
-| `codemode` | Only callable from `codemode` scripts. |
+| `codemode-only` | Only callable from `codemode` scripts (`codemode` also works). |
 | `hidden` | Not available to the model. |
 
 ```json
@@ -145,7 +175,7 @@ Change how a tool reaches the model with `tools.<name>.exposure` in settings:
 }
 ```
 
-`classify` is `codemode` by default: scripts reach it as `models.classify()`.
+`classify` is `codemode` by default: scripts reach it as `models.classify()`. Its providers need their own key: `TYPESAFE_API_KEY` for `typesafe`, or `CLOUDFLARE_API_KEY` (or `CLOUDFLARE_API_TOKEN`) plus `CLOUDFLARE_ACCOUNT_ID` for `cloudflare-workers-ai`.
 
 ## The process manager
 
@@ -153,15 +183,17 @@ The `process` tool runs commands that keep going across turns: dev servers, watc
 
 | Action | What it does |
 |---|---|
-| `start` | Starts `command` (with a `name`, optional `cwd`) in its own process group. |
+| `start` | Starts `command` (with a `name`, optional `cwd`) in its own process group. Waits 1.5 seconds and reports it if it fails at once. |
 | `list` | Shows processes with state, pid, command and folder. |
-| `output` | Shows the last `lines` (default 100), optionally only lines containing `filter`. |
+| `output` | Shows the last `lines` (default 100, max 2000), optionally only lines containing `filter`. |
 | `write` | Sends `input` to its stdin; `end` closes stdin. |
 | `stop` | Stops it (SIGTERM, then SIGKILL after 2 seconds). |
-| `watch` | Sets what the model is told about: when it exits (`on_exit`: `wake`, `context` or `ignore`), when an output line matches, or when it prints nothing for `stall_seconds`. |
+| `watch` | Sets what the model is told about: when it exits (`on_exit`: `wake`, `context` or `ignore`), when an output line matches, or when it prints nothing for `stall_seconds` (at least 5). `start` takes these too. |
 | `clear` | Forgets finished processes and deletes their logs. |
 
-The model is told when a process exits or a watched line appears, so it does not need to poll. Every process a session started is stopped when the session ends. If novacode crashes, the next start cleans up processes it left behind.
+A watch is `{pattern, regex?, on, repeat?}`: `pattern` is plain text unless `regex` is true, and `on` is `wake`, `context` or `ignore`. Setting `watches` replaces the earlier ones.
+
+The model is told when a process exits or a watched line appears, so it does not need to poll. Output logs are kept in `~/.novacode/processes/`. Every process a session started is stopped when the session ends. If novacode crashes, the next start cleans up processes it left behind.
 
 `bash` runs through the same manager. When a command hits its timeout, or you press **Ctrl+Alt+B** while it runs, the call returns at once and the command keeps running with an id. Use `/ps` in the TUI to see processes and their latest output.
 
