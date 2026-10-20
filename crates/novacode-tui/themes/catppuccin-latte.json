@@ -5,22 +5,49 @@
   "tokens": {
     "text": "#4c4f69",
     "dim": "#8c8fa1",
-    "accent": "#8839ef",
-    "user": { "fg": "#1e66f5", "bold": true },
-    "heading": { "fg": "#ea76cb", "bold": true },
-    "code": "#fe640b",
+    "accent": "#1e66f5",
+    "user": {
+      "fg": "#1e66f5",
+      "bold": true
+    },
+    "heading": {
+      "fg": "#fe640b",
+      "bold": true
+    },
+    "code": "#8839ef",
     "code_block": "#40a02b",
-    "link": { "fg": "#209fb5", "underline": true },
-    "quote": { "fg": "#7c7f93", "italic": true },
-    "thinking": { "fg": "#7c7f93", "italic": true },
+    "link": {
+      "fg": "#1e66f5",
+      "underline": true
+    },
+    "quote": {
+      "fg": "#7c7f93",
+      "italic": true
+    },
+    "thinking": {
+      "fg": "#7c7f93",
+      "italic": true
+    },
     "ok": "#40a02b",
     "warn": "#df8e1d",
     "error": "#d20f39",
     "add": "#40a02b",
     "del": "#d20f39",
     "border": "#acb0be",
-    "selection": { "bg": "#ccd0da" },
+    "selection": {
+      "bg": "#ccd0da"
+    },
     "toggle": "#179299",
-    "match": { "bg": "#df8e1d", "fg": "#eff1f5" }
+    "match": {
+      "bg": "#df8e1d",
+      "fg": "#eff1f5"
+    },
+    "thinking_off": "#8c8fa1",
+    "thinking_minimal": "#1e66f5",
+    "thinking_low": "#1e66f5",
+    "thinking_medium": "#8839ef",
+    "thinking_high": "#04a5e5",
+    "thinking_xhigh": "#d20f39",
+    "thinking_max": "#fe640b"
   }
 }

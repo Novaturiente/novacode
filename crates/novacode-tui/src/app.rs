@@ -130,7 +130,7 @@ pub enum Cmd {
     Focus(bool),
     /// Ctrl+Alt+B: running bash commands move to the process manager (L5.8).
     Background,
-    /// `/ps`: the host answers with a page of processes (L5.11).
+    /// `/ps` and the Processes tab: the host answers with [`UiEvent::Procs`] (L5.11).
     Processes,
     /// `/mcp`: server status page (L7.4).
     Mcp,
@@ -160,6 +160,10 @@ pub enum Cmd {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiEvent {
+    /// Answer to [`Cmd::Processes`]: every listed process with its output tail.
+    Procs {
+        items: Vec<crate::procs::ProcView>,
+    },
     /// Text to show in the pager (e.g. `/context`).
     Page {
         title: String,
@@ -496,6 +500,13 @@ impl App {
                 }
             }
             UiEvent::Dequeued { ok: false } => self.flash("too late: it already reached the model"),
+            UiEvent::Procs { items } => {
+                if items.is_empty() && self.panel.procs_shown() {
+                    self.panel.hide();
+                    self.flash("no processes (long-running commands land here)");
+                }
+                self.panel.set_procs(items);
+            }
             UiEvent::Page { title, text } => self.overlay = Some(Overlay::Pager(Pager::new(title, &text, &self.theme))),
             UiEvent::Thinking { level, note } => {
                 self.init.level = level;
@@ -663,6 +674,17 @@ impl App {
                 self.activity.clear();
                 self.tr.settle();
             }
+            AgentEvent::PromptTakenBack { text } => {
+                self.tr.take_back();
+                // Anything typed meanwhile stays, after the restored prompt.
+                let typed = self.editor.text().to_string();
+                let all = if typed.trim().is_empty() {
+                    text
+                } else {
+                    format!("{text}\n{typed}")
+                };
+                self.editor.set_text(&all);
+            }
         }
     }
 
@@ -749,6 +771,10 @@ impl App {
     pub fn tick(&mut self) -> bool {
         let before = self.panel.visible;
         self.panel.tick();
+        // Live output while the Processes tab is on screen (the ticker runs only then or while busy).
+        if self.panel.procs_shown() && !self.init.attached {
+            self.send(Cmd::Processes);
+        }
         before != self.panel.visible || (self.panel.visible && self.busy)
     }
 
@@ -1249,7 +1275,10 @@ impl App {
                 "/resume" => self.send(Cmd::ListSessions),
                 "/new" => self.exit = Some(Exit::New),
                 "/reload" => self.exit = Some(Exit::Reload),
-                "/ps" => self.send(Cmd::Processes),
+                "/ps" => {
+                    self.panel.show_procs();
+                    self.send(Cmd::Processes);
+                }
                 "/mcp" => self.send(Cmd::Mcp),
                 "/restart" => self.exit = Some(Exit::Restart),
                 "/keys" | "/help" => {
@@ -1565,7 +1594,12 @@ impl App {
             .border_type(BorderType::Rounded)
             .border_style(match &self.editor_border {
                 Some(b) => t.token(Some(b)),
-                None => t.border,
+                None => {
+                    t.levels[ThinkingLevel::ALL
+                        .iter()
+                        .position(|l| *l == self.init.level)
+                        .unwrap_or(3)]
+                }
             });
         if let Some(title) = &self.editor_title {
             block = block.title(Span::styled(format!(" {title} "), t.dim));

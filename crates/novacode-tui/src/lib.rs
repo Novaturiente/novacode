@@ -11,6 +11,7 @@ pub mod images;
 pub mod keys;
 pub mod markdown;
 pub mod panel;
+pub mod procs;
 pub mod prompt;
 pub mod statusline;
 pub mod term;

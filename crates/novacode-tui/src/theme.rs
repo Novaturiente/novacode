@@ -37,6 +37,8 @@ pub struct Theme {
     pub toggle: Style,
     /// The current transcript search match.
     pub matched: Style,
+    /// Editor border per thinking level, off → max (pi's `thinkingOff`…`thinkingMax`).
+    pub levels: [Style; 7],
     /// Downgrade truecolor to the 256-colour palette.
     pub ansi256: bool,
     /// How prompts are drawn in the transcript (setting `ui.userMessage`).
@@ -190,6 +192,7 @@ impl Theme {
             selection: get("selection"),
             toggle: get("toggle"),
             matched: get("match"),
+            levels: ["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(|l| get(&format!("thinking_{l}"))),
             ansi256,
             user_box: UserBox {
                 border: Some(BORDERS[0].1),

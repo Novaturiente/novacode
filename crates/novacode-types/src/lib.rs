@@ -348,6 +348,10 @@ pub enum AgentEvent {
     },
     /// Stopped and nothing is queued (L3.10).
     Settled,
+    /// Esc before the first reply: the prompt was taken off the branch; `text` goes back to the editor.
+    PromptTakenBack {
+        text: String,
+    },
     /// The session moved to another folder (a worktree, L5.22).
     CwdChanged {
         cwd: String,

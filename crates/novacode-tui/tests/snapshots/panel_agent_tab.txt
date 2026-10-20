@@ -1,11 +1,11 @@
                                                                       │  Agent
-                                                                      │  Todos 1/3 ▰▰▰▱▱▱▱▱▱▱
-                                                                      │  ✓ read the code
-                                                                      │  ◐ write the panel
-                                                                      │    ▸ rendering
-                                                                      │  ○ test it
-                                                                      │
-                                                                      │
+                                                                      │ ━━━━━━━
+                                                                      │ ▍ TODOS                            1/3
+                                                                      │    ▰▰▰▱▱▱▱▱▱▱
+                                                                      │   ├─✓ read the code
+                                                                      │   ├─◐ write the panel
+                                                                      │   │   ▸ rendering
+                                                                      │   └─○ test it
                                                                       │
                                                                       │
                                                                       │

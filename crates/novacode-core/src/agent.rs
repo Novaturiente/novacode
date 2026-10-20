@@ -1113,6 +1113,33 @@ impl Agent {
         let _ = self.events.send(ev); // no subscribers is fine
     }
 
+    /// Undo this run's prompt when nothing else happened since `start`: only text
+    /// prompts follow it on the branch. Moves the leaf back; returns their text.
+    fn take_back(&mut self, start: Option<&str>) -> Option<String> {
+        let start = start?;
+        let branch = self.store.branch();
+        let after = &branch[branch.iter().position(|e| e.id == start)? + 1..];
+        let mut texts = Vec::new();
+        for e in after {
+            let EntryKind::Message {
+                message: Message::User { content },
+            } = &e.kind
+            else {
+                return None;
+            };
+            for b in content {
+                let Block::Text { text, .. } = b else { return None };
+                texts.push(text.clone());
+            }
+        }
+        if texts.is_empty() {
+            return None;
+        }
+        self.store.set_leaf(start).ok()?;
+        self.update_report();
+        Some(texts.join("\n"))
+    }
+
     fn add(&mut self, kind: EntryKind) -> String {
         let ev = match &kind {
             EntryKind::Message { message } => Some(message.clone()),
@@ -1202,6 +1229,9 @@ impl Agent {
         self.start_checkpoint();
         let mut rec = Recovery::default();
         let mut steering_only = false;
+        // Esc before the first reply takes the prompt back (like Claude Code): the leaf returns here.
+        let start = self.store.branch().last().map(|e| e.id.clone());
+        let mut first = true;
         let stop = loop {
             for content in self.take_queued(steering_only) {
                 self.add(EntryKind::Message {
@@ -1231,6 +1261,15 @@ impl Agent {
             }
             self.emit(AgentEvent::TurnStart);
             let msg = self.call_model(&cancel).await;
+            if std::mem::take(&mut first)
+                && msg.stop == StopReason::Aborted
+                && msg.tool_calls().next().is_none()
+                && msg.text().trim().is_empty()
+                && let Some(text) = self.take_back(start.as_deref())
+            {
+                self.emit(AgentEvent::PromptTakenBack { text });
+                break StopReason::Aborted;
+            }
             let calls: Vec<ToolCall> = msg.tool_calls().cloned().collect();
             let stop = msg.stop.clone();
             let has_text = !msg.text().trim().is_empty();

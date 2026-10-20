@@ -126,7 +126,7 @@ Every message has a `type`.
 |---|---|
 | `hello` | Always first: `protocol`, `version`, `capabilities`, and the session `state` |
 | `history` | The session's messages so far (sent right after `hello`) |
-| `event` | A loop event in `event`: `agent_start`, `turn_start`, `stream`, `message`, `tool_start`, `tool_update`, `tool_end`, `retry`, `agent_end`, `settled`, `compacted`, … Streamed text arrives as `stream` events with `"stream":"delta"` |
+| `event` | A loop event in `event`: `agent_start`, `turn_start`, `stream`, `message`, `tool_start`, `tool_update`, `tool_end`, `retry`, `agent_end`, `settled`, `compacted`, `prompt_taken_back` (Esc before the first reply took the prompt off the branch; `text` holds it), … Streamed text arrives as `stream` events with `"stream":"delta"` |
 | `response` | The answer to a command that had an `id`: `command`, `ok`, `data`, `error` |
 | `ui` | A notice, page or list for the user, tagged by `ui.kind` |
 | `approve` | A permission question (see below) |

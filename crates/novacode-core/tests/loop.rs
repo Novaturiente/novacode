@@ -1154,3 +1154,37 @@ async fn side_question_reuses_the_prefix_and_leaves_no_trace() {
     let stored = format!("{:?}", a.store.projection());
     assert!(!stored.contains("side answer"));
 }
+
+#[tokio::test]
+async fn esc_before_the_first_reply_takes_the_prompt_back() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let faux = Faux::new([
+        FauxReply::Fail(ErrorKind::Aborted, "aborted".into()),
+        FauxReply::text("ok"),
+    ]);
+    let store = Store::create(&Paths::new(home.path()), work.path(), true);
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        vec![],
+        store,
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    );
+    let (agent, events) = drive(agent, &["fix it", "again"]).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::PromptTakenBack { text } if text == "fix it"))
+    );
+    // The taken-back prompt and the empty aborted reply are off the branch.
+    let reqs = faux.requests.lock().unwrap();
+    let users: Vec<_> = reqs[1]
+        .messages
+        .iter()
+        .filter(|m| matches!(m, Message::User { .. }))
+        .collect();
+    assert_eq!(users.len(), 1, "{users:?}");
+    assert!(!reqs[1].messages.iter().any(|m| matches!(m, Message::Assistant(_))));
+    drop(agent);
+}

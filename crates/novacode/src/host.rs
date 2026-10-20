@@ -387,28 +387,32 @@ impl Host {
                 let _ = ui.send(UiEvent::Notice { text, error: false });
             }
             Cmd::Processes => {
-                let text = match &self.processes {
-                    None => "the process manager is off".to_string(),
-                    Some(pm) if pm.list().is_empty() => "no processes".to_string(),
-                    Some(pm) => pm
-                        .list()
-                        .iter()
+                let items = self.processes.as_ref().map_or_else(Vec::new, |pm| {
+                    pm.list()
+                        .into_iter()
                         .map(|i| {
-                            let state = match &i.end {
-                                None => "running".to_string(),
-                                Some(e) if e.stopped => "stopped".into(),
-                                Some(e) => e.code.map_or("killed".into(), |c| format!("exited {c}")),
+                            let (status, state) = match &i.end {
+                                None => ("running", "running".to_string()),
+                                Some(e) if e.stopped => ("stopped", "stopped".into()),
+                                Some(e) => match e.code {
+                                    Some(0) => ("done", "exited 0".into()),
+                                    Some(c) => ("failed", format!("exited {c}")),
+                                    None => ("failed", "killed".into()),
+                                },
                             };
-                            let tail = pm.output(&i.id, 15, None).unwrap_or_default();
-                            format!("{} {} [{state}]\n$ {}\n{}\n", i.id, i.name, i.command, tail)
+                            novacode_tui::procs::ProcView {
+                                output: pm.output(&i.id, 300, None).unwrap_or_default(),
+                                id: i.id,
+                                name: i.name,
+                                command: i.command,
+                                status: status.into(),
+                                state,
+                                started_ms: i.started_ms,
+                            }
                         })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                };
-                let _ = ui.send(UiEvent::Page {
-                    title: "Processes".into(),
-                    text,
+                        .collect()
                 });
+                let _ = ui.send(UiEvent::Procs { items });
             }
             Cmd::Mcp => {
                 use novacode_core::mcp::Status;

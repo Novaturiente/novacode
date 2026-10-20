@@ -22,7 +22,7 @@ The panel has tabs. Switch tabs with `Tab` and `Shift+Tab` while the panel has f
 | Tab | Shows |
 |---|---|
 | Agent | The todo list and running subagents. |
-| Processes | Commands in the process manager. |
+| Processes | One process at a time: its status, command and live output (the program's own colors, else errors red, warnings yellow, success green, URLs blue). Running ones come first. `/ps` opens the panel here with focus. |
 | Usage & cache | Tokens, cost and cache numbers. |
 | Timing | Where the time of the turn went. |
 | Files | Files the model read or edited. |
@@ -35,6 +35,7 @@ Extensions can add tabs too (see [extensions](extensions.md)).
 | `Ctrl+Alt+F` | Give the panel the keys. `Esc` or `q` gives them back. |
 | `Up`/`Down` (or `k`/`j`) | Move in the focused panel. |
 | `Enter` | Run the action of the selected row (used by extension tabs). |
+| `Left`/`Right` (or `h`/`l`) | Processes tab: the previous or next process. `Up`/`Down` scroll its output; `End` follows the tail again. |
 
 The panel needs a terminal at least 100 columns wide. On a narrower screen it stays hidden and open todos show as a short block above the editor instead. Its width is a quarter of the screen, at least 40 columns and at most half.
 
@@ -138,7 +139,7 @@ Type `/` to see the list. A line that is only `/something` unknown to novacode i
 | `/context` | Where the context window goes. |
 | `/usage` | Tokens and cost per route, cache warming, memory workers and subscription windows. |
 | `/debug` | Route, cache, queues, processes, MCP and log paths, for bug reports. |
-| `/ps` | Processes in the process manager, with their latest output. |
+| `/ps` | Open the side panel on the Processes tab, one process at a time with its live output. |
 | `/mcp` | MCP servers: status and tool counts. See [mcp](mcp.md). |
 | `/login <provider>` | Log in without handing over the session: novacode runs `novacode login <provider>` in your terminal and comes back. Several accounts need `novacode login --account` on the command line. See [providers](providers.md). |
 | `/keys` (or `/help`) | Show the key bindings. |
@@ -180,7 +181,7 @@ Press `Alt+/` or type `/keys` to see the live table, including your changes. Typ
 
 | Action name | Default | What it does |
 |---|---|---|
-| `app.interrupt` | `Esc` | Abort the running turn. Twice, when idle: clear the editor. |
+| `app.interrupt` | `Esc` | Abort the running turn. Before the model's first word or tool call, this also takes the prompt back: it leaves the conversation and returns to the editor. Twice, when idle: clear the editor. |
 | `app.clear` | `Ctrl+C` | Clear editor, abort, or quit on second press. |
 | `app.exit` | `Ctrl+D` | Quit when the editor is empty. |
 | `app.suspend` | `Ctrl+Z` | Suspend to the shell. |
@@ -297,7 +298,7 @@ A theme file only needs the tokens you want to change. The rest come from the bu
 
 A token is `"#rrggbb"` or an object with `fg`, `bg` and the flags `bold`, `italic`, `underline`, `dim`. Tokens:
 
-`text`, `dim`, `accent`, `user`, `heading`, `code`, `code_block`, `link`, `quote`, `thinking`, `ok`, `warn`, `error`, `add`, `del`, `border`, `selection`, `toggle`, `match`.
+`text`, `dim`, `accent`, `user`, `heading`, `code`, `code_block`, `link`, `quote`, `thinking`, `ok`, `warn`, `error`, `add`, `del`, `border`, `selection`, `toggle`, `match`, and `thinking_off`, `thinking_minimal`, `thinking_low`, `thinking_medium`, `thinking_high`, `thinking_xhigh`, `thinking_max`: the editor's border color at each thinking level (an extension's `editor` border wins).
 
 `syntax` names the code-highlight theme. Bad tokens are skipped with a warning. Without truecolor (`COLORTERM=truecolor`), colors are mapped to the 256-color palette.
 

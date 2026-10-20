@@ -125,6 +125,11 @@ pub struct Panel {
     was_pending: bool,
     /// `ui.panel.auto: false` (or the tmux pane hosts it): never opens by itself.
     pub never_auto: bool,
+    /// `/ps` (L5.11): processes from the host, shown one at a time in the Processes tab.
+    pub procs: Vec<crate::procs::ProcView>,
+    proc_i: usize,
+    /// Output rows scrolled up from the bottom (0 = follow the tail).
+    proc_scroll: usize,
 }
 
 #[derive(Default)]
@@ -218,6 +223,9 @@ impl Default for Panel {
             stats: Stats::default(),
             was_pending: false,
             never_auto: false,
+            procs: Vec::new(),
+            proc_i: 0,
+            proc_scroll: 0,
         }
     }
 }
@@ -225,6 +233,41 @@ impl Default for Panel {
 impl Panel {
     fn tab(&mut self, name: &str) -> Option<&mut Tab> {
         self.tabs.iter_mut().find(|t| t.name == name)
+    }
+
+    /// New process list from the host; keeps the shown process if it is still there.
+    pub fn set_procs(&mut self, mut v: Vec<crate::procs::ProcView>) {
+        crate::procs::order(&mut v);
+        let cur = self.procs.get(self.proc_i).map(|p| p.id.clone());
+        self.proc_i = cur.and_then(|id| v.iter().position(|p| p.id == id)).unwrap_or(0);
+        self.procs = v;
+    }
+
+    /// `/ps`: open and focus the panel on the Processes tab, first (running) process.
+    pub fn show_procs(&mut self) {
+        self.shown = Some("processes".into());
+        self.pinned = Some(true);
+        self.visible = true;
+        self.focused = true;
+        self.proc_i = 0;
+        self.proc_scroll = 0;
+    }
+
+    /// Close it and hand control back to the automatic show/hide.
+    pub fn hide(&mut self) {
+        self.visible = false;
+        self.focused = false;
+        self.pinned = None;
+        self.shown = Some("agent".into());
+    }
+
+    /// The Processes tab is on screen: the host's list should be kept fresh.
+    pub fn procs_shown(&self) -> bool {
+        self.visible && self.shown.as_deref() == Some("processes")
+    }
+
+    fn proc_view(&self) -> bool {
+        self.shown.as_deref() == Some("processes") && !self.procs.is_empty()
     }
 
     /// Subagents still running (the `agents` status segment).
@@ -763,7 +806,7 @@ impl Panel {
                 }
             }
             let first = out.len();
-            walk(&nodes, &ids, None, " ", &mut out);
+            walk(&nodes, &ids, None, "  ", &mut out);
             if let Some(r) = out.get_mut(first) {
                 r.title = s.title.as_deref().map(|t| (t, s.progress));
                 r.rule = first > 0;
@@ -781,6 +824,23 @@ impl Panel {
 
     /// A key while focused. `None` = not handled here.
     pub fn key(&mut self, key: &str) -> Option<Option<PanelAction>> {
+        if self.proc_view() {
+            let n = self.procs.len();
+            match key {
+                "esc" | "q" => self.focused = false,
+                "tab" => self.cycle(false),
+                "shift+tab" => self.cycle(true),
+                "left" | "h" => (self.proc_i, self.proc_scroll) = ((self.proc_i + n - 1) % n, 0),
+                "right" | "l" => (self.proc_i, self.proc_scroll) = ((self.proc_i + 1) % n, 0),
+                "up" | "k" => self.proc_scroll += 1,
+                "down" | "j" => self.proc_scroll = self.proc_scroll.saturating_sub(1),
+                "pageup" => self.proc_scroll += 10,
+                "pagedown" => self.proc_scroll = self.proc_scroll.saturating_sub(10),
+                "end" | "G" => self.proc_scroll = 0,
+                _ => return None,
+            }
+            return Some(None);
+        }
         let tab = self.current()?.clone();
         let rows = self.rows();
         let sel_id = rows.get(self.sel).map(|r| r.node.id.clone());
@@ -834,15 +894,32 @@ impl Panel {
 
     pub fn render(&mut self, f: &mut Frame, area: Rect, theme: &Theme) {
         let tabs = self.shown_tabs();
+        // Accent-bar look: icon + name, the shown tab in accent with a ━ bar under it.
         let mut head: Vec<Span> = Vec::new();
+        let mut under: Vec<Span> = Vec::new();
         for t in &tabs {
             let on = self.shown.as_deref() == Some(t.name.as_str());
+            let icon = match (self.nerd, t.name.as_str()) {
+                (true, "agent") => "\u{f06a9} ",
+                (true, "processes") => "\u{f013} ",
+                (true, "usage") => "\u{f080} ",
+                (true, "timing") => "\u{f017} ",
+                (true, "files") => "\u{f15b} ",
+                _ => "",
+            };
+            let label = format!(" {icon}{} ", t.title);
+            let lw = unicode_width::UnicodeWidthStr::width(label.as_str());
             let st = if on {
-                theme.text.add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                theme.accent.add_modifier(Modifier::BOLD)
             } else {
                 theme.dim
             };
-            head.push(Span::styled(format!(" {} ", t.title), st));
+            head.push(Span::styled(label, st));
+            under.push(if on {
+                Span::styled("━".repeat(lw), theme.accent)
+            } else {
+                Span::raw(" ".repeat(lw))
+            });
         }
         let border = if self.focused { theme.accent } else { theme.border };
         let block = Block::default().borders(Borders::LEFT).border_style(border);
@@ -856,17 +933,26 @@ impl Panel {
         if inner.height == 0 {
             return;
         }
-        self.size = (inner.width, inner.height.saturating_sub(1));
+        let top = 2.min(inner.height);
+        self.size = (inner.width, inner.height - top);
         f.render_widget(
-            Paragraph::new(crate::wrap::truncate(head, inner.width as usize)),
-            Rect { height: 1, ..inner },
+            Paragraph::new(vec![
+                crate::wrap::truncate(head, inner.width as usize),
+                crate::wrap::truncate(under, inner.width as usize),
+            ]),
+            Rect { height: top, ..inner },
         );
         let body = Rect {
-            y: inner.y + 1,
-            height: inner.height - 1,
+            y: inner.y + top,
+            height: inner.height - top,
             ..inner
         };
         let w = body.width as usize;
+        if self.proc_view() {
+            let lines = self.proc_lines(w, body.height as usize, theme);
+            f.render_widget(Paragraph::new(lines), body);
+            return;
+        }
         let lines: Vec<Line> = match self.current().and_then(|t| t.region.clone()) {
             Some(region) => region
                 .iter()
@@ -887,23 +973,37 @@ impl Panel {
                     let n = r.node;
                     if r.rule {
                         out.push(Line::raw(""));
-                        out.push(Line::styled("─".repeat(w), theme.border));
                     }
                     if let Some((title, progress)) = r.title {
-                        let mut h = vec![Span::styled(
-                            format!(" {}{title}", if nerd { "\u{f0ae} " } else { "" }),
-                            theme.heading.add_modifier(Modifier::BOLD),
-                        )];
+                        let icon = match (nerd, title) {
+                            (true, "Goal") => "\u{f140} ",
+                            (true, "Todos") => "\u{f0ae} ",
+                            (true, "Subagents") => "\u{f06a9} ",
+                            _ => "",
+                        };
+                        let h = vec![
+                            Span::styled("▍", theme.accent),
+                            Span::styled(
+                                format!(" {icon}{}", title.to_uppercase()),
+                                theme.heading.add_modifier(Modifier::BOLD),
+                            ),
+                        ];
+                        let count = progress.map(|(d, t)| format!("{d}/{t}")).unwrap_or_default();
+                        let cw = count.chars().count();
+                        let l = crate::wrap::truncate(h, w.saturating_sub(cw + 1).max(1));
+                        let pad = w.saturating_sub(crate::wrap::width(&l.spans) + cw);
+                        let mut sp = l.spans;
+                        sp.push(Span::raw(" ".repeat(pad)));
+                        sp.push(Span::styled(count, theme.dim));
+                        out.push(Line::from(sp));
                         if let Some((done, total)) = progress {
                             let filled = (done * 10 + total / 2).checked_div(total).unwrap_or(0);
-                            h.push(Span::styled(
-                                format!(" {done}/{total} "),
-                                theme.heading.add_modifier(Modifier::BOLD),
-                            ));
-                            h.push(Span::styled("▰".repeat(filled), theme.ok));
-                            h.push(Span::styled("▱".repeat(10 - filled), theme.dim));
+                            out.push(Line::from(vec![
+                                Span::raw("   "),
+                                Span::styled("▰".repeat(filled), theme.ok),
+                                Span::styled("▱".repeat(10 - filled), theme.border),
+                            ]));
                         }
-                        out.push(crate::wrap::truncate(h, w));
                     }
                     let (g, gs) = glyph(n.icon.as_deref(), n.status.as_deref(), nerd, theme);
                     let todo = n.icon.as_deref().is_some_and(|i| i.starts_with("todo:"));
@@ -921,10 +1021,6 @@ impl Panel {
                     ];
                     if let Some(t) = &n.tag {
                         left.push(Span::styled(format!(" {t}"), theme.dim));
-                    }
-                    // Todos sit flat under their heading, like pi's list; trees keep guides.
-                    if n.icon.as_deref().is_some_and(|i| i.starts_with("todo:")) {
-                        left[0] = Span::raw(" ");
                     }
                     let (right, rs) = match n.time {
                         Some(t) => {
@@ -954,11 +1050,7 @@ impl Panel {
                     let has_kids = rows
                         .get(i + 1)
                         .is_some_and(|x| x.node.parent.as_deref() == Some(n.id.as_str()));
-                    let flat = n.icon.as_deref().is_some_and(|i| i.starts_with("todo:"));
-                    let pad = match flat {
-                        true => "   ".to_string(),
-                        false => format!("{}{}", r.below, if has_kids { "│ " } else { "  " }),
-                    };
+                    let pad = format!("{}{}", r.below, if has_kids { "│ " } else { "  " });
                     for (k, d) in n.detail.iter().enumerate() {
                         let mut v = vec![Span::styled(pad.clone(), theme.border)];
                         if k == 0
@@ -1008,13 +1100,55 @@ impl Panel {
                 let mut out: Vec<Line> = out.into_iter().skip(start).take(room).collect();
                 if let Some(f) = footer {
                     out.resize(room, Line::raw(""));
-                    out.push(crate::wrap::truncate(vec![Span::styled(f, theme.dim)], w));
+                    out.push(footer_line(&f, w, theme));
                 }
                 out
             }
         };
         f.render_widget(Paragraph::new(lines), body);
     }
+}
+
+impl Panel {
+    /// The Processes tab body: one process, its header and as much output as fits.
+    fn proc_lines(&mut self, w: usize, h: usize, t: &Theme) -> Vec<Line<'static>> {
+        let n = self.procs.len();
+        self.proc_i = self.proc_i.min(n - 1);
+        let p = &self.procs[self.proc_i];
+        let mut out = crate::procs::header(p, self.proc_i, n, w, self.nerd, t);
+        let footer = self
+            .focused
+            .then(|| footer_line("←→ process  ↑↓ scroll  ⇥ tab  esc back", w, t));
+        let room = h.saturating_sub(out.len() + footer.is_some() as usize);
+        let body = crate::procs::output_lines(p, w, t);
+        self.proc_scroll = self.proc_scroll.min(body.len().saturating_sub(room));
+        let end = body.len() - self.proc_scroll;
+        out.extend(body[end.saturating_sub(room)..end].iter().cloned());
+        if let Some(f) = footer {
+            out.resize(h.saturating_sub(1), Line::raw(""));
+            out.push(f);
+        }
+        out
+    }
+}
+
+/// `key word  key word`: keys in the accent colour, words dim.
+fn footer_line(f: &str, w: usize, t: &Theme) -> Line<'static> {
+    let mut sp = Vec::new();
+    for (i, item) in f.split("  ").filter(|x| !x.is_empty()).enumerate() {
+        let (k, rest) = item.split_once(' ').unwrap_or((item, ""));
+        sp.push(Span::raw(if i == 0 { " " } else { "  " }));
+        sp.push(Span::styled(k.to_string(), t.accent));
+        if !rest.is_empty() {
+            sp.push(Span::styled(format!(" {rest}"), t.dim));
+        }
+    }
+    crate::wrap::truncate(sp, w)
+}
+
+/// A status's glyph and colour (for the process view).
+pub fn status_glyph(status: &str, nerd: bool, t: &Theme) -> (String, Style) {
+    glyph(None, Some(status), nerd, t)
 }
 
 /// The status glyph and its colour: Nerd Font like the pi panel, or plain Unicode.
@@ -1069,7 +1203,7 @@ fn glyph(icon: Option<&str>, status: Option<&str>, nerd: bool, t: &Theme) -> (St
 }
 
 /// pi viewer clock: 42s, 3m07s, 1h05m.
-fn clock(ms: u64) -> String {
+pub fn clock(ms: u64) -> String {
     let s = ms / 1000;
     match s {
         0..60 => format!("{s}s"),
@@ -1145,8 +1279,8 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                ("a".to_string(), " └─".to_string()),
-                ("b".to_string(), "   └─".to_string())
+                ("a".to_string(), "  └─".to_string()),
+                ("b".to_string(), "    └─".to_string())
             ]
         );
         p.focused = true;

@@ -209,6 +209,20 @@ impl Transcript {
         });
     }
 
+    /// Esc before the first reply: drop the last turn if it is only the prompt (and notices).
+    pub fn take_back(&mut self) {
+        if let Some(t) = self.turns.last()
+            && matches!(t.items.first(), Some(Item::User(_)))
+            && t.items
+                .iter()
+                .all(|i| matches!(i, Item::User(_) | Item::Image(_) | Item::Notice { .. }))
+        {
+            self.turns.pop();
+        }
+        self.live = None;
+        self.live_shown.clear();
+    }
+
     /// Mark every turn finished (the agent stopped).
     pub fn settle(&mut self) {
         for t in &mut self.turns {
