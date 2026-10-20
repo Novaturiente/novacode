@@ -16,6 +16,8 @@ pub mod metrics;
 pub mod modes;
 pub mod packages;
 pub mod pipeline;
+pub mod plugin;
+pub mod plugin_hooks;
 pub mod policy;
 pub mod process_ext;
 pub mod prompt;

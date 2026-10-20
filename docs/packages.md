@@ -1,15 +1,97 @@
 # Packages
 
-A package is a folder (or git repo) that bundles extensions, skills, prompts, agents, themes and MCP servers, so you can share them and install them with one command. This page covers installing, updating and removing packages, packages a project asks for, and how to write your own.
+A package is a folder or git repo that bundles skills, prompt templates, subagents, MCP servers, hooks, extensions and themes, so you can share them and install them with one command. novacode reads two kinds:
+
+- **novacode packages**, laid out as described in [What a package holds](#what-a-package-holds).
+- **Claude Code plugins**, such as [ponytail](https://github.com/DietrichGebert/ponytail), [caveman](https://github.com/juliusbrussee/caveman) or [mattpocock/skills](https://github.com/mattpocock/skills). They install as they are; see [Claude Code plugins](#claude-code-plugins).
+
+This page covers installing, versions and updates, removing packages, packages a project asks for, and how to write your own.
+
+## Install
+
+```sh
+novacode install https://github.com/you/my-pack.git         # its latest release
+novacode install git@github.com:you/my-pack.git             # any URL git can clone
+novacode install https://github.com/you/my-pack --ref v1.2.0  # a tag, branch or commit
+novacode install ~/code/my-pack                             # link a local folder
+novacode install ~/code/my-pack --name mine                 # choose the name
+```
+
+The package name is the last part of the path without `.git` (`my-pack` above), and it is the folder name under `packages/`. A name can't contain `/` or start with a dot. Use `--name` when you want another name. If a package of that name is already installed, the command stops and tells you to uninstall it first.
+
+Installs go to `~/.novacode/packages/<name>`. New sessions load the package; run `/reload` in a running session to pick it up. After the install, novacode prints what the package adds (for example `Claude Code plugin 5.3.2: 6 skills` and the hook events it runs) and asks for its [options](#plugin-options) if it has any.
+
+| Source | What happens |
+|---|---|
+| Git URL | novacode clones it and checks out its **latest release** (see [Versions](#versions-and-updates)). The commit and tag go into `~/.novacode/packages.lock.json`. |
+| Local folder | novacode makes a symlink to it. Your edits apply at once. Nothing is recorded in the lock file. |
+
+If a path exists as a folder on disk, novacode treats it as a local folder. Otherwise it treats the text as a git URL. You need `git` on your `PATH` for git installs. Git never asks for a password in the terminal (`GIT_TERMINAL_PROMPT=0`), so private repos need an SSH key or a credential helper.
+
+## Versions and updates
+
+Packages follow **releases**, not every commit.
+
+The latest release is:
+
+1. For a GitHub repo, the release GitHub marks as "Latest". novacode asks GitHub's public API, which needs no token or setup.
+2. Otherwise (another host, no network, or the API limit was hit), the highest version tag: `v1.2.3` or `1.2.3`, also with a name prefix such as `bin-v1.2.3`. Pre-releases like `v2.0.0-rc1` are skipped.
+3. A repo with no release tags at all is installed at its newest commit and then **stays pinned** there.
+
+```sh
+novacode packages update                 # every package to its latest release
+novacode packages update my-pack         # only this one
+novacode packages update --commits       # also move packages without releases to their newest commit
+```
+
+What `packages update` does, by how the package was installed:
+
+| Installed as | `packages update` |
+|---|---|
+| Latest release (the default) | Moves to a newer release when there is one. |
+| `--ref <tag>` | The same: a pinned tag still moves to newer releases. Reinstall with `--ref` to hold an old one. |
+| `--ref <branch>` | Follows the branch: moves to its newest commit. |
+| `--ref <commit>`, or a repo without releases | Stays where it is. `--commits` moves it to the newest commit of the default branch. If the repo later starts publishing releases, a plain update moves it to the latest one. |
+
+The command prints one line per package, for example `ponytail: v5.3.1 → v5.3.2`, `caveman: up to date (v4.0.1)` or `my-pack: no releases; stays at 3f2a9c1d0b5e (--commits moves it to the newest commit)`. Linked folders are always current, so update skips them.
+
+`install`, `uninstall`, `packages update` and `packages config` work on your own packages in `~/.novacode/`. They don't change a project's packages.
+
+### The lock file
+
+`packages.lock.json` maps each cloned package to its source, commit, and the tag or branch it follows:
+
+```json
+{
+  "ponytail": {
+    "source": "https://github.com/DietrichGebert/ponytail",
+    "rev": "16352ac229eb08a9598dcae48fe9f2b342567d86",
+    "tag": "v5.3.2"
+  }
+}
+```
+
+Nothing changes under you. A package stays at its recorded commit until you run `novacode packages update`. Lock files from older novacode versions (without `tag`) keep working: a plain update moves such a package to its latest release if it has one.
+
+## List and remove
+
+```sh
+novacode packages                 # list what's installed
+novacode uninstall my-pack        # remove it
+```
+
+`novacode packages` shows each package with its version (`git v5.3.2`, or `→ /path` for a linked folder), what kind it is, what it adds, and which hook events it runs. A package that can't load shows `(disabled: …)` with the reason. Hooks or hook events novacode doesn't support are listed as `not supported`.
+
+`uninstall` deletes a clone, or removes just the symlink for a linked folder. It never touches your source folder.
 
 ## What a package holds
 
-Every part is optional. Use the folder names exactly as shown.
+A novacode package uses these folders. Every part is optional. Use the names exactly as shown.
 
 | In the package | What it adds |
 |---|---|
 | `extensions/` | Script extensions (see [extensions](extensions.md)) |
-| `skills/` | Agent Skills (`<name>/SKILL.md`) |
+| `skills/` | Agent Skills (`<name>/SKILL.md`, at any depth) |
 | `prompts/` | Prompt templates (`<name>.md`, used as `/name`) |
 | `agents/` | Subagent definitions (see [subagents](subagents.md)) |
 | `themes/` | Themes (`<name>.json`, picked with `ui.theme`) |
@@ -20,55 +102,61 @@ npm packages are not supported. A package comes from a git URL or a local folder
 
 A package can't carry process extensions or settings. Process extensions (and custom providers) come only from your settings; see [extensions](extensions.md).
 
-## Install
+## Claude Code plugins
 
-```sh
-novacode install https://github.com/you/my-pack.git   # clone it
-novacode install git@github.com:you/my-pack.git       # any URL git can clone
-novacode install ~/code/my-pack                       # link a local folder
-novacode install ~/code/my-pack --name mine          # choose the name
-```
+A repo is read as a Claude Code plugin when it has `.claude-plugin/plugin.json`, or, without a `novacode-package.json`, any of `commands/`, `hooks/hooks.json` or `.mcp.json`. Its parts then follow Claude Code's rules:
 
-The package name is the last part of the path without `.git` (`my-pack` above), and it is the folder name under `packages/`. A name can't contain `/` or start with a dot. Use `--name` when you want another name. If a package of that name is already installed, the command stops and tells you to uninstall it first.
-
-Installs go to `~/.novacode/packages/<name>`. New sessions load the package; run `/reload` in a running session to pick it up.
-
-| Source | What happens |
+| Plugin part | In novacode |
 |---|---|
-| Git URL | novacode runs `git clone` and records the exact commit in `~/.novacode/packages.lock.json`. |
-| Local folder | novacode makes a symlink to it. Your edits apply at once. Nothing is recorded in the lock file. |
+| `skills/<name>/SKILL.md` (one level deep), plus the folders the manifest's `skills` lists, or a single `SKILL.md` at the root | Skills |
+| `commands/*.md`, or the manifest's `commands` (paths or a name → `source` map) | Prompt templates (`/name`); `$ARGUMENTS` works |
+| `agents/*.md`, or the manifest's `agents` | Subagent types |
+| `.mcp.json`, plus the manifest's `mcpServers` (a `.json` path or inline servers) | MCP servers |
+| `hooks/hooks.json`, plus the manifest's `hooks` (a path, inline, or a list of both) | Hooks, see below |
+| `userConfig` in the manifest | [Options](#plugin-options) |
 
-If a path exists as a folder on disk, novacode treats it as a local folder. Otherwise it treats the text as a git URL. You need `git` on your `PATH` for git installs. Git never asks for a password in the terminal (`GIT_TERMINAL_PROMPT=0`), so private repos need an SSH key or a credential helper.
+Other files (`.codex-plugin/`, `.cursor-plugin/`, `.toml` commands, installers, source code) are ignored.
 
-## List, update, remove
+These variables are filled in, as Claude Code does:
+
+| Variable | Means |
+|---|---|
+| `${CLAUDE_PLUGIN_ROOT}` | The package folder (`~/.novacode/packages/<name>`). |
+| `${CLAUDE_PLUGIN_DATA}` | `~/.novacode/plugin-data/<name>/`, kept across updates and created on first use. |
+| `${CLAUDE_PROJECT_DIR}` | The session's folder (hooks only). |
+| `${user_config.KEY}` | An option's value. Secret (`sensitive`) options are filled in only for hooks and MCP servers, never in text the model reads. |
+
+They are filled in for MCP server configs, hook commands, `/skill:` and command text, and agent prompts. When the model reads a `SKILL.md` on its own, it sees `${CLAUDE_PLUGIN_ROOT}` as written; the skills list tells it that the variable means the package's folder.
+
+### Hooks
+
+A plugin's command hooks run with Claude Code's input on stdin (`session_id`, `cwd`, `hook_event_name`, plus the event's fields) and Claude Code's output rules: plain stdout or `hookSpecificOutput.additionalContext` adds context, exit code `2` or `"decision": "block"` blocks. Tool names are Claude Code's (`Bash`, `Edit`, `Read`, `mcp__<server>__<tool>`), and a hook's `matcher` applies to them. Hooks get `CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_DATA`, `CLAUDE_PROJECT_DIR` and `CLAUDE_PLUGIN_OPTION_<KEY>` in their environment. Both forms work: shell (`command`, run with `sh`, or `bash` with `"shell": "bash"`) and exec (`command` plus `args`). `timeout` (seconds) and `async: true` are honoured.
+
+| Event | When it runs in novacode | What its output does |
+|---|---|---|
+| `SessionStart` | Before the first model call of a session (`startup`, or `resume` for a resumed one), and after each compaction (`compact`) | Saved as context for the model |
+| `SubagentStart` | Instead of `SessionStart` in a subagent; the matcher is the agent type | Saved as context for the subagent |
+| `UserPromptSubmit` | Before each prompt you send (not in subagents) | Context is saved after the prompt; a block refuses the prompt and shows the reason |
+| `PreToolUse` | Before each tool call | Block (the reason goes to the model), or `updatedInput` changes the arguments |
+| `PostToolUse` | After each tool call | `additionalContext`, a block reason or exit-2 stderr is added to the result; `updatedToolOutput` replaces it |
+| `Stop` | When the agent finishes a turn normally (not in subagents) | A block keeps the agent going, with the reason as its next instruction; `stop_hook_active` is `true` on the next stop |
+| `SessionEnd` | When the session closes | Nothing (observe only) |
+
+Plugin hooks run every time their event fires, with your permissions, from the moment the package is installed. novacode does not ask before running them. Read a plugin's hooks before you install it, and check what changed before you update. `novacode packages` lists which events each package hooks.
+
+Every hook fails open: if it crashes, times out (default 30 s for `SessionStart`, `SubagentStart` and `UserPromptSubmit`, 60 s for the rest, 5 s for `SessionEnd`) or prints something novacode can't read, nothing changes.
+
+Not supported: hook types other than `command` (`prompt`, `agent`, `http`, `mcp_tool`), other events (`PreCompact`, `UserPromptExpansion`, `Notification`, …), `transcript_path` (novacode's session file isn't Claude Code's format), and `bin/`, `.lsp.json`, output styles, monitors, workflows, channels, `.mcpb` bundles and `dependencies`. `novacode packages` and `novacode doctor` list skipped hooks per package. A marketplace repo that holds many plugins (such as `wshobson/agents`) is not split up; install a plugin's own repo instead.
+
+### Plugin options
+
+A plugin can declare options (`userConfig` in its manifest), such as a webhook URL or an API token. `novacode install` asks for each one in the terminal; press Enter to keep the default. Without a terminal, the defaults are used. Change them later with:
 
 ```sh
-novacode packages                 # list what's installed
-novacode packages update          # move every cloned package to its newest commit
-novacode packages update my-pack  # only this one
-novacode uninstall my-pack        # remove it
+novacode packages config ponytail
 ```
 
-`novacode packages` shows each package with the parts it contains and where it comes from (`git`, or `→ /path` for a linked folder). A package that can't load shows `(disabled: …)` with the reason.
-
-`packages update` pulls the default branch (fast-forward only) and writes the new commit into the lock file. Linked folders are always current, so update skips them. `uninstall` deletes a clone, or removes just the symlink for a linked folder. It never touches your source folder.
-
-`install`, `uninstall` and `packages update` work on your own packages in `~/.novacode/`. They don't change a project's packages.
-
-## Pinned commits
-
-The lock file `packages.lock.json` maps each cloned package to its source and commit:
-
-```json
-{
-  "my-pack": {
-    "source": "https://github.com/you/my-pack.git",
-    "rev": "3f2a9c1d0b5e7a8c4d6e1f2a3b4c5d6e7f8a9b0c"
-  }
-}
-```
-
-Nothing changes under you. A package stays at its recorded commit until you run `novacode packages update`.
+Values are kept in `~/.novacode/package-options.json`, readable only by you (like `auth.json`). Secret options are masked while you type.
 
 ## Packages for a project
 
@@ -82,7 +170,7 @@ A repo can list the packages its team uses. Create `.novacode/packages.json`:
 }
 ```
 
-The key is the package name and the value is the source (a git URL or a local path). Commit this file and `.novacode/packages.lock.json`. The installed copies live in `.novacode/packages/`, so add that folder to `.gitignore`.
+The key is the package name and the value is the source (a git URL or a local path). Commit this file and `.novacode/packages.lock.json`. The installed copies live in `.novacode/packages/` (plugin data in `.novacode/plugin-data/`, options in `.novacode/package-options.json`), so add those to `.gitignore`.
 
 Project packages only load in a [trusted folder](security.md). When you open a trusted project that lists packages you don't have:
 
@@ -97,13 +185,13 @@ novacode trust                # once per project, if you haven't yet
 novacode packages install
 ```
 
-`packages install` installs each missing package at the commit in `.novacode/packages.lock.json`, so everyone on the team gets the same code. If the lock file has no entry for a package (or its source changed), it takes the newest commit and records it. Run `novacode packages` inside the project to see project packages marked with a `project` prefix.
+`packages install` installs each missing package at the commit in `.novacode/packages.lock.json`, so everyone on the team gets the same code. If the lock file has no entry for a package (or its source changed), it takes the latest release and records it. Run `novacode packages` inside the project to see project packages marked with a `project` prefix.
 
 ## Which one wins
 
 A package never overrides your own files. For skills, prompts and agents, the first folder with a name wins: your project's `.novacode/`, the project's `.claude/`, `~/.novacode/`, `~/.claude/`, `~/.agents/skills` (skills only), and last the packages. Project packages come before your global packages. [Skills](skills.md#where-skills-are-found) has the full order.
 
-When two packages use the same skill, prompt or agent name, the first one wins and the other is skipped without a message. `novacode doctor` lists what was skipped. Extension files that clash are settled the same way: your project, then `~/.novacode`, then packages.
+A package's skill, prompt or agent whose name is already taken is not lost: it loads as `<package>:<name>`. For example, if you have your own `retro` skill and install `mattpocock/skills`, its skill is `/skill:skills:retro`. `novacode doctor` lists every clash and the name it loads under. Extension files that clash are settled by order alone: your project, then `~/.novacode`, then packages.
 
 For MCP servers, packages are loaded first, then `~/.novacode/mcp.json`, then the project's `.mcp.json`. Later files win a server name. Between packages, a project package beats a global one, and within the same scope the name that comes first alphabetically wins. See [mcp](mcp.md).
 
@@ -140,6 +228,8 @@ Other keys, such as `name` and `version`, are allowed but ignored. The package's
    └── mcp.json
    ```
 
+   If you want the same repo to work in Claude Code too, use the Claude Code plugin layout instead (`.claude-plugin/plugin.json`, `skills/`, `commands/`, `agents/`, `hooks/hooks.json`, `.mcp.json`). novacode reads it as described in [Claude Code plugins](#claude-code-plugins), but script extensions and themes are then not loaded.
+
 2. If you ship MCP servers, `mcp.json` uses the same format as `~/.novacode/mcp.json`:
 
    ```json
@@ -150,7 +240,7 @@ Other keys, such as `name` and `version`, are allowed but ignored. The package's
    }
    ```
 
-   The server starts in the user's session folder, not in your package folder, and there is no variable for the package path. Use commands that are on the `PATH`.
+   The server starts in the user's session folder, not in your package folder. In a novacode package, use commands that are on the `PATH`. In a Claude Code plugin, `${CLAUDE_PLUGIN_ROOT}` points at the package folder.
 
 3. Try it from the folder while you work. The link means every edit applies at once:
 
@@ -159,18 +249,19 @@ Other keys, such as `name` and `version`, are allowed but ignored. The package's
    novacode packages
    ```
 
-4. Publish it as a git repo:
+4. Publish it as a git repo, and tag releases so users get stable versions:
 
    ```sh
    cd my-pack
    git init && git add . && git commit -m "first version"
    git remote add origin git@github.com:you/my-pack.git
    git push -u origin main
+   git tag v0.1.0 && git push origin v0.1.0
    ```
 
-5. Others install it with `novacode install https://github.com/you/my-pack.git`.
+5. Others install it with `novacode install https://github.com/you/my-pack.git`, and `novacode packages update` moves them to each new tag you push.
 
-Remember that a package can run code on the machine of whoever installs it (extensions, MCP servers). Say what it does in the README, and read other people's packages before you install them.
+Remember that a package can run code on the machine of whoever installs it (extensions, hooks, MCP servers). Say what it does in the README, and read other people's packages before you install them.
 
 ## See also
 
@@ -178,5 +269,6 @@ Remember that a package can run code on the machine of whoever installs it (exte
 - [skills](skills.md): skills, prompts and how they load
 - [subagents](subagents.md): agent definitions for `agents/`
 - [mcp](mcp.md): MCP servers and `mcp.json`
+- [automation](automation.md): command hooks in your own settings
 - [security](security.md): trust, which decides whether project packages load
 - [config](config.md): settings such as `ui.theme`

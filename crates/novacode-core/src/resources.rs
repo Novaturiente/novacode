@@ -20,22 +20,29 @@ pub struct Seen {
 }
 
 impl Seen {
-    /// Whether `name` at `path` should load.
-    pub fn admit(&mut self, kind: &str, name: &str, path: &Path) -> bool {
+    /// The name `name` at `path` loads under, or `None`. A package's file whose
+    /// name is taken loads as `<package>:<name>` (L7.14).
+    pub fn admit(&mut self, kind: &str, name: &str, path: &Path) -> Option<String> {
         let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if !self.files.insert(real.clone()) {
-            return false;
+            return None;
         }
         if let Some(first) = self.names.get(name) {
+            let first = first.display().to_string();
+            let ns = crate::plugin::owner_name(path)
+                .map(|p| format!("{p}:{name}"))
+                .filter(|n| !self.names.contains_key(n));
             self.shadowed.push(format!(
-                "{kind} `{name}`: {} is shadowed by {}",
+                "{kind} `{name}`: {} is shadowed by {first}{}",
                 real.display(),
-                first.display()
+                ns.as_ref().map(|n| format!("; it loads as `{n}`")).unwrap_or_default()
             ));
-            return false;
+            let ns = ns?;
+            self.names.insert(ns.clone(), real);
+            return Some(ns);
         }
         self.names.insert(name.to_string(), real);
-        true
+        Some(name.to_string())
     }
 }
 
@@ -116,9 +123,9 @@ pub fn skills(dirs: &[PathBuf]) -> (Vec<Skill>, Vec<String>, Vec<String>) {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default()
             });
-            if !seen.admit("skill", &name, &path) {
+            let Some(name) = seen.admit("skill", &name, &path) else {
                 continue;
-            }
+            };
             found.insert(
                 name.clone(),
                 Skill {
@@ -209,6 +216,14 @@ pub fn render_skills(skills: &[Skill]) -> String {
         };
         s.push_str(&format!("\n- {}{at}: {}", k.name, cap(&k.description)));
     }
+    // Claude Code plugin skills name their package folder with this variable (L7.14).
+    if skills.iter().any(|k| {
+        !k.hidden && crate::plugin::Parts::owning(&k.path).is_some_and(|p| p.kind == crate::plugin::Kind::Claude)
+    }) {
+        s.push_str(
+            "\nIn a skill from a package (`…/packages/<name>/…`), `${CLAUDE_PLUGIN_ROOT}` means that package's folder.",
+        );
+    }
     s
 }
 
@@ -222,14 +237,18 @@ fn cap(d: &str) -> String {
     format!("{}…", cut.rsplit_once(' ').map_or(cut.as_str(), |(a, _)| a))
 }
 
-/// Templates from `dirs` (top-level `.md` files), earlier folders winning ([`Seen`]).
-/// Returns the shadowed ones too (for `doctor`).
+/// Templates from `dirs` (top-level `.md` files, or a `.md` file itself), earlier
+/// folders winning ([`Seen`]). Returns the shadowed ones too (for `doctor`).
 pub fn templates(dirs: &[PathBuf]) -> (Vec<Template>, Vec<String>) {
     let mut found: BTreeMap<String, Template> = BTreeMap::new();
     let mut seen = Seen::default();
     for dir in dirs {
-        let Ok(rd) = std::fs::read_dir(dir) else { continue };
-        let mut files: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        let mut files: Vec<PathBuf> = if dir.is_file() {
+            vec![dir.clone()]
+        } else {
+            let Ok(rd) = std::fs::read_dir(dir) else { continue };
+            rd.flatten().map(|e| e.path()).collect()
+        };
         files.sort();
         for p in files {
             if p.extension().is_none_or(|e| e != "md") || !p.is_file() {
@@ -239,9 +258,10 @@ pub fn templates(dirs: &[PathBuf]) -> (Vec<Template>, Vec<String>) {
                 continue;
             };
             let name = p.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-            if !seen.admit("prompt", &name, &p) {
+            let Some(name) = seen.admit("prompt", &name, &p) else {
                 continue;
-            }
+            };
+            let text = crate::plugin::fill_for(&p, text);
             let (fm, body) = frontmatter(&text);
             let description = fm.get("description").cloned().unwrap_or_else(|| {
                 let first = body.lines().find(|l| !l.trim().is_empty()).unwrap_or_default();
@@ -279,6 +299,7 @@ pub fn expand(text: &str, skills: &[Skill], templates: &[Template]) -> String {
         let Ok(raw) = std::fs::read_to_string(&k.path) else {
             return text.to_string();
         };
+        let raw = crate::plugin::fill_for(&k.path, raw);
         let base = k.path.parent().unwrap_or(Path::new("/"));
         let block = format!(
             "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",

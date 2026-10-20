@@ -11,12 +11,20 @@
 //! An optional `novacode-package.json` manifest (`{name, version, apiVersion}`,
 //! `apiVersion` a number or `[min, max]`) is checked against this novacode's
 //! extension API: a package that needs another version is disabled with a reason.
+//! A Claude Code plugin installs the same way; [`crate::plugin`] reads its parts.
+//!
+//! Versions follow releases (L7.15): install and update take the latest release
+//! (GitHub's "Latest" when the API answers, else the highest `vX.Y.Z` tag). A
+//! repo without releases stays at its commit unless `update --commits` is asked.
+//! `--ref` pins a tag (still updated to newer releases), a branch (followed) or a
+//! commit.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone)]
 pub struct Package {
     pub name: String,
     pub dir: PathBuf,
@@ -31,6 +39,22 @@ pub struct Package {
 pub struct Pin {
     pub source: String,
     pub rev: String,
+    /// The release tag it is at; updates move it to newer releases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// The branch it follows (`--ref <branch>`); updates take its newest commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+/// Which version to install.
+pub enum Want<'a> {
+    /// The latest release, else the newest commit.
+    Latest,
+    /// `--ref`: a tag, branch or commit.
+    Ref(&'a str),
+    /// A lockfile's pin.
+    Pin(&'a Pin),
 }
 
 type Lock = BTreeMap<String, Pin>;
@@ -97,9 +121,9 @@ impl Store {
         v
     }
 
-    /// Install `src` (an existing folder, else a git URL) as `name`, at `rev` when
-    /// given (a lockfile's pin), else its newest commit, which is then pinned.
-    pub fn install(&self, src: &str, name: Option<&str>, rev: Option<&str>) -> Result<String, String> {
+    /// Install `src` (an existing folder, else a git URL) as `name`, at the version
+    /// `want` says, which is then pinned.
+    pub async fn install(&self, src: &str, name: Option<&str>, want: Want<'_>) -> Result<String, String> {
         let name = match name {
             Some(n) => n.to_string(),
             None => name_of(src).ok_or("can't tell the package name; pass --name")?,
@@ -121,22 +145,22 @@ impl Store {
             return Ok(name);
         }
         git(&["clone", "-q", src, &dest.display().to_string()], None)?;
-        if let Some(r) = rev
-            && let Err(e) = git(&["checkout", "-q", r], Some(&dest))
-        {
-            let _ = std::fs::remove_dir_all(&dest);
-            return Err(format!("`{name}`: pinned commit {r} not found: {e}"));
-        }
+        let pin = match checkout_wanted(src, &dest, want).await {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dest);
+                return Err(format!("`{name}`: {e}"));
+            }
+        };
         let mut lock = self.read_lock();
-        lock.insert(
-            name.clone(),
-            Pin {
-                source: src.into(),
-                rev: head(&dest)?,
-            },
-        );
+        lock.insert(name.clone(), pin);
         self.write_lock(&lock)?;
         Ok(name)
+    }
+
+    /// The pin of an installed clone.
+    pub fn pin(&self, name: &str) -> Option<Pin> {
+        self.read_lock().remove(name)
     }
 
     /// Remove a package: unlink a local one, delete a clone, drop its pin.
@@ -158,38 +182,194 @@ impl Store {
         Ok(())
     }
 
-    /// Move every clone (or one) to its branch's newest commit and pin that.
-    /// Linked folders are always current. Returns (name, new pin or error).
-    pub fn update(&self, only: Option<&str>) -> Vec<(String, Result<String, String>)> {
+    /// Move every clone (or one) to its latest release, or a followed branch to
+    /// its newest commit. One without releases stays where it is unless
+    /// `commits`, which moves it to the newest commit of its default branch.
+    /// Linked folders are always current. Returns (name, what happened or error).
+    pub async fn update(&self, only: Option<&str>, commits: bool) -> Vec<(String, Result<String, String>)> {
         let mut lock = self.read_lock();
-        let out: Vec<_> = self
-            .list()
-            .into_iter()
-            .filter(|p| p.link.is_none() && only.is_none_or(|o| o == p.name))
-            .map(|p| {
-                // A clone checked out at a pin is on a detached HEAD: go back to the default branch.
-                let r = git(&["checkout", "-q", "-"], Some(&p.dir))
-                    .or(Ok::<(), String>(()))
-                    .and_then(|_| git(&["pull", "--ff-only", "-q"], Some(&p.dir)))
-                    .and_then(|_| head(&p.dir));
-                if let Ok(rev) = &r {
-                    let source = lock.get(&p.name).map(|x| x.source.clone()).unwrap_or_default();
-                    lock.insert(
-                        p.name.clone(),
-                        Pin {
-                            source,
-                            rev: rev.clone(),
-                        },
-                    );
-                }
-                (p.name, r)
-            })
-            .collect();
+        let mut out = Vec::new();
+        for p in self.list() {
+            if p.link.is_some() || only.is_some_and(|o| o != p.name) {
+                continue;
+            }
+            let old = lock.get(&p.name).cloned().unwrap_or_else(|| Pin {
+                source: git_out(&["remote", "get-url", "origin"], Some(&p.dir)).unwrap_or_default(),
+                rev: head(&p.dir).unwrap_or_default(),
+                tag: None,
+                branch: None,
+            });
+            let r = update_one(&p.dir, &old, commits).await;
+            let r = r.map(|new| {
+                let msg = describe(&old, &new);
+                lock.insert(p.name.clone(), new);
+                msg
+            });
+            out.push((p.name, r));
+        }
         if let Err(e) = self.write_lock(&lock) {
             tracing::warn!("packages lock: {e}");
         }
         out
     }
+}
+
+/// The version a pin is at, for messages: its tag, branch or short commit.
+pub fn version_of(p: &Pin) -> String {
+    let short = &p.rev[..p.rev.len().min(12)];
+    match (&p.tag, &p.branch) {
+        (Some(t), _) => t.clone(),
+        (_, Some(b)) => format!("{b}@{short}"),
+        _ => short.to_string(),
+    }
+}
+
+fn describe(old: &Pin, new: &Pin) -> String {
+    if old.rev == new.rev {
+        return match (&new.tag, &new.branch) {
+            (None, None) => format!(
+                "no releases; stays at {} (`--commits` moves it to the newest commit)",
+                version_of(new)
+            ),
+            _ => format!("up to date ({})", version_of(new)),
+        };
+    }
+    format!("{} → {}", version_of(old), version_of(new))
+}
+
+async fn update_one(dir: &Path, old: &Pin, commits: bool) -> Result<Pin, String> {
+    let d = Some(dir);
+    git(&["fetch", "-q", "--tags", "--force", "origin"], d)?;
+    let at = |rev: String, tag: Option<String>, branch: Option<String>| Pin {
+        source: old.source.clone(),
+        rev,
+        tag,
+        branch,
+    };
+    if let Some(b) = &old.branch {
+        git(&["checkout", "-q", "--detach", &format!("origin/{b}")], d)?;
+        return Ok(at(head(dir)?, None, Some(b.clone())));
+    }
+    if let Some(t) = latest(&old.source, dir).await {
+        git(&["checkout", "-q", "--detach", &format!("refs/tags/{t}")], d)?;
+        return Ok(at(head(dir)?, Some(t), None));
+    }
+    if commits {
+        git(&["checkout", "-q", "--detach", "origin/HEAD"], d)?;
+        return Ok(at(head(dir)?, None, None));
+    }
+    Ok(old.clone())
+}
+
+/// Check out what `want` asks for in a fresh clone; the pin to record.
+async fn checkout_wanted(src: &str, dir: &Path, want: Want<'_>) -> Result<Pin, String> {
+    let d = Some(dir);
+    let pin = |tag: Option<String>, branch: Option<String>| -> Result<Pin, String> {
+        Ok(Pin {
+            source: src.into(),
+            rev: head(dir)?,
+            tag,
+            branch,
+        })
+    };
+    match want {
+        Want::Pin(p) => {
+            git(&["checkout", "-q", "--detach", &p.rev], d)
+                .map_err(|e| format!("pinned commit {} not found: {e}", p.rev))?;
+            pin(p.tag.clone(), p.branch.clone())
+        }
+        Want::Ref(r) => {
+            if git(
+                &["rev-parse", "-q", "--verify", &format!("refs/tags/{r}^{{commit}}")],
+                d,
+            )
+            .is_ok()
+            {
+                git(&["checkout", "-q", "--detach", &format!("refs/tags/{r}")], d)?;
+                pin(Some(r.into()), None)
+            } else if git(&["rev-parse", "-q", "--verify", &format!("refs/remotes/origin/{r}")], d).is_ok() {
+                git(&["checkout", "-q", "--detach", &format!("origin/{r}")], d)?;
+                pin(None, Some(r.into()))
+            } else {
+                git(&["checkout", "-q", "--detach", r], d)
+                    .map_err(|e| format!("no tag, branch or commit `{r}`: {e}"))?;
+                pin(None, None)
+            }
+        }
+        Want::Latest => match latest(src, dir).await {
+            Some(t) => {
+                git(&["checkout", "-q", "--detach", &format!("refs/tags/{t}")], d)?;
+                pin(Some(t), None)
+            }
+            None => pin(None, None),
+        },
+    }
+}
+
+/// The latest release of a clone: GitHub's "Latest" release when the API answers
+/// (no token needed), else the highest `vX.Y.Z` tag; `None` without releases.
+pub async fn latest(src: &str, dir: &Path) -> Option<String> {
+    let have = |t: &str| {
+        git(
+            &["rev-parse", "-q", "--verify", &format!("refs/tags/{t}^{{commit}}")],
+            Some(dir),
+        )
+        .is_ok()
+    };
+    if let Some((owner, repo)) = github(src)
+        && let Some(t) = github_latest(&owner, &repo).await
+        && have(&t)
+    {
+        return Some(t);
+    }
+    let tags = git_out(&["tag", "-l"], Some(dir)).ok()?;
+    best_tag(tags.lines())
+}
+
+async fn github_latest(owner: &str, repo: &str) -> Option<String> {
+    let r = reqwest::Client::builder()
+        .user_agent(concat!("novacode/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?
+        .get(format!("https://api.github.com/repos/{owner}/{repo}/releases/latest"))
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .ok()?;
+    if !r.status().is_success() {
+        return None;
+    }
+    let v: Value = serde_json::from_str(&r.text().await.ok()?).ok()?;
+    v["tag_name"].as_str().map(str::to_string)
+}
+
+/// `owner/repo` of a GitHub URL (https, ssh or scp form).
+fn github(src: &str) -> Option<(String, String)> {
+    let rest = [
+        "https://github.com/",
+        "http://github.com/",
+        "git@github.com:",
+        "ssh://git@github.com/",
+    ]
+    .iter()
+    .find_map(|p| src.strip_prefix(p))?;
+    let mut it = rest.trim_end_matches('/').trim_end_matches(".git").split('/');
+    let (o, r) = (it.next()?, it.next()?);
+    (!o.is_empty() && !r.is_empty() && it.next().is_none()).then(|| (o.to_string(), r.to_string()))
+}
+
+/// The highest stable `X.Y.Z` tag (`v` and a `name-` prefix allowed; pre-releases
+/// skipped). On a tie the shorter name wins (`v1.2.0` over `bin-v1.2.0`).
+fn best_tag<'a>(tags: impl Iterator<Item = &'a str>) -> Option<String> {
+    let re = regex::Regex::new(r"^(?:.*[-_/])?v?(\d+)\.(\d+)\.(\d+)$").ok()?;
+    tags.filter_map(|t| {
+        let c = re.captures(t.trim())?;
+        let n = |i: usize| c[i].parse::<u64>().ok();
+        Some(((n(1)?, n(2)?, n(3)?), std::cmp::Reverse(t.len()), t.trim().to_string()))
+    })
+    .max()
+    .map(|(_, _, t)| t)
 }
 
 /// Packages that load in this session, in precedence order: a trusted project's
@@ -267,20 +447,20 @@ pub fn missing(cwd: &Path) -> Vec<String> {
 }
 
 /// Install the project's missing packages, each at its pinned commit when the
-/// lockfile has one. Returns (name, result).
-pub fn install_project(cwd: &Path) -> Vec<(String, Result<String, String>)> {
+/// lockfile has one, else its latest release. Returns (name, result).
+pub async fn install_project(cwd: &Path) -> Vec<(String, Result<String, String>)> {
     let store = Store::project(cwd);
     let lock = store.read_lock();
     let want = declared(cwd);
-    missing(cwd)
-        .into_iter()
-        .map(|n| {
-            let src = want[&n].clone();
-            let rev = lock.get(&n).filter(|p| p.source == src).map(|p| p.rev.clone());
-            let r = store.install(&src, Some(&n), rev.as_deref());
-            (n, r)
-        })
-        .collect()
+    let mut out = Vec::new();
+    for n in missing(cwd) {
+        let src = want[&n].clone();
+        let pin = lock.get(&n).filter(|p| p.source == src);
+        let w = pin.map_or(Want::Latest, Want::Pin);
+        let r = store.install(&src, Some(&n), w).await;
+        out.push((n, r));
+    }
+    out
 }
 
 /// The package name a source would get: its last path segment without `.git`.
@@ -330,8 +510,8 @@ mod tests {
         g(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", file]);
     }
 
-    #[test]
-    fn install_pin_update_uninstall() {
+    #[tokio::test]
+    async fn install_pin_update_uninstall() {
         let home = tempfile::tempdir().unwrap();
         let store = Store::global(home.path());
         let src = tempfile::tempdir().unwrap();
@@ -340,14 +520,15 @@ mod tests {
         assert_eq!(name_of("git@github.com:a/b").as_deref(), Some("b"));
         assert_eq!(
             store
-                .install(src.path().to_str().unwrap(), Some("local"), None)
+                .install(src.path().to_str().unwrap(), Some("local"), Want::Latest)
+                .await
                 .unwrap(),
             "local"
         );
         let (r, g) = repo();
         commit(r.path(), &g, "one");
         let url = format!("file://{}", r.path().display());
-        store.install(&url, Some("cloned"), None).unwrap();
+        store.install(&url, Some("cloned"), Want::Latest).await.unwrap();
         let first = store.read_lock()["cloned"].rev.clone();
         assert_eq!(first.len(), 40, "the commit is pinned");
         let l = store.list();
@@ -362,22 +543,71 @@ mod tests {
         );
         assert!(
             store
-                .install(src.path().to_str().unwrap(), Some("local"), None)
+                .install(src.path().to_str().unwrap(), Some("local"), Want::Latest)
+                .await
                 .is_err()
         );
 
+        // No releases: a plain update leaves it; --commits moves it.
         commit(r.path(), &g, "two");
-        let up = store.update(None);
+        let up = store.update(None, false).await;
+        assert!(up[0].1.as_ref().unwrap().contains("no releases"), "{up:?}");
+        assert_eq!(store.read_lock()["cloned"].rev, first, "untagged stays pinned");
+        let up = store.update(None, true).await;
         assert!(up.iter().all(|(_, r)| r.is_ok()), "{:?}", up);
         let second = store.read_lock()["cloned"].rev.clone();
-        assert_ne!(first, second, "update moves the pin");
+        assert_ne!(first, second, "--commits moves the pin");
+
+        // Releases appear: a plain update takes the highest one.
+        let tag = |t: &str| g(&["tag", t]);
+        tag("v1.0.0");
+        commit(r.path(), &g, "three");
+        tag("v1.2.0");
+        tag("bin-v1.2.0");
+        commit(r.path(), &g, "four");
+        tag("v2.0.0-rc1");
+        let up = store.update(Some("cloned"), false).await;
+        assert!(up[0].1.as_ref().unwrap().ends_with("→ v1.2.0"), "{up:?}");
+        let pin = store.pin("cloned").unwrap();
+        assert_eq!(pin.tag.as_deref(), Some("v1.2.0"));
+        assert!(store.dir.join("cloned/three").exists() && !store.dir.join("cloned/four").exists());
+        assert!(
+            store.update(None, false).await[0]
+                .1
+                .as_ref()
+                .unwrap()
+                .starts_with("up to date")
+        );
 
         // A fresh machine with the old lock gets the old commit.
         let other = tempfile::tempdir().unwrap();
         let s2 = Store::global(other.path());
-        s2.install(&url, Some("cloned"), Some(&first)).unwrap();
+        let old = Pin {
+            source: url.clone(),
+            rev: first.clone(),
+            tag: None,
+            branch: None,
+        };
+        s2.install(&url, Some("cloned"), Want::Pin(&old)).await.unwrap();
         assert_eq!(head(&s2.dir.join("cloned")).unwrap(), first);
         assert!(!s2.dir.join("cloned/two").exists());
+        // A fresh install takes the latest release; --ref a tag, a branch.
+        s2.install(&url, Some("latest"), Want::Latest).await.unwrap();
+        assert_eq!(s2.pin("latest").unwrap().tag.as_deref(), Some("v1.2.0"));
+        s2.install(&url, Some("old"), Want::Ref("v1.0.0")).await.unwrap();
+        assert!(!s2.dir.join("old/three").exists());
+        let up = s2.update(Some("old"), false).await;
+        assert!(
+            up[0].1.as_ref().unwrap().contains("v1.0.0 → v1.2.0"),
+            "a pinned tag still moves: {up:?}"
+        );
+        s2.install(&url, Some("edge"), Want::Ref("main")).await.unwrap();
+        assert_eq!(s2.pin("edge").unwrap().branch.as_deref(), Some("main"));
+        commit(r.path(), &g, "five");
+        s2.update(Some("edge"), false).await;
+        assert!(s2.dir.join("edge/five").exists(), "a branch is followed");
+        assert!(s2.install(&url, Some("bad"), Want::Ref("nope")).await.is_err());
+        assert!(!s2.dir.join("bad").exists(), "a failed install leaves nothing");
 
         store.uninstall("local").unwrap();
         store.uninstall("cloned").unwrap();
@@ -386,21 +616,45 @@ mod tests {
     }
 
     #[test]
-    fn manifest_api_range_and_project_packages() {
+    fn tags_and_github_urls() {
+        assert_eq!(
+            best_tag(["v1.9.0", "v1.10.0", "x", "2.0.0-beta"].into_iter()).as_deref(),
+            Some("v1.10.0")
+        );
+        assert_eq!(
+            best_tag(["bin-v4.0.1", "v4.0.1"].into_iter()).as_deref(),
+            Some("v4.0.1")
+        );
+        assert_eq!(best_tag(["main"].into_iter()), None);
+        let gh = |s| github(s).map(|(o, r)| format!("{o}/{r}"));
+        assert_eq!(gh("https://github.com/a/b.git").as_deref(), Some("a/b"));
+        assert_eq!(gh("git@github.com:a/b").as_deref(), Some("a/b"));
+        assert_eq!(gh("https://gitlab.com/a/b"), None);
+    }
+
+    #[tokio::test]
+    async fn manifest_api_range_and_project_packages() {
         let home = tempfile::tempdir().unwrap();
         let proj = tempfile::tempdir().unwrap();
-        let mk = |name: &str, manifest: Option<&str>| {
+        let mk = |_name: &str, manifest: Option<&str>| {
             let d = tempfile::tempdir().unwrap().keep();
             if let Some(m) = manifest {
                 std::fs::write(d.join("novacode-package.json"), m).unwrap();
             }
-            Store::global(home.path())
-                .install(d.to_str().unwrap(), Some(name), None)
-                .unwrap();
+            d
         };
-        mk("plain", None);
-        mk("ok", Some(r#"{"name": "ok", "apiVersion": [1, 3]}"#));
-        mk("future", Some(r#"{"apiVersion": 2}"#));
+        let install = |name: &'static str, d: PathBuf| {
+            let store = Store::global(home.path());
+            async move {
+                store
+                    .install(d.to_str().unwrap(), Some(name), Want::Latest)
+                    .await
+                    .unwrap()
+            }
+        };
+        install("plain", mk("plain", None)).await;
+        install("ok", mk("ok", Some(r#"{"name": "ok", "apiVersion": [1, 3]}"#))).await;
+        install("future", mk("future", Some(r#"{"apiVersion": 2}"#))).await;
         let names: Vec<String> = enabled(home.path(), proj.path(), true)
             .into_iter()
             .map(|p| p.name)
@@ -421,7 +675,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(missing(proj.path()), ["team"]);
-        assert!(install_project(proj.path()).iter().all(|(_, r)| r.is_ok()));
+        assert!(install_project(proj.path()).await.iter().all(|(_, r)| r.is_ok()));
         assert!(missing(proj.path()).is_empty());
         assert!(proj.path().join(".novacode/packages.lock.json").is_file());
         let names: Vec<String> = enabled(home.path(), proj.path(), true)

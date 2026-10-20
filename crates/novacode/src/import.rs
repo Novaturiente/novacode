@@ -13,21 +13,7 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-/// Claude Code tool names and novacode's.
-pub const TOOLS: &[(&str, &str)] = &[
-    ("Read", "read"),
-    ("Write", "write"),
-    ("Edit", "edit"),
-    ("MultiEdit", "edit"),
-    ("Bash", "bash"),
-    ("Grep", "grep"),
-    ("Glob", "find"),
-    ("LS", "ls"),
-    ("WebFetch", "web_fetch"),
-    ("WebSearch", "web_search"),
-    ("TodoWrite", "todo"),
-    ("Task", "agent"),
-];
+pub use novacode_core::plugin_hooks::TOOLS;
 
 /// A Claude Code tool name as novacode's (unknown names, e.g. `mcp__…`, unchanged).
 pub fn nova_tool(t: &str) -> String {

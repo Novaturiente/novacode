@@ -128,11 +128,19 @@ pub fn defs(dirs: &[PathBuf]) -> (Vec<Def>, Vec<String>) {
     let mut all: BTreeMap<String, Def> = BTreeMap::new();
     let mut seen = novacode_core::resources::Seen::default();
     for dir in dirs {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        // A plugin's manifest may name agent files, not folders (L7.14).
+        let entries = if dir.is_file() {
+            vec![dir.clone()]
+        } else {
+            std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .collect()
+        };
+        let mut files: Vec<PathBuf> = entries
             .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|e| e == "md"))
             .collect();
         files.sort();
@@ -140,15 +148,19 @@ pub fn defs(dirs: &[PathBuf]) -> (Vec<Def>, Vec<String>) {
             let Ok(text) = std::fs::read_to_string(&f) else {
                 continue;
             };
+            let text = novacode_core::plugin::fill_for(&f, text);
             let (fm, body) = novacode_core::resources::frontmatter(&text);
             let name = fm
                 .get("name")
                 .cloned()
                 .or_else(|| f.file_stem().map(|s| s.to_string_lossy().to_string()))
                 .unwrap_or_default();
-            if name.is_empty() || !seen.admit("agent", &name, &f) {
+            if name.is_empty() {
                 continue;
             }
+            let Some(name) = seen.admit("agent", &name, &f) else {
+                continue;
+            };
             let tools = fm.get("tools").map(|v| {
                 // `Read, Grep` or a flow list `[Read, "Grep"]`.
                 v.trim_matches(|c| c == '[' || c == ']')

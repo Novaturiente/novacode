@@ -47,7 +47,7 @@ novacode looks in these folders. When two skills have the same name, the earlier
 | 3 | `~/.novacode/skills/` | Always. |
 | 4 | `~/.claude/skills/` | `compat.claude` is on. |
 | 5 | `~/.agents/skills/` | Always. |
-| 6 | `skills/` inside each enabled [package](packages.md) | Project packages only when trusted. |
+| 6 | `skills/` inside each enabled [package](packages.md) (for a Claude Code plugin: `skills/<name>/` one level deep plus the folders its manifest lists) | Project packages only when trusted. A package skill whose name is taken loads as `<package>:<name>`. |
 
 `compat.claude` is `true` by default. Set it to `false` to ignore every `.claude` folder. See [config](config.md).
 
@@ -123,7 +123,7 @@ The first folder with a given name wins.
 | 2 | `<project>/.claude/commands/` | The project is trusted and `compat.claude` is on. |
 | 3 | `~/.novacode/prompts/` | Always. |
 | 4 | `~/.claude/commands/` | `compat.claude` is on. |
-| 5 | `prompts/` inside each enabled [package](packages.md) | Project packages only when trusted. |
+| 5 | `prompts/` inside each enabled [package](packages.md) (`commands/` for a Claude Code plugin) | Project packages only when trusted. |
 
 Only `.md` files directly in these folders count. Subfolders are not searched, so there are no namespaced commands like `/team:review`. The command name is the file name without `.md`.
 

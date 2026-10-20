@@ -1266,3 +1266,71 @@ async fn esc_before_the_first_reply_takes_the_prompt_back() {
     assert!(!reqs[1].messages.iter().any(|m| matches!(m, Message::Assistant(_))));
     drop(agent);
 }
+
+/// L7.14 check: a Claude Code plugin's hooks in a session. SessionStart text and
+/// UserPromptSubmit context reach the model, a refused prompt never does, and a
+/// Stop hook's block runs the agent once more with its reason.
+#[tokio::test]
+async fn claude_plugin_hooks_in_a_session() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let pkg = home.path().join(".novacode/packages/pony");
+    std::fs::create_dir_all(pkg.join(".claude-plugin")).unwrap();
+    let hook = |c: &str| json!([{"hooks": [{"type": "command", "command": c}]}]);
+    std::fs::write(
+        pkg.join(".claude-plugin/plugin.json"),
+        json!({"name": "pony", "hooks": {
+            "SessionStart": hook("cat >/dev/null; echo PONY MODE ON"),
+            "UserPromptSubmit": hook(r#"grep -q forbidden && { echo 'not that' >&2; exit 2; }; echo '{"hookSpecificOutput":{"additionalContext":"prompt seen"}}'"#),
+            "Stop": hook(r#"grep -q '"stop_hook_active":true' && exit 0; echo '{"decision":"block","reason":"check the tests first"}'"#),
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let packages = vec![novacode_core::packages::Package {
+        name: "pony".into(),
+        dir: pkg,
+        link: None,
+        disabled: None,
+    }];
+    let hooks = novacode_core::plugin_hooks::PluginHooks::load(&packages, work.path(), "s", None);
+    let faux = Faux::new([FauxReply::text("one"), FauxReply::text("two")]);
+    let store = Store::create(&Paths::new(home.path()), work.path(), false);
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        vec![],
+        store,
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_plugin_hooks(Arc::new(hooks));
+    let (h, task) = agent::spawn(agent);
+    let mut rx = h.subscribe();
+    h.prompt("this is forbidden");
+    let mut refused = false;
+    loop {
+        match rx.recv().await.unwrap() {
+            AgentEvent::Stream(novacode_types::StreamEvent::Notice { text }) => refused |= text.contains("not that"),
+            AgentEvent::Settled => break,
+            _ => {}
+        }
+    }
+    assert!(refused, "the refusal is shown");
+    assert!(
+        faux.requests.lock().unwrap().is_empty(),
+        "a refused prompt makes no call"
+    );
+    h.prompt("hello");
+    while !matches!(rx.recv().await.unwrap(), AgentEvent::Settled) {}
+    h.shutdown();
+    drop(task.await.unwrap());
+    let reqs = faux.requests.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 2, "the Stop hook ran the agent once more");
+    let first = format!("{:?}", reqs[0].messages);
+    assert!(
+        first.contains("PONY MODE ON") && first.contains("prompt seen"),
+        "{first}"
+    );
+    assert!(!first.contains("forbidden"));
+    assert!(format!("{:?}", reqs[1].messages).contains("check the tests first"));
+}

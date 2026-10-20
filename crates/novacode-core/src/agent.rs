@@ -107,6 +107,16 @@ pub struct Agent {
     hooks: Arc<crate::hooks::Hooks>,
     /// Script extensions (L7.2): commands for the host.
     extensions: Option<Arc<crate::extensions::Extensions>>,
+    /// Claude Code plugin hooks (L7.14) and the state they need.
+    plugins: Option<Plugins>,
+}
+
+struct Plugins {
+    hooks: Arc<crate::plugin_hooks::PluginHooks>,
+    /// `SessionStart` has run (it runs before the first model call).
+    started: bool,
+    /// The last run was started by a `Stop` hook's block (`stop_hook_active`).
+    stop_active: bool,
 }
 
 /// Where a model's tool call goes (L5.17).
@@ -357,6 +367,7 @@ impl Agent {
             mcp: None,
             hooks: Arc::default(),
             extensions: None,
+            plugins: None,
             pending_cp: None,
         };
         agent.update_report();
@@ -954,6 +965,8 @@ impl Agent {
         });
         self.compacted = true;
         self.usage_stale = true;
+        // What plugins said at session start went with the compacted part.
+        self.plugin_context("compact").await;
         let tokens_after = self.context_tokens();
         self.emit(AgentEvent::Compacted {
             tokens_before,
@@ -1008,6 +1021,36 @@ impl Agent {
     /// Permission check for one prepared call (L6.1). `None` = run it; `Some` = the refusal to return.
     async fn authorize(&self, call: &ToolCall, args: &serde_json::Value) -> Option<ToolOutput> {
         pipeline::authorize(&self.policy, self.approver.as_ref(), &call.name, args, &self.cfg.cwd).await
+    }
+
+    /// Claude Code plugin hooks (L7.14): session start, prompt submit, stop, session end.
+    pub fn with_plugin_hooks(mut self, hooks: Arc<crate::plugin_hooks::PluginHooks>) -> Self {
+        self.plugins = Some(Plugins {
+            hooks,
+            started: false,
+            stop_active: false,
+        });
+        self
+    }
+
+    /// Run `SessionStart` (`SubagentStart` in a subagent) and save what it says for the model.
+    async fn plugin_context(&mut self, source: &str) {
+        let Some(p) = &self.plugins else { return };
+        let hooks = p.hooks.clone();
+        for text in hooks.start(source).await {
+            self.add(EntryKind::CustomMessage {
+                kind: "hook".into(),
+                text,
+                display: false,
+            });
+        }
+    }
+
+    /// `SessionEnd` hooks of plugins, when the session closes.
+    async fn plugin_end(&self) {
+        if let Some(p) = &self.plugins {
+            p.hooks.end().await;
+        }
     }
 
     pub fn with_hooks(mut self, hooks: Arc<crate::hooks::Hooks>) -> Self {
@@ -1250,14 +1293,73 @@ impl Agent {
         self.start_checkpoint();
         let mut rec = Recovery::default();
         let mut steering_only = false;
+        if let Some(p) = self.plugins.as_mut()
+            && !std::mem::replace(&mut p.started, true)
+        {
+            let resumed = self.store.branch().iter().any(|e| {
+                matches!(
+                    &e.kind,
+                    EntryKind::Message {
+                        message: Message::User { .. }
+                    }
+                )
+            });
+            self.plugin_context(if resumed { "resume" } else { "startup" }).await;
+        }
         // Esc before the first reply takes the prompt back (like Claude Code): the leaf returns here.
         let start = self.store.branch().last().map(|e| e.id.clone());
         let mut first = true;
+        let mut refused = false;
         let stop = loop {
-            for content in self.take_queued(steering_only) {
+            let queued = self.take_queued(steering_only);
+            let mut added = queued.is_empty();
+            for content in queued {
+                // UserPromptSubmit (L7.14): a plugin may refuse the prompt or add context after it.
+                let hooks = self.plugins.as_mut().map(|p| {
+                    p.stop_active = false;
+                    p.hooks.clone()
+                });
+                let extra = match hooks {
+                    Some(h) => {
+                        let text: Vec<&str> = content
+                            .iter()
+                            .filter_map(|b| match b {
+                                Block::Text { text, .. } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect();
+                        match h.prompt(&text.join("\n")).await {
+                            Ok(extra) => extra,
+                            Err(why) => {
+                                let why = if why.trim().is_empty() {
+                                    "no reason given".into()
+                                } else {
+                                    why
+                                };
+                                self.emit(AgentEvent::Stream(StreamEvent::Notice {
+                                    text: format!("a plugin hook refused the prompt: {why}"),
+                                }));
+                                continue;
+                            }
+                        }
+                    }
+                    None => vec![],
+                };
+                added = true;
                 self.add(EntryKind::Message {
                     message: Message::User { content },
                 });
+                for text in extra {
+                    self.add(EntryKind::CustomMessage {
+                        kind: "hook".into(),
+                        text,
+                        display: false,
+                    });
+                }
+            }
+            if !added && first {
+                refused = true;
+                break StopReason::Stop;
             }
             self.flush_ext_state();
             let notes: Vec<(String, String)> = {
@@ -1349,6 +1451,29 @@ impl Agent {
             }
             break stop;
         };
+        // Stop (L7.14): a plugin hook's block keeps the agent going with its reason.
+        if stop == StopReason::Stop
+            && !refused
+            && let Some(p) = self.plugins.as_mut()
+        {
+            let (hooks, active) = (p.hooks.clone(), p.stop_active);
+            let last = self
+                .store
+                .projection()
+                .iter()
+                .rev()
+                .find_map(|m| match m {
+                    Message::Assistant(a) => Some(a.text()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if let Some(why) = hooks.stop(active, &last).await {
+                if let Some(p) = self.plugins.as_mut() {
+                    p.stop_active = true;
+                }
+                self.shared.remind("hook", why, true);
+            }
+        }
         *self.shared.cancel.lock().unwrap() = None;
         self.finish_checkpoint().await;
         self.set_busy(false);
@@ -2049,6 +2174,7 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
             } else if *agent.shared.closed.lock().unwrap() {
                 agent.shared.warm_wake.notify_one();
                 agent.store_warm_usage();
+                agent.plugin_end().await;
                 break agent;
             } else {
                 agent.shared.notify.notified().await;

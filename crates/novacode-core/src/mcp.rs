@@ -100,12 +100,15 @@ pub fn load(home: &Path, cwd: &Path, trusted: bool) -> (Vec<Configured>, Vec<Str
     let mut out: BTreeMap<String, Configured> = BTreeMap::new();
     let mut warnings = Vec::new();
     // Later files win a name: packages' servers, then yours, then the project's.
-    let mut files: Vec<PathBuf> = crate::packages::enabled(home, cwd, trusted)
-        .into_iter()
-        .rev()
-        .map(|p| p.dir.join("mcp.json"))
-        .collect();
-    files.push(home.join("mcp.json"));
+    type Parsed = Result<BTreeMap<String, ServerConfig>, String>;
+    let mut sources: Vec<(PathBuf, Parsed)> = Vec::new();
+    for p in crate::packages::enabled(home, cwd, trusted).into_iter().rev() {
+        for (f, r) in crate::plugin::Parts::of(&p).mcp() {
+            let r = r.and_then(|m| serde_json::from_value(Value::Object(m)).map_err(|e| e.to_string()));
+            sources.push((f, r));
+        }
+    }
+    let mut files = vec![home.join("mcp.json")];
     if trusted && let Some(p) = project_file(cwd) {
         files.push(p);
     }
@@ -113,9 +116,15 @@ pub fn load(home: &Path, cwd: &Path, trusted: bool) -> (Vec<Configured>, Vec<Str
         let Ok(text) = std::fs::read_to_string(&f) else {
             continue;
         };
-        match serde_json::from_str::<File>(&text) {
-            Ok(file) => {
-                for (name, config) in file.mcp_servers {
+        let r = serde_json::from_str::<File>(&text)
+            .map(|f| f.mcp_servers)
+            .map_err(|e| e.to_string());
+        sources.push((f, r));
+    }
+    for (f, r) in sources {
+        match r {
+            Ok(servers) => {
+                for (name, config) in servers {
                     if name.contains("__") || name.is_empty() {
                         warnings.push(format!(
                             "{}: MCP server name `{name}` may not contain `__`",

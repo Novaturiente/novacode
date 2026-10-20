@@ -70,7 +70,7 @@ What it leaves out, and says so:
 - An MCP server whose name you already have in `~/.novacode/mcp.json` (yours is kept).
 - A `model` when you already have one, or when no novacode model matches.
 
-Nothing else is read. Project-level `.claude/settings.json`, plugins, output styles and status line settings are not imported. Project MCP servers need no import because `.mcp.json` is read as it is.
+Nothing else is read. Project-level `.claude/settings.json`, output styles and status line settings are not imported. Plugins are not imported either, but most install directly from their repo: `novacode install https://github.com/<owner>/<plugin>` (skills, commands, agents, MCP servers, hooks and options; see [packages](packages.md#claude-code-plugins)). Project MCP servers need no import because `.mcp.json` is read as it is.
 
 ### Tool names
 

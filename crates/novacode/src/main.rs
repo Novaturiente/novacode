@@ -223,18 +223,22 @@ enum Command {
         #[arg(long)]
         turns: bool,
     },
-    /// Install a package (extensions/, skills/, prompts/, agents/, themes/, mcp.json) from a git URL
-    /// (its commit pinned in ~/.novacode/packages.lock.json) or a local folder (linked).
+    /// Install a package (a novacode package or a Claude Code plugin) from a git URL, at its latest
+    /// release (pinned in ~/.novacode/packages.lock.json), or link a local folder.
     Install {
         source: String,
         #[arg(long)]
         name: Option<String>,
+        /// A tag, branch or commit instead of the latest release.
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
     },
     /// Remove an installed package.
     Uninstall { name: String },
     /// Update novacode itself (release installs; AUR and source builds say how to update).
     Update,
-    /// Installed packages; `packages update [name]` moves pins to the newest commit,
+    /// Installed packages; `packages update [name]` moves them to their latest release,
+    /// `packages config <name>` sets a plugin's options,
     /// `packages install` installs what this project's .novacode/packages.json declares.
     Packages {
         #[command(subcommand)]
@@ -274,8 +278,15 @@ enum Command {
 
 #[derive(clap::Subcommand, Clone)]
 enum PkgCmd {
-    /// Pull clones (all, or one) to their newest commit and pin it.
-    Update { name: Option<String> },
+    /// Move packages (all, or one) to their latest release; a followed branch to its newest commit.
+    Update {
+        name: Option<String>,
+        /// Also move packages without releases to the newest commit of their default branch.
+        #[arg(long)]
+        commits: bool,
+    },
+    /// Set the options a Claude Code plugin declares (its userConfig).
+    Config { name: String },
     /// Install the packages this project declares, at the commits its lockfile pins.
     Install,
 }
@@ -536,6 +547,11 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
                 shadowed.extend(novacode_core::resources::templates(&dirs("prompts", "commands")).1);
                 shadowed.extend(agents::defs(&dirs("agents", "agents")).1);
                 shadowed.extend(novacode_core::packages::problems(paths.home(), &cwd, trusted));
+                for pkg in novacode_core::packages::enabled(paths.home(), &cwd, trusted) {
+                    for s in novacode_core::plugin::Parts::of(&pkg).hooks().1 {
+                        shadowed.push(format!("package `{}`: {s} is skipped", pkg.name));
+                    }
+                }
                 return Ok(doctor::doctor(&p, &settings, problems, shadowed).await);
             }
             return Ok(doctor::auth_status(&p));
@@ -627,12 +643,40 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             return import::run(&paths, &Providers::load(paths.home(), &settings), yes);
         }
         Some(Command::Update) => return update::run().await,
-        Some(Command::Install { source, name }) => {
-            let store = novacode_core::packages::Store::global(paths.home());
+        Some(Command::Install { source, name, git_ref }) => {
+            use novacode_core::packages::{Store, Want};
+            let store = Store::global(paths.home());
+            let want = git_ref.as_deref().map_or(Want::Latest, Want::Ref);
             let n = store
-                .install(&source, name.as_deref(), None)
+                .install(&source, name.as_deref(), want)
+                .await
                 .map_err(anyhow::Error::msg)?;
-            eprintln!("installed `{n}`; new sessions load it");
+            let at = store
+                .pin(&n)
+                .map(|p| format!(" at {}", novacode_core::packages::version_of(&p)))
+                .unwrap_or_default();
+            eprintln!("installed `{n}`{at}; new sessions load it");
+            if let Some(p) = store.list().into_iter().find(|p| p.name == n) {
+                let parts = novacode_core::plugin::Parts::of(&p);
+                eprintln!("{}", package_summary(&parts));
+                ask_options(&parts, true)?;
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Command::Packages {
+            what: Some(PkgCmd::Config { name }),
+        }) => {
+            let p = novacode_core::packages::Store::global(paths.home())
+                .list()
+                .into_iter()
+                .find(|p| p.name == name)
+                .ok_or_else(|| anyhow::anyhow!("`{name}` is not installed"))?;
+            let parts = novacode_core::plugin::Parts::of(&p);
+            if parts.option_specs().is_empty() {
+                eprintln!("`{name}` has no options");
+            } else {
+                ask_options(&parts, false)?;
+            }
             return Ok(ExitCode::SUCCESS);
         }
         Some(Command::Uninstall { name }) => {
@@ -643,12 +687,13 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Some(Command::Packages {
-            what: Some(PkgCmd::Update { name }),
+            what: Some(PkgCmd::Update { name, commits }),
         }) => {
             let mut bad = false;
-            for (n, r) in novacode_core::packages::Store::global(paths.home()).update(name.as_deref()) {
+            let store = novacode_core::packages::Store::global(paths.home());
+            for (n, r) in store.update(name.as_deref(), commits).await {
                 match r {
-                    Ok(rev) => eprintln!("{n}: at {}", &rev[..rev.len().min(12)]),
+                    Ok(msg) => eprintln!("{n}: {msg}"),
                     Err(e) => {
                         bad = true;
                         eprintln!("{n}: {e}");
@@ -664,7 +709,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             if !trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &cwd, false) {
                 bail!("this folder isn't trusted; run `novacode trust` first");
             }
-            let r = novacode_core::packages::install_project(&cwd);
+            let r = novacode_core::packages::install_project(&cwd).await;
             if r.is_empty() {
                 eprintln!("nothing to install");
             }
@@ -690,16 +735,15 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             for (label, store) in stores {
                 for p in store.list() {
                     none = false;
-                    let what: Vec<&str> = ["extensions", "skills", "prompts", "agents", "themes", "mcp.json"]
-                        .into_iter()
-                        .filter(|d| p.dir.join(d).exists())
-                        .collect();
-                    let src = p
-                        .link
-                        .map(|l| format!("→ {}", l.display()))
-                        .unwrap_or_else(|| "git".into());
+                    let parts = novacode_core::plugin::Parts::of(&p);
+                    let src = match (&p.link, store.pin(&p.name)) {
+                        (Some(l), _) => format!("→ {}", l.display()),
+                        (None, Some(pin)) => format!("git {}", novacode_core::packages::version_of(&pin)),
+                        (None, None) => "git".into(),
+                    };
                     let off = p.disabled.map(|w| format!("  (disabled: {w})")).unwrap_or_default();
-                    println!("{label}{}  [{}]  {src}{off}", p.name, what.join(", "));
+                    println!("{label}{}  {src}{off}", p.name);
+                    println!("  {}", package_summary(&parts).replace('\n', "\n  "));
                 }
             }
             if none {
@@ -790,7 +834,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         }
     }
     if trusted {
-        project_packages(&paths, &cwd, interactive)?;
+        project_packages(&paths, &cwd, interactive).await?;
     }
     let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
     diag::mark("trust + settings");
@@ -1220,7 +1264,7 @@ impl Ctx {
         }
         ext_dirs.push(self.paths.home().join("extensions"));
         for p in novacode_core::packages::enabled(self.paths.home(), &self.cwd, self.trusted) {
-            ext_dirs.push(p.dir.join("extensions"));
+            ext_dirs.extend(novacode_core::plugin::Parts::of(&p).dirs("extensions"));
         }
         let procs: Vec<(String, novacode_core::process_ext::Config)> = s
             .get::<std::collections::BTreeMap<String, novacode_core::process_ext::Config>>("processExtensions")
@@ -1322,6 +1366,20 @@ impl Ctx {
             novacode_core::hooks::spawn_observers(cmds.clone(), agent.subscribe());
             if !cmds.config.before_tool.is_empty() || !cmds.config.after_tool.is_empty() {
                 handlers.push(cmds);
+            }
+            // Claude Code plugin hooks (L7.14).
+            let plugin = novacode_core::plugin_hooks::PluginHooks::load(
+                &novacode_core::packages::enabled(self.paths.home(), &self.cwd, self.trusted),
+                &self.cwd,
+                agent.store.id(),
+                self.cli.agent.clone(),
+            );
+            if !plugin.is_empty() {
+                let plugin = Arc::new(plugin);
+                if plugin.has("PreToolUse") || plugin.has("PostToolUse") {
+                    handlers.push(plugin.clone());
+                }
+                agent = agent.with_plugin_hooks(plugin);
             }
         }
         if !exts.is_empty() || !exts.failed.is_empty() {
@@ -1836,10 +1894,129 @@ fn resource_dirs(
     }
     d.extend(
         novacode_core::packages::enabled(paths.home(), cwd, trusted)
-            .into_iter()
-            .map(|p| p.dir.join(kind)),
+            .iter()
+            .flat_map(|p| novacode_core::plugin::Parts::of(p).dirs(kind)),
     );
     d
+}
+
+/// What a package adds, in a line or two: its kind, parts and hook events.
+fn package_summary(p: &novacode_core::plugin::Parts) -> String {
+    use novacode_core::plugin::Kind;
+    let count = |kind: &str| -> usize {
+        match kind {
+            "skills" => novacode_core::resources::skills(&p.dirs("skills")).0.len(),
+            "prompts" => novacode_core::resources::templates(&p.dirs("prompts")).0.len(),
+            _ => agents::defs(&p.dirs("agents")).0.len() - agents::defs(&[]).0.len(),
+        }
+    };
+    let mut parts: Vec<String> = [("skills", "skills"), ("prompts", "commands"), ("agents", "agents")]
+        .into_iter()
+        .filter_map(|(k, label)| Some(count(k)).filter(|n| *n > 0).map(|n| format!("{n} {label}")))
+        .collect();
+    let servers: usize = p
+        .mcp()
+        .iter()
+        .filter_map(|(_, r)| r.as_ref().ok())
+        .map(|m| m.len())
+        .sum();
+    if servers > 0 {
+        parts.push(format!("{servers} MCP servers"));
+    }
+    if p.kind == Kind::Native {
+        if p.root.join("extensions").is_dir() {
+            parts.push("extensions".into());
+        }
+        if p.root.join("themes").is_dir() {
+            parts.push("themes".into());
+        }
+    }
+    let kind = match (p.kind, p.version()) {
+        (Kind::Claude, Some(v)) => format!("Claude Code plugin {v}"),
+        (Kind::Claude, None) => "Claude Code plugin".into(),
+        (Kind::Native, _) => "novacode package".into(),
+    };
+    let mut s = format!(
+        "{kind}: {}",
+        if parts.is_empty() {
+            "nothing novacode loads".into()
+        } else {
+            parts.join(", ")
+        }
+    );
+    let (hooks, skipped) = p.hooks();
+    if !hooks.is_empty() {
+        let mut ev: Vec<&str> = hooks.iter().map(|h| h.event.as_str()).collect();
+        ev.dedup();
+        s.push_str(&format!("\nhooks (run on every matching event): {}", ev.join(", ")));
+    }
+    if !skipped.is_empty() {
+        s.push_str(&format!("\nnot supported: {}", skipped.join("; ")));
+    }
+    s
+}
+
+/// Ask for a plugin's declared options (`userConfig`) and save them. With
+/// `keep`, options that already have a value are not asked again; without a
+/// terminal the defaults are used.
+fn ask_options(p: &novacode_core::plugin::Parts, keep: bool) -> anyhow::Result<()> {
+    let specs = p.option_specs();
+    if specs.is_empty() {
+        return Ok(());
+    }
+    let mut values = p.options();
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "`{}` has options; defaults are used (`novacode packages config {}` sets them)",
+            p.name, p.name
+        );
+        return Ok(());
+    }
+    eprintln!("`{}` options (Enter keeps the value shown):", p.name);
+    for (k, spec) in specs {
+        if keep && values.contains_key(&k) && spec.get("default").is_none_or(|d| values.get(&k) != Some(d)) {
+            continue;
+        }
+        let title = spec["title"].as_str().unwrap_or(&k);
+        if let Some(d) = spec["description"].as_str() {
+            eprintln!("  {d}");
+        }
+        let sensitive = spec["sensitive"] == true;
+        let cur = match values.get(&k) {
+            Some(_) if sensitive => " [set]".to_string(),
+            Some(v) => format!(" [{}]", v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())),
+            None => String::new(),
+        };
+        let line = read_secret_or_line(&format!("  {title}{cur}: "), sensitive)?;
+        if line.is_empty() {
+            continue;
+        }
+        let v = match spec["type"].as_str() {
+            Some("boolean") => serde_json::Value::Bool(matches!(
+                line.to_lowercase().as_str(),
+                "y" | "yes" | "true" | "1" | "on"
+            )),
+            Some("number") => line
+                .parse::<f64>()
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::String(line)),
+            _ => serde_json::Value::String(line),
+        };
+        values.insert(k, v);
+    }
+    p.save_options(&values).map_err(anyhow::Error::msg)?;
+    eprintln!("saved; new sessions use them");
+    Ok(())
+}
+
+fn read_secret_or_line(prompt: &str, secret: bool) -> anyhow::Result<String> {
+    if secret {
+        return read_secret(prompt);
+    }
+    eprint!("{prompt}");
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim().to_string())
 }
 
 /// `--bg` (the child) and `--rpc`: a session with no window of its own.
@@ -2319,7 +2496,7 @@ fn export_session(
 /// L6.3: four choices, asked once per folder that has project config.
 /// A trusted project declares packages that aren't installed: ask once per
 /// project, never install silently. The answer is kept in `~/.novacode/project-packages.json`.
-fn project_packages(paths: &Paths, cwd: &Path, interactive: bool) -> anyhow::Result<()> {
+async fn project_packages(paths: &Paths, cwd: &Path, interactive: bool) -> anyhow::Result<()> {
     let missing = novacode_core::packages::missing(cwd);
     if missing.is_empty() {
         return Ok(());
@@ -2365,7 +2542,7 @@ fn project_packages(paths: &Paths, cwd: &Path, interactive: bool) -> anyhow::Res
         novacode_base::storage::Durability::Durable,
     )?;
     if yes {
-        for (n, r) in novacode_core::packages::install_project(cwd) {
+        for (n, r) in novacode_core::packages::install_project(cwd).await {
             match r {
                 Ok(_) => eprintln!("installed `{n}`"),
                 Err(e) => eprintln!("`{n}` failed: {e}"),

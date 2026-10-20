@@ -2,7 +2,7 @@
 
 <p align="center">A coding agent for your terminal, in one small Rust binary.</p>
 
-novacode reads and edits your code, runs commands, and works through tasks with you, like Claude Code, pi or Codex. It uses the subscriptions you already pay for (Claude Pro/Max, ChatGPT/Codex, Antigravity, GitHub Copilot) or an API key for about 50 providers, including local models. Your existing Claude Code skills, agents and commands load without moving any files.
+novacode reads and edits your code, runs commands, and works through tasks with you, like Claude Code, pi or Codex. It uses the subscriptions you already pay for (Claude Pro/Max, ChatGPT/Codex, Antigravity, GitHub Copilot) or an API key for about 50 providers, including local models. Your existing Claude Code skills, agents and commands load without moving any files, and Claude Code plugins (ponytail, caveman, mattpocock/skills, …) install with `novacode install <repo>`, hooks included.
 
 > **Status:** early release (0.1). Linux is the main platform. macOS builds exist but are not tested yet. Windows is not supported; use WSL. Release binaries and AUR packages arrive with the first release; until then, build from source (below and in [docs/install.md](docs/install.md)).
 
@@ -44,7 +44,7 @@ The full walk-through and a list of every flag and subcommand are in [docs/quick
 | **Sessions** | Every session is a tree: resume, branch, fork, rewind the conversation and your files, export to JSONL or HTML. Sessions can run in the background and be attached from another terminal. |
 | **Context** | `AGENTS.md`/`CLAUDE.md` files, Agent Skills, prompt templates, notes-based compaction, and memory that carries across sessions. |
 | **Subagents** | Background helper sessions (scout, worker, reviewer, or your own) that see only the tools they're given, plus plan mode and `/goal` (keep working until an auditor agrees it's done). |
-| **Extending** | MCP servers, TypeScript/JavaScript extensions with no build step, extensions in any language over JSON-RPC, command hooks, and git packages that bundle all of these. |
+| **Extending** | MCP servers, TypeScript/JavaScript extensions with no build step, extensions in any language over JSON-RPC, command hooks, and git packages that bundle all of these. Claude Code plugins install as packages (skills, commands, agents, MCP servers, hooks, options), and packages update to their latest release. |
 | **Automation** | Print mode, a JSON event stream, and an RPC protocol for driving novacode from scripts, editors and CI. |
 
 ## How it compares
@@ -55,6 +55,7 @@ The full walk-through and a list of every flag and subcommand are in [docs/quick
 | Open source | Yes (MIT or Apache-2.0) | Yes | No |
 | Several model providers | Yes | Yes | Claude only |
 | Loads Claude Code skills, agents, commands | Yes, as they are | Partly | Yes |
+| Installs Claude Code plugins (with hooks) | Yes | No | Yes |
 | Subagents, plan mode, MCP | Built in | Extensions | Built in |
 | Command risk check and approvals | Built in | Extension | Built in |
 | Extensions | TS/JS (no npm) or any language | TS with npm | Plugins and hooks |
