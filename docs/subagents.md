@@ -29,7 +29,7 @@ One tool, several actions:
 | `list` | One line per subagent: id, status, type, title, model, time, tokens. |
 | `status {id}` | One agent's status, session id, working folder and last activity. |
 | `log {id, limit?}` | Its recent activity lines (default 20). |
-| `read {id, offset?, limit?}` | The full report. Long reports reach the model cut at 6000 characters, with a pointer to `read`. |
+| `read {id, offset?, limit?}` | The full report (`limit` default 20000 characters). Long reports reach the model cut at 6000 characters, with a pointer to `read`. |
 | `send {id, message}` | Steer a running agent, or resume a finished one with a new message. |
 | `wait {ids?, any?, timeout?}` | Block until reports arrive. Default: all started agents, 600 s (max 3600). |
 | `stop {id}` | Stop it. |
@@ -47,7 +47,7 @@ There is no separate `resume` action: `send` to a finished agent resumes its ses
 | `cwd` | Working folder. |
 | `after` | Ids of agents that must finish first. The new agent waits in `queued`. If one of them fails or is stopped, it fails too. |
 | `notify` | `wake` (default): the report starts a turn. `next`: rides along with the next turn. `quiet`: panel only. |
-| `worktree` | `true` runs it in a new git worktree under `.worktrees/` on branch `worktree-<name>`. You merge the branch yourself. |
+| `worktree` | `true` runs it in a new git worktree under `.worktrees/` on branch `worktree-<title-slug>-<id>` (for example `worktree-fix-parser-a2`). You merge the branch yourself. |
 | `tools` | Tools for it, picked from the parent's own. Default: the type's tools. |
 | `mcp` | MCP servers it may use. Default: none. |
 
@@ -236,6 +236,8 @@ When the model says the goal is done, an `auditor` subagent re-checks every crit
 | `goal.audit` | `true` | Check completion with the `auditor` subagent. |
 | `goal.auditModel` | the session's model | Model for the auditor, `provider/model[:level]`. |
 | `goal.maxRuns` | `30` | Automatic runs before it pauses (per start or resume). |
+
+The model drives a goal with the `goal` tool: `set` (objective, criteria, optional `ordered` to do the todo steps in order, one per run), `complete` (with evidence), `block` (with a reason) and `status`.
 
 Goals need a window or an RPC client. They're not available in a subagent at maximum depth.
 

@@ -2496,7 +2496,8 @@ fn branch(
 
 fn export_redactor(paths: &Paths) -> Redactor {
     let auth_path = paths.home().join("auth.json");
-    Redactor::new(move || AuthStore::new(auth_path.clone()).secrets())
+    // Exports and debug bundles get shared: token patterns are always masked here.
+    Redactor::new(move || AuthStore::new(auth_path.clone()).secrets()).with_patterns(true)
 }
 
 /// Write a session's branch as JSONL or HTML, secrets masked.

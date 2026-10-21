@@ -144,6 +144,10 @@ NOVACODE_HOME=/tmp/nc-test novacode
 | `~/.novacode/skills/`, `prompts/`, `agents/`, `themes/` | Your skills, prompt templates, subagent definitions and themes |
 | `~/.novacode/packages/`, `packages.lock.json` | Installed packages and their pinned commits |
 | `~/.novacode/memory/` | Memory that carries across sessions |
+| `~/.novacode/checkpoints/` | File checkpoints for `/rewind` |
+| `~/.novacode/spill/`, `processes/`, `goals/` | Long tool output, background process records, `/goal` state |
+| `~/.novacode/plugin-data/`, `package-options.json` | Data and options of installed packages |
+| `~/.novacode/exhausted.json` | Which subscription accounts are used up, and until when |
 | `~/.novacode/metrics/` | Timing files, when `debug.metrics` is on |
 | `~/.novacode/logs/` | Daily log files (set `NOVACODE_LOG`, for example `NOVACODE_LOG=debug`, to change the level) |
 | `~/.novacode/cache/` | Model catalog and subscription quota caches |

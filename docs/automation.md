@@ -54,9 +54,10 @@ novacode --mode read-only -p "list the TODOs in this repo"
 | Flag | What it does |
 |---|---|
 | `-m provider/model[:level]` | Choose the model, e.g. `codex/gpt-5.5:high` |
-| `--api-key KEY` | API key for the model's provider, this run only. Needs `-m provider/model`. It comes ahead of saved and environment keys. |
+| `--api-key KEY` | API key for the model's provider, this run only. Needs a model: `-m provider/model` or `model` in settings. It comes ahead of saved and environment keys. |
 | `--trace` | Record the raw request and stream (secrets removed) to `~/.novacode/logs/trace-<id>.jsonl`. See [troubleshooting](troubleshooting.md). |
 | `--no-session` | Don't save this run as a session |
+| `-w`, `--worktree [NAME]` | Start in git worktree `.worktrees/NAME` (made if missing) |
 | `-c` / `-r ID` | Continue the newest session in this folder / resume one by id prefix |
 | `--mode auto\|ask\|read-only` | Permission mode for this run |
 | `--profile NAME` | Restrict tools to a named profile, e.g. `scout` |
@@ -166,7 +167,7 @@ A line that isn't a valid command gets `{"type":"response","command":"parse","ok
 
 ### Slash commands over RPC
 
-`prompt` text starting with `/` runs the command in the session instead of going to the model. These work: `/compact`, `/context`, `/mcp`, `/name <text>`, `/worktree [name|exit|remove]`, `/btw <q>`, `/export [html]`, `/model <id>`, `/thinking <level>`, `/plan`, `/mode`, `/goal`, `/usage`, `/debug`, plus skills, prompt templates and extension commands. `get_commands` lists them.
+`prompt` text starting with `/` runs the command in the session instead of going to the model. These work: `/compact`, `/context`, `/mcp`, `/name <text>`, `/worktree [name|exit|remove]`, `/btw <q>`, `/docs`, `/export [html]`, `/model <id>`, `/thinking <level>`, `/plan`, `/mode`, `/goal`, `/usage`, `/debug`, plus skills, prompt templates and extension commands. `get_commands` lists them.
 
 These need the session's own window and answer with an error such as `/resume works only in the session's own window`: `/resume`, `/new`, `/tree`, `/rewind`, `/fork`, `/clone`, `/reload`, `/restart`, `/login`, `/keys`, `/copy`, `/ps`, `/quit`. `/model` and `/thinking` without an argument (the pickers) fail the same way. The session-changing ones also don't work in a window opened with `novacode attach`.
 
@@ -340,9 +341,9 @@ The `hooks` setting runs shell commands around tool calls and on session events.
 |---|---|---|
 | `beforeTool` | Before each tool call. Stdin: `{event, tool, args, session, cwd}` | Exit `2` to block the call; stderr is the reason the model sees. Print `{"args": {…}}` on stdout (exit `0`) to change the arguments. Any other exit code, or a timeout, lets the call through. |
 | `afterTool` | After each tool call. Stdin adds `is_error`, `output`, `call_id`, `duration_ms`, `touched` | Whatever it prints on stdout is added to the tool result the model sees. |
-| `events.<type>` | On each session event, such as `agent_end`, `turn_start`, `tool_end`, `compacted`, plus `session_start` and `session_end`. Stdin: the event JSON | Observe only. Streaming text and live tool output don't trigger hooks. |
+| `events.<type>` | On each session event, such as `agent_end`, `turn_start`, `tool_end`, `compacted`, plus `session_start` and `session_end`. Stdin: the event JSON (events have a `type` field; `session_start` and `session_end` are `{event, session, cwd}`). `NOVACODE_TOOL` is not set | Observe only. Streaming text and live tool output (`stream`, `tool_update`) don't trigger hooks. |
 
-Each of these takes one command or a list. `timeoutMs` (default `5000`) is the limit for `beforeTool`; `afterTool` gets twice that. Event hooks run in the background (up to 30 seconds each), and `session_end` is waited for up to 5 seconds. A novacode started inside a hook runs no hooks of its own (`NOVACODE_HOOKS_DISABLED` is set).
+Each of these takes one command or a list. `timeoutMs` (default `5000`) is the limit for `beforeTool`; `afterTool` gets twice that. Event hooks run in the background (up to 30 seconds each), and `session_end` is waited for up to 5 seconds. A novacode started inside a hook runs no command hooks or plugin hooks of its own (`NOVACODE_HOOKS_DISABLED` is set). It still loads extensions and runs `hooks.onActivity`.
 
 Hooks from a project's settings run only when the folder is [trusted](security.md). If you moved from Claude Code, `novacode import claude` converts your hooks (see [migrating](migrating.md)).
 

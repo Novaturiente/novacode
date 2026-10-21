@@ -29,7 +29,7 @@ The format is the same `mcpServers` object Claude Code uses.
 
 | File | Notes |
 |---|---|
-| `mcp.json` in an installed [package](packages.md) | Lowest priority. |
+| `mcp.json` in an installed [package](packages.md) (a Claude Code plugin uses `.mcp.json` and the manifest's `mcpServers`) | Lowest priority. |
 | `~/.novacode/mcp.json` | Yours. Written by `novacode mcp add` and `remove`. |
 | `.mcp.json` in your project | Read only in [trusted](security.md) folders. novacode looks in the current folder and then upward to the nearest one. Highest priority. |
 
@@ -77,7 +77,7 @@ A server is stdio if it has `command`, and HTTP if it has `url`. If both are set
 
 Connecting gives up after 60 seconds. Each step of the handshake (`initialize` and listing the tools) waits at most 30 seconds for an answer. At most 50 pages of tools are read; the rest are dropped without a message.
 
-A stdio server starts in your session's folder, not in the folder of the package that ships its `mcp.json`. There is no variable for the package folder, so a packaged server should use a command that is on the `PATH` (such as `npx`).
+A stdio server starts in your session's folder, not in the folder of the package that ships its `mcp.json`. A native package has no variable for its folder, so a packaged server should use a command that is on the `PATH` (such as `npx`). A Claude Code plugin gets `${CLAUDE_PLUGIN_ROOT}` (see [packages](packages.md#claude-code-plugins)).
 
 ## `novacode mcp` commands
 
@@ -86,9 +86,9 @@ A stdio server starts in your session's folder, not in the folder of the package
 | `novacode mcp list` | Every server with its status, tool count, config file, and its first 15 tools with their exposure. Exits 1 if any server failed. |
 | `novacode mcp add <name> -- <command> [args…]` | Add a stdio server to `~/.novacode/mcp.json`. A server with the same name is replaced. |
 | `novacode mcp add <name> --url <url>` | Add an HTTP server. |
-| `novacode mcp add … --env KEY=VALUE` | Set an environment variable for the server. Repeat the flag for more. |
-| `novacode mcp remove <name>` | Remove a server from `~/.novacode/mcp.json`. |
-| `novacode mcp login <name>` | Log in to an HTTP server that uses OAuth. |
+| `novacode mcp add … --env KEY=VALUE` | Set an environment variable for a stdio server. Repeat the flag for more. It has no effect with `--url`. |
+| `novacode mcp remove <name>` | Remove a server from `~/.novacode/mcp.json`. Exits 1 if the name isn't there. |
+| `novacode mcp login <name>` | Log in to an HTTP server that uses OAuth. It opens the browser with `xdg-open`; elsewhere, open the printed URL yourself. |
 | `novacode mcp logout <name>` | Forget that server's saved login. |
 
 `add` and `remove` only edit your own file. To change a server in a project `.mcp.json` or a package, edit that file.

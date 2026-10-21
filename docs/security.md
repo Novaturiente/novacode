@@ -56,17 +56,17 @@ Every `bash` command is split into simple commands (including ones inside `$(...
 | Low | Changes something ordinary. | writing a file, running a program |
 | Confirm | Destroys data or history in bulk. | `rm -rf target`, `git reset --hard`, `git clean -fd`, `git branch -D`, `find -delete`, `curl ... \| sh`, `sudo ...`, `dd`, `chmod -R` |
 | Shared | Rewrites or deletes history on a remote, which no local undo can fix. | `git push --force`, `git push origin +main`, `git push --delete` |
-| Catastrophic | Targets the system, your home folder or credentials. **Never runs.** | `rm -rf /`, `rm -rf ~`, writing to `/dev/sda`, `mkfs` on a device, `kill -1` (as the last argument), fork bombs, anything that deletes or overwrites `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.config/gcloud`, `~/.password-store` or `~/.novacode` |
+| Catastrophic | Targets the system, your home folder or credentials. **Never runs.** | `rm -rf /`, `rm -rf ~`, writing to `/dev/sda`, `mkfs` on a device, `kill -1` (as the last argument), `pkill -f` with a pattern that matches its own command line, fork bombs, anything that deletes or overwrites `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.config/gcloud`, `~/.password-store` or `~/.novacode` |
 
 System folders count too: `/`, `/bin`, `/boot`, `/dev`, `/etc`, `/home`, `/lib`, `/lib64`, `/opt`, `/proc`, `/root`, `/sbin`, `/srv`, `/sys`, `/usr`, `/var`, and your home folder itself.
 
-More commands that count as Confirm: `git checkout -- .` and `git checkout -f`, `git restore` (unless only `--staged`), `git stash drop` and `clear`, `git filter-branch`, `git worktree remove -f`, `truncate`, `shred`, `wipefs`, `mkfs` and `fdisk` (when the target is not a device or protected), `shutdown`, `reboot`, `crontab -r`, `docker prune`, and `find -exec rm`. A command it cannot parse, or one nested more than 4 levels deep, is Confirm too. `git push origin :branch` is Shared, like `--delete`.
+More commands that count as Confirm: `git checkout -- .` and `git checkout -f`, `git restore` (unless only `--staged`), `git stash drop` and `clear`, `git filter-branch`, `git worktree remove -f`, `truncate`, `shred`, `wipefs`, `mkfs` and `fdisk` (when the target is not a device or protected), `shutdown`, `reboot`, `poweroff`, `halt`, `crontab -r`, `docker`/`podman` prune or `volume rm`, and `find -exec rm`. A command it cannot parse, or one nested more than 4 levels deep, is Confirm too. `git push origin :branch` is Shared, like `--delete`.
 
 What each level does depends on the mode:
 
 - **Catastrophic**: refused in every mode. The model is told to do it another way or ask you to run it yourself.
 - **Shared**: asks you, even in `auto` mode.
-- **Confirm**: asks you in `ask` and `read-only` mode. In `auto` mode it runs without asking (it is logged). In `read-only` mode it is then refused anyway, because only Safe commands run there.
+- **Confirm**: asks you in `ask` and `read-only` mode. In `auto` mode it runs without asking (it is logged). In `read-only` mode the card still appears and, if you approve, it runs. With nobody to ask, a justification gets it past the gate but it is then refused as not read-only.
 - **Safe / Low**: no gate action.
 
 You can add folders to the protected set and ban commands outright:
@@ -100,7 +100,7 @@ When something needs your approval, a card shows the tool, the command or path, 
 | `n` | Deny. You can type a reason, then Enter; the model sees it. |
 | Esc or Ctrl+C | Deny without a reason. |
 
-"Session" for a risk-gated command means that exact command. For other calls, `a` and `A` use a rule such as `Bash(git push:*)` (the first two words of the command) or `Edit(<path>)`; `A` also saves it to `permissions.allow`.
+"Session" for a risk-gated command means that exact command. For other calls, `a` and `A` use a rule such as `Bash(git push:*)` (the first two words of the command) or `Edit(<path>)` / `Write(<path>)`; `A` also saves it to `permissions.allow`.
 
 In print mode there is nobody to approve. A call that would need approval is not run, and the model is told to use an allow rule or run interactively (or, for a risk-gate hold, to add a `justification`).
 
@@ -111,9 +111,9 @@ Rules go in `permissions.allow`, `permissions.ask` and `permissions.deny`. A rul
 ```json
 {
   "permissions": {
-    "allow": ["Bash(git status)", "Bash(cargo test:*)", "Read(~/notes/**)"],
+    "allow": ["Bash(git status)", "Bash(cargo test:*)", "Read(**/notes/**)"],
     "ask":   ["Bash(git push:*)", "Edit(src/secret/**)"],
-    "deny":  ["Bash(curl:*)", "Read(.env)"]
+    "deny":  ["Bash(curl:*)", "Read(**/.env)"]
   }
 }
 ```
@@ -123,10 +123,10 @@ Rules go in `permissions.allow`, `permissions.ask` and `permissions.deny`. A rul
 | `Bash` | Every bash command. |
 | `Bash(git status)` | Exactly that command. |
 | `Bash(git push:*)` | `git push` and anything starting with `git push `. |
-| `Read(path)`, `Write(path)`, `Edit(path)`, `Grep(path)`, `Find(path)`, `Ls(path)` | The tool's `path` argument, as a glob (`*`, `**`, `?`). Matched against the path as given and against its absolute form. `~/` expands to your home folder. |
+| `Read(path)`, `Write(path)`, `Edit(path)`, `Grep(path)`, `Find(path)`, `Ls(path)` | The tool's `path` argument, as a glob (`*`, `**`, `?`). The glob is matched against the path as given and against its absolute form, but the pattern itself is not expanded: `~/` in a pattern only matches a path the model wrote with `~/`. Use `**/name` to match anywhere. |
 | Any other tool name | The whole tool (no pattern). A rule with a pattern, such as `Mcp(x)`, never matches these tools. |
 
-Bash commands are matched per simple command. Commands are split at `;`, `&&`, `||`, `|`, `&` and newlines, and compared with quotes removed (`git commit -m "a b"` is compared as `git commit -m a b`). A leading `FOO=1` stays in the text, so `Bash(git status)` does not match `FOO=1 git status`. A `deny` or `ask` rule fires if **any** part of a chained command matches. An `allow` rule only fires if **all** parts match, so `Bash(git status)` does not allow `git status && rm -rf x`.
+Bash commands are matched per simple command. Commands are split at `;`, `&&`, `||`, `|`, `&`, newlines and group brackets, a redirect counts as a `>` word (so `Bash(git status)` does not match `git status > out`), and compared with quotes removed (`git commit -m "a b"` is compared as `git commit -m a b`). A leading `FOO=1` stays in the text, so `Bash(git status)` does not match `FOO=1 git status`. A `deny` or `ask` rule fires if **any** part of a chained command matches. An `allow` rule only fires if **all** parts match, so `Bash(git status)` does not allow `git status && rm -rf x`.
 
 Order of checks for each call:
 
@@ -181,7 +181,7 @@ A project folder can ship config that changes settings and runs code. novacode o
 - `.mcp.json`
 - project-level Claude Code config under `.claude`: `skills`, `agents` and `commands` (when `compat.claude` is on)
 
-`AGENTS.md` and `CLAUDE.md` are plain text and always load.
+`AGENTS.md`, `CLAUDE.md` and the project's `.novacode/prompts` are plain text and always load.
 
 The first time you open a folder that has any of these, an interactive session asks:
 
@@ -216,7 +216,7 @@ novacode --trust               # trust this folder for this run only
 
 - Logins are stored in `~/.novacode/auth.json`, created with mode `0600` (owner read and write only).
 - MCP OAuth tokens are stored in `~/.novacode/mcp-auth.json`, also `0600`.
-- Spill files and exports are masked the same way. See [Sessions](sessions.md).
+- Spill files are masked the same way. Exports and debug bundles always mask both your saved logins and the token patterns, whatever `security.maskSecrets` says. See [Sessions](sessions.md).
 
 Masking changes what the model reads. It does not stop a command you allow from sending a secret somewhere.
 

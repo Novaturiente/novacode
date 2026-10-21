@@ -2,9 +2,9 @@
 
 <p align="center">A coding agent for your terminal, in one small Rust binary.</p>
 
-novacode reads and edits your code, runs commands, and works through tasks with you, like Claude Code, pi or Codex. It uses the subscriptions you already pay for (Claude Pro/Max, ChatGPT/Codex, Antigravity, GitHub Copilot) or an API key for about 50 providers, including local models. Your existing Claude Code skills, agents and commands load without moving any files, and Claude Code plugins (ponytail, caveman, mattpocock/skills, …) install with `novacode install <repo>`, hooks included.
+novacode reads and edits your code, runs commands, and works through tasks with you, like Claude Code, pi or Codex. It uses the subscriptions you already pay for (Claude Pro/Max, ChatGPT/Codex, Antigravity, GitHub Copilot) or an API key for about 55 providers, including local models. Your existing Claude Code skills, agents and commands load without moving any files, and Claude Code plugins (ponytail, caveman, mattpocock/skills, …) install with `novacode install <repo>`, hooks included.
 
-> **Status:** early release (0.1). Linux is the main platform. macOS builds exist but are not tested yet. Windows is not supported; use WSL. Release binaries and AUR packages arrive with the first release; until then, build from source (below and in [docs/install.md](docs/install.md)).
+> **Status:** early release (0.2). Linux is the main platform. macOS builds exist but are not tested yet. Windows is not supported; use WSL. Release binaries and AUR packages arrive with the first release; until then, build from source (below and in [docs/install.md](docs/install.md)).
 
 ## Install
 

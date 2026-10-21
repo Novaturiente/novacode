@@ -35,7 +35,7 @@ Every call, including calls from `codemode` scripts, goes through the same permi
 
 ### How calls run
 
-- Calls in one reply run at the same time, and their results are added in order. If any call in the reply is one that must run alone (`ask_user`, `tool_search`, `schedule`, the worktree tools, the plan tools), the whole reply runs one call at a time.
+- Calls in one reply run at the same time, and their results are added in order. If any call in the reply is one that must run alone (`ask_user`, `todo`, `goal`, `tool_search`, `schedule`, the worktree tools, the plan tools), the whole reply runs one call at a time.
 - Permission checks and approval cards happen first, one card at a time.
 - An unknown tool name gets a "did you mean" hint. String arguments are fixed to the type the schema wants (`"5"` becomes 5, `"true"` becomes true). Arguments that are not valid JSON are not run; the model is told to resend.
 
@@ -66,7 +66,7 @@ Params: `path`, `content`. Creates missing folders. If the file changed on disk 
 
 ### edit
 
-Params: `path`, `edits` (a list of `old_text` / `new_text`). Each `old_text` must match exactly one place. If an exact match fails, a whitespace and quote tolerant match is tried. All edits apply together or none do. CRLF line endings and a BOM are kept. If the file changed on disk since the agent last read it, `edit` still applies when every `old_text` matches exactly once, and the result says the file had changed. Only a failed match adds "changed on disk since you last read it". Edits to the same file run one at a time. The result is a short diff.
+Params: `path`, `edits` (a list of `old_text` / `new_text`). Each `old_text` must match exactly one place. If an exact match fails, a whitespace and quote tolerant match is tried. All edits apply together or none do. CRLF line endings and a BOM are kept. If the file changed on disk since the agent last read it, `edit` still applies when every `old_text` matches exactly once, and the result says the file had changed. Only a failed match adds "changed on disk since you last read it". Edits to the same file run one at a time. The result is a one-line summary of where it edited. If the match was fuzzy, it also includes the diff so the model can check it.
 
 `apply_patch` (a patch-format tool that can replace `edit` for some models) exists in the code but is not turned on in any release path yet, so the model does not see it.
 
@@ -85,15 +85,15 @@ A command that passes its timeout is not killed: it moves to the process manager
 
 ### grep, find, ls
 
-All three respect `.gitignore`.
+`grep` and `find` respect `.gitignore` and skip hidden files (dotfiles). `ls` lists everything, dotfiles and ignored files included.
 
 | Tool | Params | Default cap |
 |---|---|---|
 | `grep` | `pattern` (Rust regex, or literal text with `literal`), `path`, `glob`, `ignore_case`, `context` lines, `limit` | 100 matches; the real total is reported |
 | `find` | `pattern` (glob, e.g. `**/*.rs`; a pattern with no `/` matches file names anywhere), `path`, `limit` | 1000 results (limit 1 to 5000) |
-| `ls` | `path`, `limit` | 500 entries; sorted, directories end in `/`, dotfiles included |
+| `ls` | `path`, `limit` (1 to 5000) | 500 entries; sorted, directories end in `/`, dotfiles included |
 
-`grep` limit is 1 to 1000, and match lines are clipped at 500 characters. All three only search the local file system.
+`grep` limit is 1 to 1000, `context` is at most 10, and match lines are clipped at 500 characters. All three only search the local file system.
 
 ### todo
 
@@ -108,15 +108,15 @@ A small task list. A call with no fields shows the list. The list is saved with 
 | `start` | The id being worked on now (only one is active). |
 | `note` | What the started item is doing. |
 
-The list shows `done/total` first, then one line per item: `○` pending, `◐` active, `✓` done, `✗` dropped.
+The list shows `done/total` first (dropped items are not counted in the total), then one line per item: `○` pending, `◐` active, `✓` done, `✗` dropped.
 
 ### ask_user
 
-Asks you one or more questions in one form. Each has 2 to 6 choices (one can be marked recommended, and each can have a `description` and a `preview`), and a question can allow several picks with `multi`. You can always type your own answer. If you dismiss the form, the model is told to ask in chat instead.
+Asks you one or more questions in one form. Params: `questions`, each with `question`, an optional `header`, `options` (2 to 6 suggested; one can be marked `recommended`, and each can have a `description` and a `preview`), and `multi` to allow several picks. You can always type your own answer. If you dismiss the form, the model is told to ask in chat instead.
 
 ### agent and goal
 
-`agent` runs subagents: actions `spawn`, `list`, `status`, `log`, `read`, `send`, `wait`, `stop`. `goal` takes `set` (objective and criteria), `complete`, `block` and `status`. See [Subagents](subagents.md).
+`agent` runs subagents: actions `spawn`, `list`, `status`, `log`, `read`, `send`, `wait`, `stop`. `goal` takes `set` (`objective`, `criteria`, and `ordered` to do the todo steps in order), `complete` (with `evidence`), `block` (with `reason`) and `status`. See [Subagents](subagents.md).
 
 ### Plan mode
 
@@ -179,7 +179,7 @@ Change how a tool reaches the model with `tools.<name>.exposure` in settings:
 
 ## The process manager
 
-The `process` tool runs commands that keep going across turns: dev servers, watchers, long builds. Actions:
+The `process` tool runs commands that keep going across turns: dev servers, watchers, long builds. Actions (all but `start`, `list` and `clear` need the process `id`, e.g. `proc_3`):
 
 | Action | What it does |
 |---|---|

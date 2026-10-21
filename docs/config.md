@@ -10,8 +10,8 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `model` | string | picked at first run | Default `provider/model[:level]`, e.g. `claude/claude-opus-5-5:medium`. |
 | `thinking` | string | `medium` | Default thinking level: off, minimal, low, medium, high, xhigh, max. |
 | `maxTokens` | number | 16384 | Output cap per reply, clamped to the model's limit. |
-| `contextWindow` | number | from the catalog | Use a smaller context window than the model has. |
-| `cacheRetention` | string | `short` | `long` asks for 1h (Anthropic) or 24h (OpenAI) prompt caching. |
+| `contextWindow` | number | from the catalog | Override the model's context window (normally a smaller one). |
+| `cacheRetention` | string | `short` | `long` asks Anthropic (Claude) for 1h prompt caching instead of 5 min. Other providers ignore it. |
 | `cache.warm` | bool | false | Keep the prompt cache alive with 1-token replays while it pays off. |
 | `providers` | object | {} | Add a provider or change a bundled one: `providers.<id>.{api, name, baseUrl, auth, env, apiKey, keyOptional, catalog, headers, compat}`, merged field by field over the bundled profile. See docs/providers.md. |
 | `models` | object | {} | Per-model catalog overrides, keyed `"<provider>/<id>"`: `contextWindow`, `maxTokens`, `images`, `reasoning` (bools), `name`, `cost`. See docs/providers.md. |
@@ -29,7 +29,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `memory.observeAfterTokens` | number | 10000 | New tokens before the observer runs. |
 | `memory.keepRecentTokens` | number | 20000 | Tokens kept verbatim after a compaction. |
 | `memory.compactAtTokens` | number | min(80% of window, 400k) | Context size that triggers auto-compaction. |
-| `memory.reflectAfterTokens` | number | 20000 | New observer tokens before the reflector runs. |
+| `memory.reflectAfterTokens` | number | 20000 | New conversation tokens before the reflector runs. |
 | `memory.poolTargetTokens` | number | 10000 | Size the dropper trims active notes down to. |
 | `memory.store` | bool | true | Cross-session memory (SQLite) and its start-of-session index. |
 | `memory.indexItems` | number | 15 | Memory items in the session-start index. |
@@ -47,12 +47,12 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `debug.metrics` | bool | false | Per-session timing JSONL in `~/.novacode/metrics/` for `novacode stats`. |
 | `notifications.enabled` | bool | true | OSC 777 notification when a turn ends unwatched or needs you. |
 | `tmux.agentState` | bool | true | Set the `@agent_*` pane options inside tmux. |
-| `ui.theme` | string | `auto` | auto, catppuccin-mocha, catppuccin-latte or a file in `~/.novacode/themes`. |
+| `ui.theme` | string | `auto` | auto, dark (catppuccin-mocha), light (catppuccin-latte) or a file in `~/.novacode/themes`. |
 | `ui.turnCollapse` | bool | true | Fold finished turns to one line (Alt+O toggles). |
 | `ui.thinking` | string | `collapsed` | How thinking shows: collapsed, full or hidden. |
 | `ui.userMessage` | object | rounded box | Your messages' box: `border` (rounded, single, heavy, double, ascii, none), `borderColor` and `text` (`#rrggbb` or `{fg, bg, bold, italic, …}`), `paddingX` (1), `paddingY` (0). |
 | `ui.statusline` | object | built-in rows | `placement` and `rows` of segments (activity, ctx, cache, model, …). Segment names are in docs/tui.md. |
-| `ui.icons` | string | `nerd` | `unicode` when your font has no Nerd Font glyphs; any other value means `nerd`. |
+| `ui.icons` | string | `nerd` | `unicode` when your font has no Nerd Font glyphs; any other value means `nerd` (`novacode doctor` flags it). |
 | `ui.images` | string | `auto` | Image protocol: auto, kitty, iterm2, sixel, halfblocks or off. |
 | `ui.panel.auto` | bool | true | Open the side panel by itself while todos or subagents run. |
 | `ui.panel.host` | string | `inline` | inline, tmux or auto: draw the panel in novacode or in a tmux pane. `tmux` and `auto` only take effect inside tmux. |

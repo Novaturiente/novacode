@@ -50,7 +50,7 @@ The default export gets the frozen `novacode` object (also `globalThis.novacode`
 - **`registerTool(t)`**: `{name, description, parameters (JSON Schema), exposure?, execute(args, {cwd, session})}`.
   - `execute` returns a string, or `{content: string, isError?, details?}`. `undefined` gives `(no output)`; any other value is shown as pretty-printed JSON. If it throws, the model gets `<name> failed: <message>`.
   - `details.ui` (a list of [lines](#ui-novacodeui-version-1)) replaces the tool output in the transcript.
-  - `exposure` is `listed` (the default: the model sees it), `codemode` (or `codemode-only`: only codemode scripts can call it), `deferred` (found through `tool_search`) or `hidden`. An unknown value counts as `listed`.
+  - `exposure` is `listed` (the default: the model sees it), `codemode` (or `codemode-only`: only codemode scripts can call it), `deferred` (found through `tool_search`) or `hidden`. An unknown value counts as `listed`. The setting `tools.<name>.exposure` overrides it.
 - **`registerCommand(name, {description, handler(args)})`**: a `/name` command (a leading `/` in `name` is optional). `args` is the text after the name, trimmed. A returned string is shown as a notice.
 - If two extensions register the same command, the first one loaded wins. Built-in commands always win.
 - **`registerShortcut(key, handler | {handler, description})`**: a key such as `ctrl+alt+d`, shown in Alt+/ help.
@@ -70,7 +70,7 @@ The default export gets the frozen `novacode` object (also `globalThis.novacode`
 - **`state.append(kind, data)`** and **`state.entries(kind)`**: your extension's data, kept in the session file and never sent to the model. `entries` returns what you appended under `kind` on the current branch, oldest first, so state follows `/rewind` and `/tree`.
 - **`log(...args)`**: writes one line to novacode's log, `~/.novacode/logs/novacode.log.<date>`, tagged `extension=<name>`. `console.log`, `info`, `warn`, `error` and `debug` do the same.
 
-Every call above returns a promise (except `log`). A failed call rejects with an `Error` whose message starts with the call's name, for example `exec: …`. `notify`, `remind`, `sendMessage`, `state.*`, `messages`, `complete` and `spawnAgent` need a session, so they fail during setup: call them from a handler.
+Every call above returns a promise (except `log`). A failed call rejects with an `Error` whose message starts with the call's name, for example `exec: …`. `remind`, `sendMessage`, `state.*`, `messages`, `complete` and `spawnAgent` need a session, so they fail during setup: call them from a handler. `notify` during setup is only written to the log.
 
 ### UI (`novacode.ui`, version 1)
 
@@ -83,8 +83,8 @@ Every call sends data; novacode draws it in every window, including attached one
 - **`openTab(name, {title, priority, width, region, show})`**, **`showTab(name)`**, **`closeTab(name)`**: a side-panel tab.
 - **`setSource(tab, id, {title, order, newestFirst})`**, **`publish(tab, source, node)`**, **`unpublish(tab, source, id?)`**: tree rows in a tab. `unpublish` without an id clears the source. A node is `{id, parent?, label, tag?, status?, icon?, dim?, detail?, time?, order?, actions?}`, where `actions` maps a key to a `/command`.
 - **`setRegion(tab, lines)`**: a region tab drawn with your own lines. Keys come back as `ui_key` events with `{tab, node, key, width, height}`.
-- **`ask(questions)`**: dialogs in the `ask_user` form. `questions` is a list of `{question, header?, options: [{label, description?, preview?, recommended?}], multi?}`. It resolves to one answer per question, `{question, chosen: [labels], text?}` (`text` is what the user typed instead of picking), or `null` when dismissed or when no window is open.
-- **`select(question, options)`**, **`confirm(question)`**, **`input(question)`**: short forms. `select` resolves to the chosen label (options may be strings), `confirm` to `true` or `false`, `input` to the typed text. Each resolves to `undefined` when dismissed or with no window.
+- **`ask(questions)`**: dialogs in the `ask_user` form. `questions` is a list of `{question, header?, options: [{label, description?, preview?, recommended?}], multi?}`. It resolves to one answer per question, `{question, chosen: [labels], text?}` (`text` is what the user typed instead of picking), or `null` when dismissed or when the session has no window attached. In print mode (`-p`) the call rejects with `ask: this session has no window to ask in`.
+- **`select(question, options)`**, **`confirm(question)`**, **`input(question)`**: short forms. `select` resolves to the chosen label (options may be strings), `confirm` to `true` or `false`, `input` to the typed text. Each resolves to `undefined` when dismissed or with no window attached; in print mode they reject like `ask`.
 
 Styles are theme token names (`accent`, `dim`, `error`, …) or `#rrggbb`. A line is a string or a list of `{text, style?}` segments.
 
@@ -93,13 +93,13 @@ Styles are theme token names (`accent`, `dim`, `error`, …) or `#rrggbb`. A lin
 | Event | Payload | Return |
 |---|---|---|
 | `before_tool` | `{tool, args, cwd}`. MCP tools are named `<server>__<tool>`. It also runs for calls made inside codemode | `{block: reason}` refuses the call; the model sees `Blocked by a hook: <reason> (<extension>)`. `{args}` (an object) rewrites the arguments; the next handler sees the rewrite. The first block wins. |
-| `after_tool` | `{tool, args, output, isError, callId, durationMs, touched}`. `output` is cut to 16 000 characters | A string is appended to the result as feedback, shown as `[hook] <text>` and cut to 8 000 characters. `{append?, replace?, isError?}` also replaces the result text or sets its error flag. `touched` lists the absolute paths the call changed or read: the `path` of edit/write/read, and the files a `bash` command changed (seen from git status before and after; outside a git repo, none). |
+| `after_tool` | `{tool, args, output, isError, callId, durationMs, touched}`. `output` is cut to 16 000 characters | A string is appended to the result as feedback, shown as `[hook] <text>` and cut to 8 000 characters. `{append?, replace?, isError?}` also replaces the result text or sets its error flag. `touched` lists the absolute paths the call changed or read: the `path` of edit/write/read, the files of an `apply_patch`, and the files a `bash` command changed (seen from git status before and after; outside a git repo, none). |
 | `input` | `{text, source}`. `source` is `prompt` for a new prompt, `steer` for a message typed while a run is going | `{text}` rewrites the prompt before it is saved, `{handled: true}` swallows it. Handlers run in load order and see earlier rewrites. |
 | `before_request` | `{provider, model, cwd, contextTokens, lastUser}` | A string, a list of strings or `{append: string or list}`: unsaved text sent after the cached prefix, for current state such as the time or git status. |
 | `ui_key` | `{tab, node, key, width, height}`. `tab` is `null` for a key from `registerShortcut` | Ignored. |
 | Session events: `agent_start`, `turn_start`, `message`, `tool_start`, `tool_update`, `tool_end`, `retry`, `agent_end`, `settled`, `cwd_changed`, `process_started`, `process_ended`, `compacted`, `prompt_taken_back`, `ui` | The event as on the [wire](automation.md), with snake_case fields (`call_id`, `is_error`, `duration_ms`) | Ignored: observe only. |
 
-Handlers fail open: an error leaves things as they were. Running past the 10 s limit also disables the extension.
+With several `after_tool` handlers, each sees the original result; the last `replace` or `isError` wins. Handlers fail open: an error leaves things as they were. Running past the 10 s limit also disables the extension.
 
 ## Process extensions
 
@@ -118,7 +118,7 @@ A process extension is a separate program, in any language, that novacode starts
 - The key (`lsp` here) is the extension's name. Its own settings go under `extensions.<name>` and arrive in `initialize`.
 - A project's `.novacode/settings.json` can declare process extensions too, but only in a [trusted](security.md) folder.
 - novacode starts every process extension when the session starts, in the session folder, in its own process group. `/reload` starts them again.
-- The environment is novacode's own plus your `env`, with `NOVACODE_HOOKS_DISABLED=1` set so a novacode you start from it doesn't run hooks again.
+- The environment is novacode's own plus your `env`, with `NOVACODE_HOOKS_DISABLED=1` set so a novacode you start from it doesn't run command hooks or plugin hooks again (it still loads extensions).
 - stderr goes to `~/.novacode/logs/ext-<name>.log`, which is emptied at each start. Print debug output there, never on stdout: stdout carries only protocol lines, and a line that isn't JSON is ignored.
 
 ### Messages from novacode
@@ -188,12 +188,12 @@ The `ui` ops use snake_case field names. `lines` is a list of [lines](#ui-novaco
 | `messages` | `{}` | `session.messages()` |
 | `complete` | `{messages, system?, maxTokens?}` | `complete()` |
 | `spawnAgent` | `{task, opts}` | `spawnAgent()` |
-| `ask` | `{questions}` | `ui.ask()`; `null` when dismissed or with no window |
+| `ask` | `{questions}` | `ui.ask()`; `null` when dismissed or with no window attached (an error in print mode) |
 | `settings` | `{path?}` | `settings.get()` |
 | `stateAppend` / `stateEntries` | `{kind, data}` / `{kind}` | `state.append()` / `state.entries()` |
 | `sendMessage` | `{text, deliverAs?}` | `sendMessage()` |
 
-An unknown `op` gets an error. Like a script's calls, these run with your permissions: `exec` refuses only catastrophic commands, and nothing asks for approval. Ops that need a session (`messages`, `complete`, `spawnAgent`, `stateAppend`, `sendMessage`, …) fail while you are still answering `initialize`.
+The notifications `notify`, `remind`, `log` and `ui` also work as `host` ops. An unknown `op` gets an error. Like a script's calls, these run with your permissions: `exec` refuses only catastrophic commands, and nothing asks for approval. Ops that need a session (`messages`, `complete`, `spawnAgent`, `stateAppend`, `sendMessage`, …) fail while you are still answering `initialize`.
 
 ### Writing one in Rust
 
@@ -281,7 +281,7 @@ Add `"processExtensions": {"hello": {"command": "novacode-hello"}}` to `~/.novac
 
 When handlers get slow (network calls, language servers) or you need host requests, answer each request from its own task. The two bundled extensions show how: they read stdin in a loop, `tokio::spawn` a task per request, and send every reply through one channel to a single stdout writer. Start from [`extensions/image-gen/src/main.rs`](../extensions/image-gen/src/main.rs) (about 70 lines) for a tool, or [`extensions/lsp/src/main.rs`](../extensions/lsp/src/main.rs) for an `after_tool` hook with `timeoutMs`. Both are their own crates, outside novacode's workspace, so they build and ship on their own.
 
-**Example: image generation.** [`extensions/image-gen`](../extensions/image-gen) adds a `generate_image` tool (Gemini image models through `novacode login antigravity`, or a key in `extensions.image-gen.apiKey` / `GEMINI_API_KEY`). Install with `cargo install --locked --path extensions/image-gen` and add `"processExtensions": {"image-gen": {"command": "novacode-image-gen"}}`.
+**Example: image generation.** [`extensions/image-gen`](../extensions/image-gen) adds a `generate_image` tool (Gemini image models through `novacode login antigravity`, or a key in `extensions.image-gen.apiKey`, `GEMINI_API_KEY` or `GOOGLE_API_KEY`). Install with `cargo install --locked --path extensions/image-gen` and add `"processExtensions": {"image-gen": {"command": "novacode-image-gen"}}`.
 
 **Example: language-server diagnostics.** [`extensions/lsp`](../extensions/lsp) is a process extension that reports the errors an edit (or a `bash` command) left in the touched files. It isn't part of novacode: install it with `cargo install --locked --path extensions/lsp`, then add the `processExtensions.lsp` entry above.
 

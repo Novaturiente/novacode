@@ -51,9 +51,10 @@ What `packages update` does, by how the package was installed:
 | Latest release (the default) | Moves to a newer release when there is one. |
 | `--ref <tag>` | The same: a pinned tag still moves to newer releases. Reinstall with `--ref` to hold an old one. |
 | `--ref <branch>` | Follows the branch: moves to its newest commit. |
-| `--ref <commit>`, or a repo without releases | Stays where it is. `--commits` moves it to the newest commit of the default branch. If the repo later starts publishing releases, a plain update moves it to the latest one. |
+| `--ref <commit>` | Stays only while the repo has no releases. Once it has any, a plain update moves it to the latest release. |
+| A repo without releases | Stays where it is. `--commits` moves it to the newest commit of the default branch. If the repo later starts publishing releases, a plain update moves it to the latest one. |
 
-The command prints one line per package, for example `ponytail: v5.3.1 → v5.3.2`, `caveman: up to date (v4.0.1)` or `my-pack: no releases; stays at 3f2a9c1d0b5e (--commits moves it to the newest commit)`. Linked folders are always current, so update skips them.
+The command prints one line per package, for example `ponytail: v5.3.1 → v5.3.2`, `caveman: up to date (v4.0.1)` or `my-pack: no releases; stays at 3f2a9c1d0b5e (--commits moves it to the newest commit)`. Linked folders are always current, so update skips them. `packages update` exits `1` if any package failed. `packages install` needs a [trusted](security.md) folder and stops with `this folder isn't trusted; run novacode trust first` otherwise.
 
 `install`, `uninstall`, `packages update` and `packages config` work on your own packages in `~/.novacode/`. They don't change a project's packages.
 
@@ -131,7 +132,7 @@ They are filled in for MCP server configs, hook commands, `/skill:` and command 
 
 ### Hooks
 
-A plugin's command hooks run with Claude Code's input on stdin (`session_id`, `cwd`, `hook_event_name`, plus the event's fields) and Claude Code's output rules: plain stdout or `hookSpecificOutput.additionalContext` adds context, exit code `2` or `"decision": "block"` blocks. Tool names are Claude Code's (`Bash`, `Edit`, `Read`, `mcp__<server>__<tool>`), and a hook's `matcher` applies to them. Hooks get `CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_DATA`, `CLAUDE_PROJECT_DIR` and `CLAUDE_PLUGIN_OPTION_<KEY>` in their environment. Both forms work: shell (`command`, run with `sh`, or `bash` with `"shell": "bash"`) and exec (`command` plus `args`). `timeout` (seconds) and `async: true` are honoured.
+A plugin's command hooks run with Claude Code's input on stdin (`session_id`, `cwd`, `hook_event_name`, plus the event's fields) and Claude Code's output rules: `hookSpecificOutput.additionalContext` adds context (for `SessionStart`, `SubagentStart` and `UserPromptSubmit`, plain stdout does too), exit code `2` or `"decision": "block"` blocks. Tool names are Claude Code's (`Bash`, `Edit`, `Read`, `mcp__<server>__<tool>`), and a hook's `matcher` applies to them. For `PostToolUse` and `PreToolUse`, plain stdout is ignored; only the JSON fields below count. Hooks get `CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_DATA`, `CLAUDE_PROJECT_DIR` and `CLAUDE_PLUGIN_OPTION_<KEY>` in their environment. Both forms work: shell (`command`, run with `sh`, or `bash` with `"shell": "bash"`) and exec (`command` plus `args`). `timeout` (seconds) and `async: true` are honoured.
 
 | Event | When it runs in novacode | What its output does |
 |---|---|---|
@@ -176,7 +177,7 @@ The key is the package name and the value is the source (a git URL or a local pa
 Project packages only load in a [trusted folder](security.md). When you open a trusted project that lists packages you don't have:
 
 - In the TUI, novacode asks once: install them, or "Not now (don't ask again here)". The message warns that packages can add tools, hooks and MCP servers that run code. Your answer is kept per project in `~/.novacode/project-packages.json`.
-- In print mode, RPC and other non-interactive runs, it prints a note and installs nothing.
+- In print mode, RPC and other non-interactive runs, it prints a note and installs nothing. The note also appears in the TUI on later runs once you have answered.
 - Nothing is installed without your yes.
 
 To install them yourself at any time:

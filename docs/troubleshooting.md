@@ -34,7 +34,7 @@ skills, prompts, agents
 | Flag | What it does |
 |---|---|
 | `-v`, `--verbose` | With `-p`: print tool calls, the stop reason, token and cache usage, and the session file to stderr |
-| `--trace` | Record the raw request and stream (secrets masked) to `~/.novacode/logs/trace-<id>.jsonl`. It also sets the log level to `debug`. In print mode the file path is printed to stderr. |
+| `--trace` | Record the raw request and stream (secrets masked) to `~/.novacode/logs/trace-<id>.jsonl`. It also sets the default log level to `debug` (unless `NOVACODE_LOG` is set). In print mode the file path is printed to stderr. |
 | `--profile-startup` | Time each startup phase, print the table and exit before a session starts |
 
 ```sh
@@ -199,7 +199,7 @@ Open an issue at <https://github.com/Novaturiente/novacode/issues>.
    novacode debug bundle
    ```
 
-   It writes `novacode-debug-<time>.tar.gz` in the current folder and prints the path. It holds `info.txt` (version, OS, terminal, the names of your logins), your settings, key bindings and `mcp.json`, the recent logs, crash logs, cache-miss and MCP/extension logs, and the newest session in this folder. Known keys and tokens are masked, and anything shaped like a credential is masked too. Still, look inside before you share it. The session contains your conversation.
+   It writes `novacode-debug-<time>.tar.gz` in the current folder and prints the path. It holds `info.txt` (version, OS, terminal, the names of your logins), your settings (global and project), key bindings and `mcp.json`, the recent logs, crash logs, cache-miss and MCP/extension logs, and the newest session in this folder with its metrics file, if any. Known keys and tokens are masked, and anything shaped like a credential is masked too. Still, look inside before you share it. The session contains your conversation.
 
    | Flag | What it does |
    |---|---|

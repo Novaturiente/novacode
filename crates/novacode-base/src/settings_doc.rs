@@ -32,13 +32,13 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "contextWindow",
         "number",
         "from the catalog",
-        "Use a smaller context window than the model has.",
+        "Override the model's context window (normally a smaller one).",
     ),
     (
         "cacheRetention",
         "string",
         "`short`",
-        "`long` asks for 1h (Anthropic) or 24h (OpenAI) prompt caching.",
+        "`long` asks Anthropic (Claude) for 1h prompt caching instead of 5 min. Other providers ignore it.",
     ),
     (
         "cache.warm",
@@ -146,7 +146,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "memory.reflectAfterTokens",
         "number",
         "20000",
-        "New observer tokens before the reflector runs.",
+        "New conversation tokens before the reflector runs.",
     ),
     (
         "memory.poolTargetTokens",
@@ -249,7 +249,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "ui.theme",
         "string",
         "`auto`",
-        "auto, catppuccin-mocha, catppuccin-latte or a file in `~/.novacode/themes`.",
+        "auto, dark (catppuccin-mocha), light (catppuccin-latte) or a file in `~/.novacode/themes`.",
     ),
     (
         "ui.turnCollapse",
@@ -279,7 +279,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "ui.icons",
         "string",
         "`nerd`",
-        "`unicode` when your font has no Nerd Font glyphs; any other value means `nerd`.",
+        "`unicode` when your font has no Nerd Font glyphs; any other value means `nerd` (`novacode doctor` flags it).",
     ),
     (
         "ui.images",

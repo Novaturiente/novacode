@@ -60,7 +60,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/ps", "processes in the process manager, with their latest output"),
     ("/mcp", "MCP servers: status and tool counts"),
-    ("/reload", "re-read settings, keys, theme, skills and context files"),
+    (
+        "/reload",
+        "re-read settings, keys, theme, skills, extensions, MCP servers and context files",
+    ),
     ("/restart", "restart novacode (a new build) and resume this session"),
     ("/quit", "quit"),
 ];

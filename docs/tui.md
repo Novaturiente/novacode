@@ -21,7 +21,7 @@ The panel has tabs. Switch tabs with `Tab` and `Shift+Tab` while the panel has f
 
 | Tab | Shows |
 |---|---|
-| Agent | The todo list and running subagents. |
+| Agent | The goal, the todo list and running subagents. |
 | Processes | One process at a time: its status, command and live output (the program's own colors, else errors red, warnings yellow, success green, URLs blue). Running ones come first. `/ps` opens the panel here with focus. |
 | Usage & cache | Tokens, cost and cache numbers. |
 | Timing | Where the time of the turn went. |
@@ -35,7 +35,7 @@ Extensions can add tabs too (see [extensions](extensions.md)).
 | `Ctrl+Alt+F` | Give the panel the keys. `Esc` or `q` gives them back. |
 | `Up`/`Down` (or `k`/`j`) | Move in the focused panel. |
 | `Enter` | Run the action of the selected row (used by extension tabs). |
-| `Left`/`Right` (or `h`/`l`) | Processes tab: the previous or next process. `Up`/`Down` scroll its output; `End` follows the tail again. |
+| `Left`/`Right` (or `h`/`l`) | Processes tab: the previous or next process. `Up`/`Down` scroll its output; `PageUp`/`PageDown` scroll by 10; `End` or `G` follows the tail again. |
 
 The panel needs a terminal at least 100 columns wide. On a narrower screen it stays hidden and open todos show as a short block above the editor instead. Its width is a quarter of the screen, at least 40 columns and at most half.
 
@@ -150,7 +150,7 @@ Type `/` to see the list. A line that is only `/something` unknown to novacode i
 
 Session commands are explained in [sessions](sessions.md).
 
-In a window opened with `novacode attach`, `/resume`, `/new`, `/tree`, `/rewind`, `/fork`, `/clone`, `/reload`, `/restart` and `/login` work only in the session's own window. Over `--rpc` more of them are limited, see [automation](automation.md#slash-commands-over-rpc).
+In a window opened with `novacode attach`, `/resume`, `/new`, `/tree`, `/rewind`, `/fork`, `/clone`, `/reload`, `/restart` and `/login` work only in the session's own window, and so do the `Alt+Up` and `Alt+Shift+R` keys. Over `--rpc` more of them are limited, see [automation](automation.md#slash-commands-over-rpc).
 
 ### Modes and goals
 
@@ -194,7 +194,7 @@ Press `Alt+/` or type `/keys` to see the live table, including your changes. Typ
 | `app.message.copy` | `Ctrl+X` | Copy the last reply. |
 | `app.input.copy` | `Alt+C` | Copy what is in the input box. |
 | `app.message.dequeue` | `Alt+Up` | Take back the last queued message. |
-| `app.reload` | `Alt+Shift+R` | Reload settings, keys, theme, skills and extensions. |
+| `app.reload` | `Alt+Shift+R` | Reload settings, keys, theme, skills, extensions, MCP servers and context files. |
 | `app.clipboard.pasteImage` | `Ctrl+V` | Paste an image (or text). |
 | `app.process.background` | `Ctrl+Alt+B` | Move running commands to the process manager. |
 | `app.panel.toggle` | `Ctrl+Alt+P` | Show or hide the side panel. |
@@ -317,7 +317,7 @@ A token is `"#rrggbb"` or an object with `fg`, `bg` and the flags `bold`, `itali
 } } }
 ```
 
-`border` is `rounded` (default), `single`, `heavy`, `double`, `ascii` or `none`. Padding is 0 to 8.
+`border` is `rounded` (default), `single`, `heavy`, `double`, `ascii` or `none`. Padding is 0 to 8 (default 1 across, 0 down).
 
 ## Status line
 

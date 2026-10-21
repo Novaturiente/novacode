@@ -43,7 +43,7 @@ novacode login claude --account work
 novacode login claude --account second
 ```
 
-When an account runs out (quota used up, or a rate limit longer than novacode is willing to wait) before a reply starts, novacode switches to the next account of that provider and tells you in the transcript. It remembers when the limit resets, so a new session doesn't start on a used-up account. Order is `default` first, then by name.
+When an account runs out (quota used up, or a rate limit longer than novacode is willing to wait) before a reply starts, novacode switches to the next account of that provider and tells you in the transcript. It remembers when the limit resets, so a new session doesn't start on a used-up account. Order is `default` first, then by name. Accounts known to be used up go last.
 
 novacode never falls back to a metered API key. If every account is used up, the error says when the limit resets and suggests adding an account or switching model with `/model`.
 
@@ -81,6 +81,7 @@ Some others have names you might not guess:
 | `kimi-code-plan-global` | `KIMI_API_KEY` |
 | `minimax`, `minimax-coding-plan` | `MINIMAX_API_KEY` |
 | `huggingface` | `HF_TOKEN` |
+| `novita-ai` | `NOVITA_API_KEY` |
 | `friendli` | `FRIENDLI_TOKEN` |
 | `fireworks-ai` | `FIREWORKS_API_KEY` |
 | `ollama-cloud` | `OLLAMA_API_KEY` (address `https://ollama.com/v1`) |
@@ -155,7 +156,7 @@ novacode models --all        # every provider, connected or not
 novacode models --refresh    # update model info from models.dev first
 ```
 
-Each row shows the model, its context size, whether it supports thinking and images, and the API price per million tokens (API-key providers only). novacode refreshes the model info in the background about once a day.
+Each row shows the model, its context size, whether it supports thinking and images, and, when the catalog has one, the list price per million tokens (on a subscription this is not what you pay). novacode refreshes the model info in the background about once a day.
 
 ### Thinking levels
 
@@ -175,7 +176,7 @@ ollama pull qwen3-coder
 novacode -m ollama/qwen3-coder
 ```
 
-If the server is not running, the provider is skipped quietly in `/model` and `novacode doctor`. For a server on another machine, change its address:
+If the server is not running, the provider is skipped in `/model`, and `novacode doctor` shows it with `-` (not a failure). For a server on another machine, change its address:
 
 ```json
 { "providers": { "ollama": { "baseUrl": "http://gpu-box:11434/v1" } } }

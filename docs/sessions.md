@@ -128,7 +128,7 @@ novacode export -o review.html --html
 
 Without `-o` the file is `novacode-<first 13 characters of the id>.jsonl` (or `.html`) in the current folder (not the session folder), and the path is printed. `/export` does the same.
 
-JSONL has one message per line, with a `ts_ms` timestamp added. Only this branch's messages are written: memory notes, compaction and checkpoint entries are left out. HTML shows thinking, tool calls and results, with errors marked. Masking covers your saved logins, and also token patterns if `security.maskSecrets` is on. See [Security](security.md#secrets).
+JSONL has one message per line, with a `ts_ms` timestamp added. Only this branch's messages are written: memory notes, compaction and checkpoint entries are left out. HTML shows thinking, tool calls and results, with errors marked. Masking covers your saved logins and token patterns (API keys, bearer tokens and the like), always, whatever `security.maskSecrets` says. See [Security](security.md#secrets).
 
 ## Background sessions
 

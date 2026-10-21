@@ -18,7 +18,7 @@ novacode needs a terminal (stdin and stdout must both be one), or it stops with 
 If you have no default model yet, a picker asks how novacode should reach a model:
 
 - **Subscriptions** (Claude, Codex, Antigravity, Copilot) are always listed. Pick one that you are not logged in to yet and novacode starts the login, then lists its models. novacode prints a sign-in URL and tries to open it with `xdg-open`. On macOS or a machine with no browser, open the printed URL yourself. Details are in [providers](providers.md).
-- **API-key providers** show up in the list only when their key is already set: in your environment (for example `OPENROUTER_API_KEY`) or saved with `novacode login <provider>`. `novacode models --all` lists every provider and its env var.
+- **API-key providers** show up in the list only when their key is already set: in your environment (for example `OPENROUTER_API_KEY`) or saved with `novacode login <provider>`. `novacode models --all` lists every provider and its env var. Local servers (Ollama, LM Studio) don't appear here; pass `-m ollama/<model>`.
 
 Press Esc to cancel. novacode then exits with "setup cancelled"; run it again. To skip the picker, pass a model: `novacode -m provider/model`, or `provider/model:thinking` such as `-m codex/gpt-5.5:high`.
 
@@ -118,7 +118,7 @@ novacode auth status   # which logins and keys novacode sees
 novacode doctor        # checks every connected provider and your settings
 ```
 
-Both exit with `1` when nothing is connected. Without a model, a `-p` run fails with `no model: pass -m provider/model or set "model" in settings`. More in [troubleshooting](troubleshooting.md).
+Both exit with `1` when nothing is connected (`doctor` also when it finds a problem). Without a model, a `-p` run fails with `no model: pass -m provider/model or set "model" in settings`. More in [troubleshooting](troubleshooting.md).
 
 ## Command line reference
 
@@ -135,7 +135,7 @@ Both exit with `1` when nothing is connected. Without a model, a `-p` run fails 
 | `-c`, `--continue` | Continue the newest session in this folder |
 | `-r`, `--resume ID` | Resume a session by id prefix, in the folder it was last in |
 | `--no-session` | Don't save this session |
-| `-w`, `--worktree [NAME]` | Start in git worktree `.worktrees/NAME` (made if missing; no NAME: `wt-MMDD-HHMM`) |
+| `-w`, `--worktree [NAME]` | Start in git worktree `.worktrees/NAME` on branch `worktree-NAME` (made if missing; no NAME: `wt-MMDD-HHMM`) |
 | `--mode auto\|ask\|read-only` | Permission mode |
 | `--profile NAME` | Limit tools to a named profile, e.g. `scout` |
 | `--trust` | Trust this folder's project config for this run |
@@ -161,10 +161,10 @@ Both exit with `1` when nothing is connected. Without a model, a `-p` run fails 
 | `stop ID` | End a live session |
 | `debug bundle` | Pack logs, settings and a session for a bug report |
 | `stats [SESSION] [--all] [--turns]` | Timing report (needs `debug.metrics`) |
-| `install SOURCE [--name N]` | Install a package from a git URL or folder |
+| `install SOURCE [--name N] [--ref REF]` | Install a package from a git URL or folder |
 | `uninstall NAME` | Remove a package |
-| `packages [update [NAME] \| install]` | List, update or install packages |
-| `mcp list \| add \| remove \| login \| logout` | Manage MCP servers |
+| `packages [update [NAME] [--commits] \| config NAME \| install]` | List, update, configure or install packages |
+| `mcp list \| add \| remove \| login \| logout` | Manage MCP servers. `mcp add NAME [--url URL] [--env K=V] [-- CMD ARGS…]` |
 | `import claude [--yes]` | Copy Claude Code settings once |
 | `trust [PATH] [--revoke]` | Trust (or distrust) a folder's project config |
 | `update` | Update novacode itself |

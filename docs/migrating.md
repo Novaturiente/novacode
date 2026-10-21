@@ -11,7 +11,7 @@ novacode reads these Claude Code files directly. You don't copy anything.
 | Claude Code | In novacode |
 |---|---|
 | `~/.claude/skills`, `.claude/skills` | Skills |
-| `~/.claude/agents`, `.claude/agents` | Subagent definitions. Claude tool names (`Read`, `Glob`, `Task`, …) are mapped to novacode's. `model: sonnet` or `inherit` is understood. |
+| `~/.claude/agents`, `.claude/agents` | Subagent definitions. Claude tool names (`Read`, `Glob`, `Task`, …) are mapped to novacode's. A `model` that isn't `provider/model` or `small` (such as `sonnet` or `inherit`) is ignored; the parent's model is used. |
 | `~/.claude/commands`, `.claude/commands` | Prompt templates, used as `/name` |
 | `.mcp.json` in the project | MCP servers (same format; trusted folders only) |
 | `CLAUDE.md` | Instructions for the model, when the folder has no `AGENTS.md` |
@@ -19,7 +19,7 @@ novacode reads these Claude Code files directly. You don't copy anything.
 Rules for these folders:
 
 - novacode's own folders win. If `~/.novacode/skills/review` and `~/.claude/skills/review` both exist, the novacode one is used. `novacode doctor` lists the ones that were skipped.
-- A project's `.claude/` folder (skills, agents, commands) loads only when you [trust](security.md) the folder (`novacode trust`). In an untrusted folder it is ignored and novacode prints one `note:` line. `~/.claude` always loads.
+- A project's `.claude/` folder (skills, agents, commands) loads only when you [trust](security.md) the folder (`novacode trust`). In an untrusted folder it is ignored and novacode prints a `note:` line (two, if there is also a `.mcp.json`). `~/.claude` always loads.
 - To turn all of this off, set `compat.claude` to `false`. See [config](config.md).
 
 ### CLAUDE.md and AGENTS.md

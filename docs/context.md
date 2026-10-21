@@ -26,7 +26,7 @@ A subagent definition can either replace the preamble or add an `agent` section.
 
 The model gets the whole prompt once, at the start of a session. Later, if a section changes (you edit `AGENTS.md`, add a skill, switch mode), novacode appends a short message with only the changed section. It never rewrites the start of the conversation, so the provider's prompt cache stays valid.
 
-The date and git state are written once at session start. If the date or the git branch/HEAD changes during the session, novacode adds a short hidden reminder such as `Git branch is now fix-login (HEAD a1b2c3d).`
+The date and git state are written once at session start. If the date or the git branch/HEAD changes during the session, novacode adds a short hidden reminder such as `Git branch is now fix-login (HEAD a1b2c3d).` (also for a new date or a moved HEAD)
 
 ## Context files
 
@@ -77,7 +77,7 @@ Providers can reuse the start of a request instead of reading it again, which is
 ```json
 {
   "cacheRetention": "long",
-  "cache.warm": true
+  "cache": { "warm": true }
 }
 ```
 
@@ -153,7 +153,7 @@ At session start, novacode writes a short index of saved memories into the promp
 | `memory.indexItems` | `15` | Most items in the start-of-session index. |
 | `memory.indexChars` | `2000` | Character cap for that index. |
 
-The files are `~/.novacode/memory/global.db` and `~/.novacode/memory/projects/<key>.db`. `<key>` is a 16-digit hash of the project's root folder. You can delete the files to wipe memory.
+The files are `~/.novacode/memory/global.db` and `~/.novacode/memory/projects/<key>.db`. `<key>` is a 16-hex-digit hash of the project's root folder. You can delete the files to wipe memory.
 
 ### Searching old sessions
 
@@ -163,8 +163,7 @@ The `session_search` tool finds words in messages of earlier sessions. It search
 
 ```json
 {
-  "memory.enabled": false,
-  "memory.store": false
+  "memory": { "enabled": false, "store": false }
 }
 ```
 
