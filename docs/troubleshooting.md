@@ -101,12 +101,13 @@ novacode logout claude --account work   # remove one account later
 
 ### Login on a machine with no browser
 
-`novacode login` always prints the URL, so you can open it on another machine. It only tries to open a browser with `xdg-open`, so on macOS you always open the URL yourself.
+`novacode login` always prints the URL, so you can open it on another machine (in `/login`, `Ctrl+X` copies it).
 
 | Provider | What to do |
 |---|---|
 | `codex`, `copilot` | You get a short code and a URL. Open the URL on any device, enter the code and approve. It works over SSH. |
-| `claude` | Open the URL anywhere, sign in, then paste the code you're shown into the terminal. |
+| `claude` | Pick **Copy a code** (`--method code`), open the URL anywhere, sign in, then paste the code you're shown. With **Browser**, paste the `localhost` address the browser fails to load instead, or forward port 53692. |
+| `codex` (browser) | Same as antigravity below; or pick **Device code** (`--method device`). |
 | `antigravity` | Open the URL anywhere. When the browser ends on a `localhost` page that fails to load, copy that full address and paste it into the terminal. |
 | API-key providers (`openrouter`, `openai`, …) | `novacode login <provider>` asks for the key. You can pipe it: `echo "$KEY" \| novacode login openrouter`. novacode first checks the key with a model-list call. If the check fails it asks "save it anyway? [y/N]"; with piped input it saves nothing. Or skip the login and set the provider's environment variable. |
 

@@ -639,7 +639,11 @@ pub async fn attach(
                 | Cmd::Focus(_)
                 | Cmd::Background
                 | Cmd::Processes
-                | Cmd::Dequeue(_) => continue,
+                | Cmd::Dequeue(_)
+                | Cmd::LoginList
+                | Cmd::Login { .. }
+                | Cmd::LoginInput(_)
+                | Cmd::LoginCancel => continue,
                 Cmd::Quit => break,
             };
             let id = matches!(cmd, ClientCmd::GetContext | ClientCmd::Export { .. }).then(|| "ui".to_string());

@@ -10,8 +10,8 @@ Four providers use your existing subscription instead of an API key:
 
 | Provider | Subscription | How you sign in |
 |---|---|---|
-| `claude` | Claude Pro / Max | Open a URL, copy the code shown, paste it into the terminal |
-| `codex` | ChatGPT (Codex) | Open a URL and enter a short code |
+| `claude` | Claude Pro / Max | Sign in in the browser; novacode catches the redirect. Or `--method code`: paste the code Claude shows |
+| `codex` | ChatGPT (Codex) | Sign in in the browser; novacode catches the redirect. Or `--method device`: enter a short code |
 | `antigravity` | Google (Antigravity) | Open a URL and sign in with Google |
 | `copilot` | GitHub Copilot | Open a URL and enter a short code |
 
@@ -19,11 +19,11 @@ Four providers use your existing subscription instead of an API key:
 novacode login claude
 ```
 
-novacode prints the URL (and tries to open your browser with `xdg-open`). Then it waits for you. You can also run `/login claude` inside a session. Logins are stored in `~/.novacode/auth.json` and tokens refresh by themselves.
+novacode prints the URL, opens your browser (`xdg-open`, or `open` on macOS) and waits. With no provider, `novacode login` lets you pick one from a list. For `claude` and `codex` it then asks how to sign in: **Browser** (the default) catches the redirect on `localhost` (port 53692 for Claude, any free port if that one is taken; port 1455 for Codex), so there is nothing to copy. The other method (`code` / `device`) is for SSH or another machine. Pass `--method browser|code|device` to skip the question. Logins are stored in `~/.novacode/auth.json` and tokens refresh by themselves.
 
 The first run picker (see [quickstart](quickstart.md)) starts these logins for you.
 
-Inside a session, `/login <provider>` hands the terminal to `novacode login`. It has no `--account` form, so add extra accounts from the command line. The models of these providers come from the matching catalog entry (`claude` from `anthropic`, `codex` from `openai`, `antigravity` from `google`, `copilot` from `github-copilot`). Copilot login also prints `enabled models: …` after it turns on the Copilot models for your account.
+Inside a session, `/login` opens a list of every provider (subscriptions first, each marked when connected), and `/login <provider>` goes straight to it. The login runs in a dialog: the URL with `Ctrl+X` to copy it and `Ctrl+O` to open it, a box to paste a code, redirect URL or API key, and `Esc` to cancel. After a login the session reloads to pick it up. `/login` has no `--account` form, so add extra accounts from the command line. The models of these providers come from the matching catalog entry (`claude` from `anthropic`, `codex` from `openai`, `antigravity` from `google`, `copilot` from `github-copilot`). Copilot login also prints `enabled models: …` after it turns on the Copilot models for your account.
 
 ### Logging in on a machine without a browser
 

@@ -9,6 +9,7 @@ pub mod editor;
 pub mod highlight;
 pub mod images;
 pub mod keys;
+pub mod login;
 pub mod markdown;
 pub mod panel;
 pub mod procs;
@@ -84,15 +85,6 @@ pub async fn run_in(
                 Ok(Some(s)) => app.editor.set_text(&s),
                 Ok(None) => {}
                 Err(e) => app.tr.notice(format!("$EDITOR failed: {e}"), true),
-            }
-            app.dirty = true;
-        }
-        if let Some(provider) = app.login.take() {
-            match term::login(t, &provider) {
-                // New credentials load on reload; the session carries on.
-                Ok(true) => break Ok(Exit::Reload),
-                Ok(false) => app.tr.notice(format!("login to {provider} didn't finish"), true),
-                Err(e) => app.tr.notice(format!("login failed to start: {e}"), true),
             }
             app.dirty = true;
         }

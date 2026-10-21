@@ -10,6 +10,7 @@ use novacode_base::paths::Paths;
 use novacode_core::session;
 use novacode_tui::app::{BranchAction, Cmd, UiEvent};
 use novacode_tui::dialog::PickItem;
+use novacode_tui::login::LoginStep;
 use novacode_types::ThinkingLevel;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -33,6 +34,8 @@ pub struct Host {
     pub extensions: Option<Arc<novacode_core::extensions::Extensions>>,
     pub modes: Option<Arc<novacode_core::modes::Modes>>,
     pub goals: Option<Arc<crate::goals::Goals>>,
+    /// The `/login` running now: where pasted text goes, and how to stop it.
+    pub login: Mutex<Option<(UnboundedSender<String>, tokio::task::AbortHandle)>>,
 }
 
 /// Mode commands (L10.7), handled here so they work in every window and over RPC.
@@ -58,6 +61,87 @@ pub const MODE_COMMANDS: &[(&str, &str)] = &[
 ];
 
 impl Host {
+    /// `/login <provider>`: offer the methods when there are several, else run it
+    /// in the background, reporting each step to the dialog.
+    fn login(self: &Arc<Self>, provider: String, method: Option<String>, ui: &UnboundedSender<UiEvent>) {
+        let Some(pr) = self.providers.profiles.get(&provider).cloned() else {
+            let _ = ui.send(UiEvent::LoginDone {
+                result: Err(format!("unknown provider `{provider}`")),
+            });
+            return;
+        };
+        let methods = crate::login::methods(&provider);
+        if method.is_none() && methods.len() > 1 {
+            let items = methods
+                .iter()
+                .map(|(v, l, d)| PickItem {
+                    label: l.to_string(),
+                    detail: d.to_string(),
+                    value: v.to_string(),
+                })
+                .collect();
+            let _ = ui.send(UiEvent::LoginMethods { provider, items });
+            return;
+        }
+        let (tx, input) = tokio::sync::mpsc::unbounded_channel();
+        let (me, ui) = (self.clone(), ui.clone());
+        let step = {
+            let (ui, provider) = (ui.clone(), provider.clone());
+            move |step| {
+                let _ = ui.send(UiEvent::LoginStep {
+                    provider: provider.clone(),
+                    step,
+                });
+            }
+        };
+        let task = tokio::spawn(async move {
+            let mut io = crate::login::Io {
+                step: Box::new(step),
+                input,
+            };
+            let result = if pr.oauth() {
+                let method = method.unwrap_or_default();
+                crate::login::oauth(
+                    &me.providers.auth,
+                    &provider,
+                    novacode_ai::auth::DEFAULT_ACCOUNT,
+                    &method,
+                    &mut io,
+                )
+                .await
+                .map(|lines| lines.join("; "))
+                .map_err(|e| format!("{e:#}"))
+            } else {
+                (io.step)(LoginStep::Key {
+                    note: crate::login::key_note(&pr),
+                });
+                // A key that fails its check isn't saved; paste another or Esc.
+                loop {
+                    let Some(key) = io.input.recv().await else { return };
+                    match crate::login::check_key(me.paths.home(), &me.providers.profiles, &provider, &key).await {
+                        Ok(n) => {
+                            break me
+                                .providers
+                                .auth
+                                .put_key(&provider, &key)
+                                .await
+                                .map(|_| format!("{provider} key works ({n} models); saved in auth.json"))
+                                .map_err(|e| e.to_string());
+                        }
+                        Err(e) => (io.step)(LoginStep::Info {
+                            text: format!("key check failed: {e}. Paste another key, or Esc."),
+                        }),
+                    }
+                }
+            };
+            me.login.lock().unwrap().take();
+            let _ = ui.send(UiEvent::LoginDone { result });
+        });
+        if let Some((_, old)) = self.login.lock().unwrap().replace((tx, task.abort_handle())) {
+            old.abort();
+        }
+    }
+
     /// Do `c` for a window; replies go to `ui`. `local` = the session's own TUI.
     pub async fn handle(self: &Arc<Self>, c: Cmd, ui: &UnboundedSender<UiEvent>, local: bool) {
         let h = &self.hub.handle;
@@ -266,6 +350,22 @@ impl Host {
                 });
             }
             Cmd::Compact => h.compact(),
+            Cmd::LoginList => {
+                let _ = ui.send(UiEvent::LoginList {
+                    items: crate::login::providers(&self.providers),
+                });
+            }
+            Cmd::Login { provider, method } => self.login(provider, method, ui),
+            Cmd::LoginInput(s) => {
+                if let Some((tx, _)) = &*self.login.lock().unwrap() {
+                    let _ = tx.send(s);
+                }
+            }
+            Cmd::LoginCancel => {
+                if let Some((_, task)) = self.login.lock().unwrap().take() {
+                    task.abort();
+                }
+            }
             Cmd::Docs => {
                 h.remind_as("docs", crate::docs::brief(&self.paths, &self.cwd), false);
                 let text = format!(

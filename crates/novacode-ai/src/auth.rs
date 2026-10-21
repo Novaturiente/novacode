@@ -325,7 +325,7 @@ pub fn resolve_key(value: &str) -> Result<String, AuthError> {
     Ok(v.to_string())
 }
 
-/// Claude Pro/Max OAuth (manual-paste flow; works over SSH).
+/// Claude Pro/Max OAuth: a loopback redirect (browser login) or the copy-code page (works over SSH).
 pub mod claude {
     use super::*;
 
@@ -333,17 +333,20 @@ pub mod claude {
     const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
     const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
     const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
-    const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
+    /// The page that shows a `code#state` to paste back.
+    pub const COPY_REDIRECT: &str = "https://platform.claude.com/oauth/code/callback";
+    /// Preferred loopback port (pi's), so it can be forwarded; any free port works too.
+    pub const PORT: u16 = 53692;
     const SCOPES: &str =
         "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
-    /// URL to open; the page shows a `code#state` string to paste back.
-    pub fn authorize_url(verifier: &str, challenge: &str) -> String {
+    /// URL to open; `redirect` is [`COPY_REDIRECT`] or `http://localhost:<port>/callback`.
+    pub fn authorize_url(verifier: &str, challenge: &str, redirect: &str) -> String {
         let q = [
             ("code", "true"),
             ("client_id", CLIENT_ID),
             ("response_type", "code"),
-            ("redirect_uri", REDIRECT_URI),
+            ("redirect_uri", redirect),
             ("scope", SCOPES),
             ("code_challenge", challenge),
             ("code_challenge_method", "S256"),
@@ -380,7 +383,7 @@ pub mod claude {
         }
     }
 
-    pub async fn exchange(pasted: &str, verifier: &str) -> Result<OAuthCredential, AuthError> {
+    pub async fn exchange(pasted: &str, verifier: &str, redirect: &str) -> Result<OAuthCredential, AuthError> {
         let (code, state) = parse_pasted(pasted);
         if state.as_deref().is_some_and(|s| s != verifier) {
             return Err(AuthError::Http("OAuth state mismatch; start the login again".into()));
@@ -393,7 +396,7 @@ pub mod claude {
             "client_id": CLIENT_ID,
             "code": code,
             "state": state.as_deref().unwrap_or(verifier),
-            "redirect_uri": REDIRECT_URI,
+            "redirect_uri": redirect,
             "code_verifier": verifier,
         }))
         .await
@@ -433,7 +436,8 @@ pub mod claude {
     }
 }
 
-/// ChatGPT Plus/Pro (Codex) OAuth: device-code login (works over SSH), refresh,
+/// ChatGPT Plus/Pro (Codex) OAuth: browser login with a loopback redirect, or a
+/// device code (works over SSH); refresh,
 /// and the account id from the token (L2.13).
 pub mod codex {
     use super::*;
@@ -443,6 +447,38 @@ pub mod codex {
     const AUTH: &str = "https://auth.openai.com";
     const DEVICE_REDIRECT: &str = "https://auth.openai.com/deviceauth/callback";
     pub const VERIFY_URL: &str = "https://auth.openai.com/codex/device";
+    /// Shared with the Codex CLI; the client only accepts this redirect.
+    pub const PORT: u16 = 1455;
+    const REDIRECT: &str = "http://localhost:1455/auth/callback";
+
+    pub fn authorize_url(challenge: &str, state: &str) -> String {
+        let q = [
+            ("response_type", "code"),
+            ("client_id", CLIENT_ID),
+            ("redirect_uri", REDIRECT),
+            ("scope", "openid profile email offline_access"),
+            ("code_challenge", challenge),
+            ("code_challenge_method", "S256"),
+            ("state", state),
+            ("id_token_add_organizations", "true"),
+            ("codex_cli_simplified_flow", "true"),
+            ("originator", "novacode"),
+        ];
+        let qs: Vec<String> = q.iter().map(|(k, v)| format!("{k}={}", claude::encode(v))).collect();
+        format!("{AUTH}/oauth/authorize?{}", qs.join("&"))
+    }
+
+    /// Browser login: trade the redirect's code for tokens.
+    pub async fn exchange(code: &str, verifier: &str) -> Result<OAuthCredential, AuthError> {
+        token(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", CLIENT_ID),
+            ("code", code),
+            ("code_verifier", verifier),
+            ("redirect_uri", REDIRECT),
+        ])
+        .await
+    }
 
     pub struct Device {
         id: String,
@@ -910,7 +946,10 @@ mod tests {
             ("abc".into(), Some("xyz".into()))
         );
         assert_eq!(claude::parse_pasted("abc"), ("abc".into(), None));
-        assert!(claude::authorize_url(&v, &c).contains("scope=org%3Acreate_api_key%20user%3Aprofile"));
+        assert!(
+            claude::authorize_url(&v, &c, claude::COPY_REDIRECT)
+                .contains("scope=org%3Acreate_api_key%20user%3Aprofile")
+        );
     }
 
     #[test]

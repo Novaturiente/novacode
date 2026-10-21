@@ -83,7 +83,7 @@ Type `/` to see the slash commands. The ones you will use first:
 | `/thinking` | Pick a thinking level, or `/thinking <level>` |
 | `/resume` | Resume another session in this folder |
 | `/new` | Start a new session |
-| `/login <provider>` | Log in without leaving novacode |
+| `/login [provider]` | Log in without leaving novacode (no provider = pick from a list) |
 | `/keys` | Show key bindings |
 | `/quit` | Quit |
 

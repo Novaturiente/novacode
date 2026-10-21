@@ -5,6 +5,7 @@
 use crate::dialog::{self, Answer, ApprovalCard, ApproveReq, Pager, PickItem, Picked, Picker};
 use crate::editor::{Action, Editor};
 use crate::keys::{A, Keymap, Scope};
+use crate::login::LoginKey;
 use crate::theme::Theme;
 use crate::transcript::{Thinking, Transcript, View};
 use crate::wrap;
@@ -56,7 +57,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/login",
-        "log in: /login <provider> (claude, codex, antigravity, copilot, or an API-key provider)",
+        "log in: pick a provider, or /login <provider> (claude, codex, antigravity, copilot, or an API-key one)",
     ),
     ("/ps", "processes in the process manager, with their latest output"),
     ("/mcp", "MCP servers: status and tool counts"),
@@ -152,6 +153,16 @@ pub enum Cmd {
     /// Alt+Up: take back the newest queued message; `true` = a steer. The host
     /// answers with [`UiEvent::Dequeued`].
     Dequeue(bool),
+    /// `/login` with no provider: the host answers with [`UiEvent::LoginList`].
+    LoginList,
+    /// Start a login; no method = the host offers the methods when there are several.
+    Login {
+        provider: String,
+        method: Option<String>,
+    },
+    /// A pasted code, redirect URL or API key for the running login.
+    LoginInput(String),
+    LoginCancel,
     /// A key or panel action for an extension (L9 UI API).
     ExtKey {
         ext: String,
@@ -209,6 +220,21 @@ pub enum UiEvent {
     /// Answer to [`Cmd::Dequeue`]: `false` = it already reached the model.
     Dequeued {
         ok: bool,
+    },
+    LoginList {
+        items: Vec<PickItem>,
+    },
+    LoginMethods {
+        provider: String,
+        items: Vec<PickItem>,
+    },
+    LoginStep {
+        provider: String,
+        step: crate::login::LoginStep,
+    },
+    /// The login finished: a note to show, or why it failed.
+    LoginDone {
+        result: Result<String, String>,
     },
     /// The level actually used (clamped to what the model supports), and a note.
     Thinking {
@@ -303,6 +329,11 @@ enum Overlay {
     /// After a prompt is picked in `/rewind`: what to restore.
     RewindMode(String, Picker),
     Pager(Pager),
+    /// `/login` with no provider: every provider you can log in to.
+    LoginPick(Picker),
+    /// How to log in to this provider (browser or a code).
+    LoginMethod(String, Picker),
+    Login(crate::login::LoginView),
 }
 
 pub struct App {
@@ -344,8 +375,6 @@ pub struct App {
     pub suspend: bool,
     /// Open `$EDITOR` on the prompt (needs the terminal, so the loop does it).
     pub external_editor: bool,
-    /// `/login <provider>`: the run loop hands the terminal to `novacode login`.
-    pub login: Option<String>,
     pub panel: crate::panel::Panel,
     /// Extension status segments `ext:<ext>:<key>` → (text, style).
     ext_status: std::collections::BTreeMap<String, (String, Option<String>)>,
@@ -457,7 +486,6 @@ impl App {
             exit: None,
             suspend: false,
             external_editor: false,
-            login: None,
             panel,
             ext_status: Default::default(),
             widgets: Default::default(),
@@ -528,6 +556,29 @@ impl App {
                         .set_text(&if draft.is_empty() { t } else { format!("{t}\n{draft}") });
                 }
             }
+            UiEvent::LoginList { items } => self.overlay = Some(Overlay::LoginPick(Picker::new("Log in to", items))),
+            UiEvent::LoginMethods { provider, items } => {
+                let title = format!("Log in to {provider}");
+                self.overlay = Some(Overlay::LoginMethod(provider, Picker::new(title, items)));
+            }
+            UiEvent::LoginStep { provider, step } => match &mut self.overlay {
+                Some(Overlay::Login(v)) if v.provider == provider => v.step(step),
+                _ => {
+                    let mut v = crate::login::LoginView::new(&provider);
+                    v.step(step);
+                    self.overlay = Some(Overlay::Login(v));
+                }
+            },
+            UiEvent::LoginDone { result: Ok(note) } => {
+                self.overlay = None;
+                self.tr.notice(note, false);
+                // New credentials load on reload; the session carries on.
+                self.exit = Some(Exit::Reload);
+            }
+            UiEvent::LoginDone { result: Err(e) } => match &mut self.overlay {
+                Some(Overlay::Login(v)) => v.failed(e),
+                _ => self.tr.notice(format!("login failed: {e}"), true),
+            },
             UiEvent::Dequeued { ok: false } => self.flash("too late: it already reached the model"),
             UiEvent::Procs { items } => {
                 if items.is_empty() && self.panel.procs_shown() {
@@ -822,6 +873,11 @@ impl App {
         self.dirty = true;
         match ev {
             Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
+            Event::Paste(s) if matches!(self.overlay, Some(Overlay::Login(_))) => {
+                if let Some(Overlay::Login(v)) = &mut self.overlay {
+                    v.paste(&s);
+                }
+            }
             Event::Paste(s) if self.approvals.is_empty() && self.asks.is_empty() && self.overlay.is_none() => {
                 self.editor.paste(&s)
             }
@@ -891,11 +947,26 @@ impl App {
                         self.overlay = None;
                     }
                 }
+                Overlay::Login(v) => {
+                    let copy = self.keymap.lookup(&k, &[Scope::App]) == Some(A::MessageCopy);
+                    match v.handle(k, copy) {
+                        LoginKey::None => {}
+                        LoginKey::Copy(u) => crate::term::copy(&u),
+                        LoginKey::Open(u) => crate::term::open(&u),
+                        LoginKey::Submit(s) => self.send(Cmd::LoginInput(s)),
+                        LoginKey::Close => {
+                            self.overlay = None;
+                            self.send(Cmd::LoginCancel);
+                        }
+                    }
+                }
                 Overlay::Models(p)
                 | Overlay::Sessions(p)
                 | Overlay::Thinking(p)
                 | Overlay::Branch(_, p)
-                | Overlay::RewindMode(_, p) => match p.handle(k, &self.keymap) {
+                | Overlay::RewindMode(_, p)
+                | Overlay::LoginPick(p)
+                | Overlay::LoginMethod(_, p) => match p.handle(k, &self.keymap) {
                     Picked::Pending => {}
                     Picked::Cancel => self.overlay = None,
                     Picked::Value(v) => {
@@ -903,6 +974,14 @@ impl App {
                         match o {
                             Some(Overlay::Models(_)) => self.set_model(&v),
                             Some(Overlay::Thinking(_)) => self.set_thinking(&v),
+                            Some(Overlay::LoginPick(_)) => self.send(Cmd::Login {
+                                provider: v,
+                                method: None,
+                            }),
+                            Some(Overlay::LoginMethod(provider, _)) => self.send(Cmd::Login {
+                                provider,
+                                method: Some(v),
+                            }),
                             Some(Overlay::Branch(BranchAction::Rewind, _)) if v == "undo" => {
                                 self.exit = Some(Exit::Rewind {
                                     at: v,
@@ -1330,8 +1409,11 @@ impl App {
                 "/name" if !arg.is_empty() => self.send(Cmd::Rename(arg.to_string())),
                 "/name" => self.flash("usage: /name <text>"),
                 "/worktree" => self.send(Cmd::Worktree(arg.to_string())),
-                "/login" if !arg.is_empty() => self.login = Some(arg.to_string()),
-                "/login" => self.flash("usage: /login <provider>, e.g. /login claude"),
+                "/login" if !arg.is_empty() => self.send(Cmd::Login {
+                    provider: arg.to_string(),
+                    method: None,
+                }),
+                "/login" => self.send(Cmd::LoginList),
                 "/context" => self.send(Cmd::Context),
                 "/docs" => {
                     self.send(Cmd::Docs);
@@ -1672,8 +1754,19 @@ impl App {
                 | Overlay::Sessions(p)
                 | Overlay::Thinking(p)
                 | Overlay::Branch(_, p)
-                | Overlay::RewindMode(_, p),
+                | Overlay::RewindMode(_, p)
+                | Overlay::LoginPick(p)
+                | Overlay::LoginMethod(_, p),
             ) => p.render(f, dialog::centered(main, 70, 70, 20), t),
+            Some(Overlay::Login(v)) => {
+                let w = (main.width * 80 / 100).max(20);
+                v.render(
+                    f,
+                    dialog::centered(main, 80, 90, v.height(w)),
+                    t,
+                    &self.keymap.keys(A::MessageCopy),
+                )
+            }
             Some(Overlay::Pager(p)) => p.render(f, dialog::centered(main, 90, 90, main.height), t),
             None => {}
         }

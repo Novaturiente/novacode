@@ -140,7 +140,7 @@ novacode follows pi in several places on purpose.
 |---|---|
 | `AGENTS.md`, `AGENTS.override.md` | Both are read in every folder up the tree. `AGENTS.override.md` wins over `AGENTS.md` in the same folder. |
 | `~/.codex/AGENTS.md` | Not read. Copy it to `~/.novacode/AGENTS.md`. |
-| `codex login` (ChatGPT sign-in) | `novacode login codex`. It uses a device code that works over SSH. This is a separate login; novacode doesn't read Codex's own credentials. Use models like `codex/gpt-5.5:high`. |
+| `codex login` (ChatGPT sign-in) | `novacode login codex`. It signs in through the browser; `--method device` gives a code that works over SSH. This is a separate login; novacode doesn't read Codex's own credentials. Use models like `codex/gpt-5.5:high`. |
 | `codex exec "…"` | `novacode -p "…"` (see [automation](automation.md)) |
 | `~/.agents/skills` | Scanned for skills. |
 | MCP servers in `config.toml` | Add them again: `novacode mcp add name -- command args…` (see [mcp](mcp.md)). |

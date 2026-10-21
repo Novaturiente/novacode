@@ -3,7 +3,7 @@
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use novacode_ai::adapter::CacheRetention;
-use novacode_ai::auth::{self, AuthStore, DEFAULT_ACCOUNT, antigravity, claude, codex, copilot};
+use novacode_ai::auth::{AuthStore, DEFAULT_ACCOUNT};
 use novacode_ai::connect::Providers;
 use novacode_ai::trace::Trace;
 use novacode_base::redact::Redactor;
@@ -34,6 +34,7 @@ mod goals;
 mod host;
 mod hub;
 mod import;
+mod login;
 mod models;
 mod schedule;
 mod serve;
@@ -143,11 +144,14 @@ enum Command {
     /// API key for any other provider (openrouter, openai, google, …).
     /// Several subscription accounts (--account work) rotate when one runs out.
     Login {
-        /// claude, codex, antigravity, copilot, or an API-key provider (openrouter, openai, …)
-        provider: String,
+        /// claude, codex, antigravity, copilot, or an API-key provider (openrouter, openai, …); none = pick from a list
+        provider: Option<String>,
         /// Account name, for several logins to one subscription (they rotate when one runs out)
         #[arg(long, default_value = DEFAULT_ACCOUNT)]
         account: String,
+        /// How to sign in: `browser` (catch the redirect, the default) or `code` (claude) / `device` (codex)
+        #[arg(long)]
+        method: Option<String>,
     },
     /// Remove a stored login (one account with --account, else all of them).
     Logout {
@@ -467,12 +471,8 @@ async fn mcp_command(paths: &Paths, what: McpCmd) -> anyhow::Result<ExitCode> {
                 "Open this URL and approve novacode:\n\n{}\n\nnovacode catches the redirect on {redirect}. On another machine, paste the URL the browser ends on:",
                 pending.url
             );
-            let _ = std::process::Command::new("xdg-open")
-                .arg(&pending.url)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-            let (code, state) = catch_or_paste(Some(listener)).await?;
+            login::open_browser(&pending.url);
+            let (code, state) = login::catch_or_input(Some(listener), &mut login::stdin_lines()).await?;
             if state.as_deref() != Some(pending.state.as_str()) {
                 bail!("OAuth state mismatch; start the login again");
             }
@@ -513,18 +513,28 @@ fn fail(e: anyhow::Error) -> ExitCode {
 async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     let auth_store = AuthStore::new(paths.home().join("auth.json"));
     match cli.command {
-        Some(Command::Login { provider, account }) => {
+        Some(Command::Login {
+            provider,
+            account,
+            method,
+        }) => {
             let cwd = std::env::current_dir()?;
             let trusted = trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &cwd, false);
             let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
             let p = Providers::load(paths.home(), &settings);
+            let provider = match provider {
+                Some(p) => p,
+                None => {
+                    novacode_tui::prompt::select("Log in to", &[], login::providers(&p))?.context("login cancelled")?
+                }
+            };
             if p.profiles.get(&provider).is_some_and(|pr| !pr.oauth()) {
                 if account != DEFAULT_ACCOUNT {
                     bail!("API keys don't rotate, so there is one per provider (no --account)");
                 }
-                return key_login(p, &provider).await;
+                return key_login(p, &provider, paths.home()).await;
             }
-            return login(&auth_store, &provider, &account).await;
+            return login(&auth_store, &provider, &account, method.as_deref()).await;
         }
         Some(Command::Logout { provider, account }) => {
             let had = auth_store.remove(&provider, account.as_deref()).await?;
@@ -1815,6 +1825,7 @@ async fn start_session(
         inputs: ctx.inputs(),
         undo: undo.clone(),
         providers: ctx.providers.clone(),
+        login: Default::default(),
         limits: models::Limits::new(&ctx.settings),
         trace: ctx.trace(),
         processes,
@@ -2663,7 +2674,15 @@ async fn onboard(paths: &Paths, p: &Arc<Providers>) -> anyhow::Result<String> {
         .context("setup cancelled; run novacode again, or pass -m provider/model")?;
     let pr = p.profile(&provider)?;
     if pr.oauth() && !p.connected(pr) {
-        login(&p.auth, &provider, DEFAULT_ACCOUNT).await?;
+        // A child process: its stdin reader ends with it, so none is left to steal the TUI's keys.
+        let exe = std::env::current_exe()?;
+        if !std::process::Command::new(exe)
+            .args(["login", &provider])
+            .status()?
+            .success()
+        {
+            bail!("login to {provider} didn't finish");
+        }
     }
     let (adapter, _) = p.adapter(&provider, None).await?;
     let ids = adapter
@@ -2701,29 +2720,15 @@ fn git_branch(cwd: &Path) -> Option<String> {
 
 /// `novacode login <api-key provider>`: read the key without echo, check it with a
 /// free model-list call (jcode validates at login), save it in auth.json (pi).
-async fn key_login(mut p: Providers, provider: &str) -> anyhow::Result<ExitCode> {
-    let pr = &p.profiles[provider];
-    let env = pr.env.first().cloned().unwrap_or_default();
-    eprintln!("Paste your {provider} API key (or $VAR / !command to read it on each use).");
-    if !env.is_empty() {
-        eprintln!("Without a saved key novacode reads {env}.");
-    }
+async fn key_login(p: Providers, provider: &str, home: &Path) -> anyhow::Result<ExitCode> {
+    eprintln!("{}", login::key_note(&p.profiles[provider]));
     let key = read_secret("key: ")?;
     if key.is_empty() {
         bail!("no key entered; nothing saved");
     }
-    p.cli_key = Some((provider.into(), key.clone()));
-    let p = Arc::new(p);
-    let check = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        match p.adapter(provider, None).await {
-            Ok((a, _)) => a.list_models().await,
-            Err(e) => Err(e.to_string()),
-        }
-    })
-    .await
-    .unwrap_or_else(|_| Err("no answer in 30s".into()));
+    let check = login::check_key(home, &p.profiles, provider, &key).await;
     match check {
-        Ok(ids) => eprintln!("key works: {} models", ids.len()),
+        Ok(n) => eprintln!("key works: {n} models"),
         Err(e) => {
             eprintln!("key check failed: {e}");
             if !std::io::stdin().is_terminal() {
@@ -2763,154 +2768,36 @@ fn read_secret(prompt: &str) -> anyhow::Result<String> {
     Ok(line.trim().to_string())
 }
 
-async fn login(store: &AuthStore, provider: &str, account: &str) -> anyhow::Result<ExitCode> {
-    // Default browser via xdg-open; the URL is always printed too, for headless or another browser.
-    let open = |url: &str| {
-        let _ = std::process::Command::new("xdg-open")
-            .arg(url)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    };
-    let cred = match provider {
-        claude::PROVIDER => {
-            let (verifier, challenge) = auth::pkce();
-            let url = claude::authorize_url(&verifier, &challenge);
-            eprintln!("Open this URL, sign in, then paste the code shown:\n\n{url}\n");
-            open(&url);
-            eprint!("code: ");
-            let mut line = String::new();
-            std::io::stdin().read_line(&mut line)?;
-            claude::exchange(&line, &verifier).await?
-        }
-        codex::PROVIDER => {
-            let d = codex::start().await?;
-            eprintln!(
-                "Open {} and enter the code\n\n    {}\n\nWaiting for you to approve (Ctrl+C to cancel)…",
-                codex::VERIFY_URL,
-                d.user_code
-            );
-            open(codex::VERIFY_URL);
-            codex::finish(&d).await?
-        }
-        antigravity::PROVIDER => {
-            let (verifier, challenge) = auth::pkce();
-            let state = auth::pkce().0;
-            let url = antigravity::authorize_url(&challenge, &state);
-            eprintln!(
-                "Open this URL and sign in with Google:\n\n{url}\n\nnovacode catches the redirect on localhost:{}. On another machine, paste the URL the browser ends on:",
-                antigravity::PORT
-            );
-            open(&url);
-            let (code, got_state) = loopback_or_paste(antigravity::PORT).await?;
-            if got_state.as_deref() != Some(state.as_str()) {
-                bail!("OAuth state mismatch; start the login again");
-            }
-            antigravity::exchange(&code, &verifier).await?
-        }
-        copilot::PROVIDER => {
-            let d = copilot::start().await?;
-            eprintln!(
-                "Open {} and enter the code\n\n    {}\n\nWaiting for you to approve (Ctrl+C to cancel)…",
-                copilot::VERIFY_URL,
-                d.user_code
-            );
-            open(copilot::VERIFY_URL);
-            let c = copilot::finish(&d).await?;
-            let on = copilot::enable_models(&c.access).await;
-            if !on.is_empty() {
-                eprintln!("enabled models: {}", on.join(", "));
-            }
-            c
-        }
-        _ => bail!(
-            "unknown provider `{provider}` (subscriptions: claude, codex, antigravity, copilot; API keys: see `novacode models --all`)"
+/// `novacode login [provider]`: no provider = pick one; several methods = pick one too.
+async fn login(store: &AuthStore, provider: &str, account: &str, method: Option<&str>) -> anyhow::Result<ExitCode> {
+    let methods = login::methods(provider);
+    let method = match method {
+        Some(m) if methods.is_empty() || methods.iter().any(|(v, ..)| *v == m) => m.to_string(),
+        Some(m) => bail!(
+            "`{provider}` has no `{m}` login; use {}",
+            methods.iter().map(|(v, ..)| *v).collect::<Vec<_>>().join(" or ")
         ),
+        None if methods.len() > 1 && std::io::stdin().is_terminal() => {
+            let items = methods
+                .iter()
+                .map(|(v, l, d)| PickItem {
+                    label: l.to_string(),
+                    detail: d.to_string(),
+                    value: v.to_string(),
+                })
+                .collect();
+            novacode_tui::prompt::select(&format!("Log in to {provider}"), &[], items)?.context("login cancelled")?
+        }
+        None => methods.first().map_or("", |(v, ..)| v).to_string(),
     };
-    store.put(provider, account, cred).await?;
-    if account == DEFAULT_ACCOUNT {
-        eprintln!("logged in to {provider}");
-    } else {
-        eprintln!("logged in to {provider} (account `{account}`)");
+    let mut io = login::Io {
+        step: Box::new(login::print_step),
+        input: login::stdin_lines(),
+    };
+    for line in login::oauth(store, provider, account, &method, &mut io).await? {
+        eprintln!("{line}");
     }
     Ok(ExitCode::SUCCESS)
-}
-
-/// Wait for an OAuth redirect on `127.0.0.1:port`, or a pasted redirect URL on stdin,
-/// whichever comes first. Returns (code, state).
-async fn loopback_or_paste(port: u16) -> anyhow::Result<(String, Option<String>)> {
-    catch_or_paste(tokio::net::TcpListener::bind(("127.0.0.1", port)).await.ok()).await
-}
-
-async fn catch_or_paste(listener: Option<tokio::net::TcpListener>) -> anyhow::Result<(String, Option<String>)> {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-    let caught = async {
-        let Some(l) = listener else {
-            return std::future::pending().await;
-        };
-        loop {
-            let Ok((mut sock, _)) = l.accept().await else { continue };
-            let mut buf = vec![0u8; 8192];
-            let n = sock.read(&mut buf).await.unwrap_or(0);
-            let req = String::from_utf8_lossy(&buf[..n]).to_string();
-            let target = req.split_whitespace().nth(1).unwrap_or_default().to_string();
-            if !target.contains("code=") {
-                let _ = sock
-                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
-                    .await;
-                continue;
-            }
-            let page = "<html><body><h3>novacode is logged in. You can close this tab.</h3></body></html>";
-            let reply = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
-                page.len()
-            );
-            let _ = sock.write_all(reply.as_bytes()).await;
-            return target;
-        }
-    };
-    let pasted = async {
-        let mut line = String::new();
-        let _ = BufReader::new(tokio::io::stdin()).read_line(&mut line).await;
-        line
-    };
-    let got = tokio::select! {
-        t = caught => t,
-        l = pasted => l,
-    };
-    let (code, state) = claude::parse_pasted(&got);
-    if code.is_empty() {
-        bail!("no authorization code received");
-    }
-    Ok((percent_decode(&code), state.map(|s| percent_decode(&s))))
-}
-
-/// `4%2F0Ab` → `4/0Ab` (query values in a redirect URL).
-fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        match (
-            b[i],
-            b.get(i + 1..i + 3)
-                .and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()),
-        ) {
-            (b'%', Some(v)) => {
-                out.push(v);
-                i += 3;
-            }
-            (b'+', _) => {
-                out.push(b' ');
-                i += 1;
-            }
-            (c, _) => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -2920,11 +2807,5 @@ mod tests {
         let p = |s: &str| super::live_path(s.into());
         assert_eq!(p("/x/novacode (deleted)"), std::path::PathBuf::from("/x/novacode"));
         assert_eq!(p("/x/novacode"), std::path::PathBuf::from("/x/novacode"));
-    }
-
-    #[test]
-    fn percent_decoding() {
-        assert_eq!(super::percent_decode("4%2F0Ab-x%3D"), "4/0Ab-x=");
-        assert_eq!(super::percent_decode("plain%zz"), "plain%zz");
     }
 }
