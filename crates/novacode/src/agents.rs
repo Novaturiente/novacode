@@ -476,14 +476,21 @@ struct Child {
 pub struct Supervisor {
     children: Mutex<Vec<Child>>,
     changed: Notify,
-    /// The parent session: its windows answer the children's questions.
-    slot: HubSlot,
     place: Place,
     me: String,
     home: PathBuf,
+    exe: PathBuf,
+    waiting: Mutex<usize>,
+    /// What `/reload` may change; running children stay (`reconfigure`).
+    cfg: std::sync::RwLock<Arc<Cfg>>,
+}
+
+#[derive(Clone)]
+struct Cfg {
+    /// The parent session: its windows answer the children's questions.
+    slot: HubSlot,
     cwd: PathBuf,
     trusted: bool,
-    exe: PathBuf,
     stall: Duration,
     timeout: Duration,
     defs: Vec<Def>,
@@ -492,13 +499,31 @@ pub struct Supervisor {
     /// MCP servers this session may hand on.
     servers: Vec<String>,
     /// This session's own tool names (MCP ones aside): a child never gets more.
-    own: std::sync::OnceLock<Vec<String>>,
+    own: Option<Vec<String>>,
     small_model: Option<String>,
-    waiting: Mutex<usize>,
     /// Nerd Font glyphs in the panel rows (`ui.icons`).
     nerd: bool,
     /// Print mode: nobody reads notices, so every report wakes the parent.
     unattended: bool,
+}
+
+impl Cfg {
+    fn of(s: Setup) -> Self {
+        Cfg {
+            slot: s.slot,
+            defs: s.defs,
+            parent_picks: s.parent_picks,
+            servers: s.servers,
+            own: None,
+            cwd: s.cwd,
+            trusted: s.trusted,
+            stall: Duration::from_secs(s.stall_min * 60),
+            timeout: Duration::from_secs(s.timeout_min * 60),
+            small_model: s.small_model,
+            nerd: s.nerd,
+            unattended: s.unattended,
+        }
+    }
 }
 
 pub struct Setup {
@@ -525,25 +550,15 @@ impl Supervisor {
         let sup = Arc::new(Supervisor {
             children: Mutex::default(),
             changed: Notify::new(),
-            slot: s.slot,
             place: Place::from_env(),
-            me: s.me,
-            defs: s.defs,
-            parent_picks: s.parent_picks,
-            servers: s.servers,
-            own: std::sync::OnceLock::new(),
-            home: s.home,
-            cwd: s.cwd,
-            trusted: s.trusted,
+            me: s.me.clone(),
+            home: s.home.clone(),
             exe: s
                 .exe
+                .clone()
                 .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| "novacode".into())),
-            stall: Duration::from_secs(s.stall_min * 60),
-            timeout: Duration::from_secs(s.timeout_min * 60),
-            small_model: s.small_model,
             waiting: Mutex::new(0),
-            nerd: s.nerd,
-            unattended: s.unattended,
+            cfg: std::sync::RwLock::new(Arc::new(Cfg::of(s))),
         });
         // Stall and timeout watchdog (L10.1: 10 min without activity, 45 min in all).
         let weak = Arc::downgrade(&sup);
@@ -551,12 +566,13 @@ impl Supervisor {
             loop {
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 let Some(s) = weak.upgrade() else { break };
+                let cfg = s.c();
                 let mut stop = Vec::new();
                 for c in s.children.lock().unwrap().iter() {
                     if matches!(c.status, Status::Running | Status::Starting) {
-                        if c.last_activity.elapsed() > s.stall {
+                        if c.last_activity.elapsed() > cfg.stall {
                             stop.push((c.n.clone(), "stalled: no activity"));
-                        } else if c.started.is_some_and(|t| t.elapsed() > s.timeout) {
+                        } else if c.started.is_some_and(|t| t.elapsed() > cfg.timeout) {
                             stop.push((c.n.clone(), "timed out"));
                         }
                     }
@@ -571,15 +587,32 @@ impl Supervisor {
 
     /// This session's tool names, once its tool list is built (children get no more).
     pub fn set_own_tools(&self, names: Vec<String>) {
-        let _ = self.own.set(names);
+        let mut g = self.cfg.write().unwrap();
+        let mut c = Cfg::clone(&g);
+        c.own = Some(names);
+        *g = Arc::new(c);
+    }
+
+    /// `/reload`: new settings, agent types and window; running children carry on.
+    pub fn reconfigure(&self, s: Setup) {
+        *self.cfg.write().unwrap() = Arc::new(Cfg::of(s));
+    }
+
+    fn c(&self) -> Arc<Cfg> {
+        self.cfg.read().unwrap().clone()
     }
 
     fn handle(&self) -> Option<novacode_core::agent::SessionHandle> {
-        self.slot.0.get().and_then(|w| w.upgrade()).map(|h| h.handle.clone())
+        self.c()
+            .slot
+            .0
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|h| h.handle.clone())
     }
 
     fn parent_model(&self) -> Option<String> {
-        self.slot.0.get().and_then(|w| w.upgrade()).map(|h| h.state().model)
+        self.c().slot.0.get().and_then(|w| w.upgrade()).map(|h| h.state().model)
     }
 
     /// Show a child in the Agent tab (L9.16 Subagents).
@@ -587,7 +620,7 @@ impl Supervisor {
         let Some(h) = self.handle() else { return };
         // Like the tmux swarm pane: type + id, then the title, then tokens and tool
         // calls; while it works, what it's doing.
-        let (bot, db, wrench) = if self.nerd {
+        let (bot, db, wrench) = if self.c().nerd {
             ("\u{f06a9} ", "\u{f01bc} ", "\u{f0ad} ")
         } else {
             ("", "", "tools ")
@@ -661,7 +694,7 @@ impl Supervisor {
                 mcp: None,
             })?
             .0;
-        self.wait(vec![id.clone()], false, self.timeout).await;
+        self.wait(vec![id.clone()], false, self.c().timeout).await;
         let g = self.children.lock().unwrap();
         let c = g.iter().find(|c| c.n == id).ok_or("the auditor vanished")?;
         match (c.status, &c.report) {
@@ -676,13 +709,14 @@ impl Supervisor {
             return Err(format!("subagents can't spawn below depth {MAX_DEPTH}"));
         }
         let agent = a.agent.unwrap_or_else(|| "worker".into());
-        let def = self.defs.iter().find(|d| d.name == agent).ok_or_else(|| {
-            let names: Vec<&str> = self.defs.iter().map(|d| d.name.as_str()).collect();
+        let cfg = self.c();
+        let def = cfg.defs.iter().find(|d| d.name == agent).ok_or_else(|| {
+            let names: Vec<&str> = cfg.defs.iter().map(|d| d.name.as_str()).collect();
             format!("no agent `{agent}`; known: {}", names.join(", "))
         })?;
         let parent = self.parent_model().unwrap_or_default();
         let mut model = match a.model.or(def.model.clone()).as_deref() {
-            Some("small") => self.small_model.clone().unwrap_or(parent),
+            Some("small") => cfg.small_model.clone().unwrap_or(parent),
             Some(m) => m.to_string(),
             None => parent,
         };
@@ -691,17 +725,10 @@ impl Supervisor {
         {
             model = format!("{model}:{t}");
         }
-        let (tools, mcp, notes) = grant(
-            def,
-            a.tools,
-            a.mcp,
-            self.parent_picks,
-            self.own.get().map(Vec::as_slice),
-            &self.servers,
-        );
+        let (tools, mcp, notes) = grant(def, a.tools, a.mcp, cfg.parent_picks, cfg.own.as_deref(), &cfg.servers);
         let mut cwd = match &a.cwd {
-            Some(c) => at(&self.cwd, c),
-            None => self.cwd.clone(),
+            Some(c) => at(&cfg.cwd, c),
+            None => cfg.cwd.clone(),
         };
         let mut g = self.children.lock().unwrap();
         let n = format!("a{}", g.len() + 1);
@@ -823,7 +850,7 @@ impl Supervisor {
             cmd.arg(format!("--tools={}", t.join(",")));
         }
         cmd.arg(format!("--mcp={}", mcp.join(",")));
-        if self.trusted {
+        if self.c().trusted {
             cmd.arg("--trust");
         }
         if let Some(s) = &session {
@@ -984,7 +1011,8 @@ impl Supervisor {
         }
         let (me, n) = (self.clone(), n.to_string());
         tokio::spawn(async move {
-            let replies = me.slot.ask(questions).await;
+            let slot = me.c().slot.clone();
+            let replies = slot.ask(questions).await;
             me.send_line(&n, json!({"type": "answer", "ask": id, "replies": replies}));
             me.with(&n, |c| c.status = Status::Running);
         });
@@ -1013,7 +1041,8 @@ impl Supervisor {
         };
         let (me, n) = (self.clone(), n.to_string());
         tokio::spawn(async move {
-            let answer = match me.slot.approve(req).await {
+            let slot = me.c().slot.clone();
+            let answer = match slot.approve(req).await {
                 Approval::Once => json!("once"),
                 Approval::Session => json!("session"),
                 Approval::Always => json!("always"),
@@ -1045,7 +1074,7 @@ impl Supervisor {
         }) else {
             return;
         };
-        let notify = if self.unattended { Notify_::Wake } else { notify };
+        let notify = if self.c().unattended { Notify_::Wake } else { notify };
         let head = format!("subagent {n} \"{title}\" {} after {}", status.word(), dur(secs * 1000));
         if let Some(h) = self.handle() {
             let first = report.lines().find(|l| !l.trim().is_empty()).unwrap_or_default();
@@ -1257,7 +1286,8 @@ pub struct AgentTool {
 
 impl AgentTool {
     pub fn new(sup: Arc<Supervisor>) -> Self {
-        let agents: Vec<String> = sup
+        let cfg = sup.c();
+        let agents: Vec<String> = cfg
             .defs
             .iter()
             .map(|d| {
@@ -1268,14 +1298,14 @@ impl AgentTool {
                 format!("- {} [{kit}]: {}", d.name, d.description)
             })
             .collect();
-        let (pick, tools) = if sup.parent_picks {
-            let mcp = if sup.servers.is_empty() {
+        let (pick, tools) = if cfg.parent_picks {
+            let mcp = if cfg.servers.is_empty() {
                 String::new()
             } else {
                 format!(
                     " MCP servers are off unless you grant them with `mcp` (it calls them through codemode; \
                      say in the task which server tool to use first): {}.",
-                    sup.servers.join(", ")
+                    cfg.servers.join(", ")
                 )
             };
             (

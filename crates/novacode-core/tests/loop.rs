@@ -1334,3 +1334,60 @@ async fn claude_plugin_hooks_in_a_session() {
     assert!(!first.contains("forbidden"));
     assert!(format!("{:?}", reqs[1].messages).contains("check the tests first"));
 }
+
+/// `/reload` (L9): the rebuilt agent keeps the old one's live state.
+#[tokio::test]
+async fn reload_carries_reads_mode_and_session_approvals() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(work.path().join("notes.txt"), "alpha\n").unwrap();
+    let paths = Paths::new(home.path());
+    let build = |faux: &Faux, store: Store| {
+        let policy = Arc::new(novacode_core::policy::Policy::new(
+            Default::default(),
+            home.path().into(),
+            None,
+        ));
+        let modes = novacode_core::modes::Modes::new(policy.clone(), Default::default());
+        Agent::new(
+            Arc::new(faux.clone()),
+            novacode_tools::builtins(false),
+            store,
+            cfg(work.path(), home.path()),
+            Arc::new(LocalEnv),
+        )
+        .with_shared_policy(policy)
+        .with_modes(modes)
+    };
+    let faux = Faux::new([
+        tools_reply(vec![call("c1", "read", json!({"path": "notes.txt"}))]),
+        FauxReply::text("read it"),
+    ]);
+    let agent = build(&faux, Store::create(&paths, work.path(), false));
+    let (agent, _) = drive(agent, &["read notes"]).await;
+    agent.modes().unwrap().set(Some("plan")).unwrap();
+    agent
+        .policy()
+        .allow_for_session(vec![novacode_core::policy::Rule::parse("Bash(make test:*)").unwrap()]);
+    let carry = agent.carry();
+    assert_eq!(carry.cwd, work.path());
+
+    // Someone changes the file after the read: the reloaded agent still knows and says so.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(work.path().join("notes.txt"), "alpha\n").unwrap();
+    let faux2 = Faux::new([
+        tools_reply(vec![call(
+            "c2",
+            "edit",
+            json!({"path": "notes.txt", "edits": [{"old_text": "alpha", "new_text": "beta"}]}),
+        )]),
+        FauxReply::text("done"),
+    ]);
+    let fresh = build(&faux2, agent.store).adopt(carry);
+    assert_eq!(fresh.modes().unwrap().active().as_deref(), Some("plan"));
+    assert_eq!(fresh.policy().session_rules().len(), 1);
+    fresh.modes().unwrap().set(None).unwrap();
+    let (_fresh, _) = drive(fresh, &["now edit"]).await;
+    let last = format!("{:?}", faux2.requests.lock().unwrap()[1].messages.last().unwrap());
+    assert!(last.contains("changed on disk since your last read"), "{last}");
+}

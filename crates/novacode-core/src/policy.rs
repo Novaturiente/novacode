@@ -214,6 +214,15 @@ impl Policy {
 
     /// Only these tools may run (a subagent definition's `tools`, L10.1).
     /// Apply a mode preset's rules on top of the session's (`None` clears it).
+    /// "Allow for this session" answers so far (`/reload` keeps them).
+    pub fn session_rules(&self) -> Vec<Rule> {
+        self.session_allow.lock().unwrap().clone()
+    }
+
+    pub fn allow_for_session(&self, rules: Vec<Rule>) {
+        self.session_allow.lock().unwrap().extend(rules);
+    }
+
     pub fn set_overlay(&self, o: Option<Overlay>) {
         *self.overlay.lock().unwrap() = o;
     }

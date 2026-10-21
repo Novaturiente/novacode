@@ -38,6 +38,7 @@ fn app(history: Vec<Message>) -> (App, mpsc::UnboundedReceiver<Cmd>) {
         nerd_icons: false,
         slow: false,
         images: "off".into(),
+        procs: Vec::new(),
     };
     (App::new(init, tx), rx)
 }
@@ -505,6 +506,7 @@ fn file_completion_in_a_real_folder() {
             nerd_icons: false,
             slow: false,
             images: "off".into(),
+            procs: Vec::new(),
         },
         tx,
     );

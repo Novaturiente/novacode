@@ -679,6 +679,7 @@ pub async fn attach(
         nerd_icons: base.nerd_icons,
         slow: base.slow,
         images: base.images.clone(),
+        procs: Vec::new(),
     };
     novacode_tui::run(init, erx, ui_rx, cmd_tx).await?;
     match bye.lock().unwrap().take() {

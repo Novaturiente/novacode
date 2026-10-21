@@ -145,7 +145,7 @@ Type `/` to see the list. A line that is only `/something` unknown to novacode i
 | `/mcp` | MCP servers: status and tool counts. See [mcp](mcp.md). |
 | `/login [provider]` | Log in from a dialog: no provider = a list of all of them. Shows the sign-in URL (`Ctrl+X` copy, `Ctrl+O` open), a device code, or a box for a pasted code / API key; the session reloads after. Several accounts need `novacode login --account` on the command line. See [providers](providers.md). |
 | `/keys` (or `/help`) | Show the key bindings. |
-| `/reload` | Re-read settings, keys, theme, skills, extensions, MCP servers and context files. During a turn it waits for the turn to end (`Esc` ends it sooner); the same goes for `Alt+Shift+R`. |
+| `/reload` | Re-read settings, keys, theme, skills, extensions, MCP servers and context files. During a turn it waits for the turn to end (`Esc` ends it sooner); the same goes for `Alt+Shift+R`. The session stays as it is: its folder (a worktree too), background processes, running subagents, the mode (plan mode…), "allow for this session" answers and which files were read. |
 | `/restart` | Restart novacode (for example after a rebuild) and resume this session. |
 | `/quit` (or `/exit`) | Quit. |
 

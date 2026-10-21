@@ -68,6 +68,22 @@ pub struct Switch {
     pub thinking: ThinkingLevel,
 }
 
+/// Live state `/reload` hands to the rebuilt session: everything that isn't config.
+pub struct Carry {
+    /// Where the session is now (a worktree move included).
+    pub cwd: PathBuf,
+    /// Files read this session: edits keep working without a re-read.
+    pub files: Arc<FileState>,
+    /// Background processes keep running.
+    pub processes: Option<Arc<novacode_tools::process::ProcessManager>>,
+    /// "Allow for this session" answers.
+    pub allow: Vec<crate::policy::Rule>,
+    /// The mode preset that is on (plan mode, …).
+    pub mode: Option<String>,
+    /// `SessionStart` already ran: its context isn't added again.
+    pub started: bool,
+}
+
 pub struct Agent {
     adapter: Arc<dyn Adapter>,
     tools: Vec<Arc<dyn Tool>>,
@@ -1000,6 +1016,35 @@ impl Agent {
     /// Share an existing policy (mode presets hold it too).
     pub fn with_shared_policy(mut self, policy: Arc<Policy>) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// What `/reload` keeps: see [`Carry`].
+    pub fn carry(&self) -> Carry {
+        Carry {
+            cwd: self.cfg.cwd.clone(),
+            files: self.files.clone(),
+            processes: self.processes.clone(),
+            allow: self.policy.session_rules(),
+            mode: self.modes.as_ref().and_then(|m| m.active()),
+            started: self.plugins.as_ref().is_some_and(|p| p.started),
+        }
+    }
+
+    /// Take over a reloaded session's live state (call after the other builder steps).
+    pub fn adopt(mut self, c: Carry) -> Self {
+        self.files = c.files;
+        if c.processes.is_some() {
+            self.processes = c.processes;
+        }
+        self.policy.allow_for_session(c.allow);
+        if let (Some(m), Some(name)) = (&self.modes, c.mode.as_deref()) {
+            // A preset removed from settings just ends.
+            let _ = m.set(Some(name));
+        }
+        if let Some(p) = &mut self.plugins {
+            p.started = c.started;
+        }
         self
     }
 
@@ -2069,7 +2114,12 @@ async fn process_bridge(
 ) {
     use novacode_tools::process::{Attention, Event};
     loop {
-        match rx.recv().await {
+        let ev = rx.recv().await;
+        // A reloaded session's manager lives on in the new one; this bridge is done.
+        if *handle.shared.closed.lock().unwrap() {
+            break;
+        }
+        match ev {
             Ok(Event::Started { id, name }) => {
                 let _ = events.send(AgentEvent::ProcessStarted { id, name });
             }

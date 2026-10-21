@@ -891,6 +891,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         trusted,
         goals: Default::default(),
         sup: Default::default(),
+        carry: Default::default(),
     };
     let store = match resumed {
         Some(s) => s,
@@ -945,6 +946,8 @@ struct Ctx {
     goals: std::sync::Mutex<Option<Arc<goals::Goals>>>,
     /// The subagent supervisor of the last agent built (print mode waits for its children).
     sup: std::sync::Mutex<Option<Arc<agents::Supervisor>>>,
+    /// `/reload`: the old session's live state, for the next `agent()` (then taken).
+    carry: std::sync::Mutex<Option<novacode_core::agent::Carry>>,
 }
 
 impl Ctx {
@@ -1081,6 +1084,7 @@ impl Ctx {
         asker: Option<Arc<dyn novacode_tools::ask::Asker>>,
         slot: Option<hub::HubSlot>,
     ) -> anyhow::Result<(Agent, String)> {
+        let carry = self.carry.lock().unwrap().take();
         // A resumed session keeps its own model unless -m says otherwise.
         let resumed = match (&self.cli.model, store.last_model()) {
             (None, Some((p, m))) => Some(format!("{p}/{m}")),
@@ -1244,7 +1248,7 @@ impl Ctx {
                     .as_str()
                     .map(|m| format!("{}/{m}", route.provider))
             });
-            let sup = agents::Supervisor::new(agents::Setup {
+            let setup = agents::Setup {
                 slot,
                 me: store.id().to_string(),
                 home: self.paths.home().to_path_buf(),
@@ -1259,7 +1263,16 @@ impl Ctx {
                 exe: None,
                 nerd: s.get::<String>("ui.icons").as_deref() != Some("unicode"),
                 unattended: approver.is_none(),
-            });
+            };
+            // `/reload` keeps the supervisor, so running subagents carry on and report back.
+            let kept = carry.as_ref().and_then(|_| self.sup.lock().unwrap().clone());
+            let sup = match kept {
+                Some(old) => {
+                    old.reconfigure(setup);
+                    old
+                }
+                None => agents::Supervisor::new(setup),
+            };
             *self.sup.lock().unwrap() = Some(sup.clone());
             // Goals (/goal): audited by the `auditor` subagent.
             let g = goals::Goals::new(
@@ -1436,8 +1449,11 @@ impl Ctx {
         {
             agent = agent.with_checkpoints(repo);
         }
-        let pm = novacode_tools::process::ProcessManager::new(&self.paths.home().join("processes"), agent.store.id());
-        agent = agent.with_processes(pm);
+        if carry.as_ref().is_none_or(|c| c.processes.is_none()) {
+            let pm =
+                novacode_tools::process::ProcessManager::new(&self.paths.home().join("processes"), agent.store.id());
+            agent = agent.with_processes(pm);
+        }
         if let Some(w) = worker {
             let mut m = novacode_core::memory::Settings::for_window(window);
             if let Some(v) = s.get("memory.observeAfterTokens") {
@@ -1462,6 +1478,9 @@ impl Ctx {
         }
         if let Some(a) = approver {
             agent = agent.with_approver(a);
+        }
+        if let Some(c) = carry {
+            agent = agent.adopt(c);
         }
         Ok((agent, route.spec()))
     }
@@ -2279,8 +2298,22 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
         let (handle, id) = (host.hub.handle.clone(), host.id.clone());
         let tmux_pane = tmux_panel(&ctx.settings, &id, ctx.paths.home());
         let (etx, erx) = mpsc::unbounded_channel();
+        // A mode kept over `/reload`: its status-line marker, as `/plan` sets it.
         // The window starts from the current extension UI, as attached windows do.
         for ev in host.hub.ui_log() {
+            let _ = etx.send(ev);
+        }
+        if let Some(n) = host.modes.as_ref().and_then(|m| m.active()) {
+            let ev = AgentEvent::Ui {
+                ext: "novacode".into(),
+                op: novacode_types::ui::UiOp::Status {
+                    key: "mode".into(),
+                    text: Some(format!("⏸ {n} mode")),
+                    style: Some("warn".into()),
+                },
+            };
+            // Attached windows get it through the hub; this one isn't subscribed yet.
+            host.hub.handle.emit(ev.clone());
             let _ = etx.send(ev);
         }
         let mut events = handle.subscribe();
@@ -2348,6 +2381,13 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
             nerd_icons: base.nerd_icons,
             slow: base.slow,
             images: base.images.clone(),
+            procs: host.processes.as_ref().map_or_else(Vec::new, |pm| {
+                pm.list()
+                    .into_iter()
+                    .filter(|i| i.end.is_none())
+                    .map(|i| i.id)
+                    .collect()
+            }),
         };
         let t = match &mut screen {
             Some(s) => s,
@@ -2441,6 +2481,12 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
             continue;
         }
         if res == Exit::Reload {
+            // Live state stays; only config is read again (the session's folder included).
+            let carry = agent.carry();
+            if carry.cwd != ctx.cwd && carry.cwd.is_dir() {
+                ctx.cwd = carry.cwd.clone();
+            }
+            *ctx.carry.lock().unwrap() = Some(carry);
             notices.extend(ctx.reload());
             info.push("reloaded settings, keys, theme, extensions, MCP servers, skills and context files".into());
             store = agent.store;

@@ -115,6 +115,8 @@ pub struct Init {
     pub slow: bool,
     /// `ui.images`: auto (default), kitty, iterm2, sixel, halfblocks or off (L9.14).
     pub images: String,
+    /// Background processes already running (`/reload` keeps them).
+    pub procs: Vec<String>,
 }
 
 /// What the UI asks of the session.
@@ -466,6 +468,7 @@ impl App {
             }
             tr.on_message(&m);
         }
+        let procs = std::mem::take(&mut init.procs).into_iter().collect();
         for n in std::mem::take(&mut init.notices) {
             tr.notice(n, true);
         }
@@ -488,7 +491,7 @@ impl App {
             init,
             busy: false,
             reload_after: false,
-            procs: Default::default(),
+            procs,
             activity: String::new(),
             spinner: 0,
             usage,
