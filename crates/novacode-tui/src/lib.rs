@@ -134,6 +134,7 @@ pub async fn run_in(
             },
             _ = spin.tick(), if app.busy => {
                 app.spinner += 1;
+                app.tr.tick();
                 app.dirty = true;
             }
             _ = second.tick(), if app.busy || app.panel.visible => {

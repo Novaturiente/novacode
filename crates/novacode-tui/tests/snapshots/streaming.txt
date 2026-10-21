@@ -2,7 +2,7 @@
  │ explain                                      │
  ╰──────────────────────────────────────────────╯
 
- ∴ thinking… · 3 words · ctrl+t to show
+ ∴ thought · 3 words · ctrl+t to show
 
  The loop has **three
  ⏵ queued: use tests

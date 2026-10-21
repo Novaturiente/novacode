@@ -873,3 +873,37 @@ fn bench_frame() {
     println!("BENCH frame_p99_ms {:.2}", p99.as_secs_f64() * 1e3);
     assert!(p99.as_millis() < 16, "frame p99 {p99:?} over the 16 ms budget");
 }
+
+#[test]
+fn prompt_echoes_at_once_and_thinking_ticks() {
+    let (mut a, mut rx) = app(vec![]);
+    for c in "fix it".chars() {
+        a.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(rx.try_recv().unwrap(), Cmd::Prompt("fix it".into()));
+    // Before the agent answers, the prompt is already in the chat, once.
+    assert_eq!(screen(&mut a, 50, 12).matches("fix it").count(), 1);
+    a.on_agent(AgentEvent::AgentStart);
+    a.on_agent(AgentEvent::Message(Message::user("fix it")));
+    assert_eq!(screen(&mut a, 50, 12).matches("fix it").count(), 1);
+    a.on_agent(AgentEvent::Stream(StreamEvent::BlockStart {
+        index: 0,
+        kind: BlockKind::Thinking,
+        name: None,
+    }));
+    a.on_agent(AgentEvent::Stream(StreamEvent::Delta {
+        index: 0,
+        text: "one two three".into(),
+    }));
+    while a.pace() {}
+    assert!(screen(&mut a, 50, 12).contains("thinking"), "live thinking line");
+    // A prompt that never comes back (refused by a hook) loses its echo when the run settles.
+    a.on_agent(AgentEvent::Settled);
+    for c in "again".chars() {
+        a.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    a.on_agent(AgentEvent::Settled);
+    assert!(!screen(&mut a, 50, 12).contains("again"));
+}

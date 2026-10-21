@@ -26,7 +26,7 @@ const DOUBLE_PRESS: Duration = Duration::from_millis(500);
 const COMPLETE_ROWS: usize = 8;
 /// Files listed for `@` completion; bigger trees are cut.
 const FILE_CAP: usize = 20_000;
-const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+use crate::transcript::SPINNER;
 
 /// Built-in slash commands (L8.9). Skill and template commands come from the
 /// host (`Init.commands`); over RPC the host runs the session ones itself.
@@ -633,7 +633,10 @@ impl App {
                 }
                 self.tr.on_message(&m);
             }
-            AgentEvent::ToolStart { call } => self.activity = format!("running {}", call.name),
+            AgentEvent::ToolStart { call } => {
+                self.tr.tool_start(&call.id);
+                self.activity = format!("running {}", call.name);
+            }
             AgentEvent::ToolUpdate { call_id, text } => self.tr.tool_update(&call_id, &text),
             AgentEvent::ToolEnd {
                 call_id,
@@ -706,9 +709,12 @@ impl App {
             AgentEvent::Settled => {
                 self.busy = false;
                 self.activity.clear();
+                // A refused or failed prompt never comes back: drop its echo.
+                self.tr.echo = None;
                 self.tr.settle();
             }
             AgentEvent::PromptTakenBack { text } => {
+                self.tr.echo = None;
                 self.tr.take_back();
                 // Anything typed meanwhile stays, after the restored prompt.
                 let typed = self.editor.text().to_string();
@@ -1353,6 +1359,8 @@ impl App {
             self.pending.push((text.clone(), steer));
             self.send(if steer { Cmd::Steer(text) } else { Cmd::Prompt(text) });
         } else {
+            // Shown at once, like pi; the agent's copy replaces it (hooks and the prompt rebuild come first).
+            self.tr.echo = Some(text.clone());
             self.send(Cmd::Prompt(text));
         }
     }
@@ -1886,6 +1894,31 @@ impl App {
         crate::statusline::render(&self.init.statusline, &v, &ext, width, t)
     }
 
+    /// The activity text with cycling dots and, unless slow, a highlight sweeping across it.
+    fn shimmer(&self, t: &Theme) -> Vec<Span<'static>> {
+        let dots = &"...   "[3 - (self.spinner / 4 % 4)..][..3];
+        let text: Vec<char> = format!("{}{dots}", self.activity).chars().collect();
+        if self.init.slow {
+            return vec![Span::styled(text.into_iter().collect::<String>(), t.text)];
+        }
+        // A 3-char window, then a pause as long as the text before it comes round again.
+        let at = self.spinner % (text.len() * 2 + 6);
+        let mut out: Vec<Span<'static>> = Vec::new();
+        for (i, c) in text.into_iter().enumerate() {
+            let lit = (i + 3).abs_diff(at) <= 1;
+            let st = if lit {
+                t.accent.add_modifier(ratatui::style::Modifier::BOLD)
+            } else {
+                t.text
+            };
+            match out.last_mut() {
+                Some(s) if s.style == st => s.content.to_mut().push(c),
+                _ => out.push(Span::styled(c.to_string(), st)),
+            }
+        }
+        out
+    }
+
     /// The `activity` segment: what's going on, or what's wanted from the user.
     fn activity_spans(&mut self) -> Vec<Span<'static>> {
         let t = &self.theme;
@@ -1905,7 +1938,7 @@ impl App {
                 format!(" {} ", SPINNER[self.spinner % SPINNER.len()]),
                 t.accent,
             ));
-            left.push(Span::styled(self.activity.clone(), t.text));
+            left.extend(self.shimmer(t));
         } else {
             left.push(Span::styled(" ● ", t.dim));
             left.push(Span::styled("ready", t.dim));

@@ -8,6 +8,7 @@ use crate::wrap::{self, sanitize};
 use novacode_types::{Block, BlockKind, Message, StreamEvent};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
+use std::time::Instant;
 
 const OUTPUT_TAIL: usize = 4;
 const LIVE_CAP: usize = 64 * 1024;
@@ -33,6 +34,8 @@ pub struct Tool {
     pub is_error: bool,
     pub done: bool,
     pub duration_ms: Option<u64>,
+    /// When it started running; a running row shows a spinner and the seconds so far.
+    pub started: Option<Instant>,
     /// `details.ui` of the result: styled lines the tool asks to show instead of its output.
     pub ui: Option<Vec<novacode_types::ui::Line>>,
 }
@@ -143,6 +146,17 @@ pub struct Transcript {
     /// Tallest an open image may be, in rows (the transcript height); 0 = this
     /// terminal draws no images (L9.14).
     pub image_rows: usize,
+    /// The prompt just submitted, shown until the agent's own copy arrives.
+    pub echo: Option<String>,
+    /// When the live message began streaming.
+    pub(crate) live_since: Option<Instant>,
+}
+
+/// Braille spinner frames, one per 100 ms.
+pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn spin_frame(since: Instant) -> &'static str {
+    SPINNER[(since.elapsed().as_millis() / 100) as usize % SPINNER.len()]
 }
 
 /// How thinking blocks show (L9.7, setting `ui.thinking`).
@@ -304,6 +318,9 @@ impl Transcript {
     }
 
     pub fn on_stream(&mut self, ev: &StreamEvent) {
+        if self.live.is_none() {
+            self.live_since = Some(Instant::now());
+        }
         let live = self.live.get_or_insert_with(Vec::new);
         match ev {
             StreamEvent::BlockStart { index, kind, .. } => {
@@ -330,6 +347,7 @@ impl Transcript {
     pub fn on_message(&mut self, m: &Message) {
         match m {
             Message::User { content } => {
+                self.echo = None;
                 // Images follow as their own items (L9.14).
                 let text = content
                     .iter()
@@ -389,6 +407,7 @@ impl Transcript {
                         is_error: false,
                         done: false,
                         duration_ms: None,
+                        started: None,
                         ui: None,
                     }));
                 }
@@ -443,6 +462,24 @@ impl Transcript {
         }
     }
 
+    pub fn tool_start(&mut self, id: &str) {
+        if let Some(t) = self.tool(id) {
+            t.started = Some(Instant::now());
+        }
+    }
+
+    /// Animation step: re-lay the newest turn while one of its tools runs.
+    pub fn tick(&mut self) {
+        if let Some(turn) = self.turns.last_mut()
+            && turn
+                .items
+                .iter()
+                .any(|i| matches!(i, Item::Tool(t) if !t.done && t.started.is_some()))
+        {
+            turn.touch();
+        }
+    }
+
     pub fn tool_end(&mut self, id: &str, is_error: bool, ms: u64) {
         if let Some(t) = self.tool(id) {
             t.duration_ms = Some(ms);
@@ -472,7 +509,7 @@ impl Transcript {
         let mut behind = false;
         for (i, (kind, text)) in live.iter().enumerate() {
             let shown = &mut self.live_shown[i];
-            if *kind != BlockKind::Text {
+            if !matches!(kind, BlockKind::Text | BlockKind::Thinking) {
                 *shown = text.len();
                 continue;
             }
@@ -493,9 +530,11 @@ impl Transcript {
             live.iter()
                 .enumerate()
                 .map(|(i, (k, t))| {
-                    // Only text is paced; thinking shows its word count straight away.
+                    // Text and thinking are paced, so a burst climbs instead of jumping.
                     let n = match k {
-                        BlockKind::Text => self.live_shown.get(i).copied().unwrap_or(0).min(t.len()),
+                        BlockKind::Text | BlockKind::Thinking => {
+                            self.live_shown.get(i).copied().unwrap_or(0).min(t.len())
+                        }
                         _ => t.len(),
                     };
                     (*k, t[..n].to_string())
@@ -509,6 +548,7 @@ impl Transcript {
         let thinking = self.thinking;
         let hint = self.thinking_hint.clone();
         let live = self.live_view();
+        let since = Some(self.live_since.unwrap_or_else(Instant::now));
         let mut v = View {
             lines: Vec::new(),
             starts: Vec::new(),
@@ -550,13 +590,34 @@ impl Transcript {
             if i == last
                 && let Some(live) = &live
             {
-                v.lines.extend(lay_assistant(live, width, theme, true, thinking, &hint));
+                v.lines
+                    .extend(lay_assistant(live, width, theme, since, thinking, &hint));
             }
         }
         if self.turns.is_empty()
             && let Some(live) = &live
         {
-            v.lines.extend(lay_assistant(live, width, theme, true, thinking, &hint));
+            v.lines
+                .extend(lay_assistant(live, width, theme, since, thinking, &hint));
+        }
+        if let Some(text) = &self.echo {
+            let turn = Turn {
+                items: vec![Item::User(text.clone())],
+                ..Default::default()
+            };
+            if !v.lines.is_empty() {
+                v.lines.push(Line::default());
+            }
+            let c = lay_turn(
+                &turn,
+                width,
+                theme,
+                thinking,
+                &hint,
+                images,
+                (self.tools_full, &self.tools_hint),
+            );
+            v.lines.extend(c.lines);
         }
         v
     }
@@ -640,7 +701,7 @@ fn lay_turn(
                     .filter(|(k, _)| !only_reply || *k == BlockKind::Text)
                     .cloned()
                     .collect();
-                lines.extend(lay_assistant(&blocks, width, t, false, thinking, hint));
+                lines.extend(lay_assistant(&blocks, width, t, None, thinking, hint));
             }
             Item::Tool(tool) => lines.extend(lay_tool(tool, width, t, tools)),
             Item::Image(img) => {
@@ -760,7 +821,7 @@ fn lay_assistant(
     blocks: &[(BlockKind, String)],
     width: usize,
     t: &Theme,
-    live: bool,
+    live: Option<Instant>,
     thinking: Thinking,
     hint: &str,
 ) -> Vec<Line<'static>> {
@@ -777,7 +838,8 @@ fn lay_assistant(
             _ => merged.push((*kind, text.clone())),
         }
     }
-    for (kind, text) in &merged {
+    let n = merged.len();
+    for (j, (kind, text)) in merged.iter().enumerate() {
         // One blank line between thinking and the reply text below it.
         if *kind == BlockKind::Text && std::mem::take(&mut after_thinking) {
             lines.push(Line::default());
@@ -804,14 +866,22 @@ fn lay_assistant(
             // L9.7: by default thinking shows as one collapsed line.
             BlockKind::Thinking => {
                 let words = text.split_whitespace().count();
-                let label = if live { "thinking…" } else { "thought" };
+                // Still thinking: dots cycle and the seconds tick (the provider sends thinking in bursts).
+                let label = match live.filter(|_| j + 1 == n) {
+                    Some(at) => {
+                        let ms = at.elapsed().as_millis();
+                        let dots = &"...   "[3 - (ms / 400 % 4) as usize..][..3];
+                        format!("thinking{dots} {}s", ms / 1000)
+                    }
+                    None => "thought".into(),
+                };
                 let mut l = Line::styled(format!("∴ {label} · {words} words"), t.thinking);
                 if !hint.is_empty() {
                     l.push_span(Span::styled(format!(" · {hint} to show"), t.dim));
                 }
                 lines.push(l);
             }
-            BlockKind::Text => lines.extend(markdown::render(text, width, t, !live)),
+            BlockKind::Text => lines.extend(markdown::render(text, width, t, live.is_none())),
             _ => {}
         }
     }
@@ -937,7 +1007,7 @@ const FULL_ROWS: usize = 2000;
 
 fn lay_tool(tool: &Tool, width: usize, t: &Theme, (full, hint): (bool, &str)) -> Vec<Line<'static>> {
     let (dot, st) = match (tool.done, tool.is_error) {
-        (false, _) => ("◌", t.warn),
+        (false, _) => (tool.started.map_or("◌", spin_frame), t.warn),
         (true, false) => ("●", t.ok),
         (true, true) => ("●", t.error),
     };
@@ -949,6 +1019,13 @@ fn lay_tool(tool: &Tool, width: usize, t: &Theme, (full, hint): (bool, &str)) ->
     ];
     if let Some(ms) = tool.duration_ms.filter(|ms| *ms >= 1000) {
         head.push(Span::styled(format!("  {:.1}s", ms as f64 / 1000.0), t.dim));
+    } else if let Some(s) = tool
+        .started
+        .filter(|_| !tool.done)
+        .map(|at| at.elapsed().as_secs())
+        .filter(|s| *s >= 1)
+    {
+        head.push(Span::styled(format!("  {s}s"), t.dim));
     }
     let mut lines = vec![Line::default(), wrap::truncate(head, width)];
     if let Some(intent) = tool.args.get("intent").and_then(Value::as_str) {
