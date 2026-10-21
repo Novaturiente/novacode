@@ -112,7 +112,7 @@ The list shows `done/total` first (dropped items are not counted in the total), 
 
 ### ask_user
 
-Asks you one or more questions in one form. Params: `questions`, each with `question`, an optional `header`, `options` (2 to 6 suggested; one can be marked `recommended`, and each can have a `description` and a `preview`), and `multi` to allow several picks. You can always type your own answer. If you dismiss the form, the model is told to ask in chat instead.
+Asks you one or more questions in one form. Params: `questions`, each with `question`, an optional `header`, `options` (2 to 6 suggested; one can be marked `recommended`, and each can have a `description` and a `preview`), and `multi` to allow several picks. You can always type your own answer, or press `n` on a choice to add a note that is sent with it (the model sees `choice; note`). If you dismiss the form, the model is told to ask in chat instead.
 
 ### agent and goal
 

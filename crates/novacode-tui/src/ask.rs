@@ -1,5 +1,5 @@
 //! The `ask_user` form (L5.21): one question at a time, choices with a cursor,
-//! multi-select, a free-text row, and the focused choice's preview.
+//! multi-select, a free-text row, a note on a choice (`n`), and the focused choice's preview.
 
 use crate::theme::Theme;
 use crate::wrap;
@@ -32,6 +32,9 @@ pub struct AskForm {
     picked: Vec<BTreeSet<usize>>,
     typed: Vec<String>,
     typing: bool,
+    /// A note sent with the picked choice(s), and the row it was written on.
+    notes: Vec<(String, usize)>,
+    noting: bool,
 }
 
 pub enum Done {
@@ -55,6 +58,8 @@ impl AskForm {
             picked: vec![BTreeSet::new(); n],
             typed: vec![String::new(); n],
             typing: false,
+            notes: vec![(String::new(), 0); n],
+            noting: false,
         }
     }
 
@@ -77,10 +82,15 @@ impl AskForm {
                 if !q.multi && chosen.is_empty() && self.typed[i].trim().is_empty() && self.sel[i] < q.options.len() {
                     chosen.push(q.options[self.sel[i]].label.clone());
                 }
+                // Typed text replaces the choice; a note goes along with it.
+                let text = [self.typed[i].trim(), self.notes[i].0.trim()]
+                    .into_iter()
+                    .find(|t| !t.is_empty())
+                    .map(String::from);
                 Reply {
                     question: q.question.clone(),
                     chosen,
-                    text: Some(self.typed[i].trim().to_string()).filter(|t| !t.is_empty()),
+                    text,
                 }
             })
             .collect()
@@ -89,6 +99,7 @@ impl AskForm {
     /// Next question, or the end.
     fn advance(&mut self) -> Done {
         self.typing = false;
+        self.noting = false;
         if self.q + 1 < self.req.questions.len() {
             self.q += 1;
             Done::Pending
@@ -99,6 +110,23 @@ impl AskForm {
 
     pub fn handle(&mut self, k: KeyEvent) -> Done {
         let q = self.q;
+        if self.noting {
+            match k.code {
+                // Single choice: the noted choice is the answer. Multi: it's picked, keep picking.
+                KeyCode::Enter if !self.cur().multi => return self.advance(),
+                KeyCode::Enter => {
+                    self.picked[q].insert(self.notes[q].1);
+                    self.noting = false;
+                }
+                KeyCode::Esc => self.noting = false,
+                KeyCode::Backspace => {
+                    self.notes[q].0.pop();
+                }
+                KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => self.notes[q].0.push(c),
+                _ => {}
+            }
+            return Done::Pending;
+        }
         if self.typing {
             match k.code {
                 KeyCode::Enter => return self.advance(),
@@ -134,6 +162,10 @@ impl AskForm {
                 }
             }
             KeyCode::Enter | KeyCode::Tab if self.sel[q] == rows - 1 => self.typing = true,
+            KeyCode::Char('n') if self.sel[q] < rows - 1 => {
+                self.notes[q].1 = self.sel[q];
+                self.noting = true;
+            }
             KeyCode::Enter | KeyCode::Tab => {
                 if self.cur().multi && self.picked[q].is_empty() {
                     self.picked[q].insert(self.sel[q]);
@@ -167,7 +199,7 @@ impl AskForm {
         gap(&mut out);
         let sel = self.sel[self.q];
         for (i, o) in q.options.iter().enumerate() {
-            let focused = i == sel && !self.typing;
+            let focused = i == sel && !self.typing && !self.noting;
             let mark = if q.multi {
                 if self.picked[self.q].contains(&i) {
                     "[x] "
@@ -190,6 +222,23 @@ impl AskForm {
             if let Some(d) = o.description.as_deref().filter(|d| !d.trim().is_empty()) {
                 out.extend(wrap::wrap(
                     vec![Span::styled(d.to_string(), t.dim)],
+                    w,
+                    &indent,
+                    &indent,
+                ));
+            }
+            let (note, at) = &self.notes[self.q];
+            if *at == i && (self.noting || !note.is_empty()) {
+                let text = if self.noting {
+                    format!("{note}▏")
+                } else {
+                    note.clone()
+                };
+                out.extend(wrap::wrap(
+                    vec![
+                        Span::styled("note: ", t.dim),
+                        Span::styled(text, if self.noting { t.accent } else { t.text }),
+                    ],
                     w,
                     &indent,
                     &indent,
@@ -233,12 +282,17 @@ impl AskForm {
         }
         let keys = if self.typing {
             "Enter answer · Esc back to the choices"
+        } else if self.noting && q.multi {
+            "Enter pick with note · Esc back"
+        } else if self.noting {
+            "Enter choose with note · Esc back"
         } else if q.multi {
-            "↑↓ move · Space pick · Enter next · ← back · Esc dismiss"
+            "↑↓ move · Space pick · n note · Enter next · ← back · Esc dismiss"
         } else {
-            "↑↓ move · Enter choose · 1-9 pick · ← back · Esc dismiss"
+            "↑↓ move · Enter choose · n note · 1-9 pick · ← back · Esc dismiss"
         };
-        out.push(Line::styled(keys.to_string(), t.dim));
+        // Wrapped, so a narrow form never hides "Esc dismiss".
+        out.extend(wrap::wrap(vec![Span::styled(keys, t.dim)], w, &[], &[]));
         out
     }
 
@@ -421,5 +475,61 @@ mod tests {
         assert_eq!(r[1].chosen, ["a", "c"]);
         assert_eq!((r[2].chosen.len(), r[2].text.as_deref()), (0, Some("nova")));
         assert!(matches!(f.handle(key(KeyCode::Esc)), Done::Dismissed));
+    }
+
+    #[test]
+    fn note_goes_with_the_choice() {
+        let ch = |l: &str| Choice {
+            label: l.into(),
+            description: None,
+            preview: None,
+            recommended: false,
+        };
+        let (tx, _rx) = oneshot::channel();
+        let mut f = AskForm::new(AskReq {
+            id: 1,
+            questions: vec![
+                Question {
+                    question: "db?".into(),
+                    header: None,
+                    options: vec![ch("pg"), ch("sqlite")],
+                    multi: false,
+                },
+                Question {
+                    question: "features?".into(),
+                    header: None,
+                    options: vec![ch("a"), ch("b")],
+                    multi: true,
+                },
+            ],
+            reply: tx,
+        });
+        f.handle(key(KeyCode::Char('n')));
+        for c in "with pgvector".chars() {
+            f.handle(key(KeyCode::Char(c)));
+        }
+        let shown: String = f
+            .lines(60, &Theme::default(), false)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(shown.contains("note: with pgvector"));
+        assert!(matches!(f.handle(key(KeyCode::Enter)), Done::Pending));
+        // Multi: the note picks its row; Enter then moves on.
+        f.handle(key(KeyCode::Down));
+        f.handle(key(KeyCode::Char('n')));
+        f.handle(key(KeyCode::Char('x')));
+        f.handle(key(KeyCode::Enter));
+        let Done::Answered(r) = f.handle(key(KeyCode::Enter)) else {
+            panic!("not done")
+        };
+        assert_eq!(
+            (r[0].chosen.clone(), r[0].text.as_deref()),
+            (vec!["pg".to_string()], Some("with pgvector"))
+        );
+        assert_eq!(
+            (r[1].chosen.clone(), r[1].text.as_deref()),
+            (vec!["b".to_string()], Some("x"))
+        );
     }
 }
