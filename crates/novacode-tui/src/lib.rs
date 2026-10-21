@@ -35,12 +35,27 @@ const FRAME: Duration = Duration::from_millis(16);
 /// first; the screen redraws only when something changed, never while idle.
 pub async fn run(
     init: Init,
-    mut events: UnboundedReceiver<AgentEvent>,
-    mut ui: UnboundedReceiver<UiEvent>,
+    events: UnboundedReceiver<AgentEvent>,
+    ui: UnboundedReceiver<UiEvent>,
     cmds: UnboundedSender<Cmd>,
 ) -> std::io::Result<Exit> {
     term::install_panic_hook();
     let mut t = term::enter()?;
+    let res = run_in(&mut t, init, events, ui, cmds).await;
+    term::restore();
+    res
+}
+
+/// [`run`] on a terminal the caller keeps between sessions. Its last frame stays
+/// up while the session is swapped (reload, rewind, /new), and the next run
+/// redraws only the cells that changed, so the screen never goes blank.
+pub async fn run_in(
+    t: &mut term::Term,
+    init: Init,
+    mut events: UnboundedReceiver<AgentEvent>,
+    mut ui: UnboundedReceiver<UiEvent>,
+    cmds: UnboundedSender<Cmd>,
+) -> std::io::Result<Exit> {
     let mut app = App::new(init, cmds);
     // L9.17: over SSH or on a loaded machine, fewer frames and a slower spinner.
     let frame = if app.slow() { FRAME * 3 } else { FRAME };
@@ -58,14 +73,14 @@ pub async fn run(
     let res = loop {
         if app.suspend {
             app.suspend = false;
-            if let Err(e) = term::suspend(&mut t) {
+            if let Err(e) = term::suspend(t) {
                 break Err(e);
             }
             app.dirty = true;
         }
         if app.external_editor {
             app.external_editor = false;
-            match term::external_editor(&mut t, app.editor.text()) {
+            match term::external_editor(t, app.editor.text()) {
                 Ok(Some(s)) => app.editor.set_text(&s),
                 Ok(None) => {}
                 Err(e) => app.tr.notice(format!("$EDITOR failed: {e}"), true),
@@ -73,7 +88,7 @@ pub async fn run(
             app.dirty = true;
         }
         if let Some(provider) = app.login.take() {
-            match term::login(&mut t, &provider) {
+            match term::login(t, &provider) {
                 // New credentials load on reload; the session carries on.
                 Ok(true) => break Ok(Exit::Reload),
                 Ok(false) => app.tr.notice(format!("login to {provider} didn't finish"), true),
@@ -90,7 +105,7 @@ pub async fn run(
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => break Err(e),
                     Err(_) => {
-                        t = term::enter()?;
+                        *t = term::enter()?;
                         app.tr.notice("drawing failed; details are in the log", true);
                     }
                 }
@@ -129,6 +144,9 @@ pub async fn run(
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {}
         }
     };
-    term::restore();
+    if let Ok(e) = &res {
+        app.leaving(e);
+        let _ = t.draw(|f| app.draw(f));
+    }
     res
 }

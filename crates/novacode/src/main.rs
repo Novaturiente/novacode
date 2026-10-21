@@ -2167,6 +2167,15 @@ fn spawn_bg() -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The window's terminal; given back to the shell when dropped (quit, restart, error).
+struct Screen(novacode_tui::term::Term);
+
+impl Drop for Screen {
+    fn drop(&mut self) {
+        novacode_tui::term::restore();
+    }
+}
+
 /// The TUI, one session at a time; /resume and /new swap the session in place.
 async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> anyhow::Result<ExitCode> {
     let mut notices = Vec::new();
@@ -2180,6 +2189,8 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
         .unwrap_or(true)
         .then(|| novacode_core::checkpoint::resolve(&ctx.cwd, ctx.paths.home()))
         .flatten();
+    // Kept across reload, rewind and session swaps: the old frame stays up meanwhile.
+    let mut screen: Option<Screen> = None;
     loop {
         let (ui_tx, ui_rx) = mpsc::unbounded_channel();
         let (live, task) = start_session(
@@ -2266,7 +2277,17 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
             slow: base.slow,
             images: base.images.clone(),
         };
-        let res = novacode_tui::run(init, erx, ui_rx, ctx_tx).await;
+        let t = match &mut screen {
+            Some(s) => s,
+            None => {
+                novacode_tui::term::install_panic_hook();
+                screen.insert(Screen(novacode_tui::term::enter()?))
+            }
+        };
+        let res = novacode_tui::run_in(&mut t.0, init, erx, ui_rx, ctx_tx).await;
+        if matches!(res, Ok(Exit::Quit | Exit::Restart) | Err(_)) {
+            screen = None;
+        }
         handle.abort();
         handle.shutdown();
         let agent = task.await?;
@@ -2392,6 +2413,7 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
                         std::env::set_current_dir(&dir)?;
                         let id = s.header.id.clone();
                         drop(s); // release the session lock before exec
+                        drop(screen);
                         return Err(restart(&id));
                     }
                     Ok(s)

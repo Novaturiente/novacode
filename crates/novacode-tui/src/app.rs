@@ -476,6 +476,20 @@ impl App {
         self.flash = Some((s.into(), Instant::now()));
     }
 
+    /// The frame that stays up while the session is swapped under the window:
+    /// no overlay, a note of what is happening.
+    pub fn leaving(&mut self, e: &Exit) {
+        self.overlay = None;
+        self.flash(match e {
+            Exit::Quit => return,
+            Exit::Reload => "reloading…",
+            Exit::Restart => "restarting…",
+            Exit::Rewind { .. } => "rewinding…",
+            Exit::Branch(..) => "branching…",
+            Exit::New | Exit::Resume(_) => "switching session…",
+        });
+    }
+
     pub fn on_ui(&mut self, ev: UiEvent) {
         self.dirty = true;
         match ev {
