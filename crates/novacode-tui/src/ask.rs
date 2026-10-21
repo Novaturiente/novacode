@@ -7,6 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use novacode_types::{Question, Reply};
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use std::collections::BTreeSet;
@@ -147,23 +148,23 @@ impl AskForm {
         Done::Pending
     }
 
-    fn lines(&self, w: usize, t: &Theme) -> Vec<Line<'static>> {
+    /// `spaced`: a blank line between the parts, dropped when the screen is short.
+    fn lines(&self, w: usize, t: &Theme, spaced: bool) -> Vec<Line<'static>> {
         let q = self.cur();
-        let n = self.req.questions.len();
         let mut out = Vec::new();
-        let mut head = Vec::new();
-        if n > 1 {
-            head.push(Span::styled(format!("{}/{n} ", self.q + 1), t.dim));
-        }
-        if let Some(h) = &q.header {
-            head.push(Span::styled(format!("{h} · "), t.accent));
-        }
+        let gap = |out: &mut Vec<Line<'static>>| {
+            if spaced {
+                out.push(Line::default());
+            }
+        };
+        // The question on its own, then each choice: label on one line, its description under it.
         out.extend(wrap::wrap(
-            vec![Span::styled(q.question.clone(), t.text)],
+            vec![Span::styled(q.question.clone(), t.text.add_modifier(Modifier::BOLD))],
             w,
-            &head,
-            &[Span::raw("  ")],
+            &[],
+            &[],
         ));
+        gap(&mut out);
         let sel = self.sel[self.q];
         for (i, o) in q.options.iter().enumerate() {
             let focused = i == sel && !self.typing;
@@ -182,12 +183,21 @@ impl AskForm {
                 Span::styled(o.label.clone(), if focused { t.accent } else { t.text }),
             ];
             if o.recommended {
-                spans.push(Span::styled(" (recommended)", t.ok));
+                spans.push(Span::styled("  recommended", t.ok));
             }
-            if let Some(d) = &o.description {
-                spans.push(Span::styled(format!(" — {d}"), t.dim));
+            let indent = [Span::raw(" ".repeat(6 + mark.len()))];
+            out.extend(wrap::wrap(spans, w, &[], &indent));
+            if let Some(d) = o.description.as_deref().filter(|d| !d.trim().is_empty()) {
+                out.extend(wrap::wrap(
+                    vec![Span::styled(d.to_string(), t.dim)],
+                    w,
+                    &indent,
+                    &indent,
+                ));
             }
-            out.extend(wrap::wrap(spans, w, &[], &[Span::raw("      ")]));
+            if o.description.is_some() {
+                gap(&mut out);
+            }
         }
         let typed = &self.typed[self.q];
         let on_text = sel == q.options.len();
@@ -206,6 +216,7 @@ impl AskForm {
             ],
             w,
         ));
+        gap(&mut out);
         if let Some(p) = q.options.get(sel).and_then(|o| o.preview.as_ref()) {
             // Wrapped, not cut: a plan's lines are long. Capped so the keys line stays on screen.
             let bar = [Span::styled("   │ ", t.code)];
@@ -218,6 +229,7 @@ impl AskForm {
             if more > 0 {
                 out.push(Line::styled(format!("   │ … {more} more lines"), t.dim));
             }
+            gap(&mut out);
         }
         let keys = if self.typing {
             "Enter answer · Esc back to the choices"
@@ -231,12 +243,27 @@ impl AskForm {
     }
 
     pub fn height(&self, width: u16) -> u16 {
-        self.lines(width.saturating_sub(2) as usize, &Theme::default()).len() as u16 + 2
+        self.lines(width.saturating_sub(4) as usize, &Theme::default(), true)
+            .len() as u16
+            + 2
     }
 
     pub fn render(&self, f: &mut Frame, area: Rect, t: &Theme) {
-        let inner = crate::dialog::frame(f, area, "Question", t);
-        f.render_widget(Paragraph::new(self.lines(inner.width as usize, t)), inner);
+        let n = self.req.questions.len();
+        let mut title = "Question".to_string();
+        if n > 1 {
+            title.push_str(&format!(" {} of {n}", self.q + 1));
+        }
+        if let Some(h) = &self.cur().header {
+            title.push_str(&format!(" · {h}"));
+        }
+        let inner = crate::dialog::frame(f, area, &title, t);
+        let w = inner.width as usize;
+        let mut lines = self.lines(w, t, true);
+        if lines.len() > inner.height as usize {
+            lines = self.lines(w, t, false);
+        }
+        f.render_widget(Paragraph::new(lines), inner);
     }
 }
 
@@ -269,7 +296,7 @@ mod tests {
             reply: tx,
         });
         let text: String = f
-            .lines(40, &Theme::default())
+            .lines(40, &Theme::default(), true)
             .iter()
             .map(|l| crate::wrap::plain(l) + "\n")
             .collect();
@@ -278,6 +305,67 @@ mod tests {
             text.lines().filter(|l| l.contains('│')).all(|l| !l.contains('…')),
             "{text}"
         );
+    }
+
+    /// Question alone at the top, each choice's description on its own lines under it,
+    /// header and progress in the title; a short screen drops the blank lines, not the keys.
+    #[test]
+    fn layout_separates_question_and_choices() {
+        let ch = |l: &str, d: &str| Choice {
+            label: l.into(),
+            description: Some(d.into()),
+            preview: None,
+            recommended: l.starts_with("Run both"),
+        };
+        let (tx, _rx) = oneshot::channel();
+        let q = |n: &str| Question {
+            question: format!("{n}: the model replies with two tool calls and no text. What does the loop do next?"),
+            header: Some("Agent loop".into()),
+            options: vec![
+                ch(
+                    "End the turn",
+                    "Show the reply and wait for the user before running anything.",
+                ),
+                ch(
+                    "Run both tools, then call the model again",
+                    "Run them (in parallel, they are independent), append the results, send it back.",
+                ),
+            ],
+            multi: false,
+        };
+        let f = AskForm::new(AskReq {
+            id: 1,
+            questions: vec![q("Q1"), q("Q2")],
+            reply: tx,
+        });
+        let draw = |h: u16| {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, h)).unwrap();
+            term.draw(|fr| f.render(fr, fr.area(), &Theme::default())).unwrap();
+            let b = term.backend().buffer().clone();
+            (0..h)
+                .map(|y| {
+                    (0..60)
+                        .map(|x| b[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        let tall = draw(f.height(60));
+        eprintln!("{}", tall.join("\n"));
+        assert!(tall[0].contains("Question 1 of 2 · Agent loop"), "{tall:?}");
+        let at = |s: &str| tall.iter().position(|l| l.contains(s)).unwrap();
+        assert!(at("1. End the turn") > at("Q1:") + 1, "a blank line after the question");
+        assert_eq!(
+            at("Show the reply"),
+            at("1. End the turn") + 1,
+            "description under its label"
+        );
+        let r = at("Run both tools");
+        assert!(tall[r..=r + 1].iter().any(|l| l.contains("recommended")));
+        let short = draw(f.height(60) - 4);
+        assert!(short.iter().any(|l| l.contains("Esc dismiss")), "{short:?}");
     }
 
     #[test]

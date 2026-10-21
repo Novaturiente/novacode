@@ -7,6 +7,7 @@ use crate::wrap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use tokio::sync::oneshot;
@@ -211,37 +212,42 @@ impl ApprovalCard {
     }
 
     pub fn height(&self, width: u16) -> u16 {
-        self.lines(width.saturating_sub(2) as usize, &Theme::default()).len() as u16 + 2
+        self.lines(width.saturating_sub(4) as usize, &Theme::default(), true)
+            .len() as u16
+            + 2
     }
 
-    fn lines(&self, w: usize, t: &Theme) -> Vec<Line<'static>> {
+    /// Tool name, then the command or path under it, then why it is asked, then the keys.
+    /// `spaced`: blank lines between those parts, dropped when the screen is short.
+    fn lines(&self, w: usize, t: &Theme, spaced: bool) -> Vec<Line<'static>> {
         let r = &self.req;
+        let bar = [Span::styled("│ ", t.dim)];
         // Line by line: `wrap::wrap` runs lines together, which glued multi-line commands.
-        let mut lines: Vec<Line<'static>> = r
+        let mut body: Vec<Line<'static>> = r
             .detail
             .lines()
-            .enumerate()
-            .flat_map(|(i, l)| {
-                let first = if i == 0 {
-                    Span::styled(format!("{} ", r.tool), t.accent)
-                } else {
-                    Span::raw("  ")
-                };
-                wrap::wrap(
-                    vec![Span::styled(wrap::sanitize(l), t.text)],
-                    w,
-                    &[first],
-                    &[Span::raw("  ")],
-                )
-            })
+            .flat_map(|l| wrap::wrap(vec![Span::styled(wrap::sanitize(l), t.code)], w, &bar, &bar))
             .collect();
-        if lines.len() > 12 {
-            let more = lines.len() - 11;
-            lines.truncate(11);
-            lines.push(Line::styled(format!("  … {more} more lines"), t.dim));
+        if body.len() > 12 {
+            let more = body.len() - 11;
+            body.truncate(11);
+            body.push(Line::styled(format!("│ … {more} more lines"), t.dim));
+        }
+        let mut lines = vec![Line::styled(r.tool.clone(), t.accent.add_modifier(Modifier::BOLD))];
+        lines.extend(body);
+        if spaced {
+            lines.push(Line::default());
         }
         let why_st = if r.risky { t.error } else { t.dim };
-        lines.extend(wrap::wrap(vec![Span::styled(r.reason.clone(), why_st)], w, &[], &[]));
+        lines.extend(wrap::wrap(
+            vec![Span::styled(r.reason.clone(), why_st)],
+            w,
+            &[Span::styled("why: ", t.dim)],
+            &[Span::raw("     ")],
+        ));
+        if spaced {
+            lines.push(Line::default());
+        }
         match &self.reason {
             Some(reason) => lines.push(Line::from(vec![
                 Span::styled("why not? ", t.warn),
@@ -251,17 +257,18 @@ impl ApprovalCard {
             None => {
                 let mut keys = vec![
                     Span::styled("y", t.ok),
-                    Span::styled(" once  ", t.dim),
+                    Span::styled(" once · ", t.dim),
                     Span::styled("a", t.ok),
-                    Span::styled(" this session  ", t.dim),
+                    Span::styled(" this session · ", t.dim),
                 ];
                 if !r.risky {
                     keys.push(Span::styled("A", t.ok));
-                    keys.push(Span::styled(format!(" always ({})  ", r.rule), t.dim));
+                    keys.push(Span::styled(format!(" always ({}) · ", r.rule), t.dim));
                 }
                 keys.push(Span::styled("n", t.error));
                 keys.push(Span::styled(" deny", t.dim));
-                lines.push(wrap::truncate(keys, w));
+                // Wrapped, not cut: a long rule must not hide `deny`.
+                lines.extend(wrap::wrap(keys, w, &[], &[]));
             }
         }
         lines
@@ -270,7 +277,12 @@ impl ApprovalCard {
     pub fn render(&self, f: &mut Frame, area: Rect, t: &Theme) {
         let title = if self.req.risky { "Safety check" } else { "Allow?" };
         let inner = frame(f, area, title, t);
-        f.render_widget(Paragraph::new(self.lines(inner.width as usize, t)), inner);
+        let w = inner.width as usize;
+        let mut lines = self.lines(w, t, true);
+        if lines.len() > inner.height as usize {
+            lines = self.lines(w, t, false);
+        }
+        f.render_widget(Paragraph::new(lines), inner);
     }
 }
 
@@ -437,14 +449,15 @@ mod tests {
             reply,
         });
         let text: Vec<String> = card
-            .lines(80, &Theme::default())
+            .lines(80, &Theme::default(), true)
             .iter()
             .map(crate::wrap::plain)
             .collect();
         assert!(
-            text[0].ends_with("Inventory as I") && text[1].trim() == "i=I()\"",
+            text[0] == "bash" && text[1].ends_with("Inventory as I") && text[2] == "│ i=I()\"",
             "{text:?}"
         );
+        assert_eq!(text[4], "why: r");
     }
 
     #[test]
