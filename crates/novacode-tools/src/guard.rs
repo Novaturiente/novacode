@@ -1,5 +1,5 @@
 //! Output guards (L5.3), applied once when the result is created (L1.7):
-//! 1. cut at 2000 lines / 50 KB, keeping head or tail, full text in a spill file;
+//! 1. cut at 2000 lines / 50 KB / 2000-byte lines, keeping head or tail, full text in a spill file;
 //! 2. refuse output too big for the context unless `accept_large_output`.
 
 use crate::Keep;
@@ -20,11 +20,38 @@ pub fn estimate_tokens(text: &str) -> u64 {
     novacode_types::estimate::text(text)
 }
 
-/// Cut `text` to the limits. Returns the text to send; when cut, the full text
-/// is written to `spill` and a hint says where.
+/// Longest line kept, in bytes: one base64 blob or minified line must not fill the context.
+pub const MAX_LINE: usize = 2000;
+
+/// Lines longer than [`MAX_LINE`] cut, with how many were cut.
+fn cap_lines(text: &str) -> (std::borrow::Cow<'_, str>, usize) {
+    if !text.split('\n').any(|l| l.len() > MAX_LINE) {
+        return (text.into(), 0);
+    }
+    let mut cut = 0;
+    let mut out = String::with_capacity(text.len().min(MAX_BYTES * 2));
+    for l in text.split_inclusive('\n') {
+        let (body, nl) = l.strip_suffix('\n').map_or((l, ""), |b| (b, "\n"));
+        if body.len() > MAX_LINE {
+            cut += 1;
+            let end = (0..=MAX_LINE).rev().find(|&i| body.is_char_boundary(i)).unwrap_or(0);
+            out.push_str(&body[..end]);
+            out.push_str(&format!("… [+{} chars]", body.len() - end));
+        } else {
+            out.push_str(body);
+        }
+        out.push_str(nl);
+    }
+    (out.into(), cut)
+}
+
+/// Cut `text` to the limits (lines, bytes, line length). Returns the text to send;
+/// when cut, the full text is written to `spill` and a hint says where.
 pub fn truncate(text: &str, keep: Keep, spill: &Path) -> String {
-    let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    if lines.len() <= MAX_LINES && text.len() <= MAX_BYTES {
+    let (capped, long) = cap_lines(text);
+    let lines: Vec<&str> = capped.split_inclusive('\n').collect();
+    let fits = lines.len() <= MAX_LINES && capped.len() <= MAX_BYTES;
+    if fits && long == 0 {
         return text.to_string();
     }
     let mut kept: Vec<&str> = Vec::new();
@@ -49,15 +76,19 @@ pub fn truncate(text: &str, keep: Keep, spill: &Path) -> String {
         .map(std::fs::create_dir_all)
         .transpose()
         .and_then(|_| std::fs::write(spill, text));
-    let where_ = match spilled {
+    let mut where_ = match spilled {
         Ok(()) => format!("Full output: {}", spill.display()),
         Err(e) => format!("Full output could not be saved: {e}"),
     };
+    if long > 0 {
+        where_ = format!("{long} lines over {MAX_LINE} chars were cut. {where_}");
+    }
     let body: String = kept.concat();
     let (shown, total) = (kept.len(), lines.len());
-    match keep {
-        Keep::Head => format!("{body}\n[Showing lines 1-{shown} of {total}. {where_}]"),
-        Keep::Tail => format!("[Showing the last {shown} of {total} lines. {where_}]\n{body}"),
+    match (keep, fits) {
+        (_, true) => format!("{body}\n[{where_}]"),
+        (Keep::Head, _) => format!("{body}\n[Showing lines 1-{shown} of {total}. {where_}]"),
+        (Keep::Tail, _) => format!("[Showing the last {shown} of {total} lines. {where_}]\n{body}"),
     }
 }
 
@@ -101,6 +132,17 @@ mod tests {
         let tail = truncate(&text, Keep::Tail, &spill);
         assert!(tail.ends_with("line 2999\n") && !tail.contains("line 999\n"));
         assert_eq!(truncate("short", Keep::Head, &spill), "short");
+    }
+
+    #[test]
+    fn long_lines_are_cut_and_spilled() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = dir.path().join("s.txt");
+        let blob = format!("url: data:text/html;base64,{}\nnext é\n", "é".repeat(5000));
+        let out = truncate(&blob, Keep::Tail, &spill);
+        assert!(out.len() < 2200 + 200, "{}", out.len());
+        assert!(out.contains("… [+") && out.contains("next é") && out.contains("1 lines over 2000 chars"));
+        assert_eq!(std::fs::read_to_string(&spill).unwrap(), blob);
     }
 
     #[test]

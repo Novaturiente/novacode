@@ -27,6 +27,8 @@ pub fn query_background() -> Option<bool> {
         let bg: u8 = v.rsplit(';').next()?.parse().ok()?;
         Some(!matches!(bg, 7 | 15))
     };
+    // On reload the TUI's terminal is still up (raw): leave it that way afterwards.
+    let was_raw = terminal::is_raw_mode_enabled().unwrap_or(false);
     if terminal::enable_raw_mode().is_err() {
         return from_env();
     }
@@ -49,7 +51,9 @@ pub fn query_background() -> Option<bool> {
             break;
         }
     }
-    let _ = terminal::disable_raw_mode();
+    if !was_raw {
+        let _ = terminal::disable_raw_mode();
+    }
     crate::theme::dark_from_osc11(&String::from_utf8_lossy(&reply)).or_else(from_env)
 }
 

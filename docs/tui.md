@@ -137,6 +137,7 @@ Type `/` to see the list. A line that is only `/something` unknown to novacode i
 | `/copy` | Copy the last reply (also `Ctrl+X`). |
 | `/btw <question>` | Side question. See [below](#side-questions-with-btw). |
 | `/context` | Where the context window goes. |
+| `/docs [question]` | Add a hidden note telling the model where novacode's own docs (`~/.novacode/docs/`) and your config files are, then ask the question if you gave one. Use it to have the session set up or customise novacode. |
 | `/usage` | Tokens and cost per route, cache warming, memory workers and subscription windows. |
 | `/debug` | Route, cache, queues, processes, MCP and log paths, for bug reports. |
 | `/ps` | Open the side panel on the Processes tab, one process at a time with its live output. |

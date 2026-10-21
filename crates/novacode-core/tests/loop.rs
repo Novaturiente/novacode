@@ -546,13 +546,13 @@ async fn cache_miss_is_named_and_logged() {
         .collect();
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(
-        notices[0].starts_with("cache miss: 20070 prompt tokens")
+        notices[0].starts_with("cache miss: 20060 prompt tokens")
             && notices[0].contains("(evicted by the provider: prefix unchanged"),
         "{}",
         notices[0]
     );
     let log = std::fs::read_to_string(home.path().join("logs/cache-misses.jsonl")).unwrap();
-    assert!(log.contains("\"lost\":20070"), "{log}");
+    assert!(log.contains("\"lost\":20060"), "{log}");
 }
 
 /// L11.11 check: a session with a known slow tool writes model, tool and task

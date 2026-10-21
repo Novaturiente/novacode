@@ -37,6 +37,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/new", "start a new session"),
     ("/keys", "show keybindings"),
     ("/context", "where the context window goes"),
+    (
+        "/docs",
+        "point the session at novacode's own docs and config files: /docs [question]",
+    ),
     ("/compact", "replace older messages with the memory notes"),
     ("/tree", "go to any prompt of the session tree"),
     ("/rewind", "go back to before a prompt of this branch"),
@@ -123,6 +127,8 @@ pub enum Cmd {
     ListPrompts(BranchAction),
     /// The host answers with [`UiEvent::Page`].
     Context,
+    /// `/docs`: a hidden note with novacode's docs path and config files.
+    Docs,
     Compact,
     /// Write the session to a file; `true` = HTML (L4.14).
     Export(bool),
@@ -1318,6 +1324,12 @@ impl App {
                 "/login" if !arg.is_empty() => self.login = Some(arg.to_string()),
                 "/login" => self.flash("usage: /login <provider>, e.g. /login claude"),
                 "/context" => self.send(Cmd::Context),
+                "/docs" => {
+                    self.send(Cmd::Docs);
+                    if !arg.is_empty() {
+                        self.send(Cmd::Prompt(arg.to_string()));
+                    }
+                }
                 "/compact" => self.send(Cmd::Compact),
                 "/tree" => self.send(Cmd::ListPrompts(BranchAction::Tree)),
                 "/rewind" => self.send(Cmd::ListPrompts(BranchAction::Rewind)),

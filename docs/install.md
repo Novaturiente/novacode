@@ -107,7 +107,7 @@ What happens depends on how you installed:
 | `novacode` (AUR, source build) | Does nothing. It tells you to update with your AUR helper, for example `paru -Syu`. |
 | `cargo install` or a source build | Does nothing. It tells you to run `git pull && cargo install --locked --path crates/novacode` in your checkout, or to rerun `cargo install --git` with `--force`. |
 
-If you are already current it says `novacode X is the newest release`. The binary's folder must be writable by you, because the update replaces the file. Updates use GitHub's latest (non-prerelease) release. An update never touches `~/.novacode`.
+If you are already current it says `novacode X is the newest release`. The binary's folder must be writable by you, because the update replaces the file. Updates use GitHub's latest (non-prerelease) release. An update never touches your files in `~/.novacode`. The docs ship inside the binary: the first run of a new version rewrites `~/.novacode/docs/` to match it, whichever way you installed.
 
 ## Uninstall
 
@@ -148,6 +148,7 @@ NOVACODE_HOME=/tmp/nc-test novacode
 | `~/.novacode/logs/` | Daily log files (set `NOVACODE_LOG`, for example `NOVACODE_LOG=debug`, to change the level) |
 | `~/.novacode/cache/` | Model catalog and subscription quota caches |
 | `~/.novacode/run/` | Records of live sessions (used by `agents`, `attach`, `status`) |
+| `~/.novacode/docs/` | This documentation for the installed version (rewritten on every update; don't edit it). `/docs` points a session at it |
 
 In a project, `<project>/.novacode/settings.json` and friends hold project config. They only load in folders you trust. See [security](security.md).
 

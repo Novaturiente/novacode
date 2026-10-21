@@ -41,7 +41,7 @@ Every call, including calls from `codemode` scripts, goes through the same permi
 
 ### Output caps
 
-Output that reaches the model is cut at **2000 lines or 50 KB**. When it is cut, the full text is saved to `~/.novacode/spill/<session id>-<call id>.txt` (secrets already masked) and the result tells the model where. `bash` keeps the end of the output; most other tools keep the start.
+Output that reaches the model is cut at **2000 lines or 50 KB**, and any line longer than 2000 bytes is cut with a `… [+N chars]` marker (a base64 blob or a minified file can't fill the context). When it is cut, the full text is saved to `~/.novacode/spill/<session id>-<call id>.txt` (secrets already masked) and the result tells the model where. `bash` keeps the end of the output; most other tools keep the start.
 
 Two limits protect the context window:
 

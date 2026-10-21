@@ -608,6 +608,7 @@ pub async fn attach(
                 Cmd::Compact => ClientCmd::Compact,
                 Cmd::Export(html) => ClientCmd::Export { html },
                 Cmd::Mcp => ClientCmd::Prompt { text: "/mcp".into() },
+                Cmd::Docs => ClientCmd::Prompt { text: "/docs".into() },
                 Cmd::Btw(q) => ClientCmd::Prompt {
                     text: format!("/btw {q}"),
                 },

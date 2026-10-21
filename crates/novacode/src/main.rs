@@ -28,6 +28,7 @@ use tokio::sync::{broadcast, mpsc};
 mod activity;
 mod agents;
 mod diag;
+mod docs;
 mod doctor;
 mod goals;
 mod host;
@@ -340,6 +341,9 @@ fn main() -> ExitCode {
         Err(e) => return fail(e.into()),
     };
     diag::install_crash_hook(&paths);
+    if let Err(e) = docs::install(&paths) {
+        tracing::warn!(%e, "writing ~/.novacode/docs");
+    }
     diag::mark("logging");
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -965,7 +969,13 @@ impl Ctx {
     /// Agent definitions with the user's `agents.<name>` settings applied.
     fn agent_defs(&self) -> Vec<agents::Def> {
         let mut d = agents::defs(&self.resource_dirs("agents", "agents")).0;
-        agents::configure(&mut d, |name| self.settings.get(&format!("agents.{name}")));
+        // Read key by key: each documented key is checked (debug builds assert on the parent).
+        agents::configure(&mut d, |name| {
+            Some(agents::AgentCfg {
+                tools: self.settings.get(&format!("agents.{name}.tools")),
+                mcp: self.settings.get(&format!("agents.{name}.mcp")),
+            })
+        });
         d
     }
 

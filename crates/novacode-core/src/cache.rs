@@ -37,7 +37,14 @@ pub fn miss(prev: &Sent, provider: &str, req: &Request, usage: &Usage, ttl: Opti
         .iter()
         .map(|t| novacode_types::estimate::text(t))
         .sum::<u64>();
-    let expected = prev.usage.prompt_total().min(usage.prompt_total()).saturating_sub(tail);
+    // A provider that reports writes (explicit markers) cached exactly read + write; its
+    // uncached input (a system delta after the last marker) was never cached, so not a miss.
+    let cached = if prev.usage.cache_write > 0 {
+        prev.usage.cache_read + prev.usage.cache_write
+    } else {
+        prev.usage.prompt_total().saturating_sub(tail)
+    };
+    let expected = cached.min(usage.prompt_total());
     let noise = (expected / 20).max(1024);
     if usage.cache_read + noise >= expected {
         return None;
@@ -196,7 +203,12 @@ mod tests {
         let lost = miss(&prev, "claude", &next, &usage(20_000, 30_100, 4), ttl)
             .unwrap()
             .lost;
-        assert_eq!(lost, 30_010);
+        assert_eq!(lost, 30_000);
+        // Live numbers: after a rebuild 7.5k of input sat after the marker; the next call
+        // reads what was written and writes that input. Not an eviction.
+        let mut rebuilt = prev.clone();
+        rebuilt.usage = usage(0, 55_519, 7_504);
+        assert_eq!(miss(&rebuilt, "claude", &next, &usage(55_519, 7_776, 2), ttl), None);
         // A provider that reports no caching never "misses".
         let mut quiet = prev.clone();
         quiet.usage = usage(0, 0, 50_000);

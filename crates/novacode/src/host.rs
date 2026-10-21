@@ -266,6 +266,14 @@ impl Host {
                 });
             }
             Cmd::Compact => h.compact(),
+            Cmd::Docs => {
+                h.remind_as("docs", crate::docs::brief(&self.paths, &self.cwd), false);
+                let text = format!(
+                    "novacode docs added to the context: {}",
+                    crate::docs::dir(&self.paths).display()
+                );
+                let _ = ui.send(UiEvent::Notice { text, error: false });
+            }
             Cmd::Export(html) => {
                 let text = match self.export(html) {
                     Ok(p) => format!("exported to {}", p.display()),
@@ -450,6 +458,7 @@ impl Host {
             .map_or((t, ""), |(a, b)| (a, b.trim()));
         Some(Ok(match name {
             "/compact" => Cmd::Compact,
+            "/docs" if arg.is_empty() => Cmd::Docs,
             "/context" => Cmd::Context,
             "/mcp" => Cmd::Mcp,
             "/name" if !arg.is_empty() => Cmd::Rename(arg.into()),
