@@ -472,6 +472,7 @@ mod tests {
                         question: String::new(),
                         chosen: vec!["Remove worktree".into()],
                         text: None,
+                        preview: None,
                     }])
                 })
             }

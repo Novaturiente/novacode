@@ -95,7 +95,7 @@ defs! {
     ModelSelect, "app.model.select", App, ["ctrl+l"], "Pick a model";
     ToolsExpand, "app.tools.expand", App, ["ctrl+o"], "Show every tool's output in full, or short again";
     TurnsToggle, "app.turns.toggle", App, ["alt+o"], "Expand or collapse finished turns";
-    ExternalEditor, "app.editor.external", App, ["ctrl+g"], "Edit the prompt in $EDITOR";
+    ExternalEditor, "app.editor.external", App, ["ctrl+g"], "Edit the prompt (or a question's plan) in your editor";
     FollowUp, "app.message.followUp", App, ["alt+enter"], "Queue as a follow-up";
     MessageCopy, "app.message.copy", App, ["ctrl+x"], "Copy the last reply";
     InputCopy, "app.input.copy", App, ["alt+c"], "Copy what's in the input box";

@@ -35,6 +35,10 @@ pub struct AskForm {
     /// A note sent with the picked choice(s), and the row it was written on.
     notes: Vec<(String, usize)>,
     noting: bool,
+    /// (question, choice) whose preview the user rewrote in the editor.
+    edited: BTreeSet<(usize, usize)>,
+    /// The key that opens the editor, for the keys line (empty = not shown).
+    pub edit_key: String,
 }
 
 pub enum Done {
@@ -60,6 +64,33 @@ impl AskForm {
             typing: false,
             notes: vec![(String::new(), 0); n],
             noting: false,
+            edited: BTreeSet::new(),
+            edit_key: String::new(),
+        }
+    }
+
+    /// What the external editor opens: the text being typed, the note, or the focused choice's preview.
+    pub fn edit_text(&self) -> Option<String> {
+        let q = self.q;
+        if self.typing {
+            return Some(self.typed[q].clone());
+        }
+        if self.noting {
+            return Some(self.notes[q].0.clone());
+        }
+        self.cur().options.get(self.sel[q])?.preview.clone()
+    }
+
+    /// The editor's result goes back where [`edit_text`](Self::edit_text) took it from.
+    pub fn set_edited(&mut self, text: String) {
+        let (q, k) = (self.q, self.sel[self.q]);
+        if self.typing {
+            self.typed[q] = text;
+        } else if self.noting {
+            self.notes[q].0 = text;
+        } else if let Some(o) = self.req.questions[q].options.get_mut(k) {
+            o.preview = Some(text);
+            self.edited.insert((q, k));
         }
     }
 
@@ -87,10 +118,17 @@ impl AskForm {
                     .into_iter()
                     .find(|t| !t.is_empty())
                     .map(String::from);
+                // A preview the user rewrote (an edited plan): the chosen one's, else any.
+                let edited = |k: &usize| self.edited.contains(&(i, *k));
+                let preview = (0..q.options.len())
+                    .filter(edited)
+                    .max_by_key(|&k| chosen.contains(&q.options[k].label))
+                    .and_then(|k| q.options[k].preview.clone());
                 Reply {
                     question: q.question.clone(),
                     chosen,
                     text,
+                    preview,
                 }
             })
             .collect()
@@ -268,6 +306,9 @@ impl AskForm {
         gap(&mut out);
         if let Some(p) = q.options.get(sel).and_then(|o| o.preview.as_ref()) {
             // Wrapped, not cut: a plan's lines are long. Capped so the keys line stays on screen.
+            if self.edited.contains(&(self.q, sel)) {
+                out.push(Line::styled("   edited — the choice sends this text", t.accent));
+            }
             let bar = [Span::styled("   │ ", t.code)];
             let rows: Vec<Line<'static>> = p
                 .lines()
@@ -280,7 +321,8 @@ impl AskForm {
             }
             gap(&mut out);
         }
-        let keys = if self.typing {
+        let has_preview = q.options.get(sel).is_some_and(|o| o.preview.is_some());
+        let mut keys = if self.typing {
             "Enter answer · Esc back to the choices"
         } else if self.noting && q.multi {
             "Enter pick with note · Esc back"
@@ -290,7 +332,16 @@ impl AskForm {
             "↑↓ move · Space pick · n note · Enter next · ← back · Esc dismiss"
         } else {
             "↑↓ move · Enter choose · n note · 1-9 pick · ← back · Esc dismiss"
-        };
+        }
+        .to_string();
+        if !self.edit_key.is_empty() && (self.typing || self.noting || has_preview) {
+            let what = if has_preview && !self.typing && !self.noting {
+                "view/edit in editor"
+            } else {
+                "editor"
+            };
+            keys = format!("{} {what} · {keys}", self.edit_key);
+        }
         // Wrapped, so a narrow form never hides "Esc dismiss".
         out.extend(wrap::wrap(vec![Span::styled(keys, t.dim)], w, &[], &[]));
         out
@@ -475,6 +526,45 @@ mod tests {
         assert_eq!(r[1].chosen, ["a", "c"]);
         assert_eq!((r[2].chosen.len(), r[2].text.as_deref()), (0, Some("nova")));
         assert!(matches!(f.handle(key(KeyCode::Esc)), Done::Dismissed));
+    }
+
+    #[test]
+    fn edited_plan_goes_with_the_answer() {
+        let mut approve = Choice {
+            label: "Approve".into(),
+            description: None,
+            preview: Some("1. old step".into()),
+            recommended: false,
+        };
+        let keep = Choice {
+            preview: None,
+            label: "Keep planning".into(),
+            ..approve.clone()
+        };
+        approve.recommended = true;
+        let (tx, _rx) = oneshot::channel();
+        let mut f = AskForm::new(AskReq {
+            id: 1,
+            questions: vec![Question {
+                question: "Approve this plan?".into(),
+                header: None,
+                options: vec![approve, keep],
+                multi: false,
+            }],
+            reply: tx,
+        });
+        f.edit_key = "ctrl+g".into();
+        assert_eq!(f.edit_text().as_deref(), Some("1. old step"));
+        let keys: String = f.lines(80, &Theme::default(), true).iter().map(wrap::plain).collect();
+        assert!(keys.contains("ctrl+g view/edit in editor"), "{keys}");
+        f.set_edited("1. new step".into());
+        let Done::Answered(r) = f.handle(key(KeyCode::Enter)) else {
+            panic!()
+        };
+        assert_eq!(
+            (r[0].chosen[0].as_str(), r[0].preview.as_deref()),
+            ("Approve", Some("1. new step"))
+        );
     }
 
     #[test]

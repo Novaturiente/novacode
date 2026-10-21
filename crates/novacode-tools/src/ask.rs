@@ -36,6 +36,9 @@ pub fn render(replies: &[Reply]) -> String {
             if a.is_empty() {
                 a = "(no answer)".into();
             }
+            if let Some(p) = &r.preview {
+                a += &format!("\n(the user rewrote that choice's preview:)\n{p}");
+            }
             format!("Q: {}\nA: {a}", r.question)
         })
         .collect::<Vec<_>>()
@@ -101,6 +104,7 @@ mod tests {
             question: "Which db?".into(),
             chosen: vec!["Postgres".into()],
             text: Some("with pgvector".into()),
+            preview: None,
         };
         let o = AskUser(Arc::new(Fixed(Some(vec![r]))))
             .execute(args.clone(), &ctx(d.path()))

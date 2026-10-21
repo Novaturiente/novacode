@@ -776,4 +776,7 @@ pub struct Reply {
     /// What the user typed instead of (or as well as) picking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// The chosen choice's preview as the user rewrote it (an edited plan).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
 }

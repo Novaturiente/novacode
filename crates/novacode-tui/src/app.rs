@@ -360,6 +360,10 @@ pub struct App {
     anchor: Option<(usize, usize)>,
     shown: Option<Shown>,
     selection: Option<(Pos, Pos)>,
+    /// A drag outside the chat (status line, dialogs, panel): (start, end) as (column, row).
+    screen_sel: Option<((u16, u16), (u16, u16))>,
+    /// The last frame as drawn, to copy a screen selection from.
+    frame: ratatui::buffer::Buffer,
     flash: Option<(String, Instant)>,
     last_ctrl_c: Option<Instant>,
     last_esc: Option<Instant>,
@@ -472,6 +476,8 @@ impl App {
             anchor: None,
             shown: None,
             selection: None,
+            screen_sel: None,
+            frame: Default::default(),
             flash: None,
             last_ctrl_c: None,
             last_esc: None,
@@ -532,7 +538,11 @@ impl App {
         match ev {
             UiEvent::Approve(req) => self.approvals.push_back(ApprovalCard::new(req)),
             UiEvent::ApprovalDone { id } => self.approvals.retain(|c| c.req.id != id),
-            UiEvent::Ask(req) => self.asks.push_back(crate::ask::AskForm::new(req)),
+            UiEvent::Ask(req) => {
+                let mut form = crate::ask::AskForm::new(req);
+                form.edit_key = self.keymap.keys(A::ExternalEditor);
+                self.asks.push_back(form);
+            }
             UiEvent::AskDone { id } => self.asks.retain(|f| f.req.id != id),
             UiEvent::Models { result: Ok(items) } => self.overlay = Some(Overlay::Models(Picker::new("Model", items))),
             UiEvent::Models { result: Err(e) } => self.tr.notice(format!("could not list models: {e}"), true),
@@ -882,6 +892,9 @@ impl App {
                 self.editor.paste(&s)
             }
             Event::Mouse(m) if self.overlay.is_none() => self.on_mouse(m),
+            Event::Mouse(m) => {
+                self.on_screen_mouse(m);
+            }
             Event::FocusGained => self.send(Cmd::Focus(true)),
             Event::FocusLost => self.send(Cmd::Focus(false)),
             _ => {}
@@ -907,6 +920,7 @@ impl App {
     pub fn on_key(&mut self, k: KeyEvent) {
         let now = Instant::now();
         self.selection = None;
+        self.screen_sel = None;
         if let Some(card) = self.approvals.front_mut() {
             if let Some(ans) = card.handle(k) {
                 self.answer(ans);
@@ -915,6 +929,10 @@ impl App {
         }
         if let Some(form) = self.asks.front_mut() {
             use crate::ask::Done;
+            if self.keymap.lookup(&k, &[Scope::App]) == Some(A::ExternalEditor) && form.edit_text().is_some() {
+                self.external_editor = true;
+                return;
+            }
             let done = form.handle(k);
             self.dirty = true;
             let replies = match done {
@@ -1487,6 +1505,21 @@ impl App {
         self.anchor = Some((turn, top - start));
     }
 
+    /// What Ctrl+G opens: the question form's text or preview (a plan), else the prompt.
+    pub fn editor_text(&self) -> String {
+        match self.asks.front().and_then(|f| f.edit_text()) {
+            Some(t) => t,
+            None => self.editor.text().to_string(),
+        }
+    }
+
+    pub fn set_editor_text(&mut self, text: String) {
+        match self.asks.front_mut().filter(|f| f.edit_text().is_some()) {
+            Some(f) => f.set_edited(text),
+            None => self.editor.set_text(&text),
+        }
+    }
+
     fn at(&self, col: u16, row: u16) -> Option<Pos> {
         let s = self.shown.as_ref()?;
         s.area.contains(Position::new(col, row)).then(|| Pos {
@@ -1495,7 +1528,58 @@ impl App {
         })
     }
 
+    /// Select by dragging anywhere the chat isn't; the text is copied on release.
+    /// Returns false when the event isn't part of such a drag.
+    fn on_screen_mouse(&mut self, m: MouseEvent) -> bool {
+        let at = (m.column, m.row);
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => self.screen_sel = Some((at, at)),
+            MouseEventKind::Drag(MouseButton::Left) if self.screen_sel.is_some() => {
+                if let Some((_, b)) = &mut self.screen_sel {
+                    *b = at;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.screen_sel.is_some() => {
+                let (a, b) = self.screen_sel.take().unwrap();
+                if a != b {
+                    let text = screen_text(&self.frame, a, b);
+                    if !text.is_empty() {
+                        crate::term::copy(&text);
+                        self.flash(format!("copied {} chars", text.chars().count()));
+                    }
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// After a draw: keep the frame for copying, then paint the screen selection.
+    pub fn finish_frame(&mut self, f: &mut Frame) {
+        let buf = f.buffer_mut();
+        self.frame = buf.clone();
+        let Some((a, b)) = self.screen_sel else { return };
+        let (a, b) = if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) };
+        for row in a.1..=b.1 {
+            let (from, to) = (
+                if row == a.1 { a.0 } else { 0 },
+                if row == b.1 { b.0 } else { u16::MAX },
+            );
+            for col in from..=to.min(buf.area.width.saturating_sub(1)) {
+                if let Some(c) = buf.cell_mut(Position::new(col, row)) {
+                    c.set_style(self.theme.selection);
+                }
+            }
+        }
+    }
+
     fn on_mouse(&mut self, m: MouseEvent) {
+        let starts = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
+        if (starts && self.at(m.column, m.row).is_none() || !starts && self.screen_sel.is_some())
+            && self.on_screen_mouse(m)
+        {
+            return;
+        }
         match m.kind {
             MouseEventKind::ScrollUp => self.scroll_by(-WHEEL),
             MouseEventKind::ScrollDown => self.scroll_by(WHEEL),
@@ -2113,4 +2197,49 @@ fn browse(cwd: &str, q: &str) -> Option<Vec<(String, String, String)>> {
             })
             .collect(),
     )
+}
+
+/// The text between two screen cells, row by row like a terminal selection.
+/// Dialog borders at either end of a row are left out.
+fn screen_text(buf: &ratatui::buffer::Buffer, a: (u16, u16), b: (u16, u16)) -> String {
+    let (a, b) = if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) };
+    let mut rows = Vec::new();
+    for row in a.1..=b.1.min(buf.area.height.saturating_sub(1)) {
+        let (from, to) = (
+            if row == a.1 { a.0 } else { 0 },
+            if row == b.1 { b.0 } else { u16::MAX },
+        );
+        let mut line = String::new();
+        let mut skip = 0;
+        for col in from..=to.min(buf.area.width.saturating_sub(1)) {
+            let Some(c) = buf.cell(Position::new(col, row)) else {
+                break;
+            };
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            // A wide character fills the next cell too.
+            skip = c.symbol().width().saturating_sub(1);
+            line.push_str(c.symbol());
+        }
+        let border = |ch: char| "│╭╮╰╯─┃┏┓┗┛━".contains(ch);
+        rows.push(line.trim().trim_matches(border).trim().to_string());
+    }
+    rows.join("\n").trim().to_string()
+}
+
+#[cfg(test)]
+mod screen_tests {
+    #[test]
+    fn copies_screen_text_without_borders() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 3));
+        buf.set_string(0, 0, "╭ Question ───────╮", ratatui::style::Style::default());
+        buf.set_string(0, 1, "│ Pick 数据 one   │", ratatui::style::Style::default());
+        buf.set_string(0, 2, "╰─────────────────╯", ratatui::style::Style::default());
+        assert_eq!(super::screen_text(&buf, (0, 1), (19, 1)), "Pick 数据 one");
+        assert_eq!(super::screen_text(&buf, (9, 1), (2, 0)), "Question\nPick 数据");
+    }
 }

@@ -185,14 +185,29 @@ impl Tool for PlanComplete {
                 options: vec![approve, choice("Keep planning", "Type what to change.")],
                 multi: false,
             };
+            let edited = |r: &novacode_types::Reply| {
+                r.preview
+                    .as_ref()
+                    .map(|p| format!("\n\nThe user edited the plan in their editor. This is the plan now:\n\n{p}"))
+                    .unwrap_or_default()
+            };
             match self.asker.ask(vec![q]).await {
                 Some(r) if r[0].chosen.first().is_some_and(|c| c == "Approve") => {
                     let _ = self.modes.set(None);
-                    ToolOutput::text("The user approved the plan. Plan mode is off: build it now, exactly as approved.")
+                    let note = r[0]
+                        .text
+                        .as_ref()
+                        .map(|t| format!(" The user adds: {t}"))
+                        .unwrap_or_default();
+                    ToolOutput::text(format!(
+                        "The user approved the plan. Plan mode is off: build it now, exactly as approved.{note}{}",
+                        edited(&r[0])
+                    ))
                 }
                 Some(r) => ToolOutput::text(format!(
-                    "Not approved; still in plan mode. The user says: {}",
-                    r[0].text.as_deref().unwrap_or("revise the plan")
+                    "Not approved; still in plan mode. The user says: {}{}",
+                    r[0].text.as_deref().unwrap_or("revise the plan"),
+                    edited(&r[0])
                 )),
                 None => ToolOutput::text("The user dismissed it; still in plan mode. Ask what they want changed."),
             }

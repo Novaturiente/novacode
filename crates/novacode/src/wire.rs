@@ -487,6 +487,7 @@ mod tests {
                         question: "Which db?".into(),
                         chosen: vec!["SQLite".into()],
                         text: None,
+                        preview: None,
                     }]),
                 },
             },

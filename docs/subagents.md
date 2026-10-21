@@ -162,6 +162,8 @@ When the plan is ready, `plan_complete` shows it to you with two answers:
 - **Approve**: plan mode ends and the model builds it.
 - **Keep planning**: type what to change; it stays read-only and revises.
 
+The form shows the first 24 lines of the plan. `Ctrl+G` opens the whole plan in your editor. Save and quit to bring your edits back: the form marks the plan "edited", and whichever answer you pick sends the edited plan to the model as the plan to build (or to revise).
+
 ### Mode presets
 
 Plan mode is one preset. You can define your own in settings under `modes`:

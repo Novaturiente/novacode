@@ -81,8 +81,8 @@ pub async fn run_in(
         }
         if app.external_editor {
             app.external_editor = false;
-            match term::external_editor(t, app.editor.text()) {
-                Ok(Some(s)) => app.editor.set_text(&s),
+            match term::external_editor(t, &app.editor_text()) {
+                Ok(Some(s)) => app.set_editor_text(s),
                 Ok(None) => {}
                 Err(e) => app.tr.notice(format!("$EDITOR failed: {e}"), true),
             }
@@ -93,7 +93,13 @@ pub async fn run_in(
                 // One pacer step per drawn frame (L9.7).
                 let behind = app.pace();
                 // L9.3: a panic while drawing is reported, not fatal.
-                match std::panic::catch_unwind(AssertUnwindSafe(|| t.draw(|f| app.draw(f)).map(|_| ()))) {
+                match std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    t.draw(|f| {
+                        app.draw(f);
+                        app.finish_frame(f);
+                    })
+                    .map(|_| ())
+                })) {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => break Err(e),
                     Err(_) => {

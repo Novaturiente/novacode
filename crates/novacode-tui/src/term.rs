@@ -125,11 +125,24 @@ pub fn suspend(t: &mut Term) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Ctrl+G: edit `text` in `$VISUAL`/`$EDITOR` (default `vi`). `None` if unchanged.
+/// The editor to run: `$VISUAL`, `$EDITOR`, else the first of nvim, nano, emacs, vim, vi on PATH.
+pub fn editor_command() -> String {
+    let set = |k| std::env::var(k).ok().filter(|v: &String| !v.trim().is_empty());
+    set("VISUAL").or_else(|| set("EDITOR")).unwrap_or_else(|| {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let found = |b: &&&str| std::env::split_paths(&path).any(|d| d.join(b).is_file());
+        match ["nvim", "nano", "emacs", "vim"].iter().find(found) {
+            // In the terminal, not a GUI window.
+            Some(&"emacs") => "emacs -nw".into(),
+            Some(b) => b.to_string(),
+            None => "vi".into(),
+        }
+    })
+}
+
+/// Ctrl+G: edit `text` in [`editor_command`]. `None` if unchanged.
 pub fn external_editor(t: &mut Term, text: &str) -> std::io::Result<Option<String>> {
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".into());
+    let editor = editor_command();
     let path = std::env::temp_dir().join(format!("novacode-prompt-{}.md", std::process::id()));
     std::fs::write(&path, text)?;
     restore();

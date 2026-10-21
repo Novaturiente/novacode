@@ -859,6 +859,7 @@ mod tests {
                         question: q[0].question.clone(),
                         chosen: vec![q[0].options[1].label.clone()],
                         text: None,
+                        preview: None,
                     }])
                 })
             }

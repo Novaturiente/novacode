@@ -2,7 +2,7 @@
 
 This page covers the novacode screen, the editor, slash commands, key bindings and the look of the UI (themes, status line, icons, images).
 
-novacode runs full screen in your terminal's alternate screen. The mouse is on: the wheel scrolls, a click folds or unfolds a tool block or thinking line, and dragging over text copies it to the clipboard.
+novacode runs full screen in your terminal's alternate screen. The mouse is on: the wheel scrolls, a click folds or unfolds a tool block or thinking line, and dragging over text copies it to the clipboard. That works anywhere on screen: the chat, the status line, question and approval dialogs, pickers and the side panel (dialog borders are left out of the copy).
 
 ## Layout
 
@@ -75,7 +75,7 @@ The pane closes when the session's window closes. See [config](config.md) for al
 | Prompt history | `Up` at the top line, `Down` at the bottom line. History is the prompts of the current session. |
 | Search history | `Ctrl+R`, type, `Ctrl+R` again for older matches, `Enter` to use, `Esc` to cancel. |
 | Complete | `Tab` or `Enter` in the popup. Works for `/commands` and `@files`. |
-| Edit in your editor | `Ctrl+G` opens `$VISUAL`, else `$EDITOR`, else `vi`. Save and quit to bring the text back. |
+| Edit in your editor | `Ctrl+G` opens `$VISUAL`, else `$EDITOR`, else the first of `nvim`, `nano`, `emacs -nw`, `vim`, `vi` found. Save and quit to bring the text back. In a question form it opens what you are typing, or the focused choice's preview (a plan) to read in full or edit. |
 | Copy the input | `Alt+C`. |
 | Clear | `Ctrl+C` clears the editor. `Esc` twice quickly does too. |
 
@@ -189,7 +189,7 @@ Press `Alt+/` or type `/keys` to see the live table, including your changes. Typ
 | `app.model.select` | `Ctrl+L` | Pick a model. |
 | `app.tools.expand` | `Ctrl+O` | Show every tool's output in full, or short again. |
 | `app.turns.toggle` | `Alt+O` | Expand or collapse finished turns. |
-| `app.editor.external` | `Ctrl+G` | Edit the prompt in `$EDITOR`. |
+| `app.editor.external` | `Ctrl+G` | Edit the prompt, or a question form's text or plan, in your editor. |
 | `app.message.followUp` | `Alt+Enter` | Queue as a follow-up. |
 | `app.message.copy` | `Ctrl+X` | Copy the last reply. |
 | `app.input.copy` | `Alt+C` | Copy what is in the input box. |
