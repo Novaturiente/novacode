@@ -22,7 +22,7 @@ The panel has tabs. Switch tabs with `Tab` and `Shift+Tab` or the number keys `1
 | Tab | Shows |
 |---|---|
 | Agent | The goal, the todo list and subagents. Subagents show from the oldest prompt that still has one running up to the newest prompt that started any; older finished ones are hidden (the title counts them). |
-| Processes | One process at a time: its status, command and live output (the program's own colors, else errors red, warnings yellow, success green, URLs blue). Running ones come first. `/ps` opens the panel here with focus. |
+| Processes | A list of processes, running ones first: status, run time, command and the last output line. `Enter` or a click opens the process popup. |
 | Usage stats | Bars for context use (and a split into system prompt, tools and messages), cache hits (last request and session) and subscription windows; sparklines of cache hit and cost (or output tokens) per request; token totals and cost; MCP servers with connected or failed state and tool counts; how many skills, prompts, agents, extensions, packages and context files loaded, and running processes and subagents. `Ctrl+Alt+U` opens it. |
 | Timing | Where the time of each task went, with a sparkline of task times. |
 | Files | Files the model read or edited, edited first, each with `+added −removed` lines since the session started. `Enter` or a click opens the file in your editor: in nvim or vim as a diff against the session start (`-d`), else the file alone. |
@@ -35,9 +35,8 @@ Extensions can add tabs too (see [extensions](extensions.md)).
 | `Ctrl+Alt+U` | Open the panel on Usage stats with focus. Again closes it. |
 | `Ctrl+Alt+F` | Give the panel the keys. `Esc` or `q` gives them back. |
 | `Up`/`Down` (or `k`/`j`) | Move in the focused panel. |
-| `Enter` | Run the action of the selected row (Files: open it; extension tabs: their action). |
+| `Enter` | Run the action of the selected row (Files: open it; Processes: show its output; extension tabs: their action). |
 | Mouse | Wheel scrolls the panel, a click picks a tab or a row, a drag copies text. |
-| `Left`/`Right` (or `h`/`l`) | Processes tab: the previous or next process. `Up`/`Down` scroll its output; `PageUp`/`PageDown` scroll by 10; `End` or `G` follows the tail again. |
 
 The panel needs a terminal at least 100 columns wide. On a narrower screen it stays hidden and open todos show as a short block above the editor instead. Its width is a quarter of the screen, at least 40 columns and at most half.
 
@@ -142,7 +141,7 @@ Type `/` to see the list. A line that is only `/something` unknown to novacode i
 | `/docs [question]` | Add a hidden note telling the model where novacode's own docs (`~/.novacode/docs/`) and your config files are, then ask the question if you gave one. Use it to have the session set up or customise novacode. |
 | `/usage` | Tokens and cost per route, cache warming, memory workers and subscription windows. |
 | `/debug` | Route, cache, queues, processes, MCP and log paths, for bug reports. |
-| `/ps` | Open the side panel on the Processes tab, one process at a time with its live output. |
+| `/ps` | Open the process popup: one process at a time with its live output in the program's own colors (else errors red, warnings yellow, success green, URLs blue). `←`/`→` switch process, `↑`/`↓` and `PageUp`/`PageDown` scroll, `g`/`G` jump to the top or back to the live tail, `Esc` closes. |
 | `/mcp` | MCP servers: status and tool counts. See [mcp](mcp.md). |
 | `/login [provider]` | Log in from a dialog: no provider = a list of all of them. Shows the sign-in URL (`Ctrl+X` copy, `Ctrl+O` open), a device code, or a box for a pasted code / API key; the session reloads after. Several accounts need `novacode login --account` on the command line. See [providers](providers.md). |
 | `/keys` (or `/help`) | Show the key bindings. |

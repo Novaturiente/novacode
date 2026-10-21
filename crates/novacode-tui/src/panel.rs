@@ -118,6 +118,8 @@ pub enum PanelAction {
     Command(String),
     /// Open a file from the Files tab in the editor, diffed against the session start.
     OpenFile(String),
+    /// Show a process's output in the `/ps` popup.
+    OpenProc(String),
     /// Tell the owning extension: (ext, tab, node id, action or key).
     Ext {
         ext: String,
@@ -147,11 +149,8 @@ pub struct Panel {
     was_pending: bool,
     /// `ui.panel.auto: false` (or the tmux pane hosts it): never opens by itself.
     pub never_auto: bool,
-    /// `/ps` (L5.11): processes from the host, shown one at a time in the Processes tab.
+    /// Processes from the host (L5.11): the Processes tab lists them, the `/ps` popup shows one.
     pub procs: Vec<crate::procs::ProcView>,
-    proc_i: usize,
-    /// Output rows scrolled up from the bottom (0 = follow the tail).
-    proc_scroll: usize,
     /// Session facts from the host (Usage stats tab).
     pub host: HostInfo,
     /// Runs started so far: a subagent belongs to the run (user prompt) it was spawned in.
@@ -263,8 +262,6 @@ impl Default for Panel {
             was_pending: false,
             never_auto: false,
             procs: Vec::new(),
-            proc_i: 0,
-            proc_scroll: 0,
             host: HostInfo::default(),
             run: 0,
             agent_set: BTreeMap::new(),
@@ -285,36 +282,60 @@ impl Panel {
     /// New process list from the host; keeps the shown process if it is still there.
     pub fn set_procs(&mut self, mut v: Vec<crate::procs::ProcView>) {
         crate::procs::order(&mut v);
-        let cur = self.procs.get(self.proc_i).map(|p| p.id.clone());
-        self.proc_i = cur.and_then(|id| v.iter().position(|p| p.id == id)).unwrap_or(0);
         self.procs = v;
+        self.refresh_procs();
     }
 
-    /// `/ps`: open and focus the panel on the Processes tab, first (running) process.
-    pub fn show_procs(&mut self) {
-        self.shown = Some("processes".into());
-        self.pinned = Some(true);
-        self.visible = true;
-        self.focused = true;
-        self.proc_i = 0;
-        self.proc_scroll = 0;
-    }
-
-    /// Close it and hand control back to the automatic show/hide.
-    pub fn hide(&mut self) {
-        self.visible = false;
-        self.focused = false;
-        self.pinned = None;
-        self.shown = Some("agent".into());
+    /// Processes tab: one row per process, the host's list when it has sent one.
+    /// Enter or a click opens its output.
+    fn refresh_procs(&mut self) {
+        let now = now_ms();
+        let known: Vec<&str> = self.procs.iter().map(|p| p.id.as_str()).collect();
+        // Started or ended since the host's last list: from the events.
+        let mut nodes: Vec<Node> = self
+            .stats
+            .procs
+            .iter()
+            .rev()
+            .filter(|(id, _)| !known.contains(&id.as_str()))
+            .map(|(id, (name, end))| {
+                let mut n = node(id, name.clone());
+                n.tag = Some(id.clone());
+                n.status = Some(end.clone().unwrap_or_else(|| "running".into()));
+                n.dim = end.is_some();
+                n.actions.insert("enter".into(), "output".into());
+                n
+            })
+            .collect::<Vec<_>>();
+        nodes.extend(self.procs.iter().enumerate().map(|(i, p)| {
+            let mut n = node(&p.id, p.name.clone());
+            n.tag = Some(p.id.clone());
+            n.status = Some(p.status.clone());
+            n.dim = p.status != "running";
+            n.order = Some(i as f64);
+            let mut state = p.state.clone();
+            if p.status == "running" {
+                state += &format!(" · {}", clock(now.saturating_sub(p.started_ms)));
+            }
+            n.detail = vec![format!("{state} · $ {}", p.command)];
+            let last = p
+                .output
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty() && *l != "[stderr]");
+            if let Some(l) = last {
+                let plain: String = crate::procs::plain(l);
+                n.detail.push(format!("› {}", plain.trim()));
+            }
+            n.actions.insert("enter".into(), "output".into());
+            n
+        }));
+        self.set_nodes("processes", "procs", nodes);
     }
 
     /// The Processes tab is on screen: the host's list should be kept fresh.
     pub fn procs_shown(&self) -> bool {
         self.visible && self.shown.as_deref() == Some("processes")
-    }
-
-    fn proc_view(&self) -> bool {
-        self.shown.as_deref() == Some("processes") && !self.procs.is_empty()
     }
 
     /// Subagents still running (the `agents` status segment).
@@ -393,18 +414,21 @@ impl Panel {
         let r = (*self.line_rows.get(line)?)?;
         self.sel = r;
         let tab = self.current()?;
-        if tab.name == "files" && tab.owner.is_none() {
-            let rows = self.rows();
-            return rows.get(r).map(|x| PanelAction::OpenFile(x.node.id.clone()));
+        if tab.owner.is_none() && matches!(tab.name.as_str(), "files" | "processes") {
+            let files = tab.name == "files";
+            let id = self.rows().get(r)?.node.id.clone();
+            return Some(if files {
+                PanelAction::OpenFile(id)
+            } else {
+                PanelAction::OpenProc(id)
+            });
         }
         None
     }
 
     /// The mouse wheel over the panel.
     pub fn wheel(&mut self, up: bool) {
-        if self.proc_view() {
-            let _ = self.key(if up { "up" } else { "down" });
-        } else if self.interactive() {
+        if self.interactive() {
             let n = self.rows().len();
             self.sel = if up {
                 self.sel.saturating_sub(1)
@@ -726,19 +750,6 @@ impl Panel {
     /// Rebuild the computed tabs from the stats.
     fn refresh(&mut self, window_tokens: u64, price: Option<&novacode_types::Cost>) {
         let st = &self.stats;
-        let procs: Vec<Node> = st
-            .procs
-            .iter()
-            .rev()
-            .map(|(id, (name, end))| {
-                let mut n = node(id, name.clone());
-                n.tag = Some(id.clone());
-                n.status = Some(end.clone().unwrap_or_else(|| "running".into()));
-                n.dim = end.is_some();
-                n.actions.insert("o".into(), "/ps".into());
-                n
-            })
-            .collect();
         let mut usage = Vec::new();
         if let Some(u) = st.last {
             let ctx = u.prompt_total() + u.output;
@@ -797,7 +808,7 @@ impl Panel {
             timing.insert(0, n);
         }
         let had_procs = self.tabs.iter().any(|t| t.name == "processes" && !t.empty());
-        self.set_nodes("processes", "procs", procs);
+        self.refresh_procs();
         self.set_nodes("usage", "usage", usage);
         self.set_nodes("timing", "tasks", timing);
         self.refresh_files();
@@ -1014,29 +1025,6 @@ impl Panel {
 
     /// A key while focused. `None` = not handled here.
     pub fn key(&mut self, key: &str) -> Option<Option<PanelAction>> {
-        if self.proc_view() {
-            let n = self.procs.len();
-            match key {
-                "esc" | "q" => self.focused = false,
-                "tab" => self.cycle(false),
-                "shift+tab" => self.cycle(true),
-                "left" | "h" => (self.proc_i, self.proc_scroll) = ((self.proc_i + n - 1) % n, 0),
-                "right" | "l" => (self.proc_i, self.proc_scroll) = ((self.proc_i + 1) % n, 0),
-                "up" | "k" => self.proc_scroll += 1,
-                "down" | "j" => self.proc_scroll = self.proc_scroll.saturating_sub(1),
-                "pageup" => self.proc_scroll += 10,
-                "pagedown" => self.proc_scroll = self.proc_scroll.saturating_sub(10),
-                "end" | "G" => self.proc_scroll = 0,
-                d if d.len() == 1 && ('1'..='9').contains(&d.chars().next().unwrap_or('0')) => {
-                    let i = d.parse::<usize>().unwrap_or(1) - 1;
-                    if let Some(name) = self.shown_tabs().get(i).map(|t| t.name.clone()) {
-                        self.shown = Some(name);
-                    }
-                }
-                _ => return None,
-            }
-            return Some(None);
-        }
         let tab = self.current()?.clone();
         let rows = self.rows();
         let sel_id = rows.get(self.sel).map(|r| r.node.id.clone());
@@ -1075,6 +1063,9 @@ impl Panel {
                 if let Some(a) = act {
                     if a == "open" && tab.name == "files" && tab.owner.is_none() {
                         return Some(sel_id.map(PanelAction::OpenFile));
+                    }
+                    if a == "output" && tab.name == "processes" && tab.owner.is_none() {
+                        return Some(sel_id.map(PanelAction::OpenProc));
                     }
                     return Some(Some(if a.starts_with('/') {
                         PanelAction::Command(a.clone())
@@ -1190,11 +1181,6 @@ impl Panel {
                 out.push(f);
             }
             f.render_widget(Paragraph::new(out), body);
-            return;
-        }
-        if self.proc_view() {
-            let lines = self.proc_lines(w, body.height as usize, theme);
-            f.render_widget(Paragraph::new(lines), body);
             return;
         }
         let lines: Vec<Line> = match self.current().and_then(|t| t.region.clone()) {
@@ -1557,27 +1543,6 @@ impl Panel {
                 " (nothing yet: stats appear after the first reply)",
                 t.dim,
             ));
-        }
-        out
-    }
-
-    /// The Processes tab body: one process, its header and as much output as fits.
-    fn proc_lines(&mut self, w: usize, h: usize, t: &Theme) -> Vec<Line<'static>> {
-        let n = self.procs.len();
-        self.proc_i = self.proc_i.min(n - 1);
-        let p = &self.procs[self.proc_i];
-        let mut out = crate::procs::header(p, self.proc_i, n, w, self.nerd, t);
-        let footer = self
-            .focused
-            .then(|| footer_line("←→ process  ↑↓ scroll  ⇥ tab  esc back", w, t));
-        let room = h.saturating_sub(out.len() + footer.is_some() as usize);
-        let body = crate::procs::output_lines(p, w, t);
-        self.proc_scroll = self.proc_scroll.min(body.len().saturating_sub(room));
-        let end = body.len() - self.proc_scroll;
-        out.extend(body[end.saturating_sub(room)..end].iter().cloned());
-        if let Some(f) = footer {
-            out.resize(h.saturating_sub(1), Line::raw(""));
-            out.push(f);
         }
         out
     }

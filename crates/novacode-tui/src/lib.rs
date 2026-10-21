@@ -144,7 +144,7 @@ pub async fn run_in(
                 app.tr.tick();
                 app.dirty = true;
             }
-            _ = second.tick(), if app.busy || app.panel.visible => {
+            _ = second.tick(), if app.busy || app.panel.visible || app.procs_open() => {
                 if app.tick() {
                     app.dirty = true;
                 }

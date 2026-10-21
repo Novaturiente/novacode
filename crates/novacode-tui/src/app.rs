@@ -59,7 +59,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/login",
         "log in: pick a provider, or /login <provider> (claude, codex, antigravity, copilot, or an API-key one)",
     ),
-    ("/ps", "processes in the process manager, with their latest output"),
+    (
+        "/ps",
+        "process output in a popup (the Processes tab in the side panel lists them)",
+    ),
     ("/mcp", "MCP servers: status and tool counts"),
     (
         "/reload",
@@ -346,6 +349,8 @@ enum Overlay {
     /// How to log in to this provider (browser or a code).
     LoginMethod(String, Picker),
     Login(crate::login::LoginView),
+    /// `/ps`: one process's live output.
+    Procs(crate::procs::ProcPopup),
 }
 
 pub struct App {
@@ -605,13 +610,7 @@ impl App {
                 _ => self.tr.notice(format!("login failed: {e}"), true),
             },
             UiEvent::Dequeued { ok: false } => self.flash("too late: it already reached the model"),
-            UiEvent::Procs { items } => {
-                if items.is_empty() && self.panel.procs_shown() {
-                    self.panel.hide();
-                    self.flash("no processes (long-running commands land here)");
-                }
-                self.panel.set_procs(items);
-            }
+            UiEvent::Procs { items } => self.panel.set_procs(items),
             UiEvent::FileStats(v) => self.panel.set_diffstat(v),
             UiEvent::OpenFile { path, base } => self.open_file = Some((path, base)),
             UiEvent::Page { title, text } => self.overlay = Some(Overlay::Pager(Pager::new(title, &text, &self.theme))),
@@ -855,11 +854,18 @@ impl App {
         }
     }
 
+    /// The `/ps` popup on process `id` (else the first), with a fresh list from the host.
+    fn open_procs(&mut self, id: Option<String>) {
+        self.overlay = Some(Overlay::Procs(crate::procs::ProcPopup::new(id)));
+        self.send(Cmd::Processes);
+    }
+
     fn panel_action(&mut self, a: crate::panel::PanelAction) {
         use crate::panel::PanelAction;
         match a {
             PanelAction::Command(c) => self.submit(c, self.busy),
             PanelAction::OpenFile(p) => self.send(Cmd::OpenFile(p)),
+            PanelAction::OpenProc(id) => self.open_procs(Some(id)),
             PanelAction::Ext { ext, tab, node, action } => {
                 let (width, height) = self.panel.size;
                 self.send(Cmd::ExtKey {
@@ -897,10 +903,16 @@ impl App {
         let before = self.panel.visible;
         self.panel.tick();
         // Live output while the Processes tab is on screen (the ticker runs only then or while busy).
-        if self.panel.procs_shown() && !self.init.attached {
+        let popup = matches!(self.overlay, Some(Overlay::Procs(_)));
+        if (popup || self.panel.procs_shown()) && !self.init.attached {
             self.send(Cmd::Processes);
         }
-        before != self.panel.visible || (self.panel.visible && self.busy)
+        before != self.panel.visible || (self.panel.visible && self.busy) || popup
+    }
+
+    /// The `/ps` popup is open: it needs the 1 s ticker for live output.
+    pub fn procs_open(&self) -> bool {
+        matches!(self.overlay, Some(Overlay::Procs(_)))
     }
 
     pub fn on_event(&mut self, ev: Event) {
@@ -986,6 +998,11 @@ impl App {
             match o {
                 Overlay::Pager(p) => {
                     if p.handle(k, page) {
+                        self.overlay = None;
+                    }
+                }
+                Overlay::Procs(p) => {
+                    if p.handle(&k, &self.panel.procs, page) {
                         self.overlay = None;
                     }
                 }
@@ -1437,10 +1454,7 @@ impl App {
                 "/resume" => self.send(Cmd::ListSessions),
                 "/new" => self.exit = Some(Exit::New),
                 "/reload" => self.exit = Some(Exit::Reload),
-                "/ps" => {
-                    self.panel.show_procs();
-                    self.send(Cmd::Processes);
-                }
+                "/ps" => self.open_procs(None),
                 "/mcp" => self.send(Cmd::Mcp),
                 "/restart" => self.exit = Some(Exit::Restart),
                 "/keys" | "/help" => {
@@ -1868,7 +1882,7 @@ impl App {
         f.render_widget(Paragraph::new(status_lines), status);
 
         let t = &self.theme;
-        match &self.overlay {
+        match &mut self.overlay {
             Some(
                 Overlay::Models(p)
                 | Overlay::Sessions(p)
@@ -1888,6 +1902,13 @@ impl App {
                 )
             }
             Some(Overlay::Pager(p)) => p.render(f, dialog::centered(main, 90, 90, main.height), t),
+            Some(Overlay::Procs(p)) => p.render(
+                f,
+                dialog::centered(main, 90, 90, main.height),
+                &self.panel.procs,
+                self.panel.nerd,
+                t,
+            ),
             None => {}
         }
     }
