@@ -993,6 +993,27 @@ impl Ctx {
         self.resource_dirs("prompts", "commands")
     }
 
+    /// Counts for the Usage stats tab: what this session loaded.
+    fn loaded(&self, agent: &Agent) -> Vec<(String, usize)> {
+        let i = self.inputs();
+        let ctx_files = if self.cli.no_context_files {
+            0
+        } else {
+            novacode_core::prompt::context_files(&self.cwd, self.paths.home()).len()
+        };
+        vec![
+            ("skills".into(), resources::skills(&i.skills).0.len()),
+            ("prompts".into(), resources::templates(&i.templates).0.len()),
+            ("agents".into(), self.agent_defs().len()),
+            ("extensions".into(), agent.extensions().map_or(0, |e| e.loaded.len())),
+            (
+                "packages".into(),
+                novacode_core::packages::enabled(self.paths.home(), &self.cwd, self.trusted).len(),
+            ),
+            ("context files".into(), ctx_files),
+        ]
+    }
+
     fn inputs(&self) -> Inputs {
         Inputs {
             skills: self.skill_dirs(),
@@ -1795,6 +1816,10 @@ async fn start_session(
         branch: git_branch(&ctx.cwd),
         project: activity::project(&ctx.cwd).await,
         started_ms: novacode_core::session::now_ms(),
+        host: novacode_tui::panel::HostInfo {
+            loaded: ctx.loaded(&agent),
+            ..Default::default()
+        },
         ..Default::default()
     };
     for m in &history {
@@ -1848,8 +1873,23 @@ async fn start_session(
                 let st = m.status();
                 let ready = st.iter().filter(|s| s.1 == novacode_core::mcp::Status::Ready).count();
                 let now = Some((ready, st.len()));
-                if h.hub.state().mcp != now {
-                    h.hub.update(false, |s| s.mcp = now);
+                let servers: Vec<(String, String, usize)> = st
+                    .into_iter()
+                    .map(|(name, s, n, _)| {
+                        let s = match s {
+                            novacode_core::mcp::Status::Ready => "ready".to_string(),
+                            novacode_core::mcp::Status::Connecting => "connecting".into(),
+                            novacode_core::mcp::Status::Failed(e) => format!("failed: {e}"),
+                        };
+                        (name, s, n)
+                    })
+                    .collect();
+                let cur = h.hub.state();
+                if cur.mcp != now || cur.host.servers != servers {
+                    h.hub.update(false, |s| {
+                        s.mcp = now;
+                        s.host.servers = servers;
+                    });
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
@@ -1872,6 +1912,17 @@ fn quota_task(host: Arc<host::Host>) -> tokio::task::JoinHandle<()> {
                     && s.quota.as_ref() != Some(&q)
                 {
                     host.hub.update(false, |st| st.quota = Some(q));
+                }
+                // The context split for the Usage stats tab, as of this run.
+                let c = host.hub.handle.context();
+                let sum = |v: &[(String, u64)]| v.iter().map(|(_, t)| t).sum::<u64>();
+                let parts = vec![
+                    ("system prompt".to_string(), sum(&c.sections)),
+                    ("tools".to_string(), sum(&c.tools)),
+                    ("messages".to_string(), c.messages),
+                ];
+                if s.host.parts != parts {
+                    host.hub.update(false, |st| st.host.parts = parts);
                 }
             }
             was_busy = s.busy;

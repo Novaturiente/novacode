@@ -1,5 +1,5 @@
-                                                                      │  Deploy  Agent
-                                                                      │ ━━━━━━━━
+                                                                      │  1 Deploy  2 Agent
+                                                                      │ ━━━━━━━━━━
                                                                       │ region line
                                                                       │ ok
                                                                       │

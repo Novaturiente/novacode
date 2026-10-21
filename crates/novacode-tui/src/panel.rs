@@ -20,6 +20,26 @@ pub const MIN_WIDTH: u16 = 40;
 /// Below this terminal width the panel stays hidden (pi's status-panel rule).
 pub const MIN_SCREEN: u16 = 100;
 
+/// Session facts from the host for the Usage stats tab.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct HostInfo {
+    /// MCP servers: (name, `ready` / `connecting` / `failed: why`, tools).
+    #[serde(default)]
+    pub servers: Vec<(String, String, usize)>,
+    /// What loaded: (`skills`, 67), (`extensions`, 1), …
+    #[serde(default)]
+    pub loaded: Vec<(String, usize)>,
+    /// Where the context goes, tokens: (`system prompt`, …), (`tools`, …), (`messages`, …).
+    #[serde(default)]
+    pub parts: Vec<(String, u64)>,
+}
+
+impl HostInfo {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Source {
     pub id: String,
@@ -96,6 +116,8 @@ impl Tab {
 pub enum PanelAction {
     /// Run a `/command`.
     Command(String),
+    /// Open a file from the Files tab in the editor, diffed against the session start.
+    OpenFile(String),
     /// Tell the owning extension: (ext, tab, node id, action or key).
     Ext {
         ext: String,
@@ -130,6 +152,19 @@ pub struct Panel {
     proc_i: usize,
     /// Output rows scrolled up from the bottom (0 = follow the tail).
     proc_scroll: usize,
+    /// Session facts from the host (Usage stats tab).
+    pub host: HostInfo,
+    /// Runs started so far: a subagent belongs to the run (user prompt) it was spawned in.
+    run: u32,
+    agent_set: BTreeMap<String, u32>,
+    /// Files tab: (+added, -removed) lines since the session started, from the host.
+    diffstat: BTreeMap<String, (u64, u64)>,
+    /// Where the last draw put things, for the mouse: tab labels (x from, x to, name),
+    /// the body, and which row each body line shows.
+    tab_spans: Vec<(u16, u16, String)>,
+    tab_row: u16,
+    body: Rect,
+    line_rows: Vec<Option<usize>>,
 }
 
 #[derive(Default)]
@@ -142,6 +177,10 @@ struct Stats {
     settled_at: Option<Instant>,
     usage_total: Usage,
     last: Option<Usage>,
+    /// Per request: (% of the prompt from cache, $ cost or output tokens without a price).
+    requests: Vec<(f64, f64)>,
+    window: u64,
+    price: Option<novacode_types::Cost>,
     procs: BTreeMap<String, (String, Option<String>)>,
     files: BTreeMap<String, &'static str>,
 }
@@ -208,7 +247,7 @@ impl Default for Panel {
             tabs: vec![
                 agent,
                 Tab::new("processes", "Processes", 15),
-                Tab::new("usage", "Usage & cache", 5),
+                Tab::new("usage", "Usage stats", 5),
                 Tab::new("timing", "Timing", 4),
                 Tab::new("files", "Files", 3),
             ],
@@ -226,6 +265,14 @@ impl Default for Panel {
             procs: Vec::new(),
             proc_i: 0,
             proc_scroll: 0,
+            host: HostInfo::default(),
+            run: 0,
+            agent_set: BTreeMap::new(),
+            diffstat: BTreeMap::new(),
+            tab_spans: Vec::new(),
+            tab_row: 0,
+            body: Rect::default(),
+            line_rows: Vec::new(),
         }
     }
 }
@@ -275,6 +322,93 @@ impl Panel {
         let tab = self.tabs.iter().find(|t| t.name == "agent");
         tab.and_then(|t| t.sources.iter().find(|s| s.id == "subagents"))
             .map_or(0, |s| s.nodes.iter().filter(|n| !n.dim).count())
+    }
+
+    /// The oldest prompt whose subagents are shown: the oldest one with a subagent
+    /// still running, else the newest that spawned any.
+    fn agent_floor(&self) -> u32 {
+        let tab = self.tabs.iter().find(|t| t.name == "agent");
+        let nodes = tab
+            .and_then(|t| t.sources.iter().find(|s| s.id == "subagents"))
+            .map(|s| &s.nodes);
+        let set = |n: &Node| self.agent_set.get(&n.id).copied().unwrap_or(0);
+        let all = nodes.into_iter().flatten();
+        let newest = all.clone().map(set).max().unwrap_or(0);
+        all.filter(|n| !n.dim).map(set).min().unwrap_or(newest).min(newest)
+    }
+
+    /// Open the panel on `name`, focused (Ctrl+Alt+U for Usage stats); again closes it.
+    pub fn show_tab(&mut self, name: &str) {
+        if self.visible && self.focused && self.shown.as_deref() == Some(name) {
+            self.toggle();
+            return;
+        }
+        self.pinned = Some(true);
+        self.visible = true;
+        self.focused = true;
+        self.shown = Some(name.into());
+        self.sel = 0;
+    }
+
+    /// Edited files, for the host to count changed lines.
+    pub fn edited_files(&self) -> Vec<String> {
+        self.stats
+            .files
+            .iter()
+            .filter(|(_, k)| **k == "edited")
+            .map(|(p, _)| p.clone())
+            .collect()
+    }
+
+    pub fn set_diffstat(&mut self, v: Vec<(String, u64, u64)>) {
+        self.diffstat = v.into_iter().map(|(p, a, d)| (p, (a, d))).collect();
+        self.refresh_files();
+    }
+
+    /// The panel's part of the screen (as last drawn) holds this cell.
+    pub fn contains(&self, col: u16, row: u16) -> bool {
+        self.visible
+            && (self.tab_row..self.body.bottom()).contains(&row)
+            && col >= self.body.x.saturating_sub(2)
+            && col < self.body.right()
+    }
+
+    /// A click at a cell of the panel: a tab label switches to it; a row selects it
+    /// (and opens it, in the Files tab).
+    pub fn click(&mut self, col: u16, row: u16) -> Option<PanelAction> {
+        self.focused = true;
+        if row <= self.tab_row + 1 {
+            if let Some((_, _, name)) = self.tab_spans.iter().find(|(a, b, _)| (*a..*b).contains(&col)).cloned() {
+                self.shown = Some(name);
+                self.sel = 0;
+            }
+            return None;
+        }
+        let line = row.checked_sub(self.body.y)? as usize;
+        let r = (*self.line_rows.get(line)?)?;
+        self.sel = r;
+        let tab = self.current()?;
+        if tab.name == "files" && tab.owner.is_none() {
+            let rows = self.rows();
+            return rows.get(r).map(|x| PanelAction::OpenFile(x.node.id.clone()));
+        }
+        None
+    }
+
+    /// The mouse wheel over the panel.
+    pub fn wheel(&mut self, up: bool) {
+        if self.proc_view() {
+            let _ = self.key(if up { "up" } else { "down" });
+        } else if self.interactive() {
+            let n = self.rows().len();
+            self.sel = if up {
+                self.sel.saturating_sub(1)
+            } else {
+                (self.sel + 1).min(n.saturating_sub(1))
+            };
+        } else {
+            self.sel = if up { self.sel.saturating_sub(3) } else { self.sel + 3 };
+        }
     }
 
     pub fn current(&self) -> Option<&Tab> {
@@ -357,15 +491,32 @@ impl Panel {
             }
             UiOp::Publish { tab, source, node } => {
                 self.publish(tab, source, (**node).clone(), Some(ext));
-                if tab == "agent"
-                    && source == "subagents"
-                    && let Some(s) = self.tab("agent").map(|t| t.source("subagents"))
-                {
-                    let (n, live) = (s.nodes.len(), s.nodes.iter().filter(|n| !n.dim).count());
-                    s.title = Some(match live {
-                        0 => format!("Subagents · {n}"),
-                        _ => format!("Subagents · {live} running of {n}"),
-                    });
+                if tab == "agent" && source == "subagents" {
+                    self.agent_set.entry(node.id.clone()).or_insert(self.run);
+                    let floor = self.agent_floor();
+                    let sets = &self.agent_set;
+                    if let Some(s) = self
+                        .tabs
+                        .iter_mut()
+                        .find(|t| t.name == "agent")
+                        .map(|t| t.source("subagents"))
+                    {
+                        let shown: Vec<&Node> = s
+                            .nodes
+                            .iter()
+                            .filter(|n| sets.get(&n.id).is_none_or(|&r| r >= floor))
+                            .collect();
+                        let (n, live) = (shown.len(), shown.iter().filter(|n| !n.dim).count());
+                        let earlier = s.nodes.len() - n;
+                        let mut t = match live {
+                            0 => format!("Subagents · {n}"),
+                            _ => format!("Subagents · {live} running of {n}"),
+                        };
+                        if earlier > 0 {
+                            t += &format!(" · {earlier} earlier hidden");
+                        }
+                        s.title = Some(t);
+                    }
                 }
                 self.offer(tab);
             }
@@ -424,7 +575,12 @@ impl Panel {
     /// Feed the built-in tabs.
     pub fn on_agent(&mut self, ev: &AgentEvent, window_tokens: u64, price: Option<&novacode_types::Cost>) {
         let now = Instant::now();
+        if matches!(ev, AgentEvent::AgentStart) {
+            self.run += 1;
+        }
         let st = &mut self.stats;
+        st.window = window_tokens;
+        st.price = price.copied();
         match ev {
             AgentEvent::AgentStart => {
                 st.task = Task {
@@ -447,6 +603,9 @@ impl Panel {
                 st.replied_at = (a.stop == StopReason::ToolUse).then_some(now);
                 if a.usage.prompt_total() > 0 {
                     st.last = Some(a.usage);
+                    let hit = a.usage.cache_read as f64 * 100.0 / a.usage.prompt_total() as f64;
+                    let spend = price.map_or(a.usage.output as f64, |p| a.usage.cost(p));
+                    st.requests.push((hit, spend));
                     let u = &mut st.usage_total;
                     u.input += a.usage.input;
                     u.output += a.usage.output;
@@ -625,24 +784,41 @@ impl Panel {
                 n
             })
             .collect();
-        let files: Vec<Node> = st
-            .files
-            .iter()
-            .map(|(p, k)| {
-                let mut n = node(p, p.clone());
-                n.tag = Some((*k).into());
-                n.dim = *k == "read";
-                n
-            })
-            .collect();
+        let mut timing = timing;
+        if st.tasks.len() >= 2 {
+            let walls: Vec<f64> = st.tasks.iter().map(|k| k.wall.as_secs_f64()).collect();
+            let mut n = node("trend", format!("per task {}", sparkline(&walls, 24)));
+            n.order = Some(-1.0);
+            timing.insert(0, n);
+        }
         let had_procs = self.tabs.iter().any(|t| t.name == "processes" && !t.empty());
         self.set_nodes("processes", "procs", procs);
         self.set_nodes("usage", "usage", usage);
         self.set_nodes("timing", "tasks", timing);
-        self.set_nodes("files", "files", files);
+        self.refresh_files();
         if !had_procs && !self.stats.procs.is_empty() {
             self.offer("processes");
         }
+    }
+
+    /// Files tab: edited first, each with its +/- lines; Enter or a click opens it.
+    fn refresh_files(&mut self) {
+        let mut v: Vec<(&String, &&str)> = self.stats.files.iter().collect();
+        v.sort_by_key(|(p, k)| (**k != "edited", (*p).clone()));
+        let files: Vec<Node> = v
+            .into_iter()
+            .map(|(p, k)| {
+                let mut n = node(p, p.clone());
+                n.tag = Some(match self.diffstat.get(p) {
+                    Some((a, d)) => format!("+{a} −{d}"),
+                    None => (*k).into(),
+                });
+                n.dim = *k == "read";
+                n.actions.insert("enter".into(), "open".into());
+                n
+            })
+            .collect();
+        self.set_nodes("files", "files", files);
     }
 
     /// The user's quota windows, from the host (L8.15).
@@ -705,7 +881,12 @@ impl Panel {
 
     /// Tab names that have something to show, in priority order.
     fn shown_tabs(&self) -> Vec<&Tab> {
-        let mut v: Vec<&Tab> = self.tabs.iter().filter(|t| !t.empty() || t.owner.is_some()).collect();
+        let usage = !self.host.loaded.is_empty() || !self.host.servers.is_empty();
+        let mut v: Vec<&Tab> = self
+            .tabs
+            .iter()
+            .filter(|t| !t.empty() || t.owner.is_some() || (t.name == "usage" && usage))
+            .collect();
         v.sort_by_key(|t| std::cmp::Reverse(t.priority));
         v
     }
@@ -779,8 +960,12 @@ impl Panel {
         let mut srcs: Vec<&Source> = t.sources.iter().filter(|s| !s.nodes.is_empty()).collect();
         srcs.sort_by(|a, b| a.order.total_cmp(&b.order));
         let mut out = Vec::new();
+        let floor = self.agent_floor();
         for s in srcs {
             let mut nodes: Vec<&Node> = s.nodes.iter().collect();
+            if t.name == "agent" && s.id == "subagents" {
+                nodes.retain(|n| self.agent_set.get(&n.id).is_none_or(|&r| r >= floor));
+            }
             nodes.sort_by(|a, b| a.order.unwrap_or(0.0).total_cmp(&b.order.unwrap_or(0.0)));
             if s.newest_first {
                 nodes.reverse();
@@ -837,6 +1022,12 @@ impl Panel {
                 "pageup" => self.proc_scroll += 10,
                 "pagedown" => self.proc_scroll = self.proc_scroll.saturating_sub(10),
                 "end" | "G" => self.proc_scroll = 0,
+                d if d.len() == 1 && ('1'..='9').contains(&d.chars().next().unwrap_or('0')) => {
+                    let i = d.parse::<usize>().unwrap_or(1) - 1;
+                    if let Some(name) = self.shown_tabs().get(i).map(|t| t.name.clone()) {
+                        self.shown = Some(name);
+                    }
+                }
                 _ => return None,
             }
             return Some(None);
@@ -855,6 +1046,13 @@ impl Panel {
                 action: key.into(),
             }));
         }
+        if let Some(d) = key.parse::<usize>().ok().filter(|d| (1..=9).contains(d)) {
+            if let Some(name) = self.shown_tabs().get(d - 1).map(|t| t.name.clone()) {
+                self.shown = Some(name);
+                self.sel = 0;
+            }
+            return Some(None);
+        }
         match key {
             "esc" | "q" => self.focused = false,
             "tab" => self.cycle(false),
@@ -870,6 +1068,9 @@ impl Panel {
                     sel_actions.get(k)
                 };
                 if let Some(a) = act {
+                    if a == "open" && tab.name == "files" && tab.owner.is_none() {
+                        return Some(sel_id.map(PanelAction::OpenFile));
+                    }
                     return Some(Some(if a.starts_with('/') {
                         PanelAction::Command(a.clone())
                     } else {
@@ -897,7 +1098,9 @@ impl Panel {
         // Accent-bar look: icon + name, the shown tab in accent with a ━ bar under it.
         let mut head: Vec<Span> = Vec::new();
         let mut under: Vec<Span> = Vec::new();
-        for t in &tabs {
+        let mut spans_at: Vec<(u16, u16, String)> = Vec::new();
+        let mut x = area.x + 2;
+        for (i, t) in tabs.iter().enumerate() {
             let on = self.shown.as_deref() == Some(t.name.as_str());
             let icon = match (self.nerd, t.name.as_str()) {
                 (true, "agent") => "\u{f06a9} ",
@@ -907,8 +1110,16 @@ impl Panel {
                 (true, "files") => "\u{f15b} ",
                 _ => "",
             };
-            let label = format!(" {icon}{} ", t.title);
+            // Focused: the number that jumps to it.
+            let num = if self.focused && i < 9 {
+                format!("{} ", i + 1)
+            } else {
+                String::new()
+            };
+            let label = format!(" {num}{icon}{} ", t.title);
             let lw = unicode_width::UnicodeWidthStr::width(label.as_str());
+            spans_at.push((x, x + lw as u16, t.name.clone()));
+            x += lw as u16;
             let st = if on {
                 theme.accent.add_modifier(Modifier::BOLD)
             } else {
@@ -921,6 +1132,8 @@ impl Panel {
                 Span::raw(" ".repeat(lw))
             });
         }
+        self.tab_spans = spans_at;
+        self.tab_row = area.y;
         let border = if self.focused { theme.accent } else { theme.border };
         let block = Block::default().borders(Borders::LEFT).border_style(border);
         let inner = block.inner(area);
@@ -948,6 +1161,23 @@ impl Panel {
             ..inner
         };
         let w = body.width as usize;
+        self.body = body;
+        self.line_rows.clear();
+        if self.shown.as_deref() == Some("usage") {
+            let all = self.usage_lines(w, theme);
+            let footer = self
+                .focused
+                .then(|| footer_line("↑↓ scroll  1-9 tab  ⇥ tab  esc back", w, theme));
+            let room = (body.height as usize).saturating_sub(footer.is_some() as usize);
+            self.sel = self.sel.min(all.len().saturating_sub(room));
+            let mut out: Vec<Line> = all.into_iter().skip(self.sel).take(room).collect();
+            if let Some(f) = footer {
+                out.resize(room, Line::raw(""));
+                out.push(f);
+            }
+            f.render_widget(Paragraph::new(out), body);
+            return;
+        }
         if self.proc_view() {
             let lines = self.proc_lines(w, body.height as usize, theme);
             f.render_widget(Paragraph::new(lines), body);
@@ -968,12 +1198,14 @@ impl Panel {
                 let focused = self.focused && interactive;
                 let now = now_ms();
                 let mut out = Vec::new();
+                let mut owner: Vec<Option<usize>> = Vec::new();
                 let mut sel_line = 0;
                 for (i, r) in rows.iter().enumerate() {
                     let n = r.node;
                     if r.rule {
                         out.push(Line::raw(""));
                     }
+                    owner.resize(out.len(), None);
                     if let Some((title, progress)) = r.title {
                         let icon = match (nerd, title) {
                             (true, "Goal") => "\u{f140} ",
@@ -1045,7 +1277,9 @@ impl Panel {
                             })
                             .collect();
                     }
+                    owner.resize(out.len(), None);
                     out.push(Line::from(sp));
+                    owner.push(Some(i));
                     // Details hang under the label; the guide keeps going to the children.
                     let has_kids = rows
                         .get(i + 1)
@@ -1061,6 +1295,7 @@ impl Panel {
                         }
                         v.push(Span::styled(d.clone(), theme.dim));
                         out.push(crate::wrap::truncate(v, w));
+                        owner.push(Some(i));
                     }
                 }
                 if out.is_empty() {
@@ -1080,9 +1315,9 @@ impl Panel {
                         .unwrap_or_default();
                     k.push(
                         if interactive {
-                            "⇥ tab"
+                            "1-9 ⇥ tab"
                         } else {
-                            "↑↓ scroll  ⇥ tab"
+                            "↑↓ scroll  1-9 ⇥ tab"
                         }
                         .into(),
                     );
@@ -1097,6 +1332,8 @@ impl Panel {
                     self.sel = self.sel.min(max_start);
                     self.sel
                 };
+                owner.resize(out.len(), None);
+                self.line_rows = owner.into_iter().skip(start).take(room).collect();
                 let mut out: Vec<Line> = out.into_iter().skip(start).take(room).collect();
                 if let Some(f) = footer {
                     out.resize(room, Line::raw(""));
@@ -1110,6 +1347,206 @@ impl Panel {
 }
 
 impl Panel {
+    /// The Usage stats tab: bars for context, cache and quota, request sparklines,
+    /// then MCP servers and what loaded.
+    fn usage_lines(&self, w: usize, t: &Theme) -> Vec<Line<'static>> {
+        let st = &self.stats;
+        let mut out: Vec<Line<'static>> = Vec::new();
+        let head = |out: &mut Vec<Line<'static>>, title: &str, right: String| {
+            if !out.is_empty() {
+                out.push(Line::raw(""));
+            }
+            let l = vec![
+                Span::styled("▍", t.accent),
+                Span::styled(
+                    format!(" {}", title.to_uppercase()),
+                    t.heading.add_modifier(Modifier::BOLD),
+                ),
+            ];
+            let pad = w.saturating_sub(crate::wrap::width(&l) + right.chars().count());
+            let mut l = l;
+            l.push(Span::raw(" ".repeat(pad)));
+            l.push(Span::styled(right, t.dim));
+            out.push(crate::wrap::truncate(l, w));
+        };
+        let bw = w.saturating_sub(16).clamp(8, 40);
+        // A labelled bar: `label ███▌░░░ 42%`. `high_bad`: colour turns warn/error as it fills.
+        let meter = |label: &str, pct: f64, high_bad: bool| -> Line<'static> {
+            let st = match (high_bad, pct) {
+                (true, p) if p >= 85.0 => t.error,
+                (true, p) if p >= 60.0 => t.warn,
+                (true, _) => t.ok,
+                (false, p) if p >= 70.0 => t.ok,
+                (false, p) if p >= 40.0 => t.warn,
+                (false, _) => t.error,
+            };
+            let mut v = vec![Span::styled(format!("  {label:<8}"), t.dim)];
+            v.extend(bar(pct / 100.0, bw, st, t.border));
+            v.push(Span::styled(format!(" {pct:>3.0}%"), st));
+            crate::wrap::truncate(v, w)
+        };
+        let k = |n: u64| -> String {
+            match n {
+                0..1000 => n.to_string(),
+                1000..1_000_000 => format!("{:.1}k", n as f64 / 1e3),
+                _ => format!("{:.2}M", n as f64 / 1e6),
+            }
+        };
+        if let Some(u) = st.last {
+            let ctx = u.prompt_total() + u.output;
+            let win = st.window.max(1);
+            head(&mut out, "Context", format!("{} / {}", k(ctx), k(win)));
+            out.push(meter("used", ctx as f64 * 100.0 / win as f64, true));
+            // What fills it, as one stacked bar and a legend.
+            let parts: Vec<(String, u64)> = self.host.parts.iter().filter(|(_, n)| *n > 0).cloned().collect();
+            if !parts.is_empty() {
+                let colors = [t.accent, t.warn, t.ok, t.link];
+                let mut v = vec![Span::styled(format!("  {:<8}", "split"), t.dim)];
+                let mut used = 0;
+                for (i, (_, n)) in parts.iter().enumerate() {
+                    let cells = ((*n as f64 / win as f64) * bw as f64).round() as usize;
+                    let cells = cells.min(bw - used);
+                    used += cells;
+                    v.push(Span::styled("█".repeat(cells), colors[i % colors.len()]));
+                }
+                v.push(Span::styled("░".repeat(bw - used), t.border));
+                out.push(crate::wrap::truncate(v, w));
+                let mut legend = vec![Span::raw("  ".to_string() + &" ".repeat(8))];
+                for (i, (name, n)) in parts.iter().enumerate() {
+                    legend.push(Span::styled("■ ", colors[i % colors.len()]));
+                    legend.push(Span::styled(format!("{name} {}  ", k(*n)), t.dim));
+                }
+                out.extend(crate::wrap::wrap(legend, w, &[], &[Span::raw("          ")]));
+            }
+            head(&mut out, "Cache", String::new());
+            out.push(meter(
+                "last",
+                u.cache_read as f64 * 100.0 / u.prompt_total().max(1) as f64,
+                false,
+            ));
+            let tot = st.usage_total;
+            out.push(meter(
+                "session",
+                tot.cache_read as f64 * 100.0 / tot.prompt_total().max(1) as f64,
+                false,
+            ));
+            if st.requests.len() >= 2 {
+                let hits: Vec<f64> = st.requests.iter().map(|r| r.0).collect();
+                out.push(Line::from(vec![
+                    Span::styled(format!("  {:<8}", "per req"), t.dim),
+                    Span::styled(sparkline(&hits, bw), t.ok),
+                ]));
+            }
+            out.push(Line::styled(
+                format!(
+                    "  read {} · write {} · new {}",
+                    k(u.cache_read),
+                    k(u.cache_write),
+                    k(u.input)
+                ),
+                t.dim,
+            ));
+            let right = st.price.map(|p| format!("${:.4}", tot.cost(&p))).unwrap_or_default();
+            head(&mut out, "Tokens", right);
+            out.push(Line::styled(
+                format!(
+                    "  prompt {} · output {} · {} requests",
+                    k(tot.prompt_total()),
+                    k(tot.output),
+                    st.requests.len()
+                ),
+                t.text,
+            ));
+            if st.requests.len() >= 2 {
+                let spend: Vec<f64> = st.requests.iter().map(|r| r.1).collect();
+                let what = if st.price.is_some() { "$ / req" } else { "out/req" };
+                out.push(Line::from(vec![
+                    Span::styled(format!("  {what:<8}"), t.dim),
+                    Span::styled(sparkline(&spend, bw), t.accent),
+                ]));
+            }
+        }
+        let quota: Vec<(String, f64)> = self
+            .tabs
+            .iter()
+            .find(|x| x.name == "usage")
+            .and_then(|x| x.sources.iter().find(|s| s.id == "quota"))
+            .map(|s| {
+                s.nodes
+                    .iter()
+                    .filter_map(|n| {
+                        let pct = n.label.split_whitespace().nth(2)?.trim_end_matches('%').parse().ok()?;
+                        Some((n.id.clone(), pct))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !quota.is_empty() {
+            head(&mut out, "Subscription", String::new());
+            for (id, pct) in quota {
+                out.push(meter(&id, pct, true));
+            }
+        }
+        if !self.host.servers.is_empty() {
+            let ready = self.host.servers.iter().filter(|s| s.1 == "ready").count();
+            head(
+                &mut out,
+                "MCP",
+                format!("{ready}/{} connected", self.host.servers.len()),
+            );
+            for (name, status, tools) in &self.host.servers {
+                let (g, gs) = match status.as_str() {
+                    "ready" => ("●", t.ok),
+                    "connecting" => ("◌", t.warn),
+                    _ => ("✗", t.error),
+                };
+                let what = if status == "ready" {
+                    format!("{tools} tools")
+                } else {
+                    status.clone()
+                };
+                out.push(crate::wrap::truncate(
+                    vec![
+                        Span::styled(format!("  {g} "), gs),
+                        Span::styled(name.clone(), t.text.add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("  {what}"), t.dim),
+                    ],
+                    w,
+                ));
+            }
+        }
+        if !self.host.loaded.is_empty() {
+            head(&mut out, "Loaded", String::new());
+            let running = self
+                .procs
+                .len()
+                .max(st.procs.values().filter(|(_, e)| e.is_none()).count());
+            let mut items: Vec<(String, usize)> = self.host.loaded.clone();
+            items.push(("processes running".into(), running));
+            items.push(("subagents running".into(), self.live_subagents()));
+            for (name, n) in items {
+                out.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {n:>4} "),
+                        if n > 0 {
+                            t.accent.add_modifier(Modifier::BOLD)
+                        } else {
+                            t.dim
+                        },
+                    ),
+                    Span::styled(name, t.text),
+                ]));
+            }
+        }
+        if out.is_empty() {
+            out.push(Line::styled(
+                " (nothing yet: stats appear after the first reply)",
+                t.dim,
+            ));
+        }
+        out
+    }
+
     /// The Processes tab body: one process, its header and as much output as fits.
     fn proc_lines(&mut self, w: usize, h: usize, t: &Theme) -> Vec<Line<'static>> {
         let n = self.procs.len();
@@ -1202,6 +1639,30 @@ fn glyph(icon: Option<&str>, status: Option<&str>, nerd: bool, t: &Theme) -> (St
     (g.to_string(), style)
 }
 
+/// A bar `width` cells long, filled to `frac` with eighth-cell precision.
+fn bar(frac: f64, width: usize, on: Style, off: Style) -> Vec<Span<'static>> {
+    const PART: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+    let eighths = (frac.clamp(0.0, 1.0) * width as f64 * 8.0).round() as usize;
+    let (full, part) = (eighths / 8, eighths % 8);
+    let mut fill = "█".repeat(full);
+    fill.push_str(PART[part]);
+    let rest = width.saturating_sub(full + (part > 0) as usize);
+    vec![Span::styled(fill, on), Span::styled("░".repeat(rest), off)]
+}
+
+/// The last `width` values as `▁▂▅█`, scaled to their own maximum.
+fn sparkline(v: &[f64], width: usize) -> String {
+    const TICKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let v = &v[v.len().saturating_sub(width)..];
+    let max = v.iter().cloned().fold(0.0_f64, f64::max);
+    v.iter()
+        .map(|x| match max {
+            m if m <= 0.0 => TICKS[0],
+            m => TICKS[((x / m) * 7.0).round().clamp(0.0, 7.0) as usize],
+        })
+        .collect()
+}
+
 /// pi viewer clock: 42s, 3m07s, 1h05m.
 pub fn clock(ms: u64) -> String {
     let s = ms / 1000;
@@ -1252,14 +1713,67 @@ mod tests {
         p.apply("agents", &sub("a2", "running"));
         p.tick();
         assert!(p.visible, "new work opens it again");
-        // Usage has no actions: no selection, j/k scroll.
-        p.shown = Some("files".into());
-        p.stats.files.insert("a.rs".into(), "read");
+        // Timing has no actions: no selection, j/k scroll.
+        p.shown = Some("timing".into());
+        p.stats.tasks.push(Task::default());
         p.refresh(0, None);
         assert!(!p.interactive());
         p.focused = true;
         assert_eq!(p.key("j"), Some(None));
         assert_eq!(p.sel, 1, "scroll offset, clamped when drawn");
+        // Files: rows select, Enter opens; edited files first, with their line counts.
+        p.shown = Some("files".into());
+        p.stats.files.insert("b.rs".into(), "read");
+        p.stats.files.insert("c.rs".into(), "edited");
+        p.set_diffstat(vec![("c.rs".into(), 12, 3)]);
+        assert!(p.interactive());
+        p.sel = 0;
+        let first = &p.rows()[0].node;
+        assert_eq!((first.id.as_str(), first.tag.as_deref()), ("c.rs", Some("+12 −3")));
+        assert_eq!(p.key("enter"), Some(Some(PanelAction::OpenFile("c.rs".into()))));
+        assert_eq!(p.edited_files(), ["c.rs"]);
+        // Number keys jump to a tab.
+        assert_eq!(p.key("1"), Some(None));
+        assert_eq!(p.shown.as_deref(), Some("agent"));
+    }
+
+    #[test]
+    fn subagents_show_from_the_oldest_prompt_still_running() {
+        let mut p = Panel::default();
+        let op = |v: serde_json::Value| serde_json::from_value::<UiOp>(v).unwrap();
+        let sub = |id: &str, status: &str| {
+            op(json!({"op": "publish", "tab": "agent", "source": "subagents",
+                "node": {"id": id, "label": "scout", "status": status, "dim": status == "done"}}))
+        };
+        let start = |p: &mut Panel| p.on_agent(&AgentEvent::AgentStart, 0, None);
+        let shown = |p: &Panel| p.rows().iter().map(|r| r.node.id.clone()).collect::<Vec<_>>();
+        start(&mut p);
+        p.apply("agents", &sub("a1", "done"));
+        p.apply("agents", &sub("a2", "done"));
+        start(&mut p);
+        p.apply("agents", &sub("a3", "running"));
+        assert_eq!(shown(&p), ["a3"], "only the newest prompt's set");
+        start(&mut p);
+        p.apply("agents", &sub("a4", "running"));
+        assert_eq!(shown(&p), ["a4", "a3"], "a set still running stays");
+        p.apply("agents", &sub("a3", "done"));
+        assert_eq!(shown(&p), ["a4"]);
+        assert_eq!(
+            p.tab("agent").unwrap().source("subagents").title.as_deref(),
+            Some("Subagents · 1 running of 1 · 3 earlier hidden")
+        );
+        start(&mut p);
+        assert_eq!(shown(&p), ["a4"], "a prompt without subagents keeps the last set");
+    }
+
+    #[test]
+    fn bars_and_sparklines() {
+        let t = Theme::default();
+        let text = |v: Vec<Span>| v.iter().map(|s| s.content.to_string()).collect::<String>();
+        assert_eq!(text(bar(0.5, 8, t.ok, t.dim)), "████░░░░");
+        assert_eq!(text(bar(0.0625, 8, t.ok, t.dim)), "▌░░░░░░░");
+        assert_eq!(sparkline(&[0.0, 50.0, 100.0], 10), "▁▅█");
+        assert_eq!(sparkline(&[1.0, 2.0, 3.0], 2), "▆█");
     }
 
     #[test]

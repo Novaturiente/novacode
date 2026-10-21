@@ -549,7 +549,7 @@ pub async fn attach(
                     let _ = ui_tx.send(UiEvent::AskDone { id });
                 }
                 ServerMsg::State { state } => {
-                    if (state.quota.clone(), state.mcp) != (last.quota.clone(), last.mcp) {
+                    if state.info_key() != last.info_key() {
                         let _ = ui_tx.send(state.info());
                     }
                     if state.model != last.model || state.level != last.level {
@@ -643,7 +643,9 @@ pub async fn attach(
                 | Cmd::LoginList
                 | Cmd::Login { .. }
                 | Cmd::LoginInput(_)
-                | Cmd::LoginCancel => continue,
+                | Cmd::LoginCancel
+                | Cmd::FileStats(_)
+                | Cmd::OpenFile(_) => continue,
                 Cmd::Quit => break,
             };
             let id = matches!(cmd, ClientCmd::GetContext | ClientCmd::Export { .. }).then(|| "ui".to_string());

@@ -79,6 +79,15 @@ pub async fn run_in(
             }
             app.dirty = true;
         }
+        if let Some((path, base)) = app.open_file.take() {
+            if let Err(e) = term::open_in_editor(t, &path, base.as_deref()) {
+                app.tr.notice(format!("editor failed: {e}"), true);
+            }
+            if let Some(b) = base {
+                let _ = std::fs::remove_file(b);
+            }
+            app.dirty = true;
+        }
         if app.external_editor {
             app.external_editor = false;
             match term::external_editor(t, &app.editor_text()) {

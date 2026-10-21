@@ -61,6 +61,38 @@ pub const MODE_COMMANDS: &[(&str, &str)] = &[
 ];
 
 impl Host {
+    /// `p` (as the tools named it) when the session started: `None` = no checkpoint
+    /// to tell; `Some(None)` = it didn't exist yet.
+    fn session_base(&self, p: &str) -> Option<Option<String>> {
+        let file = self.hub.state().file?;
+        let repo = novacode_core::checkpoint::resolve(&self.cwd, self.paths.home())?;
+        let abs = self.cwd.join(p);
+        let rel = abs.strip_prefix(&repo.root).ok()?.to_string_lossy().into_owned();
+        novacode_core::checkpoint::session_base(std::path::Path::new(&file), &repo, &rel).ok()
+    }
+
+    /// (path, +added, -removed) since the session started, by `git diff --numstat`.
+    fn diffstat(&self, p: &str) -> Option<(String, u64, u64)> {
+        let base = self.session_base(p)?;
+        let tmp = std::env::temp_dir().join(format!("novacode-diffstat-{}", std::process::id()));
+        std::fs::write(&tmp, base.unwrap_or_default()).ok()?;
+        let out = std::process::Command::new("git")
+            .args(["diff", "--no-index", "--numstat", "--"])
+            .arg(&tmp)
+            .arg(self.cwd.join(p))
+            .output()
+            .ok();
+        let _ = std::fs::remove_file(&tmp);
+        let text = String::from_utf8_lossy(&out?.stdout).into_owned();
+        let mut f = text.split_whitespace();
+        // No output = unchanged.
+        let (a, d) = (
+            f.next().and_then(|x| x.parse().ok()).unwrap_or(0),
+            f.next().and_then(|x| x.parse().ok()).unwrap_or(0),
+        );
+        Some((p.to_string(), a, d))
+    }
+
     /// `/login <provider>`: offer the methods when there are several, else run it
     /// in the background, reporting each step to the dialog.
     fn login(self: &Arc<Self>, provider: String, method: Option<String>, ui: &UnboundedSender<UiEvent>) {
@@ -350,6 +382,30 @@ impl Host {
                 });
             }
             Cmd::Compact => h.compact(),
+            Cmd::FileStats(paths) => {
+                let (me, ui) = (self.clone(), ui.clone());
+                tokio::task::spawn_blocking(move || {
+                    let v = paths.iter().filter_map(|p| me.diffstat(p)).collect();
+                    let _ = ui.send(UiEvent::FileStats(v));
+                });
+            }
+            Cmd::OpenFile(p) => {
+                let (me, ui) = (self.clone(), ui.clone());
+                tokio::task::spawn_blocking(move || {
+                    let path = me.cwd.join(&p);
+                    let base = me.session_base(&p).map(|text| {
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let f =
+                            std::env::temp_dir().join(format!("novacode-session-start-{}-{name}", std::process::id()));
+                        let _ = std::fs::write(&f, text.unwrap_or_default());
+                        f
+                    });
+                    let _ = ui.send(UiEvent::OpenFile { path, base });
+                });
+            }
             Cmd::LoginList => {
                 let _ = ui.send(UiEvent::LoginList {
                     items: crate::login::providers(&self.providers),

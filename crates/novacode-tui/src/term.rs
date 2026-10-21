@@ -163,6 +163,30 @@ pub fn external_editor(t: &mut Term, text: &str) -> std::io::Result<Option<Strin
     Ok((new != text).then_some(new))
 }
 
+/// Files tab: open `path` in the editor. With `base` (its content when the session
+/// started) and an editor that diffs (nvim, vim, vi), both open side by side.
+pub fn open_in_editor(t: &mut Term, path: &std::path::Path, base: Option<&std::path::Path>) -> std::io::Result<()> {
+    let editor = editor_command();
+    let bin = editor.split_whitespace().next().unwrap_or_default();
+    let bin = bin.rsplit('/').next().unwrap_or(bin);
+    let diff = base.filter(|_| matches!(bin, "nvim" | "vim" | "vi" | "gvim"));
+    restore();
+    // Through sh, so `EDITOR="code --wait"` works; paths are passed as $1/$2, never spliced.
+    let mut c = std::process::Command::new("sh");
+    match diff {
+        Some(b) => c
+            .arg("-c")
+            .arg(format!("{editor} -d \"$1\" \"$2\""))
+            .arg("sh")
+            .arg(b)
+            .arg(path),
+        None => c.arg("-c").arg(format!("{editor} \"$1\"")).arg("sh").arg(path),
+    };
+    let status = c.status();
+    *t = enter()?;
+    status.map(|_| ())
+}
+
 /// Open a URL in the default browser (xdg-open, or `open` on macOS); output goes nowhere.
 pub fn open(url: &str) {
     let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };

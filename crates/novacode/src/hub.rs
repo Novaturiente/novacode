@@ -329,10 +329,10 @@ impl Hub {
         let (s, route_changed) = {
             let mut g = self.inner.lock().unwrap();
             let before = (g.state.model.clone(), g.state.level, g.state.window_tokens);
-            let info_before = (g.state.quota.clone(), g.state.mcp);
+            let info_before = g.state.info_key();
             f(&mut g.state);
             let after = (g.state.model.clone(), g.state.level, g.state.window_tokens);
-            if info_before != (g.state.quota.clone(), g.state.mcp)
+            if info_before != g.state.info_key()
                 && let Some(l) = &g.local
             {
                 let _ = l.send(g.state.info());

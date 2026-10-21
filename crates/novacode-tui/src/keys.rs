@@ -52,6 +52,7 @@ pub enum A {
     Background,
     PanelToggle,
     PanelFocus,
+    PanelUsage,
     SessionNew,
     SessionResume,
     KeysHelp,
@@ -105,6 +106,7 @@ defs! {
     Background, "app.process.background", App, ["ctrl+alt+b"], "Move running commands to the process manager";
     PanelToggle, "app.panel.toggle", App, ["ctrl+alt+p"], "Show or hide the side panel";
     PanelFocus, "app.panel.focus", App, ["ctrl+alt+f"], "Move keys to the side panel (Esc returns)";
+    PanelUsage, "app.panel.usage", App, ["ctrl+alt+u"], "Open the side panel on Usage stats (again: close)";
     SessionNew, "app.session.new", App, [], "Start a new session";
     SessionResume, "app.session.resume", App, [], "Resume a session";
     KeysHelp, "app.keys.help", App, ["alt+/"], "Show keybindings";

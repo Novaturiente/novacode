@@ -102,6 +102,9 @@ pub struct State {
     /// MCP servers: (ready, configured).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp: Option<(usize, usize)>,
+    /// MCP servers, what loaded and the context split, for the Usage stats tab.
+    #[serde(default, skip_serializing_if = "novacode_tui::panel::HostInfo::is_empty")]
+    pub host: novacode_tui::panel::HostInfo,
 }
 
 impl State {
@@ -114,7 +117,19 @@ impl State {
             weekly: q.and_then(|q| q.weekly.as_ref()).map(|w| w.used_pct),
             mcp_ready,
             mcp_total,
+            host: self.host.clone(),
         }
+    }
+
+    /// What [`info`](Self::info) is built from, to tell when to send it again.
+    pub fn info_key(
+        &self,
+    ) -> (
+        Option<novacode_ai::quota::Quota>,
+        Option<(usize, usize)>,
+        novacode_tui::panel::HostInfo,
+    ) {
+        (self.quota.clone(), self.mcp, self.host.clone())
     }
 
     /// Context use, 0–100.

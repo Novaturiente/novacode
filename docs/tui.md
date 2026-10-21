@@ -17,24 +17,26 @@ Above the editor you may also see queued messages (`⏵ queued: …`), the compl
 
 ## Side panel
 
-The panel has tabs. Switch tabs with `Tab` and `Shift+Tab` while the panel has focus.
+The panel has tabs. Switch tabs with `Tab` and `Shift+Tab` or the number keys `1`–`9` while the panel has focus (the tab bar shows the numbers then), or click a tab.
 
 | Tab | Shows |
 |---|---|
-| Agent | The goal, the todo list and running subagents. |
+| Agent | The goal, the todo list and subagents. Subagents show from the oldest prompt that still has one running up to the newest prompt that started any; older finished ones are hidden (the title counts them). |
 | Processes | One process at a time: its status, command and live output (the program's own colors, else errors red, warnings yellow, success green, URLs blue). Running ones come first. `/ps` opens the panel here with focus. |
-| Usage & cache | Tokens, cost and cache numbers. |
-| Timing | Where the time of the turn went. |
-| Files | Files the model read or edited. |
+| Usage stats | Bars for context use (and a split into system prompt, tools and messages), cache hits (last request and session) and subscription windows; sparklines of cache hit and cost (or output tokens) per request; token totals and cost; MCP servers with connected or failed state and tool counts; how many skills, prompts, agents, extensions, packages and context files loaded, and running processes and subagents. `Ctrl+Alt+U` opens it. |
+| Timing | Where the time of each task went, with a sparkline of task times. |
+| Files | Files the model read or edited, edited first, each with `+added −removed` lines since the session started. `Enter` or a click opens the file in your editor: in nvim or vim as a diff against the session start (`-d`), else the file alone. |
 
 Extensions can add tabs too (see [extensions](extensions.md)).
 
 | Key | What it does |
 |---|---|
 | `Ctrl+Alt+P` | Show or hide the panel. |
+| `Ctrl+Alt+U` | Open the panel on Usage stats with focus. Again closes it. |
 | `Ctrl+Alt+F` | Give the panel the keys. `Esc` or `q` gives them back. |
 | `Up`/`Down` (or `k`/`j`) | Move in the focused panel. |
-| `Enter` | Run the action of the selected row (used by extension tabs). |
+| `Enter` | Run the action of the selected row (Files: open it; extension tabs: their action). |
+| Mouse | Wheel scrolls the panel, a click picks a tab or a row, a drag copies text. |
 | `Left`/`Right` (or `h`/`l`) | Processes tab: the previous or next process. `Up`/`Down` scroll its output; `PageUp`/`PageDown` scroll by 10; `End` or `G` follows the tail again. |
 
 The panel needs a terminal at least 100 columns wide. On a narrower screen it stays hidden and open todos show as a short block above the editor instead. Its width is a quarter of the screen, at least 40 columns and at most half.
@@ -199,6 +201,7 @@ Press `Alt+/` or type `/keys` to see the live table, including your changes. Typ
 | `app.process.background` | `Ctrl+Alt+B` | Move running commands to the process manager. |
 | `app.panel.toggle` | `Ctrl+Alt+P` | Show or hide the side panel. |
 | `app.panel.focus` | `Ctrl+Alt+F` | Move keys to the side panel. |
+| `app.panel.usage` | `Ctrl+Alt+U` | Open the side panel on Usage stats (again: close). |
 | `app.session.new` | none | Start a new session. |
 | `app.session.resume` | none | Resume a session. |
 | `app.keys.help` | `Alt+/` | Show key bindings. |

@@ -277,6 +277,33 @@ pub fn rewind(store: &crate::session::Store, repo: &Repo, prompt: &str) -> Resul
     Ok(Rewound { undo, changed, skipped })
 }
 
+/// `rel` (relative to the repo root) as it was when the session in `file` began:
+/// the first checkpoint's copy, or outside git the copy kept before the first edit.
+/// `Ok(None)` = it didn't exist then (or nothing was kept for it).
+pub fn session_base(file: &Path, repo: &Repo, rel: &str) -> Result<Option<String>, String> {
+    use crate::session::{Entry, EntryKind};
+    let text = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
+    for e in text
+        .lines()
+        .skip(1)
+        .filter_map(|l| serde_json::from_str::<Entry>(l).ok())
+    {
+        match e.kind {
+            EntryKind::Checkpoint { tree, .. } if repo.shadow.is_none() => {
+                return Ok(git(repo, &["show", &format!("{tree}:{rel}")], None).ok());
+            }
+            EntryKind::FileBefore { path, blob } if path == rel => {
+                return match blob {
+                    Some(b) => git(repo, &["cat-file", "blob", &b], None).map(Some),
+                    None => Ok(None),
+                };
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
 /// Undo a rewind: files back to `undo`.
 pub fn undo(store: &crate::session::Store, repo: &Repo, undo: &str) -> Result<usize, String> {
     let mut tracked: Vec<String> = Vec::new();
@@ -329,6 +356,21 @@ mod tests {
         assert!(repo.shadow.is_none());
         let (tree, skipped) = snapshot(&repo, &[]).unwrap();
         assert_eq!(skipped, ["big.bin"]);
+        // The session's first checkpoint is the base the Files tab diffs against.
+        let entry = crate::session::Entry {
+            id: "e1".into(),
+            parent: None,
+            ts_ms: 0,
+            kind: crate::session::EntryKind::Checkpoint {
+                tree: tree.clone(),
+                skipped: vec![],
+            },
+        };
+        let sd = tempfile::tempdir().unwrap();
+        let file = sd.path().join("s.jsonl");
+        std::fs::write(&file, format!("{{}}\n{}\n", serde_json::to_string(&entry).unwrap())).unwrap();
+        assert_eq!(session_base(&file, &repo, "a.txt").unwrap().as_deref(), Some("one\n"));
+        assert_eq!(session_base(&file, &repo, "new.txt").unwrap(), None);
         // The turn edits, deletes and creates files, as bash would.
         std::fs::write(root.join("a.txt"), "two\n").unwrap();
         std::fs::remove_file(root.join("notes.txt")).unwrap();

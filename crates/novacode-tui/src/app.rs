@@ -133,6 +133,10 @@ pub enum Cmd {
     Context,
     /// `/docs`: a hidden note with novacode's docs path and config files.
     Docs,
+    /// Count changed lines of these files since the session started (Files tab).
+    FileStats(Vec<String>),
+    /// Get a file's content from the session start, to open it in the editor beside the file.
+    OpenFile(String),
     Compact,
     /// Write the session to a file; `true` = HTML (L4.14).
     Export(bool),
@@ -236,6 +240,13 @@ pub enum UiEvent {
     LoginDone {
         result: Result<String, String>,
     },
+    /// Files tab: (path, +added, -removed) since the session started.
+    FileStats(Vec<(String, u64, u64)>),
+    /// Open `path` in the editor; `base` holds its content from the session start, for a diff.
+    OpenFile {
+        path: std::path::PathBuf,
+        base: Option<std::path::PathBuf>,
+    },
     /// The level actually used (clamped to what the model supports), and a note.
     Thinking {
         level: ThinkingLevel,
@@ -247,6 +258,7 @@ pub enum UiEvent {
         weekly: Option<f64>,
         mcp_ready: usize,
         mcp_total: usize,
+        host: crate::panel::HostInfo,
     },
     /// A model switch was accepted: the resolved `provider/model`, its context window and level.
     ModelSet {
@@ -379,6 +391,8 @@ pub struct App {
     pub suspend: bool,
     /// Open `$EDITOR` on the prompt (needs the terminal, so the loop does it).
     pub external_editor: bool,
+    /// Open a file (and its session-start copy, for a diff) in the editor; the loop does it.
+    pub open_file: Option<(std::path::PathBuf, Option<std::path::PathBuf>)>,
     pub panel: crate::panel::Panel,
     /// Extension status segments `ext:<ext>:<key>` → (text, style).
     ext_status: std::collections::BTreeMap<String, (String, Option<String>)>,
@@ -492,6 +506,7 @@ impl App {
             exit: None,
             suspend: false,
             external_editor: false,
+            open_file: None,
             panel,
             ext_status: Default::default(),
             widgets: Default::default(),
@@ -597,6 +612,8 @@ impl App {
                 }
                 self.panel.set_procs(items);
             }
+            UiEvent::FileStats(v) => self.panel.set_diffstat(v),
+            UiEvent::OpenFile { path, base } => self.open_file = Some((path, base)),
             UiEvent::Page { title, text } => self.overlay = Some(Overlay::Pager(Pager::new(title, &text, &self.theme))),
             UiEvent::Thinking { level, note } => {
                 self.init.level = level;
@@ -607,10 +624,12 @@ impl App {
                 weekly,
                 mcp_ready,
                 mcp_total,
+                host,
             } => {
                 self.quota = (five_hour, weekly);
                 self.mcp = (mcp_ready, mcp_total);
                 self.panel.quota(five_hour, weekly);
+                self.panel.host = host;
             }
             UiEvent::ModelSet {
                 model,
@@ -770,6 +789,10 @@ impl App {
             AgentEvent::Settled => {
                 self.busy = false;
                 self.activity.clear();
+                let edited = self.panel.edited_files();
+                if !edited.is_empty() {
+                    self.send(Cmd::FileStats(edited));
+                }
                 // A refused or failed prompt never comes back: drop its echo.
                 self.tr.echo = None;
                 self.tr.settle();
@@ -836,6 +859,7 @@ impl App {
         use crate::panel::PanelAction;
         match a {
             PanelAction::Command(c) => self.submit(c, self.busy),
+            PanelAction::OpenFile(p) => self.send(Cmd::OpenFile(p)),
             PanelAction::Ext { ext, tab, node, action } => {
                 let (width, height) = self.panel.size;
                 self.send(Cmd::ExtKey {
@@ -1042,7 +1066,7 @@ impl App {
         // The focused panel takes the keys, except the ones that leave it (L9.16).
         if self.panel.focused && self.panel.visible {
             match self.keymap.lookup(&k, &[Scope::App]) {
-                Some(A::PanelFocus | A::PanelToggle | A::Clear) if !self.init.panel_only => {}
+                Some(A::PanelFocus | A::PanelToggle | A::PanelUsage | A::Clear) if !self.init.panel_only => {}
                 Some(A::Clear) => self.exit = Some(Exit::Quit),
                 _ => {
                     if let Some(Some(a)) = self.panel.key(&crate::keys::name(&k)) {
@@ -1155,6 +1179,7 @@ impl App {
             }
             Some(A::ThinkingToggle) => self.toggle_thinking(),
             Some(A::PanelToggle) => self.panel.toggle(),
+            Some(A::PanelUsage) => self.panel.show_tab("usage"),
             Some(A::PanelFocus) => {
                 if !self.panel.visible {
                     self.panel.toggle();
@@ -1541,7 +1566,11 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) if self.screen_sel.is_some() => {
                 let (a, b) = self.screen_sel.take().unwrap();
-                if a != b {
+                if a == b && self.overlay.is_none() && self.panel.contains(a.0, a.1) {
+                    if let Some(act) = self.panel.click(a.0, a.1) {
+                        self.panel_action(act);
+                    }
+                } else if a != b {
                     let text = screen_text(&self.frame, a, b);
                     if !text.is_empty() {
                         crate::term::copy(&text);
@@ -1574,6 +1603,13 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
+        if self.panel.contains(m.column, m.row) {
+            match m.kind {
+                MouseEventKind::ScrollUp => return self.panel.wheel(true),
+                MouseEventKind::ScrollDown => return self.panel.wheel(false),
+                _ => {}
+            }
+        }
         let starts = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
         if (starts && self.at(m.column, m.row).is_none() || !starts && self.screen_sel.is_some())
             && self.on_screen_mouse(m)
