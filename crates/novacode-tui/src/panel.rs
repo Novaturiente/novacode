@@ -161,7 +161,7 @@ pub struct Panel {
     diffstat: BTreeMap<String, (u64, u64)>,
     /// Where the last draw put things, for the mouse: tab labels (x from, x to, name),
     /// the body, and which row each body line shows.
-    tab_spans: Vec<(u16, u16, String)>,
+    tab_spans: Vec<(u16, u16, u16, String)>,
     tab_row: u16,
     body: Rect,
     line_rows: Vec<Option<usize>>,
@@ -377,8 +377,13 @@ impl Panel {
     /// (and opens it, in the Files tab).
     pub fn click(&mut self, col: u16, row: u16) -> Option<PanelAction> {
         self.focused = true;
-        if row <= self.tab_row + 1 {
-            if let Some((_, _, name)) = self.tab_spans.iter().find(|(a, b, _)| (*a..*b).contains(&col)).cloned() {
+        if row < self.body.y {
+            // A tab's name row or the bar row under it.
+            let hit = self
+                .tab_spans
+                .iter()
+                .find(|(y, a, b, _)| (*y..=*y + 1).contains(&row) && (*a..*b).contains(&col));
+            if let Some((.., name)) = hit.cloned() {
                 self.shown = Some(name);
                 self.sel = 0;
             }
@@ -1094,12 +1099,24 @@ impl Panel {
     }
 
     pub fn render(&mut self, f: &mut Frame, area: Rect, theme: &Theme) {
-        let tabs = self.shown_tabs();
+        let border = if self.focused { theme.accent } else { theme.border };
+        let block = Block::default().borders(Borders::LEFT).border_style(border);
+        let inner = block.inner(area);
+        let inner = Rect {
+            x: inner.x + 1,
+            width: inner.width.saturating_sub(1),
+            ..inner
+        };
+        f.render_widget(block, area);
+        if inner.height == 0 {
+            return;
+        }
         // Accent-bar look: icon + name, the shown tab in accent with a ━ bar under it.
-        let mut head: Vec<Span> = Vec::new();
-        let mut under: Vec<Span> = Vec::new();
-        let mut spans_at: Vec<(u16, u16, String)> = Vec::new();
-        let mut x = area.x + 2;
+        // Tabs that don't fit go on another row, so every name stays visible.
+        let tabs = self.shown_tabs();
+        let mut rows: Vec<(Vec<Span>, Vec<Span>)> = vec![(Vec::new(), Vec::new())];
+        let mut spans_at: Vec<(u16, u16, u16, String)> = Vec::new();
+        let mut x = 0u16;
         for (i, t) in tabs.iter().enumerate() {
             let on = self.shown.as_deref() == Some(t.name.as_str());
             let icon = match (self.nerd, t.name.as_str()) {
@@ -1117,44 +1134,41 @@ impl Panel {
                 String::new()
             };
             let label = format!(" {num}{icon}{} ", t.title);
-            let lw = unicode_width::UnicodeWidthStr::width(label.as_str());
-            spans_at.push((x, x + lw as u16, t.name.clone()));
-            x += lw as u16;
+            let lw = unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
+            if x > 0 && x + lw > inner.width {
+                rows.push((Vec::new(), Vec::new()));
+                x = 0;
+            }
+            let y = inner.y + 2 * (rows.len() as u16 - 1);
+            spans_at.push((y, inner.x + x, inner.x + x + lw, t.name.clone()));
+            x += lw;
             let st = if on {
                 theme.accent.add_modifier(Modifier::BOLD)
             } else {
                 theme.dim
             };
+            let (head, under) = rows.last_mut().unwrap();
             head.push(Span::styled(label, st));
             under.push(if on {
-                Span::styled("━".repeat(lw), theme.accent)
+                Span::styled("━".repeat(lw as usize), theme.accent)
             } else {
-                Span::raw(" ".repeat(lw))
+                Span::raw(" ".repeat(lw as usize))
             });
         }
         self.tab_spans = spans_at;
         self.tab_row = area.y;
-        let border = if self.focused { theme.accent } else { theme.border };
-        let block = Block::default().borders(Borders::LEFT).border_style(border);
-        let inner = block.inner(area);
-        let inner = Rect {
-            x: inner.x + 1,
-            width: inner.width.saturating_sub(1),
-            ..inner
-        };
-        f.render_widget(block, area);
-        if inner.height == 0 {
-            return;
-        }
-        let top = 2.min(inner.height);
+        let lines: Vec<Line> = rows
+            .into_iter()
+            .flat_map(|(h, u)| {
+                [
+                    crate::wrap::truncate(h, inner.width as usize),
+                    crate::wrap::truncate(u, inner.width as usize),
+                ]
+            })
+            .collect();
+        let top = (lines.len() as u16).min(inner.height);
         self.size = (inner.width, inner.height - top);
-        f.render_widget(
-            Paragraph::new(vec![
-                crate::wrap::truncate(head, inner.width as usize),
-                crate::wrap::truncate(under, inner.width as usize),
-            ]),
-            Rect { height: top, ..inner },
-        );
+        f.render_widget(Paragraph::new(lines), Rect { height: top, ..inner });
         let body = Rect {
             y: inner.y + top,
             height: inner.height - top,
@@ -1764,6 +1778,30 @@ mod tests {
         );
         start(&mut p);
         assert_eq!(shown(&p), ["a4"], "a prompt without subagents keeps the last set");
+    }
+
+    #[test]
+    fn tabs_wrap_so_every_name_shows() {
+        let mut p = Panel::default();
+        p.stats.files.insert("a.rs".into(), "edited");
+        p.stats.tasks.push(Task::default());
+        p.stats.procs.insert("p1".into(), ("dev".into(), None));
+        p.host.loaded = vec![("skills".into(), 3)];
+        p.refresh(0, None);
+        p.todos(&json!([{"id": 1, "text": "x", "status": "active"}]));
+        p.focused = true;
+        p.visible = true;
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 12)).unwrap();
+        term.draw(|f| p.render(f, f.area(), &Theme::default())).unwrap();
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        for name in ["Agent", "Processes", "Usage stats", "Timing", "Files"] {
+            assert!(text.contains(name), "{name} hidden:\n{text}");
+        }
+        // A click on the second row of tabs switches to that tab.
+        let (y, x, _, name) = p.tab_spans.last().cloned().unwrap();
+        assert!(y > p.tab_row, "wrapped to a second row");
+        p.click(x + 1, y);
+        assert_eq!(p.shown.as_deref(), Some(name.as_str()));
     }
 
     #[test]
