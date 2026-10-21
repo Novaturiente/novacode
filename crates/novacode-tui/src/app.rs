@@ -361,6 +361,8 @@ pub struct App {
     tx: UnboundedSender<Cmd>,
     init: Init,
     pub busy: bool,
+    /// `/reload` during a turn: done when the turn ends, so the turn isn't cut off.
+    reload_after: bool,
     /// Running processes in the manager (L5.11), for the status line.
     procs: std::collections::BTreeSet<String>,
     activity: String,
@@ -485,6 +487,7 @@ impl App {
             tx,
             init,
             busy: false,
+            reload_after: false,
             procs: Default::default(),
             activity: String::new(),
             spinner: 0,
@@ -603,7 +606,7 @@ impl App {
                 self.overlay = None;
                 self.tr.notice(note, false);
                 // New credentials load on reload; the session carries on.
-                self.exit = Some(Exit::Reload);
+                self.reload();
             }
             UiEvent::LoginDone { result: Err(e) } => match &mut self.overlay {
                 Some(Overlay::Login(v)) => v.failed(e),
@@ -788,6 +791,9 @@ impl App {
             AgentEvent::Settled => {
                 self.busy = false;
                 self.activity.clear();
+                if std::mem::take(&mut self.reload_after) {
+                    self.exit = Some(Exit::Reload);
+                }
                 let edited = self.panel.edited_files();
                 if !edited.is_empty() {
                     self.send(Cmd::FileStats(edited));
@@ -851,6 +857,17 @@ impl App {
                 self.panel.apply(ext, &op);
                 self.panel.tick();
             }
+        }
+    }
+
+    /// `/reload`: now when idle, else when the running turn ends (it isn't cut off).
+    fn reload(&mut self) {
+        if self.busy {
+            self.reload_after = true;
+            self.tr
+                .notice("reload queued: it runs when this turn ends (Esc ends it now)", false);
+        } else {
+            self.exit = Some(Exit::Reload);
         }
     }
 
@@ -1170,7 +1187,7 @@ impl App {
                 None => self.flash("nothing queued"),
             },
             Some(A::Reload) if self.init.attached => self.flash("reload works in the session's own window"),
-            Some(A::Reload) => self.exit = Some(Exit::Reload),
+            Some(A::Reload) => self.reload(),
             Some(A::HistorySearch) => self.editor.search_history(),
             Some(A::FollowUp) => {
                 if let Some(t) = self.editor.take() {
@@ -1453,7 +1470,7 @@ impl App {
                 "/thinking" => self.pick_thinking(),
                 "/resume" => self.send(Cmd::ListSessions),
                 "/new" => self.exit = Some(Exit::New),
-                "/reload" => self.exit = Some(Exit::Reload),
+                "/reload" => self.reload(),
                 "/ps" => self.open_procs(None),
                 "/mcp" => self.send(Cmd::Mcp),
                 "/restart" => self.exit = Some(Exit::Restart),

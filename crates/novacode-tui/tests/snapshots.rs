@@ -907,3 +907,24 @@ fn prompt_echoes_at_once_and_thinking_ticks() {
     a.on_agent(AgentEvent::Settled);
     assert!(!screen(&mut a, 50, 12).contains("again"));
 }
+
+#[test]
+fn reload_during_a_turn_waits_for_it_to_end() {
+    let (mut a, _rx) = app(vec![]);
+    let type_ = |a: &mut App, s: &str| {
+        for c in s.chars() {
+            a.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    };
+    a.on_agent(AgentEvent::AgentStart);
+    type_(&mut a, "/reload");
+    assert_eq!(a.exit, None, "the turn keeps going");
+    assert!(screen(&mut a, 70, 12).contains("reload queued"));
+    a.on_agent(AgentEvent::Settled);
+    assert_eq!(a.exit, Some(Exit::Reload));
+    // Idle: at once.
+    let (mut b, _rx) = app(vec![]);
+    type_(&mut b, "/reload");
+    assert_eq!(b.exit, Some(Exit::Reload));
+}
