@@ -136,7 +136,7 @@ Type `/` to see the list. A line that is only `/something` unknown to novacode i
 | `/compact` | Replace older messages with the memory notes. |
 | `/export [html]` | Write this branch to a file. |
 | `/copy` | Copy the last reply (also `Ctrl+X`). |
-| `/btw <question>` | Side question. See [below](#side-questions-with-btw). |
+| `/btw [question]` | Side chat. See [below](#side-questions-with-btw). |
 | `/context` | Where the context window goes. |
 | `/docs [question]` | Add a hidden note telling the model where novacode's own docs (`~/.novacode/docs/`) and your config files are, then ask the question if you gave one. Use it to have the session set up or customise novacode. |
 | `/usage` | Tokens and cost per route, cache warming, memory workers and subscription windows. |
@@ -173,7 +173,7 @@ All of them show up in the `/` popup.
 
 ### Side questions with /btw
 
-`/btw <question>` asks the model something without touching the conversation. Your main turn keeps running. The answer is not saved in the session. A short answer appears in the transcript; a longer one opens in a page (`Esc` or `q` closes it).
+`/btw [question]` opens a side chat in a popup. It asks the model things without touching the conversation, and your main turn keeps running. The model may look things up with read-only tools (`read`, `grep`, `find`, `ls`, and `codemode` scripts limited to those), up to 5 rounds per question; anything else, and anything that would need your approval, is refused. Type follow-ups in the popup's own input and press `Enter`; one question is answered at a time. `PgUp`/`PgDn` scroll, `Esc` closes. Nothing asked here is saved in the session. If you close the popup before an answer arrives, the answer appears in the transcript instead.
 
 ## Key bindings
 

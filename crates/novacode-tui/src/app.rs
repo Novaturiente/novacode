@@ -49,7 +49,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/clone", "new session with this whole branch"),
     ("/export", "write this branch to a file (/export html for a web page)"),
     ("/copy", "copy the last reply"),
-    ("/btw", "side question: /btw <question>, not kept in the conversation"),
+    ("/btw", "side chat: /btw [question], not kept in the conversation"),
     ("/name", "name this session: /name <text>"),
     (
         "/worktree",
@@ -226,6 +226,10 @@ pub enum UiEvent {
         text: String,
         error: bool,
     },
+    /// Answer to [`Cmd::Btw`]: the side answer, or why it failed.
+    Btw {
+        result: Result<String, String>,
+    },
     /// Answer to [`Cmd::Dequeue`]: `false` = it already reached the model.
     Dequeued {
         ok: bool,
@@ -320,6 +324,8 @@ struct Shown {
     view: View,
     top: usize,
     area: Rect,
+    /// The "jump to bottom" pill, drawn while scrolled up; a click on it follows the tail.
+    jump: Option<Rect>,
 }
 
 /// Popup under the cursor: `@file` or a slash command (L9.5).
@@ -353,6 +359,8 @@ enum Overlay {
     Login(crate::login::LoginView),
     /// `/ps`: one process's live output.
     Procs(crate::procs::ProcPopup),
+    /// `/btw`: the side chat.
+    Btw(crate::btw::BtwChat),
 }
 
 pub struct App {
@@ -620,6 +628,18 @@ impl App {
             UiEvent::FileStats(v) => self.panel.set_diffstat(v),
             UiEvent::OpenFile { path, base } => self.open_file = Some((path, base)),
             UiEvent::Page { title, text } => self.overlay = Some(Overlay::Pager(Pager::new(title, &text, &self.theme))),
+            UiEvent::Btw { result } => {
+                let left = match &mut self.overlay {
+                    Some(Overlay::Btw(c)) => c.answer(result),
+                    _ => Err(result),
+                };
+                // The popup was closed meanwhile: the answer goes to the transcript (never stored).
+                match left {
+                    Ok(()) => {}
+                    Err(Ok(a)) => self.tr.notice(format!("btw › {a}"), false),
+                    Err(Err(e)) => self.tr.notice(format!("btw: {e}"), true),
+                }
+            }
             UiEvent::Thinking { level, note } => {
                 self.init.level = level;
                 self.tr.notice(note, false);
@@ -944,6 +964,11 @@ impl App {
                     v.paste(&s);
                 }
             }
+            Event::Paste(s) if matches!(self.overlay, Some(Overlay::Btw(_))) => {
+                if let Some(Overlay::Btw(c)) = &mut self.overlay {
+                    c.paste(&s);
+                }
+            }
             Event::Paste(s) if self.approvals.is_empty() && self.asks.is_empty() && self.overlay.is_none() => {
                 self.editor.paste(&s)
             }
@@ -1024,6 +1049,17 @@ impl App {
                 Overlay::Procs(p) => {
                     if p.handle(&k, &self.panel.procs, page) {
                         self.overlay = None;
+                    }
+                }
+                Overlay::Btw(c) => {
+                    use crate::btw::BtwKey;
+                    match c.handle(k, self.keymap.lookup(&k, &[Scope::Editor]), page) {
+                        BtwKey::None => {}
+                        BtwKey::Ask(q) => {
+                            c.ask(q.clone());
+                            self.send(Cmd::Btw(q));
+                        }
+                        BtwKey::Close => self.overlay = None,
                     }
                 }
                 Overlay::Login(v) => {
@@ -1481,8 +1517,14 @@ impl App {
                     self.overlay = Some(Overlay::Pager(Pager::keys_help(&self.keymap, &self.theme)));
                 }
                 "/copy" => self.copy_reply(),
-                "/btw" if !arg.is_empty() => self.send(Cmd::Btw(arg.to_string())),
-                "/btw" => self.flash("usage: /btw <question>"),
+                "/btw" => {
+                    let mut c = crate::btw::BtwChat::default();
+                    if !arg.is_empty() {
+                        c.ask(arg.to_string());
+                        self.send(Cmd::Btw(arg.to_string()));
+                    }
+                    self.overlay = Some(Overlay::Btw(c));
+                }
                 "/name" if !arg.is_empty() => self.send(Cmd::Rename(arg.to_string())),
                 "/name" => self.flash("usage: /name <text>"),
                 "/worktree" => self.send(Cmd::Worktree(arg.to_string())),
@@ -1645,6 +1687,16 @@ impl App {
             }
         }
         let starts = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
+        let on_jump = self
+            .shown
+            .as_ref()
+            .and_then(|s| s.jump)
+            .is_some_and(|r| r.contains(Position::new(m.column, m.row)));
+        if starts && on_jump {
+            self.anchor = None;
+            self.selection = None;
+            return;
+        }
         if (starts && self.at(m.column, m.row).is_none() || !starts && self.screen_sel.is_some())
             && self.on_screen_mouse(m)
         {
@@ -1922,6 +1974,7 @@ impl App {
                 )
             }
             Some(Overlay::Pager(p)) => p.render(f, dialog::centered(main, 90, 90, main.height), t),
+            Some(Overlay::Btw(c)) => c.render(f, dialog::centered(main, 80, 80, main.height), t),
             Some(Overlay::Procs(p)) => p.render(
                 f,
                 dialog::centered(main, 90, 90, main.height),
@@ -2012,7 +2065,20 @@ impl App {
                 }
             }
         }
-        self.shown = Some(Shown { view, top, area });
+        let jump = self.anchor.is_some().then(|| {
+            let label = format!(" ↓ Jump to bottom ({}) ", self.keymap.keys(A::Bottom));
+            let w = (label.width() as u16).min(area.width);
+            let r = Rect {
+                x: area.x + area.width - w,
+                y: area.y + area.height.saturating_sub(1),
+                width: w,
+                height: 1.min(area.height),
+            };
+            let style = self.theme.accent.add_modifier(ratatui::style::Modifier::REVERSED);
+            f.render_widget(Paragraph::new(Line::styled(label, style)), r);
+            r
+        });
+        self.shown = Some(Shown { view, top, area, jump });
     }
 
     /// Every status segment that has something to show (L9.12).
@@ -2203,12 +2269,6 @@ impl App {
             } else {
                 self.flash = None;
             }
-        }
-        if self.anchor.is_some() {
-            left.push(Span::styled(
-                format!("  ↓ scrolled ({})", self.keymap.keys(A::Bottom)),
-                t.dim,
-            ));
         }
         left
     }

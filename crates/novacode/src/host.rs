@@ -510,28 +510,10 @@ impl Host {
             }
             Cmd::Btw(q) => {
                 let (h, ui) = (self.hub.handle.clone(), ui.clone());
-                let _ = ui.send(UiEvent::Notice {
-                    text: format!("btw: asking \"{}\"…", q.lines().next().unwrap_or("")),
-                    error: false,
-                });
                 // Off the command loop: the main thread keeps going meanwhile.
                 tokio::spawn(async move {
-                    let ev = match h.side_question(&q).await {
-                        // Short answers sit in the transcript (never stored); long ones get a page.
-                        Ok(a) if a.lines().count() <= 6 && a.len() <= 600 => UiEvent::Notice {
-                            text: format!("btw › {a}"),
-                            error: false,
-                        },
-                        Ok(a) => UiEvent::Page {
-                            title: format!("btw: {}", q.lines().next().unwrap_or("")),
-                            text: a,
-                        },
-                        Err(e) => UiEvent::Notice {
-                            text: format!("btw: {e}"),
-                            error: true,
-                        },
-                    };
-                    let _ = ui.send(ev);
+                    let result = h.side_question(&q).await;
+                    let _ = ui.send(UiEvent::Btw { result });
                 });
             }
             Cmd::Dequeue(steer) => {

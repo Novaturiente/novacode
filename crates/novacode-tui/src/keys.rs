@@ -116,7 +116,7 @@ defs! {
     PageUp, "tui.altScreen.pageUp", Scroll, ["pageUp"], "Scroll up a page";
     PageDown, "tui.altScreen.pageDown", Scroll, ["pageDown"], "Scroll down a page";
     Top, "tui.altScreen.top", Scroll, ["ctrl+home"], "Scroll to the top";
-    Bottom, "tui.altScreen.bottom", Scroll, ["ctrl+end"], "Scroll to the bottom";
+    Bottom, "tui.altScreen.bottom", Scroll, ["ctrl+end", "shift+pageDown"], "Scroll to the bottom";
     PrevPrompt, "tui.altScreen.previousPrompt", Scroll, ["ctrl+up", "ctrl+shift+up"], "Jump to the previous prompt";
     NextPrompt, "tui.altScreen.nextPrompt", Scroll, ["ctrl+down", "ctrl+shift+down"], "Jump to the next prompt";
     Search, "tui.altScreen.search", Scroll, ["ctrl+f", "ctrl+shift+f"], "Search the transcript";

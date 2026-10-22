@@ -225,6 +225,28 @@ struct ExtView {
     route: Option<(Arc<dyn Adapter>, Request)>,
     /// The pipeline runner and a context for extension tool calls (`spawnAgent`).
     tools: Option<(Arc<crate::codemode::Runner>, ToolCtx)>,
+    /// The codemode tool, for `/btw` scripts limited to read-only tools.
+    codemode: Option<Arc<dyn Tool>>,
+}
+
+/// What `/btw` may run: tools that can't change anything.
+const SIDE_TOOLS: [&str; 4] = ["read", "grep", "find", "ls"];
+/// Tool rounds per side question before it must answer.
+const SIDE_ROUNDS: usize = 5;
+
+/// A runner with `r`'s rules and hooks but only `tools`, and no approver:
+/// anything that would need an approval is refused instead of prompting over the popup.
+fn side_runner(r: &crate::codemode::Runner, tools: Vec<Arc<dyn Tool>>) -> Arc<crate::codemode::Runner> {
+    Arc::new(crate::codemode::Runner {
+        tools,
+        policy: r.policy.clone(),
+        approver: None,
+        spill_dir: r.spill_dir.clone(),
+        redactor: r.redactor.clone(),
+        budget: r.budget,
+        seq: Default::default(),
+        hooks: r.hooks.clone(),
+    })
 }
 
 impl Shared {
@@ -414,9 +436,12 @@ impl Agent {
             .take_while(|m| matches!(m, Message::System { .. }))
             .count();
         let messages = projection[lead..].iter().map(estimate::message).sum();
-        if self.extensions.is_some() {
-            self.refresh_ext(projection[lead..].to_vec());
-        }
+        // Always: `/btw` runs its tools through this view; the history copy only for extensions.
+        let history = match self.extensions {
+            Some(_) => projection[lead..].to_vec(),
+            None => Vec::new(),
+        };
+        self.refresh_ext(history);
         let warm = if self.cfg.warm {
             self.shared.warm.lock().unwrap().status.clone()
         } else {
@@ -507,6 +532,7 @@ impl Agent {
             history: Arc::new(history),
             route: Some((self.adapter.clone(), template)),
             tools: Some((self.runner(budget), ctx)),
+            codemode: self.tools.iter().find(|t| t.name() == crate::codemode::NAME).cloned(),
         };
     }
 
@@ -2035,7 +2061,7 @@ impl SessionHandle {
         if let Some(r) = reply.filter(|r| r.stop != StopReason::ToolUse) {
             req.messages.push(Message::Assistant(r));
         }
-        let note = "<system-reminder>\nThe user asks a side question (/btw) while you work. Answer it directly and briefly from what you already know; don't call tools. Neither the question nor your answer stays in the conversation.\n</system-reminder>";
+        let note = "<system-reminder>\nThe user asks a side question (/btw) while you work. Answer it directly and briefly. Only read-only tools run here: read, grep, find, ls, and codemode scripts limited to those; any other call is refused. Use them only when the answer needs it. Neither the question nor your answer stays in the conversation.\n</system-reminder>";
         for (q, a) in &thread {
             req.messages.push(Message::user(q.clone()));
             req.messages.push(Message::Assistant(AssistantMessage {
@@ -2050,21 +2076,64 @@ impl SessionHandle {
             }));
         }
         req.messages.push(Message::user(format!("{note}\n\n{question}")));
-        let mut rx = adapter.stream(req, CancellationToken::new());
-        let mut done = None;
-        while let Some(ev) = rx.recv().await {
-            if let StreamEvent::Done(m) | StreamEvent::Error(m) = ev {
-                done = Some(m);
+        // Read-only runners: `top` answers the model's calls, `nested` serves codemode scripts.
+        let tools = {
+            let ext = self.shared.ext.lock().unwrap();
+            ext.tools.as_ref().map(|(r, ctx)| {
+                let ro: Vec<Arc<dyn Tool>> = r
+                    .tools
+                    .iter()
+                    .filter(|t| SIDE_TOOLS.contains(&t.name()))
+                    .cloned()
+                    .collect();
+                let nested = side_runner(r, ro.clone());
+                let top = side_runner(r, ro.into_iter().chain(ext.codemode.clone()).collect());
+                let mut ctx = ctx.clone();
+                ctx.nested = Some(nested);
+                (top, ctx)
+            })
+        };
+        let mut round = 0;
+        let answer = loop {
+            // The tool list stays as sent, so the cached prefix still matches.
+            let mut rx = adapter.stream(req.clone(), CancellationToken::new());
+            let mut done = None;
+            while let Some(ev) = rx.recv().await {
+                if let StreamEvent::Done(m) | StreamEvent::Error(m) = ev {
+                    done = Some(m);
+                }
             }
-        }
-        let m = done.ok_or("the provider stream ended without a result")?;
-        if let StopReason::Error { .. } = m.stop {
-            return Err(m.error_message.unwrap_or_else(|| "request failed".into()));
-        }
-        let mut answer = m.text().trim().to_string();
-        if m.content.iter().any(|b| matches!(b, Block::ToolCall { .. })) {
-            answer.push_str("\n\n(it wanted to call a tool; /btw answers without tools)");
-        }
+            let m = done.ok_or("the provider stream ended without a result")?;
+            if let StopReason::Error { .. } = m.stop {
+                return Err(m.error_message.unwrap_or_else(|| "request failed".into()));
+            }
+            let calls: Vec<ToolCall> = m.tool_calls().cloned().collect();
+            let Some((top, ctx)) = tools.as_ref().filter(|_| !calls.is_empty() && round < SIDE_ROUNDS) else {
+                let mut answer = m.text().trim().to_string();
+                if !calls.is_empty() {
+                    answer.push_str("\n\n(stopped: it still wanted tools after the round limit)");
+                }
+                break answer;
+            };
+            round += 1;
+            req.messages.push(Message::Assistant(m));
+            use novacode_tools::Nested;
+            let outs = futures_util::future::join_all(
+                calls
+                    .iter()
+                    .map(|c| top.call(c.name.clone(), c.arguments.clone(), ctx.clone())),
+            )
+            .await;
+            for (c, out) in calls.into_iter().zip(outs) {
+                req.messages.push(Message::ToolResult {
+                    call_id: c.id,
+                    tool_name: c.name,
+                    content: out.content,
+                    is_error: out.is_error,
+                    details: None,
+                });
+            }
+        };
         self.shared
             .side
             .lock()

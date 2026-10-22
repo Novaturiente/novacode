@@ -1233,6 +1233,53 @@ async fn side_question_reuses_the_prefix_and_leaves_no_trace() {
     assert!(!stored.contains("side answer"));
 }
 
+/// `/btw` runs read-only tools in a side loop; a write is refused and nothing changes.
+#[tokio::test]
+async fn side_question_runs_only_read_only_tools() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(work.path().join("notes.txt"), "alpha\n").unwrap();
+    let faux = Faux::new([
+        FauxReply::text("main answer"),
+        tools_reply(vec![
+            call("s1", "read", json!({"path": "notes.txt"})),
+            call("s2", "write", json!({"path": "notes.txt", "content": "gone"})),
+        ]),
+        FauxReply::text("it says alpha"),
+    ]);
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        novacode_tools::builtins(false),
+        Store::create(&Paths::new(home.path()), work.path(), true),
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    );
+    let (h, task) = agent::spawn(agent);
+    let mut rx = h.subscribe();
+    h.prompt("main question");
+    while !matches!(rx.recv().await.unwrap(), AgentEvent::Settled) {}
+    assert_eq!(h.side_question("what's in notes?").await.unwrap(), "it says alpha");
+    h.shutdown();
+    task.await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(work.path().join("notes.txt")).unwrap(),
+        "alpha\n"
+    );
+    let reqs = faux.requests.lock().unwrap();
+    assert_eq!(reqs[2].tools, reqs[1].tools, "the tool list stays as sent");
+    let results: Vec<_> = reqs[2]
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::ToolResult { content, is_error, .. } => Some((format!("{content:?}"), *is_error)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert!(results[0].0.contains("alpha") && !results[0].1, "{results:?}");
+    assert!(results[1].1, "write is refused: {results:?}");
+}
+
 #[tokio::test]
 async fn esc_before_the_first_reply_takes_the_prompt_back() {
     let work = tempfile::tempdir().unwrap();
