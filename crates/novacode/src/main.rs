@@ -2403,6 +2403,13 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
         handle.abort();
         handle.shutdown();
         let agent = task.await?;
+        // The session ends here unless `/reload` hands its processes on (docs: stopped at
+        // session end). Explicit: the manager's Drop doesn't run while the window's tasks hold it.
+        if !matches!(res, Ok(Exit::Reload))
+            && let Some(pm) = agent.processes()
+        {
+            pm.kill_all();
+        }
         live.end(match &res {
             // Same session again: attached windows reconnect.
             Ok(
