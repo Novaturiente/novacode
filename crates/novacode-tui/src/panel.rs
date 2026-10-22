@@ -817,19 +817,19 @@ impl Panel {
         }
     }
 
-    /// Files tab: edited first, each with its +/- lines; Enter or a click opens it.
+    /// Files tab: edited files only, each with its +/- lines; Enter or a click opens it.
     fn refresh_files(&mut self) {
-        let mut v: Vec<(&String, &&str)> = self.stats.files.iter().collect();
-        v.sort_by_key(|(p, k)| (**k != "edited", (*p).clone()));
-        let files: Vec<Node> = v
-            .into_iter()
+        let files: Vec<Node> = self
+            .stats
+            .files
+            .iter()
+            .filter(|(_, k)| **k == "edited")
             .map(|(p, k)| {
                 let mut n = node(p, p.clone());
                 n.tag = Some(match self.diffstat.get(p) {
                     Some((a, d)) => format!("+{a} −{d}"),
                     None => (*k).into(),
                 });
-                n.dim = *k == "read";
                 n.actions.insert("enter".into(), "open".into());
                 n
             })
@@ -1700,7 +1700,7 @@ mod tests {
         p.focused = true;
         assert_eq!(p.key("j"), Some(None));
         assert_eq!(p.sel, 1, "scroll offset, clamped when drawn");
-        // Files: rows select, Enter opens; edited files first, with their line counts.
+        // Files: only edited files, with their line counts; rows select, Enter opens.
         p.shown = Some("files".into());
         p.stats.files.insert("b.rs".into(), "read");
         p.stats.files.insert("c.rs".into(), "edited");
@@ -1711,6 +1711,7 @@ mod tests {
         assert_eq!((first.id.as_str(), first.tag.as_deref()), ("c.rs", Some("+12 −3")));
         assert_eq!(p.key("enter"), Some(Some(PanelAction::OpenFile("c.rs".into()))));
         assert_eq!(p.edited_files(), ["c.rs"]);
+        assert_eq!(p.rows().len(), 1, "read-only b.rs is not listed");
         // Number keys jump to a tab.
         assert_eq!(p.key("1"), Some(None));
         assert_eq!(p.shown.as_deref(), Some("agent"));

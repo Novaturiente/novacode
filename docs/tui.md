@@ -25,7 +25,7 @@ The panel has tabs. Switch tabs with `Tab` and `Shift+Tab` or the number keys `1
 | Processes | A list of processes, running ones first: status, run time, command and the last output line. `Enter` or a click opens the process popup. |
 | Usage stats | Bars for context use (and a split into system prompt, tools and messages), cache hits (last request and session) and subscription windows; sparklines of cache hit and cost (or output tokens) per request; token totals and cost; MCP servers with connected or failed state and tool counts; how many skills, prompts, agents, extensions, packages and context files loaded, and running processes and subagents. `Ctrl+Alt+U` opens it. |
 | Timing | Where the time of each task went, with a sparkline of task times. |
-| Files | Files the model read or edited, edited first, each with `+added −removed` lines since the session started. `Enter` or a click opens the file in your editor: in nvim or vim as a diff against the session start (`-d`), else the file alone. |
+| Files | Files the model edited (not ones it only read), each with `+added −removed` lines since the session started. `Enter` or a click opens the file in your editor: in nvim or vim as a diff against the session start (`-d`), else the file alone. |
 
 Extensions can add tabs too (see [extensions](extensions.md)).
 
