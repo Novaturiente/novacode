@@ -1,0 +1,1 @@
+Part 1 of 2, do only this part: add a function `slugify(s)` to text.py. It lowercases the text, turns every run of characters that aren't ASCII letters or digits into one `-`, and strips `-` from both ends. Don't touch cli.py yet.

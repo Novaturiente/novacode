@@ -1,0 +1,1 @@
+Part 2: use the function you wrote in the previous step to add a `--slug` flag to cli.py, so `python3 cli.py --slug 'Hello, World!'` prints `hello-world`. Without the flag cli.py must behave as before. Import the function, don't copy it.
