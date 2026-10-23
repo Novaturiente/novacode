@@ -135,6 +135,8 @@ What comes back from a call: text and images are passed on, an embedded text res
 
 Servers connect in the background, so a session starts at once. novacode caches each server's tool list in `~/.novacode/cache/mcp/<name>.json` after a successful connect, and the next session starts with the same tools whether or not the server is up yet.
 
+A server whose tool list is cached doesn't start with the session: it shows as `idle` in `/mcp` and starts at the first call to one of its tools (that first call waits for it). So a session that never uses a server doesn't pay for it. A server without a cached list starts with the session, so its tools can be found. `novacode mcp list` starts every server to show its live status.
+
 The tool list is fixed when the session starts. So the first time you add a server, its tools are not visible in that session until the list has been fetched; start a new session after `novacode mcp list` (or after the first session has connected). A call to a server that isn't connected yet waits for the connection. If a stdio server dies, the next call starts it again. If a connect failed, the next call tries again too.
 
 The cache is keyed by server name only. If you change a server's config, run `novacode mcp list` to refresh it.

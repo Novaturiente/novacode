@@ -1,7 +1,8 @@
 //! MCP client (L7.4): stdio and streamable-HTTP servers from `~/.novacode/mcp.json`
 //! plus the nearest project `.mcp.json` (Claude Code format, project wins, trust-gated).
 //! Servers connect in the background; their tool lists are cached so a session
-//! starts with the same tools whether or not a server is up yet.
+//! starts with the same tools whether or not a server is up yet. A server with a
+//! cached list starts only at its first call (`Idle` until then, L7.4 revision).
 
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
@@ -163,6 +164,8 @@ pub struct ToolSpec {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Status {
+    /// Not started: its tools come from the cache; it starts at its first call.
+    Idle,
     Connecting,
     Ready,
     Failed(String),
@@ -491,10 +494,15 @@ impl Hub {
                             .ok()
                             .flatten()
                             .unwrap_or_default();
+                    let first = if cached.is_empty() {
+                        Status::Connecting
+                    } else {
+                        Status::Idle
+                    };
                     Arc::new(Server {
                         name: c.name,
                         config: c.config,
-                        status: watch::channel(Status::Connecting).0,
+                        status: watch::channel(first).0,
                         conn: tokio::sync::Mutex::new(None),
                         tools: Mutex::new(cached),
                     })
@@ -505,11 +513,19 @@ impl Hub {
             cwd: cwd.to_path_buf(),
             home: home.to_path_buf(),
         });
-        for s in &hub.servers {
+        // Only servers without a cached list start now, so their tools can be found.
+        for s in hub.servers.iter().filter(|s| *s.status.borrow() == Status::Connecting) {
             let (hub, s) = (hub.clone(), s.clone());
             tokio::spawn(async move { hub.connect(&s).await });
         }
         hub
+    }
+
+    /// Start every server, idle ones too, and wait for each to settle (`novacode mcp list`).
+    pub async fn connect_all(&self) {
+        for s in &self.servers {
+            self.connect(s).await;
+        }
     }
 
     async fn connect(&self, s: &Arc<Server>) -> Option<Arc<Conn>> {
@@ -834,8 +850,79 @@ for line in sys.stdin:
             home.path(),
         );
         assert_eq!(cached.tools().len(), 1);
-        cached.settle().await;
+        assert_eq!(
+            cached.status()[0].1,
+            Status::Idle,
+            "a cached server waits for its first call"
+        );
+        let out = cached.tools()[0].execute(json!({"a": 2, "b": 3}), &ctx).await;
+        assert!(out.is_error);
         assert!(matches!(cached.status()[0].1, Status::Failed(_)));
+    }
+
+    /// L7.4 revision: an uncached server starts with the session; a cached one only at
+    /// its first call, and concurrent first calls share one start.
+    #[tokio::test]
+    async fn cached_servers_start_on_first_use() {
+        let home = tempfile::tempdir().unwrap();
+        let script = home.path().join("srv.py");
+        let marker = home.path().join("starts");
+        std::fs::write(
+            &script,
+            format!("import os\nopen(os.environ['MARK'], 'a').write('x')\n{SERVER}"),
+        )
+        .unwrap();
+        let servers = vec![Configured {
+            name: "calc".into(),
+            config: ServerConfig {
+                command: Some("python3".into()),
+                args: vec![script.display().to_string()],
+                env: [("MARK".to_string(), marker.display().to_string())].into(),
+                ..Default::default()
+            },
+            source: home.path().join("mcp.json"),
+        }];
+        let starts = || std::fs::read_to_string(&marker).unwrap_or_default().len();
+        let first = Hub::start(servers.clone(), home.path(), home.path());
+        tokio::time::timeout(Duration::from_secs(10), first.settle())
+            .await
+            .unwrap();
+        assert_eq!(
+            (starts(), first.status()[0].1.clone()),
+            (1, Status::Ready),
+            "no cache: starts at once"
+        );
+        drop(first);
+        let hub = Hub::start(servers, home.path(), home.path());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            (starts(), hub.status()[0].1.clone()),
+            (1, Status::Idle),
+            "cached: not started"
+        );
+        let ctx = ToolCtx {
+            cwd: home.path().into(),
+            env: Arc::new(novacode_tools::LocalEnv),
+            cancel: Default::default(),
+            updates: None,
+            files: Default::default(),
+            session_id: "t".into(),
+            processes: None,
+            native_tools: false,
+            nested: None,
+            script: false,
+        };
+        let tools = hub.tools();
+        let (a, b) = tokio::join!(
+            tools[0].execute(json!({"a": 1, "b": 2}), &ctx),
+            tools[0].execute(json!({"a": 3, "b": 4}), &ctx)
+        );
+        assert!(!a.is_error && !b.is_error);
+        assert_eq!(
+            (starts(), hub.status()[0].1.clone()),
+            (2, Status::Ready),
+            "one start for both calls"
+        );
     }
 
     #[test]

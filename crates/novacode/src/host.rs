@@ -588,6 +588,7 @@ impl Host {
                         .map(|(name, st, n, d)| {
                             let st = match st {
                                 Status::Ready => "ready".to_string(),
+                                Status::Idle => "idle (starts on first use)".into(),
                                 Status::Connecting => "connecting…".into(),
                                 Status::Failed(e) => format!("failed: {e}"),
                             };

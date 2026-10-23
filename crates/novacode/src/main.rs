@@ -383,7 +383,8 @@ async fn mcp_command(paths: &Paths, what: McpCmd) -> anyhow::Result<ExitCode> {
             }
             let sources: Vec<_> = servers.iter().map(|s| (s.name.clone(), s.source.clone())).collect();
             let hub = mcp::Hub::start(servers, paths.home(), &cwd);
-            hub.settle().await;
+            // Live status, idle servers included.
+            hub.connect_all().await;
             let tools = hub.tools();
             let mut bad = false;
             for (name, status, n, _) in hub.status() {
@@ -394,6 +395,7 @@ async fn mcp_command(paths: &Paths, what: McpCmd) -> anyhow::Result<ExitCode> {
                     .unwrap_or_default();
                 let st = match status {
                     mcp::Status::Ready => "ready".to_string(),
+                    mcp::Status::Idle => "idle".into(),
                     mcp::Status::Connecting => "connecting".into(),
                     mcp::Status::Failed(e) => {
                         bad = true;
@@ -1920,13 +1922,23 @@ async fn start_session(
             // MCP connection counts for the `mcp` segment (pi's mcp-status had to poll too).
             loop {
                 let st = m.status();
-                let ready = st.iter().filter(|s| s.1 == novacode_core::mcp::Status::Ready).count();
+                // Idle servers are usable (they start on first use), so they count as ready.
+                let ready = st
+                    .iter()
+                    .filter(|s| {
+                        matches!(
+                            s.1,
+                            novacode_core::mcp::Status::Ready | novacode_core::mcp::Status::Idle
+                        )
+                    })
+                    .count();
                 let now = Some((ready, st.len()));
                 let servers: Vec<(String, String, usize)> = st
                     .into_iter()
                     .map(|(name, s, n, _)| {
                         let s = match s {
                             novacode_core::mcp::Status::Ready => "ready".to_string(),
+                            novacode_core::mcp::Status::Idle => "idle".into(),
                             novacode_core::mcp::Status::Connecting => "connecting".into(),
                             novacode_core::mcp::Status::Failed(e) => format!("failed: {e}"),
                         };
