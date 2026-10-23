@@ -60,6 +60,7 @@ fn ctx(cwd: &std::path::Path) -> ToolCtx {
         processes: None,
         native_tools: false,
         nested: None,
+        script: false,
     }
 }
 

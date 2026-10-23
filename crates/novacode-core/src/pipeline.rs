@@ -176,6 +176,10 @@ pub async fn run(
             if let Some(clean) = redactor.apply(text) {
                 *text = clean;
             }
+            // A script's own output is cut when it reaches the model.
+            if ctx.script {
+                continue;
+            }
             let cut = guard::truncate(text, tool.keep(), spill);
             *text = match guard::check_budget(&cut, budget, accept) {
                 Ok(t) => t,

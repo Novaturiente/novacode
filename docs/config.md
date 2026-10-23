@@ -37,11 +37,14 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `agents.stallMinutes` | number | 10 | A subagent silent this long is stopped. |
 | `agents.timeoutMinutes` | number | 45 | A subagent running this long is stopped. |
 | `agents.parentPicksTools` | bool | true | The model may pick a subagent's tools (`tools`) and MCP servers (`mcp`) when it spawns one, from its own. Off: only the type's tools. |
+| `agents.env` | object | {} | Environment variables every subagent starts with, e.g. `{"CAVEMAN_DEFAULT_MODE": "off", "PONYTAIL_SUBAGENT_MATCHER": "^$"}` keeps those plugins' `SubagentStart` text out of subagents. |
 | `agents.<name>.tools` | list | the agent file's | Default tools of subagent type `<name>` (built-ins too); a subagent sees only its tools. |
 | `agents.<name>.mcp` | list | [] | MCP servers subagent type `<name>` gets by default (subagents start none otherwise). |
 | `goal.audit` | bool | true | `/goal` completion is checked by the `auditor` subagent before it counts. |
 | `goal.auditModel` | string | the session's model | Model of the goal auditor (`provider/model[:level]`). |
 | `goal.maxRuns` | number | 30 | Automatic continuations of a goal before it pauses (per start or `/goal resume`). |
+| `goal.maxTokens` | number | none | Tokens (prompt + output) a goal may spend; then the agent summarises its progress and the goal pauses. |
+| `goal.judge` | string | the observer's model | Checks after each turn whether the goal is met: a `provider/model`, a classifier model (e.g. `typesafe/jev-latest`: calibrated probabilities, met needs 0.8), or `off` (only the agent's `complete` ends it). |
 | `web.native` | bool | false | Use the model's own web search when it has one. |
 | `web.searxngUrl` | string | unset | SearXNG instance for `web_search`, the last fallback. |
 | `debug.metrics` | bool | false | Per-session timing JSONL in `~/.novacode/metrics/` for `novacode stats`. |

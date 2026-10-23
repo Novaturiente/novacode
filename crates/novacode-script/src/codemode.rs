@@ -102,7 +102,11 @@ const PRELUDE: &str = r#"
   const names = new Set(list.map((t) => t.name));
   const unknown = (name) => { throw new Error(`unknown tool '${name}'. Use searchTools("…") to find tools.`); };
   globalThis.tools = new Proxy({}, {
-    get(_, n) { if (typeof n !== "string" || n === "then") return undefined; return names.has(n) ? (a) => call(n, a) : (a) => Promise.reject(new Error(`unknown tool '${n}'. Use searchTools("…") to find tools.`)); },
+    get(_, n) {
+      if (typeof n !== "string" || n === "then") return undefined;
+      // Scripts see deferred tools directly; `tools.call({name, arguments})` is the same call.
+      if (n === "call") return async (a) => (names.has(a?.name) ? call(a.name, a.arguments ?? {}) : unknown(a?.name));
+      return names.has(n) ? (a) => call(n, a) : (a) => Promise.reject(new Error(`unknown tool '${n}'. Use searchTools("…") to find tools.`)); },
     has(_, n) { return names.has(String(n)); },
     ownKeys() { return list.filter((t) => !t.namespace).map((t) => t.name); },
     getOwnPropertyDescriptor(_, n) { return names.has(String(n)) ? { enumerable: true, configurable: true } : undefined; },

@@ -92,7 +92,7 @@ pub struct Codemode {
 }
 
 const DESCRIPTION: &str = "Run a short JavaScript/TypeScript script that calls tools, to chain several calls (or MCP calls) and return only the result you need. \
-`await tools.<name>(args)` calls a tool (resolves to its text output, throws on error); `await mcp.<server>.<tool>(args)` calls an MCP tool (`mcp.server[\"tool-name\"]` for dashed names). \
+`await tools.<name>(args)` calls any tool, deferred ones too (resolves to its full text output: never clipped or paged, so `JSON.parse(await tools.read({path}))` works; throws on error); `await mcp.<server>.<tool>(args)` calls an MCP tool (`mcp.server[\"tool-name\"]` for dashed names). \
 Use `Promise.all` for parallel calls. Only `text(v)`, `console.log(...)`, `image(dataUrl)` and the `return` value reach you. \
 `await searchTools(query)`, `await describeTool(name)` and `await describeNamespace(server)` show what exists and its argument types. `store(key, v)`/`load(key)` keep JSON across scripts. \
 Classifier models answer typed questions about JSON with probabilities: `await models.getAvailableOfType(\"classifier\")`, then \
@@ -258,6 +258,7 @@ impl Tool for Codemode {
             let mut inner = ctx.clone();
             inner.nested = None;
             inner.updates = None;
+            inner.script = true;
             let undo = a.transaction.then(Arc::default);
             let host = Arc::new(ScriptHost {
                 nested,

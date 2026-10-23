@@ -848,6 +848,7 @@ mod tests {
             processes: None,
             native_tools: false,
             nested: None,
+            script: false,
         };
         let out = bad.execute(json!({}), &ctx).await;
         assert!(text_of(&out).contains("missing field"), "{}", text_of(&out));
@@ -968,6 +969,7 @@ mod tests {
             processes: None,
             native_tools: false,
             nested: None,
+            script: false,
         };
         let shout = tools.iter().find(|t| t.name() == "shout").unwrap();
         assert_eq!(text_of(&shout.execute(json!({"t": "hey"}), &ctx).await), "HEY");

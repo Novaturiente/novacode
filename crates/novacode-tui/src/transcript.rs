@@ -23,6 +23,9 @@ pub enum Item {
     Notice {
         text: String,
         error: bool,
+        /// Folds with the turn's steps: a non-error note from while the turn ran (or a
+        /// replayed one). Errors and replies to the user's own commands stay in view.
+        folds: bool,
     },
 }
 
@@ -117,8 +120,22 @@ impl Turn {
         tools.fold((0, 0), |(n, e), t| (n + 1, e + t.is_error as usize))
     }
 
+    /// Notices that fold with the steps.
+    fn notice_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|i| matches!(i, Item::Notice { folds: true, .. }))
+            .count()
+    }
+
+    /// Only a prompt's turn folds: everything but the prompt and the final reply
+    /// (tool calls, notes, process lines, in-between text) goes behind one line.
+    fn foldable(&self) -> bool {
+        matches!(self.items.first(), Some(Item::User(_))) && (self.tool_count().0 > 0 || self.notice_count() > 0)
+    }
+
     fn collapsed(&self) -> bool {
-        self.done && !self.expanded && self.tool_count().0 > 0
+        self.done && !self.expanded && self.foldable()
     }
 
     pub fn touch(&mut self) {
@@ -217,9 +234,21 @@ impl Transcript {
     }
 
     pub fn notice(&mut self, text: impl Into<String>, error: bool) {
-        self.turn().items.push(Item::Notice {
+        let turn = self.turn();
+        let folds = !error && !turn.done;
+        turn.items.push(Item::Notice {
             text: text.into(),
             error,
+            folds,
+        });
+    }
+
+    /// A notice that stays in view when its turn folds (why a turn ended early).
+    pub fn pinned_notice(&mut self, text: impl Into<String>) {
+        self.turn().items.push(Item::Notice {
+            text: text.into(),
+            error: false,
+            folds: false,
         });
     }
 
@@ -228,7 +257,7 @@ impl Transcript {
     pub fn renotice(&mut self, prefix: &str, text: String, error: bool) {
         for turn in self.turns.iter_mut().rev() {
             for item in turn.items.iter_mut().rev() {
-                if let Item::Notice { text: t, error: e } = item
+                if let Item::Notice { text: t, error: e, .. } = item
                     && t.starts_with(prefix)
                 {
                     (*t, *e) = (text, error);
@@ -360,7 +389,11 @@ impl Transcript {
                 // A saved reminder (`!cmd`, process exit, schedule, report) replayed from the
                 // session: one quiet line, as it looked live, not the model-facing markup.
                 if let Some(line) = reminder_line(&text) {
-                    self.notice(line, false);
+                    // A process's notes (watch matches, stalls, its exit) share one line, as live.
+                    match line.strip_prefix("Process proc_").and_then(|r| r.split_once(' ')) {
+                        Some((n, rest)) => self.renotice(&format!("⚙ proc_{n} "), format!("⚙ proc_{n} {rest}"), false),
+                        None => self.notice(line, false),
+                    }
                     return;
                 }
                 for t in &mut self.turns {
@@ -415,6 +448,7 @@ impl Transcript {
                     turn.items.push(Item::Notice {
                         text: e.clone(),
                         error: true,
+                        folds: false,
                     });
                 }
             }
@@ -657,6 +691,7 @@ fn lay_turn(
     let mut image_toggles = Vec::new();
     let collapsed = turn.collapsed();
     let (n, errors) = turn.tool_count();
+    let notes = turn.notice_count();
     // In a collapsed turn only the prompt, the fold line and the final reply show.
     let final_reply = turn
         .items
@@ -664,21 +699,25 @@ fn lay_turn(
         .rposition(|i| matches!(i, Item::Assistant(b) if b.iter().any(|(k, _)| *k == BlockKind::Text)));
     let mut folded = false;
     for (idx, item) in turn.items.iter().enumerate() {
-        // Notices (errors, "interrupted", retries) always show.
         // Images right after the prompt are part of it and never fold.
         let prompt_image = matches!(item, Item::Image(_))
             && turn.items[..idx]
                 .iter()
                 .all(|i| matches!(i, Item::User(_) | Item::Image(_)));
-        let is_step = !matches!(item, Item::User(_) | Item::Notice { .. }) && Some(idx) != final_reply && !prompt_image;
-        if turn.done && n > 0 && !folded && is_step {
+        let is_step = !matches!(item, Item::User(_) | Item::Notice { folds: false, .. })
+            && Some(idx) != final_reply
+            && !prompt_image;
+        if turn.done && turn.foldable() && !folded && is_step {
             folded = true;
             toggles.push(lines.len());
             let arrow = if collapsed { "▸" } else { "▾" };
-            let mut s = vec![Span::styled(
-                format!("{arrow} {n} tool call{}", if n == 1 { "" } else { "s" }),
-                t.toggle,
-            )];
+            let plural = |k: usize, w: &str| format!("{k} {w}{}", if k == 1 { "" } else { "s" });
+            let what: Vec<String> = [(n, "tool call"), (notes, "note")]
+                .into_iter()
+                .filter(|(k, _)| *k > 0)
+                .map(|(k, w)| plural(k, w))
+                .collect();
+            let mut s = vec![Span::styled(format!("{arrow} {}", what.join(" · ")), t.toggle)];
             if errors > 0 {
                 s.push(Span::styled(format!(" · {errors} failed"), t.error));
             }
@@ -729,7 +768,7 @@ fn lay_turn(
                     }
                 }
             }
-            Item::Notice { text, error } => {
+            Item::Notice { text, error, .. } => {
                 let st = if *error { t.error } else { t.dim };
                 // Multi-line notices (`!cmd` output) keep their lines.
                 for (i, l) in text.lines().enumerate() {
@@ -1220,6 +1259,70 @@ mod reminder_tests {
             })
             .collect();
         assert_eq!(texts, ["⚙ proc_6 web: stopped", "⚙ proc_63 x: running"]);
+    }
+
+    #[test]
+    fn a_replayed_process_keeps_one_line() {
+        let mut tr = super::Transcript::default();
+        let note = |t: &str| novacode_types::Message::User {
+            content: vec![novacode_types::Block::text(format!(
+                "<system-reminder>\n{t}\n</system-reminder>"
+            ))],
+        };
+        tr.on_message(&note(
+            "Process proc_3 (dev) printed a line matching `Ready`:\nReady in 2s",
+        ));
+        tr.on_message(&note("Process proc_4 (tests) has printed nothing for 60s."));
+        tr.on_message(&note("Process proc_3 (dev) exited successfully. Last output:\nbye"));
+        let texts: Vec<_> = tr.turns[0]
+            .items
+            .iter()
+            .map(|i| match i {
+                super::Item::Notice { text, .. } => text.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "⚙ proc_3 (dev) exited successfully. Last output:…",
+                "⚙ proc_4 (tests) has printed nothing for 60s."
+            ]
+        );
+    }
+
+    #[test]
+    fn a_settled_turn_folds_notes_but_not_errors_or_later_notices() {
+        use novacode_types::{AssistantMessage, Block, Message, StopReason};
+        let mut tr = super::Transcript::default();
+        let reply = |b: Vec<Block>, stop| {
+            Message::Assistant(AssistantMessage {
+                content: b,
+                stop,
+                usage: Default::default(),
+                provider: "p".into(),
+                model: "m".into(),
+                response_id: None,
+                error_message: None,
+                thinking_level: None,
+            })
+        };
+        tr.on_message(&Message::user("go"));
+        tr.notice("⚙ proc_1 dev: exited", false);
+        tr.notice("⚙ proc_2 web: exited", false);
+        tr.notice("retry failed hard", true);
+        tr.on_message(&reply(vec![Block::text("done it")], StopReason::Stop));
+        tr.settle();
+        tr.notice("model → x", false);
+        let v = tr.layout(60, &crate::theme::Theme::default());
+        let s: Vec<String> = v.lines.iter().map(crate::wrap::plain).collect();
+        let s = s.join("\n");
+        assert!(s.contains("▸ 2 notes"), "{s}");
+        assert!(!s.contains("proc_1"), "{s}");
+        assert!(
+            s.contains("retry failed hard") && s.contains("done it") && s.contains("model → x"),
+            "{s}"
+        );
     }
 
     #[test]

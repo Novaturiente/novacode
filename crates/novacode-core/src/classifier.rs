@@ -30,6 +30,19 @@ impl Classify {
         })
     }
 
+    /// One classification with `m` (the tool and the goal judge use it).
+    pub async fn run(&self, m: &classify::Model, ctx: &Context) -> Result<classify::Outcome, String> {
+        let Some(key) = self.key(m.provider) else {
+            return Err(format!(
+                "no key for {}: run `novacode login {}` or set its env var",
+                m.provider, m.provider
+            ));
+        };
+        let account = std::env::var("CLOUDFLARE_ACCOUNT_ID").ok();
+        let _slot = self.slots.acquire().await;
+        Ok(classify::classify(&novacode_ai::http::client(), m, &key, account.as_deref(), ctx).await)
+    }
+
     /// Classifier models whose provider has a key.
     pub fn available(&self) -> Vec<&'static classify::Model> {
         let cf = std::env::var("CLOUDFLARE_ACCOUNT_ID").is_ok();
@@ -91,16 +104,10 @@ impl Tool for Classify {
                 Ok(c) => c,
                 Err(e) => return ToolOutput::error(format!("bad classify arguments: {e}")),
             };
-            let Some(key) = self.key(m.provider) else {
-                return ToolOutput::error(format!(
-                    "no key for {}: run `novacode login {}` or set its env var",
-                    m.provider, m.provider
-                ));
-            };
-            let account = std::env::var("CLOUDFLARE_ACCOUNT_ID").ok();
-            let _slot = self.slots.acquire().await;
-            let out = classify::classify(&novacode_ai::http::client(), m, &key, account.as_deref(), &ctx).await;
-            structured(serde_json::to_value(out).unwrap_or_default())
+            match self.run(m, &ctx).await {
+                Ok(out) => structured(serde_json::to_value(out).unwrap_or_default()),
+                Err(e) => ToolOutput::error(e),
+            }
         })
     }
 }

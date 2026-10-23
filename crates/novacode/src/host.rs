@@ -212,6 +212,20 @@ impl Host {
                     });
                     return;
                 };
+                if arg == "edit" {
+                    match g.edit_text() {
+                        Some(text) => {
+                            let _ = ui.send(UiEvent::Draft { text });
+                        }
+                        None => {
+                            let _ = ui.send(UiEvent::Notice {
+                                text: "no goal to edit; /goal <what you want done> starts one".into(),
+                                error: true,
+                            });
+                        }
+                    }
+                    return;
+                }
                 match g.command(&arg) {
                     Ok(text) if arg.is_empty() || arg == "status" => {
                         let _ = ui.send(UiEvent::Page {
@@ -223,9 +237,13 @@ impl Host {
                         let _ = ui.send(UiEvent::Notice { text, error: false });
                     }
                     // Not a subcommand: it's the objective.
-                    Err(_) if !matches!(arg.as_str(), "pause" | "resume" | "clear" | "audit on" | "audit off") => {
-                        // The how-to rides as a hidden reminder; the transcript shows the goal itself.
-                        self.hub.handle.remind_as("goal", crate::goals::draft_prompt(), false);
+                    Err(_)
+                        if !matches!(arg.as_str(), "pause" | "resume" | "audit on" | "audit off")
+                            && !arg.starts_with("edit ") =>
+                    {
+                        // Set at once (not left to the model); the how-to rides as a hidden note after the prompt.
+                        g.start(arg.clone());
+                        self.hub.handle.remind_as("goal", crate::goals::START_NOTE, false);
                         Box::pin(self.handle(Cmd::Prompt(format!("Goal: {arg}")), ui, local)).await;
                     }
                     Err(e) => {

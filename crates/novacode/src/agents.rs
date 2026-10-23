@@ -25,6 +25,17 @@ use tokio::sync::{Notify, mpsc};
 
 /// Children may spawn children; theirs may not (L10.1 depth 2).
 pub const MAX_DEPTH: u32 = 2;
+/// The running binary, for children. After an update deletes it, Linux still runs it
+/// as `/proc/self/exe`, and a child of the same version speaks the same `--rpc`.
+fn own_exe() -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_else(|_| "novacode".into());
+    let proc = Path::new("/proc/self/exe");
+    if exe.to_str().is_some_and(|s| s.ends_with(" (deleted)")) && proc.exists() {
+        return proc.into();
+    }
+    exe
+}
+
 /// Reports longer than this reach the model cut, with an `agent read` pointer.
 /// Reports are written terse (see the task preamble), so most arrive whole; only
 /// a runaway one is cut, saving the parent an `agent read` call per child.
@@ -505,6 +516,8 @@ struct Cfg {
     nerd: bool,
     /// Print mode: nobody reads notices, so every report wakes the parent.
     unattended: bool,
+    /// Extra environment for every child (`agents.env`), e.g. to switch a plugin off.
+    env: std::collections::BTreeMap<String, String>,
 }
 
 impl Cfg {
@@ -522,6 +535,7 @@ impl Cfg {
             small_model: s.small_model,
             nerd: s.nerd,
             unattended: s.unattended,
+            env: s.env,
         }
     }
 }
@@ -543,6 +557,7 @@ pub struct Setup {
     pub exe: Option<PathBuf>,
     pub nerd: bool,
     pub unattended: bool,
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 impl Supervisor {
@@ -553,10 +568,7 @@ impl Supervisor {
             place: Place::from_env(),
             me: s.me.clone(),
             home: s.home.clone(),
-            exe: s
-                .exe
-                .clone()
-                .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| "novacode".into())),
+            exe: s.exe.clone().unwrap_or_else(own_exe),
             waiting: Mutex::new(0),
             cfg: std::sync::RwLock::new(Arc::new(Cfg::of(s))),
         });
@@ -858,6 +870,7 @@ impl Supervisor {
         }
         let mut chain = self.place.chain.clone();
         chain.push(self.me.clone());
+        cmd.envs(&self.c().env);
         cmd.current_dir(&cwd)
             .env("NOVACODE_HOME", &self.home)
             .env("NOVACODE_AGENT_DEPTH", (self.place.depth + 1).to_string())
@@ -1523,7 +1536,7 @@ mod tests {
             "    time.sleep(0.3)".into(),
             format!("    print({:?}, flush=True)", ev(AgentEvent::AgentStart)),
             format!(
-                "    print({reply:?}.replace('REPLY', os.getcwd() + ' :: ' + m['text'].split(chr(10))[-1]), flush=True)"
+                "    print({reply:?}.replace('REPLY', os.getcwd() + ' :: ' + m['text'].split(chr(10))[-1] + os.environ.get('NC_ENV', '')), flush=True)"
             ),
             format!("    print({:?}, flush=True)", ev(AgentEvent::Settled)),
         ];
@@ -1553,6 +1566,7 @@ mod tests {
             small_model: None,
             exe: Some(fake_child(&tmp)),
             nerd: false,
+            env: [("NC_ENV".to_string(), " env-set".to_string())].into(),
         });
         let spawn = |task: &str, after: &[&str]| {
             sup.spawn(serde_json::from_value(json!({"task": task, "after": after, "model": "p/m"})).unwrap())
@@ -1569,6 +1583,11 @@ mod tests {
             "{out}"
         );
         assert_eq!(out.matches(":: task").count(), 3, "one report each: {out}");
+        assert_eq!(
+            out.matches(" env-set").count(),
+            3,
+            "`agents.env` reaches every child: {out}"
+        );
         assert_eq!(sup.children.lock().unwrap().len(), 3);
         let started: Vec<u64> = ["a1", "a2", "a3"]
             .iter()

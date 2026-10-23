@@ -474,6 +474,16 @@ const GIT_SAFE: &[&str] = &[
     "tag",
     "worktree",
     "stash",
+    "ls-tree",
+    "ls-remote",
+    "cat-file",
+    "for-each-ref",
+    "show-ref",
+    "rev-list",
+    "merge-base",
+    "name-rev",
+    "count-objects",
+    "check-ignore",
 ];
 /// Prefix words that run the rest of the line as a command.
 const WRAPPERS: &[&str] = &[
@@ -540,6 +550,15 @@ fn command(words: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
             }
         }
         "eval" => classify_depth(&rest(), ctx, depth + 1).max(Risk::low()),
+        // Shell keywords: what follows them is the command (`$(…)` is checked on its own).
+        "if" | "then" | "else" | "elif" | "while" | "until" | "do" | "!" => {
+            if args.is_empty() {
+                Risk::safe()
+            } else {
+                command(args, piped, ctx, depth)
+            }
+        }
+        "for" | "done" | "fi" => Risk::safe(),
         "rm" => rm(args, ctx),
         "rmdir" | "unlink" => targets(args, ctx, "deletes").max(Risk::low()),
         "mv" | "cp" | "ln" | "install" | "rsync" => targets(args, ctx, "replaces").max(Risk::low()),
@@ -627,6 +646,7 @@ fn command(words: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
             }
         }
         "git" => git(args),
+        "sed" => sed(args),
         n if SAFE.contains(&n) => Risk::safe(),
         _ => Risk::low(),
     }
@@ -668,6 +688,20 @@ fn targets(args: &[String], ctx: &Ctx, verb: &str) -> Risk {
         }
     }
     r
+}
+
+/// `sed` only reads unless it edits in place, runs a script file, or its script
+/// writes (`w`, `W`) or executes (`e`). A `w`/`e` the check can't rule out counts.
+fn sed(args: &[String]) -> Risk {
+    let short = |a: &String, c: char| a.starts_with('-') && !a.starts_with("--") && a.contains(c);
+    let in_place = args.iter().any(|a| a.starts_with("--in-place") || short(a, 'i'));
+    let script_file = args.iter().any(|a| a.starts_with("--file") || short(a, 'f'));
+    let writes = regex::Regex::new(r"(^|[/;{}0-9$p]\s*)[wWe](\s|;|$)").unwrap();
+    if in_place || script_file || args.iter().any(|a| !a.starts_with('-') && writes.is_match(a)) {
+        Risk::low()
+    } else {
+        Risk::safe()
+    }
 }
 
 fn git(args: &[String]) -> Risk {
@@ -843,6 +877,33 @@ mod tests {
             ("echo hi >&2", Safe),
             ("find . -name '*.rs'", Safe),
             ("git branch", Safe),
+            // Plan-mode refusals seen in real sessions: these only read.
+            ("cd /r && git show origin/main:a.tsx | sed -n 586,720p", Safe),
+            (
+                "git ls-tree -r -l origin/main data | sed 's#/[^/]*$##' | sort | uniq -c",
+                Safe,
+            ),
+            ("git -C /r ls-remote origin refs/heads/main", Safe),
+            (
+                "for r in $(git for-each-ref --format='%(refname:short)' refs/heads); do git grep -l x $r; done",
+                Safe,
+            ),
+            (
+                "git cat-file -p HEAD && git merge-base HEAD main && git rev-list --count HEAD",
+                Safe,
+            ),
+            ("sed 's/-[0-9].*//;s/[.]json//' a.txt", Safe),
+            // …but sed that edits, writes or executes doesn't.
+            ("sed -i 's/a/b/' f.txt", Low),
+            ("sed -ni 's/a/b/p' f.txt", Low),
+            ("sed --in-place=.bak 's/a/b/' f.txt", Low),
+            ("sed 's/a/b/w out.txt' f.txt", Low),
+            ("sed -n '1,5w out.txt' f.txt", Low),
+            ("sed 's/.*/date/e' f.txt", Low),
+            ("sed -f prog.sed f.txt", Low),
+            ("for f in a b; do rm -rf ~; done", Catastrophic),
+            ("for f in $(rm -rf ~); do echo $f; done", Catastrophic),
+            ("if true; then git push --force; fi", Shared),
             // Heredoc bodies are data (the screenshot case: JS with `=>` and `{`).
             (
                 "cat > ./q.mjs <<'EOF'\nconst f = (s)=>{ return a > b; };\nconsole.log(x >> 2);\nEOF",

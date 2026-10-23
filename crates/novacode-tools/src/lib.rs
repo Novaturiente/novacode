@@ -138,6 +138,9 @@ pub struct ToolCtx {
     pub native_tools: bool,
     /// Nested calls through the pipeline (codemode); None inside a nested call.
     pub nested: Option<Arc<dyn Nested>>,
+    /// A codemode script is the caller: the output goes to code, not the model, so
+    /// it is neither clipped nor paged (the script's own output is).
+    pub script: bool,
 }
 
 impl ToolCtx {
@@ -254,6 +257,7 @@ pub(crate) mod testutil {
             processes: None,
             native_tools: false,
             nested: None,
+            script: false,
         }
     }
 

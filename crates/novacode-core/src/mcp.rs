@@ -810,6 +810,7 @@ for line in sys.stdin:
             processes: None,
             native_tools: false,
             nested: None,
+            script: false,
         };
         let out = tools[0].execute(json!({"a": 2, "b": 3}), &ctx).await;
         assert!(!out.is_error);

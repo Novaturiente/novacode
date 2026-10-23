@@ -778,6 +778,73 @@ async fn long_session_compacts_from_notes() {
     assert!(total < 7000, "{total} tokens after compaction");
 }
 
+/// One prompt that runs many tool calls (the 16-hour EEC-Learning run): notes are
+/// taken and the context compacts at `compact_at` during the run, not only after it.
+#[tokio::test]
+async fn long_run_compacts_between_model_calls() {
+    use novacode_core::memory::{Settings, Worker};
+    use novacode_core::session::EntryKind;
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let bash = |i: usize| {
+        let cmd = format!("echo out{i}; head -c 4000 /dev/zero | tr '\\0' x");
+        // No usage: the context is estimated from the messages themselves.
+        FauxReply::Message {
+            blocks: vec![call(&format!("b{i}"), "bash", json!({ "command": cmd }))],
+            stop: StopReason::ToolUse,
+            usage: Usage::default(),
+        }
+    };
+    let mut replies: Vec<FauxReply> = (0..14).map(bash).collect();
+    replies.push(FauxReply::text("done"));
+    let main = Faux::new(replies);
+    let main_reqs = main.requests.clone();
+    let store = Store::create(&Paths::new(home.path()), work.path(), false);
+    let agent = Agent::new(
+        Arc::new(main),
+        novacode_tools::builtins(false),
+        store,
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_memory(
+        Worker {
+            adapter: Arc::new(Faux::new((0..40).map(notes_reply))),
+            provider: "faux".into(),
+            model: "small".into(),
+        },
+        Settings {
+            observe_after: 2000,
+            keep_recent: 2500,
+            compact_at: 7000,
+            chunk_tokens: 3000,
+            reflect_after: u64::MAX,
+            pool_target: u64::MAX,
+        },
+    );
+    let (agent, _) = drive(agent, &["refine it until it works"]).await;
+    let entries = agent.store.entries();
+    let last_compaction = entries
+        .iter()
+        .rposition(|e| matches!(e.kind, EntryKind::Compaction { .. }))
+        .expect("no compaction during the run");
+    // The run went on after compacting: tool calls came after the compaction.
+    assert!(
+        entries[last_compaction..].iter().any(|e| matches!(
+            &e.kind,
+            EntryKind::Message {
+                message: Message::ToolResult { .. }
+            }
+        )),
+        "compacted only after the run"
+    );
+    // Every model call stayed near the threshold, never the whole run's output.
+    for r in main_reqs.lock().unwrap().iter() {
+        let t: u64 = r.messages.iter().map(novacode_types::estimate::message).sum();
+        assert!(t < 12_000, "{t} tokens sent in one call");
+    }
+}
+
 /// When the observer can't run, the session model summarises the gap instead.
 #[tokio::test]
 async fn compaction_without_notes_falls_back() {
@@ -1100,6 +1167,96 @@ async fn codemode_chains_through_the_pipeline() {
     );
     assert_eq!(std::fs::read_to_string(work.path().join("a.txt")).unwrap(), "alpha");
     assert!(!work.path().join("new.txt").exists());
+}
+
+/// The same lines of an unchanged file, still in the context, are not sent again;
+/// a changed file or other lines are.
+#[tokio::test]
+async fn unchanged_reread_points_at_the_earlier_result() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(work.path().join("a.txt"), "alpha\nbeta\n").unwrap();
+    let read = |id: &str, extra: serde_json::Value| {
+        let mut a = json!({ "path": "a.txt" });
+        a.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        tools_reply(vec![call(id, "read", a)])
+    };
+    let faux = Faux::new([
+        read("r1", json!({})),
+        read("r2", json!({})),
+        read("r3", json!({ "offset": 2 })),
+        tools_reply(vec![call(
+            "w",
+            "write",
+            json!({ "path": "a.txt", "content": "gamma\n" }),
+        )]),
+        read("r4", json!({})),
+        read("r5", json!({})),
+        FauxReply::text("done"),
+    ]);
+    let agent = Agent::new(
+        Arc::new(faux),
+        novacode_tools::builtins(false),
+        Store::create(&Paths::new(home.path()), work.path(), true),
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    );
+    let (agent, _) = drive(agent, &["go"]).await;
+    let out: Vec<String> = agent
+        .store
+        .projection()
+        .iter()
+        .filter(|m| matches!(m, Message::ToolResult { tool_name, .. } if tool_name == "read"))
+        .map(result_text)
+        .collect();
+    let unchanged = |s: &str| s.contains("unchanged since your last read");
+    assert!(out[0].contains("alpha") && unchanged(&out[1]), "{out:?}");
+    assert!(
+        out[2].contains("beta") && !unchanged(&out[2]),
+        "other lines are sent: {out:?}"
+    );
+    assert!(out[3].contains("gamma"), "a changed file is sent: {out:?}");
+    assert!(unchanged(&out[4]), "{out:?}");
+}
+
+/// Scripts get tool output whole (the novahome sessions' `JSON.parse` failures): a
+/// 3000-line JSON file with a 5000-char line parses, and `tools.call` reaches the named tool.
+#[tokio::test]
+async fn codemode_gets_whole_tool_output() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let rows: Vec<String> = (0..3000).map(|i| format!("{{\"i\": {i}}}")).collect();
+    let big = format!(
+        "{{\"long\": \"{}\",\n\"rows\": [\n{}\n]}}",
+        "x".repeat(5000),
+        rows.join(",\n")
+    );
+    std::fs::write(work.path().join("d.json"), big).unwrap();
+    let script = "const d = JSON.parse(await tools.read({path: 'd.json'}));\n\
+                  const c = await tools.call({name: 'read', arguments: {path: 'd.json', offset: 2, limit: 1}});\n\
+                  return [d.long.length, d.rows.length, c].join(' ');";
+    let faux = Faux::new([
+        tools_reply(vec![call("a", "codemode", json!({ "code": script }))]),
+        FauxReply::text("done"),
+    ]);
+    let mut tools = novacode_tools::builtins(false);
+    tools.push(Arc::new(novacode_core::codemode::Codemode::default()));
+    let agent = Agent::new(
+        Arc::new(faux),
+        tools,
+        Store::create(&Paths::new(home.path()), work.path(), true),
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    );
+    let (agent, _) = drive(agent, &["go"]).await;
+    let out: Vec<String> = agent
+        .store
+        .projection()
+        .iter()
+        .filter(|m| matches!(m, Message::ToolResult { .. }))
+        .map(result_text)
+        .collect();
+    assert_eq!(out[0], "5000 3000 \"rows\": [");
 }
 
 /// Extension context injection without cache misses: `remind` notes are saved and

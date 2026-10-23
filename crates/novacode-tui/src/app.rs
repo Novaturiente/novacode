@@ -193,6 +193,10 @@ pub enum UiEvent {
     Procs {
         items: Vec<crate::procs::ProcView>,
     },
+    /// Put text in the input to change and send (`/goal edit`); what was typed goes after it.
+    Draft {
+        text: String,
+    },
     /// Text to show in the pager (e.g. `/context`).
     Page {
         title: String,
@@ -592,6 +596,14 @@ impl App {
                 self.overlay = Some(Overlay::Branch(a, Picker::new(title, items)));
             }
             UiEvent::Notice { text, error } => self.tr.notice(text, error),
+            UiEvent::Draft { text } => {
+                let draft = self.editor.take().unwrap_or_default();
+                self.editor.set_text(&if draft.is_empty() {
+                    text
+                } else {
+                    format!("{text}\n{draft}")
+                });
+            }
             UiEvent::Dequeued { ok: true } => {
                 if let Some((t, _)) = self.pending.pop() {
                     // The draft goes after it, so nothing typed is lost.
@@ -733,7 +745,7 @@ impl App {
                         self.cache_total.1 += a.usage.prompt_total();
                     }
                     if a.stop == StopReason::Aborted {
-                        self.tr.notice("interrupted", false);
+                        self.tr.pinned_notice("interrupted");
                     }
                 }
                 self.tr.on_message(&m);

@@ -1030,6 +1030,24 @@ impl Ctx {
         })
     }
 
+    /// The goal judge (L10.8): `goal.judge` = `off`, a classifier model (e.g.
+    /// `typesafe/jev-latest`) or a `provider/model`; default the observer's model.
+    async fn goal_judge(
+        &self,
+        route: &novacode_ai::connect::Route,
+        main: Arc<dyn novacode_ai::adapter::Adapter>,
+    ) -> Option<goals::Judge> {
+        let spec = self.settings.get::<String>("goal.judge");
+        match spec.as_deref() {
+            Some("off") => None,
+            Some(s) if novacode_ai::classify::find(s).is_some() => Some(goals::Judge::Classifier(
+                Arc::new(novacode_core::classifier::Classify::new(self.providers.clone())),
+                novacode_ai::classify::find(s)?,
+            )),
+            _ => Some(goals::Judge::Model(self.memory_worker(route, main).await)),
+        }
+    }
+
     /// The observer's model: `memory.model`, else the provider's small
     /// model, else the session's own. A worker that can't connect falls back to it.
     async fn memory_worker(
@@ -1260,6 +1278,7 @@ impl Ctx {
                 stall_min: s.get("agents.stallMinutes").unwrap_or(10),
                 timeout_min: s.get("agents.timeoutMinutes").unwrap_or(45),
                 small_model: small,
+                env: s.get("agents.env").unwrap_or_default(),
                 exe: None,
                 nerd: s.get::<String>("ui.icons").as_deref() != Some("unicode"),
                 unattended: approver.is_none(),
@@ -1278,9 +1297,13 @@ impl Ctx {
             let g = goals::Goals::new(
                 self.paths.home().join("goals").join(format!("{}.json", store.id())),
                 Some(sup.clone()),
-                s.get("goal.maxRuns").unwrap_or(30),
-                s.get("goal.audit").unwrap_or(true),
-                s.get("goal.auditModel"),
+                goals::Config {
+                    max_runs: s.get("goal.maxRuns").unwrap_or(30),
+                    max_tokens: s.get("goal.maxTokens"),
+                    audit: s.get("goal.audit").unwrap_or(true),
+                    audit_model: s.get("goal.auditModel"),
+                    judge: self.goal_judge(&route, adapter.clone()).await,
+                },
             );
             all.push(Arc::new(goals::GoalTool(g.clone())));
             *self.goals.lock().unwrap() = Some(g);
@@ -1824,7 +1847,7 @@ async fn start_session(
         .resolve(&spec)
         .ok()
         .and_then(|r| models::price(&ctx.providers, &r));
-    let history = agent.store.projection();
+    let history = agent.store.transcript();
     let mut state = wire::State {
         session: agent.store.id().to_string(),
         cwd: ctx.cwd.display().to_string(),
@@ -1880,7 +1903,7 @@ async fn start_session(
     });
     let mut live = serve::go_live(&host, bg)?;
     if let Some(g) = goals {
-        live.add_task(g.watch(host.hub.handle.clone()));
+        live.add_task(g.watch(host.hub.handle.clone(), host.processes.clone()));
     }
     live.add_task(activity::spawn(&host.hub, sinks));
     live.add_task(quota_task(host.clone()));

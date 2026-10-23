@@ -362,7 +362,16 @@ impl Store {
 
     /// The messages sent to the model (L4.2). Pure: same file, same output.
     pub fn projection(&self) -> Vec<Message> {
-        project(&self.path_to_leaf())
+        project(&self.path_to_leaf(), |_| true)
+    }
+
+    /// What a window replays: the projection without the hidden notes that never
+    /// showed live (hooks, env changes, docs briefs, nudges); process, schedule and
+    /// subagent notes stay, as one line each.
+    pub fn transcript(&self) -> Vec<Message> {
+        project(&self.path_to_leaf(), |kind| {
+            ["process", "schedule", "agent"].contains(&kind)
+        })
     }
 
     /// The last request that got a reply with usage, as far as the file can tell:
@@ -383,7 +392,7 @@ impl Store {
             EntryKind::ModelChange { provider, model } => Some((provider.clone(), model.clone())),
             _ => None,
         })?;
-        Some((project(&path[..i]), provider, model, a.usage, path[i].ts_ms))
+        Some((project(&path[..i], |_| true), provider, model, a.usage, path[i].ts_ms))
     }
 
     /// Last recorded thinking level.
@@ -452,7 +461,7 @@ impl Store {
 /// After the last compaction: its prompt, then the kept entries with the
 /// summary placed in front of the first kept user message (L4.5). System
 /// deltas older than the compaction are already part of its prompt.
-fn project(path: &[&Entry]) -> Vec<Message> {
+fn project(path: &[&Entry], custom: impl Fn(&str) -> bool) -> Vec<Message> {
     let mut edits: HashMap<&str, Option<&Message>> = HashMap::new();
     for e in path {
         if let EntryKind::ContextEdit { target, replace } = &e.kind {
@@ -495,6 +504,7 @@ fn project(path: &[&Entry]) -> Vec<Message> {
     for e in path {
         let msg = match &e.kind {
             EntryKind::Message { message } => message.clone(),
+            EntryKind::CustomMessage { kind, .. } if !custom(kind) => continue,
             EntryKind::CustomMessage { text, .. } => Message::User {
                 content: vec![Block::text(format!("<system-reminder>\n{text}\n</system-reminder>"))],
             },
@@ -803,6 +813,8 @@ mod tests {
         .unwrap();
         let want = s.projection();
         assert_eq!(want.len(), 3);
+        // A window replays no hidden nudge.
+        assert_eq!(s.transcript().len(), 2);
         drop(s);
         let s2 = Store::open(&path).unwrap();
         assert_eq!(s2.projection(), want);

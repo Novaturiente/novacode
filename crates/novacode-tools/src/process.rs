@@ -202,8 +202,8 @@ impl ProcessManager {
             ask_at_ms: AtomicU64::new(0),
         });
         tokio::spawn(ticker(Arc::downgrade(self), p.clone()));
-        self.save(&p);
         self.procs.lock().unwrap().insert(id.clone(), p.clone());
+        self.save(&p);
         if listed {
             let _ = self.events.send(Event::Started {
                 id: id.clone(),
@@ -275,8 +275,14 @@ impl ProcessManager {
         Ok(id)
     }
 
+    /// Under the map lock: a process `clear`/`clear_one` already forgot must not be
+    /// written back (its exit raced the delete and resurrected the file, with a `.bak` warning).
     fn save(&self, p: &Proc) {
+        let procs = self.procs.lock().unwrap();
         let info = p.info.lock().unwrap().clone();
+        if !procs.contains_key(&info.id) {
+            return;
+        }
         let _ = novacode_base::storage::write_json(
             &self.dir.join(format!("{}.json", info.id)),
             &info,

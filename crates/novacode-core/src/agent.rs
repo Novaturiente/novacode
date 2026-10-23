@@ -502,6 +502,7 @@ impl Agent {
             processes: self.processes.clone(),
             native_tools: false,
             nested: None,
+            script: false,
         };
         let template = Request {
             tail: Vec::new(),
@@ -819,6 +820,31 @@ impl Agent {
             self.compact("the context reached the compaction threshold").await;
             return;
         }
+        self.start_observer();
+    }
+
+    /// Between model calls of one long run: the same upkeep as after a run, so a
+    /// run of hundreds of tool calls still gets notes and compacts at `compact_at`.
+    async fn mid_run_memory(&mut self) {
+        self.collect_notes(false).await;
+        let Some(m) = self.memory.as_ref() else { return };
+        let window = self.cfg.window_tokens;
+        // `compact_at` at or past the window means auto-compaction is off.
+        let at = if m.settings.compact_at < window {
+            m.settings.compact_at.min(window * 95 / 100)
+        } else {
+            u64::MAX
+        };
+        if self.context_tokens() >= at {
+            self.compact("the context reached the compaction threshold").await;
+        } else {
+            self.start_observer();
+        }
+    }
+
+    /// Start the observer once enough new conversation built up since its last notes.
+    fn start_observer(&mut self) {
+        let Some(m) = self.memory.as_ref() else { return };
         if m.task.is_some() {
             return;
         }
@@ -1446,13 +1472,8 @@ impl Agent {
                 });
             }
             steering_only = true;
-            // A long run near the window: compact at this model-call boundary (L4.5).
-            if let Some(m) = &self.memory
-                && self.context_tokens() >= self.cfg.window_tokens * 95 / 100
-                && m.settings.compact_at < self.cfg.window_tokens
-            {
-                self.compact("the context is nearly full").await;
-            }
+            // A long run: notes and compaction at this model-call boundary (L4.5).
+            self.mid_run_memory().await;
             self.emit(AgentEvent::TurnStart);
             let msg = self.call_model(&cancel).await;
             if std::mem::take(&mut first)
@@ -1720,6 +1741,46 @@ impl Agent {
     /// Run one batch (L3.3): sequential preflight, then concurrent execution
     /// (or sequential if any tool asks), results appended in source order.
     /// Returns true when every call was rejected before running.
+    /// A `read` of the same lines of a byte-identical file, whose earlier full result
+    /// is still in the context: point at it instead of sending it again. After a
+    /// compaction, rewind or change the earlier result is gone, so the file is sent.
+    fn unchanged_read(&self, call: &ToolCall, mut out: ToolOutput) -> ToolOutput {
+        let Some(sha) = out.details.as_ref().and_then(|d| d["sha"].as_str()) else {
+            return out;
+        };
+        if call.name != "read" || out.is_error {
+            return out;
+        }
+        let key = |a: &serde_json::Value| (a["path"].clone(), a["offset"].clone(), a["limit"].clone());
+        let want = key(&call.arguments);
+        let p = self.store.projection();
+        let same: std::collections::HashSet<&str> = p
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant(a) => Some(a.tool_calls()),
+                _ => None,
+            })
+            .flatten()
+            .filter(|c| c.name == "read" && key(&c.arguments) == want)
+            .map(|c| c.id.as_str())
+            .collect();
+        // Pointers carry no sha, so this finds the last full copy.
+        let last = p.iter().rev().find_map(|m| match m {
+            Message::ToolResult { call_id, details, .. } if same.contains(call_id.as_str()) => {
+                details.as_ref()?["sha"].as_str()
+            }
+            _ => None,
+        });
+        if last == Some(sha) {
+            let path = call.arguments["path"].as_str().unwrap_or("the file");
+            out.content = vec![Block::text(format!(
+                "{path} is unchanged since your last read of these lines; that result above is still current."
+            ))];
+            out.details = None;
+        }
+        out
+    }
+
     async fn run_tools(&mut self, calls: Vec<ToolCall>, cancel: &CancellationToken) -> bool {
         let activated = if self.deferred.is_empty() {
             vec![]
@@ -1786,6 +1847,7 @@ impl Agent {
             processes: self.processes.clone(),
             native_tools: self.adapter.native_tool_changes(&self.cfg.model),
             nested: None,
+            script: false,
         };
         let mut base = base;
         if prepared
@@ -1867,6 +1929,7 @@ impl Agent {
                 .and_then(|d| d["set_cwd"].as_str())
                 .filter(|_| !out.is_error)
                 .map(PathBuf::from);
+            let out = self.unchanged_read(&call, out);
             let message = Message::ToolResult {
                 call_id: call.id,
                 tool_name: call.name,

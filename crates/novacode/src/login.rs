@@ -303,7 +303,13 @@ pub async fn catch_or_input(
         t = caught => t,
         l = input.recv() => l.context("login cancelled")?,
     };
-    let (code, state) = claude::parse_pasted(&got);
+    let pasted = got.trim();
+    if pasted.starts_with("http") && !pasted.contains("code=") {
+        bail!(
+            "that URL has no sign-in code: the browser hasn't reached the redirect yet. Finish signing in (approve access), then paste the URL it ends on: it starts with http://localhost and has ?code="
+        );
+    }
+    let (code, state) = claude::parse_pasted(pasted);
     if code.is_empty() {
         bail!("no authorization code received");
     }
@@ -381,5 +387,11 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         drop(tx);
         assert!(catch_or_input(None, &mut rx).await.is_err());
+        // A provider's sign-in page (no code yet) gets a clear error, not a state mismatch.
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        tx.send("https://accounts.google.com/signin/oauth/v3/consent?authuser=0#".into())
+            .unwrap();
+        let e = catch_or_input(None, &mut rx).await.unwrap_err().to_string();
+        assert!(e.contains("no sign-in code"), "{e}");
     }
 }

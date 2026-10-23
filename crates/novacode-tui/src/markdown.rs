@@ -312,29 +312,55 @@ impl R<'_> {
                 widths[i] = widths[i].max(c.width());
             }
         }
-        let total: usize = widths.iter().sum::<usize>() + cols.saturating_sub(1) * 3;
+        let gaps = cols.saturating_sub(1) * 3;
+        let fits = widths.iter().sum::<usize>() + gaps <= self.width;
+        if !fits && self.width >= gaps + cols * 3 {
+            // Too wide: narrow columns get their full width, wide ones share the rest.
+            let mut avail = self.width - gaps;
+            let mut order: Vec<usize> = (0..cols).collect();
+            order.sort_by_key(|&i| widths[i]);
+            for (k, &i) in order.iter().enumerate() {
+                widths[i] = widths[i].min(avail / (cols - k)).max(1);
+                avail -= widths[i];
+            }
+        }
+        let grid = fits || self.width >= gaps + cols * 3;
         for (n, r) in rows.iter().enumerate() {
             let style = if n == 0 {
                 t.text.add_modifier(Modifier::BOLD)
             } else {
                 t.text
             };
-            if total <= self.width {
-                let mut spans = Vec::new();
-                for (i, c) in r.iter().enumerate() {
-                    if i > 0 {
-                        spans.push(Span::styled(" │ ", t.border));
+            if grid {
+                // Wrap each cell inside its column; the row is as tall as its tallest cell.
+                let cells: Vec<Vec<Line<'static>>> = (0..cols)
+                    .map(|i| {
+                        let c = r.get(i).map_or("", String::as_str);
+                        wrap::wrap(vec![Span::styled(c.to_string(), style)], widths[i], &[], &[])
+                    })
+                    .collect();
+                let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+                for h in 0..height {
+                    let mut spans = Vec::new();
+                    for (i, cell) in cells.iter().enumerate() {
+                        if i > 0 {
+                            spans.push(Span::styled(" │ ", t.border));
+                        }
+                        let part = cell.get(h).map(|l| l.spans.clone()).unwrap_or_default();
+                        let pad = widths[i].saturating_sub(wrap::width(&part));
+                        spans.extend(part);
+                        if i + 1 < cols {
+                            spans.push(Span::styled(" ".repeat(pad), style));
+                        }
                     }
-                    let pad = if i + 1 == r.len() { 0 } else { widths[i] - c.width() };
-                    spans.push(Span::styled(format!("{c}{}", " ".repeat(pad)), style));
+                    self.out.push(Line::from(spans));
                 }
-                self.out.push(Line::from(spans));
                 if n == 0 {
                     let sep: Vec<String> = widths.iter().map(|w| "─".repeat(*w)).collect();
                     self.out.push(Line::styled(sep.join("─┼─"), t.border));
                 }
             } else {
-                // Too wide: one wrapped line per row.
+                // Too narrow even for a wrapped grid: one wrapped line per row.
                 self.out.extend(wrap::wrap(
                     vec![Span::styled(r.join(" │ "), style)],
                     self.width,
@@ -386,6 +412,11 @@ mod tests {
         assert_eq!(
             md("| a | bb |\n|---|---|\n| ccc | d |", 40),
             ["a   │ bb", "────┼───", "ccc │ d"]
+        );
+        // Too wide: cells wrap inside their columns, short columns keep full width.
+        assert_eq!(
+            md("| id | note |\n|---|---|\n| 1 | alpha beta gamma |", 14),
+            ["id │ note", "───┼──────────", "1  │ alpha", "   │ beta", "   │ gamma"]
         );
         assert_eq!(md("[docs](https://x.y)", 40), ["docs (https://x.y)"]);
         assert_eq!(md("<https://x.y>", 40), ["https://x.y"]);

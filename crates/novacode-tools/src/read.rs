@@ -77,6 +77,11 @@ impl Tool for Read {
             if start >= total && total > 0 {
                 return ToolOutput::error(format!("offset {} is past the end ({total} lines)", start + 1));
             }
+            // A script gets the file as it is: no clipped lines, paging or footer.
+            if ctx.script {
+                let s = lines.iter().skip(start).take(a.limit.unwrap_or(usize::MAX));
+                return ToolOutput::text(s.copied().collect::<Vec<_>>().join("\n"));
+            }
             let limit = a.limit.unwrap_or(guard::MAX_LINES).min(guard::MAX_LINES);
             let mut out = String::new();
             let mut end = start;
@@ -99,7 +104,17 @@ impl Tool for Read {
                     end + 1
                 ));
             }
-            ToolOutput::text(out)
+            // The file's fingerprint: an identical re-read can be answered with a pointer (agent).
+            let sha = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut h);
+                format!("{:016x}", h.finish())
+            };
+            ToolOutput {
+                details: Some(serde_json::json!({ "sha": sha })),
+                ..ToolOutput::text(out)
+            }
         })
     }
 }
