@@ -193,7 +193,7 @@ The `process` tool runs commands that keep going across turns: dev servers, watc
 
 A watch is `{pattern, regex?, on, repeat?}`: `pattern` is plain text unless `regex` is true, and `on` is `wake`, `context` or `ignore`. Setting `watches` replaces the earlier ones.
 
-The model is told when a process exits or a watched line appears, so it does not need to poll. Output logs are kept in `~/.novacode/processes/`. Every process a session started is stopped when the session ends. If novacode crashes, the next start cleans up processes it left behind.
+The model is told when a process exits or a watched line appears, so it does not need to poll. Output logs are kept in `~/.novacode/processes/`. Each stream's log rotates at 8 MiB, keeping one older file (`.1`); output older than that is dropped, and `output` marks the gap with `[older output discarded]`. Every process a session started is stopped when the session ends. If novacode crashes, the next start cleans up processes it left behind.
 
 `bash` runs through the same manager. When a command hits its timeout, or you press **Ctrl+Alt+B** while it runs, the call returns at once and the command keeps running with an id. Use `/ps` in the TUI to see processes and their latest output.
 

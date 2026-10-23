@@ -101,6 +101,25 @@ struct Proc {
     stall: Mutex<Option<(Duration, Attention, bool)>>,
     /// L5.8: at this time (unix ms) ask the model whether to keep it running.
     ask_at_ms: AtomicU64,
+    /// Per stream (stdout, stderr): a rotation overwrote an older `.1`, so output is gone.
+    dropped: [AtomicBool; 2],
+}
+
+/// A log file rotates into `<file>.1` past this size, so at most 2× is kept per stream.
+const LOG_CAP: u64 = 8 << 20;
+
+/// The rotated, older half of a log file.
+fn older(p: &Path) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(".1");
+    PathBuf::from(s)
+}
+
+fn remove_logs(p: &Proc) {
+    for f in [&p.out, &p.err] {
+        let _ = std::fs::remove_file(f);
+        let _ = std::fs::remove_file(older(f));
+    }
 }
 
 pub struct ProcessManager {
@@ -200,6 +219,7 @@ impl ProcessManager {
             stopping: AtomicBool::new(false),
             stall: Mutex::new(None),
             ask_at_ms: AtomicU64::new(0),
+            dropped: Default::default(),
         });
         tokio::spawn(ticker(Arc::downgrade(self), p.clone()));
         self.procs.lock().unwrap().insert(id.clone(), p.clone());
@@ -263,7 +283,7 @@ impl ProcessManager {
                         Some(c) => format!("exited with code {c}"),
                         None => "was killed by a signal".to_string(),
                     };
-                    let tail = tail_text(&p.out, &p.err, 10, None);
+                    let tail = tail_text(&p, 10, None);
                     let _ = me.events.send(Event::Notice {
                         id: id.clone(),
                         text: format!("Process {id} ({name}) {how}. Last output:\n{tail}"),
@@ -425,7 +445,7 @@ impl ProcessManager {
     /// The last `lines` lines of its output, optionally only lines containing `filter`.
     pub fn output(&self, id: &str, lines: usize, filter: Option<&str>) -> Option<String> {
         let p = self.get(id)?;
-        Some(tail_text(&p.out, &p.err, lines, filter))
+        Some(tail_text(&p, lines, filter))
     }
 
     /// Forget finished processes and delete their logs.
@@ -438,8 +458,7 @@ impl ProcessManager {
             .collect();
         for k in &done {
             if let Some(p) = g.remove(k) {
-                let _ = std::fs::remove_file(&p.out);
-                let _ = std::fs::remove_file(&p.err);
+                remove_logs(&p);
                 let _ = std::fs::remove_file(self.dir.join(format!("{k}.json")));
             }
         }
@@ -450,8 +469,7 @@ impl ProcessManager {
     pub fn clear_one(&self, id: &str) {
         let removed = self.procs.lock().unwrap().remove(id);
         if let Some(p) = removed {
-            let _ = std::fs::remove_file(&p.out);
-            let _ = std::fs::remove_file(&p.err);
+            remove_logs(&p);
             let _ = std::fs::remove_file(self.dir.join(format!("{id}.json")));
         }
     }
@@ -484,6 +502,7 @@ async fn pump(
         Ok(f) => f,
         Err(_) => return,
     };
+    let mut size = file.metadata().await.map_or(0, |m| m.len());
     let mut buf = vec![0u8; 16 * 1024];
     let mut partial = String::new();
     while let Ok(n) = r.read(&mut buf).await {
@@ -491,7 +510,21 @@ async fn pump(
             break;
         }
         let chunk = &buf[..n];
+        if size > 0 && size + n as u64 > LOG_CAP {
+            let _ = file.flush().await;
+            let old = older(path);
+            if old.exists() {
+                p.dropped[is_err as usize].store(true, Ordering::Relaxed);
+            }
+            let _ = tokio::fs::rename(path, &old).await;
+            match tokio::fs::OpenOptions::new().create(true).append(true).open(path).await {
+                Ok(f) => file = f,
+                Err(_) => return,
+            }
+            size = 0;
+        }
         let _ = file.write_all(chunk).await;
+        size += n as u64;
         let _ = p.chunks.send((is_err, chunk.to_vec()));
         p.last_output_ms.store(now_ms(), Ordering::Relaxed);
         // Watches look at whole lines.
@@ -589,7 +622,7 @@ fn check_watches(pm: &ProcessManager, p: &Proc, line: &str) {
 }
 
 /// The last `n` lines of stdout and stderr (stderr marked), from the log files.
-pub fn tail_text(out: &Path, err: &Path, n: usize, filter: Option<&str>) -> String {
+fn tail_text(p: &Proc, n: usize, filter: Option<&str>) -> String {
     let read_tail = |p: &Path| -> Vec<String> {
         let Ok(mut f) = std::fs::File::open(p) else {
             return vec![];
@@ -607,17 +640,33 @@ pub fn tail_text(out: &Path, err: &Path, n: usize, filter: Option<&str>) -> Stri
             .map(String::from)
             .collect()
     };
-    let o = read_tail(out);
-    let e = read_tail(err);
-    let take = |v: Vec<String>| {
+    // Current file first; the rotated `.1` only when that is short of `n` lines.
+    let read = |f: &Path, dropped: &AtomicBool| -> (Vec<String>, bool) {
+        let mut v = read_tail(f);
+        if v.len() >= n {
+            return (v, false);
+        }
+        let mut old = read_tail(&older(f));
+        old.append(&mut v);
+        (old, dropped.load(Ordering::Relaxed))
+    };
+    let (o, o_dropped) = read(&p.out, &p.dropped[0]);
+    let (e, e_dropped) = read(&p.err, &p.dropped[1]);
+    let take = |v: Vec<String>, dropped: bool| {
         let k = v.len().saturating_sub(n);
-        v[k..].join("\n")
+        // Mark the gap only when the window reaches the oldest line still kept.
+        let mark = if dropped && k == 0 {
+            "[older output discarded]\n"
+        } else {
+            ""
+        };
+        format!("{mark}{}", v[k..].join("\n"))
     };
     match (o.is_empty(), e.is_empty()) {
         (true, true) => "(no output)".into(),
-        (false, true) => take(o),
-        (true, false) => format!("[stderr]\n{}", take(e)),
-        (false, false) => format!("{}\n[stderr]\n{}", take(o), take(e)),
+        (false, true) => take(o, o_dropped),
+        (true, false) => format!("[stderr]\n{}", take(e, e_dropped)),
+        (false, false) => format!("{}\n[stderr]\n{}", take(o, o_dropped), take(e, e_dropped)),
     }
 }
 
@@ -883,6 +932,56 @@ mod tests {
         drop(pm);
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!group_alive(pid2) && !group_alive(pid));
+    }
+
+    #[tokio::test]
+    async fn logs_rotate_and_mark_dropped_output() {
+        let d = tempfile::tempdir().unwrap();
+        let pm = ProcessManager::new(d.path(), "s");
+        let mut ev = pm.events.subscribe();
+        // ~20.2 MB of stdout: two rotations, so the first 8 MiB is dropped.
+        let id = pm
+            .start(
+                "big",
+                "sleep 0.2; head -c 20000000 /dev/zero | tr '\\0' 'x' | fold -w 100; echo; echo READY-AFTER",
+                d.path(),
+                &[],
+                true,
+            )
+            .unwrap();
+        pm.set_watches(
+            &id,
+            vec![Watch {
+                pattern: "READY-AFTER".into(),
+                regex: false,
+                on: Attention::Context,
+                repeat: false,
+            }],
+            Some(Attention::Ignore),
+        );
+        assert!(matches!(ev.recv().await.unwrap(), Event::Started { .. }));
+        let n = tokio::time::timeout(Duration::from_secs(30), ev.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&n, Event::Notice { text, .. } if text.contains("READY-AFTER")),
+            "{n:?}"
+        );
+        assert!(pm.wait(&id, Duration::from_secs(10), |_| {}).await.is_some());
+        let p = pm.get(&id).unwrap();
+        for f in [p.out.clone(), older(&p.out)] {
+            assert!(std::fs::metadata(&f).unwrap().len() <= LOG_CAP, "{f:?}");
+        }
+        let last = pm.output(&id, 1, None).unwrap();
+        assert_eq!(last, "READY-AFTER");
+        assert!(
+            pm.output(&id, 30_000, None)
+                .unwrap()
+                .starts_with("[older output discarded]\n")
+        );
+        assert_eq!(pm.clear(), 1);
+        assert!(!p.out.exists() && !older(&p.out).exists());
     }
 
     #[tokio::test]
