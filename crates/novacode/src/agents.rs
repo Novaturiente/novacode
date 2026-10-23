@@ -36,6 +36,23 @@ fn own_exe() -> PathBuf {
     exe
 }
 
+/// A provider's small model as `provider/model`, or None.
+pub type SmallModel = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// A child's model: the spawn's or its type's (`small` = the small model of the
+/// parent's current provider), else the parent's own.
+fn child_model(
+    requested: Option<&str>,
+    parent: String,
+    small: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+) -> String {
+    match requested {
+        Some("small") => small(parent.split_once('/').map_or("", |(p, _)| p)).unwrap_or(parent),
+        Some(m) => m.to_string(),
+        None => parent,
+    }
+}
+
 /// Reports longer than this reach the model cut, with an `agent read` pointer.
 /// Reports are written terse (see the task preamble), so most arrive whole; only
 /// a runaway one is cut, saving the parent an `agent read` call per child.
@@ -482,6 +499,8 @@ struct Child {
     tool_calls: u32,
     /// The report was handed over (by `wait` or as a reminder).
     delivered: bool,
+    /// A message to resume it with once a slot is free (`send` to a finished child).
+    resume: Option<String>,
 }
 
 pub struct Supervisor {
@@ -511,7 +530,9 @@ struct Cfg {
     servers: Vec<String>,
     /// This session's own tool names (MCP ones aside): a child never gets more.
     own: Option<Vec<String>>,
-    small_model: Option<String>,
+    small_model: SmallModel,
+    /// Children running at once; more wait as `queued` (`agents.maxConcurrent`; 1 below the top).
+    max_running: usize,
     /// Nerd Font glyphs in the panel rows (`ui.icons`).
     nerd: bool,
     /// Print mode: nobody reads notices, so every report wakes the parent.
@@ -535,6 +556,7 @@ impl Cfg {
             stall: Duration::from_secs(s.stall_min * 60),
             timeout: Duration::from_secs(s.timeout_min * 60),
             small_model: s.small_model,
+            max_running: s.max_running.max(1),
             nerd: s.nerd,
             unattended: s.unattended,
             env: s.env,
@@ -555,7 +577,9 @@ pub struct Setup {
     pub servers: Vec<String>,
     pub stall_min: u64,
     pub timeout_min: u64,
-    pub small_model: Option<String>,
+    /// A provider's small model as `provider/model`, asked at spawn time (the parent may switch provider).
+    pub small_model: SmallModel,
+    pub max_running: usize,
     /// The child binary (tests use a fake); default: this one.
     pub exe: Option<PathBuf>,
     pub nerd: bool,
@@ -731,11 +755,11 @@ impl Supervisor {
             format!("no agent `{agent}`; known: {}", names.join(", "))
         })?;
         let parent = self.parent_model().unwrap_or_default();
-        let mut model = match a.model.or(def.model.clone()).as_deref() {
-            Some("small") => cfg.small_model.clone().unwrap_or(parent),
-            Some(m) => m.to_string(),
-            None => parent,
-        };
+        let mut model = child_model(
+            a.model.or(def.model.clone()).as_deref(),
+            parent,
+            cfg.small_model.as_ref(),
+        );
         if let Some(t) = &def.thinking
             && !model.contains(':')
         {
@@ -793,6 +817,7 @@ impl Supervisor {
             tokens: 0,
             tool_calls: 0,
             delivered: false,
+            resume: None,
         });
         drop(g);
         self.start_ready();
@@ -801,18 +826,27 @@ impl Supervisor {
 
     /// Start every queued child whose `after` agents are all done.
     fn start_ready(self: &Arc<Self>) {
+        let cap = self.c().max_running;
         // Pick and mark in one lock: parallel spawns must not start a child twice.
-        let ready: Vec<(String, String)> = {
+        let ready: Vec<(String, String, Option<String>)> = {
             let mut g = self.children.lock().unwrap();
             let done: Vec<String> = g
                 .iter()
                 .filter(|c| c.status == Status::Done)
                 .map(|c| c.n.clone())
                 .collect();
+            let running = g
+                .iter()
+                .filter(|c| matches!(c.status, Status::Starting | Status::Running))
+                .count();
             g.iter_mut()
                 .filter(|c| c.status == Status::Queued && c.after.iter().all(|d| done.contains(d)))
+                .take(cap.saturating_sub(running))
                 .map(|c| {
                     c.status = Status::Starting;
+                    if let Some(text) = c.resume.take() {
+                        return (c.n.clone(), text, c.session.clone());
+                    }
                     let first = format!(
                         "You are subagent \"{}\" (agent {}, depth {}), started by another novacode agent. \
                          Do the task below. Your final message is your report to it: what you did, what you \
@@ -825,13 +859,13 @@ impl Supervisor {
                         self.place.depth + 1,
                         c.task
                     );
-                    (c.n.clone(), first)
+                    (c.n.clone(), first, None)
                 })
                 .collect()
         };
-        for (n, first) in ready {
+        for (n, prompt, session) in ready {
             let me = self.clone();
-            tokio::spawn(async move { me.run(n, Some(first), None).await });
+            tokio::spawn(async move { me.run(n, Some(prompt), session).await });
         }
         // Children waiting on one that failed can never start.
         let mut g = self.children.lock().unwrap();
@@ -1165,14 +1199,24 @@ impl Supervisor {
             let _ = tx.send(json!({"type": "steer", "text": text}).to_string());
             return Ok(format!("sent to {n}; it sees the message before its next step"));
         }
-        let session = session.ok_or(format!("{n} never started; nothing to resume"))?;
+        if session.is_none() {
+            return Err(format!("{n} never started; nothing to resume"));
+        }
+        // Resumes take a slot like new spawns: queue it, then start what fits.
         self.with(n, |c| {
-            c.status = Status::Starting;
+            c.status = Status::Queued;
+            c.after.clear();
             c.delivered = false;
+            c.resume = Some(match c.resume.take() {
+                Some(earlier) => format!("{earlier}\n\n{text}"),
+                None => text,
+            });
         });
-        let (me, n2) = (self.clone(), n.to_string());
-        tokio::spawn(async move { me.run(n2, Some(text), Some(session)).await });
-        Ok(format!("resumed {n} with the message"))
+        self.start_ready();
+        Ok(match self.with(n, |c| c.status) {
+            Some(Status::Queued) => format!("{n} is queued; it resumes with the message when a running subagent ends"),
+            _ => format!("resumed {n} with the message"),
+        })
     }
 
     fn line(c: &Child) -> String {
@@ -1578,7 +1622,8 @@ mod tests {
             servers: vec![],
             stall_min: 10,
             timeout_min: 45,
-            small_model: None,
+            small_model: Arc::new(|_: &str| None),
+            max_running: 4,
             exe: Some(fake_child(&tmp)),
             nerd: false,
             env: [("NC_ENV".to_string(), " env-set".to_string())].into(),
@@ -1640,6 +1685,97 @@ mod tests {
             "{out}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn at_most_max_running_children_and_slots_free_on_exit() {
+        let tmp = std::env::temp_dir().join(format!("nc-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let setup = |exe: PathBuf| Setup {
+            slot: HubSlot::default(),
+            unattended: false,
+            me: "ROOT".into(),
+            home: tmp.clone(),
+            cwd: tmp.clone(),
+            trusted: false,
+            defs: defs(&[]).0,
+            parent_picks: true,
+            servers: vec![],
+            stall_min: 10,
+            timeout_min: 45,
+            small_model: Arc::new(|_: &str| None),
+            max_running: 2,
+            exe: Some(exe),
+            nerd: false,
+            env: Default::default(),
+            policy: Arc::new(novacode_core::policy::Policy::new(
+                Default::default(),
+                tmp.clone(),
+                None,
+            )),
+        };
+        let spawn = |sup: &Arc<Supervisor>, task: &str| {
+            sup.spawn(serde_json::from_value(json!({"task": task, "model": "p/m"})).unwrap())
+                .unwrap()
+                .0
+        };
+        let sup = Supervisor::new(setup(fake_child(&tmp)));
+        let ids: Vec<String> = (0..5).map(|i| spawn(&sup, &format!("t{i}"))).collect();
+        // A queued child can be stopped before it ever starts.
+        assert!(sup.stop(&ids[4], "not needed"));
+        let mut most = 0;
+        while sup.pending() > 0 {
+            let running = sup
+                .children
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| matches!(c.status, Status::Starting | Status::Running))
+                .count();
+            most = most.max(running);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(most, 2, "never more than max_running at once");
+        {
+            let g = sup.children.lock().unwrap();
+            assert!(g[..4].iter().all(|c| c.status == Status::Done), "all ran");
+            assert!(g[4].status == Status::Stopped && g[4].started.is_none());
+            // Spawn order: t2 started only after one of t0/t1 ended.
+            let first_end = g[..2].iter().map(|c| c.ended_ms.unwrap()).min().unwrap();
+            assert!(g[2].started_ms >= first_end);
+        }
+        // A child that dies at once frees its slot, so the rest still run.
+        let sup = Supervisor::new(setup("/bin/false".into()));
+        for i in 0..3 {
+            spawn(&sup, &format!("crash{i}"));
+        }
+        let out = sup.wait(vec![], false, Duration::from_secs(20)).await;
+        assert_eq!(out.matches("exited before it finished").count(), 3, "{out}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn small_model_follows_the_parents_provider() {
+        let small = |p: &str| match p {
+            "claude" => Some("claude/haiku".to_string()),
+            "codex" => Some("codex/mini".to_string()),
+            _ => None,
+        };
+        assert_eq!(child_model(Some("small"), "claude/opus".into(), &small), "claude/haiku");
+        // After `/model` switched the parent to another provider, scouts follow it.
+        assert_eq!(child_model(Some("small"), "codex/gpt".into(), &small), "codex/mini");
+        assert_eq!(
+            child_model(Some("small"), "local/llama".into(), &small),
+            "local/llama",
+            "no small model: the parent's"
+        );
+        assert_eq!(
+            child_model(Some("x/y"), "codex/gpt".into(), &small),
+            "x/y",
+            "explicit wins"
+        );
+        assert_eq!(child_model(None, "codex/gpt".into(), &small), "codex/gpt");
     }
 
     #[test]

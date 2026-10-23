@@ -180,6 +180,12 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "A subagent running this long is stopped.",
     ),
     (
+        "agents.maxConcurrent",
+        "number",
+        "4",
+        "Subagents running at once; more wait as `queued`, in spawn order. A subagent's own subagents run one at a time.",
+    ),
+    (
         "agents.parentPicksTools",
         "bool",
         "true",

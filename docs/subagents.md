@@ -12,7 +12,7 @@ A subagent does not see your conversation. The model must give it a complete tas
 
 | Type | What it is for | Tools | Model |
 |---|---|---|---|
-| `scout` | Read-only recon: find where something is done, map a folder, summarise long files | `read`, `grep`, `find`, `ls`, `todo` | the provider's small model (falls back to the parent's) |
+| `scout` | Read-only recon: find where something is done, map a folder, summarise long files | `read`, `grep`, `find`, `ls`, `todo` | the small model of the parent's current provider (falls back to the parent's) |
 | `worker` | A bounded change: edit the named files, run the check, report | all of the parent's tools | the parent's |
 | `reviewer` | Review a change for bugs, risk and missing tests; changes nothing | `read`, `grep`, `find`, `ls`, `bash`, `todo` | the parent's |
 | `auditor` | Checks that a goal is really done (used by `/goal`); changes nothing | `read`, `grep`, `find`, `ls`, `bash` | the parent's (or `goal.auditModel`) |
@@ -56,6 +56,7 @@ There is no separate `resume` action: `send` to a finished agent resumes its ses
 ### Limits and safety
 
 - **Depth.** Your session can start subagents, and those can start their own. Theirs cannot. Two levels, no more.
+- **How many at once.** At most `agents.maxConcurrent` (default 4) subagents run at the same time; more wait as `queued` and start in spawn order as others end. A subagent's own subagents run one at a time, so a tree has at most 8 running. Resuming a finished subagent with `send` takes a slot too.
 - **Permission mode.** A subagent starts in your session's permission mode. While plan mode (or another read-only preset) is on, it starts read-only, and a preset's tool list limits its tools too.
 - **File claims.** Two agents never edit the same file. A subagent that tries `edit`, `write` or `apply_patch` on a file another live agent holds is refused with a message naming the holder. A claim passes down from parent to child. Claims of dead processes are dropped.
 - **Stall and timeout.** A subagent with no activity for `agents.stallMinutes` (default 10) is stopped. One that runs longer than `agents.timeoutMinutes` (default 45) is stopped.
@@ -130,6 +131,7 @@ novacode sets a few variables for its subagent processes (`NOVACODE_AGENT_DEPTH`
 |---|---|---|
 | `agents.stallMinutes` | `10` | Stop a subagent silent this long. |
 | `agents.timeoutMinutes` | `45` | Stop a subagent running this long. |
+| `agents.maxConcurrent` | `4` | Subagents running at once; more wait as `queued`. Their own subagents run one at a time. |
 | `agents.parentPicksTools` | `true` | The model may pick `tools` and `mcp` when it spawns. Off: only the type's tools, and `tools`/`mcp` in a spawn are ignored. |
 | `agents.<name>.tools` | the type's | Replace the tools of type `<name>` (built-ins too). |
 | `agents.<name>.mcp` | `[]` | MCP servers type `<name>` gets by default. |

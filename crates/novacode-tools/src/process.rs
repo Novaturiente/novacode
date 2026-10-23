@@ -517,11 +517,11 @@ async fn pump(
                 p.dropped[is_err as usize].store(true, Ordering::Relaxed);
             }
             let _ = tokio::fs::rename(path, &old).await;
-            match tokio::fs::OpenOptions::new().create(true).append(true).open(path).await {
-                Ok(f) => file = f,
-                Err(_) => return,
+            // A failed reopen keeps the old handle (tried again next chunk): live output and watches go on.
+            if let Ok(f) = tokio::fs::OpenOptions::new().create(true).append(true).open(path).await {
+                file = f;
+                size = 0;
             }
-            size = 0;
         }
         let _ = file.write_all(chunk).await;
         size += n as u64;

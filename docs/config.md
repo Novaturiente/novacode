@@ -36,6 +36,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `memory.indexChars` | number | 2000 | Character cap of that index. |
 | `agents.stallMinutes` | number | 10 | A subagent silent this long is stopped. |
 | `agents.timeoutMinutes` | number | 45 | A subagent running this long is stopped. |
+| `agents.maxConcurrent` | number | 4 | Subagents running at once; more wait as `queued`, in spawn order. A subagent's own subagents run one at a time. |
 | `agents.parentPicksTools` | bool | true | The model may pick a subagent's tools (`tools`) and MCP servers (`mcp`) when it spawns one, from its own. Off: only the type's tools. |
 | `agents.env` | object | {} | Environment variables every subagent starts with, e.g. `{"CAVEMAN_DEFAULT_MODE": "off", "PONYTAIL_SUBAGENT_MATCHER": "^$"}` keeps those plugins' `SubagentStart` text out of subagents. |
 | `agents.<name>.tools` | list | the agent file's | Default tools of subagent type `<name>` (built-ins too); a subagent sees only its tools. |

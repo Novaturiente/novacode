@@ -1262,11 +1262,11 @@ impl Ctx {
         if let Some(slot) = slot
             && place.depth < agents::MAX_DEPTH
         {
-            let small = self.providers.profile(&route.provider).ok().and_then(|p| {
-                p.extra
-                    .get("smallModel")?
-                    .as_str()
-                    .map(|m| format!("{}/{m}", route.provider))
+            // Asked at spawn time: `/model` may have switched provider since.
+            let providers = self.providers.clone();
+            let small: agents::SmallModel = Arc::new(move |provider: &str| {
+                let p = providers.profile(provider).ok()?;
+                Some(format!("{provider}/{}", p.extra.get("smallModel")?.as_str()?))
             });
             let setup = agents::Setup {
                 slot,
@@ -1280,6 +1280,11 @@ impl Ctx {
                 stall_min: s.get("agents.stallMinutes").unwrap_or(10),
                 timeout_min: s.get("agents.timeoutMinutes").unwrap_or(45),
                 small_model: small,
+                max_running: if place.depth == 0 {
+                    s.get("agents.maxConcurrent").unwrap_or(4)
+                } else {
+                    1
+                },
                 env: s.get("agents.env").unwrap_or_default(),
                 exe: None,
                 nerd: s.get::<String>("ui.icons").as_deref() != Some("unicode"),
