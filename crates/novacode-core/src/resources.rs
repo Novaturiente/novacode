@@ -328,7 +328,7 @@ pub fn render_skills(skills: &[Skill]) -> String {
         None => p.display().to_string(),
     };
     let mut s = String::from(
-        "Skills: specialized instructions for specific tasks. When a task matches one, read its file first: `<folder>/<name>/SKILL.md`, or the path in brackets. Resolve relative paths in it against the skill's own folder.",
+        "Skills: specialized instructions for specific tasks. When a task matches one, activate it first with the `skill` tool (it applies the skill's tool rules), or read its file: `<folder>/<name>/SKILL.md`, or the path in brackets. Resolve relative paths in it against the skill's own folder.",
     );
     let mut folder: Option<&Path> = None;
     for k in listed {

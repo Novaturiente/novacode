@@ -233,6 +233,9 @@ pub struct Policy {
     overlay: Mutex<Option<Overlay>>,
     /// Risk-gated commands the user approved for this session, verbatim.
     session_commands: Mutex<HashSet<String>>,
+    /// An activated skill's `allowed-tools` rules and `disallowed-tools` names,
+    /// until the next user message (L5.25).
+    turn: Mutex<(Vec<Rule>, Vec<String>)>,
 }
 
 fn rules(list: &[String]) -> Vec<Rule> {
@@ -260,6 +263,7 @@ impl Policy {
             session_allow: Mutex::default(),
             overlay: Mutex::default(),
             session_commands: Mutex::default(),
+            turn: Mutex::default(),
         }
     }
 
@@ -281,6 +285,19 @@ impl Policy {
 
     pub fn allow_for_session(&self, rules: Vec<Rule>) {
         self.session_allow.lock().unwrap().extend(rules);
+    }
+
+    /// A skill's tool rules for the rest of this turn: `allow` runs without asking
+    /// (never past deny rules, the risk gate or read-only), `deny` is refused.
+    pub fn for_turn(&self, allow: Vec<Rule>, deny: Vec<String>) {
+        let mut t = self.turn.lock().unwrap();
+        t.0.extend(allow);
+        t.1.extend(deny);
+    }
+
+    /// A user message ends the turn's skill rules.
+    pub fn end_turn(&self) {
+        *self.turn.lock().unwrap() = Default::default();
     }
 
     pub fn set_overlay(&self, o: Option<Overlay>) {
@@ -373,6 +390,11 @@ impl Policy {
         }
         if self.profile.deny.iter().any(|t| t.eq_ignore_ascii_case(tool)) {
             return Verdict::Deny(format!("The `{tool}` tool is not available to this agent."));
+        }
+        if self.turn.lock().unwrap().1.iter().any(|t| t.eq_ignore_ascii_case(tool)) {
+            return Verdict::Deny(format!(
+                "The `{tool}` tool is off for this turn (the active skill's `disallowed-tools`)."
+            ));
         }
         let overlay = self.overlay.lock().unwrap().clone();
         if let Some((name, _, Some(only))) = &overlay
@@ -508,9 +530,17 @@ impl Policy {
         }
 
         let session = self.session_allow.lock().unwrap();
-        if self.allow.iter().chain(session.iter()).any(|r| matches(r, true)) {
+        let turn = self.turn.lock().unwrap();
+        if self
+            .allow
+            .iter()
+            .chain(session.iter())
+            .chain(turn.0.iter())
+            .any(|r| matches(r, true))
+        {
             return Verdict::Allow;
         }
+        drop(turn);
         drop(session);
         // Placed after deny rules, the risk gate and read-only mode, so a hook's allow skips only the asks below.
         if *hook == HookDecision::Allow {

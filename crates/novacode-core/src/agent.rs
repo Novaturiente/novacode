@@ -1473,6 +1473,8 @@ impl Agent {
             let queued = self.take_queued(steering_only);
             let mut added = queued.is_empty();
             for content in queued {
+                // A user message ends an activated skill's turn rules (L5.25).
+                self.policy.end_turn();
                 // UserPromptSubmit (L7.14): a plugin may refuse the prompt or add context after it.
                 let hooks = self.plugins.as_mut().map(|p| {
                     p.stop_active = false;

@@ -2,7 +2,7 @@
 
 <p align="center">A coding agent for your terminal, in one small Rust binary.</p>
 
-novacode reads and edits your code, runs commands, and works through tasks with you, like Claude Code, pi or Codex. It uses the subscriptions you already pay for (Claude Pro/Max, ChatGPT/Codex, Antigravity, GitHub Copilot) or an API key for about 55 providers, including local models. Your existing Claude Code skills, agents and commands load without moving any files, and Claude Code plugins (ponytail, caveman, mattpocock/skills, …) install with `novacode install <repo>`, hooks included.
+novacode reads and edits your code, runs commands, and works through tasks with you, like Claude Code, pi or Codex. It uses the subscriptions you already pay for (Claude Pro/Max, ChatGPT/Codex, Antigravity, GitHub Copilot) or an API key for about 55 providers, including local models. Your existing Claude Code skills, agents and commands load without moving any files (a documented subset of their fields; `novacode doctor` lists what doesn't apply), and Claude Code plugins (ponytail, caveman, mattpocock/skills, …) install with `novacode install <repo>`, hooks included.
 
 > **Status:** early release (0.2). Linux is the main platform. macOS builds exist but are not tested yet. Windows is not supported; use WSL. Release binaries and AUR packages arrive with the first release; until then, build from source (below and in [docs/install.md](docs/install.md)).
 
@@ -54,7 +54,7 @@ The full walk-through and a list of every flag and subcommand are in [docs/quick
 | Runtime | One native binary | Node.js | Node.js |
 | Open source | Yes (MIT or Apache-2.0) | Yes | No |
 | Several model providers | Yes | Yes | Claude only |
-| Loads Claude Code skills, agents, commands | Yes, as they are | Partly | Yes |
+| Loads Claude Code skills, agents, commands | Yes, a documented subset of fields | Partly | Yes |
 | Installs Claude Code plugins (with hooks) | Yes | No | Yes |
 | Subagents, plan mode, MCP | Built in | Extensions | Built in |
 | Command risk check and approvals | Built in | Extension | Built in |

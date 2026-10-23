@@ -11,7 +11,7 @@ novacode reads these Claude Code files directly. You don't copy anything.
 | Claude Code | In novacode |
 |---|---|
 | `~/.claude/skills`, `.claude/skills` | Skills |
-| `~/.claude/agents`, `.claude/agents` | Subagent definitions. Claude tool names (`Read`, `Glob`, `Task`, …) are mapped to novacode's. A `model` that isn't `provider/model` or `small` (such as `sonnet` or `inherit`) is ignored; the parent's model is used. |
+| `~/.claude/agents`, `.claude/agents` | Subagent definitions. Claude tool names (`Read`, `Glob`, `Task`, …) are mapped to novacode's, and most fields work (`disallowedTools`, `permissionMode: plan`, `maxTurns`, `skills`, `isolation`, model families); see [subagents](subagents.md#agent-definition-files) for the list and what is ignored. |
 | `~/.claude/commands`, `.claude/commands` | Prompt templates, used as `/name` |
 | `.mcp.json` in the project | MCP servers (same format; trusted folders only) |
 | `CLAUDE.md` | Instructions for the model, when the folder has no `AGENTS.md` |

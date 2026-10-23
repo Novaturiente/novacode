@@ -26,15 +26,24 @@ description: Write release notes from the git log. Use when the user asks for a 
 
 ### Frontmatter fields
 
-novacode reads these fields. Others (for example `allowed-tools` or `license`) are ignored.
+novacode reads these fields, with the meaning Claude Code gives them. `license`, `compatibility`, `metadata` and `argument-hint` are accepted and have no effect, as in Claude Code.
 
 | Field | Required | Meaning |
 |---|---|---|
 | `description` | yes | What the skill does and when to use it. A `SKILL.md` without one is skipped, and novacode warns about it. A loose `.md` file without one is skipped silently. Long descriptions are cut to 1024 characters. |
+| `when_to_use` | no | Added after the description in the skill list. |
 | `name` | no | The skill's name. Defaults to the folder name (or the file name for a loose `.md`). If it differs from the folder name, the system prompt shows the file's path next to it. |
-| `disable-model-invocation` | no | Set to `true` (exactly) to hide the skill from the model. Only you can use it, with `/skill:name`. |
+| `disable-model-invocation` | no | `true` hides the skill from the model. Only you can use it, with `/skill:name`. |
+| `user-invocable` | no | `false` makes it the model's only: no `/skill:` completion, and typing it does nothing. |
+| `allowed-tools` | no | Tools that run without asking for the rest of the turn the skill is activated in (until your next message), e.g. `Bash(git commit *) Read`. They never get past `deny` rules, the risk gate or read-only mode. |
+| `disallowed-tools` | no | Tools refused for the rest of that turn. |
+| `context`, `agent` | no | `context: fork` runs the skill as a subagent of type `agent` (default `worker`) with the skill's text as its task. |
 
-The frontmatter is a simple `key: value` block. It must start on the very first line of the file, between two `---` lines; only the first block is read. Quoted values and `|` / `>` multi-line values work. Nested maps are skipped.
+`allowed-tools`, `disallowed-tools` and `context: fork` apply when the model activates the skill with the `skill` tool. A skill whose file the model just reads gets its text only.
+
+Not supported (listed by `novacode doctor`): `model`, `effort`, `hooks`, `paths`, `shell`, `background`, and `!` command lines in the text (they would run shell commands from the skill before the model sees it).
+
+The frontmatter is YAML: lists, nested maps and `yes`/`no` booleans work. It must start on the very first line of the file, between two `---` lines. Frontmatter that isn't valid YAML (often an unquoted `: ` inside a description) is read as plain `key: value` lines instead, and `novacode doctor` says so. In the text, `$ARGUMENTS` (and `$1`, `$2`…) take what you type after `/skill:name`.
 
 ### Where skills are found
 
@@ -72,7 +81,7 @@ Skills: specialized instructions for specific tasks. ...
 - release-notes: Write release notes from the git log. Use when the user asks for a changelog or release notes.
 ```
 
-The model reads the full `SKILL.md` with its normal file-reading tool when the task matches. Only the short list costs tokens on every request. Relative paths inside a skill are resolved against the skill's own folder.
+The model activates a skill with the `skill` tool when the task matches: the tool returns the full text and applies the skill's tool rules. It may also just read the `SKILL.md` file. Only the short list costs tokens on every request. Relative paths inside a skill are resolved against the skill's own folder.
 
 Add or edit a skill and the change reaches the model on its next turn, as a small prompt update.
 

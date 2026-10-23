@@ -1330,6 +1330,18 @@ impl Ctx {
             supervisor = Some(sup.clone());
             all.push(Arc::new(agents::AgentTool::new(sup)));
         }
+        // The `skill` tool (L5.25), when there are skills to activate.
+        let skill_dirs = self.skill_dirs();
+        if !resources::skills(&skill_dirs).0.is_empty() {
+            let fork = supervisor.clone().map(|sup| -> novacode_core::skill::Fork {
+                Arc::new(move |task, agent, title| sup.spawn_task(task, agent, title))
+            });
+            all.push(Arc::new(novacode_core::skill::SkillTool {
+                dirs: skill_dirs,
+                policy: policy.clone(),
+                fork,
+            }));
+        }
         // Mode presets and plan mode (L10.7).
         let modes = novacode_core::modes::Modes::new(policy.clone(), s.get("modes").unwrap_or_default());
         if let Some(a) = asker.clone() {

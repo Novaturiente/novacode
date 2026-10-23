@@ -98,14 +98,21 @@ Frontmatter fields:
 |---|---|
 | `name` | Type name. Default: the file name without `.md`. |
 | `description` | Shown to the model so it can pick the type. |
-| `tools` | Comma-separated tool names, or a list like `[Read, Grep]`. Leave it out to give all of the parent's tools. |
-| `model` | `provider/model` or `small`. Any other value (such as Claude Code's `inherit` or `sonnet`) is ignored and the parent's model is used. |
-| `thinking` | Thinking level, added to the model as `model:level`. |
+| `tools` | Comma-separated tool names, or a YAML list. Leave it out to give all of the parent's tools. `mcp__server__tool` gives that MCP server (MCP tools come per server). If none of the listed tools is available, the spawn is refused. |
+| `disallowedTools` | Never given, whatever the spawn asks. `mcp__server…` drops that server. |
+| `model` | `provider/model`, `small`, `inherit` (the parent's), a family such as `sonnet`, `opus`, `haiku` (on the parent's provider, when it has the family; else the parent's model), or a model id on the parent's provider. |
+| `thinking` | Thinking level, added to the model as `model:level`. Claude Code's `effort` works too. |
+| `permissionMode` | `plan`: the subagent starts read-only. Other values never give it more than its parent and are ignored (`doctor` lists them). |
+| `mcpServers` | Names of configured MCP servers it gets. Inline server definitions are not supported. |
+| `maxTurns` | Model turns before it is stopped; its report is then marked partial, and `send` resumes it. |
+| `skills` | Skills whose text starts its task. |
+| `isolation` | `worktree`: runs in a new git worktree, like `worktree: true` on spawn. |
+| `omitClaudeMd` | `true`: starts without AGENTS.md/CLAUDE.md files. |
 | `mode` | `replace`: the file's text replaces the built-in subagent preamble instead of being added after it. `systemPromptMode: replace` also works. |
 
 The text after the frontmatter is the agent's role prompt.
 
-**Claude Code agent files** work as they are. Tool names are mapped:
+**Claude Code agent files** load with the fields above. As in Claude Code, `permissionMode`, `mcpServers` and `hooks` are ignored in agents that come from a plugin. A user or project agent with `hooks` is not loaded, because novacode doesn't run agent-scoped hooks and the agent may rely on them; `memory`, `background`, `initialPrompt`, `autoCompactWindow` and `experimental` are ignored. `novacode doctor` lists each of these per file. Tool names are mapped:
 
 | Claude Code | novacode |
 |---|---|
@@ -121,7 +128,7 @@ The text after the frontmatter is the agent's role prompt.
 | `TodoWrite` | `todo` |
 | `Task` | `agent` |
 
-Other names (for example `mcp__server__tool`) pass through unchanged.
+Other names pass through unchanged.
 
 novacode sets a few variables for its subagent processes (`NOVACODE_AGENT_DEPTH`, `NOVACODE_AGENT_CHAIN`, `NOVACODE_AGENT_TITLE`, `NOVACODE_BG_CHILD`). They are internal; don't set them.
 

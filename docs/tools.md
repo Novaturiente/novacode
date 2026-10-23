@@ -16,6 +16,7 @@ This page lists the tools the model can call, what each one does, how output is 
 | `process` | Runs and manages long-running commands. |
 | `todo` | Keeps a task list for the session. |
 | `ask_user` | Asks you structured questions. |
+| `skill` | Activates a [skill](skills.md) by name: returns its text and applies its `allowed-tools` / `disallowed-tools` for the turn, or runs it as a subagent (`context: fork`). Only there when you have skills. |
 | `agent` | Starts and manages subagents. |
 | `goal` | Works toward a goal until it is done. |
 | `enter_plan_mode`, `plan_complete` | Plan mode: propose it, then submit the plan. |

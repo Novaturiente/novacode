@@ -832,6 +832,28 @@ impl Supervisor {
         }
     }
 
+    /// A skill with `context: fork` (L5.25): its text as the task of an `agent` subagent.
+    pub fn spawn_task(self: &Arc<Self>, task: String, agent: String, title: String) -> Result<String, String> {
+        let (id, notes) = self.spawn(SpawnArgs {
+            task,
+            title: Some(title),
+            agent: Some(agent),
+            model: None,
+            cwd: None,
+            after: Vec::new(),
+            notify: Notify_::default(),
+            worktree: false,
+            tools: None,
+            mcp: None,
+        })?;
+        let notes = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", notes.join("; "))
+        };
+        Ok(format!("started {id}; its report arrives when it's done{notes}"))
+    }
+
     /// Start (or queue) a child; returns its id and notes about its tools.
     fn spawn(self: &Arc<Self>, a: SpawnArgs) -> Result<(String, Vec<String>), String> {
         if self.place.depth >= MAX_DEPTH {
