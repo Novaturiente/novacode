@@ -134,12 +134,14 @@ Order of checks for each call:
 2. `deny` rules.
 3. Protected commands, then the risk gate.
 4. Read-only mode (or a read-only mode preset). `allow` rules do not get around it.
-5. `allow` rules (and what you approved this session).
+5. `allow` rules (and what you approved this session), then a plugin `PreToolUse` hook's `"allow"`.
 6. `ask` rules.
 7. `ask` mode.
 8. Otherwise allow.
 
 So a Catastrophic command is refused before any `allow` rule is looked at. `ask` rules still ask in `auto` mode.
+
+A plugin hook's `"ask"` turns an allowed call into one that needs your approval; it never makes a refused call run.
 
 Malformed rules are ignored with a warning in the log.
 

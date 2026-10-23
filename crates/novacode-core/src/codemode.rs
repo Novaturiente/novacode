@@ -58,11 +58,13 @@ impl Nested for Runner {
                 Prepared::Rejected(o) => return o,
                 Prepared::Ready(t, a, acc) => (t, a, acc),
             };
-            let args = match hooks.before_tool(&call.name, args).await {
+            let (args, decision) = match hooks.before_tool(&call.name, args).await {
                 Ok(a) => a,
                 Err(out) => return out,
             };
-            if let Some(refusal) = pipeline::authorize(&policy, approver.as_ref(), &call.name, &args, &ctx.cwd).await {
+            if let Some(refusal) =
+                pipeline::authorize(&policy, approver.as_ref(), &call.name, &args, &ctx.cwd, &decision).await
+            {
                 return refusal;
             }
             let started = hooks.start(&call.name, &ctx.cwd).await;

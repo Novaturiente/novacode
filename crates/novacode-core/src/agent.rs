@@ -1116,8 +1116,21 @@ impl Agent {
     }
 
     /// Permission check for one prepared call (L6.1). `None` = run it; `Some` = the refusal to return.
-    async fn authorize(&self, call: &ToolCall, args: &serde_json::Value) -> Option<ToolOutput> {
-        pipeline::authorize(&self.policy, self.approver.as_ref(), &call.name, args, &self.cfg.cwd).await
+    async fn authorize(
+        &self,
+        call: &ToolCall,
+        args: &serde_json::Value,
+        hook: &crate::policy::HookDecision,
+    ) -> Option<ToolOutput> {
+        pipeline::authorize(
+            &self.policy,
+            self.approver.as_ref(),
+            &call.name,
+            args,
+            &self.cfg.cwd,
+            hook,
+        )
+        .await
     }
 
     /// Claude Code plugin hooks (L7.14): session start, prompt submit, stop, session end.
@@ -1810,11 +1823,12 @@ impl Agent {
         // Permissions are part of the sequential preflight (L3.3, L6.1); approvals are asked one at a time.
         for (call, p) in &mut prepared {
             // Hooks first (they may rewrite the args), so permissions judge what will run.
+            let mut decision = crate::policy::HookDecision::None;
             if let Prepared::Ready(_, args, _) = p
                 && !self.hooks.is_empty()
             {
                 match self.hooks.before_tool(&call.name, args.clone()).await {
-                    Ok(a) => *args = a,
+                    Ok((a, d)) => (*args, decision) = (a, d),
                     Err(out) => {
                         *p = Prepared::Rejected(out);
                         continue;
@@ -1822,7 +1836,7 @@ impl Agent {
                 }
             }
             if let Prepared::Ready(_, args, _) = p
-                && let Some(refusal) = self.authorize(call, args).await
+                && let Some(refusal) = self.authorize(call, args, &decision).await
             {
                 *p = Prepared::Rejected(refusal);
             }

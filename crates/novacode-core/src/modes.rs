@@ -236,17 +236,20 @@ mod tests {
         let m = Modes::new(policy.clone(), user);
         let cwd = std::path::Path::new("/tmp");
         let edit = json!({"path": "/tmp/a"});
-        assert_eq!(policy.check("edit", &edit, cwd, false), Verdict::Allow);
+        let none = &crate::policy::HookDecision::None;
+        assert_eq!(policy.check("edit", &edit, cwd, false, none), Verdict::Allow);
         m.set(Some("plan")).unwrap();
         assert!(
-            matches!(policy.check("edit", &edit, cwd, false), Verdict::Deny(r) if r.contains("Plan mode is read-only"))
+            matches!(policy.check("edit", &edit, cwd, false, none), Verdict::Deny(r) if r.contains("Plan mode is read-only"))
         );
-        assert_eq!(policy.check("read", &edit, cwd, false), Verdict::Allow);
+        assert_eq!(policy.check("read", &edit, cwd, false, none), Verdict::Allow);
         assert!(m.prompt().unwrap().starts_with("Plan mode is on"));
         m.set(Some("teach")).unwrap();
-        assert!(matches!(policy.check("grep", &json!({}), cwd, false), Verdict::Deny(r) if r.contains("teach mode")));
+        assert!(
+            matches!(policy.check("grep", &json!({}), cwd, false, none), Verdict::Deny(r) if r.contains("teach mode"))
+        );
         m.set(None).unwrap();
-        assert_eq!(policy.check("edit", &edit, cwd, false), Verdict::Allow);
+        assert_eq!(policy.check("edit", &edit, cwd, false, none), Verdict::Allow);
         assert!(m.prompt().is_none() && m.set(Some("nope")).is_err());
     }
 }

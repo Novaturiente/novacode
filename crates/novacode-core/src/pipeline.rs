@@ -129,9 +129,10 @@ pub async fn authorize(
     tool: &str,
     args: &Value,
     cwd: &Path,
+    hook: &crate::policy::HookDecision,
 ) -> Option<ToolOutput> {
     use crate::policy::{Approval, ApprovalRequest, Verdict};
-    let (reason, rule, risky) = match policy.check(tool, args, cwd, approver.is_some()) {
+    let (reason, rule, risky) = match policy.check(tool, args, cwd, approver.is_some(), hook) {
         Verdict::Allow => return None,
         Verdict::Deny(why) => return Some(ToolOutput::error(why)),
         Verdict::Ask { reason, rule, risky } => (reason, rule, risky),

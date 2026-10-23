@@ -412,6 +412,52 @@ async fn ask_mode_uses_the_approver_once_per_rule() {
     );
 }
 
+/// L7.16: a hook's ask reaches the approver in auto mode; a hook's allow skips ask mode.
+#[tokio::test]
+async fn hook_ask_and_allow_reach_the_policy() {
+    use novacode_core::hooks::{Gate, Handler, Hooks};
+    use novacode_core::policy::{HookDecision, Mode, Permissions, Policy};
+    struct Decide(Mode);
+    impl Handler for Decide {
+        fn before_tool<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a serde_json::Value,
+        ) -> futures_util::future::BoxFuture<'a, Gate> {
+            let d = match self.0 {
+                Mode::Auto => HookDecision::Ask("plugin asks".into()),
+                _ => HookDecision::Allow,
+            };
+            Box::pin(async move { Gate::Decide(d, None) })
+        }
+    }
+    for mode in [Mode::Auto, Mode::Ask] {
+        let work = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let faux = Faux::new([
+            tools_reply(vec![call("a", "bash", json!({"command": "touch one"}))]),
+            FauxReply::text("ok"),
+        ]);
+        let yes = Arc::new(Yes(Default::default()));
+        let agent = Agent::new(
+            Arc::new(faux.clone()),
+            novacode_tools::builtins(false),
+            Store::create(&Paths::new(home.path()), work.path(), true),
+            cfg(work.path(), home.path()),
+            Arc::new(LocalEnv),
+        )
+        .with_policy(Policy::new(Permissions::default(), home.path().into(), None).with_mode(mode))
+        .with_hooks(Arc::new(Hooks {
+            handlers: vec![Arc::new(Decide(mode))],
+        }))
+        .with_approver(yes.clone());
+        drive(agent, &["make a file"]).await;
+        assert!(work.path().join("one").exists());
+        let asked = yes.0.lock().unwrap().len();
+        assert_eq!(asked, usize::from(mode == Mode::Auto), "{mode:?}");
+    }
+}
+
 #[tokio::test]
 async fn rejected_schema_keyword_is_stripped_and_remembered() {
     let work = tempfile::tempdir().unwrap();

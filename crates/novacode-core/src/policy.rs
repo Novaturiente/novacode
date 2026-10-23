@@ -3,8 +3,9 @@
 //! skip it.
 //!
 //! Order: profile → deny rules → risk gate → read-only mode → allow rules →
-//! ask rules → ask mode → allow. Catastrophic commands and protected commands
-//! are refused before any allow rule is looked at.
+//! hook allow → ask rules → ask mode → allow, then a hook ask turns an allow
+//! into an ask. Catastrophic commands and protected commands are refused
+//! before any allow rule is looked at.
 
 use crate::risk::{self, Level};
 use futures_util::future::BoxFuture;
@@ -126,6 +127,28 @@ pub enum Verdict {
     Deny(String),
 }
 
+/// A `PreToolUse` hook's permission answer (L7.16). Its deny is a hook block, never this.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum HookDecision {
+    #[default]
+    None,
+    /// Skips ask rules and ask mode only.
+    Allow,
+    /// Needs the user even when the policy allows it; the text is the reason.
+    Ask(String),
+}
+
+impl HookDecision {
+    /// Several hooks answered: ask wins over allow; the first ask's reason is kept.
+    pub fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (a @ Self::Ask(_), _) | (_, a @ Self::Ask(_)) => a,
+            (Self::Allow, _) | (_, Self::Allow) => Self::Allow,
+            _ => Self::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
     pub tool: String,
@@ -241,8 +264,25 @@ impl Policy {
         self.perms.mode
     }
 
-    /// `interactive` = an approver can ask the user right now.
-    pub fn check(&self, tool: &str, args: &Value, cwd: &Path, interactive: bool) -> Verdict {
+    /// `interactive` = an approver can ask the user right now; `hook` = what `PreToolUse` hooks answered.
+    pub fn check(&self, tool: &str, args: &Value, cwd: &Path, interactive: bool, hook: &HookDecision) -> Verdict {
+        match (self.verdict(tool, args, cwd, interactive, hook), hook) {
+            // A hook's ask only adds a question; it never weakens a deny.
+            (Verdict::Allow, HookDecision::Ask(reason)) => Verdict::Ask {
+                reason: reason.clone(),
+                rule: suggest_rule(
+                    tool,
+                    (tool.eq_ignore_ascii_case("bash"))
+                        .then(|| args.get("command").and_then(Value::as_str).unwrap_or("")),
+                    args.get("path").and_then(Value::as_str),
+                ),
+                risky: false,
+            },
+            (v, _) => v,
+        }
+    }
+
+    fn verdict(&self, tool: &str, args: &Value, cwd: &Path, interactive: bool, hook: &HookDecision) -> Verdict {
         let lower = tool.to_lowercase();
         if let Some(only) = &self.profile.tools
             && !only.iter().any(|t| t.eq_ignore_ascii_case(tool))
@@ -363,6 +403,10 @@ impl Policy {
             return Verdict::Allow;
         }
         drop(session);
+        // Placed after deny rules, the risk gate and read-only mode, so a hook's allow skips only the asks below.
+        if *hook == HookDecision::Allow {
+            return Verdict::Allow;
+        }
 
         let ask = |reason: String| Verdict::Ask {
             reason,
@@ -457,7 +501,7 @@ mod tests {
     }
     const CWD: &str = "/home/u/proj";
     fn check(p: &Policy, tool: &str, args: Value, interactive: bool) -> Verdict {
-        p.check(tool, &args, Path::new(CWD), interactive)
+        p.check(tool, &args, Path::new(CWD), interactive, &HookDecision::None)
     }
     fn denied(v: &Verdict) -> bool {
         matches!(v, Verdict::Deny(_))
@@ -537,6 +581,40 @@ mod tests {
         assert!(denied(&check(&scout, "bash", bash("ls"), true)));
         assert_eq!(check(&scout, "grep", json!({"pattern": "x"}), true), Verdict::Allow);
         assert!(policy(json!({})).with_profile("nope").is_err());
+    }
+
+    #[test]
+    fn hook_decisions() {
+        let hook =
+            |p: &Policy, tool: &str, args: Value, h: HookDecision| p.check(tool, &args, Path::new(CWD), true, &h);
+        let allow = || HookDecision::Allow;
+        let p = policy(json!({ "ask": ["Edit(src/**)"], "deny": ["Bash(git push:*)"] })).with_mode(Mode::Ask);
+        // Allow skips the ask rule and ask mode…
+        assert_eq!(hook(&p, "edit", json!({"path": "src/a.rs"}), allow()), Verdict::Allow);
+        assert_eq!(hook(&p, "bash", bash("cargo build"), allow()), Verdict::Allow);
+        // …but not deny rules, the risk gate or read-only mode.
+        assert!(denied(&hook(&p, "bash", bash("git push origin"), allow())));
+        assert!(denied(&hook(&p, "bash", bash("rm -rf ~"), allow())));
+        assert!(matches!(
+            hook(&p, "bash", bash("rm -rf target"), allow()),
+            Verdict::Ask { risky: true, .. }
+        ));
+        let ro = policy(json!({})).with_mode(Mode::ReadOnly);
+        assert!(denied(&hook(&ro, "write", json!({"path": "a"}), allow())));
+        // Ask turns an allow into an ask, and never weakens a deny.
+        let auto = policy(json!({ "deny": ["Read(**/.env)"] }));
+        let ask = || HookDecision::Ask("plugin says check".into());
+        assert_eq!(
+            hook(&auto, "read", json!({"path": "a"}), ask()),
+            Verdict::Ask {
+                reason: "plugin says check".into(),
+                rule: "Read(a)".into(),
+                risky: false
+            }
+        );
+        assert!(denied(&hook(&auto, "read", json!({"path": "x/.env"}), ask())));
+        assert_eq!(allow().merge(ask()), ask());
+        assert_eq!(HookDecision::None.merge(allow()), allow());
     }
 
     #[test]

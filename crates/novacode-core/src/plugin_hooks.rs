@@ -15,6 +15,7 @@
 use crate::hooks::{After, DISABLED_ENV, Gate, Handler, Run};
 use crate::packages::Package;
 use crate::plugin::{Hook, Kind, Parts};
+use crate::policy::HookDecision;
 use futures_util::future::BoxFuture;
 use novacode_tools::ToolOutput;
 use serde_json::{Value, json};
@@ -266,6 +267,7 @@ impl Handler for PluginHooks {
                 )
                 .await;
             let mut new_args: Option<Value> = None;
+            let mut decision = HookDecision::None;
             for o in &outs {
                 let j = o.json().unwrap_or_default();
                 let spec = &j["hookSpecificOutput"];
@@ -281,6 +283,17 @@ impl Handler for PluginHooks {
                     .unwrap_or("refused by a plugin hook");
                     return Gate::Block(why.to_string());
                 }
+                decision = decision.merge(match spec["permissionDecision"].as_str() {
+                    Some("ask") => HookDecision::Ask(
+                        spec["permissionDecisionReason"]
+                            .as_str()
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or("a plugin hook asks")
+                            .to_string(),
+                    ),
+                    Some("allow") => HookDecision::Allow,
+                    _ => HookDecision::None,
+                });
                 if let Some(u) = spec["updatedInput"].as_object() {
                     let base = new_args.get_or_insert_with(|| args.clone());
                     if let Some(b) = base.as_object_mut() {
@@ -291,9 +304,10 @@ impl Handler for PluginHooks {
                     }
                 }
             }
-            match new_args {
-                Some(a) => Gate::Args(a),
-                None => Gate::Allow,
+            match (decision, new_args) {
+                (HookDecision::None, Some(a)) => Gate::Args(a),
+                (HookDecision::None, None) => Gate::Allow,
+                (d, a) => Gate::Decide(d, a),
             }
         })
     }
@@ -417,7 +431,15 @@ mod tests {
             json!({
                 "SessionStart": [{"matcher": "startup|compact", "hooks": [{"type": "command", "command": "echo \"ROOT=$CLAUDE_PLUGIN_ROOT\"; cat >/dev/null"}]}],
                 "UserPromptSubmit": cmd(r#"jq -r 'if .prompt == "bad" then halt_error(2) else {hookSpecificOutput: {additionalContext: ("saw " + .prompt)}} end' 2>/dev/null || { echo nope >&2; exit 2; }"#),
-                "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": r#"jq -e '.tool_input.command | test("rm")' >/dev/null && { echo "no rm" >&2; exit 2; }; echo '{"hookSpecificOutput":{"updatedInput":{"command":"echo safe"}}}'"#}]}],
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": r#"jq -e '.tool_input.command | test("rm")' >/dev/null && { echo "no rm" >&2; exit 2; }; echo '{"hookSpecificOutput":{"updatedInput":{"command":"echo safe"}}}'"#}]},
+                    // Two hooks on Edit: ask wins over allow.
+                    {"matcher": "Edit", "hooks": [
+                        {"type": "command", "command": r#"echo '{"hookSpecificOutput":{"permissionDecision":"allow"}}'"#},
+                        {"type": "command", "command": r#"echo '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"check edits"}}'"#},
+                    ]},
+                    {"matcher": "Write", "hooks": [{"type": "command", "command": r#"echo '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"file_path":"b"}}}'"#}]},
+                ],
                 "PostToolUse": [{"matcher": "Read", "hooks": [{"type": "command", "command": r#"jq -c '{hookSpecificOutput: {additionalContext: ("read " + .tool_input.file_path)}}'"#}]}],
                 "Stop": cmd(r#"jq -e '.stop_hook_active' >/dev/null && exit 0; echo '{"decision":"block","reason":"run the tests"}'"#),
             }),
@@ -439,6 +461,14 @@ mod tests {
         assert!(matches!(
             h.before_tool("read", &json!({"path": "a"})).await,
             Gate::Allow
+        ));
+        assert!(matches!(
+            h.before_tool("edit", &json!({"path": "a"})).await,
+            Gate::Decide(HookDecision::Ask(r), None) if r == "check edits"
+        ));
+        assert!(matches!(
+            h.before_tool("write", &json!({"path": "a"})).await,
+            Gate::Decide(HookDecision::Allow, Some(a)) if a["path"] == "b"
         ));
         let out = ToolOutput::text("x");
         let run = Run {

@@ -3,9 +3,10 @@
 //! one implementation; script extensions (L7.2) are another.
 //!
 //! Combine rules: `before_tool` chains (each sees the previous one's args; the
-//! first block wins), `after_tool` runs in order: each may append feedback,
+//! first block wins, then ask over allow), `after_tool` runs in order: each may append feedback,
 //! replace the result text or flip its error flag. Events are observed only.
 
+use crate::policy::HookDecision;
 use futures_util::future::BoxFuture;
 use novacode_tools::ToolOutput;
 use serde_json::{Value, json};
@@ -139,6 +140,8 @@ pub enum Gate {
     Args(Value),
     /// Don't run; the reason goes to the model as the tool's error.
     Block(String),
+    /// A permission answer (plugin `PreToolUse`, L7.16), with rewritten arguments if any.
+    Decide(HookDecision, Option<Value>),
 }
 
 pub trait Handler: Send + Sync {
@@ -175,17 +178,25 @@ impl Hooks {
         self.handlers.is_empty()
     }
 
-    /// Chain the handlers: `Ok(args)` to run with, or `Err(output)` to return instead.
-    pub async fn before_tool(&self, tool: &str, mut args: Value) -> Result<Value, ToolOutput> {
+    /// Chain the handlers: `Ok((args, decision))` to run with, or `Err(output)` to return instead.
+    /// A block wins over any decision; the decision goes to the permission check.
+    pub async fn before_tool(&self, tool: &str, mut args: Value) -> Result<(Value, HookDecision), ToolOutput> {
+        let mut decision = HookDecision::None;
         for h in &self.handlers {
-            match h.before_tool(tool, &args).await {
-                Gate::Allow => {}
-                Gate::Args(a) if a.is_object() => args = a,
-                Gate::Args(_) => {}
+            let new = match h.before_tool(tool, &args).await {
+                Gate::Allow => None,
+                Gate::Args(a) => Some(a),
+                Gate::Decide(d, a) => {
+                    decision = decision.merge(d);
+                    a
+                }
                 Gate::Block(why) => return Err(ToolOutput::error(format!("Blocked by a hook: {why}"))),
+            };
+            if let Some(a) = new.filter(Value::is_object) {
+                args = a;
             }
         }
-        Ok(args)
+        Ok((args, decision))
     }
 
     /// Before a call runs: start its clock, and snapshot the tree around `bash`
@@ -617,7 +628,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(blocked.is_error && text(&blocked).contains("no deleting"));
-        let args = hooks.before_tool("read", json!({"path": "a.txt"})).await.unwrap();
+        let (args, _) = hooks.before_tool("read", json!({"path": "a.txt"})).await.unwrap();
         assert_eq!(args, json!({"path": "b.txt"}), "transformed; exit 7 fails open");
         let mut out = ToolOutput::text("contents");
         let started = hooks.start("read", d.path()).await;
