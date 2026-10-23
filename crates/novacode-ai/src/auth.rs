@@ -73,7 +73,12 @@ pub struct AuthStore {
 
 impl AuthStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        let path = path.into();
+        // A symlinked auth.json (an isolated home sharing the login) is written and
+        // locked at its target, so a token refresh reaches every home that uses it.
+        Self {
+            path: std::fs::canonicalize(&path).unwrap_or(path),
+        }
     }
 
     fn read(&self) -> Result<AuthFile, AuthError> {
@@ -926,6 +931,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn writes_go_through_a_symlinked_auth_file() {
+        let real = tempfile::tempdir().unwrap();
+        let iso = tempfile::tempdir().unwrap();
+        let target = real.path().join("auth.json");
+        AuthStore::new(&target).put_key("p", "old-key").await.unwrap();
+        let link = iso.path().join("auth.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        AuthStore::new(&link).put_key("p", "new-key").await.unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "the link stays"
+        );
+        assert_eq!(AuthStore::new(&target).stored_key("p").as_deref(), Some("new-key"));
+    }
 
     #[test]
     fn codex_account_id_from_jwt() {

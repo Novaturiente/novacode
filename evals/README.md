@@ -19,7 +19,7 @@ With `EVAL_RUNS=N` every task runs N times, each in a fresh work folder, and a `
 
 ## Isolation
 
-Each run gets its own `NOVACODE_HOME` and `HOME` (a temp folder), which holds only a symlink to your `auth.json` (from `$NOVACODE_HOME`, else `~/.novacode`). Your skills, hooks, extensions, MCP servers, settings and context files don't load, so results don't depend on your setup. If a login refreshes during the run, the new `auth.json` is copied back to your real home. The temp home is deleted after the run.
+Each run gets its own `NOVACODE_HOME` and `HOME` (a temp folder), which holds only a symlink to your `auth.json` (from `$NOVACODE_HOME`, else `~/.novacode`). Your skills, hooks, extensions, MCP servers, settings and context files don't load, so results don't depend on your setup. A login refreshed during the run is written through the symlink to your real `auth.json`, under the same lock as your other sessions. The temp home is deleted after the run.
 
 ## Optional task parts
 

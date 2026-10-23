@@ -67,11 +67,6 @@ for t in "$@"; do
       agent --no-session -p "$(cat "$t/prompt.md")" >"$work/.events.jsonl" 2>"$work/.stderr"
     fi
     secs=$(( $(date +%s) - start ))
-    # A token refresh replaces the symlink with a file: copy the new login back, or the
-    # real home keeps a refresh token that may no longer work.
-    if [ -f "$iso/auth.json" ] && [ ! -L "$iso/auth.json" ]; then
-      cp "$iso/auth.json" "$real_home/.auth.json.eval" && mv "$real_home/.auth.json.eval" "$real_home/auth.json"
-    fi
     toks=$(tokens "$work/.reply" "$work/.events.jsonl" "$work/.events2.jsonl")
     if (cd "$work" && sh "$here/$t/check.sh" >/dev/null 2>&1); then r=PASS; tpass=$((tpass+1)); else r=FAIL; fi
     printf '%-20s %s  %4ss  %s  %s\n' "$t" "$r" "$secs" "$toks" "$work"
