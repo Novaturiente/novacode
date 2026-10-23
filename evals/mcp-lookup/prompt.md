@@ -1,0 +1,1 @@
+The `vault` MCP server has a tool that returns this project's build id. Get the build id from it and write it into version.txt, replacing `unknown`, so the file reads `build: <id>`. Don't guess the id.

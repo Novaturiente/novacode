@@ -1,0 +1,1 @@
+Change `distance` in geo/dist.py to take two points, `distance(a, b)`, where each point is an `(x, y)` tuple, instead of four numbers. Update every caller in the project, not only the ones the tests reach. `python3 run_tests.py` must pass. Don't change the tests.

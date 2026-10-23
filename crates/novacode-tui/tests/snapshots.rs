@@ -855,25 +855,58 @@ fn bench_frame() {
             op: op(json!({"op": "widget", "key": ext, "lines": ["line a", [{"text": "b", "style": "accent"}]]})),
         });
     }
+    let (p50, p99) = frame_times(&mut a);
+    println!("BENCH frame_p50_ms {:.2}", p50.as_secs_f64() * 1e3);
+    println!("BENCH frame_p99_ms {:.2}", p99.as_secs_f64() * 1e3);
+    assert!(p99.as_millis() < 16, "frame p99 {p99:?} over the 16 ms budget");
+}
+
+/// Keypress to frame: draw once, then time 200 keypresses each followed by a draw.
+/// Returns (p50, p99).
+fn frame_times(a: &mut App) -> (std::time::Duration, std::time::Duration) {
     let mut t = Terminal::new(TestBackend::new(200, 60)).unwrap();
     t.draw(|f| a.draw(f)).unwrap();
     let mut times = Vec::new();
     for i in 0..200 {
         let start = std::time::Instant::now();
-        key(
-            &mut a,
-            KeyCode::Char(if i % 2 == 0 { 'x' } else { 'y' }),
-            KeyModifiers::NONE,
-        );
+        key(a, KeyCode::Char(if i % 2 == 0 { 'x' } else { 'y' }), KeyModifiers::NONE);
         t.draw(|f| a.draw(f)).unwrap();
         times.push(start.elapsed());
     }
     times.sort();
-    let p50 = times[times.len() / 2];
-    let p99 = times[times.len() * 99 / 100];
-    println!("BENCH frame_p50_ms {:.2}", p50.as_secs_f64() * 1e3);
-    println!("BENCH frame_p99_ms {:.2}", p99.as_secs_f64() * 1e3);
-    assert!(p99.as_millis() < 16, "frame p99 {p99:?} over the 16 ms budget");
+    (times[times.len() / 2], times[times.len() * 99 / 100])
+}
+
+/// L11.12 report-only row: a day-long session, 2000 turns, every turn expanded
+/// (Alt+O), each with a tool call and its output. No budget: `scripts/bench.sh` prints it.
+#[test]
+#[ignore]
+fn bench_frame_long() {
+    let mut history = Vec::new();
+    for i in 0..2000 {
+        history.push(Message::user(format!("question {i}: why does `foo` fail?")));
+        history.push(assistant(
+            vec![call(&format!("c{i}"), "bash", json!({"command": "cargo test"}))],
+            StopReason::ToolUse,
+        ));
+        history.push(result(
+            &format!("c{i}"),
+            "bash",
+            &format!("running 3 tests\ntest a ... ok\ntest b ... ok\ntest foo ... FAILED {i}\n"),
+            true,
+        ));
+        history.push(assistant(
+            vec![Block::text(format!(
+                "## Answer {i}\n\nThe **bug** is in `foo`:\n\n```rust\nfn foo() -> u32 {{ {i} }}\n```\n\n- one\n- two\n"
+            ))],
+            StopReason::Stop,
+        ));
+    }
+    let (mut a, _rx) = app(history);
+    key(&mut a, KeyCode::Char('o'), KeyModifiers::ALT);
+    let (p50, p99) = frame_times(&mut a);
+    println!("BENCH frame_long_p50_ms {:.2}", p50.as_secs_f64() * 1e3);
+    println!("BENCH frame_long_p99_ms {:.2}", p99.as_secs_f64() * 1e3);
 }
 
 #[test]

@@ -35,3 +35,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked -p novacode --no-default-features
+  # L11.12 budgets on every change, warning only: shared runners are noisy, so an
+  # OVER row is printed but doesn't fail the job. The release workflow still enforces it.
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p novacode
+      - run: BENCH_WARN_ONLY=1 scripts/bench.sh
