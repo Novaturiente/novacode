@@ -1119,7 +1119,13 @@ impl Agent {
     }
 
     /// Permission check for one prepared call (L6.1). `None` = run it; `Some` = the refusal to return.
-    async fn authorize(&self, call: &ToolCall, read_only: bool, args: &serde_json::Value) -> Option<ToolOutput> {
+    async fn authorize(
+        &self,
+        call: &ToolCall,
+        read_only: bool,
+        args: &serde_json::Value,
+        hook: &crate::policy::HookDecision,
+    ) -> Option<ToolOutput> {
         pipeline::authorize(
             &self.policy,
             self.approver.as_ref(),
@@ -1127,6 +1133,7 @@ impl Agent {
             read_only,
             args,
             &self.cfg.cwd,
+            hook,
         )
         .await
     }
@@ -1874,11 +1881,12 @@ impl Agent {
         // Permissions are part of the sequential preflight (L3.3, L6.1); approvals are asked one at a time.
         for (call, p) in &mut prepared {
             // Hooks first (they may rewrite the args), so permissions judge what will run.
+            let mut decision = crate::policy::HookDecision::None;
             if let Prepared::Ready(_, args, _) = p
                 && !self.hooks.is_empty()
             {
                 match self.hooks.before_tool(&call.name, args.clone()).await {
-                    Ok(a) => *args = a,
+                    Ok((a, d)) => (*args, decision) = (a, d),
                     Err(out) => {
                         *p = Prepared::Rejected(out);
                         continue;
@@ -1886,7 +1894,7 @@ impl Agent {
                 }
             }
             if let Prepared::Ready(t, args, _) = p
-                && let Some(refusal) = self.authorize(call, t.read_only(), args).await
+                && let Some(refusal) = self.authorize(call, t.read_only(), args, &decision).await
             {
                 *p = Prepared::Rejected(refusal);
             }

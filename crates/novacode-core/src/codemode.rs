@@ -58,7 +58,7 @@ impl Nested for Runner {
                 Prepared::Rejected(o) => return o,
                 Prepared::Ready(t, a, acc) => (t, a, acc),
             };
-            let args = match hooks.before_tool(&call.name, args).await {
+            let (args, decision) = match hooks.before_tool(&call.name, args).await {
                 Ok(a) => a,
                 Err(out) => return out,
             };
@@ -69,6 +69,7 @@ impl Nested for Runner {
                 tool.read_only(),
                 &args,
                 &ctx.cwd,
+                &decision,
             )
             .await
             {

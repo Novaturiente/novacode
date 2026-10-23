@@ -139,7 +139,7 @@ A plugin's command hooks run with Claude Code's input on stdin (`session_id`, `c
 | `SessionStart` | Before the first model call of a session (`startup`, or `resume` for a resumed one), and after each compaction (`compact`) | Saved as context for the model |
 | `SubagentStart` | Instead of `SessionStart` in a subagent; the matcher is the agent type | Saved as context for the subagent |
 | `UserPromptSubmit` | Before each prompt you send (not in subagents) | Context is saved after the prompt; a block refuses the prompt and shows the reason |
-| `PreToolUse` | Before each tool call | Block (the reason goes to the model), or `updatedInput` changes the arguments |
+| `PreToolUse` | Before each tool call | Block or `permissionDecision: "deny"` (the reason goes to the model); `"ask"` needs your approval even when the policy allows the call (refused when nobody can approve); `"allow"` skips only `ask` rules and ask mode, never deny rules, protected commands, the risk gate or read-only mode. Deny beats ask, ask beats allow. `updatedInput` changes the arguments |
 | `PostToolUse` | After each tool call | `additionalContext`, a block reason or exit-2 stderr is added to the result; `updatedToolOutput` replaces it |
 | `Stop` | When the agent finishes a turn normally (not in subagents) | A block keeps the agent going, with the reason as its next instruction; `stop_hook_active` is `true` on the next stop |
 | `SessionEnd` | When the session closes | Nothing (observe only) |
