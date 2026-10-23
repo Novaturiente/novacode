@@ -28,6 +28,8 @@ base64 = "0.22"
 reqwest.workspace = true
 regex = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
+# Claude Code frontmatter: lists, nested maps (L7.16).
+yaml-rust2 = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 novacode-base.workspace = true

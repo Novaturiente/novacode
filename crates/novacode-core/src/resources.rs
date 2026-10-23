@@ -5,6 +5,7 @@
 //! (progressive disclosure). `/skill:name args` inlines one by hand. Templates
 //! are `/name args` shortcuts with bash-style argument placeholders.
 
+use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -46,13 +47,21 @@ impl Seen {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Skill {
     pub name: String,
     pub description: String,
     pub path: PathBuf,
     /// `disable-model-invocation`: only `/skill:name` uses it; not listed to the model.
     pub hidden: bool,
+    /// `user-invocable: false`: only the model uses it; no `/skill:` completion.
+    pub model_only: bool,
+    /// `allowed-tools`: run without asking for the rest of the turn it is activated in.
+    pub allowed_tools: Vec<String>,
+    /// `disallowed-tools`: refused for the rest of that turn.
+    pub disallowed_tools: Vec<String>,
+    /// `context: fork`: runs as a subagent of this type (`agent`, default `worker`).
+    pub fork: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,18 +71,122 @@ pub struct Template {
     pub body: String,
 }
 
-/// Top-level `key: value` pairs and the body. Handles quoted values and `|`/`>`
-/// block scalars; nested maps are skipped. No frontmatter = empty map.
-pub fn frontmatter(text: &str) -> (BTreeMap<String, String>, &str) {
-    let mut map = BTreeMap::new();
+/// Frontmatter fields and the body (L7.16). YAML: lists, nested maps, numbers and
+/// booleans. Frontmatter that isn't valid YAML (often an unquoted `: ` in a
+/// description) falls back to top-level `key: value` lines as strings, and
+/// `valid` is false. No frontmatter = empty map.
+pub fn frontmatter(text: &str) -> (BTreeMap<String, Value>, &str) {
+    let (map, body, _) = parse_frontmatter(text);
+    (map, body)
+}
+
+/// [`frontmatter`], plus whether it was valid YAML (for `doctor`).
+pub fn parse_frontmatter(text: &str) -> (BTreeMap<String, Value>, &str, bool) {
     let Some(rest) = text.strip_prefix("---\n").or_else(|| text.strip_prefix("---\r\n")) else {
-        return (map, text);
+        return (BTreeMap::new(), text, true);
     };
     let Some(end) = rest.find("\n---") else {
-        return (map, text);
+        return (BTreeMap::new(), text, true);
     };
     let body = rest[end + 4..].trim_start_matches(['\r', '\n']);
-    let mut lines = rest[..end].lines().peekable();
+    let head = &rest[..end];
+    match yaml_rust2::YamlLoader::load_from_str(head).map(|d| d.into_iter().next().map(|y| yaml_json(&y))) {
+        Ok(Some(Value::Object(m))) => (m.into_iter().collect(), body, true),
+        Ok(None) => (BTreeMap::new(), body, true),
+        _ => (
+            simple_fields(head)
+                .into_iter()
+                .map(|(k, v)| (k, Value::String(v)))
+                .collect(),
+            body,
+            false,
+        ),
+    }
+}
+
+fn yaml_json(y: &yaml_rust2::Yaml) -> Value {
+    use yaml_rust2::Yaml;
+    match y {
+        Yaml::String(s) => Value::String(s.clone()),
+        Yaml::Real(s) => s
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map_or(Value::String(s.clone()), Value::Number),
+        Yaml::Integer(i) => Value::from(*i),
+        Yaml::Boolean(b) => Value::Bool(*b),
+        Yaml::Array(a) => Value::Array(a.iter().map(yaml_json).collect()),
+        Yaml::Hash(h) => Value::Object(
+            h.iter()
+                .filter_map(|(k, v)| Some((text(&yaml_json(k))?, yaml_json(v))))
+                .collect(),
+        ),
+        _ => Value::Null,
+    }
+}
+
+/// A scalar field as text (strings, numbers, booleans).
+pub fn text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// A text field of `fm`, trimmed (YAML `|` blocks keep a final newline).
+pub fn field(fm: &BTreeMap<String, Value>, key: &str) -> Option<String> {
+    fm.get(key).and_then(text).map(|s| s.trim().to_string())
+}
+
+/// A boolean field as Claude Code reads it: `true`/`yes`/`on`/`1`, any case.
+pub fn flag(v: Option<&Value>) -> bool {
+    match v {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_i64() == Some(1),
+        Some(Value::String(s)) => matches!(s.trim().to_lowercase().as_str(), "true" | "yes" | "on" | "1"),
+        _ => false,
+    }
+}
+
+/// A list field: a YAML list, or a string split at commas (or, without commas,
+/// at spaces outside brackets, so `Bash(git push *)` stays whole).
+pub fn list(v: Option<&Value>) -> Vec<String> {
+    let parts: Vec<String> = match v {
+        Some(Value::Array(a)) => a.iter().filter_map(text).collect(),
+        Some(Value::String(s)) if s.contains(',') => s.split(',').map(String::from).collect(),
+        Some(Value::String(s)) => {
+            let (mut out, mut cur, mut depth) = (Vec::new(), String::new(), 0i32);
+            for c in s.chars() {
+                match c {
+                    '(' | '[' => depth += 1,
+                    ')' | ']' => depth -= 1,
+                    c if c.is_whitespace() && depth <= 0 => {
+                        out.push(std::mem::take(&mut cur));
+                        continue;
+                    }
+                    _ => {}
+                }
+                cur.push(c);
+            }
+            out.push(cur);
+            out
+        }
+        _ => Vec::new(),
+    };
+    parts
+        .into_iter()
+        .map(|p| p.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// Top-level `key: value` lines with quoted values and `|`/`>` blocks; the
+/// fallback for frontmatter that isn't valid YAML.
+fn simple_fields(head: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    let mut lines = head.lines().peekable();
     while let Some(line) = lines.next() {
         if line.starts_with([' ', '\t', '#']) {
             continue;
@@ -92,8 +205,11 @@ pub fn frontmatter(text: &str) -> (BTreeMap<String, String>, &str) {
         };
         map.insert(k.trim().to_string(), value);
     }
-    (map, body)
+    map
 }
+
+/// Claude Code skill fields novacode doesn't act on (L7.16).
+const SKILL_UNSUPPORTED: &[&str] = &["model", "effort", "hooks", "paths", "shell", "background"];
 
 /// Skills from `dirs`, earlier folders winning a name clash ([`Seen`]). Sorted by
 /// name, so the prompt renders the same every time. Returns problems to show
@@ -109,15 +225,20 @@ pub fn skills(dirs: &[PathBuf]) -> (Vec<Skill>, Vec<String>, Vec<String>) {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let (fm, _) = frontmatter(&text);
+            let (fm, _, valid) = parse_frontmatter(&text);
             let declared = path.file_name().is_some_and(|n| n == "SKILL.md");
-            let Some(description) = fm.get("description").filter(|d| !d.trim().is_empty()) else {
+            // `when_to_use` adds to the description, as in Claude Code.
+            let description = match (field(&fm, "description"), field(&fm, "when_to_use")) {
+                (Some(d), Some(w)) => Some(format!("{d} {w}")),
+                (d, w) => d.or(w),
+            };
+            let Some(description) = description.filter(|d| !d.trim().is_empty()) else {
                 if declared {
                     warn.push(format!("skill {} has no description; skipped", path.display()));
                 }
                 continue;
             };
-            let name = fm.get("name").cloned().unwrap_or_else(|| {
+            let name = field(&fm, "name").unwrap_or_else(|| {
                 let dir = if declared { path.parent() } else { Some(path.as_path()) };
                 dir.and_then(|d| d.file_stem())
                     .map(|n| n.to_string_lossy().into_owned())
@@ -126,13 +247,36 @@ pub fn skills(dirs: &[PathBuf]) -> (Vec<Skill>, Vec<String>, Vec<String>) {
             let Some(name) = seen.admit("skill", &name, &path) else {
                 continue;
             };
+            if !valid {
+                seen.shadowed.push(format!(
+                    "skill `{name}`: frontmatter isn't valid YAML; read as plain `key: value` lines ({})",
+                    path.display()
+                ));
+            }
+            let ignored: Vec<&str> = SKILL_UNSUPPORTED
+                .iter()
+                .copied()
+                .filter(|k| fm.contains_key(*k))
+                .collect();
+            if !ignored.is_empty() {
+                seen.shadowed.push(format!(
+                    "skill `{name}`: not supported, ignored: {}",
+                    ignored.join(", ")
+                ));
+            }
+            let fork = (field(&fm, "context").as_deref() == Some("fork"))
+                .then(|| field(&fm, "agent").unwrap_or_else(|| "worker".into()));
             found.insert(
                 name.clone(),
                 Skill {
                     name,
                     description: description.chars().take(1024).collect(),
                     path,
-                    hidden: fm.get("disable-model-invocation").is_some_and(|v| v == "true"),
+                    hidden: flag(fm.get("disable-model-invocation")),
+                    model_only: fm.get("user-invocable").is_some_and(|v| !flag(Some(v))),
+                    allowed_tools: list(fm.get("allowed-tools")),
+                    disallowed_tools: list(fm.get("disallowed-tools")),
+                    fork,
                 },
             );
         }
@@ -263,7 +407,7 @@ pub fn templates(dirs: &[PathBuf]) -> (Vec<Template>, Vec<String>) {
             };
             let text = crate::plugin::fill_for(&p, text);
             let (fm, body) = frontmatter(&text);
-            let description = fm.get("description").cloned().unwrap_or_else(|| {
+            let description = field(&fm, "description").unwrap_or_else(|| {
                 let first = body.lines().find(|l| !l.trim().is_empty()).unwrap_or_default();
                 let short: String = first.chars().take(60).collect();
                 if first.chars().count() > 60 {
@@ -293,7 +437,7 @@ pub fn expand(text: &str, skills: &[Skill], templates: &[Template]) -> String {
     let (cmd, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     let args = args.trim();
     if let Some(name) = cmd.strip_prefix("skill:") {
-        let Some(k) = skills.iter().find(|k| k.name == name) else {
+        let Some(k) = skills.iter().find(|k| k.name == name && !k.model_only) else {
             return text.to_string();
         };
         let Ok(raw) = std::fs::read_to_string(&k.path) else {
@@ -301,14 +445,22 @@ pub fn expand(text: &str, skills: &[Skill], templates: &[Template]) -> String {
         };
         let raw = crate::plugin::fill_for(&k.path, raw);
         let base = k.path.parent().unwrap_or(Path::new("/"));
+        let body = frontmatter(&raw).1.trim();
+        // `$ARGUMENTS` (and `$1`…) in the body take the arguments, as in Claude Code.
+        let placed = body.contains("$ARGUMENTS");
+        let body = if placed {
+            substitute(body, &split_args(args))
+        } else {
+            body.to_string()
+        };
         let block = format!(
             "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
             k.name,
             k.path.display(),
             base.display(),
-            frontmatter(&raw).1.trim()
+            body
         );
-        return if args.is_empty() {
+        return if args.is_empty() || placed {
             block
         } else {
             format!("{block}\n\n{args}")
@@ -432,12 +584,31 @@ mod tests {
         let (fm, body) = frontmatter(
             "---\nname: humanizer\ndescription: |\n  Rewrite text.\n  Keep meaning.\nlicense: \"MIT\"\nmetadata:\n  version: \"3\"\nfolded: >\n  a\n  b\n---\n\nBody here\n",
         );
-        assert_eq!(fm["description"], "Rewrite text.\nKeep meaning.");
-        assert_eq!(fm["license"], "MIT");
-        assert_eq!(fm["folded"], "a b");
-        assert!(!fm.contains_key("version"), "nested keys are skipped");
+        assert_eq!(field(&fm, "description").unwrap(), "Rewrite text.\nKeep meaning.");
+        assert_eq!(field(&fm, "license").unwrap(), "MIT");
+        assert_eq!(field(&fm, "folded").unwrap(), "a b");
+        assert_eq!(fm["metadata"]["version"], "3", "nested maps are kept");
+        assert!(!fm.contains_key("version"));
         assert_eq!(body, "Body here\n");
         assert_eq!(frontmatter("no frontmatter").1, "no frontmatter");
+    }
+
+    /// L7.16: Claude Code frontmatter as Claude Code reads it.
+    #[test]
+    fn frontmatter_lists_flags_and_the_plain_fallback() {
+        let (fm, _, valid) = parse_frontmatter(
+            "---\ntools:\n  - Read\n  - Grep\nflow: [Read, \"Bash(git push *)\"]\ncsv: Read, Grep\nspaced: Read Bash(git log *)\non: yes\noff: No\n---\nx",
+        );
+        assert!(valid);
+        assert_eq!(list(fm.get("tools")), ["Read", "Grep"]);
+        assert_eq!(list(fm.get("flow")), ["Read", "Bash(git push *)"]);
+        assert_eq!(list(fm.get("csv")), ["Read", "Grep"]);
+        assert_eq!(list(fm.get("spaced")), ["Read", "Bash(git log *)"]);
+        assert!(flag(fm.get("on")) && !flag(fm.get("off")) && !flag(fm.get("missing")));
+        // Not YAML (an unquoted `: ` in a value): the plain reader still gets the fields.
+        let (fm, _, valid) = parse_frontmatter("---\nname: x\ndescription: Use when: the user asks\n---\nx");
+        assert!(!valid);
+        assert_eq!(field(&fm, "description").unwrap(), "Use when: the user asks");
     }
 
     #[test]

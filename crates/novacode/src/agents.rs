@@ -10,6 +10,7 @@ use crate::wire::ServerMsg;
 use futures_util::future::BoxFuture;
 use novacode_core::hooks::{Gate, Handler};
 use novacode_core::policy::{Approval, ApprovalRequest, Approver};
+use novacode_core::resources;
 use novacode_tools::ask::Asker;
 use novacode_tools::{Tool, ToolCtx, ToolOutput};
 use novacode_types::ui::{Node, Time, UiOp};
@@ -36,19 +37,20 @@ fn own_exe() -> PathBuf {
     exe
 }
 
-/// A provider's small model as `provider/model`, or None.
-pub type SmallModel = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+/// `(provider, wanted)` → `provider/model`: `small` is the provider's small model,
+/// a family (`sonnet`) or a bare model id is looked up on that provider. None: not there.
+pub type ModelLookup = Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
 
-/// A child's model: the spawn's or its type's (`small` = the small model of the
-/// parent's current provider), else the parent's own.
+/// A child's model: the spawn's or its type's (`provider/model` as is; anything
+/// else on the parent's current provider), else the parent's own.
 fn child_model(
     requested: Option<&str>,
     parent: String,
-    small: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+    lookup: &(dyn Fn(&str, &str) -> Option<String> + Send + Sync),
 ) -> String {
     match requested {
-        Some("small") => small(parent.split_once('/').map_or("", |(p, _)| p)).unwrap_or(parent),
-        Some(m) => m.to_string(),
+        Some(m) if m.contains('/') => m.to_string(),
+        Some(m) => lookup(parent.split_once('/').map_or("", |(p, _)| p), m).unwrap_or(parent),
         None => parent,
     }
 }
@@ -91,21 +93,43 @@ impl Place {
 // ---------------------------------------------------------------------------
 // Agent definitions
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Def {
     pub name: String,
     pub description: String,
     /// Its default tools; None: all of the parent's. The child is built with only these.
     pub tools: Option<Vec<String>>,
-    /// MCP servers it gets by default (`agents.<name>.mcp`); none otherwise.
+    /// MCP servers it gets by default (`agents.<name>.mcp`, Claude `mcpServers`); none otherwise.
     pub mcp: Vec<String>,
-    /// `provider/model`, or `small` for the provider's small model.
+    /// `provider/model`, `small` for the provider's small model, or a model or
+    /// family (`sonnet`) on the parent's provider.
     pub model: Option<String>,
     pub thinking: Option<String>,
     pub prompt: String,
     /// The prompt replaces the preamble instead of being added after it.
     pub replace: bool,
+    /// Claude `disallowedTools`: never given, whatever the spawn asks (`mcp__server…` drops the server).
+    pub disallowed: Vec<String>,
+    /// Claude `permissionMode: plan`: starts read-only.
+    pub read_only: bool,
+    /// Claude `maxTurns`: model turns before it is stopped with a partial report.
+    pub max_turns: Option<u32>,
+    /// Claude `skills`: their text starts the task.
+    pub skills: Vec<String>,
+    /// Claude `isolation: worktree`.
+    pub worktree: bool,
+    /// Claude `omitClaudeMd`: no AGENTS.md/CLAUDE.md files.
+    pub no_context: bool,
 }
+
+/// Claude Code agent fields novacode doesn't act on (L7.16); `hooks` refuses the file.
+const AGENT_UNSUPPORTED: &[&str] = &[
+    "memory",
+    "background",
+    "initialPrompt",
+    "autoCompactWindow",
+    "experimental",
+];
 
 fn builtins() -> Vec<Def> {
     let def = |name: &str, description: &str, tools: Option<&[&str]>, model: Option<&str>, prompt: &str| Def {
@@ -114,9 +138,8 @@ fn builtins() -> Vec<Def> {
         tools: tools.map(|t| t.iter().map(|s| s.to_string()).collect()),
         mcp: Vec::new(),
         model: model.map(str::to_string),
-        thinking: None,
         prompt: prompt.into(),
-        replace: false,
+        ..Default::default()
     };
     vec![
         def(
@@ -177,10 +200,8 @@ pub fn defs(dirs: &[PathBuf]) -> (Vec<Def>, Vec<String>) {
                 continue;
             };
             let text = novacode_core::plugin::fill_for(&f, text);
-            let (fm, body) = novacode_core::resources::frontmatter(&text);
-            let name = fm
-                .get("name")
-                .cloned()
+            let (fm, body, valid) = resources::parse_frontmatter(&text);
+            let name = resources::field(&fm, "name")
                 .or_else(|| f.file_stem().map(|s| s.to_string_lossy().to_string()))
                 .unwrap_or_default();
             if name.is_empty() {
@@ -189,30 +210,83 @@ pub fn defs(dirs: &[PathBuf]) -> (Vec<Def>, Vec<String>) {
             let Some(name) = seen.admit("agent", &name, &f) else {
                 continue;
             };
-            let tools = fm.get("tools").map(|v| {
-                // `Read, Grep` or a flow list `[Read, "Grep"]`.
-                v.trim_matches(|c| c == '[' || c == ']')
-                    .split(',')
-                    .map(|s| crate::import::nova_tool(s.trim().trim_matches(|c| c == '"' || c == '\'')))
-                    .filter(|s| !s.is_empty())
+            let mut note = |s: String| seen.shadowed.push(format!("agent `{name}`: {s}"));
+            if !valid {
+                note(format!(
+                    "frontmatter isn't valid YAML; read as plain `key: value` lines ({})",
+                    f.display()
+                ));
+            }
+            // Claude Code ignores these three in plugin agents; so do we.
+            let plugin = novacode_core::plugin::owner_name(&f).is_some();
+            if fm.contains_key("hooks") && !plugin {
+                note("not loaded: its `hooks` don't run in novacode, and it may rely on them".into());
+                all.remove(&name);
+                continue;
+            }
+            let mut d = Def::default();
+            // `mcp__server__tool` names grant the server: MCP tools come per server.
+            let split = |names: Vec<String>, mcp: &mut Vec<String>| -> Vec<String> {
+                names
+                    .into_iter()
+                    .filter_map(|t| match t.strip_prefix("mcp__") {
+                        Some(rest) => {
+                            mcp.push(rest.split("__").next().unwrap_or(rest).to_string());
+                            None
+                        }
+                        None => Some(crate::import::nova_tool(&t)),
+                    })
                     .collect()
-            });
-            // Claude Code's `inherit` and bare family names aren't routes: use the parent's model.
-            let model = fm.get("model").filter(|m| m.contains('/') || *m == "small").cloned();
+            };
+            d.tools = fm.get("tools").map(|v| split(resources::list(Some(v)), &mut d.mcp));
+            let mut dropped = Vec::new();
+            d.disallowed = split(resources::list(fm.get("disallowedTools")), &mut dropped);
+            d.disallowed.extend(dropped.into_iter().map(|s| format!("mcp__{s}")));
+            if !plugin {
+                for s in resources::list(fm.get("mcpServers")) {
+                    d.mcp.push(s);
+                }
+                if fm
+                    .get("mcpServers")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| a.iter().any(Value::is_object))
+                {
+                    note("inline `mcpServers` definitions are not supported; only server names".into());
+                }
+                match resources::field(&fm, "permissionMode").as_deref() {
+                    Some("plan") => d.read_only = true,
+                    None | Some("default" | "manual") => {}
+                    Some(m) => note(format!(
+                        "`permissionMode: {m}` ignored: a subagent never gets more than its parent"
+                    )),
+                }
+            }
+            d.mcp.sort();
+            d.mcp.dedup();
+            d.model = resources::field(&fm, "model").filter(|m| m != "inherit");
+            d.thinking = resources::field(&fm, "thinking").or_else(|| resources::field(&fm, "effort"));
+            d.max_turns = fm.get("maxTurns").and_then(Value::as_u64).map(|n| n as u32);
+            d.skills = resources::list(fm.get("skills"));
+            d.worktree = resources::field(&fm, "isolation").as_deref() == Some("worktree");
+            d.no_context = resources::flag(fm.get("omitClaudeMd"));
+            let ignored: Vec<&str> = AGENT_UNSUPPORTED
+                .iter()
+                .copied()
+                .filter(|k| fm.contains_key(*k))
+                .collect();
+            if !ignored.is_empty() {
+                note(format!("not supported, ignored: {}", ignored.join(", ")));
+            }
             all.insert(
                 name.clone(),
                 Def {
                     name,
-                    description: fm.get("description").cloned().unwrap_or_default(),
-                    tools,
-                    mcp: Vec::new(),
-                    model,
-                    thinking: fm.get("thinking").cloned(),
+                    description: resources::field(&fm, "description").unwrap_or_default(),
                     prompt: body.trim().to_string(),
-                    replace: fm
-                        .get("mode")
-                        .or(fm.get("systemPromptMode"))
+                    replace: resources::field(&fm, "mode")
+                        .or(resources::field(&fm, "systemPromptMode"))
                         .is_some_and(|m| m == "replace"),
+                    ..d
                 },
             );
         }
@@ -280,8 +354,12 @@ pub fn grant(
         }
         *t = keep;
     }
+    // Claude `disallowedTools`: never given, whoever picks.
+    if let Some(t) = tools.as_mut() {
+        t.retain(|n| !def.disallowed.contains(n));
+    }
     let granted = pick_mcp.is_some();
-    let (mcp, unknown): (Vec<String>, Vec<String>) = pick_mcp
+    let (mut mcp, unknown): (Vec<String>, Vec<String>) = pick_mcp
         .unwrap_or_else(|| def.mcp.clone())
         .into_iter()
         .partition(|s| servers.contains(s));
@@ -296,6 +374,7 @@ pub fn grant(
             }
         ));
     }
+    mcp.retain(|s| !def.disallowed.contains(&format!("mcp__{s}")));
     // MCP tools run through codemode unless configured as listed.
     if !mcp.is_empty()
         && let Some(t) = tools.as_mut()
@@ -501,6 +580,12 @@ struct Child {
     delivered: bool,
     /// A message to resume it with once a slot is free (`send` to a finished child).
     resume: Option<String>,
+    /// From its definition: starts read-only, without context files, stops after this many turns.
+    read_only: bool,
+    no_context: bool,
+    max_turns: Option<u32>,
+    /// Model turns in the current run.
+    turns: u32,
 }
 
 pub struct Supervisor {
@@ -530,7 +615,8 @@ struct Cfg {
     servers: Vec<String>,
     /// This session's own tool names (MCP ones aside): a child never gets more.
     own: Option<Vec<String>>,
-    small_model: SmallModel,
+    models: ModelLookup,
+    skill_dirs: Vec<PathBuf>,
     /// Children running at once; more wait as `queued` (`agents.maxConcurrent`; 1 below the top).
     max_running: usize,
     /// Nerd Font glyphs in the panel rows (`ui.icons`).
@@ -555,7 +641,8 @@ impl Cfg {
             trusted: s.trusted,
             stall: Duration::from_secs(s.stall_min * 60),
             timeout: Duration::from_secs(s.timeout_min * 60),
-            small_model: s.small_model,
+            models: s.models,
+            skill_dirs: s.skill_dirs,
             max_running: s.max_running.max(1),
             nerd: s.nerd,
             unattended: s.unattended,
@@ -578,7 +665,9 @@ pub struct Setup {
     pub stall_min: u64,
     pub timeout_min: u64,
     /// A provider's small model as `provider/model`, asked at spawn time (the parent may switch provider).
-    pub small_model: SmallModel,
+    pub models: ModelLookup,
+    /// Skill folders, for agents that preload skills (Claude `skills`).
+    pub skill_dirs: Vec<PathBuf>,
     pub max_running: usize,
     /// The child binary (tests use a fake); default: this one.
     pub exe: Option<PathBuf>,
@@ -755,17 +844,42 @@ impl Supervisor {
             format!("no agent `{agent}`; known: {}", names.join(", "))
         })?;
         let parent = self.parent_model().unwrap_or_default();
-        let mut model = child_model(
-            a.model.or(def.model.clone()).as_deref(),
-            parent,
-            cfg.small_model.as_ref(),
-        );
+        let mut model = child_model(a.model.or(def.model.clone()).as_deref(), parent, cfg.models.as_ref());
         if let Some(t) = &def.thinking
             && !model.contains(':')
         {
             model = format!("{model}:{t}");
         }
-        let (mut tools, mcp, notes) = grant(def, a.tools, a.mcp, cfg.parent_picks, cfg.own.as_deref(), &cfg.servers);
+        let (mut tools, mcp, mut notes) =
+            grant(def, a.tools, a.mcp, cfg.parent_picks, cfg.own.as_deref(), &cfg.servers);
+        // Claude Code refuses an agent none of whose listed tools exists.
+        if let (Some(wanted), Some(got)) = (&def.tools, &tools)
+            && !wanted.is_empty()
+            && got.is_empty()
+            && mcp.is_empty()
+        {
+            return Err(format!(
+                "agent `{agent}` would start with no tools: none of {} is available here",
+                wanted.join(", ")
+            ));
+        }
+        let short: String = a.task.chars().take(40).collect();
+        // Claude `skills`: their text starts the task.
+        let mut task = a.task;
+        if !def.skills.is_empty() {
+            let skills = novacode_core::resources::skills(&cfg.skill_dirs).0;
+            let mut blocks = Vec::new();
+            for s in &def.skills {
+                let b = novacode_core::resources::expand(&format!("/skill:{s}"), &skills, &[]);
+                if b.starts_with("<skill") {
+                    blocks.push(b);
+                } else {
+                    notes.push(format!("skill `{s}` of agent `{agent}` not found"));
+                }
+            }
+            blocks.push(task);
+            task = blocks.join("\n\n");
+        }
         // An active mode preset's tool list caps the child too.
         if let Some(only) = cfg.policy.overlay_tools() {
             let pool = tools.take().or_else(|| cfg.own.clone()).unwrap_or_default();
@@ -781,8 +895,8 @@ impl Supervisor {
         };
         let mut g = self.children.lock().unwrap();
         let n = format!("a{}", g.len() + 1);
-        let title = a.title.unwrap_or_else(|| a.task.chars().take(40).collect());
-        if a.worktree {
+        let title = a.title.unwrap_or(short);
+        if a.worktree || def.worktree {
             let name = format!("{}-{n}", slug(&title));
             let (path, _) = novacode_tools::worktree::create(&cwd, &name)?;
             cwd = path;
@@ -797,8 +911,12 @@ impl Supervisor {
             title,
             agent,
             model,
-            task: a.task,
+            task,
             cwd,
+            read_only: def.read_only,
+            no_context: def.no_context,
+            max_turns: def.max_turns,
+            turns: 0,
             tools,
             mcp,
             notify: a.notify,
@@ -884,8 +1002,9 @@ impl Supervisor {
 
     /// Run child `n` until it settles: start it (or resume `session`), send `prompt`.
     async fn run(self: Arc<Self>, n: String, prompt: Option<String>, session: Option<String>) {
-        let Some((model, agent, cwd, title, tools, mcp)) = self.with(&n, |c| {
+        let Some((model, agent, cwd, title, tools, mcp, (read_only, no_context))) = self.with(&n, |c| {
             c.status = Status::Starting;
+            c.turns = 0;
             c.started = Some(Instant::now());
             c.started_ms = novacode_core::session::now_ms();
             c.ended_ms = None;
@@ -899,6 +1018,7 @@ impl Supervisor {
                 c.title.clone(),
                 c.tools.clone(),
                 c.mcp.clone(),
+                (c.read_only, c.no_context),
             )
         }) else {
             return;
@@ -906,7 +1026,15 @@ impl Supervisor {
         let mut cmd = tokio::process::Command::new(&self.exe);
         cmd.arg("--rpc").args(["-m", &model]).args(["--agent", &agent]);
         // The parent's mode (read-only while plan mode is on), so a child can't do what it may not.
-        cmd.args(["--mode", self.c().policy.effective_mode().as_str()]);
+        let mode = if read_only {
+            novacode_core::policy::Mode::ReadOnly
+        } else {
+            self.c().policy.effective_mode()
+        };
+        cmd.args(["--mode", mode.as_str()]);
+        if no_context {
+            cmd.arg("--no-context-files");
+        }
         if let Some(t) = &tools {
             cmd.arg(format!("--tools={}", t.join(",")));
         }
@@ -1005,6 +1133,25 @@ impl Supervisor {
     /// One child event. `true` = the child settled after our prompt.
     fn on_event(self: &Arc<Self>, n: &str, ev: AgentEvent, prompted: &mut bool) -> bool {
         match ev {
+            // Claude `maxTurns`: past it, stop and hand over what it has as a partial report.
+            AgentEvent::TurnStart => {
+                let over = self
+                    .with(n, |c| {
+                        c.turns += 1;
+                        c.max_turns
+                            .filter(|m| c.turns > *m)
+                            .map(|m| (m, c.tx.clone(), c.last_text.clone()))
+                    })
+                    .flatten();
+                if let Some((max, tx, text)) = over {
+                    if let Some(tx) = tx {
+                        let _ = tx.send(json!({"type": "abort"}).to_string());
+                    }
+                    let report = format!("[partial: stopped at maxTurns {max}; send a message to resume]\n{text}");
+                    self.finish(n, Status::Done, Some(report));
+                    return true;
+                }
+            }
             AgentEvent::AgentStart => {
                 *prompted = true;
                 self.with(n, |c| {
@@ -1622,7 +1769,8 @@ mod tests {
             servers: vec![],
             stall_min: 10,
             timeout_min: 45,
-            small_model: Arc::new(|_: &str| None),
+            models: Arc::new(|_: &str, _: &str| None),
+            skill_dirs: vec![],
             max_running: 4,
             exe: Some(fake_child(&tmp)),
             nerd: false,
@@ -1704,7 +1852,8 @@ mod tests {
             servers: vec![],
             stall_min: 10,
             timeout_min: 45,
-            small_model: Arc::new(|_: &str| None),
+            models: Arc::new(|_: &str, _: &str| None),
+            skill_dirs: vec![],
             max_running: 2,
             exe: Some(exe),
             nerd: false,
@@ -1757,11 +1906,18 @@ mod tests {
 
     #[test]
     fn small_model_follows_the_parents_provider() {
-        let small = |p: &str| match p {
-            "claude" => Some("claude/haiku".to_string()),
-            "codex" => Some("codex/mini".to_string()),
+        let small = |p: &str, w: &str| match (p, w) {
+            ("claude", "small") => Some("claude/haiku".to_string()),
+            ("codex", "small") => Some("codex/mini".to_string()),
+            ("claude", "sonnet") => Some("claude/claude-sonnet-5".to_string()),
             _ => None,
         };
+        // A Claude family name resolves on the parent's provider, when it has it.
+        assert_eq!(
+            child_model(Some("sonnet"), "claude/opus".into(), &small),
+            "claude/claude-sonnet-5"
+        );
+        assert_eq!(child_model(Some("sonnet"), "codex/gpt".into(), &small), "codex/gpt");
         assert_eq!(child_model(Some("small"), "claude/opus".into(), &small), "claude/haiku");
         // After `/model` switched the parent to another provider, scouts follow it.
         assert_eq!(child_model(Some("small"), "codex/gpt".into(), &small), "codex/mini");
@@ -1776,6 +1932,62 @@ mod tests {
             "explicit wins"
         );
         assert_eq!(child_model(None, "codex/gpt".into(), &small), "codex/gpt");
+    }
+
+    /// L7.16: Claude Code agent files map onto novacode's subagents, never widening them.
+    #[test]
+    fn claude_agent_fields() {
+        let dir = std::env::temp_dir().join(format!("nc-claude-agents-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let w = |name: &str, text: &str| std::fs::write(dir.join(format!("{name}.md")), text).unwrap();
+        w(
+            "full",
+            "---\nname: full\ndescription: d\ntools:\n  - Read\n  - Bash\n  - mcp__github__get_issue\ndisallowedTools: [Bash, mcp__context7]\nmodel: inherit\npermissionMode: plan\nmaxTurns: 3\nskills: [lint]\nisolation: worktree\neffort: high\nomitClaudeMd: true\nmcpServers: [context7]\nmemory: user\n---\nRole.",
+        );
+        w(
+            "wide",
+            "---\nname: wide\ndescription: d\npermissionMode: bypassPermissions\nmodel: sonnet\n---\nx",
+        );
+        w(
+            "hooked",
+            "---\nname: hooked\ndescription: d\nhooks:\n  PreToolUse: []\n---\nx",
+        );
+        let (defs, notes) = defs(std::slice::from_ref(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+        let by = |n: &str| defs.iter().find(|d| d.name == n).cloned();
+        let full = by("full").unwrap();
+        assert_eq!(full.tools.as_deref(), Some(&["read".to_string(), "bash".into()][..]));
+        assert_eq!(full.mcp, ["context7", "github"]);
+        assert_eq!(full.disallowed, ["bash", "mcp__context7"]);
+        assert_eq!(full.model, None, "inherit = the parent's");
+        assert!(full.read_only && full.worktree && full.no_context);
+        assert_eq!((full.max_turns, full.thinking.as_deref()), (Some(3), Some("high")));
+        assert_eq!(full.skills, ["lint"]);
+        let wide = by("wide").unwrap();
+        assert!(!wide.read_only);
+        assert_eq!(wide.model.as_deref(), Some("sonnet"));
+        assert!(by("hooked").is_none(), "an agent whose hooks can't run is not loaded");
+        let all = notes.join("\n");
+        assert!(all.contains("`hooked`: not loaded"), "{all}");
+        assert!(
+            all.contains("`wide`: `permissionMode: bypassPermissions` ignored"),
+            "{all}"
+        );
+        assert!(all.contains("`full`: not supported, ignored: memory"), "{all}");
+        // Disallowed tools and servers are never granted, whoever picks.
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let own = s(&["read", "bash", "edit", "codemode"]);
+        let (t, m, _) = grant(
+            &full,
+            Some(s(&["read", "bash", "edit"])),
+            None,
+            true,
+            Some(&own),
+            &s(&["github", "context7"]),
+        );
+        assert_eq!(t.unwrap(), ["read", "edit", "codemode"]);
+        assert_eq!(m, ["github"]);
     }
 
     #[test]
@@ -1850,7 +2062,11 @@ mod tests {
             rev.tools.as_deref(),
             Some(&["read".to_string(), "grep".to_string(), "find".to_string()][..])
         );
-        assert_eq!(rev.model, None, "`sonnet` isn't a route: use the parent's model");
+        assert_eq!(
+            rev.model.as_deref(),
+            Some("sonnet"),
+            "a family name, resolved on the parent's provider at spawn"
+        );
         let docs = d.iter().find(|d| d.name == "docs").unwrap();
         assert_eq!(
             docs.tools.as_deref(),

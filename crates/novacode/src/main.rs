@@ -1266,9 +1266,18 @@ impl Ctx {
         {
             // Asked at spawn time: `/model` may have switched provider since.
             let providers = self.providers.clone();
-            let small: agents::SmallModel = Arc::new(move |provider: &str| {
-                let p = providers.profile(provider).ok()?;
-                Some(format!("{provider}/{}", p.extra.get("smallModel")?.as_str()?))
+            let models: agents::ModelLookup = Arc::new(move |provider: &str, wanted: &str| {
+                if wanted == "small" {
+                    let p = providers.profile(provider).ok()?;
+                    return Some(format!("{provider}/{}", p.extra.get("smallModel")?.as_str()?));
+                }
+                // Claude Code's family names (`sonnet`), when this provider's catalog has the family.
+                if matches!(wanted, "sonnet" | "opus" | "haiku" | "fable") {
+                    let alias = format!("claude-{wanted}");
+                    let r = providers.resolve(&format!("{provider}/{alias}")).ok()?;
+                    return (r.model != alias).then(|| format!("{provider}/{}", r.model));
+                }
+                Some(format!("{provider}/{wanted}"))
             });
             let setup = agents::Setup {
                 slot,
@@ -1281,7 +1290,8 @@ impl Ctx {
                 servers: server_names.clone(),
                 stall_min: s.get("agents.stallMinutes").unwrap_or(10),
                 timeout_min: s.get("agents.timeoutMinutes").unwrap_or(45),
-                small_model: small,
+                models,
+                skill_dirs: self.skill_dirs(),
                 max_running: if place.depth == 0 {
                     s.get("agents.maxConcurrent").unwrap_or(4)
                 } else {
@@ -1543,7 +1553,8 @@ impl Inputs {
             .into_iter()
             .map(|t| (format!("/{}", t.name), t.description))
             .collect();
-        c.extend(skills.into_iter().map(|k| {
+        // `user-invocable: false` skills are the model's only.
+        c.extend(skills.into_iter().filter(|k| !k.model_only).map(|k| {
             let d: String = k
                 .description
                 .lines()
