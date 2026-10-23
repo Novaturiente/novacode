@@ -56,6 +56,7 @@ There is no separate `resume` action: `send` to a finished agent resumes its ses
 ### Limits and safety
 
 - **Depth.** Your session can start subagents, and those can start their own. Theirs cannot. Two levels, no more.
+- **Permission mode.** A subagent starts in your session's permission mode. While plan mode (or another read-only preset) is on, it starts read-only, and a preset's tool list limits its tools too.
 - **File claims.** Two agents never edit the same file. A subagent that tries `edit`, `write` or `apply_patch` on a file another live agent holds is refused with a message naming the holder. A claim passes down from parent to child. Claims of dead processes are dropped.
 - **Stall and timeout.** A subagent with no activity for `agents.stallMinutes` (default 10) is stopped. One that runs longer than `agents.timeoutMinutes` (default 45) is stopped.
 - **Questions and approvals.** If a subagent needs to ask you something or needs an approval, it shows up in your session.

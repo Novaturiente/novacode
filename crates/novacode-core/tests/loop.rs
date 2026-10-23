@@ -384,6 +384,46 @@ async fn policy_gates_every_call_in_the_loop() {
     assert!(!work.path().join("target").exists());
 }
 
+/// Read-only mode: a write through `process` start is refused like one through `bash` (revision L6.1).
+#[tokio::test]
+async fn read_only_mode_refuses_writes_through_process() {
+    use novacode_core::policy::{Mode, Permissions, Policy};
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let faux = Faux::new([
+        tools_reply(vec![
+            call(
+                "a",
+                "process",
+                json!({"action": "start", "command": "touch made-by-process"}),
+            ),
+            call("b", "bash", json!({"command": "touch made-by-bash"})),
+        ]),
+        FauxReply::text("done"),
+    ]);
+    let mut tools = novacode_tools::builtins(false);
+    tools.push(Arc::new(novacode_tools::process::ProcessTool));
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        tools,
+        Store::create(&Paths::new(home.path()), work.path(), true),
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_processes(novacode_tools::process::ProcessManager::new(
+        &home.path().join("processes"),
+        "s",
+    ))
+    .with_policy(Policy::new(Permissions::default(), home.path().into(), None).with_mode(Mode::ReadOnly));
+    drive(agent, &["make files"]).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!work.path().join("made-by-process").exists());
+    assert!(!work.path().join("made-by-bash").exists());
+    let reqs = faux.requests.lock().unwrap();
+    let r: Vec<String> = reqs[1].messages.iter().rev().take(2).rev().map(result_text).collect();
+    assert!(r.iter().all(|t| t.contains("read-only shell commands")), "{r:?}");
+}
+
 #[tokio::test]
 async fn ask_mode_uses_the_approver_once_per_rule() {
     use novacode_core::policy::{Mode, Permissions, Policy};

@@ -2,7 +2,7 @@
 //! speaking JSON-RPC 2.0 over stdin/stdout, one message per line.
 //!
 //! novacode → extension (requests):
-//! - `initialize {apiVersion, cwd, session}` → `{tools: [{name, description, parameters, exposure?}],
+//! - `initialize {apiVersion, cwd, session}` → `{tools: [{name, description, parameters, exposure?, readOnly?}],
 //!   commands: [{name, description}], events: ["before_tool", "agent_end", …]}`
 //! - `tool {name, args, cwd, session}` → a string, or `{content, isError}`
 //! - `command {name, args}` → text to show
@@ -208,6 +208,7 @@ impl ProcessExt {
                 description: t["description"].as_str().unwrap_or_default().into(),
                 schema: t["parameters"].clone(),
                 exposure: t["exposure"].as_str().map(String::from),
+                read_only: t["readOnly"] == true,
                 handler: me.routes.len() as u32,
             });
             me.routes.push(("tool", n));

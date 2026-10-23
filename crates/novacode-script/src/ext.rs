@@ -4,7 +4,7 @@
 //!
 //! API v1 (the object passed to `export default function (novacode) {…}`, also
 //! the global `novacode`):
-//! - `registerTool({ name, description, parameters, exposure?, execute(args, ctx) })`
+//! - `registerTool({ name, description, parameters, exposure?, readOnly?, execute(args, ctx) })`
 //! - `registerCommand(name, { description, handler(args) })`
 //! - `on(event, handler)`: `before_tool` (return `{ block }` or `{ args }`),
 //!   `after_tool` (return feedback text), or any session event type (observe).
@@ -37,6 +37,8 @@ pub struct ToolReg {
     pub description: String,
     pub schema: Value,
     pub exposure: Option<String>,
+    /// Declared to only read: runs in read-only mode.
+    pub read_only: bool,
     pub handler: u32,
 }
 
@@ -93,7 +95,7 @@ const PRELUDE: &str = r#"
       const run = t.execute;
       if (typeof run !== "function") throw new TypeError("execute must be a function");
       const handler = add((p) => run(p.args, { cwd: p.cwd, session: p.session }), "execute");
-      bridge.reg("tool", JSON.stringify({ name: t.name, description: String(t.description ?? ""), schema: t.parameters ?? { type: "object", properties: {} }, exposure: t.exposure ?? null, handler }));
+      bridge.reg("tool", JSON.stringify({ name: t.name, description: String(t.description ?? ""), schema: t.parameters ?? { type: "object", properties: {} }, exposure: t.exposure ?? null, readOnly: t.readOnly === true, handler }));
     },
     registerCommand(name, c) {
       bridge.reg("command", JSON.stringify({ name: String(name).replace(/^\//, ""), description: String(c?.description ?? ""), handler: add(c?.handler, "handler") }));
@@ -450,6 +452,7 @@ fn bridge<'js>(ctx: &rquickjs::Ctx<'js>, shared: &Arc<Shared>) -> rquickjs::Resu
                     description: v["description"].as_str().unwrap_or_default().into(),
                     schema: v["schema"].clone(),
                     exposure: v["exposure"].as_str().map(String::from),
+                    read_only: v["readOnly"] == true,
                     handler: id,
                 }),
                 "command" => r.commands.push(CommandReg {

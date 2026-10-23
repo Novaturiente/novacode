@@ -25,7 +25,7 @@ What they do not do: stop a command the gate does not recognise, or stop code th
 |---|---|
 | `auto` (default) | Everything runs, except what the risk gate or your rules stop. |
 | `ask` | You approve every file change (`write`, `edit`) and every `bash` command that is not read-only. |
-| `read-only` | No file changes. `bash` only runs read-only commands such as `ls`, `cat`, `grep`, `git status`. |
+| `read-only` | No file changes. `bash` and `process` start only run read-only commands such as `ls`, `cat`, `grep`, `git status`. MCP, extension and client tools that don't declare themselves read-only need your approval. |
 
 Set the mode for one run:
 
@@ -65,8 +65,8 @@ More commands that count as Confirm: `git checkout -- .` and `git checkout -f`, 
 What each level does depends on the mode:
 
 - **Catastrophic**: refused in every mode. The model is told to do it another way or ask you to run it yourself.
-- **Shared**: asks you, even in `auto` mode.
-- **Confirm**: asks you in `ask` and `read-only` mode. In `auto` mode it runs without asking (it is logged). In `read-only` mode the card still appears and, if you approve, it runs. With nobody to ask, a justification gets it past the gate but it is then refused as not read-only.
+- **Shared**: asks you, even in `auto` mode; refused in `read-only` mode.
+- **Confirm**: asks you in `ask` mode. In `auto` mode it runs without asking (it is logged). In `read-only` mode (and plan mode) it is refused without asking: read-only means no changes.
 - **Safe / Low**: no gate action.
 
 You can add folders to the protected set and ban commands outright:
@@ -126,6 +126,8 @@ Rules go in `permissions.allow`, `permissions.ask` and `permissions.deny`. A rul
 | `Read(path)`, `Write(path)`, `Edit(path)`, `Grep(path)`, `Find(path)`, `Ls(path)` | The tool's `path` argument, as a glob (`*`, `**`, `?`). The glob is matched against the path as given and against its absolute form, but the pattern itself is not expanded: `~/` in a pattern only matches a path the model wrote with `~/`. Use `**/name` to match anywhere. |
 | Any other tool name | The whole tool (no pattern). A rule with a pattern, such as `Mcp(x)`, never matches these tools. |
 
+`process` with `action: start` is checked as a `bash` call with its `command`: `Bash(...)` rules, protected commands, the risk gate and read-only mode all apply.
+
 Bash commands are matched per simple command. Commands are split at `;`, `&&`, `||`, `|`, `&`, newlines and group brackets, a redirect counts as a `>` word (so `Bash(git status)` does not match `git status > out`), and compared with quotes removed (`git commit -m "a b"` is compared as `git commit -m a b`). A leading `FOO=1` stays in the text, so `Bash(git status)` does not match `FOO=1 git status`. A `deny` or `ask` rule fires if **any** part of a chained command matches. An `allow` rule only fires if **all** parts match, so `Bash(git status)` does not allow `git status && rm -rf x`.
 
 Order of checks for each call:
@@ -133,7 +135,7 @@ Order of checks for each call:
 1. Profile, or the tool list of a mode preset (tool not available: refused).
 2. `deny` rules.
 3. Protected commands, then the risk gate.
-4. Read-only mode (or a read-only mode preset). `allow` rules do not get around it.
+4. Read-only mode (or a read-only mode preset). `allow` rules do not get around it. File changes, `enter_worktree`, `exit_worktree`, `process` input and commands that aren't read-only are refused. A tool whose effect novacode can't tell (an MCP tool without `readOnlyHint`, an extension tool without `readOnly`, a client tool) asks you, or is refused when nobody can answer; once you allow it, an `allow` rule or a session approval lets it run.
 5. `allow` rules (and what you approved this session).
 6. `ask` rules.
 7. `ask` mode.

@@ -62,7 +62,16 @@ impl Nested for Runner {
                 Ok(a) => a,
                 Err(out) => return out,
             };
-            if let Some(refusal) = pipeline::authorize(&policy, approver.as_ref(), &call.name, &args, &ctx.cwd).await {
+            if let Some(refusal) = pipeline::authorize(
+                &policy,
+                approver.as_ref(),
+                &call.name,
+                tool.read_only(),
+                &args,
+                &ctx.cwd,
+            )
+            .await
+            {
                 return refusal;
             }
             let started = hooks.start(&call.name, &ctx.cwd).await;

@@ -1116,8 +1116,16 @@ impl Agent {
     }
 
     /// Permission check for one prepared call (L6.1). `None` = run it; `Some` = the refusal to return.
-    async fn authorize(&self, call: &ToolCall, args: &serde_json::Value) -> Option<ToolOutput> {
-        pipeline::authorize(&self.policy, self.approver.as_ref(), &call.name, args, &self.cfg.cwd).await
+    async fn authorize(&self, call: &ToolCall, read_only: bool, args: &serde_json::Value) -> Option<ToolOutput> {
+        pipeline::authorize(
+            &self.policy,
+            self.approver.as_ref(),
+            &call.name,
+            read_only,
+            args,
+            &self.cfg.cwd,
+        )
+        .await
     }
 
     /// Claude Code plugin hooks (L7.14): session start, prompt submit, stop, session end.
@@ -1821,8 +1829,8 @@ impl Agent {
                     }
                 }
             }
-            if let Prepared::Ready(_, args, _) = p
-                && let Some(refusal) = self.authorize(call, args).await
+            if let Prepared::Ready(t, args, _) = p
+                && let Some(refusal) = self.authorize(call, t.read_only(), args).await
             {
                 *p = Prepared::Rejected(refusal);
             }

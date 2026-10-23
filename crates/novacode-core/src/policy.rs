@@ -27,6 +27,17 @@ pub enum Mode {
     ReadOnly,
 }
 
+impl Mode {
+    /// The `--mode` value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Auto => "auto",
+            Mode::Ask => "ask",
+            Mode::ReadOnly => "read-only",
+        }
+    }
+}
+
 /// `permissions` in global settings (never project settings, L0.6).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -151,6 +162,32 @@ pub trait Approver: Send + Sync {
 }
 
 const MUTATING: &[&str] = &["write", "edit", "apply_patch"];
+/// Built-in tools that only read, or change only the session itself; they run in
+/// read-only mode. `process` start is checked as its command, `agent` children
+/// inherit the mode, and `codemode`/`call` calls are checked one by one.
+const READ_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "todo",
+    "tool_search",
+    "call",
+    "ask_user",
+    "web_fetch",
+    "web_search",
+    "session_search",
+    "recall",
+    "memory",
+    "schedule",
+    "goal",
+    "plan_complete",
+    "enter_plan_mode",
+    "agent",
+    "codemode",
+    "classify",
+    "process",
+];
 const FILE_TOOLS: &[&str] = &["read", "write", "edit", "grep", "find", "ls"];
 /// A justification shorter than this is a blind retry, not a reason.
 const MIN_JUSTIFICATION: usize = 12;
@@ -241,9 +278,40 @@ impl Policy {
         self.perms.mode
     }
 
+    /// The mode a child agent starts with: read-only while a read-only preset
+    /// (plan mode) is on, else the session's own.
+    pub fn effective_mode(&self) -> Mode {
+        if self.overlay.lock().unwrap().as_ref().is_some_and(|o| o.1) {
+            Mode::ReadOnly
+        } else {
+            self.perms.mode
+        }
+    }
+
+    /// The active preset's tool list, when it limits tools.
+    pub fn overlay_tools(&self) -> Option<Vec<String>> {
+        self.overlay.lock().unwrap().as_ref().and_then(|o| o.2.clone())
+    }
+
     /// `interactive` = an approver can ask the user right now.
     pub fn check(&self, tool: &str, args: &Value, cwd: &Path, interactive: bool) -> Verdict {
+        self.check_tool(tool, false, args, cwd, interactive)
+    }
+
+    /// [`Policy::check`] for a tool that may declare it only reads (MCP
+    /// `readOnlyHint`, extension `readOnly`), so it runs in read-only mode.
+    pub fn check_tool(
+        &self,
+        tool: &str,
+        declared_read_only: bool,
+        args: &Value,
+        cwd: &Path,
+        interactive: bool,
+    ) -> Verdict {
         let lower = tool.to_lowercase();
+        // `process` start runs a shell command: the same rules and checks as `bash`.
+        let start = lower == "process" && args.get("action").and_then(Value::as_str) == Some("start");
+        let rule_tool = if start { "bash" } else { tool };
         if let Some(only) = &self.profile.tools
             && !only.iter().any(|t| t.eq_ignore_ascii_case(tool))
         {
@@ -263,12 +331,12 @@ impl Policy {
             format!("{} mode is read-only", capitalise(&o.0))
         });
 
-        let command = (lower == "bash").then(|| args.get("command").and_then(Value::as_str).unwrap_or(""));
+        let command = (lower == "bash" || start).then(|| args.get("command").and_then(Value::as_str).unwrap_or(""));
         let segments = command.map(|c| risk::segments(c).unwrap_or_else(|| vec![c.to_string()]));
         let raw_path = args.get("path").and_then(Value::as_str);
         let abs_path = raw_path.map(|p| expand(p, cwd, &self.home));
         let matches = |r: &Rule, all: bool| -> bool {
-            if !r.matches_tool(tool) {
+            if !r.matches_tool(rule_tool) {
                 return false;
             }
             match &segments {
@@ -310,6 +378,8 @@ impl Policy {
                         r.reason.trim_start_matches("rm ")
                     ));
                 }
+                // Read-only: refused below, never offered for approval (revision 2026-10-23).
+                Level::Confirm | Level::Shared if read_only => {}
                 // Auto mode never asks, like pi (user choice, revision L6.2): only the
                 // catastrophic list, `Shared` (remote history, revision 2026-10-19) and the
                 // user's own ask/deny rules stop a command.
@@ -348,13 +418,38 @@ impl Policy {
         }
 
         if read_only {
-            if MUTATING.contains(&lower.as_str()) {
+            let process_input = lower == "process" && args.get("action").and_then(Value::as_str) == Some("write");
+            if MUTATING.contains(&lower.as_str())
+                || matches!(lower.as_str(), "enter_worktree" | "exit_worktree")
+                || process_input
+            {
                 return Verdict::Deny(format!("{mode_name}: `{tool}` can't change files now."));
             }
             if command.is_some() && !read_only_bash {
                 return Verdict::Deny(format!(
                     "{mode_name}: only read-only shell commands run now (ls, cat, grep, git status, …)."
                 ));
+            }
+            // An MCP, extension or client tool that doesn't say it only reads.
+            if command.is_none() && !declared_read_only && !READ_TOOLS.contains(&lower.as_str()) {
+                let allowed = self
+                    .allow
+                    .iter()
+                    .chain(self.session_allow.lock().unwrap().iter())
+                    .any(|r| matches(r, true));
+                if allowed {
+                    return Verdict::Allow;
+                }
+                let why = format!("{mode_name}: `{tool}` may change things (it doesn't declare itself read-only)");
+                return if interactive {
+                    Verdict::Ask {
+                        reason: why,
+                        rule: suggest_rule(tool, None, None),
+                        risky: false,
+                    }
+                } else {
+                    Verdict::Deny(format!("{why}, and nobody can approve it here."))
+                };
             }
         }
 
@@ -366,7 +461,7 @@ impl Policy {
 
         let ask = |reason: String| Verdict::Ask {
             reason,
-            rule: suggest_rule(tool, command, raw_path),
+            rule: suggest_rule(rule_tool, command, raw_path),
             risky: false,
         };
         if let Some(r) = self.ask.iter().find(|r| matches(r, false)) {
@@ -537,6 +632,57 @@ mod tests {
         assert!(denied(&check(&scout, "bash", bash("ls"), true)));
         assert_eq!(check(&scout, "grep", json!({"pattern": "x"}), true), Verdict::Allow);
         assert!(policy(json!({})).with_profile("nope").is_err());
+    }
+
+    #[test]
+    fn read_only_holds_on_every_path() {
+        // `process` start is checked as its command, rules included.
+        let deny = policy(json!({ "deny": ["Bash(curl:*)"] }));
+        let start = |c: &str| json!({"action": "start", "command": c});
+        assert!(denied(&check(&deny, "process", start("curl example.invalid"), true)));
+        assert_eq!(check(&deny, "process", start("npm run dev"), true), Verdict::Allow);
+
+        let plan = policy(json!({}));
+        plan.set_overlay(Some(("plan".into(), true, None)));
+        for p in [&policy(json!({})).with_mode(Mode::ReadOnly), &plan] {
+            assert!(denied(&check(p, "process", start("touch x"), true)));
+            assert_eq!(check(p, "process", start("git status"), false), Verdict::Allow);
+            assert!(denied(&check(
+                p,
+                "process",
+                json!({"action": "write", "id": "proc_1", "input": "y"}),
+                true
+            )));
+            assert_eq!(
+                check(p, "process", json!({"action": "output", "id": "proc_1"}), false),
+                Verdict::Allow
+            );
+            assert!(denied(&check(p, "enter_worktree", json!({"name": "x"}), true)));
+            assert!(denied(&check(p, "exit_worktree", json!({}), true)));
+            // A risky command is refused, not offered for approval.
+            assert!(denied(&check(p, "bash", bash("rm -rf build"), true)));
+            // Children inherit the mode, so spawning stays allowed.
+            assert_eq!(check(p, "agent", json!({"action": "spawn"}), false), Verdict::Allow);
+            // Unknown effect: asks when someone can answer, refused otherwise, runs when declared read-only.
+            assert!(denied(&check(p, "gh__create_issue", json!({}), false)));
+            assert!(matches!(
+                check(p, "gh__create_issue", json!({}), true),
+                Verdict::Ask { risky: false, .. }
+            ));
+            assert_eq!(
+                p.check_tool("gh__get_issue", true, &json!({}), Path::new(CWD), false),
+                Verdict::Allow
+            );
+        }
+        // "Allow for this session" on an unknown tool holds in read-only mode.
+        plan.allow_for_session(vec![Rule::parse("Gh__create_issue").unwrap()]);
+        assert_eq!(check(&plan, "gh__create_issue", json!({}), false), Verdict::Allow);
+        assert_eq!(plan.effective_mode(), Mode::ReadOnly);
+        plan.set_overlay(Some(("docs".into(), false, Some(vec!["read".into()]))));
+        assert_eq!(
+            (plan.effective_mode(), plan.overlay_tools()),
+            (Mode::Auto, Some(vec!["read".to_string()]))
+        );
     }
 
     #[test]

@@ -156,6 +156,9 @@ pub struct ToolSpec {
     pub description: String,
     #[serde(default, rename = "inputSchema")]
     pub input_schema: Value,
+    /// `readOnlyHint` here lets the tool run in read-only mode.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub annotations: Value,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -683,6 +686,9 @@ impl Tool for McpTool {
     }
     fn exposure(&self) -> Exposure {
         self.exposure
+    }
+    fn read_only(&self) -> bool {
+        self.spec.annotations["readOnlyHint"] == true
     }
     fn execute<'a>(&'a self, args: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {

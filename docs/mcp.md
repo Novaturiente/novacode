@@ -113,6 +113,8 @@ Each tool is named `<server>__<tool>`. How it reaches the model depends on `expo
 
 A server with `"exposure": "hidden"` is left out of the model's server list too.
 
+In read-only mode and plan mode, a tool the server marks with `annotations.readOnlyHint: true` runs as usual. Any other MCP tool asks you first, and is refused when nobody can answer (print mode).
+
 **Why `codemode-only` is the default.** A server can have dozens of tools, and declaring all of them costs tokens on every request. With `codemode-only` the model sees one `codemode` tool, plus a line per server (its name and your `description`). It looks tools up on demand, and chains several calls in one script so only the final result comes back to it.
 
 In a script, the model calls an MCP tool like this:

@@ -183,6 +183,11 @@ pub trait Tool: Send + Sync {
     fn exposure(&self) -> Exposure {
         Exposure::Listed
     }
+    /// Declared to only read (MCP `readOnlyHint`, extension `readOnly`), so it runs
+    /// in read-only mode. Built-in tools are judged by name in the policy.
+    fn read_only(&self) -> bool {
+        false
+    }
     /// Lines for the prompt's `tool_guidelines` section, sent only while this tool is listed.
     fn guidelines(&self) -> &[&str] {
         &[]

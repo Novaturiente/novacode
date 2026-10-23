@@ -1144,6 +1144,8 @@ impl Ctx {
         if let Some(p) = &self.cli.profile {
             policy = policy.with_profile(p).map_err(anyhow::Error::msg)?;
         }
+        // Shared: mode presets change it at run time, and subagents read its mode.
+        let policy = Arc::new(policy);
         // A subagent: its role prompt, and only its tools and MCP servers (L10.1).
         let defs = self.agent_defs();
         let def = match &self.cli.agent {
@@ -1282,6 +1284,7 @@ impl Ctx {
                 exe: None,
                 nerd: s.get::<String>("ui.icons").as_deref() != Some("unicode"),
                 unattended: approver.is_none(),
+                policy: policy.clone(),
             };
             // `/reload` keeps the supervisor, so running subagents carry on and report back.
             let kept = carry.as_ref().and_then(|_| self.sup.lock().unwrap().clone());
@@ -1311,7 +1314,6 @@ impl Ctx {
             all.push(Arc::new(agents::AgentTool::new(sup)));
         }
         // Mode presets and plan mode (L10.7).
-        let policy = Arc::new(policy);
         let modes = novacode_core::modes::Modes::new(policy.clone(), s.get("modes").unwrap_or_default());
         if let Some(a) = asker.clone() {
             all.push(Arc::new(novacode_core::modes::EnterPlanMode {

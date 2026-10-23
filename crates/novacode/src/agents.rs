@@ -518,6 +518,8 @@ struct Cfg {
     unattended: bool,
     /// Extra environment for every child (`agents.env`), e.g. to switch a plugin off.
     env: std::collections::BTreeMap<String, String>,
+    /// The session's policy: children start in its effective mode, capped by its preset's tools.
+    policy: Arc<novacode_core::policy::Policy>,
 }
 
 impl Cfg {
@@ -536,6 +538,7 @@ impl Cfg {
             nerd: s.nerd,
             unattended: s.unattended,
             env: s.env,
+            policy: s.policy,
         }
     }
 }
@@ -558,6 +561,7 @@ pub struct Setup {
     pub nerd: bool,
     pub unattended: bool,
     pub env: std::collections::BTreeMap<String, String>,
+    pub policy: Arc<novacode_core::policy::Policy>,
 }
 
 impl Supervisor {
@@ -737,7 +741,16 @@ impl Supervisor {
         {
             model = format!("{model}:{t}");
         }
-        let (tools, mcp, notes) = grant(def, a.tools, a.mcp, cfg.parent_picks, cfg.own.as_deref(), &cfg.servers);
+        let (mut tools, mcp, notes) = grant(def, a.tools, a.mcp, cfg.parent_picks, cfg.own.as_deref(), &cfg.servers);
+        // An active mode preset's tool list caps the child too.
+        if let Some(only) = cfg.policy.overlay_tools() {
+            let pool = tools.take().or_else(|| cfg.own.clone()).unwrap_or_default();
+            tools = Some(
+                pool.into_iter()
+                    .filter(|t| only.iter().any(|o| o.eq_ignore_ascii_case(t)))
+                    .collect(),
+            );
+        }
         let mut cwd = match &a.cwd {
             Some(c) => at(&cfg.cwd, c),
             None => cfg.cwd.clone(),
@@ -858,6 +871,8 @@ impl Supervisor {
         };
         let mut cmd = tokio::process::Command::new(&self.exe);
         cmd.arg("--rpc").args(["-m", &model]).args(["--agent", &agent]);
+        // The parent's mode (read-only while plan mode is on), so a child can't do what it may not.
+        cmd.args(["--mode", self.c().policy.effective_mode().as_str()]);
         if let Some(t) = &tools {
             cmd.arg(format!("--tools={}", t.join(",")));
         }
@@ -1536,7 +1551,7 @@ mod tests {
             "    time.sleep(0.3)".into(),
             format!("    print({:?}, flush=True)", ev(AgentEvent::AgentStart)),
             format!(
-                "    print({reply:?}.replace('REPLY', os.getcwd() + ' :: ' + m['text'].split(chr(10))[-1] + os.environ.get('NC_ENV', '')), flush=True)"
+                "    print({reply:?}.replace('REPLY', os.getcwd() + ' :: ' + m['text'].split(chr(10))[-1] + os.environ.get('NC_ENV', '') + ' ARGS ' + ' '.join(sys.argv[1:])), flush=True)"
             ),
             format!("    print({:?}, flush=True)", ev(AgentEvent::Settled)),
         ];
@@ -1567,6 +1582,11 @@ mod tests {
             exe: Some(fake_child(&tmp)),
             nerd: false,
             env: [("NC_ENV".to_string(), " env-set".to_string())].into(),
+            policy: Arc::new(novacode_core::policy::Policy::new(
+                Default::default(),
+                tmp.clone(),
+                None,
+            )),
         });
         let spawn = |task: &str, after: &[&str]| {
             sup.spawn(serde_json::from_value(json!({"task": task, "after": after, "model": "p/m"})).unwrap())
@@ -1607,6 +1627,18 @@ mod tests {
         sup.send(&a, "again".into()).unwrap();
         let out = sup.wait(vec![a.clone()], false, Duration::from_secs(20)).await;
         assert!(out.contains(":: again"), "{out}");
+        assert!(out.contains("--mode auto"), "children get the parent's mode: {out}");
+        // Plan mode on: a new child starts read-only, with only the preset's tools.
+        sup.set_own_tools(vec!["read".into(), "bash".into()]);
+        sup.c()
+            .policy
+            .set_overlay(Some(("plan".into(), true, Some(vec!["read".into()]))));
+        let d = spawn("task D", &[]);
+        let out = sup.wait(vec![d], false, Duration::from_secs(20)).await;
+        assert!(
+            out.contains("--mode read-only") && out.contains("--tools=read "),
+            "{out}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

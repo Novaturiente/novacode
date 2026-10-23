@@ -782,6 +782,9 @@ impl Tool for ScriptTool {
     fn exposure(&self) -> Exposure {
         self.exposure
     }
+    fn read_only(&self) -> bool {
+        self.reg.read_only
+    }
     fn execute<'a>(&'a self, args: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
             let payload = json!({ "args": args, "cwd": ctx.cwd, "session": ctx.session_id });

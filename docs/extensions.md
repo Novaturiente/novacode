@@ -47,7 +47,8 @@ The default export gets the frozen `novacode` object (also `globalThis.novacode`
 
 ### Registering
 
-- **`registerTool(t)`**: `{name, description, parameters (JSON Schema), exposure?, execute(args, {cwd, session})}`.
+- **`registerTool(t)`**: `{name, description, parameters (JSON Schema), exposure?, readOnly?, execute(args, {cwd, session})}`.
+  - `readOnly: true` says the tool only reads, so it runs in read-only mode and plan mode. Without it, the tool asks the user there (or is refused when nobody can answer).
   - `execute` returns a string, or `{content: string, isError?, details?}`. `undefined` gives `(no output)`; any other value is shown as pretty-printed JSON. If it throws, the model gets `<name> failed: <message>`.
   - `details.ui` (a list of [lines](#ui-novacodeui-version-1)) replaces the tool output in the transcript.
   - `exposure` is `listed` (the default: the model sees it), `codemode` (or `codemode-only`: only codemode scripts can call it), `deferred` (found through `tool_search`) or `hidden`. An unknown value counts as `listed`. The setting `tools.<name>.exposure` overrides it.
@@ -144,7 +145,7 @@ The `initialize` result declares everything you handle:
 }
 ```
 
-- `parameters` is a JSON Schema for the tool's arguments. `exposure` is `listed` (the default: the model sees it), `codemode` (only codemode scripts can call it), `deferred` (found through `tool_search`) or `hidden`.
+- `parameters` is a JSON Schema for the tool's arguments. `readOnly: true` lets the tool run in read-only mode, as for script tools. `exposure` is `listed` (the default: the model sees it), `codemode` (only codemode scripts can call it), `deferred` (found through `tool_search`) or `hidden`.
 - `events` lists the event names you want, from the [Events](#events) table. You get no other events.
 - `timeoutMs` (1 to 60 000) replaces the 10 s limit for your event handlers, for slow work like waiting on a language server. It doesn't change the tool and command limit.
 

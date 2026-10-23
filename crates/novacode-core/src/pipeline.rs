@@ -123,15 +123,17 @@ fn edit_distance(a: &str, b: &str) -> usize {
 }
 
 /// Permission check for one call (L6.1). `None` = run it; `Some` = the refusal to return.
+/// `read_only`: the tool declares it only reads ([`Tool::read_only`]).
 pub async fn authorize(
     policy: &crate::policy::Policy,
     approver: Option<&Arc<dyn crate::policy::Approver>>,
     tool: &str,
+    read_only: bool,
     args: &Value,
     cwd: &Path,
 ) -> Option<ToolOutput> {
     use crate::policy::{Approval, ApprovalRequest, Verdict};
-    let (reason, rule, risky) = match policy.check(tool, args, cwd, approver.is_some()) {
+    let (reason, rule, risky) = match policy.check_tool(tool, read_only, args, cwd, approver.is_some()) {
         Verdict::Allow => return None,
         Verdict::Deny(why) => return Some(ToolOutput::error(why)),
         Verdict::Ask { reason, rule, risky } => (reason, rule, risky),
