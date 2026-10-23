@@ -116,7 +116,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "memory.enabled",
         "bool",
         "true",
-        "Observer notes, compaction from notes and the `recall` tool.",
+        "Observer notes, compaction from notes and the `recall` tool. Off: compaction still runs, summarised by the session model.",
     ),
     (
         "memory.model",

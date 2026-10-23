@@ -1062,6 +1062,48 @@ async fn compaction_without_notes_falls_back() {
     assert!(p.contains("Summary of the earlier conversation"), "{p}");
 }
 
+/// L4.5 revision: with the observer off (`memory.enabled: false`) a long session
+/// still compacts, summarising with the session model; the observer is never called.
+#[tokio::test]
+async fn compaction_without_the_observer() {
+    use novacode_core::memory::{Settings, Worker};
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let big = "lorem ipsum ".repeat(300);
+    let main = Faux::new((0..8).map(|i| FauxReply::text(&format!("answer {i} {big}"))));
+    let observer = Faux::new((0..20).map(notes_reply));
+    let agent = Agent::new(
+        Arc::new(main),
+        vec![],
+        Store::create(&Paths::new(home.path()), work.path(), false),
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_memory(
+        Worker {
+            adapter: Arc::new(observer.clone()),
+            provider: "faux".into(),
+            model: "small".into(),
+        },
+        Settings {
+            observe_after: 1000,
+            keep_recent: 2500,
+            compact_at: 6000,
+            chunk_tokens: 3000,
+            reflect_after: u64::MAX,
+            pool_target: u64::MAX,
+        },
+    )
+    .without_observer();
+    let prompts: Vec<String> = (0..5).map(|i| format!("task {i} {big}")).collect();
+    let refs: Vec<&str> = prompts.iter().map(String::as_str).collect();
+    let (agent, events) = drive(agent, &refs).await;
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::Compacted { .. })));
+    assert!(observer.requests.lock().unwrap().is_empty(), "the observer never ran");
+    let p = format!("{:?}", agent.store.projection());
+    assert!(p.contains("Summary of the earlier conversation"), "{p}");
+}
+
 /// One prompt followed by many tool calls (the novabrowser session): `/compact`
 /// cuts inside the turn instead of keeping all of it, and the prompt stays word
 /// for word in the summary, which gets a user message of its own.

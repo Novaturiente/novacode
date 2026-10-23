@@ -123,7 +123,7 @@ Two more background steps keep the notes small. They run in the same background 
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `memory.enabled` | `true` | Turn session memory and compaction on or off. |
+| `memory.enabled` | `true` | Turn the observer (session notes) and `recall` on or off. Compaction runs either way. |
 | `memory.model` | the provider's small model, else the session model | Model used for the observer, reflector and dropper. |
 | `memory.observeAfterTokens` | `10000` | New tokens before the observer runs. |
 | `memory.keepRecentTokens` | `20000` | Tokens kept word for word after a compaction. |
@@ -167,7 +167,7 @@ The `session_search` tool finds words in messages of earlier sessions. It search
 }
 ```
 
-- `memory.enabled: false` stops the observer, reflector and compaction, and removes the `recall` tool. `/compact` then says compaction is off, and a full context is no longer compacted for you. Facts from the reflector are not saved either. `recall` is also missing with `--no-session`.
+- `memory.enabled: false` stops the observer and reflector, and removes the `recall` tool. Compaction still happens (automatically and with `/compact`): the session model summarises the older part at that moment, with no notes running in the background. Facts from the reflector are not saved either. `recall` is also missing with `--no-session`.
 - `memory.store: false` removes the `memory` tool and the start-of-session index.
 
 You can turn off one without the other.

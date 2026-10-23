@@ -24,7 +24,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `checkpoints.enabled` | bool | true | File checkpoints per prompt, for `/rewind`. |
 | `extensions.<name>` | object | unset | Settings of extension `<name>`: a process extension gets them in `initialize`, any extension through `novacode.settings.get("extensions.<name>")`. |
 | `security.maskSecrets` | bool | false | Also mask well-known secret shapes in tool output (GitHub/AWS/OpenAI/Anthropic/Slack/Google tokens, private keys, `*_TOKEN=`/`*_SECRET=` values) before the model sees them. Your own logins are always masked. |
-| `memory.enabled` | bool | true | Observer notes, compaction from notes and the `recall` tool. |
+| `memory.enabled` | bool | true | Observer notes, compaction from notes and the `recall` tool. Off: compaction still runs, summarised by the session model. |
 | `memory.model` | string | the profile's small model | Model for the observer, reflector and dropper. |
 | `memory.observeAfterTokens` | number | 10000 | New tokens before the observer runs. |
 | `memory.keepRecentTokens` | number | 20000 | Tokens kept verbatim after a compaction. |

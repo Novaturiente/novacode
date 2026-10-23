@@ -153,6 +153,8 @@ struct Memory {
     settings: crate::memory::Settings,
     /// The background observer run, if one is going.
     task: Option<tokio::task::JoinHandle<ObserverRun>>,
+    /// `memory.enabled: false`: no observer; compaction summarises with the session model.
+    observe: bool,
 }
 
 /// What a background observer run produced.
@@ -740,7 +742,16 @@ impl Agent {
             worker,
             settings,
             task: None,
+            observe: true,
         });
+        self
+    }
+
+    /// Compaction without the observer (`memory.enabled: false`, L4.5 revision).
+    pub fn without_observer(mut self) -> Self {
+        if let Some(m) = self.memory.as_mut() {
+            m.observe = false;
+        }
         self
     }
 
@@ -848,7 +859,7 @@ impl Agent {
     /// Start the observer once enough new conversation built up since its last notes.
     fn start_observer(&mut self) {
         let Some(m) = self.memory.as_ref() else { return };
-        if m.task.is_some() {
+        if m.task.is_some() || !m.observe {
             return;
         }
         let path = self.store.branch();
@@ -939,7 +950,7 @@ impl Agent {
         self.collect_notes(true).await;
         let tokens_before = self.context_tokens();
         let Some(m) = self.memory.as_ref() else { return false };
-        let (settings, worker) = (m.settings.clone(), m.worker.clone());
+        let (settings, worker, observe) = (m.settings.clone(), m.worker.clone(), m.observe);
         let (from, cut) = {
             let path = self.store.branch();
             let from = path
@@ -964,7 +975,7 @@ impl Agent {
             let path = self.store.branch();
             let cut_i = path.iter().position(|e| e.id == cut).unwrap_or(path.len());
             let wm = memory::watermark(&path).max(from);
-            if wm >= cut_i {
+            if !observe || wm >= cut_i {
                 break;
             }
             let chunk = memory::chunk(&path, wm, cut_i, settings.chunk_tokens);
@@ -987,17 +998,19 @@ impl Agent {
         }
         let path = self.store.branch();
         let cut_i = path.iter().position(|e| e.id == cut).unwrap_or(path.len());
-        // The observer couldn't cover everything: the main model summarises the gap.
+        // The observer couldn't cover everything (or is off): the main model summarises the gap.
         let mut summary_text = None;
-        if let Some(e) = &failed {
+        if failed.is_some() || !observe {
             let wm = memory::watermark(&path).max(from);
             let gap = memory::chunk(&path, wm, cut_i, self.cfg.window_tokens / 2);
-            self.emit(AgentEvent::Stream(StreamEvent::Notice {
-                text: format!(
-                    "memory observer failed while catching up ({e}); summarising {}k tokens with the session model",
-                    gap.tokens / 1000
-                ),
-            }));
+            if let Some(e) = &failed {
+                self.emit(AgentEvent::Stream(StreamEvent::Notice {
+                    text: format!(
+                        "memory observer failed while catching up ({e}); summarising {}k tokens with the session model",
+                        gap.tokens / 1000
+                    ),
+                }));
+            }
             match memory::summarize(&self.adapter, &self.cfg.model, &gap, self.store.id()).await {
                 Ok((t, _)) => summary_text = Some(t),
                 Err(e) => self.emit(AgentEvent::Stream(StreamEvent::Notice {

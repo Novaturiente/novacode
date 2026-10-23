@@ -1442,7 +1442,14 @@ impl Ctx {
             tools.push(Arc::new(novacode_tools::toolsearch::Call));
         }
         let window = cfg.window_tokens;
+        // Compaction is always on; `memory.enabled: false` turns off only the observer
+        // (L4.5 revision), and compaction then summarises with the session model.
         let worker = memory_on.then(|| self.memory_worker(&route, adapter.clone()));
+        let session_worker = novacode_core::memory::Worker {
+            adapter: adapter.clone(),
+            provider: route.provider.clone(),
+            model: route.model.clone(),
+        };
         diag::mark("mcp config + tool list");
         let mut agent = Agent::new(adapter, tools, store, cfg, Arc::new(LocalEnv))
             .with_shared_policy(policy)
@@ -1508,7 +1515,7 @@ impl Ctx {
                 novacode_tools::process::ProcessManager::new(&self.paths.home().join("processes"), agent.store.id());
             agent = agent.with_processes(pm);
         }
-        if let Some(w) = worker {
+        {
             let mut m = novacode_core::memory::Settings::for_window(window);
             if let Some(v) = s.get("memory.observeAfterTokens") {
                 m.observe_after = v;
@@ -1525,9 +1532,14 @@ impl Ctx {
             if let Some(v) = s.get("memory.poolTargetTokens") {
                 m.pool_target = v;
             }
-            agent = agent.with_memory(w.await, m);
-            if let Some(m) = memories {
-                agent = agent.with_memory_store(m);
+            match worker {
+                Some(w) => {
+                    agent = agent.with_memory(w.await, m);
+                    if let Some(m) = memories {
+                        agent = agent.with_memory_store(m);
+                    }
+                }
+                None => agent = agent.with_memory(session_worker, m).without_observer(),
             }
         }
         if let Some(a) = approver {
