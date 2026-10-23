@@ -186,6 +186,10 @@ Use `false` to force the full frame rate.
 
 `novacode packages` shows `(disabled: …)` with the reason, and `novacode doctor` lists it. The usual cause is an `apiVersion` in `novacode-package.json` that this novacode doesn't match. See [packages](packages.md).
 
+### "session not saved"
+
+novacode couldn't write the session file (disk full, permissions, a read-only mount). Nothing is lost yet: the entries stay in memory, and no model call or tool runs until they are written. Fix the cause, then send any message: the missing entries are written first, in order, and a "session saved again" note confirms it. If you quit before that, the unsaved part is gone.
+
 ### Something looks stuck
 
 Press Esc to abort the turn. Open another terminal and run `novacode agents` to see live sessions (ids and prefixes work) and `novacode status` to see what the session is doing (it exits 1 with "no live session" if there is none for this terminal; try `--all`). `novacode stop <id>` ends one. `/debug` shows running processes and queued prompts.

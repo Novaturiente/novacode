@@ -163,6 +163,10 @@ pub struct Store {
     index: HashMap<String, usize>,
     leaf: Option<String>,
     on_disk: bool,
+    /// Entries written to the file; the rest wait for [`Store::flush`] after a failed write (L4.16).
+    saved: usize,
+    /// The last write failed: the file may end in a cut-off line.
+    failed: bool,
     _lock: Option<FileLock>,
 }
 
@@ -176,6 +180,19 @@ pub enum StoreError {
     BadHeader(PathBuf),
     #[error("no session matches `{0}`")]
     NotFound(String),
+}
+
+/// End a line a failed write may have cut off, so the next entry starts on its own line.
+fn end_line(path: &Path) -> io::Result<()> {
+    let mut f = std::fs::OpenOptions::new().read(true).append(true).open(path)?;
+    if f.seek(SeekFrom::End(-1)).is_ok() {
+        let mut last = [0u8; 1];
+        f.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            f.write_all(b"\n")?;
+        }
+    }
+    Ok(())
 }
 
 /// Folder for one cwd: `<home>/sessions/<cwd with / as ->/`.
@@ -204,6 +221,8 @@ impl Store {
             index: HashMap::new(),
             leaf: None,
             on_disk: false,
+            saved: 0,
+            failed: false,
             _lock: None,
         }
     }
@@ -231,6 +250,8 @@ impl Store {
             index: HashMap::new(),
             leaf: None,
             on_disk: true,
+            saved: 0,
+            failed: false,
             _lock: Some(lock),
         };
         for (n, line) in lines.enumerate() {
@@ -238,12 +259,15 @@ impl Store {
                 continue;
             }
             match serde_json::from_str::<Entry>(line) {
+                // A retried write whose first attempt did land: keep the first copy.
+                Ok(e) if s.index.contains_key(&e.id) => {}
                 Ok(e) => s.push(e),
                 Err(e) => {
                     tracing::warn!(path = %path.display(), line = n + 2, error = %e, "skipping unreadable session line")
                 }
             }
         }
+        s.saved = s.entries.len();
         Ok(s)
     }
 
@@ -284,14 +308,44 @@ impl Store {
             }
         );
         self.push(e);
-        if let Some(path) = self.path.clone() {
-            if self.on_disk {
-                storage::append_jsonl(&path, self.entries.last().expect("pushed"))?;
-            } else if first_exchange {
-                self.materialise(&path)?;
-            }
+        if self.on_disk || first_exchange || self.failed {
+            self.flush()?;
         }
         Ok(id)
+    }
+
+    /// Write every entry not on disk yet, in order (L4.16). A failed write keeps
+    /// the entries in memory; the next append or flush writes them first, so no
+    /// entry on disk ever points at a parent that isn't.
+    pub fn flush(&mut self) -> Result<(), StoreError> {
+        let Some(path) = self.path.clone() else { return Ok(()) };
+        let r = if self.on_disk {
+            self.write_pending(&path)
+        } else {
+            self.materialise(&path)
+        };
+        self.failed = r.is_err();
+        r
+    }
+
+    /// Entries a failed write left unsaved (0 while lazy creation hasn't written yet).
+    pub fn unsaved(&self) -> usize {
+        if self.failed {
+            self.entries.len() - self.saved
+        } else {
+            0
+        }
+    }
+
+    fn write_pending(&mut self, path: &Path) -> Result<(), StoreError> {
+        if self.failed {
+            end_line(path)?;
+        }
+        while self.saved < self.entries.len() {
+            storage::append_jsonl(path, &self.entries[self.saved])?;
+            self.saved += 1;
+        }
+        Ok(())
     }
 
     /// Write the header and everything so far, creating the file (lazy creation).
@@ -306,9 +360,15 @@ impl Store {
             buf.push_str(&serde_json::to_string(e).map_err(io::Error::other)?);
             buf.push('\n');
         }
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+        // Truncate, not create_new: a failed first attempt may have left part of this new file.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
         f.write_all(buf.as_bytes())?;
         self.on_disk = true;
+        self.saved = self.entries.len();
         self._lock = Some(lock);
         Ok(())
     }
@@ -786,6 +846,48 @@ mod tests {
         let s = Store::open(&file).unwrap();
         // A removed worktree is skipped for the newest folder that still exists.
         assert_eq!(s.last_cwd(), wt.path());
+    }
+
+    /// L4.16: a failed write keeps entries in memory and the next one writes them in
+    /// order, past a cut-off line; reopening gives the whole branch, each entry once.
+    #[test]
+    fn failed_writes_are_written_later_in_order() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::new(home.path());
+        let mut s = Store::create(&paths, Path::new("/w/proj"), false);
+        s.append(msg("hi")).unwrap();
+        s.append(reply("hello")).unwrap();
+        let path = s.path().unwrap().to_path_buf();
+        let mode = |m: u32| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o444);
+        assert!(s.append(msg("lost?")).is_err());
+        assert!(s.append(reply("still lost?")).is_err());
+        assert_eq!(s.unsaved(), 2);
+        mode(0o644);
+        // What a write cut off mid-line looks like.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"id\":\"cut")
+            .unwrap();
+        s.append(msg("after")).unwrap();
+        assert_eq!(s.unsaved(), 0);
+        // The same entry written twice (a write reported failed that did land) loads once.
+        let last = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .to_string();
+        storage::append_line(&path, &last).unwrap();
+        let want = s.projection();
+        drop(s);
+        let s2 = Store::open(&path).unwrap();
+        assert_eq!(s2.projection(), want);
+        assert_eq!(s2.branch().len(), 5);
+        assert_eq!(s2.entries().len(), 5);
     }
 
     #[test]

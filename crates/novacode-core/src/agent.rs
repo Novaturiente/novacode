@@ -105,6 +105,8 @@ pub struct Agent {
     memory: Option<Memory>,
     /// A compaction happened since the last request: its miss is deliberate.
     compacted: bool,
+    /// The "session not saved" notice was shown; cleared once it saves again (L4.16).
+    save_error: bool,
     /// Kept replies carry usage from before a compaction: estimate the context instead.
     usage_stale: bool,
     /// Where file checkpoints go (L4.15); `None` = off.
@@ -397,6 +399,7 @@ impl Agent {
             quirks: Arc::new(Quirks::ephemeral()),
             memory: None,
             compacted,
+            save_error: false,
             usage_stale: compacted,
             checkpoints: None,
             processes: None,
@@ -1316,10 +1319,13 @@ impl Agent {
             _ => None,
         };
         let id = match self.store.append(kind) {
-            Ok(id) => id,
+            Ok(id) => {
+                self.save_recovered();
+                id
+            }
             Err(e) => {
-                // The entry is kept in memory; the session file misses it. Surface, don't stop.
-                tracing::error!(error = %e, "session write failed");
+                // The entry is kept in memory and written by the next successful flush (L4.16).
+                self.save_failed(&e.to_string());
                 self.store.entries().last().map(|e| e.id.clone()).unwrap_or_default()
             }
         };
@@ -1327,6 +1333,47 @@ impl Agent {
             self.emit(AgentEvent::Message(m));
         }
         id
+    }
+
+    /// Tell the user once that the session file is behind.
+    fn save_failed(&mut self, error: &str) {
+        tracing::error!(error, "session write failed");
+        if !std::mem::replace(&mut self.save_error, true) {
+            self.emit(AgentEvent::Stream(StreamEvent::Notice {
+                text: format!(
+                    "session not saved: {error}. Nothing more runs until it saves; fix the cause (disk space, permissions), then send a message to retry."
+                ),
+            }));
+        }
+    }
+
+    fn save_recovered(&mut self) {
+        if std::mem::take(&mut self.save_error) {
+            self.emit(AgentEvent::Stream(StreamEvent::Notice {
+                text: "session saved again".into(),
+            }));
+        }
+    }
+
+    /// Everything is on disk, writing what a failed write left behind first.
+    fn saved(&mut self) -> bool {
+        if self.store.unsaved() == 0 {
+            return true;
+        }
+        match self.store.flush() {
+            Ok(()) => {
+                self.save_recovered();
+                true
+            }
+            Err(e) => {
+                let e = e.to_string();
+                tracing::error!(error = e, "session write failed again");
+                self.emit(AgentEvent::Stream(StreamEvent::Notice {
+                    text: format!("not run: the session can't be saved ({e})"),
+                }));
+                false
+            }
+        }
     }
 
     fn nudge(&mut self, text: &str) {
@@ -1480,6 +1527,10 @@ impl Agent {
                 });
             }
             steering_only = true;
+            // L4.16: no model call while the session file is missing entries.
+            if !self.saved() {
+                break StopReason::Error { kind: ErrorKind::Other };
+            }
             // A long run: notes and compaction at this model-call boundary (L4.5).
             self.mid_run_memory().await;
             self.emit(AgentEvent::TurnStart);
@@ -1500,6 +1551,11 @@ impl Agent {
             self.add(EntryKind::Message {
                 message: Message::Assistant(msg),
             });
+            // L4.16: and no tool runs either.
+            if !calls.is_empty() && !self.saved() {
+                self.skip_calls(&calls, "Not run: the session could not be saved.");
+                break StopReason::Error { kind: ErrorKind::Other };
+            }
 
             match &stop {
                 StopReason::Aborted | StopReason::Error { .. } => {

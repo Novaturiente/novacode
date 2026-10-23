@@ -384,6 +384,71 @@ async fn policy_gates_every_call_in_the_loop() {
     assert!(!work.path().join("target").exists());
 }
 
+/// L4.16: while the session file can't be written, no tool runs and no model is
+/// called; once it can, the missing entries are written and the session goes on.
+#[tokio::test]
+async fn unsaved_session_stops_work_until_it_saves() {
+    use std::os::unix::fs::PermissionsExt;
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let faux = Faux::new([
+        FauxReply::text("one"),
+        tools_reply(vec![call("a", "bash", json!({"command": "touch made"}))]),
+        FauxReply::text("three"),
+    ]);
+    let store = Store::create(&Paths::new(home.path()), work.path(), false);
+    let file = store.path().unwrap().to_path_buf();
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        novacode_tools::builtins(false),
+        store,
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    );
+    let (h, task) = agent::spawn(agent);
+    let mut rx = h.subscribe();
+    let mut notices = Vec::new();
+    async fn run(
+        h: &agent::SessionHandle,
+        rx: &mut tokio::sync::broadcast::Receiver<AgentEvent>,
+        notices: &mut Vec<String>,
+        prompt: &str,
+    ) {
+        h.prompt(prompt);
+        loop {
+            match rx.recv().await.unwrap() {
+                AgentEvent::Stream(novacode_types::StreamEvent::Notice { text }) => notices.push(text),
+                AgentEvent::AgentEnd { .. } => return,
+                _ => {}
+            }
+        }
+    }
+    let mode = |m: u32| std::fs::set_permissions(&file, std::fs::Permissions::from_mode(m)).unwrap();
+    run(&h, &mut rx, &mut notices, "first").await;
+    mode(0o444);
+    run(&h, &mut rx, &mut notices, "make a file").await;
+    assert!(!work.path().join("made").exists(), "no tool runs while unsaved");
+    assert!(
+        notices.iter().any(|n| n.starts_with("session not saved")),
+        "{notices:?}"
+    );
+    run(&h, &mut rx, &mut notices, "again").await;
+    // The prompt itself failed to save, so neither run reached the model.
+    assert_eq!(faux.requests.lock().unwrap().len(), 1, "no model call while unsaved");
+    mode(0o644);
+    run(&h, &mut rx, &mut notices, "now").await;
+    assert!(notices.iter().any(|n| n == "session saved again"), "{notices:?}");
+    h.shutdown();
+    drop(task.await.unwrap());
+    let users = Store::open(&file)
+        .unwrap()
+        .projection()
+        .iter()
+        .filter(|m| matches!(m, Message::User { .. }))
+        .count();
+    assert!(users >= 4, "every prompt is in the file: {users}");
+}
+
 /// Read-only mode: a write through `process` start is refused like one through `bash` (revision L6.1).
 #[tokio::test]
 async fn read_only_mode_refuses_writes_through_process() {
