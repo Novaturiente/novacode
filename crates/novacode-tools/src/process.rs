@@ -513,14 +513,17 @@ async fn pump(
         if size > 0 && size + n as u64 > LOG_CAP {
             let _ = file.flush().await;
             let old = older(path);
-            if old.exists() {
-                p.dropped[is_err as usize].store(true, Ordering::Relaxed);
-            }
-            let _ = tokio::fs::rename(path, &old).await;
-            // A failed reopen keeps the old handle (tried again next chunk): live output and watches go on.
-            if let Ok(f) = tokio::fs::OpenOptions::new().create(true).append(true).open(path).await {
-                file = f;
-                size = 0;
+            let had_old = old.exists();
+            // A failed rename or reopen keeps the old handle and size, so it is tried
+            // again next chunk: live output and watches go on.
+            if tokio::fs::rename(path, &old).await.is_ok() {
+                if had_old {
+                    p.dropped[is_err as usize].store(true, Ordering::Relaxed);
+                }
+                if let Ok(f) = tokio::fs::OpenOptions::new().create(true).append(true).open(path).await {
+                    file = f;
+                    size = 0;
+                }
             }
         }
         let _ = file.write_all(chunk).await;

@@ -188,7 +188,7 @@ Use `false` to force the full frame rate.
 
 ### "session not saved"
 
-novacode couldn't write the session file (disk full, permissions, a read-only mount). Nothing is lost yet: the entries stay in memory, and no model call or tool runs until they are written. Fix the cause, then send any message: the missing entries are written first, in order, and a "session saved again" note confirms it. If you quit before that, the unsaved part is gone.
+novacode couldn't write the session file (disk full, permissions, a read-only mount). Nothing is lost yet: the entries stay in memory, and no further model call or batch of tool calls starts until they are written (calls already running in a batch finish). Fix the cause, then send any message: the missing entries are written first, in order, and a "session saved again" note confirms it. If you quit before that, the unsaved part is gone.
 
 ### Something looks stuck
 

@@ -860,6 +860,39 @@ for line in sys.stdin:
         assert!(matches!(cached.status()[0].1, Status::Failed(_)));
     }
 
+    /// `readOnlyHint` (from the cache too) is what lets an MCP tool run in read-only mode.
+    #[test]
+    fn read_only_hint_reaches_the_tool() {
+        let home = tempfile::tempdir().unwrap();
+        let cache = home.path().join("cache").join("mcp");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(
+            cache.join("gh.json"),
+            json!([{"name": "get", "annotations": {"readOnlyHint": true}}, {"name": "put"}]).to_string(),
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+        let hub = Hub::start(
+            vec![Configured {
+                name: "gh".into(),
+                config: ServerConfig::default(),
+                source: home.path().join("mcp.json"),
+            }],
+            home.path(),
+            home.path(),
+        );
+        let ro: Vec<(String, bool)> = hub
+            .tools()
+            .iter()
+            .map(|t| (t.name().to_string(), t.read_only()))
+            .collect();
+        assert_eq!(ro, [("gh__get".to_string(), true), ("gh__put".to_string(), false)]);
+    }
+
     /// L7.4 revision: an uncached server starts with the session; a cached one only at
     /// its first call, and concurrent first calls share one start.
     #[tokio::test]

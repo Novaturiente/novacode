@@ -210,6 +210,7 @@ const READ_TOOLS: &[&str] = &[
     "codemode",
     "classify",
     "process",
+    "skill",
 ];
 const FILE_TOOLS: &[&str] = &["read", "write", "edit", "grep", "find", "ls"];
 /// A justification shorter than this is a blind retry, not a reason.
@@ -388,10 +389,12 @@ impl Policy {
         {
             return Verdict::Deny(format!("The `{tool}` tool is not available to this agent."));
         }
-        if self.profile.deny.iter().any(|t| t.eq_ignore_ascii_case(tool)) {
+        // A denied `bash` also denies `process` start: it would run the same command.
+        let named = |t: &String| t.eq_ignore_ascii_case(tool) || t.eq_ignore_ascii_case(rule_tool);
+        if self.profile.deny.iter().any(named) {
             return Verdict::Deny(format!("The `{tool}` tool is not available to this agent."));
         }
-        if self.turn.lock().unwrap().1.iter().any(|t| t.eq_ignore_ascii_case(tool)) {
+        if self.turn.lock().unwrap().1.iter().any(named) {
             return Verdict::Deny(format!(
                 "The `{tool}` tool is off for this turn (the active skill's `disallowed-tools`)."
             ));
@@ -441,8 +444,13 @@ impl Policy {
                     ));
                 }
             }
+            // `process` start runs in its own `cwd`: judge relative paths from there.
+            let run_cwd = start
+                .then(|| args.get("cwd").and_then(Value::as_str))
+                .flatten()
+                .map(|c| expand(c, cwd, &self.home));
             let ctx = risk::Ctx {
-                cwd,
+                cwd: run_cwd.as_deref().unwrap_or(cwd),
                 home: &self.home,
                 protected: &self.perms.protected.paths,
             };
@@ -778,6 +786,39 @@ mod tests {
             (plan.effective_mode(), plan.overlay_tools()),
             (Mode::Auto, Some(vec!["read".to_string()]))
         );
+    }
+
+    #[test]
+    fn review_fixes_hold() {
+        // `process` start judges relative paths from its own `cwd` (here: the home folder).
+        let auto = policy(json!({}));
+        let rm = json!({"action": "start", "cwd": "/home/u", "command": "rm -rf .ssh"});
+        assert!(denied(&check(&auto, "process", rm, false)));
+        let rm = json!({"action": "start", "cwd": "~/", "command": "rm -rf .ssh"});
+        assert!(denied(&check(&auto, "process", rm, false)));
+        // A denied `bash` (profile or skill turn) also denies `process` start.
+        let p = policy(json!({ "profiles": { "nobash": { "deny": ["bash"] } } }))
+            .with_profile("nobash")
+            .unwrap();
+        assert!(denied(&check(
+            &p,
+            "process",
+            json!({"action": "start", "command": "ls"}),
+            false
+        )));
+        let t = policy(json!({}));
+        t.for_turn(vec![], vec!["bash".into()]);
+        assert!(denied(&check(
+            &t,
+            "process",
+            json!({"action": "start", "command": "ls"}),
+            false
+        )));
+        assert_eq!(check(&t, "process", json!({"action": "list"}), false), Verdict::Allow);
+        // `skill` works in plan mode.
+        let plan = policy(json!({}));
+        plan.set_overlay(Some(("plan".into(), true, None)));
+        assert_eq!(check(&plan, "skill", json!({"name": "x"}), false), Verdict::Allow);
     }
 
     #[test]

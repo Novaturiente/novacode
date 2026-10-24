@@ -201,6 +201,22 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A hook's ask with nobody to answer (print mode) is refused, not run.
+    #[tokio::test]
+    async fn hook_ask_is_refused_unattended() {
+        use crate::policy::{HookDecision, Permissions, Policy};
+        let p = Policy::new(Permissions::default(), "/h".into(), None);
+        let args = json!({"path": "a"});
+        let ask = HookDecision::Ask("check".into());
+        let out = authorize(&p, None, "read", false, &args, Path::new("/w"), &ask).await;
+        assert!(out.is_some_and(|o| o.is_error));
+        assert!(
+            authorize(&p, None, "read", false, &args, Path::new("/w"), &HookDecision::None)
+                .await
+                .is_none()
+        );
+    }
+
     fn call(name: &str, args: Value) -> ToolCall {
         ToolCall {
             id: "c".into(),

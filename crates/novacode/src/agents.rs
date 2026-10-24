@@ -225,6 +225,14 @@ pub fn defs(dirs: &[PathBuf]) -> (Vec<Def>, Vec<String>) {
                 continue;
             }
             let mut d = Def::default();
+            // One MCP tool can't be granted alone: its server comes whole.
+            let wide: Vec<String> = resources::list(fm.get("tools"))
+                .into_iter()
+                .filter_map(|t| {
+                    let (server, tool) = t.strip_prefix("mcp__")?.split_once("__")?;
+                    (!tool.is_empty()).then(|| format!("mcp__{server}__{tool} gives all of {server}'s tools"))
+                })
+                .collect();
             // `mcp__server__tool` names grant the server: MCP tools come per server.
             let split = |names: Vec<String>, mcp: &mut Vec<String>| -> Vec<String> {
                 names
@@ -263,6 +271,9 @@ pub fn defs(dirs: &[PathBuf]) -> (Vec<Def>, Vec<String>) {
             }
             d.mcp.sort();
             d.mcp.dedup();
+            if !wide.is_empty() {
+                note(format!("{} (MCP tools come per server)", wide.join("; ")));
+            }
             d.model = resources::field(&fm, "model").filter(|m| m != "inherit");
             d.thinking = resources::field(&fm, "thinking").or_else(|| resources::field(&fm, "effort"));
             d.max_turns = fm.get("maxTurns").and_then(Value::as_u64).map(|n| n as u32);
@@ -354,9 +365,10 @@ pub fn grant(
         }
         *t = keep;
     }
-    // Claude `disallowedTools`: never given, whoever picks.
+    // Claude `disallowedTools`: never given, whoever picks (no `bash`: no `process` either).
     if let Some(t) = tools.as_mut() {
-        t.retain(|n| !def.disallowed.contains(n));
+        let no_shell = def.disallowed.iter().any(|d| d == "bash");
+        t.retain(|n| !def.disallowed.contains(n) && !(no_shell && n == "process"));
     }
     let granted = pick_mcp.is_some();
     let (mut mcp, unknown): (Vec<String>, Vec<String>) = pick_mcp
@@ -918,7 +930,10 @@ impl Supervisor {
         let mut g = self.children.lock().unwrap();
         let n = format!("a{}", g.len() + 1);
         let title = a.title.unwrap_or(short);
-        if a.worktree || def.worktree {
+        let read_only = def.read_only || cfg.policy.effective_mode() == novacode_core::policy::Mode::ReadOnly;
+        if (a.worktree || def.worktree) && read_only {
+            notes.push("no worktree: read-only (plan mode), so the subagent can't change files anyway".into());
+        } else if a.worktree || def.worktree {
             let name = format!("{}-{n}", slug(&title));
             let (path, _) = novacode_tools::worktree::create(&cwd, &name)?;
             cwd = path;
@@ -975,9 +990,10 @@ impl Supervisor {
                 .filter(|c| c.status == Status::Done)
                 .map(|c| c.n.clone())
                 .collect();
+            // Waiting on a question or approval still holds its slot.
             let running = g
                 .iter()
-                .filter(|c| matches!(c.status, Status::Starting | Status::Running))
+                .filter(|c| !c.status.finished() && c.status != Status::Queued)
                 .count();
             g.iter_mut()
                 .filter(|c| c.status == Status::Queued && c.after.iter().all(|d| done.contains(d)))
@@ -1245,7 +1261,12 @@ impl Supervisor {
             let slot = me.c().slot.clone();
             let replies = slot.ask(questions).await;
             me.send_line(&n, json!({"type": "answer", "ask": id, "replies": replies}));
-            me.with(&n, |c| c.status = Status::Running);
+            // Not if it was stopped or finished meanwhile.
+            me.with(&n, |c| {
+                if c.status == Status::Waiting {
+                    c.status = Status::Running;
+                }
+            });
         });
     }
 
@@ -1280,7 +1301,11 @@ impl Supervisor {
                 Approval::Deny(why) => json!({"deny": why}),
             };
             me.send_line(&n, json!({"type": "approval", "approval": id, "answer": answer}));
-            me.with(&n, |c| c.status = Status::Running);
+            me.with(&n, |c| {
+                if c.status == Status::Waiting {
+                    c.status = Status::Running;
+                }
+            });
         });
     }
 
@@ -1843,6 +1868,14 @@ mod tests {
         let out = sup.wait(vec![a.clone()], false, Duration::from_secs(20)).await;
         assert!(out.contains(":: again"), "{out}");
         assert!(out.contains("--mode auto"), "children get the parent's mode: {out}");
+        // Plan mode on: no worktree is made (it can't change files anyway).
+        sup.c().policy.set_overlay(Some(("plan".into(), true, None)));
+        let (w, notes) = sup
+            .spawn(serde_json::from_value(json!({"task": "wt", "worktree": true, "model": "p/m"})).unwrap())
+            .unwrap();
+        assert!(notes.iter().any(|n| n.starts_with("no worktree")), "{notes:?}");
+        assert_eq!(sup.with(&w, |c| c.cwd.clone()).unwrap(), tmp);
+        sup.wait(vec![w], false, Duration::from_secs(20)).await;
         // Plan mode on: a new child starts read-only, with only the preset's tools.
         sup.set_own_tools(vec!["read".into(), "bash".into()]);
         sup.c()

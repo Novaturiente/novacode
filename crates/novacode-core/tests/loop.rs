@@ -1362,6 +1362,64 @@ async fn codemode_chains_through_the_pipeline() {
     assert!(!work.path().join("new.txt").exists());
 }
 
+/// Read-only mode holds inside codemode scripts and through `call` too (revision L6.1).
+#[tokio::test]
+async fn read_only_holds_for_nested_calls() {
+    use novacode_core::policy::{Mode, Permissions, Policy};
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let script = "let out = [];\n\
+                  for (const c of [() => tools.process({action: 'start', command: 'touch by-script'}), () => tools.write({path: 'w.txt', content: 'x'})]) {\n\
+                    try { await c(); out.push('ran'); } catch (e) { out.push('refused'); }\n\
+                  }\n\
+                  return out.join(',');";
+    let faux = Faux::new([
+        tools_reply(vec![
+            call("a", "codemode", json!({ "code": script })),
+            call(
+                "b",
+                "call",
+                json!({ "name": "write", "arguments": {"path": "c.txt", "content": "x"} }),
+            ),
+        ]),
+        FauxReply::text("done"),
+    ]);
+    // `write` is deferred, so `call` reaches it; codemode reaches it as well.
+    let (mut tools, deferred): (Vec<_>, Vec<_>) = novacode_tools::builtins(false)
+        .into_iter()
+        .partition(|t| t.name() != "write");
+    tools.push(Arc::new(novacode_tools::process::ProcessTool));
+    tools.push(Arc::new(novacode_core::codemode::Codemode::default()));
+    tools.push(Arc::new(novacode_tools::toolsearch::Call));
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        tools,
+        Store::create(&Paths::new(home.path()), work.path(), true),
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_deferred(deferred)
+    .with_processes(novacode_tools::process::ProcessManager::new(
+        &home.path().join("processes"),
+        "s",
+    ))
+    .with_policy(Policy::new(Permissions::default(), home.path().into(), None).with_mode(Mode::ReadOnly));
+    let (agent, _) = drive(agent, &["go"]).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let results: Vec<String> = agent
+        .store
+        .projection()
+        .iter()
+        .filter(|m| matches!(m, Message::ToolResult { .. }))
+        .map(result_text)
+        .collect();
+    assert_eq!(results[0], "refused,refused", "{results:?}");
+    assert!(results[1].contains("can't change files"), "{results:?}");
+    for f in ["by-script", "w.txt", "c.txt"] {
+        assert!(!work.path().join(f).exists(), "{f}");
+    }
+}
+
 /// The same lines of an unchanged file, still in the context, are not sent again;
 /// a changed file or other lines are.
 #[tokio::test]

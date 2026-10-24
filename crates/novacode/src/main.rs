@@ -1277,7 +1277,12 @@ impl Ctx {
                     let r = providers.resolve(&format!("{provider}/{alias}")).ok()?;
                     return (r.model != alias).then(|| format!("{provider}/{}", r.model));
                 }
-                Some(format!("{provider}/{wanted}"))
+                // A bare model id, when this provider's catalog has it.
+                let p = providers.profile(provider).ok()?;
+                providers
+                    .catalog
+                    .get(p.catalog_id(), wanted)
+                    .map(|_| format!("{provider}/{wanted}"))
             });
             let setup = agents::Setup {
                 slot,
