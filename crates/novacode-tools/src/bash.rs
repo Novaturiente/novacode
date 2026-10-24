@@ -38,7 +38,7 @@ impl Tool for Bash {
         ]
     }
     fn description(&self) -> &str {
-        "Run a shell command. stdout and stderr are merged; long output keeps the tail. stdin is closed, so interactive commands fail instead of waiting."
+        "Run a shell command. stdout and stderr are merged; long output keeps the tail. stdin is closed, so interactive commands fail instead of waiting. Each call is a fresh shell: cd and exports don't carry over. On timeout the command keeps running in the background with an id."
     }
     fn schema(&self) -> Value {
         schema_for::<Args>()
