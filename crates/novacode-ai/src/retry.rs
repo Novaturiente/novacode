@@ -28,13 +28,14 @@ pub fn should_retry(status: Option<u16>, headers: Option<&HeaderMap>) -> bool {
 /// Server-requested delay from `retry-after-ms` or `retry-after` (seconds).
 pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     let get = |k| headers.get(k).and_then(|v| v.to_str().ok());
+    // try_from: `inf` or a huge value is no delay (falls back to backoff), not a panic.
     if let Some(ms) = get("retry-after-ms").and_then(|v| v.trim().parse::<f64>().ok()) {
-        return Some(Duration::from_secs_f64(ms.max(0.0) / 1000.0));
+        return Duration::try_from_secs_f64(ms.max(0.0) / 1000.0).ok();
     }
     // shortcut: HTTP-date form of retry-after is ignored (falls back to backoff); add if a provider sends it.
     get("retry-after")
         .and_then(|v| v.trim().parse::<f64>().ok())
-        .map(|s| Duration::from_secs_f64(s.max(0.0)))
+        .and_then(|s| Duration::try_from_secs_f64(s.max(0.0)).ok())
 }
 
 /// Delay before retry number `attempt` (0-based), or `None` to give up.
@@ -69,6 +70,15 @@ mod tests {
         assert_eq!(retry_after(&h), Some(Duration::from_secs(3)));
         h.insert("retry-after-ms", "250".parse().unwrap());
         assert_eq!(retry_after(&h), Some(Duration::from_millis(250)));
+        let mut bad = HeaderMap::new();
+        bad.insert("retry-after", "inf".parse().unwrap());
+        assert_eq!(retry_after(&bad), None);
+        bad.insert("retry-after", "1e30".parse().unwrap());
+        assert_eq!(retry_after(&bad), None);
+        bad.insert("retry-after-ms", "inf".parse().unwrap());
+        assert_eq!(retry_after(&bad), None);
+        bad.insert("retry-after-ms", "1e30".parse().unwrap());
+        assert_eq!(retry_after(&bad), None);
         assert_eq!(delay(0, Some(Duration::from_secs(61))), None);
         assert_eq!(delay(MAX_RETRIES, None), None);
         let d = delay(1, None).unwrap();

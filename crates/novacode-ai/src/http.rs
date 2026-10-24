@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Time allowed between any two chunks (also covers time to first byte).
+/// Time allowed for the response headers, and between any two body chunks.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub type Failure = (ErrorKind, String);
@@ -24,6 +24,7 @@ pub type Failure = (ErrorKind, String);
 pub fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
+        .tcp_keepalive(Duration::from_secs(30))
         .build()
         .unwrap_or_default()
 }
@@ -86,8 +87,8 @@ async fn run<W: Wire>(
         let Some(req) = request.try_clone() else {
             return Err((ErrorKind::Other, "request not cloneable".into()));
         };
-        let (status, headers, f) = match req.send().await {
-            Err(e) => (None, None, (ErrorKind::Transient, format!("network error: {e}"))),
+        let (status, headers, f) = match send(req, IDLE_TIMEOUT).await {
+            Err(f) => (None, None, f),
             Ok(resp) if !resp.status().is_success() => {
                 let status = resp.status().as_u16();
                 let headers = resp.headers().clone();
@@ -116,6 +117,16 @@ async fn run<W: Wire>(
         b.rollback().await;
         tokio::time::sleep(d).await;
         attempt += 1;
+    }
+}
+
+/// Send and wait for the response headers; a server that never answers is a
+/// transient failure, so the retry path handles it.
+async fn send(req: reqwest::RequestBuilder, limit: Duration) -> Result<reqwest::Response, Failure> {
+    match tokio::time::timeout(limit, req.send()).await {
+        Err(_) => Err((ErrorKind::Transient, format!("no response headers within {limit:?}"))),
+        Ok(Err(e)) => Err((ErrorKind::Transient, format!("network error: {e}"))),
+        Ok(Ok(resp)) => Ok(resp),
     }
 }
 
@@ -188,7 +199,13 @@ fn openai_kind(status: u16, code: &str, msg: &str, headers: &HeaderMap) -> Error
     {
         return ErrorKind::Overflow;
     }
-    if code == "insufficient_quota" || lower.contains("insufficient credits") || lower.contains("quota exceeded") {
+    // "Quota exceeded" on a plain 429 is often a per-minute limit: only payment
+    // statuses or daily/billing wording mean the quota is used up.
+    let used_up = matches!(status, 402 | 403) || ["per day", "daily", "billing"].iter().any(|w| lower.contains(w));
+    if code == "insufficient_quota"
+        || lower.contains("insufficient credits")
+        || (lower.contains("quota exceeded") && used_up)
+    {
         return ErrorKind::QuotaExhausted;
     }
     match status {
@@ -242,5 +259,33 @@ mod tests {
             classify_openai(400, &h, r#"{"error":{"message":"bad field"}}"#).1,
             "bad field"
         );
+        assert_eq!(
+            k(429, r#"{"error":{"message":"Quota exceeded for requests per minute"}}"#),
+            ErrorKind::RateLimit { retry_after_ms: None },
+            "a per-minute quota is a rate limit"
+        );
+        assert_eq!(
+            k(429, r#"{"error":{"message":"Quota exceeded for requests per day"}}"#),
+            ErrorKind::QuotaExhausted
+        );
+        assert_eq!(
+            k(403, r#"{"error":{"message":"Quota exceeded"}}"#),
+            ErrorKind::QuotaExhausted
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_server_times_out_as_transient() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        // Accept and hold the connection without ever answering.
+        tokio::spawn(async move {
+            let (_s, _) = l.accept().await.unwrap();
+            std::future::pending::<()>().await
+        });
+        let req = client().post(url).body("x");
+        let (kind, msg) = send(req, Duration::from_millis(200)).await.unwrap_err();
+        assert_eq!(kind, ErrorKind::Transient);
+        assert!(msg.contains("no response headers"), "{msg}");
     }
 }

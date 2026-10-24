@@ -414,6 +414,9 @@ struct State {
     text: Option<usize>,
     thinking: Option<(usize, String)>,
     tools: BTreeMap<u64, usize>,
+    /// For vendors that omit `index`: tool call id to its key, and the last key opened.
+    ids: BTreeMap<String, u64>,
+    last_key: Option<u64>,
     details: Vec<Value>,
     finish: Option<StopReason>,
     usage: Usage,
@@ -485,7 +488,9 @@ impl Wire for State {
         let v: Value =
             serde_json::from_str(data).map_err(|e| (ErrorKind::Transient, format!("bad event json: {e}")))?;
         if v.get("error").is_some() {
-            let (kind, msg) = http::classify_openai(400, &Default::default(), data);
+            // Gateways send overloads inside HTTP 200: take the status from the event.
+            let code = v["error"]["code"].as_u64().filter(|c| (400..600).contains(c));
+            let (kind, msg) = http::classify_openai(code.unwrap_or(500) as u16, &Default::default(), data);
             // An error event mid-stream is the server's fault unless it says otherwise.
             let kind = if kind == ErrorKind::InvalidRequest && b.started {
                 ErrorKind::Transient
@@ -550,7 +555,21 @@ impl Wire for State {
             self.close_thinking(b).await;
             self.close_text(b).await;
             for (n, tc) in calls.iter().enumerate() {
-                let key = tc["index"].as_u64().unwrap_or(n as u64);
+                let id = tc["id"].as_str().filter(|s| !s.is_empty());
+                // Without `index`, a new id is a new call; no id continues the last one.
+                let key = match (tc["index"].as_u64(), id) {
+                    (Some(k), _) => k,
+                    (None, Some(id)) => match self.ids.get(id) {
+                        Some(k) => *k,
+                        None => {
+                            let k = (0..).find(|k| !self.tools.contains_key(k)).unwrap_or_default();
+                            self.ids.insert(id.into(), k);
+                            k
+                        }
+                    },
+                    (None, None) => self.last_key.unwrap_or(n as u64),
+                };
+                self.last_key = Some(key);
                 let i = match self.tools.get(&key) {
                     Some(i) => *i,
                     None => {
@@ -790,5 +809,50 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(st.at_eof(&mut b).await.unwrap_err().0, ErrorKind::Transient);
+    }
+
+    #[tokio::test]
+    async fn tool_calls_without_index_stay_apart() {
+        let m = run_stream(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"a","function":{"name":"ls","arguments":"{\"p"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\":1}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"b","function":{"name":"read","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ])
+        .await;
+        let calls: Vec<_> = m.tool_calls().map(|c| (c.id.as_str(), c.arguments.clone())).collect();
+        assert_eq!(calls, [("a", json!({"p":1})), ("b", json!({}))]);
+    }
+
+    #[tokio::test]
+    async fn mid_stream_error_uses_its_code() {
+        let err = |data: &str| {
+            let ev = SseEvent {
+                event: String::new(),
+                data: data.into(),
+            };
+            async move {
+                let (mut b, _rx) = http::channel("ds", "m");
+                State::default().on_event(&ev, &mut b).await.unwrap_err().0
+            }
+        };
+        assert_eq!(
+            err(r#"{"error":{"code":503,"message":"overloaded"}}"#).await,
+            ErrorKind::Transient
+        );
+        assert_eq!(
+            err(r#"{"error":{"message":"upstream failed"}}"#).await,
+            ErrorKind::Transient,
+            "no code: a server error"
+        );
+        assert_eq!(
+            err(r#"{"error":{"code":429,"message":"slow down"}}"#).await,
+            ErrorKind::RateLimit { retry_after_ms: None }
+        );
+        assert_eq!(
+            err(r#"{"error":{"code":400,"message":"bad field"}}"#).await,
+            ErrorKind::InvalidRequest,
+            "before any output a 400 stays a request error"
+        );
     }
 }

@@ -6,6 +6,7 @@
 //! there. It never falls back to a metered API key.
 
 use crate::adapter::{Adapter, Builder, EVENT_BUFFER, Request};
+use crate::auth::AuthError;
 use crate::connect::Providers;
 use crate::retry;
 use crate::trace::Trace;
@@ -28,6 +29,23 @@ struct Inner {
     current: AtomicUsize,
     trace: Option<Trace>,
     cached: Mutex<Option<Built>>,
+    /// Test seam: make the credential lookup fail with this error.
+    #[cfg(test)]
+    fault: Mutex<Option<fn() -> AuthError>>,
+}
+
+/// Why an account's adapter could not be built: (kind, whether another account may help, message).
+type AuthFailure = (ErrorKind, bool, String);
+
+/// A login that is gone moves on to the next account; a network blip or token
+/// endpoint error leaves the account in place and is retried.
+fn auth_failure(e: &AuthError) -> AuthFailure {
+    let (kind, rotate) = match e {
+        AuthError::Expired(..) | AuthError::NotLoggedIn(_) | AuthError::Key(_) => (ErrorKind::Auth, true),
+        AuthError::Http(_) => (ErrorKind::Transient, false),
+        AuthError::Io(_) => (ErrorKind::Other, false),
+    };
+    (kind, rotate, e.to_string())
 }
 
 /// (account index, access token, adapter built with it).
@@ -55,6 +73,8 @@ impl Live {
                 trace,
                 cached: Mutex::new(Some((0, token, first))),
                 providers,
+                #[cfg(test)]
+                fault: Mutex::new(None),
             }),
         }
     }
@@ -99,14 +119,18 @@ fn exhausted(stop: &StopReason) -> bool {
 }
 
 impl Inner {
-    async fn adapter(&self, i: usize) -> Result<Arc<dyn Adapter>, String> {
+    async fn adapter(&self, i: usize) -> Result<Arc<dyn Adapter>, AuthFailure> {
         let account = &self.accounts[i];
+        #[cfg(test)]
+        if let Some(f) = *self.fault.lock().unwrap() {
+            return Err(auth_failure(&f()));
+        }
         let cred = self
             .providers
             .auth
             .credential(&self.provider, account)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| auth_failure(&e))?;
         if let Some((ci, tok, a)) = self.cached.lock().unwrap().as_ref()
             && *ci == i
             && *tok == cred.access
@@ -117,7 +141,7 @@ impl Inner {
             .providers
             .adapter_for(&self.provider, account, self.trace.clone())
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| (ErrorKind::Auth, true, e.to_string()))?;
         *self.cached.lock().unwrap() = Some((i, cred.access, a.clone()));
         Ok(a)
     }
@@ -128,10 +152,10 @@ impl Inner {
             let i = self.current.load(Ordering::Relaxed);
             let a = match self.adapter(i).await {
                 Ok(a) => a,
-                Err(e) => {
+                Err((kind, rotate, e)) => {
                     let msg = format!("{} account `{}`: {e}", self.provider, self.accounts[i]);
                     // A broken login (e.g. a revoked refresh token) shouldn't block a working account.
-                    if tried + 1 < n {
+                    if rotate && tried + 1 < n {
                         let next = (i + 1) % n;
                         let note = format!("{msg}; switched to account `{}`", self.accounts[next]);
                         if tx.send(StreamEvent::Notice { text: note }).await.is_err() {
@@ -140,9 +164,7 @@ impl Inner {
                         self.current.store(next, Ordering::Relaxed);
                         continue 'accounts;
                     }
-                    return Builder::new(tx, &self.provider, &req.model)
-                        .fail(ErrorKind::Auth, msg)
-                        .await;
+                    return Builder::new(tx, &self.provider, &req.model).fail(kind, msg).await;
                 }
             };
             let mut rx = a.stream(req.clone(), cancel.clone());
@@ -235,7 +257,11 @@ impl Adapter for Live {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, String>> {
         Box::pin(async move {
-            let a = self.inner.adapter(self.inner.current.load(Ordering::Relaxed)).await?;
+            let a = self
+                .inner
+                .adapter(self.inner.current.load(Ordering::Relaxed))
+                .await
+                .map_err(|e| e.2)?;
             a.list_models().await
         })
     }
@@ -388,6 +414,51 @@ mod tests {
             (StopReason::Stop, "work".to_string()),
             "rotated once and stayed"
         );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_network_error_is_transient_and_keeps_the_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let sub = r#"{ "providers": { "sub": { "name": "Sub", "api": "openai-chat", "auth": "oauth", "baseUrl": "http://127.0.0.1:1" } } }"#;
+        std::fs::write(&path, sub).unwrap();
+        let p = Arc::new(Providers::load(dir.path(), &Settings::load(&path, None, false)));
+        let cred = OAuthCredential {
+            access: "a".into(),
+            refresh: "r".into(),
+            expires_ms: u64::MAX / 2,
+            project: None,
+        };
+        p.auth.put("sub", "default", cred.clone()).await.unwrap();
+        p.auth.put("sub", "work", cred).await.unwrap();
+        let (first, _) = p.adapter_for("sub", "default", None).await.unwrap();
+        let a = Live::new(p.clone(), "sub", vec!["default".into(), "work".into()], None, first);
+        *a.inner.fault.lock().unwrap() = Some(|| AuthError::Http("token request failed: connection reset".into()));
+        let req = Request {
+            tail: Vec::new(),
+            model: "m".into(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 10,
+            cache: CacheRetention::Short,
+            thinking: None,
+            images: false,
+            session: None,
+        };
+        let m = collect(a.stream(req, CancellationToken::new())).await;
+        assert_eq!(
+            (m.stop, a.account()),
+            (
+                StopReason::Error {
+                    kind: ErrorKind::Transient
+                },
+                "default".to_string()
+            ),
+            "{:?}",
+            m.error_message
+        );
+        assert_eq!(auth_failure(&AuthError::NotLoggedIn("sub".into())).0, ErrorKind::Auth);
+        assert!(auth_failure(&AuthError::Key("x".into())).1, "a bad key rotates");
     }
 
     #[test]
