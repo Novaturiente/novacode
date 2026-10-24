@@ -58,7 +58,8 @@ for t in "$@"; do
     iso=$(mktemp -d "/tmp/nc-eval-home-$t.XXXX")
     [ -f "$real_home/auth.json" ] && ln -s "$real_home/auth.json" "$iso/auth.json"
     [ -f "$t/mcp.json" ] && sed "s|\$EVAL_TASK_DIR|$here/$t|g" "$t/mcp.json" >"$iso/mcp.json"
-    agent() { (cd "$work" && HOME="$iso" NOVACODE_HOME="$iso" "$bin" -m "$model" --json "$@"); }
+    # stdin from /dev/null: `-p` reads piped stdin into the prompt and would wait on an open pipe.
+    agent() { (cd "$work" && HOME="$iso" NOVACODE_HOME="$iso" "$bin" -m "$model" --json "$@" </dev/null); }
     start=$(date +%s)
     if [ -f "$t/prompt2.md" ]; then
       agent -p "$(cat "$t/prompt.md")" >"$work/.events.jsonl" 2>"$work/.stderr"
