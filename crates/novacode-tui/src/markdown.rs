@@ -241,6 +241,13 @@ impl R<'_> {
                     if let Some(url) = self.links.pop()
                         && !url.starts_with('#')
                     {
+                        // In a table the URL belongs to the cell, not to the text after the table.
+                        if let Some(tb) = &mut self.table {
+                            if !tb.cell.ends_with(&url) {
+                                tb.cell.push_str(&format!(" ({url})"));
+                            }
+                            return;
+                        }
                         // Show the URL unless the text already is it.
                         let shown: String = self.cur.iter().rev().take(1).map(|s| s.content.to_string()).collect();
                         if shown != url {
@@ -420,6 +427,16 @@ mod tests {
         );
         assert_eq!(md("[docs](https://x.y)", 40), ["docs (https://x.y)"]);
         assert_eq!(md("<https://x.y>", 40), ["https://x.y"]);
+        // A link's URL stays in its table cell.
+        assert_eq!(
+            md("| [docs](https://x.io/d) | 2 |\n|---|---|\n\nNext para.", 60),
+            [
+                "docs (https://x.io/d) │ 2",
+                "──────────────────────┼──",
+                "",
+                "Next para."
+            ]
+        );
         // Unfinished markdown while streaming still renders.
         assert_eq!(md("```\npartial", 40), ["▏ partial"]);
     }

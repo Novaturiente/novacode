@@ -1,5 +1,6 @@
-//! The prompt editor (L9.5): multiline with soft wrap, grapheme and word
-//! moves, kill ring, undo, history and collapsed paste markers.
+//! The prompt editor (L9.5): multiline with soft word wrap (long words break
+//! per grapheme), grapheme and word moves, kill ring, undo, history and
+//! collapsed paste markers. A tab counts as 4 cells and shows as 4 spaces.
 
 use crate::keys::{A, Keymap, Scope};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -9,6 +10,16 @@ use unicode_width::UnicodeWidthStr;
 const UNDO_CAP: usize = 200;
 const PASTE_LINES: usize = 5;
 const PASTE_CHARS: usize = 1000;
+/// Cells a `\t` takes (ratatui drops control chars, so it is drawn as spaces, like `wrap::sanitize`).
+const TAB: usize = 4;
+
+fn cells(g: &str) -> usize {
+    if g == "\t" { TAB } else { g.width() }
+}
+
+fn str_cells(s: &str) -> usize {
+    s.graphemes(true).map(cells).sum()
+}
 
 #[derive(Default)]
 pub struct Editor {
@@ -68,7 +79,7 @@ impl Editor {
         self.save(EditKind::Other);
         self.text.clear();
         self.cursor = 0;
-        self.pastes.clear();
+        // `pastes` stay: undo can bring their markers back (cleared on submit).
         self.hist = None;
     }
 
@@ -195,7 +206,8 @@ impl Editor {
         self.hist = Some((idx, draft));
     }
 
-    /// Visual rows for `width` cells (grapheme wrap; one cell kept for the cursor).
+    /// Visual rows for `width` cells (one cell kept for the cursor). Rows break after
+    /// whitespace, which stays on the earlier row; a word longer than a row breaks per grapheme.
     fn rows(&self, width: usize) -> Vec<Row> {
         let width = width.max(2) - 1;
         let mut rows = Vec::new();
@@ -204,17 +216,44 @@ impl Editor {
             let base = start;
             let mut row_start = base;
             let mut w = 0;
+            // Byte after the last whitespace in this row, and the row's width up to there.
+            let mut brk: Option<(usize, usize)> = None;
             for (i, g) in line.grapheme_indices(true) {
-                let gw = g.width();
+                let gw = cells(g);
+                let space = g.chars().all(char::is_whitespace);
                 if w + gw > width {
-                    rows.push(Row {
-                        start: row_start,
-                        end: base + i,
-                    });
-                    row_start = base + i;
-                    w = 0;
+                    if space && base + i > row_start {
+                        // Overflowing whitespace hangs at the row's end; the next word starts the next row.
+                        rows.push(Row {
+                            start: row_start,
+                            end: base + i + g.len(),
+                        });
+                        row_start = base + i + g.len();
+                        w = 0;
+                        brk = None;
+                        continue;
+                    }
+                    if let Some((b, bw)) = brk.take().filter(|&(b, _)| b > row_start) {
+                        rows.push(Row {
+                            start: row_start,
+                            end: b,
+                        });
+                        row_start = b;
+                        w -= bw;
+                    }
+                    if w + gw > width {
+                        rows.push(Row {
+                            start: row_start,
+                            end: base + i,
+                        });
+                        row_start = base + i;
+                        w = 0;
+                    }
                 }
                 w += gw;
+                if space {
+                    brk = Some((base + i + g.len(), w));
+                }
             }
             rows.push(Row {
                 start: row_start,
@@ -228,16 +267,16 @@ impl Editor {
     /// (row, column in cells) of the cursor.
     fn cursor_pos(&self, rows: &[Row]) -> (usize, usize) {
         let r = rows.iter().rposition(|r| r.start <= self.cursor).unwrap_or(0);
-        (r, self.text[rows[r].start..self.cursor].width())
+        (r, str_cells(&self.text[rows[r].start..self.cursor]))
     }
 
     fn at_col(&self, row: &Row, col: usize) -> usize {
         let mut w = 0;
         for (i, g) in self.text[row.start..row.end].grapheme_indices(true) {
-            if w + g.width() > col {
+            if w + cells(g) > col {
                 return row.start + i;
             }
-            w += g.width();
+            w += cells(g);
         }
         row.end
     }
@@ -270,6 +309,7 @@ impl Editor {
         let out = self.full_text();
         self.text.clear();
         self.clear();
+        self.pastes.clear();
         self.undo.clear();
         if !out.trim().is_empty() && self.history.last() != Some(&out) {
             self.history.push(out.clone());
@@ -479,7 +519,7 @@ impl Editor {
         let shown: Vec<String> = rows[first..]
             .iter()
             .take(max)
-            .map(|row| self.text[row.start..row.end].to_string())
+            .map(|row| self.text[row.start..row.end].replace('\t', &" ".repeat(TAB)))
             .collect();
         (shown, ((r - first) as u16, c as u16))
     }
@@ -565,6 +605,55 @@ mod tests {
         key(&mut e, KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(e.cursor, 26);
         assert_eq!(e.view(20, 2).0.len(), 2);
+    }
+
+    #[test]
+    fn wraps_at_word_starts() {
+        let mut e = Editor::default();
+        e.set_text("hello wonderful world");
+        assert_eq!(e.view(10, 10).0, ["hello ", "wonderful ", "world"]);
+        // A word longer than a row still breaks per grapheme.
+        e.set_text(&"x".repeat(30));
+        let rows = e.view(10, 10).0;
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|r| r.len() <= 9), "{rows:?}");
+        assert_eq!(rows.concat(), "x".repeat(30));
+    }
+
+    #[test]
+    fn vertical_moves_land_on_graphemes() {
+        let mut e = Editor::default();
+        e.set_text("héllo wörld ünïcode 😀😀 e\u{301}e\u{301} ñandú");
+        for up in [true, true, true, false, false, false, false] {
+            let code = if up { KeyCode::Up } else { KeyCode::Down };
+            e.handle_key(KeyEvent::new(code, KeyModifiers::NONE), 8);
+            assert!(e.text.is_char_boundary(e.cursor));
+            let on_grapheme = e.cursor == e.text.len() || e.text.grapheme_indices(true).any(|(i, _)| i == e.cursor);
+            assert!(on_grapheme, "cursor {} not on a grapheme start", e.cursor);
+        }
+    }
+
+    #[test]
+    fn tabs_take_four_cells() {
+        let mut e = Editor::default();
+        e.paste("a\tb");
+        assert_eq!(e.text(), "a\tb");
+        let (rows, cur) = e.view(20, 5);
+        assert_eq!(rows, ["a    b"]);
+        assert_eq!(cur, (0, 6));
+    }
+
+    #[test]
+    fn undo_after_clear_keeps_paste_text() {
+        let mut e = Editor::default();
+        e.paste(&"line\n".repeat(10));
+        e.clear();
+        key(&mut e, KeyCode::Char('_'), KeyModifiers::CONTROL);
+        assert_eq!(e.text(), "[paste #1 +10 lines]");
+        let Action::Submit(s) = key(&mut e, KeyCode::Enter, KeyModifiers::NONE) else {
+            panic!()
+        };
+        assert_eq!(s, "line\n".repeat(10));
     }
 
     #[test]

@@ -345,14 +345,16 @@ impl Keymap {
         for (i, a) in self.bindings.iter().enumerate() {
             for b in &self.bindings[i + 1..] {
                 // Select keys only work inside dialogs, where app keys don't.
+                // The prompt looks keys up in App, Scroll, Editor order, so any two of them shadow.
                 let main = |s: Scope| s != Scope::Select;
-                let shared = a.def.scope == b.def.scope
-                    || (main(a.def.scope)
-                        && main(b.def.scope)
-                        && (a.def.scope == Scope::App || b.def.scope == Scope::App));
+                let shared = a.def.scope == b.def.scope || (main(a.def.scope) && main(b.def.scope));
                 if shared && let Some(k) = a.combos.iter().position(|c| b.combos.contains(c)) {
-                    // Known, intended overlaps: app.exit only fires on an empty editor.
-                    if (a.def.action, b.def.action) == (A::Exit, A::DeleteForward) {
+                    // Known, intended overlaps: app.exit only fires on an empty editor;
+                    // ctrl+f searches the transcript and moves right only in dialog inputs.
+                    if matches!(
+                        (a.def.action, b.def.action),
+                        (A::Exit, A::DeleteForward) | (A::Search, A::CursorRight)
+                    ) {
                         continue;
                     }
                     out.push(format!(
@@ -401,6 +403,17 @@ mod tests {
         assert_eq!(parse("ctrl+shift+F"), parse("ctrl+shift+f"));
         assert!(parse("hyper+x").is_none());
         assert!(km.conflicts().is_empty(), "{:?}", km.conflicts());
+    }
+
+    #[test]
+    fn scroll_editor_overlap_is_reported() {
+        let o: BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(r#"{"tui.altScreen.top":["ctrl+a"]}"#).unwrap();
+        let c = Keymap::new(&o).0.conflicts();
+        assert_eq!(
+            c,
+            ["`ctrl+a` is bound to both tui.altScreen.top and tui.editor.cursorLineStart"]
+        );
     }
 
     #[test]
