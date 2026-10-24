@@ -402,6 +402,11 @@ impl Hub {
             }
             g.approvals.insert(id, Pending { msg, reply: tx });
         }
+        let _open = Open {
+            hub: self.clone(),
+            id,
+            ask: false,
+        };
         self.set_blocked();
         rx.await.unwrap_or(Answer::Deny(None))
     }
@@ -466,6 +471,11 @@ impl Hub {
             }
             g.asks.insert(id, (msg, tx));
         }
+        let _open = Open {
+            hub: self.clone(),
+            id,
+            ask: true,
+        };
         self.set_blocked();
         rx.await.ok().flatten()
     }
@@ -482,6 +492,24 @@ impl Hub {
         }
         drop(g);
         self.set_blocked();
+    }
+}
+
+/// An open approval or question: if its waiter is dropped (a stopped subagent's relay),
+/// answer it as denied / dismissed so the card closes in every window. A no-op once answered.
+struct Open {
+    hub: Arc<Hub>,
+    id: u64,
+    ask: bool,
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        if self.ask {
+            self.hub.answer_ask(self.id, None);
+        } else {
+            self.hub.answer(self.id, Answer::Deny(None));
+        }
     }
 }
 
