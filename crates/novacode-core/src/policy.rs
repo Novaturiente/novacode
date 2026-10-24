@@ -583,6 +583,30 @@ impl Policy {
             }
         }
 
+        // novacode's settings hold the permission rules: a file tool changes them only with the user's yes,
+        // ahead of any allow rule (the agent mustn't widen its own permissions).
+        if MUTATING.contains(&lower.as_str()) {
+            let is_settings = |q: &Path| {
+                q.file_name().is_some_and(|n| n == "settings.json")
+                    && q.parent().and_then(Path::file_name).is_some_and(|d| d == ".novacode")
+            };
+            if let Some(p) = written(&lower, args).into_iter().find(|p| {
+                let abs = expand(p, cwd, &self.home);
+                is_settings(&abs) || is_settings(&real(&abs))
+            }) {
+                let why = format!("`{tool}` changes novacode settings ({p}), which hold the permission rules");
+                return if interactive {
+                    Verdict::Ask {
+                        reason: why,
+                        rule: String::new(),
+                        risky: true,
+                    }
+                } else {
+                    Verdict::Deny(format!("{why}; nobody can approve it here."))
+                };
+            }
+        }
+
         let session = self.session_allow.lock().unwrap();
         let turn = self.turn.lock().unwrap();
         if self
@@ -1065,6 +1089,17 @@ mod tests {
         }
         // The bash rule still covers the whole folder.
         assert!(denied(&check("bash", json!({"command": "rm -rf ~/.novacode/skills"}))));
+        // Settings (global or project) hold the permission rules: always the user's call, despite the allow rule.
+        for path in ["~/.novacode/settings.json", ".novacode/settings.json"] {
+            assert!(denied(&check("edit", json!({"path": path}))), "{path}");
+            assert!(
+                matches!(
+                    p.check("edit", &json!({"path": path}), &proj, true),
+                    Verdict::Ask { risky: true, .. }
+                ),
+                "{path}"
+            );
+        }
     }
 
     #[test]
