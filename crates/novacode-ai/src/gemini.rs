@@ -348,6 +348,54 @@ fn part(b: &Block) -> Option<Value> {
     }
 }
 
+/// Google's `RetryInfo.retryDelay` ("3.5s") from an error body, in ms.
+fn retry_info_ms(body: &str) -> Option<u64> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let e = match &v {
+        Value::Array(a) => &a.first()?["error"],
+        _ => &v["error"],
+    };
+    e["details"].as_array()?.iter().find_map(|d| {
+        let t = d["@type"].as_str()?;
+        if !t.ends_with("google.rpc.RetryInfo") {
+            return None;
+        }
+        let s: f64 = d["retryDelay"].as_str()?.strip_suffix('s')?.parse().ok()?;
+        std::time::Duration::try_from_secs_f64(s.max(0.0))
+            .ok()
+            .map(|d| d.as_millis() as u64)
+    })
+}
+
+/// A leading "1h2m3s" / "0s" / "500ms" duration in ms; text after it is ignored.
+fn duration_ms(s: &str) -> Option<u64> {
+    let mut total = 0f64;
+    let mut any = false;
+    let mut num = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() || c == '.' {
+            num.push(c);
+            continue;
+        }
+        let Ok(n) = num.parse::<f64>() else { break };
+        num.clear();
+        let unit = match c {
+            'h' => 3_600_000.0,
+            'm' if chars.peek() == Some(&'s') => {
+                chars.next();
+                1.0
+            }
+            'm' => 60_000.0,
+            's' => 1_000.0,
+            _ => break,
+        };
+        total += n * unit;
+        any = true;
+    }
+    any.then_some(total as u64)
+}
+
 // ---------- stream ----------
 
 #[derive(Default)]
@@ -370,14 +418,32 @@ impl State {
 impl Wire for State {
     fn classify(status: u16, headers: &reqwest::header::HeaderMap, body: &str) -> Failure {
         let (kind, msg) = http::classify_openai(status, headers, body);
-        let lower = msg.to_ascii_lowercase();
-        // Cloud Code: the subscription's model quota is used up.
-        let kind = if status == 429 && (lower.contains("quota") || lower.contains("exhausted")) {
-            ErrorKind::QuotaExhausted
-        } else {
-            kind
+        if status != 429 {
+            return (kind, msg);
+        }
+        let lower = body.to_ascii_lowercase();
+        // Only a daily or billing quota is used up; per-minute limits and Cloud
+        // Code's burst limiter ("reset after 0s") clear within seconds.
+        let used_up = [
+            "per day",
+            "perday",
+            "per_day",
+            "daily",
+            "billing",
+            "insufficient_quota",
+            "quota_exhausted",
+        ];
+        if used_up.iter().any(|w| lower.contains(w)) {
+            return (ErrorKind::QuotaExhausted, msg);
+        }
+        let header = match kind {
+            ErrorKind::RateLimit { retry_after_ms } => retry_after_ms,
+            _ => None,
         };
-        (kind, msg)
+        let retry_after_ms = retry_info_ms(body)
+            .or_else(|| lower.split_once("reset after ").and_then(|(_, rest)| duration_ms(rest)))
+            .or(header);
+        (ErrorKind::RateLimit { retry_after_ms }, msg)
     }
 
     async fn at_eof(&mut self, b: &mut Builder) -> Result<StopReason, Failure> {
@@ -402,8 +468,12 @@ impl Wire for State {
             &v
         };
         if let Some(e) = r.get("error") {
-            let msg = e["message"].as_str().unwrap_or("error").to_string();
-            return Err((ErrorKind::Transient, msg));
+            let status = e["code"].as_u64().filter(|c| (400..600).contains(c)).unwrap_or(500) as u16;
+            return Err(Self::classify(
+                status,
+                &Default::default(),
+                &json!({ "error": e }).to_string(),
+            ));
         }
         if b.response_id.is_none() {
             b.response_id = r["responseId"].as_str().map(String::from);
@@ -436,7 +506,11 @@ impl Wire for State {
                     .unwrap_or_else(|| format!("call_{}", novacode_base::new_id().simple()));
                 b.start(i, BlockKind::ToolCall, &id, fc["name"].as_str().unwrap_or_default())
                     .await;
-                b.delta(i, &fc["args"].to_string()).await;
+                let args = fc
+                    .get("args")
+                    .filter(|a| !a.is_null())
+                    .map_or("{}".into(), Value::to_string);
+                b.delta(i, &args).await;
                 if let Some(s) = sig {
                     b.set_replay(i, json!({ "sig": s }));
                 }
@@ -559,6 +633,72 @@ mod tests {
         assert_eq!(b["contents"][1]["parts"][0]["thoughtSignature"], SKIP_SIGNATURE);
         let b = build_request(&req("claude-sonnet-4-6", history("claude")), "antigravity");
         assert!(b["tools"][0]["functionDeclarations"][0].get("parameters").is_some());
+    }
+
+    #[test]
+    fn rate_limits_vs_quota() {
+        let h = reqwest::header::HeaderMap::new();
+        let k = |body: &str| State::classify(429, &h, body).0;
+        assert_eq!(
+            k(
+                r#"{"error":{"code":429,"message":"Quota exceeded for quota metric 'Generate Content API requests per minute'","status":"RESOURCE_EXHAUSTED"}}"#
+            ),
+            ErrorKind::RateLimit { retry_after_ms: None }
+        );
+        assert_eq!(
+            k(
+                r#"{"error":{"code":429,"message":"You have exhausted your capacity on this model. Your quota will reset after 0s.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2s"}]}}"#
+            ),
+            ErrorKind::RateLimit {
+                retry_after_ms: Some(2000)
+            }
+        );
+        assert_eq!(
+            k(r#"{"error":{"code":429,"message":"Your quota will reset after 1m30s."}}"#),
+            ErrorKind::RateLimit {
+                retry_after_ms: Some(90_000)
+            }
+        );
+        assert_eq!(
+            k(
+                r#"{"error":{"code":429,"message":"Quota exceeded for quota metric 'Generate Content API requests per day'"}}"#
+            ),
+            ErrorKind::QuotaExhausted
+        );
+        assert_eq!(duration_ms("0s."), Some(0));
+        assert_eq!(duration_ms("2h5m. next 3s"), Some(7_500_000));
+        assert_eq!(duration_ms("soon"), None);
+    }
+
+    #[tokio::test]
+    async fn mid_stream_rate_limit_is_retryable_and_missing_args_are_empty() {
+        let (mut b, rx) = http::channel("antigravity", "gemini-3-flash");
+        let mut st = State::default();
+        let ev = |d: &str| SseEvent {
+            event: String::new(),
+            data: d.into(),
+        };
+        let err = st
+            .on_event(
+                &ev(
+                    r#"{"error":{"code":429,"message":"Quota exceeded for quota metric 'requests per minute'","status":"RESOURCE_EXHAUSTED"}}"#,
+                ),
+                &mut b,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err.0, ErrorKind::RateLimit { .. }), "{err:?}");
+        assert!(err.0.is_retryable());
+        st.on_event(
+            &ev(r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"ls"}}]},"finishReason":"STOP"}]}"#),
+            &mut b,
+        )
+        .await
+        .unwrap();
+        let stop = st.at_eof(&mut b).await.unwrap();
+        b.finish(stop).await;
+        let m = collect(rx).await;
+        assert_eq!(m.tool_calls().next().unwrap().arguments, json!({}));
     }
 
     #[tokio::test]

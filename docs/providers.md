@@ -264,6 +264,22 @@ A provider can be any program that speaks JSON-RPC on stdio. Set `"api": "proces
 
 Project settings only apply in folders you trust, so a repository can't start a provider program on its own.
 
+## Errors and retries
+
+novacode retries failures that are likely to pass on their own: network errors, timeouts, server errors (5xx) and rate limits (429). It does not retry errors that need you, such as a bad key or an invalid request.
+
+**Retry schedule.** Retries happen only before the reply starts.
+
+- The provider connection retries twice quickly, after 0.5 s and 1 s.
+- If that fails, the agent loop retries 4 more times, after 2, 4, 8 and 16 s, each with up to 25% random jitter. Each retry shows in the transcript, and Esc cancels it.
+- When the server asks for a specific wait (a `retry-after` header, or Google's retry delay), novacode waits that long instead, up to 60 s. A longer requested wait is not retried; with several accounts, novacode switches account instead.
+
+**First-response timeout.** If a provider sends no response headers within 120 s, the attempt fails as a network error and is retried. The same 120 s limit applies to any pause between two chunks of a streamed reply.
+
+**Rate limits vs used-up quota (429).** A 429 usually means a per-minute limit. novacode retries it after the delay the server gives (Google sends this in the error body, for example "reset after 2s"). Only a daily or billing quota counts as used up. That error is not retried: with several accounts, novacode parks the account for an hour and switches to the next one. A rate limit whose wait is over 60 s is handled the same way, and the account is parked until the reset time the server gave.
+
+**Token refresh errors.** Subscription tokens are refreshed about once an hour. If the refresh fails because of a network error or a token-server error, the request fails as a temporary error and is retried on the same account. Only a login that is gone (expired or revoked, not logged in, or a bad key) makes novacode switch to the next account.
+
 ## Check and remove
 
 ```sh
