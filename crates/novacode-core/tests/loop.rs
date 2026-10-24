@@ -216,7 +216,8 @@ async fn retry_is_hidden_and_errors_end_the_run() {
         store,
         cfg(work.path(), home.path()),
         Arc::new(LocalEnv),
-    );
+    )
+    .with_retry_base(std::time::Duration::from_millis(5));
     let (_agent, events) = drive(agent, &["hi", "again"]).await;
     assert!(events.iter().any(|e| matches!(
         e,
@@ -1968,4 +1969,150 @@ async fn reload_carries_reads_mode_and_session_approvals() {
     let (_fresh, _) = drive(fresh, &["now edit"]).await;
     let last = format!("{:?}", faux2.requests.lock().unwrap()[1].messages.last().unwrap());
     assert!(last.contains("changed on disk since your last read"), "{last}");
+}
+
+/// Fails `n` times with a transient error, then answers; returns the agent's events.
+async fn transient_failures(n: usize) -> (Faux, Vec<AgentEvent>) {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let mut script: Vec<FauxReply> = (0..n)
+        .map(|_| FauxReply::Fail(ErrorKind::Transient, "overloaded".into()))
+        .collect();
+    script.push(FauxReply::text("ok"));
+    let faux = Faux::new(script);
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        vec![],
+        Store::create(&Paths::new(home.path()), work.path(), true),
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_retry_base(std::time::Duration::from_millis(5));
+    let (_a, events) = drive(agent, &["hi"]).await;
+    (faux, events)
+}
+
+#[tokio::test]
+async fn loop_retries_four_times_then_succeeds() {
+    let (faux, events) = transient_failures(4).await;
+    let delays: Vec<u64> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Retry { delay_ms, .. } => Some(*delay_ms),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(delays.len(), 4);
+    assert_eq!(faux.requests.lock().unwrap().len(), 5);
+    assert!(events.contains(&AgentEvent::AgentEnd { stop: StopReason::Stop }));
+}
+
+#[tokio::test]
+async fn loop_gives_up_after_five_failures() {
+    let (faux, events) = transient_failures(5).await;
+    let retries = events.iter().filter(|e| matches!(e, AgentEvent::Retry { .. })).count();
+    assert_eq!(retries, 4);
+    assert_eq!(faux.requests.lock().unwrap().len(), 5);
+    assert!(events.contains(&AgentEvent::AgentEnd {
+        stop: StopReason::Error {
+            kind: ErrorKind::Transient
+        }
+    }));
+}
+
+#[tokio::test]
+async fn quoted_tool_markup_is_not_nudged() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let faux = Faux::new([
+        FauxReply::text("The check looks for `<function_calls>` and <invoke name= in replies."),
+        FauxReply::text("unused"),
+    ]);
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        vec![],
+        Store::create(&Paths::new(home.path()), work.path(), true),
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    );
+    let (_a, events) = drive(agent, &["explain the check"]).await;
+    assert_eq!(faux.requests.lock().unwrap().len(), 1, "no nudge, no second call");
+    assert!(events.contains(&AgentEvent::AgentEnd { stop: StopReason::Stop }));
+}
+
+/// Never answers; signals when a card arrives.
+struct Never(Arc<tokio::sync::Notify>);
+impl novacode_core::policy::Approver for Never {
+    fn approve(
+        &self,
+        _req: novacode_core::policy::ApprovalRequest,
+    ) -> futures_util::future::BoxFuture<'_, novacode_core::policy::Approval> {
+        self.0.notify_one();
+        Box::pin(std::future::pending())
+    }
+}
+
+/// An agent in ask mode whose first call waits on an approval that never comes.
+fn waiting_on_approval(work: &Path, home: &Path) -> (Agent, Arc<tokio::sync::Notify>) {
+    use novacode_core::policy::{Mode, Permissions, Policy};
+    let faux = Faux::new([
+        tools_reply(vec![call("a", "bash", json!({"command": "touch one"}))]),
+        FauxReply::text("unused"),
+    ]);
+    let asked = Arc::new(tokio::sync::Notify::new());
+    let agent = Agent::new(
+        Arc::new(faux),
+        novacode_tools::builtins(false),
+        Store::create(&Paths::new(home), work, true),
+        cfg(work, home),
+        Arc::new(LocalEnv),
+    )
+    .with_policy(Policy::new(Permissions::default(), home.into(), None).with_mode(Mode::Ask))
+    .with_approver(Arc::new(Never(asked.clone())));
+    (agent, asked)
+}
+
+#[tokio::test]
+async fn abort_ends_a_pending_approval() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (agent, asked) = waiting_on_approval(work.path(), home.path());
+    let (h, task) = agent::spawn(agent);
+    let mut rx = h.subscribe();
+    h.prompt("make a file");
+    asked.notified().await;
+    h.abort();
+    let end = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let AgentEvent::AgentEnd { stop } = rx.recv().await.unwrap() {
+                return stop;
+            }
+        }
+    })
+    .await
+    .expect("the run ends without an answer");
+    assert_eq!(end, StopReason::Aborted);
+    assert!(!work.path().join("one").exists(), "the tool did not run");
+    h.shutdown();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn take_follow_ups_drops_queued_prompts() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (agent, asked) = waiting_on_approval(work.path(), home.path());
+    let (h, task) = agent::spawn(agent);
+    let mut rx = h.subscribe();
+    h.prompt("make a file");
+    asked.notified().await;
+    // The run is busy, so these wait in the follow-up queue.
+    h.prompt("then this");
+    h.prompt("and this");
+    assert_eq!(h.take_follow_ups(), 2);
+    assert_eq!(h.take_follow_ups(), 0);
+    h.abort();
+    while !matches!(rx.recv().await.unwrap(), AgentEvent::AgentEnd { .. }) {}
+    h.shutdown();
+    task.await.unwrap();
 }

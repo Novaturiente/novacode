@@ -627,7 +627,9 @@ impl Store {
         let up = |e: &Entry| {
             let mut cur = e.parent.as_deref();
             while let Some(id) = cur {
-                let p = &self.entries[self.index[id]];
+                // A parent lost to an unreadable line ends the walk, as in `path_to_leaf`.
+                let &i = self.index.get(id)?;
+                let p = &self.entries[i];
                 if prompt_text(p).is_some() {
                     return Some(p.id.as_str());
                 }
@@ -672,6 +674,50 @@ pub fn list(paths: &Paths, cwd: &Path) -> Vec<PathBuf> {
         .collect();
     files.sort_by_key(|f| std::cmp::Reverse(f.0));
     files.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Typed prompts from this cwd's recent sessions, oldest first, at most `max` (L9.5 history).
+/// Newest sessions are read first (at most 20 files), skipping session `exclude`.
+/// Prompt text = the text blocks of stored user messages, joined as the TUI joins them.
+pub fn recent_prompts(paths: &Paths, cwd: &Path, exclude: Option<&str>, max: usize) -> Vec<String> {
+    let mut chunks: Vec<Vec<String>> = Vec::new();
+    let mut have = 0;
+    let files = list(paths, cwd)
+        .into_iter()
+        .filter(|p| exclude.is_none_or(|x| p.file_stem().is_none_or(|s| s != x)))
+        .take(20);
+    for path in files {
+        if have >= max {
+            break;
+        }
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let mut found: Vec<String> = bytes
+            .split(|b| *b == b'\n')
+            .filter_map(|l| std::str::from_utf8(l).ok())
+            // Cheap prefilter: only user messages are parsed.
+            .filter(|l| l.contains("\"role\":\"user\""))
+            .filter_map(|l| match serde_json::from_str::<Entry>(l).ok()?.kind {
+                EntryKind::Message {
+                    message: Message::User { content },
+                } => Some(
+                    content
+                        .iter()
+                        .filter_map(|b| match b {
+                            Block::Text { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .filter(|t| !t.trim().is_empty())
+            .collect();
+        let keep = found.len().min(max - have);
+        found.drain(..found.len() - keep);
+        have += keep;
+        chunks.push(found);
+    }
+    chunks.into_iter().rev().flatten().collect()
 }
 
 /// What the session picker shows.
@@ -952,6 +998,78 @@ mod tests {
         let p = s.projection();
         assert_eq!(p.len(), 3);
         assert_eq!(p[2], Message::user("c"));
+    }
+
+    #[test]
+    fn prompts_survive_a_corrupt_middle_line() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = Store::create(&Paths::new(home.path()), home.path(), false);
+        s.append(msg("one")).unwrap();
+        let r1 = s.append(reply("r1")).unwrap();
+        s.append(msg("two")).unwrap();
+        s.append(reply("r2")).unwrap();
+        let path = s.path().unwrap().to_path_buf();
+        drop(s);
+        // Break the line "two" points at, so its parent id is missing on open.
+        let text: String = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                let own = l.starts_with(&format!("{{\"id\":\"{r1}\""));
+                format!("{}\n", if own { "{broken" } else { l })
+            })
+            .collect();
+        assert!(text.contains("{broken"));
+        std::fs::write(&path, text).unwrap();
+        let s = Store::open(&path).unwrap();
+        let texts: Vec<String> = s.prompts().into_iter().map(|p| p.text).collect();
+        assert_eq!(texts, ["one", "two"]);
+    }
+
+    #[test]
+    fn recent_prompts_newest_sessions_first() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::new(home.path());
+        let cwd = Path::new("/w");
+        let write = |prompts: &[&str]| {
+            let mut s = Store::create(&paths, cwd, false);
+            for p in prompts {
+                s.append(msg(p)).unwrap();
+                s.append(reply("ok")).unwrap();
+            }
+            s.append(EntryKind::CustomMessage {
+                kind: "nudge".into(),
+                text: "hidden".into(),
+                display: false,
+            })
+            .unwrap();
+            (s.id().to_string(), s.path().unwrap().to_path_buf())
+        };
+        let (_, old) = write(&["a", "b"]);
+        let (new_id, new) = write(&["c", "d"]);
+        let t = SystemTime::now();
+        let set = |p: &Path, secs| {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(t - std::time::Duration::from_secs(secs))
+                .unwrap()
+        };
+        set(&old, 100);
+        set(&new, 10);
+        // An unreadable line is skipped.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&old)
+            .unwrap()
+            .write_all(b"{\"role\":\"user\" broken\n")
+            .unwrap();
+        set(&old, 100);
+        assert_eq!(recent_prompts(&paths, cwd, None, 10), ["a", "b", "c", "d"]);
+        assert_eq!(recent_prompts(&paths, cwd, None, 3), ["b", "c", "d"]);
+        assert_eq!(recent_prompts(&paths, cwd, Some(&new_id), 10), ["a", "b"]);
+        assert!(recent_prompts(&paths, Path::new("/other"), None, 10).is_empty());
     }
 
     #[test]

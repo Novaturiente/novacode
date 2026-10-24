@@ -133,6 +133,22 @@ pub async fn authorize(
     cwd: &Path,
     hook: &crate::policy::HookDecision,
 ) -> Option<ToolOutput> {
+    let never = tokio_util::sync::CancellationToken::new();
+    authorize_cancellable(policy, approver, tool, read_only, args, cwd, hook, &never).await
+}
+
+/// [`authorize`], but a cancelled `cancel` ends a pending approval as a deny ("aborted"), not recorded.
+#[allow(clippy::too_many_arguments)]
+pub async fn authorize_cancellable(
+    policy: &crate::policy::Policy,
+    approver: Option<&Arc<dyn crate::policy::Approver>>,
+    tool: &str,
+    read_only: bool,
+    args: &Value,
+    cwd: &Path,
+    hook: &crate::policy::HookDecision,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Option<ToolOutput> {
     use crate::policy::{Approval, ApprovalRequest, Verdict};
     let (reason, rule, risky) = match policy.check_tool(tool, read_only, args, cwd, approver.is_some(), hook) {
         Verdict::Allow => return None,
@@ -151,7 +167,11 @@ pub async fn authorize(
         rule,
         risky,
     };
-    let answer = approver.approve(req.clone()).await;
+    let answer = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Some(ToolOutput::error("Not run: aborted.")),
+        a = approver.approve(req.clone()) => a,
+    };
     policy.record(&req, &answer);
     match answer {
         Approval::Deny(why) => Some(ToolOutput::error(match why {
