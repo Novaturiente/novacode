@@ -37,11 +37,14 @@ struct Inner {
 /// Why an account's adapter could not be built: (kind, whether another account may help, message).
 type AuthFailure = (ErrorKind, bool, String);
 
-/// A login that is gone moves on to the next account; a network blip or token
-/// endpoint error leaves the account in place and is retried.
+/// A login that is gone (or a token endpoint 4xx refusal) moves on to the next
+/// account; a network blip or token endpoint 5xx/408/429 leaves the account in
+/// place and is retried.
 fn auth_failure(e: &AuthError) -> AuthFailure {
     let (kind, rotate) = match e {
-        AuthError::Expired(..) | AuthError::NotLoggedIn(_) | AuthError::Key(_) => (ErrorKind::Auth, true),
+        AuthError::Expired(..) | AuthError::Rejected(_) | AuthError::NotLoggedIn(_) | AuthError::Key(_) => {
+            (ErrorKind::Auth, true)
+        }
         AuthError::Http(_) => (ErrorKind::Transient, false),
         AuthError::Io(_) => (ErrorKind::Other, false),
     };
@@ -459,6 +462,54 @@ mod tests {
         );
         assert_eq!(auth_failure(&AuthError::NotLoggedIn("sub".into())).0, ErrorKind::Auth);
         assert!(auth_failure(&AuthError::Key("x".into())).1, "a bad key rotates");
+    }
+
+    #[tokio::test]
+    async fn a_refused_refresh_token_rotates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let sub = r#"{ "providers": { "sub": { "name": "Sub", "api": "openai-chat", "auth": "oauth", "baseUrl": "http://127.0.0.1:1" } } }"#;
+        std::fs::write(&path, sub).unwrap();
+        let p = Arc::new(Providers::load(dir.path(), &Settings::load(&path, None, false)));
+        let cred = OAuthCredential {
+            access: "a".into(),
+            refresh: "r".into(),
+            expires_ms: u64::MAX / 2,
+            project: None,
+        };
+        p.auth.put("sub", "default", cred.clone()).await.unwrap();
+        p.auth.put("sub", "work", cred).await.unwrap();
+        let (first, _) = p.adapter_for("sub", "default", None).await.unwrap();
+        let a = Live::new(p.clone(), "sub", vec!["default".into(), "work".into()], None, first);
+        // A 401 without `invalid_grant`, as the token endpoint sends for a revoked token.
+        *a.inner.fault.lock().unwrap() = Some(|| {
+            AuthError::Rejected(r#"token endpoint returned 401 Unauthorized: {"error":"unauthorized_client"}"#.into())
+        });
+        let req = Request {
+            tail: Vec::new(),
+            model: "m".into(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 10,
+            cache: CacheRetention::Short,
+            thinking: None,
+            images: false,
+            session: None,
+        };
+        let mut rx = a.stream(req, CancellationToken::new());
+        let first = rx.recv().await.unwrap();
+        assert!(
+            matches!(&first, StreamEvent::Notice { text: n } if n.contains("account `default`") && n.contains("switched to account `work`")),
+            "{first:?}"
+        );
+        // The seam fails every account, so the last one ends the turn as Auth.
+        let m = collect(rx).await;
+        assert_eq!(
+            (m.stop, a.account()),
+            (StopReason::Error { kind: ErrorKind::Auth }, "work".to_string()),
+            "{:?}",
+            m.error_message
+        );
     }
 
     #[test]
