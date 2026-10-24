@@ -6,7 +6,14 @@ use novacode_base::storage::append_jsonl;
 use serde_json::json;
 use std::path::PathBuf;
 
-const SECRET_HEADERS: &[&str] = &["authorization", "x-api-key", "cookie"];
+/// A header whose lowercase name contains one of these is redacted (covers
+/// `x-goog-api-key`, `api-key`, `helicone-auth` and user-defined ones).
+const SECRET_PARTS: &[&str] = &["auth", "key", "token", "secret", "cookie"];
+
+fn is_secret(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    SECRET_PARTS.iter().any(|p| n.contains(p))
+}
 
 #[derive(Debug, Clone)]
 pub struct Trace {
@@ -28,7 +35,7 @@ impl Trace {
             .headers()
             .iter()
             .map(|(k, v)| {
-                let v = if SECRET_HEADERS.contains(&k.as_str()) {
+                let v = if is_secret(k.as_str()) {
                     "<redacted>"
                 } else {
                     v.to_str().unwrap_or("<binary>")
@@ -62,10 +69,18 @@ mod tests {
         let req = reqwest::Client::new()
             .post("http://x/v1")
             .header("x-api-key", "sk-secret")
+            .header("x-goog-api-key", "goog-secret")
+            .header("api-key", "azure-secret")
+            .header("x-portkey-api-key", "portkey-secret")
+            .header("helicone-auth", "helicone-secret")
+            .header("x-session-token", "token-secret")
+            .header("cookie", "cookie-secret")
+            .header("content-type", "application/json")
             .bearer_auth("tok");
         t.request(&req, b"{\"a\":1}");
         let text = std::fs::read_to_string(&t.path).unwrap();
-        assert!(!text.contains("sk-secret") && !text.contains("tok\""), "{text}");
+        assert!(!text.contains("secret\"") && !text.contains("tok\""), "{text}");
         assert!(text.contains("<redacted>") && text.contains("\"a\":1"));
+        assert!(text.contains("application/json"), "ordinary headers stay: {text}");
     }
 }

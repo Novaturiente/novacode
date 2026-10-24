@@ -24,16 +24,28 @@ pub fn backup_path(path: &Path) -> PathBuf {
 /// Replace `path` with `bytes` so readers see either the old or the new file,
 /// never a torn one. The old file is kept as `<path>.bak`.
 pub fn write_atomic(path: &Path, bytes: &[u8], durability: Durability) -> io::Result<()> {
-    write_impl(path, bytes, durability, None)
+    write_impl(path, bytes, durability, None, true)
+}
+
+/// Like [`write_atomic`], but no `.bak` is made or touched: for user files,
+/// where a `<path>.bak` may be the user's own.
+pub fn write_atomic_no_backup(path: &Path, bytes: &[u8], durability: Durability) -> io::Result<()> {
+    write_impl(path, bytes, durability, None, false)
 }
 
 /// Like [`write_atomic`], but the file is `0600` from its first byte and the
 /// parent dir is made `0700`. Always durable.
 pub fn write_secret(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_impl(path, bytes, Durability::Durable, Some(0o600))
+    write_impl(path, bytes, Durability::Durable, Some(0o600), true)
 }
 
-fn write_impl(path: &Path, bytes: &[u8], durability: Durability, mode: Option<u32>) -> io::Result<()> {
+fn write_impl(
+    path: &Path,
+    bytes: &[u8],
+    durability: Durability,
+    mode: Option<u32>,
+    keep_backup: bool,
+) -> io::Result<()> {
     let dir = path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
@@ -63,7 +75,7 @@ fn write_impl(path: &Path, bytes: &[u8], durability: Durability, mode: Option<u3
             f.sync_all()?;
         }
         drop(f);
-        if path.exists() {
+        if keep_backup && path.exists() {
             let bak = backup_path(path);
             let _ = fs::remove_file(&bak);
             // Hard link keeps the old bytes without a copy; the primary path never goes missing.
@@ -190,6 +202,18 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names.len(), 2, "temp file left behind: {names:?}");
+    }
+
+    #[test]
+    fn no_backup_write_leaves_an_existing_bak_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("notes");
+        fs::write(&p, b"old").unwrap();
+        fs::write(backup_path(&p), b"mine").unwrap();
+        write_atomic_no_backup(&p, b"new", Durability::Fast).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"new");
+        assert_eq!(fs::read(backup_path(&p)).unwrap(), b"mine");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2, "temp file left behind");
     }
 
     #[test]

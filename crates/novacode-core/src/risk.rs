@@ -490,17 +490,122 @@ const WRAPPERS: &[&str] = &[
     "nohup", "time", "nice", "ionice", "command", "exec", "builtin", "unbuffer", "stdbuf",
 ];
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "fish", "ksh"];
+/// Variables that make an otherwise read-only command run a program.
+const RUNNING_VARS: &[&str] = &[
+    "PAGER",
+    "LESSOPEN",
+    "LESSCLOSE",
+    "BASH_ENV",
+    "ENV",
+    "PATH",
+    "EDITOR",
+    "VISUAL",
+];
+const SUDO_VALUE_FLAGS: &[&str] = &["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "--user"];
+const XARGS_VALUE_FLAGS: &[&str] = &[
+    "-n",
+    "-L",
+    "-P",
+    "-s",
+    "-I",
+    "-d",
+    "-E",
+    "-a",
+    "--max-args",
+    "--max-procs",
+    "--delimiter",
+    "--arg-file",
+];
+
+/// The words after a wrapper's options: skips `-x`, `--x=…` and `--`, plus the
+/// next word after a flag in `value_flags`.
+fn skip_opts<'a>(args: &'a [String], value_flags: &[&str]) -> &'a [String] {
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        if a == "--" {
+            return &args[i + 1..];
+        }
+        if !a.starts_with('-') || a == "-" {
+            break;
+        }
+        i += if value_flags.contains(&a.as_str()) { 2 } else { 1 };
+    }
+    &args[i.min(args.len())..]
+}
+
+/// GNU-style parse: short letters in `value_short` and long names in
+/// `value_long` take a value (attached or the next word). Options may follow
+/// positionals; `--` ends them.
+struct Opts<'a> {
+    pos: Vec<&'a str>,
+    /// (letter or long name, value).
+    opts: Vec<(String, Option<&'a str>)>,
+}
+
+impl Opts<'_> {
+    fn has(&self, f: impl Fn(&str) -> bool) -> bool {
+        self.opts.iter().any(|(k, _)| f(k))
+    }
+}
+
+fn getopt<'a>(args: &'a [String], value_short: &str, value_long: &[&str]) -> Opts<'a> {
+    let mut o = Opts {
+        pos: Vec::new(),
+        opts: Vec::new(),
+    };
+    let mut it = args.iter().map(String::as_str);
+    while let Some(a) = it.next() {
+        if a == "--" {
+            o.pos.extend(it);
+            break;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            match long.split_once('=') {
+                Some((k, v)) => o.opts.push((k.to_string(), Some(v))),
+                None if value_long.contains(&long) => o.opts.push((long.to_string(), it.next())),
+                None => o.opts.push((long.to_string(), None)),
+            }
+        } else if a.len() > 1 && a.starts_with('-') {
+            for (j, c) in a.char_indices().skip(1) {
+                if value_short.contains(c) {
+                    let rest = &a[j + c.len_utf8()..];
+                    let v = if rest.is_empty() { it.next() } else { Some(rest) };
+                    o.opts.push((c.to_string(), v));
+                    break;
+                }
+                o.opts.push((c.to_string(), None));
+            }
+        } else {
+            o.pos.push(a);
+        }
+    }
+    o
+}
 
 fn command(words: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
     // Leading `VAR=value` assignments.
     let mut w: &[String] = words;
+    let mut runs_var = false;
     while let Some(first) = w.first() {
         if first.contains('=') && !first.starts_with('-') && !first.starts_with('=') {
+            let var = first.split('=').next().unwrap_or("");
+            runs_var |= var.starts_with("GIT_") || var.starts_with("LD_") || RUNNING_VARS.contains(&var);
             w = &w[1..];
         } else {
             break;
         }
     }
+    let r = simple(w, piped, ctx, depth);
+    // `GIT_EXTERNAL_DIFF=… git diff`, `PAGER=… git log`: the variable runs a program.
+    if runs_var && r.level == Level::Safe {
+        Risk::low()
+    } else {
+        r
+    }
+}
+
+/// A simple command without its leading assignments.
+fn simple(w: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
     let Some(first) = w.first() else {
         return Risk::safe();
     };
@@ -509,29 +614,79 @@ fn command(words: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
     let rest = || args.join(" ");
     match name.as_str() {
         "sudo" | "doas" | "pkexec" => {
-            let inner = args.iter().position(|a| !a.starts_with('-')).map(|i| &args[i..]);
-            let inner_risk = inner.map_or(Risk::safe(), |i| command(i, piped, ctx, depth));
+            let inner = skip_opts(args, SUDO_VALUE_FLAGS);
+            let inner_risk = if inner.is_empty() {
+                Risk::safe()
+            } else {
+                command(inner, piped, ctx, depth)
+            };
             Risk::new(Level::Confirm, format!("runs as root ({name})")).max(inner_risk)
         }
         "env" => {
-            let i = args.iter().position(|a| !a.starts_with('-') && !a.contains('='));
-            i.map_or(Risk::safe(), |i| command(&args[i..], piped, ctx, depth))
+            let mut i = 0;
+            while let Some(a) = args.get(i) {
+                let split = if a == "-S" || a == "--split-string" {
+                    i += 1;
+                    Some(args.get(i).map_or("", String::as_str))
+                } else {
+                    a.strip_prefix("--split-string=")
+                        .or_else(|| a.strip_prefix("-S").filter(|s| !s.is_empty()))
+                };
+                if let Some(s) = split {
+                    // `-S` splits this string into the command and its arguments.
+                    return classify_depth(s, ctx, depth + 1);
+                }
+                if a == "--" {
+                    i += 1;
+                    break;
+                }
+                if !a.starts_with('-') {
+                    break;
+                }
+                i += if ["-u", "-C", "--unset", "--chdir"].contains(&a.as_str()) {
+                    2
+                } else {
+                    1
+                };
+            }
+            // command() skips (and judges) the `VAR=value` words.
+            let rest = &args[i.min(args.len())..];
+            if rest.is_empty() {
+                Risk::safe()
+            } else {
+                command(rest, piped, ctx, depth)
+            }
         }
         "timeout" => {
-            let i = args.iter().position(|a| !a.starts_with('-')).map(|i| i + 1);
-            i.filter(|i| *i < args.len())
-                .map_or(Risk::low(), |i| command(&args[i..], piped, ctx, depth))
+            // Options, then the duration, then the command.
+            let rest = skip_opts(args, &["-s", "-k", "--signal", "--kill-after"]);
+            match rest.get(1..) {
+                Some(c) if !c.is_empty() => command(c, piped, ctx, depth),
+                _ => Risk::low(),
+            }
         }
         "xargs" => {
-            let i = args.iter().position(|a| !a.starts_with('-'));
-            i.map_or(Risk::low(), |i| command(&args[i..], piped, ctx, depth))
-                .max(Risk::low())
-        }
-        n if WRAPPERS.contains(&n) => {
-            if args.is_empty() {
+            let rest = skip_opts(args, XARGS_VALUE_FLAGS);
+            if rest.is_empty() {
                 Risk::low()
             } else {
-                command(args, piped, ctx, depth)
+                command(rest, piped, ctx, depth).max(Risk::low())
+            }
+        }
+        n if WRAPPERS.contains(&n) => {
+            let value_flags: &[&str] = match n {
+                "nice" => &["-n", "--adjustment"],
+                "ionice" => &["-c", "-n", "-p", "-P", "-u"],
+                "stdbuf" => &["-i", "-o", "-e"],
+                "time" => &["-o", "-f", "--output", "--format"],
+                "exec" => &["-a"],
+                _ => &[],
+            };
+            let inner = skip_opts(args, value_flags);
+            if inner.is_empty() {
+                Risk::low()
+            } else {
+                command(inner, piped, ctx, depth)
             }
         }
         n if SHELLS.contains(&n) => {
@@ -561,7 +716,8 @@ fn command(words: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
         "for" | "done" | "fi" => Risk::safe(),
         "rm" => rm(args, ctx),
         "rmdir" | "unlink" => targets(args, ctx, "deletes").max(Risk::low()),
-        "mv" | "cp" | "ln" | "install" | "rsync" => targets(args, ctx, "replaces").max(Risk::low()),
+        "mv" | "cp" | "ln" | "install" => copy_like(&name, args, ctx),
+        "rsync" => rsync(args, ctx),
         "chmod" | "chown" | "chgrp" | "setfacl" => {
             let base = targets(args, ctx, "changes permissions of");
             if has_flag(args, 'R', "--recursive") {
@@ -580,7 +736,10 @@ fn command(words: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
             if deletes {
                 targets(&roots, ctx, "deletes everything found under")
                     .max(Risk::new(Level::Confirm, "find deletes the files it matches"))
-            } else if args.iter().any(|a| a.starts_with("-exec") || a == "-ok") {
+            } else if args
+                .iter()
+                .any(|a| a.starts_with("-exec") || a == "-ok" || a.starts_with("-fprint") || a == "-fls")
+            {
                 Risk::low()
             } else {
                 Risk::safe()
@@ -647,9 +806,155 @@ fn command(words: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
         }
         "git" => git(args),
         "sed" => sed(args),
-        n if SAFE.contains(&n) => Risk::safe(),
+        n if SAFE.contains(&n) => {
+            if writes_or_runs(n, args) {
+                Risk::low()
+            } else {
+                Risk::safe()
+            }
+        }
         _ => Risk::low(),
     }
+}
+
+/// Safe-list commands that write a file or run a program with these arguments.
+fn writes_or_runs(name: &str, args: &[String]) -> bool {
+    let short = |a: &str, c: char| a.starts_with('-') && !a.starts_with("--") && a[1..].contains(c);
+    let any = |f: &dyn Fn(&str) -> bool| args.iter().any(|a| f(a));
+    match name {
+        "awk" => {
+            let prog = regex::Regex::new(r#"system\s*\(|getline|\|\s*"|"\s*\||print[f]?\b[^;}]*>"#).unwrap();
+            any(&|a| {
+                (a.starts_with('-')
+                    && !a.starts_with("--")
+                    && (a.starts_with("-f") || a.starts_with("-i") || a.starts_with("-E")))
+                    || a.starts_with("--include")
+                    || a.starts_with("--file")
+                    || a.starts_with("--exec")
+                    || (!a.starts_with('-') && prog.is_match(a))
+            })
+        }
+        "fd" => any(&|a| a == "-x" || a == "-X" || a.starts_with("--exec")),
+        "sort" => any(&|a| a.starts_with("--output") || short(a, 'o')),
+        "tree" => any(&|a| short(a, 'o')),
+        "uniq" => {
+            getopt(args, "fsw", &["skip-fields", "skip-chars", "check-chars"])
+                .pos
+                .len()
+                >= 2
+        }
+        "xxd" => {
+            getopt(args, "cglosn", &["cols", "groupsize", "len", "offset", "seek", "name"])
+                .pos
+                .len()
+                >= 2
+        }
+        "rg" => any(&|a| a.starts_with("--pre")),
+        "ss" => has_flag(args, 'K', "--kill"),
+        "date" => any(&|a| a.starts_with("--set") || short(a, 's')),
+        _ => false,
+    }
+}
+
+/// An exact home or system folder (not a credential or user-protected path).
+fn is_exact_dir(p: &Path, ctx: &Ctx) -> bool {
+    p == ctx.home || SYSTEM_DIRS.iter().any(|d| p == Path::new(d))
+}
+
+/// Writing to `dest`: into an exact home or system folder (`into`, the file lands
+/// inside it) is ordinary; replacing one, or writing under credentials, is not.
+fn destination(dest: &str, ctx: &Ctx, into: bool, verb: &str) -> Risk {
+    let p = resolve(dest, ctx);
+    if is_device(&p) {
+        return Risk::new(Level::Catastrophic, format!("{verb} the device {}", p.display()));
+    }
+    match protected(&p, ctx) {
+        Some(_) if into && is_exact_dir(&p, ctx) => Risk::low(),
+        Some(why) => Risk::new(Level::Catastrophic, format!("{verb} {why}")),
+        None => Risk::low(),
+    }
+}
+
+/// cp/ln/install/mv: the destination is at risk (the last positional, or the
+/// `-t` folder); mv also takes its sources away.
+fn copy_like(name: &str, args: &[String], ctx: &Ctx) -> Risk {
+    let o = if name == "install" {
+        getopt(args, "gmoSt", &["group", "mode", "owner", "suffix", "target-directory"])
+    } else {
+        getopt(args, "St", &["suffix", "target-directory"])
+    };
+    let target = o
+        .opts
+        .iter()
+        .find(|(k, _)| k == "t" || k == "target-directory")
+        .and_then(|(_, v)| *v);
+    let (sources, dest): (&[&str], Option<&str>) = match (target, o.pos.split_last()) {
+        (Some(t), _) => (&o.pos, Some(t)),
+        (None, Some((d, s))) => (s, Some(*d)),
+        (None, None) => (&[], None),
+    };
+    let into = !o.has(|k| k == "T" || k == "no-target-directory");
+    let mut r = Risk::low();
+    if name == "mv" {
+        r = r.max(targets(sources, ctx, "moves"));
+    }
+    if let Some(d) = dest {
+        r = r.max(destination(d, ctx, into, "replaces"));
+    }
+    r
+}
+
+/// rsync: a home or system destination matters only with `--delete*`; sources
+/// only with `--remove-source-files`.
+fn rsync(args: &[String], ctx: &Ctx) -> Risk {
+    let o = getopt(
+        args,
+        "eBfMT",
+        &[
+            "rsh",
+            "filter",
+            "exclude",
+            "include",
+            "exclude-from",
+            "include-from",
+            "files-from",
+            "temp-dir",
+            "partial-dir",
+            "log-file",
+            "chmod",
+            "chown",
+            "rsync-path",
+            "link-dest",
+            "compare-dest",
+            "copy-dest",
+            "backup-dir",
+            "suffix",
+            "password-file",
+            "max-size",
+            "min-size",
+            "timeout",
+            "bwlimit",
+            "port",
+            "out-format",
+            "usermap",
+            "groupmap",
+            "max-delete",
+        ],
+    );
+    let deletes = o.has(|k| k.starts_with("delete") || k == "del");
+    let Some((dest, sources)) = o.pos.split_last() else {
+        return Risk::low();
+    };
+    let mut r = destination(
+        dest,
+        ctx,
+        !deletes,
+        if deletes { "deletes files in" } else { "replaces" },
+    );
+    if o.has(|k| k == "remove-source-files") {
+        r = r.max(targets(sources, ctx, "moves"));
+    }
+    r
 }
 
 fn has_flag(args: &[String], short: char, long: &str) -> bool {
@@ -674,9 +979,9 @@ fn rm(args: &[String], ctx: &Ctx) -> Risk {
 }
 
 /// Catastrophic when any non-flag argument resolves to a protected place.
-fn targets(args: &[String], ctx: &Ctx, verb: &str) -> Risk {
+fn targets<S: AsRef<str>>(args: &[S], ctx: &Ctx, verb: &str) -> Risk {
     let mut r = Risk::safe();
-    for a in args.iter().filter(|a| !a.starts_with('-')) {
+    for a in args.iter().map(AsRef::as_ref).filter(|a| !a.starts_with('-')) {
         let p = resolve(a, ctx);
         if is_device(&p) {
             r = r.max(Risk::new(
@@ -705,22 +1010,67 @@ fn sed(args: &[String]) -> Risk {
 }
 
 fn git(args: &[String]) -> Risk {
+    // Config keys that can't run a program (`core.fsmonitor`, `alias.x=!…`, `core.pager` can).
+    let harmless = |kv: &str| {
+        let k = kv.split('=').next().unwrap_or("").to_ascii_lowercase();
+        ["color.", "core.quotepath", "safe.directory", "user.", "advice."]
+            .iter()
+            .any(|p| k.starts_with(p))
+    };
     // Skip global options: -C <dir>, -c <k=v>, --git-dir=…
     let mut i = 0;
+    let mut runs = false;
     while let Some(a) = args.get(i) {
         match a.as_str() {
-            "-C" | "-c" => i += 2,
+            "-C" => i += 2,
+            "-c" | "--config-env" => {
+                runs |= !args.get(i + 1).is_some_and(|kv| harmless(kv));
+                i += 2;
+            }
+            a if a.starts_with("--config-env=") => {
+                runs |= !harmless(&a["--config-env=".len()..]);
+                i += 1;
+            }
+            a if a.starts_with("--exec-path") => {
+                runs = true;
+                i += 1;
+            }
             a if a.starts_with('-') => i += 1,
             _ => break,
         }
     }
+    let r = git_sub(args, i);
+    let rest = args.get(i + 1..).unwrap_or_default();
+    // Options that write a file or run a program even under a read-only subcommand.
+    runs |= rest.iter().any(|r| {
+        r.starts_with("--output")
+            || r.starts_with("-O")
+            || r.starts_with("--open-files-in-pager")
+            || r == "--ext-diff"
+            || r.starts_with("--upload-pack")
+            || r.starts_with("ext::")
+    }) || (args.get(i).is_some_and(|s| s == "ls-remote") && rest.iter().any(|r| r == "-u"));
+    if runs { r.max(Risk::low()) } else { r }
+}
+
+/// The subcommand at `args[i]`, without the global options.
+fn git_sub(args: &[String], i: usize) -> Risk {
     let Some(sub) = args.get(i) else { return Risk::safe() };
     let rest: Vec<&str> = args[i + 1..].iter().map(String::as_str).collect();
     let has = |x: &str| rest.contains(&x);
     let confirm = |why: &str| Risk::new(Level::Confirm, why);
     match sub.as_str() {
-        "push" if has("-f") || has("--force") || rest.iter().any(|r| r.starts_with('+')) => {
+        "push"
+            if rest.iter().any(|r| {
+                r.starts_with("--force")
+                    || r.starts_with('+')
+                    || (r.starts_with('-') && !r.starts_with("--") && r.contains('f'))
+            }) =>
+        {
             Risk::new(Level::Shared, "git push --force rewrites the remote's history")
+        }
+        "push" if has("--mirror") || rest.iter().any(|r| r.starts_with("--prune")) => {
+            Risk::new(Level::Shared, "git push --mirror/--prune deletes remote branches")
         }
         "push" if has("--delete") || has("-d") || rest.iter().any(|r| r.starts_with(':')) => {
             Risk::new(Level::Shared, "git push deletes a remote branch")
@@ -738,6 +1088,9 @@ fn git(args: &[String]) -> Risk {
         "restore" if !has("--staged") || has("--worktree") => confirm("git restore discards uncommitted changes"),
         "branch" if has("-D") || (has("-d") && has("--force")) => confirm("git branch -D deletes an unmerged branch"),
         "stash" if has("drop") || has("clear") => confirm("git stash drop/clear deletes stashed work"),
+        // Bare `git stash` (and `git stash -u`) changes the working tree.
+        "stash" if !has("list") && !has("show") => Risk::low(),
+        "reflog" if has("expire") || has("delete") => confirm("git reflog expire/delete removes history entries"),
         "filter-branch" | "filter-repo" => confirm("rewrites the whole repository history"),
         "worktree" if has("remove") && (has("-f") || has("--force")) => confirm("removes a worktree with its changes"),
         "branch" | "tag" | "stash" | "remote" | "config" | "worktree"
@@ -811,6 +1164,12 @@ const CREDENTIAL_DIRS: &[&str] = &[
     ".password-store",
     ".novacode",
 ];
+
+/// Why writing a file at `path` would touch a protected place, or `None`: the
+/// file tools refuse what a catastrophic shell command would (L6.2).
+pub fn protected_path(path: &Path, ctx: &Ctx) -> Option<String> {
+    protected(&resolve(&path.to_string_lossy(), ctx), ctx)
+}
 
 /// Why `p` is protected, or `None`.
 fn protected(p: &Path, ctx: &Ctx) -> Option<String> {
@@ -973,6 +1332,80 @@ mod tests {
             ("kill -9 -1", Catastrophic),
             ("rm -rf ~/secrets/old", Catastrophic),
             ("rm -rf ~/.novacode", Catastrophic),
+            // Wrapper options don't hide the command (D2/L6.2).
+            ("nice -n 10 rm -rf ~", Catastrophic),
+            ("time -p rm -rf ~", Catastrophic),
+            ("stdbuf -oL rm -rf ~", Catastrophic),
+            ("ionice -c3 rm -rf ~", Catastrophic),
+            ("command -p rm -rf ~", Catastrophic),
+            ("exec -a foo rm -rf ~", Catastrophic),
+            ("nohup -- rm -rf ~", Catastrophic),
+            ("timeout -s KILL 60 rm -rf ~", Catastrophic),
+            ("xargs -n 1 rm -rf ~", Catastrophic),
+            ("env -u X rm -rf ~", Catastrophic),
+            ("env -C /tmp rm -rf ~", Catastrophic),
+            ("env -S 'rm -rf ~'", Catastrophic),
+            ("sudo -u root rm -rf ~", Catastrophic),
+            ("time -p git status", Safe),
+            // git options and variables that run programs.
+            ("git -c core.fsmonitor='touch x' status", Low),
+            ("git -c alias.x='!touch y' x", Low),
+            ("git --config-env=core.pager=P log", Low),
+            ("GIT_EXTERNAL_DIFF=./x git diff", Low),
+            ("env GIT_EXTERNAL_DIFF=./x git diff", Low),
+            ("PAGER=./x git log", Low),
+            ("git diff --output=f", Low),
+            ("git grep -Ovim x", Low),
+            ("git ls-remote --upload-pack='touch z' origin", Low),
+            ("git ls-remote -u 'touch z' origin", Low),
+            ("git diff --ext-diff", Low),
+            ("git ls-remote 'ext::sh -c touch% x'", Low),
+            ("git stash", Low),
+            ("git stash -u", Low),
+            ("git stash list", Safe),
+            ("git reflog expire --all", Confirm),
+            ("git reflog delete HEAD@{1}", Confirm),
+            ("git -c color.ui=always log", Safe),
+            ("LC_ALL=C sort a", Safe),
+            // Safe-list commands that write or run.
+            ("awk 'BEGIN{system(\"x\")}'", Low),
+            ("awk '{print > \"f\"}' a", Low),
+            ("awk -i inplace '{print}' f", Low),
+            ("awk '$3 > 100' f", Safe),
+            ("fd -x rm {}", Low),
+            ("fd -tx rs", Safe),
+            ("find . -fprint out", Low),
+            ("sort -o out a", Low),
+            ("tree -o out", Low),
+            ("uniq a out", Low),
+            ("uniq -c a", Safe),
+            ("xxd a out", Low),
+            ("rg --pre ./p x", Low),
+            ("ss -K dst 1.2.3.4", Low),
+            ("date -s 2020-01-01", Low),
+            ("date +%s", Safe),
+            // Any force or branch-deleting push.
+            ("git push --force-with-lease", Shared),
+            ("git push --force-if-includes", Shared),
+            ("git push -uf origin x", Shared),
+            ("git push --mirror", Shared),
+            ("git push --prune origin", Shared),
+            ("git push -u origin x", Low),
+            // Copying into home is fine; replacing it or credentials is not.
+            ("cp file.txt ~/", Low),
+            ("cp file.txt ~", Low),
+            ("mv a ~/", Low),
+            ("ln -s x ~", Low),
+            ("cp ~/.ssh/id_ed25519.pub .", Low),
+            ("cp -t ~ a b", Low),
+            ("cp -T dir ~", Catastrophic),
+            ("rsync -a --delete src/ ~/", Catastrophic),
+            ("rsync -a src/ ~/", Low),
+            ("rsync -a --remove-source-files ~/.ssh/ /tmp/b", Catastrophic),
+            ("cp k ~/.ssh/authorized_keys", Catastrophic),
+            ("cp -t ~/.ssh k", Catastrophic),
+            ("install -m 600 k ~/.ssh/id_rsa", Catastrophic),
+            ("cp k ~/secrets", Catastrophic),
         ];
         let mut bad = Vec::new();
         for (cmd, want) in cases {

@@ -55,12 +55,18 @@ Every `bash` command is split into simple commands (including ones inside `$(...
 | Safe | Reads only. Allowed in read-only mode. | `ls`, `git status` |
 | Low | Changes something ordinary. | writing a file, running a program |
 | Confirm | Destroys data or history in bulk. | `rm -rf target`, `git reset --hard`, `git clean -fd`, `git branch -D`, `find -delete`, `curl ... \| sh`, `sudo ...`, `dd`, `chmod -R` |
-| Shared | Rewrites or deletes history on a remote, which no local undo can fix. | `git push --force`, `git push origin +main`, `git push --delete` |
+| Shared | Rewrites or deletes history on a remote, which no local undo can fix. | `git push --force` (and `--force-with-lease`, `--force-if-includes`, `-uf`), `git push origin +main`, `git push --delete`, `git push --mirror`, `git push --prune` |
 | Catastrophic | Targets the system, your home folder or credentials. **Never runs.** | `rm -rf /`, `rm -rf ~`, writing to `/dev/sda`, `mkfs` on a device, `kill -1` (as the last argument), `pkill -f` with a pattern that matches its own command line, fork bombs, anything that deletes or overwrites `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.config/gcloud`, `~/.password-store` or `~/.novacode` |
 
 System folders count too: `/`, `/bin`, `/boot`, `/dev`, `/etc`, `/home`, `/lib`, `/lib64`, `/opt`, `/proc`, `/root`, `/sbin`, `/srv`, `/sys`, `/usr`, `/var`, and your home folder itself.
 
-More commands that count as Confirm: `git checkout -- .` and `git checkout -f`, `git restore` (unless only `--staged`), `git stash drop` and `clear`, `git filter-branch`, `git worktree remove -f`, `truncate`, `shred`, `wipefs`, `mkfs` and `fdisk` (when the target is not a device or protected), `shutdown`, `reboot`, `poweroff`, `halt`, `crontab -r`, `docker`/`podman` prune or `volume rm`, and `find -exec rm`. A command it cannot parse, or one nested more than 4 levels deep, is Confirm too. `git push origin :branch` is Shared, like `--delete`.
+More commands that count as Confirm: `git checkout -- .` and `git checkout -f`, `git restore` (unless only `--staged`), `git stash drop` and `clear`, `git reflog expire` and `delete`, `git filter-branch`, `git worktree remove -f`, `truncate`, `shred`, `wipefs`, `mkfs` and `fdisk` (when the target is not a device or protected), `shutdown`, `reboot`, `poweroff`, `halt`, `crontab -r`, `docker`/`podman` prune or `volume rm`, and `find -exec rm`. A command it cannot parse, or one nested more than 4 levels deep, is Confirm too. `git push origin :branch` is Shared, like `--delete`.
+
+How the gate reads a command:
+
+- **Wrappers and their options.** `nohup`, `time`, `nice`, `ionice`, `command`, `exec`, `stdbuf`, `timeout`, `xargs`, `env` and `sudo`/`doas` are skipped together with their options (and option values, such as `nice -n 10` or `timeout -s KILL 60`), and the command they run is judged. `env -S '...'` judges the string as a command.
+- **Read-only commands that can write or run things** are Low, not Safe: `git -c <key>=...` and `--config-env` (except `color.*`, `user.*`, `advice.*`, `core.quotepath`, `safe.directory`), `--exec-path`, `git diff --output`, `--ext-diff`, `git grep -O`, `--upload-pack`, `ext::` URLs, a bare `git stash`, and a leading `GIT_*`, `LD_*`, `PAGER`, `LESSOPEN`, `LESSCLOSE`, `BASH_ENV`, `ENV`, `PATH`, `EDITOR` or `VISUAL` assignment. The same goes for `awk` with `system()`, `getline`, pipes, `print > file` or `-f`/`-i`; `fd -x`; `find -fprint`; `sort -o`; `tree -o`; `uniq`/`xxd` with an output file; `rg --pre`; `ss -K`; `date -s`.
+- **Copying into your home folder is allowed.** For `cp`, `ln`, `install` and `mv` only the destination counts: `cp file.txt ~/` and `cp ~/.ssh/id_ed25519.pub .` are Low. Replacing the home folder itself (`cp -T dir ~`) or writing under a credential folder (`cp k ~/.ssh/authorized_keys`) is Catastrophic. `mv` also counts its sources, so `mv ~/.gnupg /tmp` is Catastrophic. `rsync` into your home or a system folder is Catastrophic only with `--delete`; with `--remove-source-files` its sources count too.
 
 What each level does depends on the mode:
 
@@ -84,6 +90,10 @@ You can add folders to the protected set and ban commands outright:
 
 A protected command never runs. It matches the command name (so `/usr/bin/sudo` too) and any other word of the command (so `env sudo ls`). Protected paths are treated like credentials: destroying or overwriting them is Catastrophic.
 
+The file tools follow the same list. `write`, `edit` and `apply_patch` are refused, in every mode and past any `allow` rule, when the file is in a credential folder, a protected path, or is your home or a system folder itself. The path is checked as given and with symlinks resolved, so a project link into `~/.ssh` is refused too. Reads are not affected. Path rules such as `Read(...)` also match the resolved path.
+
+When a tool writes a file, it writes through a symlink to its target (the link stays a link), keeps the file's mode, and never creates or deletes a `<file>.bak` next to it: a `.bak` file of your own is left alone.
+
 ### When nobody can approve
 
 In print mode (`-p`) and other runs with no one to answer a question, a held command cannot be approved. novacode gives the model one way forward: call `bash` again with the same command and a `justification` field (at least 12 characters) that says why it is safe. If the justification is there, the command runs and the reason is logged. Without it, the command is refused. This only works for commands held by the risk gate (Confirm and Shared). It does not work for a call held by an `ask` rule or by `ask` mode.
@@ -94,11 +104,13 @@ When something needs your approval, a card shows the tool, the command or path, 
 
 | Key | Answer |
 |---|---|
-| `y` or Enter | Allow once. |
+| `y` | Allow once. Enter alone does not approve. |
 | `a` | Allow for the rest of this session. |
 | `A` | Always allow: saves a rule to your global settings. Not offered for commands held by the risk gate. |
 | `n` | Deny. You can type a reason, then Enter; the model sees it. |
 | Esc or Ctrl+C | Deny without a reason. |
+
+Keys are ignored for 400 ms after a card appears, so a key you were already typing doesn't answer it.
 
 "Session" for a risk-gated command means that exact command. For other calls, `a` and `A` use a rule such as `Bash(git push:*)` (the first two words of the command) or `Edit(<path>)` / `Write(<path>)`; `A` also saves it to `permissions.allow`.
 
