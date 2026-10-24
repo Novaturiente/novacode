@@ -408,6 +408,33 @@ fn mark_cache(messages: &mut [Value]) {
 
 // ---------- stream ----------
 
+/// The HTTP status a mid-stream error with no numeric code stands for: 400
+/// (not worth retrying) unless its type, code or message names a server fault.
+fn guess_status(e: &Value) -> u16 {
+    let text = [&e["type"], &e["code"], &e["message"]]
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let has = |ws: &[&str]| ws.iter().any(|w| text.contains(w));
+    if has(&["rate limit", "rate_limit", "too many requests"]) {
+        429
+    } else if has(&[
+        "server",
+        "overloaded",
+        "unavailable",
+        "timeout",
+        "timed out",
+        "upstream",
+        "internal",
+    ]) {
+        500
+    } else {
+        400
+    }
+}
+
 #[derive(Default)]
 struct State {
     next: usize,
@@ -490,7 +517,8 @@ impl Wire for State {
         if v.get("error").is_some() {
             // Gateways send overloads inside HTTP 200: take the status from the event.
             let code = v["error"]["code"].as_u64().filter(|c| (400..600).contains(c));
-            let (kind, msg) = http::classify_openai(code.unwrap_or(500) as u16, &Default::default(), data);
+            let status = code.map_or_else(|| guess_status(&v["error"]), |c| c as u16);
+            let (kind, msg) = http::classify_openai(status, &Default::default(), data);
             // An error event mid-stream is the server's fault unless it says otherwise.
             let kind = if kind == ErrorKind::InvalidRequest && b.started {
                 ErrorKind::Transient
@@ -822,6 +850,36 @@ mod tests {
         .await;
         let calls: Vec<_> = m.tool_calls().map(|c| (c.id.as_str(), c.arguments.clone())).collect();
         assert_eq!(calls, [("a", json!({"p":1})), ("b", json!({}))]);
+    }
+
+    #[tokio::test]
+    async fn mid_stream_error_without_numeric_code_is_a_request_error_unless_it_says_server() {
+        let err = |data: &str| {
+            let ev = SseEvent {
+                event: String::new(),
+                data: data.into(),
+            };
+            async move {
+                let (mut b, _rx) = http::channel("ds", "m");
+                State::default().on_event(&ev, &mut b).await.unwrap_err().0
+            }
+        };
+        assert_eq!(
+            err(r#"{"error":{"code":"content_filter","type":"invalid_request_error","message":"blocked by content policy"}}"#).await,
+            ErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            err(r#"{"error":{"code":"server_error","message":"oops"}}"#).await,
+            ErrorKind::Transient
+        );
+        assert_eq!(
+            err(r#"{"error":{"type":"overloaded_error","message":"Overloaded"}}"#).await,
+            ErrorKind::Transient
+        );
+        assert_eq!(
+            err(r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#).await,
+            ErrorKind::RateLimit { retry_after_ms: None }
+        );
     }
 
     #[tokio::test]

@@ -348,14 +348,35 @@ fn part(b: &Block) -> Option<Value> {
     }
 }
 
-/// Google's `RetryInfo.retryDelay` ("3.5s") from an error body, in ms.
-fn retry_info_ms(body: &str) -> Option<u64> {
-    let v: Value = serde_json::from_str(body).ok()?;
+/// The `error.details` entries of a Google error body (object or one-item array).
+fn error_details(body: &str) -> Vec<Value> {
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        return Vec::new();
+    };
     let e = match &v {
-        Value::Array(a) => &a.first()?["error"],
+        Value::Array(a) => a.first().map_or(&Value::Null, |x| &x["error"]),
         _ => &v["error"],
     };
-    e["details"].as_array()?.iter().find_map(|d| {
+    e["details"].as_array().cloned().unwrap_or_default()
+}
+
+/// True when a `QuotaFailure` violation names a daily quota (`...PerDay...`).
+fn daily_quota_failure(details: &[Value]) -> bool {
+    details
+        .iter()
+        .filter(|d| {
+            d["@type"]
+                .as_str()
+                .is_some_and(|t| t.ends_with("google.rpc.QuotaFailure"))
+        })
+        .flat_map(|d| d["violations"].as_array().cloned().unwrap_or_default())
+        .filter_map(|v| v["quotaId"].as_str().map(str::to_ascii_lowercase))
+        .any(|id| id.contains("perday") || id.contains("per_day"))
+}
+
+/// Google's `RetryInfo.retryDelay` ("3.5s") from an error body, in ms.
+fn retry_info_ms(details: &[Value]) -> Option<u64> {
+    details.iter().find_map(|d| {
         let t = d["@type"].as_str()?;
         if !t.ends_with("google.rpc.RetryInfo") {
             return None;
@@ -422,25 +443,31 @@ impl Wire for State {
             return (kind, msg);
         }
         let lower = body.to_ascii_lowercase();
-        // Only a daily or billing quota is used up; per-minute limits and Cloud
-        // Code's burst limiter ("reset after 0s") clear within seconds.
+        let details = error_details(body);
+        // Only a daily quota is used up; per-minute limits and Cloud Code's burst
+        // limiter ("reset after 0s") clear within seconds. "billing" alone proves
+        // nothing: Google's free-tier per-minute 429 says "check your plan and billing".
+        // A daily QuotaFailure wins over RetryInfo, which Google attaches to daily 429s too.
+        if daily_quota_failure(&details) {
+            return (ErrorKind::QuotaExhausted, msg);
+        }
+        let retry_info = retry_info_ms(&details);
         let used_up = [
             "per day",
             "perday",
             "per_day",
             "daily",
-            "billing",
             "insufficient_quota",
             "quota_exhausted",
         ];
-        if used_up.iter().any(|w| lower.contains(w)) {
+        if retry_info.is_none() && used_up.iter().any(|w| lower.contains(w)) {
             return (ErrorKind::QuotaExhausted, msg);
         }
         let header = match kind {
             ErrorKind::RateLimit { retry_after_ms } => retry_after_ms,
             _ => None,
         };
-        let retry_after_ms = retry_info_ms(body)
+        let retry_after_ms = retry_info
             .or_else(|| lower.split_once("reset after ").and_then(|(_, rest)| duration_ms(rest)))
             .or(header);
         (ErrorKind::RateLimit { retry_after_ms }, msg)
@@ -664,6 +691,26 @@ mod tests {
                 r#"{"error":{"code":429,"message":"Quota exceeded for quota metric 'Generate Content API requests per day'"}}"#
             ),
             ErrorKind::QuotaExhausted
+        );
+        // Free-tier per-minute 429: "billing" wording plus RetryInfo is a rate limit.
+        assert_eq!(
+            k(
+                r#"{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"7s"}]}}"#
+            ),
+            ErrorKind::RateLimit {
+                retry_after_ms: Some(7000)
+            }
+        );
+        assert_eq!(
+            k(
+                r#"{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"7s"}]}}"#
+            ),
+            ErrorKind::QuotaExhausted
+        );
+        assert_eq!(
+            k(r#"{"error":{"code":429,"message":"Please check your plan and billing details."}}"#),
+            ErrorKind::RateLimit { retry_after_ms: None },
+            "billing alone is not a used-up quota"
         );
         assert_eq!(duration_ms("0s."), Some(0));
         assert_eq!(duration_ms("2h5m. next 3s"), Some(7_500_000));

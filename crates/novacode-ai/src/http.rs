@@ -200,8 +200,9 @@ fn openai_kind(status: u16, code: &str, msg: &str, headers: &HeaderMap) -> Error
         return ErrorKind::Overflow;
     }
     // "Quota exceeded" on a plain 429 is often a per-minute limit: only payment
-    // statuses or daily/billing wording mean the quota is used up.
-    let used_up = matches!(status, 402 | 403) || ["per day", "daily", "billing"].iter().any(|w| lower.contains(w));
+    // statuses or daily wording mean the quota is used up. "billing" alone does not:
+    // Google's free-tier per-minute 429 says "check your plan and billing details".
+    let used_up = matches!(status, 402 | 403) || ["per day", "daily"].iter().any(|w| lower.contains(w));
     if code == "insufficient_quota"
         || lower.contains("insufficient credits")
         || (lower.contains("quota exceeded") && used_up)
@@ -271,6 +272,14 @@ mod tests {
         assert_eq!(
             k(403, r#"{"error":{"message":"Quota exceeded"}}"#),
             ErrorKind::QuotaExhausted
+        );
+        assert_eq!(
+            k(
+                429,
+                r#"{"error":{"message":"Quota exceeded, please check your plan and billing details"}}"#
+            ),
+            ErrorKind::RateLimit { retry_after_ms: None },
+            "billing wording alone is a rate limit"
         );
     }
 

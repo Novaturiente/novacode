@@ -22,6 +22,9 @@ pub enum AuthError {
     /// The provider refused the refresh token (`invalid_grant`): only a new login helps.
     #[error("the {0} login{1} has expired or was revoked; log in again with `novacode login {0}{2}`")]
     Expired(String, String, String),
+    /// A token endpoint refused the request with a 4xx (not 408/429): retrying won't help.
+    #[error("{0}")]
+    Rejected(String),
     #[error("auth file: {0}")]
     Io(#[from] std::io::Error),
     #[error("api key: {0}")]
@@ -285,7 +288,7 @@ impl AuthStore {
 /// A refused refresh token becomes [`AuthError::Expired`], naming the login command.
 fn expired(e: AuthError, provider: &str, account: &str) -> AuthError {
     match e {
-        AuthError::Http(t) if t.contains("invalid_grant") => {
+        AuthError::Http(t) | AuthError::Rejected(t) if t.contains("invalid_grant") => {
             let (named, flag) = if account == DEFAULT_ACCOUNT {
                 (String::new(), String::new())
             } else {
@@ -294,6 +297,15 @@ fn expired(e: AuthError, provider: &str, account: &str) -> AuthError {
             AuthError::Expired(provider.into(), named, flag)
         }
         e => e,
+    }
+}
+
+/// A failed token-endpoint reply: a 4xx other than 408/429 is a refusal; the rest may pass on retry.
+fn rejected(status: reqwest::StatusCode, msg: String) -> AuthError {
+    match status.as_u16() {
+        408 | 429 => AuthError::Http(msg),
+        400..=499 => AuthError::Rejected(msg),
+        _ => AuthError::Http(msg),
     }
 }
 
@@ -423,7 +435,7 @@ pub mod claude {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(AuthError::Http(format!("token endpoint returned {status}: {text}")));
+            return Err(rejected(status, format!("token endpoint returned {status}: {text}")));
         }
         #[derive(Deserialize)]
         struct T {
@@ -604,7 +616,7 @@ pub mod codex {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(AuthError::Http(format!("token endpoint returned {status}: {text}")));
+            return Err(rejected(status, format!("token endpoint returned {status}: {text}")));
         }
         #[derive(Deserialize)]
         struct T {
@@ -722,7 +734,7 @@ pub mod antigravity {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(AuthError::Http(format!("token endpoint returned {status}: {text}")));
+            return Err(rejected(status, format!("token endpoint returned {status}: {text}")));
         }
         #[derive(Deserialize)]
         struct T {
@@ -847,9 +859,12 @@ pub mod copilot {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(AuthError::Http(format!(
-                "Copilot token request returned {status} (is Copilot enabled for this GitHub account?): {text}"
-            )));
+            return Err(rejected(
+                status,
+                format!(
+                    "Copilot token request returned {status} (is Copilot enabled for this GitHub account?): {text}"
+                ),
+            ));
         }
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| AuthError::Http(e.to_string()))?;
         let (Some(token), Some(exp)) = (v["token"].as_str(), v["expires_at"].as_u64()) else {
@@ -975,7 +990,7 @@ mod tests {
 
     #[test]
     fn invalid_grant_names_the_login_command() {
-        let e = || AuthError::Http(r#"token endpoint returned 400 Bad Request: {"error": "invalid_grant"}"#.into());
+        let e = || AuthError::Rejected(r#"token endpoint returned 400 Bad Request: {"error": "invalid_grant"}"#.into());
         assert_eq!(
             expired(e(), "claude", DEFAULT_ACCOUNT).to_string(),
             "the claude login has expired or was revoked; log in again with `novacode login claude`"
@@ -990,6 +1005,12 @@ mod tests {
             expired(AuthError::Http("timeout".into()), "claude", "x"),
             AuthError::Http(_)
         ));
+        use reqwest::StatusCode as S;
+        assert!(matches!(rejected(S::UNAUTHORIZED, "m".into()), AuthError::Rejected(_)));
+        assert!(matches!(rejected(S::BAD_REQUEST, "m".into()), AuthError::Rejected(_)));
+        for s in [S::REQUEST_TIMEOUT, S::TOO_MANY_REQUESTS, S::BAD_GATEWAY] {
+            assert!(matches!(rejected(s, "m".into()), AuthError::Http(_)), "{s}");
+        }
     }
 
     #[tokio::test]
