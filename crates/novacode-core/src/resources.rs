@@ -62,6 +62,8 @@ pub struct Skill {
     pub disallowed_tools: Vec<String>,
     /// `context: fork`: runs as a subagent of this type (`agent`, default `worker`).
     pub fork: Option<String>,
+    /// `hooks`: Claude Code hooks, run for the rest of the session once it is activated.
+    pub hooks: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -209,7 +211,7 @@ fn simple_fields(head: &str) -> BTreeMap<String, String> {
 }
 
 /// Claude Code skill fields novacode doesn't act on (L7.16).
-const SKILL_UNSUPPORTED: &[&str] = &["model", "effort", "hooks", "paths", "shell", "background"];
+const SKILL_UNSUPPORTED: &[&str] = &["model", "effort", "paths", "shell", "background"];
 
 /// Skills from `dirs`, earlier folders winning a name clash ([`Seen`]). Sorted by
 /// name, so the prompt renders the same every time. Returns problems to show
@@ -277,6 +279,7 @@ pub fn skills(dirs: &[PathBuf]) -> (Vec<Skill>, Vec<String>, Vec<String>) {
                     allowed_tools: list(fm.get("allowed-tools")),
                     disallowed_tools: list(fm.get("disallowed-tools")),
                     fork,
+                    hooks: fm.get("hooks").filter(|h| h.is_object()).cloned(),
                 },
             );
         }
@@ -446,6 +449,7 @@ pub fn expand(text: &str, skills: &[Skill], templates: &[Template]) -> String {
         let raw = crate::plugin::fill_for(&k.path, raw);
         let base = k.path.parent().unwrap_or(Path::new("/"));
         let body = frontmatter(&raw).1.trim();
+        let body = &body.replace("${CLAUDE_SKILL_DIR}", &base.display().to_string());
         // `$ARGUMENTS` (and `$1`…) in the body take the arguments, as in Claude Code.
         let placed = body.contains("$ARGUMENTS");
         let body = if placed {

@@ -1793,6 +1793,58 @@ async fn esc_before_the_first_reply_takes_the_prompt_back() {
     drop(agent);
 }
 
+/// L7.16 check: a skill the user activates (through the session handle) adds its
+/// `PreToolUse` hook, which then refuses the model's bash call.
+#[tokio::test]
+async fn activated_skill_hooks_gate_tools() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("skills/guard");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\ndescription: d\nhooks:\n  PreToolUse:\n    - matcher: Bash\n      hooks:\n        - type: command\n          command: \"echo '{\\\"hookSpecificOutput\\\":{\\\"permissionDecision\\\":\\\"deny\\\",\\\"permissionDecisionReason\\\":\\\"guarded\\\"}}'\"\n---\nbody\n",
+    )
+    .unwrap();
+    let skill = novacode_core::resources::skills(&[home.path().join("skills")])
+        .0
+        .remove(0);
+    let hooks = Arc::new(novacode_core::plugin_hooks::PluginHooks::load(
+        &[],
+        work.path(),
+        "s",
+        None,
+    ));
+    let faux = Faux::new([
+        tools_reply(vec![call("a", "bash", json!({"command": "touch made"}))]),
+        FauxReply::text("done"),
+    ]);
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        novacode_tools::builtins(false),
+        Store::create(&Paths::new(home.path()), work.path(), true),
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_hooks(Arc::new(novacode_core::hooks::Hooks {
+        handlers: vec![hooks.clone()],
+    }))
+    .with_plugin_hooks(hooks);
+    let (agent, _) = drive_with(agent, &["go"], |h| {
+        assert!(h.skill_activated(&skill).is_empty());
+    })
+    .await;
+    let results: Vec<String> = agent
+        .store
+        .projection()
+        .iter()
+        .filter(|m| matches!(m, Message::ToolResult { .. }))
+        .map(result_text)
+        .collect();
+    assert!(results[0].contains("guarded"), "{results:?}");
+    assert!(!work.path().join("made").exists());
+}
+
 /// L7.14 check: a Claude Code plugin's hooks in a session. SessionStart text and
 /// UserPromptSubmit context reach the model, a refused prompt never does, and a
 /// Stop hook's block runs the agent once more with its reason.

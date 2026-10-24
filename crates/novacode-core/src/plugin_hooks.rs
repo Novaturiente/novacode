@@ -10,16 +10,21 @@
 //! | `Stop` | a block keeps the agent going with the reason |
 //! | `SessionEnd` | when the session closes, observe only |
 //!
+//! A skill's frontmatter `hooks` join when the skill is activated (`/skill:` or the
+//! `skill` tool) and run for the rest of the session, as in Claude Code (L7.16).
+//!
 //! Every hook fails open: a crash, a timeout or output it can't read changes nothing.
 
 use crate::hooks::{After, DISABLED_ENV, Gate, Handler, Run};
 use crate::packages::Package;
 use crate::plugin::{Hook, Kind, Parts};
 use crate::policy::HookDecision;
+use crate::resources::Skill;
 use futures_util::future::BoxFuture;
 use novacode_tools::ToolOutput;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
@@ -59,10 +64,23 @@ fn claude_input(args: &Value) -> Value {
     v
 }
 
+#[derive(Clone)]
 struct Bound {
     hook: Hook,
     env: Vec<(String, String)>,
-    parts: Parts,
+    /// The plugin it comes from (its variables); none for a skill outside a plugin.
+    parts: Option<Parts>,
+    /// A skill's hook: the skill's folder (`${CLAUDE_SKILL_DIR}`) and an id for `once`.
+    skill: Option<(PathBuf, u64)>,
+}
+
+/// Hooks of activated skills.
+#[derive(Default)]
+struct SkillHooks {
+    hooks: Vec<Bound>,
+    /// Skill files already activated: a second activation adds nothing.
+    active: Vec<PathBuf>,
+    next: u64,
 }
 
 /// What one hook printed: exit code, stdout, stderr.
@@ -101,6 +119,7 @@ impl Out {
 /// The plugin hooks of one session.
 pub struct PluginHooks {
     hooks: Vec<Bound>,
+    skills: Mutex<SkillHooks>,
     cwd: PathBuf,
     session: String,
     /// Set in a subagent: its type (`SubagentStart` instead of `SessionStart`).
@@ -120,34 +139,72 @@ impl PluginHooks {
                 hooks.push(Bound {
                     hook,
                     env: env.clone(),
-                    parts: parts.clone(),
+                    parts: Some(parts.clone()),
+                    skill: None,
                 });
             }
         }
         PluginHooks {
             hooks,
+            skills: Mutex::default(),
             cwd: cwd.to_path_buf(),
             session: session.to_string(),
             subagent,
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.hooks.is_empty()
+    /// Add an activated skill's `hooks`; returns what can't run. Its plugin's variables
+    /// apply when the skill comes from one.
+    pub fn add_skill(&self, s: &Skill) -> Vec<String> {
+        let Some(map) = &s.hooks else { return vec![] };
+        let mut g = self.skills.lock().unwrap();
+        if g.active.contains(&s.path) {
+            return vec![];
+        }
+        g.active.push(s.path.clone());
+        let (mut hooks, mut skipped) = (Vec::new(), Vec::new());
+        crate::plugin::parse_hooks(map, &mut hooks, &mut skipped);
+        let dir = s.path.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let parts = Parts::owning(&s.path).filter(|p| p.kind == Kind::Claude);
+        let env = parts.as_ref().map(|p| p.env(&p.options())).unwrap_or_default();
+        for hook in hooks {
+            g.next += 1;
+            let id = g.next;
+            g.hooks.push(Bound {
+                hook,
+                env: env.clone(),
+                parts: parts.clone(),
+                skill: Some((dir.clone(), id)),
+            });
+        }
+        skipped
     }
 
-    pub fn has(&self, event: &str) -> bool {
-        self.hooks.iter().any(|b| b.hook.event == event)
+    fn matching(&self, event: &str, target: &str) -> Vec<Bound> {
+        let skills = self.skills.lock().unwrap();
+        self.hooks
+            .iter()
+            .chain(&skills.hooks)
+            .filter(|b| {
+                let m = b.hook.matcher.as_str();
+                b.hook.event == event
+                    && (m.is_empty()
+                        || m == "*"
+                        || regex::Regex::new(&format!("^(?:{m})$")).is_ok_and(|re| re.is_match(target)))
+            })
+            .cloned()
+            .collect()
     }
 
-    fn matching<'a>(&'a self, event: &'a str, target: &'a str) -> impl Iterator<Item = &'a Bound> {
-        self.hooks.iter().filter(move |b| {
-            let m = b.hook.matcher.as_str();
-            b.hook.event == event
-                && (m.is_empty()
-                    || m == "*"
-                    || regex::Regex::new(&format!("^(?:{m})$")).is_ok_and(|re| re.is_match(target)))
-        })
+    /// A `once` skill hook ran: drop it.
+    fn ran(&self, b: &Bound) {
+        if let (true, Some((_, id))) = (b.hook.once, &b.skill) {
+            self.skills
+                .lock()
+                .unwrap()
+                .hooks
+                .retain(|h| h.skill.as_ref().is_none_or(|(_, i)| i != id));
+        }
     }
 
     /// Run every matching hook in order; background ones aren't waited for.
@@ -170,11 +227,16 @@ impl PluginHooks {
         for b in self.matching(event, target) {
             let timeout = Duration::from_secs(b.hook.timeout_secs.unwrap_or(default));
             if b.hook.background {
-                let (cmd, cwd, input) = (self.command(b), self.cwd.clone(), input.clone());
+                let (cmd, cwd, input) = (self.command(&b), self.cwd.clone(), input.clone());
                 tokio::spawn(async move { run(cmd, &cwd, &input, timeout).await });
+                self.ran(&b);
                 continue;
             }
-            if let Some(o) = run(self.command(b), &self.cwd, &input, timeout).await {
+            if let Some(o) = run(self.command(&b), &self.cwd, &input, timeout).await {
+                // A failure, a block (exit 2) or a timeout keeps a `once` hook.
+                if o.code == Some(0) {
+                    self.ran(&b);
+                }
                 outs.push(o);
             }
         }
@@ -183,7 +245,18 @@ impl PluginHooks {
 
     fn command(&self, b: &Bound) -> tokio::process::Command {
         let project = self.cwd.display().to_string();
-        let fill = |s: &str| b.parts.fill(s, true).replace("${CLAUDE_PROJECT_DIR}", &project);
+        let skill_dir = b.skill.as_ref().map(|(d, _)| d.display().to_string());
+        let fill = |s: &str| {
+            let s = match &b.parts {
+                Some(p) => p.fill(s, true),
+                None => s.to_string(),
+            };
+            let s = s.replace("${CLAUDE_PROJECT_DIR}", &project);
+            match &skill_dir {
+                Some(d) => s.replace("${CLAUDE_SKILL_DIR}", d),
+                None => s,
+            }
+        };
         let mut c = match &b.hook.args {
             Some(args) => {
                 let mut c = tokio::process::Command::new(fill(&b.hook.command));
@@ -199,6 +272,9 @@ impl PluginHooks {
         c.envs(b.env.iter().map(|(k, v)| (k, v)))
             .env("CLAUDE_PROJECT_DIR", &project)
             .env(DISABLED_ENV, "1");
+        if let Some(d) = &skill_dir {
+            c.env("CLAUDE_SKILL_DIR", d);
+        }
         c
     }
 
@@ -256,7 +332,7 @@ impl Handler for PluginHooks {
     fn before_tool<'a>(&'a self, tool: &'a str, args: &'a Value) -> BoxFuture<'a, Gate> {
         Box::pin(async move {
             let name = claude_tool(tool);
-            if self.matching("PreToolUse", &name).next().is_none() {
+            if self.matching("PreToolUse", &name).is_empty() {
                 return Gate::Allow;
             }
             let outs = self
@@ -321,7 +397,9 @@ impl Handler for PluginHooks {
     ) -> BoxFuture<'a, Option<After>> {
         Box::pin(async move {
             let name = claude_tool(tool);
-            self.matching("PostToolUse", &name).next()?;
+            if self.matching("PostToolUse", &name).is_empty() {
+                return None;
+            }
             let text: String = out
                 .content
                 .iter()
@@ -421,6 +499,47 @@ mod tests {
 
     fn cmd(c: &str) -> Value {
         json!([{"hooks": [{"type": "command", "command": c}]}])
+    }
+
+    /// A skill's frontmatter hooks run once it is activated, from its own folder
+    /// (`${CLAUDE_SKILL_DIR}`); `once` drops a hook after a successful run; a second
+    /// activation adds nothing; a non-command hook is reported.
+    #[tokio::test]
+    async fn skill_hooks_join_on_activation() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("guard");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(
+            dir.join("bin/check.sh"),
+            r#"grep -q 'rm -rf' && echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"no rm"}}' || true"#,
+        )
+        .unwrap();
+        let fm = "---\nname: guard\ndescription: d\nhooks:\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"sh ${CLAUDE_SKILL_DIR}/bin/check.sh\"\n    - matcher: \"Edit\"\n      hooks:\n        - type: command\n          once: true\n          command: \"echo x >> $CLAUDE_SKILL_DIR/edits\"\n        - type: prompt\n          prompt: \"is it fine?\"\n---\nbody\n";
+        std::fs::write(dir.join("SKILL.md"), fm).unwrap();
+        let skill = crate::resources::skills(&[t.path().to_path_buf()]).0.remove(0);
+        let h = PluginHooks::load(&[], t.path(), "s1", None);
+        let rm = json!({"command": "rm -rf build"});
+        assert!(
+            matches!(h.before_tool("bash", &rm).await, Gate::Allow),
+            "not active yet"
+        );
+        let skipped = h.add_skill(&skill);
+        assert_eq!(skipped, ["PreToolUse `prompt` hook (only command hooks run)"]);
+        assert!(h.add_skill(&skill).is_empty());
+        assert!(matches!(h.before_tool("bash", &rm).await, Gate::Block(w) if w == "no rm"));
+        assert!(matches!(
+            h.before_tool("bash", &json!({"command": "ls"})).await,
+            Gate::Allow
+        ));
+        for _ in 0..2 {
+            h.before_tool("edit", &json!({"path": "a"})).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("edits")).unwrap(),
+            "x\n",
+            "once: ran one time"
+        );
+        assert_eq!(h.skills.lock().unwrap().hooks.len(), 1, "the Bash hook stays");
     }
 
     #[tokio::test]

@@ -38,10 +38,11 @@ novacode reads these fields, with the meaning Claude Code gives them. `license`,
 | `allowed-tools` | no | Tools that run without asking for the rest of the turn the skill is activated in (until your next message), e.g. `Bash(git commit *) Read`. They never get past `deny` rules, the risk gate or read-only mode. |
 | `disallowed-tools` | no | Tools refused for the rest of that turn. |
 | `context`, `agent` | no | `context: fork` runs the skill as a subagent of type `agent` (default `worker`) with the skill's text as its task. |
+| `hooks` | no | Claude Code hooks in the [plugin hook format](packages.md#claude-code-plugins). They join when the skill is activated (by you with `/skill:name`, or by the model with the `skill` tool) and run for the rest of the session, as in Claude Code. `${CLAUDE_SKILL_DIR}` is the skill's folder; `once: true` drops a hook after its first successful run. Only command hooks run; a skill of a plugin also gets that plugin's variables. Project skills load only in trusted folders. |
 
-`allowed-tools`, `disallowed-tools` and `context: fork` apply when the model activates the skill with the `skill` tool. A skill whose file the model just reads gets its text only.
+`allowed-tools`, `disallowed-tools` and `context: fork` apply when the model activates the skill with the `skill` tool. A skill whose file the model just reads gets its text only, and its hooks don't join. Hooks of an activated skill don't survive `/reload` or a resumed session; activate it again.
 
-Not supported (listed by `novacode doctor`): `model`, `effort`, `hooks`, `paths`, `shell`, `background`, and `!` command lines in the text (they would run shell commands from the skill before the model sees it).
+Not supported (listed by `novacode doctor`): `model`, `effort`, `paths`, `shell`, `background`, and `!` command lines in the text (they would run shell commands from the skill before the model sees it). `${CLAUDE_SKILL_DIR}` in the text is replaced with the skill's folder.
 
 The frontmatter is YAML: lists, nested maps and `yes`/`no` booleans work. It must start on the very first line of the file, between two `---` lines. Frontmatter that isn't valid YAML (often an unquoted `: ` inside a description) is read as plain `key: value` lines instead, and `novacode doctor` says so. In the text, `$ARGUMENTS` (and `$1`, `$2`…) take what you type after `/skill:name`.
 

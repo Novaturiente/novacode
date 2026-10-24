@@ -213,6 +213,8 @@ struct Shared {
     /// `novacode.state` entries: what the branch holds plus what extensions added
     /// since (`pending`, written to the session by the owner task).
     ext_state: Mutex<ExtState>,
+    /// Plugin hooks, for skills the user activates from outside the owner task (L7.16).
+    plugin_hooks: std::sync::OnceLock<Arc<crate::plugin_hooks::PluginHooks>>,
 }
 
 #[derive(Default)]
@@ -1156,6 +1158,7 @@ impl Agent {
 
     /// Claude Code plugin hooks (L7.14): session start, prompt submit, stop, session end.
     pub fn with_plugin_hooks(mut self, hooks: Arc<crate::plugin_hooks::PluginHooks>) -> Self {
+        let _ = self.shared.plugin_hooks.set(hooks.clone());
         self.plugins = Some(Plugins {
             hooks,
             started: false,
@@ -2190,6 +2193,15 @@ impl SessionHandle {
         if let Some(c) = self.shared.cancel.lock().unwrap().as_ref() {
             c.cancel();
         }
+    }
+    /// The user activated a skill (`/skill:`): its `hooks` run from now on (L7.16).
+    /// Returns what can't run.
+    pub fn skill_activated(&self, s: &crate::resources::Skill) -> Vec<String> {
+        self.shared
+            .plugin_hooks
+            .get()
+            .map(|h| h.add_skill(s))
+            .unwrap_or_default()
     }
     /// Switch model (any provider) from the next run on.
     pub fn set_model(&self, switch: Switch) {

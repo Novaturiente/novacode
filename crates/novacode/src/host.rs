@@ -275,7 +275,7 @@ impl Host {
                     },
                     None => t,
                 };
-                let (blocks, notes) = attach(t, self.cwd.clone(), &self.inputs).await;
+                let (blocks, notes) = attach(t, self.cwd.clone(), &self.inputs, h).await;
                 for n in notes {
                     let error = !n.starts_with("attached");
                     let _ = ui.send(UiEvent::Notice { text: n, error });

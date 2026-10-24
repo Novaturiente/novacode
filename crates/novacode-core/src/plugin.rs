@@ -53,6 +53,8 @@ pub struct Hook {
     pub timeout_secs: Option<u64>,
     /// `async: true`: started, never waited for.
     pub background: bool,
+    /// `once: true`: dropped after its first successful run (skill hooks only, as in Claude Code).
+    pub once: bool,
 }
 
 /// What one installed package contributes.
@@ -280,32 +282,7 @@ impl Parts {
         }
         let (mut out, mut skipped) = (Vec::new(), Vec::new());
         for m in maps {
-            for (event, groups) in m.as_object().into_iter().flatten() {
-                for g in groups.as_array().into_iter().flatten() {
-                    for h in g["hooks"].as_array().into_iter().flatten() {
-                        let ty = h["type"].as_str().unwrap_or("command");
-                        let Some(command) = h["command"].as_str().filter(|_| ty == "command") else {
-                            skipped.push(format!("{event} `{ty}` hook (only command hooks run)"));
-                            continue;
-                        };
-                        if !EVENTS.contains(&event.as_str()) {
-                            skipped.push(format!("{event} hook (novacode has no such event)"));
-                            continue;
-                        }
-                        out.push(Hook {
-                            event: event.clone(),
-                            matcher: g["matcher"].as_str().unwrap_or_default().to_string(),
-                            command: command.to_string(),
-                            args: h["args"]
-                                .as_array()
-                                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()),
-                            bash: h["shell"] == "bash",
-                            timeout_secs: h["timeout"].as_u64(),
-                            background: h["async"] == true,
-                        });
-                    }
-                }
-            }
+            parse_hooks(&m, &mut out, &mut skipped);
         }
         skipped.sort();
         skipped.dedup();
@@ -394,6 +371,38 @@ impl Parts {
             out = out.replace(&format!("${{user_config.{k}}}"), &val);
         }
         out
+    }
+}
+
+/// The command hooks of one Claude Code `hooks` map (`{event: [{matcher, hooks}]}`,
+/// from `hooks.json` or skill frontmatter); the rest goes to `skipped`.
+pub fn parse_hooks(m: &Value, out: &mut Vec<Hook>, skipped: &mut Vec<String>) {
+    for (event, groups) in m.as_object().into_iter().flatten() {
+        for g in groups.as_array().into_iter().flatten() {
+            for h in g["hooks"].as_array().into_iter().flatten() {
+                let ty = h["type"].as_str().unwrap_or("command");
+                let Some(command) = h["command"].as_str().filter(|_| ty == "command") else {
+                    skipped.push(format!("{event} `{ty}` hook (only command hooks run)"));
+                    continue;
+                };
+                if !EVENTS.contains(&event.as_str()) {
+                    skipped.push(format!("{event} hook (novacode has no such event)"));
+                    continue;
+                }
+                out.push(Hook {
+                    event: event.clone(),
+                    matcher: g["matcher"].as_str().unwrap_or_default().to_string(),
+                    command: command.to_string(),
+                    args: h["args"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()),
+                    bash: h["shell"] == "bash",
+                    timeout_secs: h["timeout"].as_u64(),
+                    background: h["async"] == true,
+                    once: h["once"] == true,
+                });
+            }
+        }
     }
 }
 

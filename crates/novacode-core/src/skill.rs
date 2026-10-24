@@ -21,6 +21,8 @@ pub struct SkillTool {
     pub policy: Arc<Policy>,
     /// None where no subagent can start (depth limit, no window).
     pub fork: Option<Fork>,
+    /// Where an activated skill's `hooks` go; none inside a hook's own novacode.
+    pub hooks: Option<Arc<crate::plugin_hooks::PluginHooks>>,
 }
 
 /// A Claude Code permission rule as novacode's: tool names mapped, `Bash(git log *)` → `Bash(git log:*)`.
@@ -56,6 +58,11 @@ impl SkillTool {
             ..s.clone()
         }];
         let text = resources::expand(&format!("/skill:{} {args}", s.name), &skills, &[]);
+        // Its hooks run for the rest of the session, forked or not (as in Claude Code).
+        let skipped = self.hooks.as_ref().map(|h| h.add_skill(s)).unwrap_or_default();
+        if !skipped.is_empty() {
+            tracing::warn!(skill = %s.name, ?skipped, "skill hooks not run");
+        }
         // Without a subagent here, the skill is followed in this conversation instead.
         if let (Some(agent), Some(fork)) = (&s.fork, &self.fork) {
             return match fork(text, agent.clone(), format!("skill {}", s.name)) {
@@ -161,6 +168,7 @@ mod tests {
                 s2.lock().unwrap().push((task, agent));
                 Ok("a1".into())
             })),
+            hooks: None,
         };
         let ctx = ToolCtx {
             cwd: dir.path().into(),

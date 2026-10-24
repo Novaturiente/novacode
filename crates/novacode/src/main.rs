@@ -1301,6 +1301,16 @@ impl Ctx {
             supervisor = Some(sup.clone());
             all.push(Arc::new(agents::AgentTool::new(sup)));
         }
+        // Claude Code plugin hooks (L7.14), joined by activated skills' hooks (L7.16);
+        // none inside a hook's own novacode (recursion guard).
+        let plugin_hooks = (!novacode_core::hooks::disabled()).then(|| {
+            Arc::new(novacode_core::plugin_hooks::PluginHooks::load(
+                &novacode_core::packages::enabled(self.paths.home(), &self.cwd, self.trusted),
+                &self.cwd,
+                store.id(),
+                self.cli.agent.clone(),
+            ))
+        });
         // The `skill` tool (L5.25), when there are skills to activate.
         let skill_dirs = self.skill_dirs();
         if !resources::skills(&skill_dirs).0.is_empty() {
@@ -1311,6 +1321,7 @@ impl Ctx {
                 dirs: skill_dirs,
                 policy: policy.clone(),
                 fork,
+                hooks: plugin_hooks.clone(),
             }));
         }
         // Mode presets and plan mode (L10.7).
@@ -1453,18 +1464,9 @@ impl Ctx {
             if !cmds.config.before_tool.is_empty() || !cmds.config.after_tool.is_empty() {
                 handlers.push(cmds);
             }
-            // Claude Code plugin hooks (L7.14).
-            let plugin = novacode_core::plugin_hooks::PluginHooks::load(
-                &novacode_core::packages::enabled(self.paths.home(), &self.cwd, self.trusted),
-                &self.cwd,
-                agent.store.id(),
-                self.cli.agent.clone(),
-            );
-            if !plugin.is_empty() {
-                let plugin = Arc::new(plugin);
-                if plugin.has("PreToolUse") || plugin.has("PostToolUse") {
-                    handlers.push(plugin.clone());
-                }
+            // Always on: a skill activated later can add tool hooks.
+            if let Some(plugin) = plugin_hooks {
+                handlers.push(plugin.clone());
                 agent = agent.with_plugin_hooks(plugin);
             }
         }
@@ -1532,12 +1534,19 @@ struct Inputs {
 }
 
 impl Inputs {
-    fn expand(&self, text: &str) -> String {
+    /// The expanded text, and the skill a `/skill:name` activates.
+    fn expand(&self, text: &str) -> (String, Option<resources::Skill>) {
         if !text.starts_with('/') {
-            return text.to_string();
+            return (text.to_string(), None);
         }
         let skills = resources::skills(&self.skills).0;
-        resources::expand(text, &skills, &resources::templates(&self.templates).0)
+        let out = resources::expand(text, &skills, &resources::templates(&self.templates).0);
+        let name = text
+            .strip_prefix("/skill:")
+            .and_then(|r| r.split_whitespace().next())
+            .filter(|_| out != text);
+        let skill = name.and_then(|n| skills.into_iter().find(|s| s.name == n));
+        (out, skill)
     }
 
     /// Slash completions for the editor, and warnings about broken skills.
@@ -1564,13 +1573,23 @@ impl Inputs {
     }
 }
 
-/// Expand a template or skill command, then attach mentioned images.
-async fn attach(text: String, cwd: std::path::PathBuf, inputs: &Inputs) -> (Vec<novacode_types::Block>, Vec<String>) {
-    let text = inputs.expand(&text);
+/// Expand a template or skill command (an activated skill's hooks join `handle`'s
+/// session), then attach mentioned images.
+async fn attach(
+    text: String,
+    cwd: std::path::PathBuf,
+    inputs: &Inputs,
+    handle: &novacode_core::agent::SessionHandle,
+) -> (Vec<novacode_types::Block>, Vec<String>) {
+    let (text, skill) = inputs.expand(&text);
+    let mut skipped = skill.map(|s| handle.skill_activated(&s)).unwrap_or_default();
+    skipped.iter_mut().for_each(|s| *s = format!("skill hook not run: {s}"));
     let fallback = text.clone();
-    tokio::task::spawn_blocking(move || novacode_tools::image::attach(&text, &cwd))
+    let (blocks, mut notes) = tokio::task::spawn_blocking(move || novacode_tools::image::attach(&text, &cwd))
         .await
-        .unwrap_or_else(|_| (vec![novacode_types::Block::text(fallback)], vec![]))
+        .unwrap_or_else(|_| (vec![novacode_types::Block::text(fallback)], vec![]));
+    notes.extend(skipped);
+    (blocks, notes)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1630,7 +1649,7 @@ async fn print_mode(
         },
         None => prompt,
     };
-    let (blocks, notes) = attach(prompt, cwd, &inputs).await;
+    let (blocks, notes) = attach(prompt, cwd, &inputs, &handle).await;
     for n in notes {
         eprintln!("{n}");
     }
