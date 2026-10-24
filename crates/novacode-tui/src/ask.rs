@@ -1,15 +1,18 @@
 //! The `ask_user` form (L5.21): one question at a time, choices with a cursor,
 //! multi-select, a free-text row, a note on a choice (`n`), and the focused choice's preview.
 
+use crate::editor::Editor;
+use crate::keys::A;
 use crate::theme::Theme;
 use crate::wrap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use novacode_types::{Question, Reply};
 use ratatui::Frame;
-use ratatui::layout::Rect;
-use ratatui::style::Modifier;
+use ratatui::layout::{Position, Rect};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use tokio::sync::oneshot;
 
@@ -30,11 +33,13 @@ pub struct AskForm {
     /// Cursor; `options.len()` = the free-text row.
     sel: Vec<usize>,
     picked: Vec<BTreeSet<usize>>,
-    typed: Vec<String>,
+    typed: Vec<Editor>,
     typing: bool,
     /// A note sent with the picked choice(s), and the row it was written on.
-    notes: Vec<(String, usize)>,
+    notes: Vec<(Editor, usize)>,
     noting: bool,
+    /// Width of the open input at the last draw, for its up/down moves.
+    width: Cell<usize>,
     /// (question, choice) whose preview the user rewrote in the editor.
     edited: BTreeSet<(usize, usize)>,
     /// The key that opens the editor, for the keys line (empty = not shown).
@@ -60,10 +65,11 @@ impl AskForm {
             q: 0,
             sel,
             picked: vec![BTreeSet::new(); n],
-            typed: vec![String::new(); n],
+            typed: (0..n).map(|_| Editor::default()).collect(),
             typing: false,
-            notes: vec![(String::new(), 0); n],
+            notes: (0..n).map(|_| (Editor::default(), 0)).collect(),
             noting: false,
+            width: Cell::new(40),
             edited: BTreeSet::new(),
             edit_key: String::new(),
         }
@@ -73,10 +79,10 @@ impl AskForm {
     pub fn edit_text(&self) -> Option<String> {
         let q = self.q;
         if self.typing {
-            return Some(self.typed[q].clone());
+            return Some(self.typed[q].full_text());
         }
         if self.noting {
-            return Some(self.notes[q].0.clone());
+            return Some(self.notes[q].0.full_text());
         }
         self.cur().options.get(self.sel[q])?.preview.clone()
     }
@@ -85,9 +91,9 @@ impl AskForm {
     pub fn set_edited(&mut self, text: String) {
         let (q, k) = (self.q, self.sel[self.q]);
         if self.typing {
-            self.typed[q] = text;
+            self.typed[q].set_text(&text);
         } else if self.noting {
-            self.notes[q].0 = text;
+            self.notes[q].0.set_text(&text);
         } else if let Some(o) = self.req.questions[q].options.get_mut(k) {
             o.preview = Some(text);
             self.edited.insert((q, k));
@@ -110,11 +116,16 @@ impl AskForm {
             .map(|(i, q)| {
                 let mut chosen: Vec<String> = self.picked[i].iter().map(|&k| q.options[k].label.clone()).collect();
                 // Single choice: the cursor is the answer unless text was typed.
-                if !q.multi && chosen.is_empty() && self.typed[i].trim().is_empty() && self.sel[i] < q.options.len() {
+                if !q.multi
+                    && chosen.is_empty()
+                    && self.typed[i].text().trim().is_empty()
+                    && self.sel[i] < q.options.len()
+                {
                     chosen.push(q.options[self.sel[i]].label.clone());
                 }
                 // Typed text replaces the choice; a note goes along with it.
-                let text = [self.typed[i].trim(), self.notes[i].0.trim()]
+                let (typed, note) = (self.typed[i].full_text(), self.notes[i].0.full_text());
+                let text = [typed.trim(), note.trim()]
                     .into_iter()
                     .find(|t| !t.is_empty())
                     .map(String::from);
@@ -146,34 +157,39 @@ impl AskForm {
         }
     }
 
-    pub fn handle(&mut self, k: KeyEvent) -> Done {
+    /// A paste goes into the open input, if any.
+    pub fn paste(&mut self, s: &str) {
         let q = self.q;
-        if self.noting {
-            match k.code {
-                // Single choice: the noted choice is the answer. Multi: it's picked, keep picking.
-                KeyCode::Enter if !self.cur().multi => return self.advance(),
-                KeyCode::Enter => {
-                    self.picked[q].insert(self.notes[q].1);
-                    self.noting = false;
-                }
-                KeyCode::Esc => self.noting = false,
-                KeyCode::Backspace => {
-                    self.notes[q].0.pop();
-                }
-                KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => self.notes[q].0.push(c),
-                _ => {}
-            }
-            return Done::Pending;
-        }
         if self.typing {
-            match k.code {
-                KeyCode::Enter => return self.advance(),
-                KeyCode::Esc => self.typing = false,
-                KeyCode::Backspace => {
-                    self.typed[q].pop();
-                }
-                KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => self.typed[q].push(c),
-                _ => {}
+            self.typed[q].paste(s);
+        } else if self.noting {
+            self.notes[q].0.paste(s);
+        }
+    }
+
+    /// `a` is the key's editor action from the keymap; the open input edits like the prompt.
+    pub fn handle(&mut self, k: KeyEvent, a: Option<A>) -> Done {
+        let q = self.q;
+        if self.typing || self.noting {
+            let ed = if self.typing {
+                &mut self.typed[q]
+            } else {
+                &mut self.notes[q].0
+            };
+            // `\` then Enter stays a newline, as in the prompt.
+            let submit = a == Some(A::Submit) && !ed.text()[..ed.cursor()].ends_with('\\');
+            if k.code == KeyCode::Esc {
+                self.typing = false;
+                self.noting = false;
+            } else if !submit {
+                ed.handle(a, k, self.width.get());
+            } else if self.typing || !self.cur().multi {
+                // Single choice: the noted choice is the answer.
+                return self.advance();
+            } else {
+                // Multi: the noted choice is picked; keep picking.
+                self.picked[q].insert(self.notes[q].1);
+                self.noting = false;
             }
             return Done::Pending;
         }
@@ -219,9 +235,32 @@ impl AskForm {
     }
 
     /// `spaced`: a blank line between the parts, dropped when the screen is short.
-    fn lines(&self, w: usize, t: &Theme, spaced: bool) -> Vec<Line<'static>> {
+    /// Also gives the open input's cursor (row, column).
+    fn lines(&self, w: usize, t: &Theme, spaced: bool) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
         let q = self.cur();
         let mut out = Vec::new();
+        let mut cursor = None;
+        // An input's soft-wrapped rows: the first after `lead`, the rest lined up under it.
+        let field =
+            |out: &mut Vec<Line<'static>>, ed: &Editor, lead: Vec<Span<'static>>, style: Style, active: bool| {
+                let pad: usize = lead.iter().map(|s| s.width()).sum();
+                let ew = w.saturating_sub(pad).max(2);
+                if active {
+                    self.width.set(ew);
+                }
+                let (rows, (cr, cc)) = ed.view(ew, usize::MAX);
+                let at = active.then(|| (out.len() + cr as usize, pad + cc as usize));
+                for (i, r) in rows.into_iter().enumerate() {
+                    let mut spans = if i == 0 {
+                        lead.clone()
+                    } else {
+                        vec![Span::raw(" ".repeat(pad))]
+                    };
+                    spans.push(Span::styled(r, style));
+                    out.push(Line::from(spans));
+                }
+                at
+            };
         let gap = |out: &mut Vec<Line<'static>>| {
             if spaced {
                 out.push(Line::default());
@@ -267,20 +306,9 @@ impl AskForm {
             }
             let (note, at) = &self.notes[self.q];
             if *at == i && (self.noting || !note.is_empty()) {
-                let text = if self.noting {
-                    format!("{note}▏")
-                } else {
-                    note.clone()
-                };
-                out.extend(wrap::wrap(
-                    vec![
-                        Span::styled("note: ", t.dim),
-                        Span::styled(text, if self.noting { t.accent } else { t.text }),
-                    ],
-                    w,
-                    &indent,
-                    &indent,
-                ));
+                let lead = vec![indent[0].clone(), Span::styled("note: ", t.dim)];
+                let style = if self.noting { t.accent } else { t.text };
+                cursor = field(&mut out, note, lead, style, self.noting).or(cursor);
             }
             if o.description.is_some() {
                 gap(&mut out);
@@ -288,21 +316,18 @@ impl AskForm {
         }
         let typed = &self.typed[self.q];
         let on_text = sel == q.options.len();
-        let text = if self.typing {
-            format!("{typed}▏")
-        } else if typed.is_empty() {
-            "Type something…".into()
+        let lead = vec![
+            Span::styled(if on_text && !self.typing { " ▸ " } else { "   " }, t.accent),
+            Span::styled("✎ ", t.dim),
+        ];
+        let style = if self.typing || on_text { t.accent } else { t.dim };
+        if self.typing || !typed.is_empty() {
+            cursor = field(&mut out, typed, lead, style, self.typing).or(cursor);
         } else {
-            typed.clone()
-        };
-        out.push(wrap::truncate(
-            vec![
-                Span::styled(if on_text && !self.typing { " ▸ " } else { "   " }, t.accent),
-                Span::styled("✎ ", t.dim),
-                Span::styled(text, if self.typing || on_text { t.accent } else { t.dim }),
-            ],
-            w,
-        ));
+            out.push(Line::from(
+                [lead, vec![Span::styled("Type something…", style)]].concat(),
+            ));
+        }
         gap(&mut out);
         if let Some(p) = q.options.get(sel).and_then(|o| o.preview.as_ref()) {
             // Wrapped, not cut: a plan's lines are long. Capped so the keys line stays on screen.
@@ -344,11 +369,12 @@ impl AskForm {
         }
         // Wrapped, so a narrow form never hides "Esc dismiss".
         out.extend(wrap::wrap(vec![Span::styled(keys, t.dim)], w, &[], &[]));
-        out
+        (out, cursor)
     }
 
     pub fn height(&self, width: u16) -> u16 {
         self.lines(width.saturating_sub(4) as usize, &Theme::default(), true)
+            .0
             .len() as u16
             + 2
     }
@@ -365,10 +391,14 @@ impl AskForm {
         let inner = crate::dialog::frame(f, area, &title, t);
         let w = inner.width as usize;
         let mut lines = self.lines(w, t, true);
-        if lines.len() > inner.height as usize {
+        if lines.0.len() > inner.height as usize {
             lines = self.lines(w, t, false);
         }
+        let (lines, cursor) = lines;
         f.render_widget(Paragraph::new(lines), inner);
+        if let Some((r, c)) = cursor.filter(|&(r, _)| r < inner.height as usize) {
+            f.set_cursor_position(Position::new(inner.x + c as u16, inner.y + r as u16));
+        }
     }
 }
 
@@ -379,6 +409,14 @@ mod tests {
 
     fn key(c: KeyCode) -> KeyEvent {
         KeyEvent::new(c, KeyModifiers::NONE)
+    }
+
+    fn hit(f: &mut AskForm, c: KeyCode) -> Done {
+        let k = key(c);
+        f.handle(
+            k,
+            crate::keys::Keymap::default().lookup(&k, &[crate::keys::Scope::Editor]),
+        )
     }
 
     #[test]
@@ -402,6 +440,7 @@ mod tests {
         });
         let text: String = f
             .lines(40, &Theme::default(), true)
+            .0
             .iter()
             .map(|l| crate::wrap::plain(l) + "\n")
             .collect();
@@ -507,25 +546,25 @@ mod tests {
             reply: tx,
         });
         // The recommended choice starts focused.
-        assert!(matches!(f.handle(key(KeyCode::Enter)), Done::Pending));
-        f.handle(key(KeyCode::Char(' ')));
-        f.handle(key(KeyCode::Down));
-        f.handle(key(KeyCode::Down));
-        f.handle(key(KeyCode::Char(' ')));
-        f.handle(key(KeyCode::Enter));
+        assert!(matches!(hit(&mut f, KeyCode::Enter), Done::Pending));
+        hit(&mut f, KeyCode::Char(' '));
+        hit(&mut f, KeyCode::Down);
+        hit(&mut f, KeyCode::Down);
+        hit(&mut f, KeyCode::Char(' '));
+        hit(&mut f, KeyCode::Enter);
         // Free text instead of a choice.
-        f.handle(key(KeyCode::Down));
-        f.handle(key(KeyCode::Enter));
+        hit(&mut f, KeyCode::Down);
+        hit(&mut f, KeyCode::Enter);
         for c in "nova".chars() {
-            f.handle(key(KeyCode::Char(c)));
+            hit(&mut f, KeyCode::Char(c));
         }
-        let Done::Answered(r) = f.handle(key(KeyCode::Enter)) else {
+        let Done::Answered(r) = hit(&mut f, KeyCode::Enter) else {
             panic!("not done")
         };
         assert_eq!(r[0].chosen, ["sqlite"]);
         assert_eq!(r[1].chosen, ["a", "c"]);
         assert_eq!((r[2].chosen.len(), r[2].text.as_deref()), (0, Some("nova")));
-        assert!(matches!(f.handle(key(KeyCode::Esc)), Done::Dismissed));
+        assert!(matches!(hit(&mut f, KeyCode::Esc), Done::Dismissed));
     }
 
     #[test]
@@ -555,16 +594,57 @@ mod tests {
         });
         f.edit_key = "ctrl+g".into();
         assert_eq!(f.edit_text().as_deref(), Some("1. old step"));
-        let keys: String = f.lines(80, &Theme::default(), true).iter().map(wrap::plain).collect();
+        let keys: String = f.lines(80, &Theme::default(), true).0.iter().map(wrap::plain).collect();
         assert!(keys.contains("ctrl+g view/edit in editor"), "{keys}");
         f.set_edited("1. new step".into());
-        let Done::Answered(r) = f.handle(key(KeyCode::Enter)) else {
+        let Done::Answered(r) = hit(&mut f, KeyCode::Enter) else {
             panic!()
         };
         assert_eq!(
             (r[0].chosen[0].as_str(), r[0].preview.as_deref()),
             ("Approve", Some("1. new step"))
         );
+    }
+
+    /// The note input edits like the prompt (word delete, Shift+Backspace) and wraps long text.
+    #[test]
+    fn note_is_a_real_input() {
+        let (tx, _rx) = oneshot::channel();
+        let mut f = AskForm::new(AskReq {
+            id: 1,
+            questions: vec![Question {
+                question: "db?".into(),
+                header: None,
+                options: vec![Choice {
+                    label: "pg".into(),
+                    description: None,
+                    preview: None,
+                    recommended: false,
+                }],
+                multi: false,
+            }],
+            reply: tx,
+        });
+        hit(&mut f, KeyCode::Char('n'));
+        f.paste(&"word ".repeat(20));
+        let k = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        f.handle(
+            k,
+            crate::keys::Keymap::default().lookup(&k, &[crate::keys::Scope::Editor]),
+        );
+        let k = KeyEvent::new(KeyCode::Backspace, KeyModifiers::SHIFT);
+        f.handle(
+            k,
+            crate::keys::Keymap::default().lookup(&k, &[crate::keys::Scope::Editor]),
+        );
+        let (lines, cursor) = f.lines(30, &Theme::default(), false);
+        let text: Vec<String> = lines.iter().map(wrap::plain).collect();
+        assert!(text.iter().all(|l| l.chars().count() <= 30), "{text:?}");
+        assert!(cursor.is_some());
+        let Done::Answered(r) = hit(&mut f, KeyCode::Enter) else {
+            panic!("not done")
+        };
+        assert_eq!(r[0].text.as_deref(), Some("word ".repeat(19).trim()));
     }
 
     #[test]
@@ -594,23 +674,24 @@ mod tests {
             ],
             reply: tx,
         });
-        f.handle(key(KeyCode::Char('n')));
+        hit(&mut f, KeyCode::Char('n'));
         for c in "with pgvector".chars() {
-            f.handle(key(KeyCode::Char(c)));
+            hit(&mut f, KeyCode::Char(c));
         }
         let shown: String = f
             .lines(60, &Theme::default(), false)
+            .0
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
         assert!(shown.contains("note: with pgvector"));
-        assert!(matches!(f.handle(key(KeyCode::Enter)), Done::Pending));
+        assert!(matches!(hit(&mut f, KeyCode::Enter), Done::Pending));
         // Multi: the note picks its row; Enter then moves on.
-        f.handle(key(KeyCode::Down));
-        f.handle(key(KeyCode::Char('n')));
-        f.handle(key(KeyCode::Char('x')));
-        f.handle(key(KeyCode::Enter));
-        let Done::Answered(r) = f.handle(key(KeyCode::Enter)) else {
+        hit(&mut f, KeyCode::Down);
+        hit(&mut f, KeyCode::Char('n'));
+        hit(&mut f, KeyCode::Char('x'));
+        hit(&mut f, KeyCode::Enter);
+        let Done::Answered(r) = hit(&mut f, KeyCode::Enter) else {
             panic!("not done")
         };
         assert_eq!(

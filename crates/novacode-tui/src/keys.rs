@@ -128,7 +128,7 @@ defs! {
     WordRight, "tui.editor.cursorWordRight", Editor, ["alt+right", "ctrl+right", "alt+f"], "Word right";
     LineStart, "tui.editor.cursorLineStart", Editor, ["home", "ctrl+a"], "Line start";
     LineEnd, "tui.editor.cursorLineEnd", Editor, ["end", "ctrl+e"], "Line end";
-    DeleteBack, "tui.editor.deleteCharBackward", Editor, ["backspace"], "Delete left";
+    DeleteBack, "tui.editor.deleteCharBackward", Editor, ["backspace", "shift+backspace"], "Delete left";
     DeleteForward, "tui.editor.deleteCharForward", Editor, ["delete", "ctrl+d"], "Delete right";
     DeleteWordBack, "tui.editor.deleteWordBackward", Editor, ["ctrl+w", "alt+backspace"], "Delete word left";
     DeleteWordForward, "tui.editor.deleteWordForward", Editor, ["alt+d", "alt+delete"], "Delete word right";

@@ -232,7 +232,7 @@ Press `Alt+/` or type `/keys` to see the live table, including your changes. Typ
 | `tui.editor.cursorWordRight` | `Alt+Right`, `Ctrl+Right`, `Alt+F` | Word right. |
 | `tui.editor.cursorLineStart` | `Home`, `Ctrl+A` | Line start. |
 | `tui.editor.cursorLineEnd` | `End`, `Ctrl+E` | Line end. |
-| `tui.editor.deleteCharBackward` | `Backspace` | Delete left. |
+| `tui.editor.deleteCharBackward` | `Backspace`, `Shift+Backspace` | Delete left. |
 | `tui.editor.deleteCharForward` | `Delete`, `Ctrl+D` | Delete right. |
 | `tui.editor.deleteWordBackward` | `Ctrl+W`, `Alt+Backspace` | Delete word left. |
 | `tui.editor.deleteWordForward` | `Alt+D`, `Alt+Delete` | Delete word right. |

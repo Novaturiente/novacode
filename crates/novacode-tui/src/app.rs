@@ -981,6 +981,11 @@ impl App {
                     c.paste(&s);
                 }
             }
+            Event::Paste(s) if self.approvals.is_empty() && !self.asks.is_empty() => {
+                if let Some(f) = self.asks.front_mut() {
+                    f.paste(&s);
+                }
+            }
             Event::Paste(s) if self.approvals.is_empty() && self.asks.is_empty() && self.overlay.is_none() => {
                 self.editor.paste(&s)
             }
@@ -1026,7 +1031,7 @@ impl App {
                 self.external_editor = true;
                 return;
             }
-            let done = form.handle(k);
+            let done = form.handle(k, self.keymap.lookup(&k, &[Scope::Editor]));
             self.dirty = true;
             let replies = match done {
                 Done::Pending => return,
