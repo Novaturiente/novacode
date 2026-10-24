@@ -292,7 +292,12 @@ impl Editor {
             }
             w += cells(g);
         }
-        row.end
+        // A soft-wrapped row's end is the next row's start: stop on its last grapheme instead.
+        let soft = row.end < self.text.len() && self.text.as_bytes()[row.end] != b'\n';
+        match self.text[row.start..row.end].grapheme_indices(true).next_back() {
+            Some((i, _)) if soft => row.start + i,
+            _ => row.end,
+        }
     }
 
     fn vertical(&mut self, up: bool, width: usize) {
@@ -645,6 +650,18 @@ mod tests {
             let on_grapheme = e.cursor == e.text.len() || e.text.grapheme_indices(true).any(|(i, _)| i == e.cursor);
             assert!(on_grapheme, "cursor {} not on a grapheme start", e.cursor);
         }
+    }
+
+    #[test]
+    fn up_to_a_shorter_wrapped_row_stays_on_it() {
+        let mut e = Editor::default();
+        e.set_text("hello wonderful world");
+        let rows = e.rows(10);
+        assert_eq!(rows.len(), 3);
+        // Row 1, past the end of row 0's text.
+        e.cursor = rows[1].start + 9;
+        e.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), 10);
+        assert_eq!(e.cursor_pos(&e.rows(10)).0, 0);
     }
 
     #[test]

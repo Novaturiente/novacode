@@ -70,6 +70,14 @@ impl Recovery {
             if MARKERS.iter().any(|m| t.starts_with(m)) {
                 return true;
             }
+            // Harmony leaks mid-line (`…commentary to=functions.read <|message|>{…}`): a call
+            // name followed by its envelope counts anywhere outside inline code.
+            static HARMONY: std::sync::LazyLock<regex::Regex> =
+                std::sync::LazyLock::new(|| regex::Regex::new(r"to=functions\.[A-Za-z_][\w.-]*\s*(<\||\{)").unwrap());
+            let prose: String = t.split('`').step_by(2).collect();
+            if HARMONY.is_match(&prose) {
+                return true;
+            }
         }
         false
     }
@@ -108,5 +116,16 @@ mod tests {
         assert!(!Recovery::looks_like_text_tool_call("~~~\n<function_calls>\n~~~"));
         // After a closed fence, a line-start marker counts again.
         assert!(Recovery::looks_like_text_tool_call("```\nx\n```\n<tool_call>"));
+        // Harmony leaks mid-line with its envelope; a mention of the prefix doesn't count.
+        assert!(Recovery::looks_like_text_tool_call(
+            "<|channel|>commentary to=functions.read <|constrain|>json<|message|>{}"
+        ));
+        assert!(Recovery::looks_like_text_tool_call(
+            "ok to=functions.bash {\"command\": \"ls\"}"
+        ));
+        assert!(!Recovery::looks_like_text_tool_call(
+            "the to=functions. prefix is matched"
+        ));
+        assert!(!Recovery::looks_like_text_tool_call("`to=functions.read {}` is a leak"));
     }
 }

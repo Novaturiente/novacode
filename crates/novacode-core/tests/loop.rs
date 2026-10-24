@@ -2109,8 +2109,8 @@ async fn take_follow_ups_drops_queued_prompts() {
     // The run is busy, so these wait in the follow-up queue.
     h.prompt("then this");
     h.prompt("and this");
-    assert_eq!(h.take_follow_ups(), 2);
-    assert_eq!(h.take_follow_ups(), 0);
+    assert_eq!(h.take_follow_ups(), ["then this", "and this"]);
+    assert!(h.take_follow_ups().is_empty());
     h.abort();
     while !matches!(rx.recv().await.unwrap(), AgentEvent::AgentEnd { .. }) {}
     h.shutdown();

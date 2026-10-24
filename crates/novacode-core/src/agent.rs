@@ -2371,12 +2371,25 @@ impl SessionHandle {
         q.pop_back().is_some()
     }
 
-    /// Drop every queued follow-up that hasn't started; returns how many were removed.
-    pub fn take_follow_ups(&self) -> usize {
+    /// Take every queued follow-up that hasn't started out of the queue (user abort, L3.7).
+    /// Their texts come back so the window can return them to the editor, whoever queued them.
+    // shortcut: follow-ups holding images stay queued (the editor can't take them back); fine until image follow-ups are common.
+    pub fn take_follow_ups(&self) -> Vec<String> {
         let mut q = self.shared.queues.lock().unwrap();
-        let n = q.follow_up.len();
-        q.follow_up.clear();
-        n
+        let text_only = |c: &Vec<Block>| c.iter().all(|b| matches!(b, Block::Text { .. }));
+        let (taken, kept): (VecDeque<_>, VecDeque<_>) = q.follow_up.drain(..).partition(text_only);
+        q.follow_up = kept;
+        taken
+            .into_iter()
+            .map(|c| {
+                c.into_iter()
+                    .filter_map(|b| match b {
+                        Block::Text { text, .. } => Some(text),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     /// Compact now, or as soon as the running turn ends (`/compact`, L4.5).

@@ -241,9 +241,9 @@ pub enum UiEvent {
     Dequeued {
         ok: bool,
     },
-    /// Answer to [`Cmd::TakeFollowUps`]: how many queued follow-ups were taken back.
+    /// Answer to [`Cmd::TakeFollowUps`]: the queued follow-ups taken back, oldest first.
     FollowUpsBack {
-        n: usize,
+        texts: Vec<String>,
     },
     /// Prompts of this folder's other sessions, oldest first, for Up/Ctrl+R (L9.5).
     History {
@@ -602,7 +602,13 @@ impl App {
         self.dirty = true;
         match ev {
             UiEvent::Approve(req) => self.approvals.push_back(ApprovalCard::new(req)),
-            UiEvent::ApprovalDone { id } => self.approvals.retain(|c| c.req.id != id),
+            UiEvent::ApprovalDone { id } => {
+                let front = self.approvals.front().map(|c| c.req.id);
+                self.approvals.retain(|c| c.req.id != id);
+                if self.approvals.front().map(|c| c.req.id) != front {
+                    self.front_card_shown();
+                }
+            }
             UiEvent::Ask(req) => {
                 let mut form = crate::ask::AskForm::new(req);
                 form.edit_key = self.keymap.keys(A::ExternalEditor);
@@ -640,27 +646,20 @@ impl App {
                         .set_text(&if draft.is_empty() { t } else { format!("{t}\n{draft}") });
                 }
             }
-            UiEvent::FollowUpsBack { n } if n > 0 => {
-                // The newest `n` follow-ups are the ones still queued (older ones already started).
-                let idx: Vec<usize> = self
-                    .pending
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (_, steer))| !steer)
-                    .map(|(i, _)| i)
-                    .collect();
-                let idx = &idx[idx.len().saturating_sub(n)..];
-                let back: Vec<String> = idx.iter().map(|&i| self.pending[i].0.clone()).collect();
-                for &i in idx.iter().rev() {
-                    self.pending.remove(i);
+            UiEvent::FollowUpsBack { texts } if !texts.is_empty() => {
+                // The host's texts are what was really queued (some may come from extensions or other windows).
+                for t in &texts {
+                    if let Some(i) = self.pending.iter().position(|(p, steer)| !steer && p == t) {
+                        self.pending.remove(i);
+                    }
                 }
                 let draft = self.editor.text().to_string();
-                let mut text = back.join("\n");
+                let mut text = texts.join("\n");
                 if !draft.is_empty() {
                     text = format!("{text}\n{draft}");
                 }
                 self.editor.set_text(&text);
-                self.flash(format!("{} queued follow-up(s) moved back to the editor", back.len()));
+                self.flash(format!("{} queued follow-up(s) moved back to the editor", texts.len()));
             }
             UiEvent::FollowUpsBack { .. } => {}
             UiEvent::History { prompts } => self.editor.prepend_history(prompts),
@@ -1026,11 +1025,13 @@ impl App {
         match ev {
             Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
             // An approval card takes the keys first, so it takes pastes too (its reason box).
-            Event::Paste(s) if !self.approvals.is_empty() => {
+            Event::Paste(s) if self.approvals.front().is_some_and(|c| c.typing()) => {
                 if let Some(c) = self.approvals.front_mut() {
                     c.paste(&s);
                 }
             }
+            // A card is up but not taking text: the paste goes to the prompt below it.
+            Event::Paste(s) if !self.approvals.is_empty() => self.editor.paste(&s),
             Event::Paste(s) if matches!(self.overlay, Some(Overlay::Login(_))) => {
                 if let Some(Overlay::Login(v)) = &mut self.overlay {
                     v.paste(&s);
@@ -1059,8 +1060,16 @@ impl App {
         }
     }
 
+    /// The next queued card just came to the front: its type-ahead grace starts now.
+    fn front_card_shown(&mut self) {
+        if let Some(c) = self.approvals.front_mut() {
+            c.shown = Instant::now();
+        }
+    }
+
     fn answer(&mut self, ans: Answer) {
         let Some(card) = self.approvals.pop_front() else { return };
+        self.front_card_shown();
         let r = &card.req;
         let what = format!("{} {}", r.tool, r.detail.lines().next().unwrap_or(""));
         // Kept in the transcript so the decision stays visible, even in collapsed turns (C5).

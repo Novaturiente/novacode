@@ -676,7 +676,11 @@ pub fn list(paths: &Paths, cwd: &Path) -> Vec<PathBuf> {
     files.into_iter().map(|(_, p)| p).collect()
 }
 
+/// How a subagent's first prompt starts (written by the parent); its session isn't the user's history.
+pub const SUBAGENT_TASK_PREFIX: &str = "You are subagent ";
+
 /// Typed prompts from this cwd's recent sessions, oldest first, at most `max` (L9.5 history).
+/// Subagent sessions (same folder, first prompt from the parent) are skipped.
 /// Newest sessions are read first (at most 20 files), skipping session `exclude`.
 /// Prompt text = the text blocks of stored user messages, joined as the TUI joins them.
 pub fn recent_prompts(paths: &Paths, cwd: &Path, exclude: Option<&str>, max: usize) -> Vec<String> {
@@ -712,6 +716,9 @@ pub fn recent_prompts(paths: &Paths, cwd: &Path, exclude: Option<&str>, max: usi
             })
             .filter(|t| !t.trim().is_empty())
             .collect();
+        if found.first().is_some_and(|t| t.starts_with(SUBAGENT_TASK_PREFIX)) {
+            continue;
+        }
         let keep = found.len().min(max - have);
         found.drain(..found.len() - keep);
         have += keep;
@@ -1070,6 +1077,10 @@ mod tests {
         assert_eq!(recent_prompts(&paths, cwd, None, 3), ["b", "c", "d"]);
         assert_eq!(recent_prompts(&paths, cwd, Some(&new_id), 10), ["a", "b"]);
         assert!(recent_prompts(&paths, Path::new("/other"), None, 10).is_empty());
+        // A subagent's session in the same folder is not the user's history.
+        let child = format!("{SUBAGENT_TASK_PREFIX}\"scout\" task");
+        write(&[child.as_str(), "more"]);
+        assert_eq!(recent_prompts(&paths, cwd, None, 10), ["a", "b", "c", "d"]);
     }
 
     #[test]

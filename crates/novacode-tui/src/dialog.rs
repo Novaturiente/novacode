@@ -205,6 +205,11 @@ impl ApprovalCard {
         }
     }
 
+    /// The "why not?" box is open (pastes go there).
+    pub fn typing(&self) -> bool {
+        self.reason.is_some()
+    }
+
     /// `Some` = answered. `a` is the key's editor action from the keymap (for the reason box).
     pub fn handle(&mut self, k: KeyEvent, a: Option<A>) -> Option<Answer> {
         if self.shown.elapsed() < APPROVAL_GRACE {

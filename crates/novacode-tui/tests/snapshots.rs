@@ -354,9 +354,11 @@ fn esc_puts_queued_follow_ups_back() {
     key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!(rx.try_recv().unwrap(), Cmd::TakeFollowUps);
     assert_eq!(rx.try_recv().unwrap(), Cmd::Abort);
-    // The host took back one queued follow-up: it returns to the editor; the steer stays queued.
-    a.on_ui(UiEvent::FollowUpsBack { n: 1 });
-    assert_eq!(a.editor_text(), "then docs");
+    // The host took back the queued follow-up, plus one an extension queued: both return to the editor.
+    a.on_ui(UiEvent::FollowUpsBack {
+        texts: vec!["then docs".into(), "from an extension".into()],
+    });
+    assert_eq!(a.editor_text(), "then docs\nfrom an extension");
 }
 
 #[test]
@@ -432,6 +434,34 @@ fn approval_reason_takes_a_paste() {
     assert!(a.editor.is_empty(), "the paste went to the card");
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(reply.try_recv().unwrap(), Answer::Deny(Some("too risky".into())));
+}
+
+#[test]
+fn next_queued_card_gets_its_own_grace() {
+    let (mut a, _rx) = app(vec![]);
+    let mut replies = Vec::new();
+    for id in 1..=2 {
+        let (tx, reply) = tokio::sync::oneshot::channel();
+        a.on_ui(UiEvent::Approve(ApproveReq {
+            id,
+            tool: "bash".into(),
+            detail: format!("rm -rf t{id}"),
+            reason: "deletes files".into(),
+            rule: format!("rm -rf t{id}"),
+            risky: false,
+            reply: tx,
+        }));
+        replies.push(reply);
+    }
+    a.age_approvals();
+    key(&mut a, KeyCode::Char('y'), KeyModifiers::NONE);
+    assert_eq!(replies[0].try_recv().unwrap(), Answer::Once);
+    // The second card was queued long ago, but it only just came to the front.
+    key(&mut a, KeyCode::Char('a'), KeyModifiers::NONE);
+    assert!(replies[1].try_recv().is_err());
+    // With no reason box open, a paste goes to the prompt.
+    a.on_event(Event::Paste("next task".into()));
+    assert_eq!(a.editor.text(), "next task");
 }
 
 #[test]

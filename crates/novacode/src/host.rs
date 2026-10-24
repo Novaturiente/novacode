@@ -551,7 +551,7 @@ impl Host {
             }
             Cmd::TakeFollowUps => {
                 let _ = ui.send(UiEvent::FollowUpsBack {
-                    n: self.hub.handle.take_follow_ups(),
+                    texts: self.hub.handle.take_follow_ups(),
                 });
             }
             Cmd::Background => {

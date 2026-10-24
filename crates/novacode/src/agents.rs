@@ -1047,12 +1047,13 @@ impl Supervisor {
                         return (c.n.clone(), text, c.session.clone());
                     }
                     let first = format!(
-                        "You are subagent \"{}\" (agent {}, depth {}), started by another novacode agent. \
+                        "{}\"{}\" (agent {}, depth {}), started by another novacode agent. \
                          Do the task below. Your final message is your report to it: what you did, what you \
                          found with file paths, and anything left open. Write the report terse, for an agent, \
                          not a person: fragments, no preamble or pleasantries, no restating the task. Keep every \
                          fact the parent needs (paths, line numbers, names, numbers, commands, errors quoted \
                          exactly); drop only filler.\n\n{}",
+                        novacode_core::session::SUBAGENT_TASK_PREFIX,
                         c.title,
                         c.agent,
                         self.place.depth + 1,
