@@ -157,7 +157,14 @@ pub fn apply_edits(raw: &str, edits: &[(String, String)]) -> Result<(String, Str
 }
 
 fn find_unique(text: &str, old: &str) -> Result<Range<usize>, String> {
-    let exact: Vec<usize> = text.match_indices(old).map(|(i, _)| i).collect();
+    // Overlapping hits count too ("}\n}\n" in "}\n}\n}\n" is 2), so restart one char after each start.
+    let mut exact = Vec::new();
+    let mut from = 0;
+    while let Some(i) = text.get(from..).and_then(|t| t.find(old)) {
+        let at = from + i;
+        exact.push(at);
+        from = at + text[at..].chars().next().map_or(1, char::len_utf8);
+    }
     match exact.len() {
         1 => return Ok(exact[0]..exact[0] + old.len()),
         n if n > 1 => {
@@ -272,6 +279,12 @@ mod tests {
         assert_eq!(out, "fn y() {\n    say(\"yo\");\n}\n");
         assert!(apply_edits("a a", &[e("a", "b")]).unwrap_err().contains("2 places"));
         assert!(apply_edits("abc", &[e("zz", "b")]).unwrap_err().contains("not found"));
+        assert!(
+            apply_edits("}\n}\n}\n", &[e("}\n}\n", "x")])
+                .unwrap_err()
+                .contains("matches 2 places"),
+            "overlapping matches count"
+        );
         assert!(
             apply_edits("abcd", &[e("abc", "x"), e("cd", "y")])
                 .unwrap_err()

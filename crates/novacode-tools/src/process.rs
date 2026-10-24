@@ -91,7 +91,8 @@ struct Proc {
     /// Ctrl+Alt+B: the waiting bash call should return now.
     detach: Notify,
     on_exit: Mutex<Attention>,
-    watches: Mutex<Vec<(Watch, bool)>>,
+    /// (watch, its compiled regex when `regex`, fired).
+    watches: Mutex<Vec<(Watch, Option<regex::Regex>, bool)>>,
     /// Live output for a waiting bash call: (is_stderr, bytes).
     chunks: broadcast::Sender<(bool, Vec<u8>)>,
     last_output_ms: AtomicU64,
@@ -357,7 +358,13 @@ impl ProcessManager {
 
     pub fn set_watches(&self, id: &str, watches: Vec<Watch>, on_exit: Option<Attention>) -> bool {
         let Some(p) = self.get(id) else { return false };
-        *p.watches.lock().unwrap() = watches.into_iter().map(|w| (w, false)).collect();
+        *p.watches.lock().unwrap() = watches
+            .into_iter()
+            .map(|w| {
+                let re = w.regex.then(|| regex::Regex::new(&w.pattern).ok()).flatten();
+                (w, re, false)
+            })
+            .collect();
         if let Some(a) = on_exit {
             *p.on_exit.lock().unwrap() = a;
         }
@@ -595,12 +602,12 @@ fn check_watches(pm: &ProcessManager, p: &Proc, line: &str) {
         return;
     }
     let mut hits = Vec::new();
-    for (w, fired) in p.watches.lock().unwrap().iter_mut() {
+    for (w, re, fired) in p.watches.lock().unwrap().iter_mut() {
         if *fired && !w.repeat {
             continue;
         }
         let m = if w.regex {
-            regex::Regex::new(&w.pattern).is_ok_and(|r| r.is_match(line))
+            re.as_ref().is_some_and(|r| r.is_match(line))
         } else {
             line.contains(&w.pattern)
         };
@@ -802,6 +809,15 @@ impl crate::Tool for ProcessTool {
                 a.id.clone()
                     .ok_or_else(|| ToolOutput::error("`id` is required for this action"))
             };
+            // A bad regex would silently never match: refuse it before anything starts.
+            if let Some(ws) = &a.watches
+                && let Some((w, e)) = ws
+                    .iter()
+                    .filter(|w| w.regex)
+                    .find_map(|w| regex::Regex::new(&w.pattern).err().map(|e| (w, e)))
+            {
+                return ToolOutput::error(format!("watch pattern `{}` is not a valid regex: {e}", w.pattern));
+            }
             match a.action {
                 Action::Start => {
                     let Some(cmd) = a.command.as_deref().filter(|c| !c.trim().is_empty()) else {
@@ -886,6 +902,27 @@ impl crate::Tool for ProcessTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bad_watch_regex_is_refused() {
+        use crate::Tool;
+        let d = tempfile::tempdir().unwrap();
+        let mut c = crate::testutil::ctx(d.path());
+        c.processes = Some(ProcessManager::new(d.path(), "s"));
+        let w = serde_json::json!([{"pattern": "(", "regex": true}]);
+        let o = ProcessTool
+            .execute(
+                serde_json::json!({"action": "start", "command": "sleep 5", "watches": w}),
+                &c,
+            )
+            .await;
+        assert!(o.is_error && crate::testutil::text(&o).contains("not a valid regex"));
+        assert!(c.processes.as_ref().unwrap().list().is_empty(), "nothing started");
+        let o = ProcessTool
+            .execute(serde_json::json!({"action": "watch", "id": "p1", "watches": w}), &c)
+            .await;
+        assert!(o.is_error && crate::testutil::text(&o).contains("not a valid regex"));
+    }
 
     #[tokio::test]
     async fn run_watch_stop_and_kill_on_drop() {

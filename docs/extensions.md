@@ -151,7 +151,7 @@ The `initialize` result declares everything you handle:
 
 **Requests overlap.** The model can run several tools at once, so a new request can arrive before you answered the last one. Answer each by its `id`, in any order. A slow handler should run in its own thread or task, as both examples below do.
 
-**Failures.** An `error` answer counts as an error. Three errors in a row, a missed time limit, or the process exiting disables the extension with a notice until the next `/reload`; the session carries on. A tool call the user cancels stops waiting for you, but you aren't told, and a late answer is dropped. If the program can't start or `initialize` fails, novacode shows a notice and runs without it.
+**Failures.** An `error` answer counts as an error, whatever its message says. Three errors in a row, a missed time limit, or the process exiting disables the extension with a notice until the next `/reload`; the session carries on. A tool call the user cancels stops waiting for you, but you aren't told, and a late answer is dropped. If the program can't start or `initialize` fails, novacode shows a notice and runs without it.
 
 ### Messages you send
 

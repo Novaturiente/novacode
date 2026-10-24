@@ -59,7 +59,7 @@ Two limits protect the context window:
 | `offset` | First line, 1-based. |
 | `limit` | Max lines (capped at 2000). |
 
-Lines longer than 2000 characters are clipped. A read is also cut at 50 KB. When more is left, the result says which `offset` to continue with. An `offset` past the end is an error. Images come back as images, converted and shrunk to fit if needed. Binary files (a NUL byte near the start) are refused. A directory is an error: use `ls`.
+Lines longer than 2000 characters are clipped with `… [line clipped at 2000 chars; use grep or bash \`cut -c\` to see the rest]`, since `offset` can't reach the rest of a line. Files over 64 MiB are refused before loading; use `grep`, or `sed -n 'a,bp' file` through `bash`. A read is also cut at 50 KB. When more is left, the result says which `offset` to continue with. An `offset` past the end is an error. Images come back as images, converted and shrunk to fit if needed. Binary files (a NUL byte near the start) are refused. A directory is an error: use `ls`.
 
 ### write
 
@@ -67,7 +67,7 @@ Params: `path`, `content`. Creates missing folders. If the file changed on disk 
 
 ### edit
 
-Params: `path`, `edits` (a list of `old_text` / `new_text`). Each `old_text` must match exactly one place. If an exact match fails, a whitespace and quote tolerant match is tried. All edits apply together or none do. CRLF line endings and a BOM are kept. If the file changed on disk since the agent last read it, `edit` still applies when every `old_text` matches exactly once, and the result says the file had changed. Only a failed match adds "changed on disk since you last read it". Edits to the same file run one at a time. The result is a one-line summary of where it edited. If the match was fuzzy, it also includes the diff so the model can check it.
+Params: `path`, `edits` (a list of `old_text` / `new_text`). Each `old_text` must match exactly one place; overlapping matches count too (`}\n}\n` in `}\n}\n}\n` is 2). If an exact match fails, a whitespace and quote tolerant match is tried. All edits apply together or none do. CRLF line endings and a BOM are kept. If the file changed on disk since the agent last read it, `edit` still applies when every `old_text` matches exactly once, and the result says the file had changed. Only a failed match adds "changed on disk since you last read it". Edits to the same file run one at a time. The result is a one-line summary of where it edited. If the match was fuzzy, it also includes the diff so the model can check it.
 
 `apply_patch` (a patch-format tool that can replace `edit` for some models) exists in the code but is not turned on in any release path yet, so the model does not see it.
 
@@ -80,7 +80,7 @@ Params: `path`, `edits` (a list of `old_text` / `new_text`). Each `old_text` mus
 | `intent` | One short sentence on why; shown to you. |
 | `justification` | Only when the safety check asks for it with nobody to approve. See [Security](security.md). |
 
-stdout and stderr are merged. stdin is closed, so interactive programs fail instead of hanging. The command sees `NOVACODE_SESSION_ID`. In memory, only the last 4 MB of output is kept.
+Each call is a fresh shell: `cd` and `export` don't carry over to the next call. stdout and stderr are merged. stdin is closed, so interactive programs fail instead of hanging. The command sees `NOVACODE_SESSION_ID`. In memory, only the last 4 MB of output is kept.
 
 A command that passes its timeout is not killed: it moves to the process manager and keeps running, and the model gets its id. If it is still running at twice the timeout, you are asked whether to keep it. (Without a process manager, such as in some embedded runs, it is killed at the timeout.)
 
@@ -192,7 +192,7 @@ The `process` tool runs commands that keep going across turns: dev servers, watc
 | `watch` | Sets what the model is told about: when it exits (`on_exit`: `wake`, `context` or `ignore`), when an output line matches, or when it prints nothing for `stall_seconds` (at least 5). `start` takes these too. |
 | `clear` | Forgets finished processes and deletes their logs. |
 
-A watch is `{pattern, regex?, on, repeat?}`: `pattern` is plain text unless `regex` is true, and `on` is `wake`, `context` or `ignore`. Setting `watches` replaces the earlier ones.
+A watch is `{pattern, regex?, on, repeat?}`: `pattern` is plain text unless `regex` is true, and `on` is `wake`, `context` or `ignore`. An invalid regex is an error: `start` then starts nothing, and `watch` changes nothing. Setting `watches` replaces the earlier ones.
 
 The model is told when a process exits or a watched line appears, so it does not need to poll. Output logs are kept in `~/.novacode/processes/`. Each stream's log rotates at 8 MiB, keeping one older file (`.1`); output older than that is dropped, and `output` marks the gap with `[older output discarded]`. Every process a session started is stopped when the session ends. If novacode crashes, the next start cleans up processes it left behind.
 

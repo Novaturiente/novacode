@@ -20,6 +20,8 @@ struct Args {
 }
 
 const MAX_LINE: usize = 2000;
+/// Files above this are refused before loading (images are capped lower, in `image`).
+const MAX_FILE: u64 = 64 << 20;
 impl Tool for Read {
     fn name(&self) -> &str {
         "read"
@@ -48,6 +50,14 @@ impl Tool for Read {
                 Ok(None) => return ToolOutput::error(format!("{} does not exist", a.path)),
                 Err(e) => return ToolOutput::error(format!("cannot read {}: {e}", a.path)),
             };
+            if meta.len > MAX_FILE {
+                return ToolOutput::error(format!(
+                    "{} is too large to read ({} MiB, limit {} MiB); use grep, or bash `sed -n 'a,bp' file`",
+                    a.path,
+                    meta.len >> 20,
+                    MAX_FILE >> 20
+                ));
+            }
             let bytes = match ctx.env.read(&path).await {
                 Ok(b) => b,
                 Err(e) => return ToolOutput::error(format!("cannot read {}: {e}", a.path)),
@@ -87,7 +97,10 @@ impl Tool for Read {
             let mut end = start;
             for l in lines.iter().skip(start).take(limit) {
                 let l = match l.char_indices().nth(MAX_LINE) {
-                    Some((i, _)) => format!("{}… [line clipped]", &l[..i]),
+                    Some((i, _)) => format!(
+                        "{}… [line clipped at {MAX_LINE} chars; use grep or bash `cut -c` to see the rest]",
+                        &l[..i]
+                    ),
                     None => l.to_string(),
                 };
                 if out.len() + l.len() + 1 > guard::MAX_BYTES {
@@ -142,5 +155,22 @@ mod tests {
         assert!(text(&o).ends_with("l10\n"));
         assert!(Read.execute(json!({"path": "nope"}), &c).await.is_error);
         assert!(Read.execute(json!({"path": "."}), &c).await.is_error);
+    }
+
+    #[tokio::test]
+    async fn huge_file_refused_and_long_line_clipped() {
+        let d = tempfile::tempdir().unwrap();
+        let f = std::fs::File::create(d.path().join("big")).unwrap();
+        f.set_len(100 << 20).unwrap();
+        std::fs::write(d.path().join("long"), "x".repeat(5000)).unwrap();
+        let c = ctx(d.path());
+        let o = Read.execute(json!({"path": "big"}), &c).await;
+        assert!(o.is_error && text(&o).contains("too large"), "{}", text(&o));
+        let o = Read.execute(json!({"path": "long"}), &c).await;
+        assert!(
+            text(&o).contains("… [line clipped at 2000 chars; use grep or bash `cut -c` to see the rest]"),
+            "{}",
+            text(&o)
+        );
     }
 }
