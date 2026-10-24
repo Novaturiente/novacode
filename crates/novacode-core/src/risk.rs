@@ -501,7 +501,27 @@ const RUNNING_VARS: &[&str] = &[
     "EDITOR",
     "VISUAL",
 ];
-const SUDO_VALUE_FLAGS: &[&str] = &["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "--user"];
+const SUDO_VALUE_FLAGS: &[&str] = &[
+    "-u",
+    "-g",
+    "-h",
+    "-p",
+    "-C",
+    "-D",
+    "-r",
+    "-t",
+    "-U",
+    "-T",
+    "--user",
+    "--group",
+    "--host",
+    "--prompt",
+    "--chdir",
+    "--role",
+    "--type",
+    "--other-user",
+    "--close-from",
+];
 const XARGS_VALUE_FLAGS: &[&str] = &[
     "-n",
     "-L",
@@ -633,8 +653,13 @@ fn simple(w: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
                         .or_else(|| a.strip_prefix("-S").filter(|s| !s.is_empty()))
                 };
                 if let Some(s) = split {
-                    // `-S` splits this string into the command and its arguments.
-                    return classify_depth(s, ctx, depth + 1);
+                    // `-S` splits this string into the command, and env appends the words after it.
+                    let tail: Vec<String> = args[(i + 1).min(args.len())..]
+                        .iter()
+                        .map(|a| format!("'{}'", a.replace('\'', r"'\''")))
+                        .collect();
+                    let line = std::iter::once(s.to_string()).chain(tail).collect::<Vec<_>>().join(" ");
+                    return classify_depth(&line, ctx, depth + 1);
                 }
                 if a == "--" {
                     i += 1;
@@ -821,9 +846,12 @@ fn simple(w: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
 fn writes_or_runs(name: &str, args: &[String]) -> bool {
     let short = |a: &str, c: char| a.starts_with('-') && !a.starts_with("--") && a[1..].contains(c);
     let any = |f: &dyn Fn(&str) -> bool| args.iter().any(|a| f(a));
+    static AWK_RUNS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"system\s*\(|getline|\|\s*"|"\s*\||print[f]?\b[^;}]*>"#).unwrap()
+    });
     match name {
         "awk" => {
-            let prog = regex::Regex::new(r#"system\s*\(|getline|\|\s*"|"\s*\||print[f]?\b[^;}]*>"#).unwrap();
+            let prog = &*AWK_RUNS;
             any(&|a| {
                 (a.starts_with('-')
                     && !a.starts_with("--")
@@ -834,8 +862,18 @@ fn writes_or_runs(name: &str, args: &[String]) -> bool {
                     || (!a.starts_with('-') && prog.is_match(a))
             })
         }
-        "fd" => any(&|a| a == "-x" || a == "-X" || a.starts_with("--exec")),
-        "sort" => any(&|a| a.starts_with("--output") || short(a, 'o')),
+        "fd" => getopt(
+            args,
+            "teEdSjc",
+            &["type", "extension", "exclude", "max-depth", "size", "threads", "color"],
+        )
+        .has(|k| k == "x" || k == "X" || k.starts_with("exec")),
+        "sort" => getopt(
+            args,
+            "tkSTo",
+            &["field-separator", "key", "buffer-size", "temporary-directory", "output"],
+        )
+        .has(|k| k == "o" || k == "output" || k == "compress-program"),
         "tree" => any(&|a| short(a, 'o')),
         "uniq" => {
             getopt(args, "fsw", &["skip-fields", "skip-chars", "check-chars"])
@@ -851,7 +889,38 @@ fn writes_or_runs(name: &str, args: &[String]) -> bool {
         }
         "rg" => any(&|a| a.starts_with("--pre")),
         "ss" => has_flag(args, 'K', "--kill"),
-        "date" => any(&|a| a.starts_with("--set") || short(a, 's')),
+        "date" => {
+            // Only `-s`/`--set` sets the clock; `-d`, `-f`, `-r` take a value, `-I` an attached one.
+            let mut it = args.iter();
+            while let Some(a) = it.next() {
+                if a == "--" {
+                    break;
+                }
+                if a.starts_with("--set") {
+                    return true;
+                }
+                if ["--date", "--file", "--reference"].contains(&a.as_str()) {
+                    it.next();
+                }
+                if a.starts_with("--") || !a.starts_with('-') {
+                    continue;
+                }
+                for (j, c) in a.char_indices().skip(1) {
+                    match c {
+                        's' => return true,
+                        'd' | 'f' | 'r' => {
+                            if j + 1 == a.len() {
+                                it.next();
+                            }
+                            break;
+                        }
+                        'I' => break,
+                        _ => {}
+                    }
+                }
+            }
+            false
+        }
         _ => false,
     }
 }
@@ -862,14 +931,24 @@ fn is_exact_dir(p: &Path, ctx: &Ctx) -> bool {
 }
 
 /// Writing to `dest`: into an exact home or system folder (`into`, the file lands
-/// inside it) is ordinary; replacing one, or writing under credentials, is not.
-fn destination(dest: &str, ctx: &Ctx, into: bool, verb: &str) -> Risk {
+/// inside it) is ordinary unless a source lands on a protected name there
+/// (`cp -r x/.ssh ~`); replacing one, or writing under credentials, is not.
+fn destination(dest: &str, sources: &[&str], ctx: &Ctx, into: bool, verb: &str) -> Risk {
     let p = resolve(dest, ctx);
     if is_device(&p) {
         return Risk::new(Level::Catastrophic, format!("{verb} the device {}", p.display()));
     }
     match protected(&p, ctx) {
-        Some(_) if into && is_exact_dir(&p, ctx) => Risk::low(),
+        Some(_) if into && is_exact_dir(&p, ctx) => {
+            let mut r = Risk::low();
+            for s in sources.iter().filter(|s| !s.starts_with('-')) {
+                let landed = resolve(s, ctx).file_name().map(|n| p.join(n));
+                if let Some(why) = landed.and_then(|l| protected(&l, ctx)) {
+                    r = r.max(Risk::new(Level::Catastrophic, format!("{verb} {why}")));
+                }
+            }
+            r
+        }
         Some(why) => Risk::new(Level::Catastrophic, format!("{verb} {why}")),
         None => Risk::low(),
     }
@@ -899,7 +978,7 @@ fn copy_like(name: &str, args: &[String], ctx: &Ctx) -> Risk {
         r = r.max(targets(sources, ctx, "moves"));
     }
     if let Some(d) = dest {
-        r = r.max(destination(d, ctx, into, "replaces"));
+        r = r.max(destination(d, sources, ctx, into, "replaces"));
     }
     r
 }
@@ -945,12 +1024,20 @@ fn rsync(args: &[String], ctx: &Ctx) -> Risk {
     let Some((dest, sources)) = o.pos.split_last() else {
         return Risk::low();
     };
+    // `src/` copies the contents of src, not src itself, so its name doesn't land.
+    // shortcut: what's inside such a source isn't known here; only a protected `src/` counts.
+    let named: Vec<&str> = sources.iter().copied().filter(|s| !s.ends_with('/')).collect();
     let mut r = destination(
         dest,
+        &named,
         ctx,
         !deletes,
         if deletes { "deletes files in" } else { "replaces" },
     );
+    if !deletes && is_exact_dir(&resolve(dest, ctx), ctx) {
+        let contents: Vec<&str> = sources.iter().copied().filter(|s| s.ends_with('/')).collect();
+        r = r.max(targets(&contents, ctx, "copies out of"));
+    }
     if o.has(|k| k == "remove-source-files") {
         r = r.max(targets(sources, ctx, "moves"));
     }
@@ -1167,8 +1254,27 @@ const CREDENTIAL_DIRS: &[&str] = &[
 
 /// Why writing a file at `path` would touch a protected place, or `None`: the
 /// file tools refuse what a catastrophic shell command would (L6.2).
+/// Under `~/.novacode` only the login and trust files count, so the agent can
+/// still edit AGENTS.md, skills and settings there.
 pub fn protected_path(path: &Path, ctx: &Ctx) -> Option<String> {
-    protected(&resolve(&path.to_string_lossy(), ctx), ctx)
+    let p = resolve(&path.to_string_lossy(), ctx);
+    let nova = ctx.home.join(".novacode");
+    if let Ok(rest) = p.strip_prefix(&nova)
+        && !rest.as_os_str().is_empty()
+    {
+        let mut parts = rest.components();
+        let first = parts.next().map(|c| c.as_os_str().to_string_lossy().into_owned());
+        let cred = first.as_deref().is_some_and(|n| {
+            n == "auth.json"
+                || n == "mcp-auth.json"
+                || n == "trust.json"
+                || (n.starts_with("auth-") && n.ends_with(".json"))
+        });
+        if !(cred && parts.next().is_none()) {
+            return extra_protected(&p, ctx);
+        }
+    }
+    protected(&p, ctx)
 }
 
 /// Why `p` is protected, or `None`.
@@ -1185,6 +1291,11 @@ fn protected(p: &Path, ctx: &Ctx) -> Option<String> {
             return Some(format!("credentials in ~/{d}"));
         }
     }
+    extra_protected(p, ctx)
+}
+
+/// The user's own protected paths from settings.
+fn extra_protected(p: &Path, ctx: &Ctx) -> Option<String> {
     for extra in ctx.protected {
         let e = resolve(extra, ctx);
         if p == e || p.starts_with(&e) {
@@ -1345,7 +1456,13 @@ mod tests {
             ("env -u X rm -rf ~", Catastrophic),
             ("env -C /tmp rm -rf ~", Catastrophic),
             ("env -S 'rm -rf ~'", Catastrophic),
+            ("env -S rm -rf ~", Catastrophic),
+            ("env -S 'rm -rf' ~", Catastrophic),
+            ("env --split-string=rm -rf ~", Catastrophic),
+            ("env -S 'echo' hi", Safe),
             ("sudo -u root rm -rf ~", Catastrophic),
+            ("sudo --group wheel rm -rf ~", Catastrophic),
+            ("sudo --user root --chdir /tmp rm -rf ~", Catastrophic),
             ("time -p git status", Safe),
             // git options and variables that run programs.
             ("git -c core.fsmonitor='touch x' status", Low),
@@ -1374,8 +1491,17 @@ mod tests {
             ("awk '$3 > 100' f", Safe),
             ("fd -x rm {}", Low),
             ("fd -tx rs", Safe),
+            ("fd -Hx rm", Low),
+            ("fd -X rm", Low),
+            ("fd --exec-batch rm", Low),
+            ("fd -e x rs", Safe),
             ("find . -fprint out", Low),
             ("sort -o out a", Low),
+            ("sort -ro out a", Low),
+            ("sort --output=out a", Low),
+            ("sort -to a", Safe),
+            ("sort -t o -k 2 a", Safe),
+            ("sort --compress-program=x a", Low),
             ("tree -o out", Low),
             ("uniq a out", Low),
             ("uniq -c a", Safe),
@@ -1384,6 +1510,11 @@ mod tests {
             ("ss -K dst 1.2.3.4", Low),
             ("date -s 2020-01-01", Low),
             ("date +%s", Safe),
+            ("date -Iseconds", Safe),
+            ("date -us 2020-01-01", Low),
+            ("date --set=2020-01-01", Low),
+            ("date -d 'last sun' +%s", Safe),
+            ("date -d -s", Safe),
             // Any force or branch-deleting push.
             ("git push --force-with-lease", Shared),
             ("git push --force-if-includes", Shared),
@@ -1401,6 +1532,13 @@ mod tests {
             ("cp -T dir ~", Catastrophic),
             ("rsync -a --delete src/ ~/", Catastrophic),
             ("rsync -a src/ ~/", Low),
+            // Copying a credential-named source into home merges into the credentials.
+            ("cp -r payload/.ssh ~", Catastrophic),
+            ("cp -r .novacode ~/", Catastrophic),
+            ("cp -t ~ .ssh", Catastrophic),
+            ("rsync -a dir/.ssh ~/", Catastrophic),
+            ("rsync -a ~/.ssh/ ~/", Catastrophic),
+            ("mv x/.gnupg ~", Catastrophic),
             ("rsync -a --remove-source-files ~/.ssh/ /tmp/b", Catastrophic),
             ("cp k ~/.ssh/authorized_keys", Catastrophic),
             ("cp -t ~/.ssh k", Catastrophic),

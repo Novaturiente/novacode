@@ -416,6 +416,15 @@ impl Policy {
         let abs_path = raw_path.map(|p| expand(p, cwd, &self.home));
         // Through symlinks, so a link can't route around a path rule.
         let real_path = abs_path.as_deref().map(real);
+        // The resolved path as a relative or `~/` path too, for rules written that way.
+        let real_short: Vec<String> = match &real_path {
+            Some(rp) => [(real(cwd), ""), (real(&self.home), "~/")]
+                .iter()
+                .filter_map(|(base, pre)| Some(format!("{pre}{}", rp.strip_prefix(base).ok()?.to_str()?)))
+                .collect(),
+            None => Vec::new(),
+        };
+        let links_away = real_path.is_some() && real_path.as_deref() != abs_path.as_deref().map(lexical).as_deref();
         let matches = |r: &Rule, all: bool| -> bool {
             if !r.matches_tool(rule_tool) {
                 return false;
@@ -424,7 +433,15 @@ impl Policy {
                 Some(segs) if all => !segs.is_empty() && segs.iter().all(|s| r.matches_command(s)),
                 Some(segs) => segs.iter().any(|s| r.matches_command(s)),
                 None if FILE_TOOLS.contains(&lower.as_str()) => {
-                    r.matches_path(raw_path, abs_path.as_deref()) || r.matches_path(None, real_path.as_deref())
+                    let given = r.matches_path(raw_path, abs_path.as_deref());
+                    let resolved = r.matches_path(None, real_path.as_deref())
+                        || real_short.iter().any(|s| r.matches_path(Some(s), None));
+                    // Allow needs both: a link inside an allowed area must not reach outside it.
+                    if all {
+                        given && (resolved || !links_away)
+                    } else {
+                        given || resolved
+                    }
                 }
                 None => r.pattern.is_none(),
             }
@@ -585,7 +602,12 @@ impl Policy {
         }
 
         let ask = |reason: String| Verdict::Ask {
-            reason,
+            reason: match &real_path {
+                Some(rp) if links_away && raw_path.is_some() => {
+                    format!("{reason}; {} resolves to {}", raw_path.unwrap_or(""), rp.display())
+                }
+                _ => reason,
+            },
             rule: suggest_rule(rule_tool, command, raw_path),
             risky: false,
         };
@@ -688,12 +710,39 @@ fn written(tool: &str, args: &Value) -> Vec<String> {
 /// `p` with symlinks resolved: the file itself if it exists, else its nearest
 /// existing ancestor plus the rest.
 fn real(p: &Path) -> PathBuf {
+    real_depth(p, 0)
+}
+
+fn real_depth(p: &Path, depth: u32) -> PathBuf {
     for a in p.ancestors() {
+        let rest = p.strip_prefix(a).unwrap_or(Path::new(""));
         if let Ok(c) = std::fs::canonicalize(a) {
-            return c.join(p.strip_prefix(a).unwrap_or(Path::new("")));
+            return c.join(rest);
+        }
+        // A dangling link: writing through it creates its target.
+        if depth < 8
+            && let Ok(t) = std::fs::read_link(a)
+        {
+            let t = a.parent().map_or(t.clone(), |d| d.join(&t));
+            return real_depth(&t, depth + 1).join(rest);
         }
     }
     p.to_path_buf()
+}
+
+/// `p` with `.` and `..` folded away, without touching the disk.
+fn lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn expand(p: &str, cwd: &Path, home: &Path) -> PathBuf {
@@ -1001,6 +1050,50 @@ mod tests {
             &proj,
             false
         )));
+        // Under ~/.novacode only logins and trust are refused; instructions and skills stay editable.
+        std::fs::create_dir_all(home.join(".novacode/skills")).unwrap();
+        assert_eq!(check("write", json!({"path": "~/.novacode/AGENTS.md"})), Verdict::Allow);
+        assert_eq!(
+            check("edit", json!({"path": "~/.novacode/skills/x/SKILL.md"})),
+            Verdict::Allow
+        );
+        for f in ["auth.json", "auth-work.json", "mcp-auth.json", "trust.json"] {
+            assert!(
+                denied(&check("write", json!({"path": format!("~/.novacode/{f}")}))),
+                "{f}"
+            );
+        }
+        // The bash rule still covers the whole folder.
+        assert!(denied(&check("bash", json!({"command": "rm -rf ~/.novacode/skills"}))));
+    }
+
+    #[test]
+    fn allow_rules_need_the_resolved_path_too() {
+        let d = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let proj = d.path().canonicalize().unwrap();
+        std::fs::create_dir_all(proj.join("src")).unwrap();
+        std::os::unix::fs::symlink(out.path().join("y"), proj.join("src/x")).unwrap();
+        let p = Policy::new(
+            serde_json::from_value(json!({ "allow": ["Write(src/**)"] })).unwrap(),
+            "/home/u".into(),
+            None,
+        )
+        .with_mode(Mode::Ask);
+        let check = |path: &str| p.check("write", &json!({ "path": path }), &proj, true);
+        assert_eq!(check("src/a.rs"), Verdict::Allow);
+        // A link inside the allowed area that points outside it asks, and shows where it goes.
+        match check("src/x") {
+            Verdict::Ask { reason, .. } => assert!(reason.contains("resolves to"), "{reason}"),
+            v => panic!("{v:?}"),
+        }
+        // Deny rules still match either path.
+        let deny = Policy::new(
+            serde_json::from_value(json!({ "deny": [format!("Write({}/**)", out.path().display())] })).unwrap(),
+            "/home/u".into(),
+            None,
+        );
+        assert!(denied(&deny.check("write", &json!({"path": "src/x"}), &proj, true)));
     }
 
     #[test]
