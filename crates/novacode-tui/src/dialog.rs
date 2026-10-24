@@ -1,16 +1,22 @@
 //! Overlays (L9.13): fuzzy picker, approval card (L6.1), keys help (L9.10)
 //! and a pager for full tool output.
 
+use crate::editor::Editor;
 use crate::keys::{A, Keymap, Scope};
 use crate::theme::Theme;
 use crate::wrap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+use std::cell::Cell;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
+
+/// Keys are ignored this long after an approval card appears, so type-ahead never answers it.
+const APPROVAL_GRACE: Duration = Duration::from_millis(400);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PickItem {
@@ -175,34 +181,56 @@ pub struct ApproveReq {
 pub struct ApprovalCard {
     pub req: ApproveReq,
     /// Typing a reason after `n`.
-    reason: Option<String>,
+    reason: Option<Editor>,
+    /// When the card appeared (see [`APPROVAL_GRACE`]).
+    pub(crate) shown: Instant,
+    /// Width of the reason box at the last draw, for its up/down moves.
+    width: Cell<usize>,
 }
 
 impl ApprovalCard {
     pub fn new(req: ApproveReq) -> Self {
-        Self { req, reason: None }
+        Self {
+            req,
+            reason: None,
+            shown: Instant::now(),
+            width: Cell::new(40),
+        }
     }
 
-    /// `Some` = answered.
-    pub fn handle(&mut self, k: KeyEvent) -> Option<Answer> {
+    /// A paste goes into the reason box, if it is open.
+    pub fn paste(&mut self, s: &str) {
         if let Some(r) = &mut self.reason {
-            match k.code {
-                KeyCode::Enter => return Some(Answer::Deny(Some(r.clone()).filter(|r| !r.trim().is_empty()))),
-                KeyCode::Esc => return Some(Answer::Deny(None)),
-                KeyCode::Backspace => {
-                    r.pop();
-                }
-                KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => r.push(c),
-                _ => {}
+            r.paste(s);
+        }
+    }
+
+    /// `Some` = answered. `a` is the key's editor action from the keymap (for the reason box).
+    pub fn handle(&mut self, k: KeyEvent, a: Option<A>) -> Option<Answer> {
+        if self.shown.elapsed() < APPROVAL_GRACE {
+            return None;
+        }
+        if let Some(r) = &mut self.reason {
+            // `\` then Enter stays a newline, as in the prompt.
+            let submit = a == Some(A::Submit) && !r.text()[..r.cursor()].ends_with('\\');
+            let ctrl_c = k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
+            if submit {
+                let text = r.full_text();
+                return Some(Answer::Deny(Some(text.trim().to_string()).filter(|t| !t.is_empty())));
             }
+            if k.code == KeyCode::Esc || ctrl_c {
+                return Some(Answer::Deny(None));
+            }
+            r.handle(a, k, self.width.get());
             return None;
         }
         match k.code {
-            KeyCode::Char('y') | KeyCode::Enter => Some(Answer::Once),
+            // Not Enter: a stray Enter from type-ahead must never approve.
+            KeyCode::Char('y') => Some(Answer::Once),
             KeyCode::Char('a') => Some(Answer::Session),
             KeyCode::Char('A') if !self.req.risky => Some(Answer::Always),
             KeyCode::Char('n') => {
-                self.reason = Some(String::new());
+                self.reason = Some(Editor::default());
                 None
             }
             KeyCode::Esc => Some(Answer::Deny(None)),
@@ -213,13 +241,15 @@ impl ApprovalCard {
 
     pub fn height(&self, width: u16) -> u16 {
         self.lines(width.saturating_sub(4) as usize, &Theme::default(), true)
+            .0
             .len() as u16
             + 2
     }
 
     /// Tool name, then the command or path under it, then why it is asked, then the keys.
     /// `spaced`: blank lines between those parts, dropped when the screen is short.
-    fn lines(&self, w: usize, t: &Theme, spaced: bool) -> Vec<Line<'static>> {
+    /// Also gives the reason box's cursor (row, column).
+    fn lines(&self, w: usize, t: &Theme, spaced: bool) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
         let r = &self.req;
         let bar = [Span::styled("│ ", t.dim)];
         // Line by line: `wrap::wrap` runs lines together, which glued multi-line commands.
@@ -248,12 +278,25 @@ impl ApprovalCard {
         if spaced {
             lines.push(Line::default());
         }
+        let mut cursor = None;
         match &self.reason {
-            Some(reason) => lines.push(Line::from(vec![
-                Span::styled("why not? ", t.warn),
-                Span::styled(reason.clone(), t.text),
-                Span::styled("  (Enter send, Esc skip)", t.dim),
-            ])),
+            Some(reason) => {
+                // Soft-wrapped rows: the first after "why not? ", the rest lined up under it.
+                let pad = "why not? ".len();
+                let ew = w.saturating_sub(pad).max(2);
+                self.width.set(ew);
+                let (rows, (cr, cc)) = reason.view(ew, 3);
+                cursor = Some((lines.len() + cr as usize, pad + cc as usize));
+                for (i, r) in rows.into_iter().enumerate() {
+                    let lead = if i == 0 {
+                        Span::styled("why not? ", t.warn)
+                    } else {
+                        Span::raw(" ".repeat(pad))
+                    };
+                    lines.push(Line::from(vec![lead, Span::styled(r, t.text)]));
+                }
+                lines.push(Line::styled("(Enter send, Esc skip)", t.dim));
+            }
             None => {
                 let mut keys = vec![
                     Span::styled("y", t.ok),
@@ -271,7 +314,7 @@ impl ApprovalCard {
                 lines.extend(wrap::wrap(keys, w, &[], &[]));
             }
         }
-        lines
+        (lines, cursor)
     }
 
     pub fn render(&self, f: &mut Frame, area: Rect, t: &Theme) {
@@ -279,10 +322,14 @@ impl ApprovalCard {
         let inner = frame(f, area, title, t);
         let w = inner.width as usize;
         let mut lines = self.lines(w, t, true);
-        if lines.len() > inner.height as usize {
+        if lines.0.len() > inner.height as usize {
             lines = self.lines(w, t, false);
         }
+        let (lines, cursor) = lines;
         f.render_widget(Paragraph::new(lines), inner);
+        if let Some((r, c)) = cursor.filter(|&(r, _)| r < inner.height as usize) {
+            f.set_cursor_position(Position::new(inner.x + c as u16, inner.y + r as u16));
+        }
     }
 }
 
@@ -450,6 +497,7 @@ mod tests {
         });
         let text: Vec<String> = card
             .lines(80, &Theme::default(), true)
+            .0
             .iter()
             .map(crate::wrap::plain)
             .collect();
@@ -480,31 +528,78 @@ mod tests {
         assert_eq!(fuzzy("abc", "x"), None);
     }
 
+    fn card(risky: bool, aged: bool) -> ApprovalCard {
+        let (tx, _rx) = oneshot::channel();
+        let mut c = ApprovalCard::new(ApproveReq {
+            id: 1,
+            tool: "bash".into(),
+            detail: "rm -rf build".into(),
+            reason: "deletes files".into(),
+            rule: "Bash(rm -rf:*)".into(),
+            risky,
+            reply: tx,
+        });
+        if aged {
+            c.shown -= APPROVAL_GRACE;
+        }
+        c
+    }
+
+    fn hit(c: &mut ApprovalCard, code: KeyCode) -> Option<Answer> {
+        let key = k(code);
+        c.handle(key, Keymap::default().lookup(&key, &[Scope::Editor]))
+    }
+
     #[test]
     fn approval_keys() {
-        let card = |risky| {
-            let (tx, _rx) = oneshot::channel();
-            ApprovalCard::new(ApproveReq {
-                id: 1,
-                tool: "bash".into(),
-                detail: "rm -rf build".into(),
-                reason: "deletes files".into(),
-                rule: "Bash(rm -rf:*)".into(),
-                risky,
-                reply: tx,
-            })
-        };
-        assert_eq!(card(false).handle(k(KeyCode::Char('A'))), Some(Answer::Always));
+        assert_eq!(hit(&mut card(false, true), KeyCode::Char('A')), Some(Answer::Always));
         // "Always" isn't offered for risk-gated commands.
-        assert_eq!(card(true).handle(k(KeyCode::Char('A'))), None);
-        let mut c = card(false);
-        assert_eq!(c.handle(k(KeyCode::Char('n'))), None);
+        assert_eq!(hit(&mut card(true, true), KeyCode::Char('A')), None);
+        let mut c = card(false, true);
+        assert_eq!(hit(&mut c, KeyCode::Char('n')), None);
         for ch in "use cargo clean".chars() {
-            c.handle(k(KeyCode::Char(ch)));
+            hit(&mut c, KeyCode::Char(ch));
         }
         assert_eq!(
-            c.handle(k(KeyCode::Enter)),
+            hit(&mut c, KeyCode::Enter),
             Some(Answer::Deny(Some("use cargo clean".into())))
         );
+    }
+
+    #[test]
+    fn approval_ignores_type_ahead() {
+        let mut c = card(false, false);
+        assert_eq!(hit(&mut c, KeyCode::Char('a')), None, "a key at once is type-ahead");
+        c.shown -= APPROVAL_GRACE;
+        assert_eq!(hit(&mut c, KeyCode::Char('a')), Some(Answer::Session));
+    }
+
+    #[test]
+    fn enter_never_approves() {
+        let mut c = card(false, true);
+        assert_eq!(hit(&mut c, KeyCode::Enter), None);
+        assert_eq!(hit(&mut c, KeyCode::Char('y')), Some(Answer::Once));
+    }
+
+    #[test]
+    fn reason_box_takes_pastes() {
+        let mut c = card(false, true);
+        hit(&mut c, KeyCode::Char('n'));
+        c.paste("too risky");
+        let (lines, cursor) = c.lines(60, &Theme::default(), true);
+        let text: Vec<String> = lines.iter().map(crate::wrap::plain).collect();
+        assert!(text.iter().any(|l| l == "why not? too risky"), "{text:?}");
+        assert_eq!(cursor.map(|(_, col)| col), Some("why not? too risky".len()));
+        assert_eq!(
+            hit(&mut c, KeyCode::Enter),
+            Some(Answer::Deny(Some("too risky".into())))
+        );
+        // A long reason wraps and the card grows with it.
+        let mut c = card(false, true);
+        let before = c.height(40);
+        hit(&mut c, KeyCode::Char('n'));
+        c.paste(&"word ".repeat(20));
+        assert!(c.height(40) > before + 1, "rows counted");
+        assert_eq!(hit(&mut c, KeyCode::Esc), Some(Answer::Deny(None)));
     }
 }

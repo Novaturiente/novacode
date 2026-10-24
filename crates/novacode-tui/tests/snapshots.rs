@@ -365,13 +365,40 @@ fn approval_card_blocks_input_and_answers() {
         reply: tx,
     }));
     snapshot("approval", &screen(&mut a, 60, 14));
-    // Typing goes to the card, not the editor.
+    // Type-ahead right after the card appears answers nothing.
+    key(&mut a, KeyCode::Char('a'), KeyModifiers::NONE);
+    assert!(reply.try_recv().is_err());
+    a.age_approvals();
+    // Typing goes to the card, not the editor; Enter never approves.
     key(&mut a, KeyCode::Char('x'), KeyModifiers::NONE);
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     assert!(a.editor.is_empty());
+    assert!(reply.try_recv().is_err());
     key(&mut a, KeyCode::Char('a'), KeyModifiers::NONE);
     assert_eq!(reply.try_recv().unwrap(), Answer::Session);
     let s = screen(&mut a, 60, 14);
     assert!(s.contains("allowed for this session: bash rm -rf target"), "{s}");
+}
+
+#[test]
+fn approval_reason_takes_a_paste() {
+    let (mut a, _rx) = app(vec![]);
+    let (tx, mut reply) = tokio::sync::oneshot::channel();
+    a.on_ui(UiEvent::Approve(ApproveReq {
+        id: 1,
+        tool: "bash".into(),
+        detail: "rm -rf target".into(),
+        reason: "deletes files".into(),
+        rule: "rm -rf target".into(),
+        risky: false,
+        reply: tx,
+    }));
+    a.age_approvals();
+    key(&mut a, KeyCode::Char('n'), KeyModifiers::NONE);
+    a.on_event(Event::Paste("too risky".into()));
+    assert!(a.editor.is_empty(), "the paste went to the card");
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(reply.try_recv().unwrap(), Answer::Deny(Some("too risky".into())));
 }
 
 #[test]
@@ -437,11 +464,19 @@ fn slash_commands_pickers_and_pager() {
 
 #[test]
 fn history_search() {
-    let (mut a, mut rx) = app(vec![Message::user("cargo test -p core"), Message::user("git status")]);
+    let (mut a, mut rx) = app(vec![
+        Message::user("cargo test -p core"),
+        Message::user("cargo build"),
+        Message::user("git status"),
+    ]);
     key(&mut a, KeyCode::Char('r'), KeyModifiers::CONTROL);
     for c in "carg".chars() {
         key(&mut a, KeyCode::Char(c), KeyModifiers::NONE);
     }
+    assert_eq!(a.editor.text(), "cargo build");
+    // Ctrl+R again: the next older match, still searching.
+    key(&mut a, KeyCode::Char('r'), KeyModifiers::CONTROL);
+    assert!(a.editor.searching());
     assert_eq!(a.editor.text(), "cargo test -p core");
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     assert!(rx.try_recv().is_err(), "Enter accepts the match, it doesn't send");
@@ -476,7 +511,7 @@ fn slash_and_file_completion() {
 
 #[test]
 fn file_completion_in_a_real_folder() {
-    let d = tempfile_dir();
+    let d = tempfile_dir("real");
     std::fs::create_dir_all(d.join("src")).unwrap();
     std::fs::write(d.join("src/main.rs"), "").unwrap();
     std::fs::write(d.join("README.md"), "").unwrap();
@@ -529,8 +564,61 @@ fn file_completion_in_a_real_folder() {
     assert_eq!(a.editor.text(), "see @src/main.rs ");
 }
 
-fn tempfile_dir() -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("nc-tui-{}-{}", std::process::id(), line!()));
+#[test]
+fn completion_after_multibyte_space() {
+    let d = tempfile_dir("nbsp");
+    std::fs::write(d.join("xfile.rs"), "").unwrap();
+    let (mut a, _rx) = app(vec![]);
+    a.on_agent(AgentEvent::CwdChanged {
+        cwd: d.display().to_string(),
+        branch: None,
+    });
+    // Typed key by key: the completion runs after each one.
+    typ(&mut a, "a\u{a0}@x");
+    assert!(screen(&mut a, 60, 12).contains("▸ xfile.rs"));
+    key(&mut a, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(a.editor.text(), "a\u{a0}@xfile.rs ");
+}
+
+#[test]
+fn file_list_follows_cwd_changes() {
+    let d = tempfile_dir("cwd");
+    let (mut a, _rx) = app(vec![]);
+    // Read once for the old folder (it doesn't exist: an empty list).
+    typ(&mut a, "@new");
+    assert!(!screen(&mut a, 60, 12).contains("▸"));
+    a.editor.clear();
+    std::fs::write(d.join("newfile.txt"), "").unwrap();
+    a.on_agent(AgentEvent::CwdChanged {
+        cwd: d.display().to_string(),
+        branch: None,
+    });
+    typ(&mut a, "@new");
+    assert!(screen(&mut a, 60, 12).contains("▸ newfile.txt"));
+}
+
+#[test]
+fn draft_event_keeps_history_and_pastes() {
+    let (mut a, mut rx) = app(vec![Message::user("old")]);
+    typ(&mut a, "see ");
+    a.on_event(Event::Paste("line\n".repeat(10)));
+    a.on_ui(UiEvent::Draft { text: "queued".into() });
+    assert_eq!(a.editor.text(), "queued\nsee [paste #1 +10 lines]");
+    // History unchanged: Up at the top of the text still shows the last real prompt.
+    a.editor.set_text("");
+    key(&mut a, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(a.editor.text(), "old");
+    a.editor.set_text("queued\nsee [paste #1 +10 lines]");
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        Cmd::Prompt(format!("queued\nsee {}", "line\n".repeat(10)))
+    );
+}
+
+/// A fresh folder per test (tests run in parallel).
+fn tempfile_dir(name: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("nc-tui-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d

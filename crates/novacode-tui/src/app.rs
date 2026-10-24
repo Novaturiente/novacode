@@ -559,6 +559,14 @@ impl App {
 
     /// The frame that stays up while the session is swapped under the window:
     /// no overlay, a note of what is happening.
+    /// Tests: let the approval cards' key grace period pass.
+    #[doc(hidden)]
+    pub fn age_approvals(&mut self) {
+        for c in &mut self.approvals {
+            c.shown = c.shown.checked_sub(Duration::from_secs(1)).unwrap_or(c.shown);
+        }
+    }
+
     pub fn leaving(&mut self, e: &Exit) {
         self.overlay = None;
         self.flash(match e {
@@ -597,7 +605,8 @@ impl App {
             }
             UiEvent::Notice { text, error } => self.tr.notice(text, error),
             UiEvent::Draft { text } => {
-                let draft = self.editor.take().unwrap_or_default();
+                // Not `take()`: that would put the half-typed draft in history and drop its pastes.
+                let draft = self.editor.text().to_string();
                 self.editor.set_text(&if draft.is_empty() {
                     text
                 } else {
@@ -607,7 +616,7 @@ impl App {
             UiEvent::Dequeued { ok: true } => {
                 if let Some((t, _)) = self.pending.pop() {
                     // The draft goes after it, so nothing typed is lost.
-                    let draft = self.editor.take().unwrap_or_default();
+                    let draft = self.editor.text().to_string();
                     self.editor
                         .set_text(&if draft.is_empty() { t } else { format!("{t}\n{draft}") });
                 }
@@ -772,8 +781,10 @@ impl App {
                     false,
                 );
             }
-            AgentEvent::AgentEnd { .. } => {}
+            // The turn may have added files: the `@` list is read again on next use.
+            AgentEvent::AgentEnd { .. } => self.files = None,
             AgentEvent::CwdChanged { cwd, branch } => {
+                self.files = None;
                 self.init.cwd = cwd;
                 self.init.branch = branch;
             }
@@ -971,6 +982,12 @@ impl App {
         self.dirty = true;
         match ev {
             Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
+            // An approval card takes the keys first, so it takes pastes too (its reason box).
+            Event::Paste(s) if !self.approvals.is_empty() => {
+                if let Some(c) = self.approvals.front_mut() {
+                    c.paste(&s);
+                }
+            }
             Event::Paste(s) if matches!(self.overlay, Some(Overlay::Login(_))) => {
                 if let Some(Overlay::Login(v)) = &mut self.overlay {
                     v.paste(&s);
@@ -1020,7 +1037,7 @@ impl App {
         self.selection = None;
         self.screen_sel = None;
         if let Some(card) = self.approvals.front_mut() {
-            if let Some(ans) = card.handle(k) {
+            if let Some(ans) = card.handle(k, self.keymap.lookup(&k, &[Scope::Editor])) {
                 self.answer(ans);
             }
             return;
@@ -1170,6 +1187,11 @@ impl App {
             }
         }
         if self.completion.is_some() && self.completion_key(k) {
+            return;
+        }
+        // Ctrl+R again while searching: the next older match (it is an app key, not an editor one).
+        if self.editor.searching() && self.keymap.lookup(&k, &[Scope::App]) == Some(A::HistorySearch) {
+            self.editor.search_history();
             return;
         }
         let scopes: &[Scope] = if self.editor.searching() {
@@ -1326,7 +1348,11 @@ impl App {
     fn update_completion(&mut self) {
         let text = self.editor.text();
         let before = &text[..self.editor.cursor()];
-        let start = before.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+        // The whitespace may be multi-byte (U+00A0, U+3000).
+        let start = before
+            .char_indices()
+            .rfind(|(_, c)| c.is_whitespace())
+            .map_or(0, |(i, c)| i + c.len_utf8());
         let token = &before[start..];
         let items: Vec<(String, String, String)> = if start == 0 && token.starts_with('/') {
             COMMANDS
@@ -2295,6 +2321,8 @@ impl App {
 fn list_files(cwd: &str) -> Vec<String> {
     let root = std::path::Path::new(cwd);
     let mut out: Vec<String> = ignore::WalkBuilder::new(root)
+        // .gitignore applies outside a git repo too.
+        .require_git(false)
         .build()
         .flatten()
         .filter_map(|e| {

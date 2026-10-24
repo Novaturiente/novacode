@@ -10,11 +10,26 @@ use crossterm::{execute, queue};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io::{Stdout, Write, stdout};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::ThreadId;
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
 
 static KITTY: AtomicBool = AtomicBool::new(false);
+/// The thread that runs the UI loop; only its panics tear the terminal down.
+static UI_THREAD: OnceLock<ThreadId> = OnceLock::new();
+
+/// Record the calling thread as the UI thread (the first call wins).
+pub fn mark_ui_thread() {
+    UI_THREAD.get_or_init(|| std::thread::current().id());
+}
+
+/// A panic on `cur` restores the terminal: on the UI thread, or anywhere when that isn't known.
+/// Panics on other threads (tokio tasks contain theirs) leave the live UI alone.
+fn restores_on_panic(ui: Option<ThreadId>, cur: ThreadId) -> bool {
+    ui.is_none_or(|u| u == cur)
+}
 
 /// Is the terminal background dark? Asks with OSC 11 (150 ms timeout), then
 /// falls back to `COLORFGBG`. Call before [`enter`]; `None` = unknown.
@@ -107,11 +122,15 @@ pub fn restore() {
     let _ = terminal::disable_raw_mode();
 }
 
-/// Restore the terminal before the default panic message prints.
+/// Restore the terminal before the default panic message prints (UI-thread panics only).
+/// Call it on the thread that runs the UI.
 pub fn install_panic_hook() {
+    mark_ui_thread();
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore();
+        if restores_on_panic(UI_THREAD.get().copied(), std::thread::current().id()) {
+            restore();
+        }
         tracing::error!(%info, "panic");
         prev(info);
     }));
@@ -296,6 +315,15 @@ fn run(cmd: &str, args: &[&str]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod paste_tests {
+    #[test]
+    fn only_ui_thread_panics_restore() {
+        let me = std::thread::current().id();
+        let other = std::thread::spawn(|| std::thread::current().id()).join().unwrap();
+        assert!(super::restores_on_panic(Some(me), me));
+        assert!(!super::restores_on_panic(Some(me), other));
+        assert!(super::restores_on_panic(None, other));
+    }
+
     #[test]
     fn picks_the_best_image_type() {
         assert_eq!(

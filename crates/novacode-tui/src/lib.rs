@@ -58,6 +58,8 @@ pub async fn run_in(
     mut ui: UnboundedReceiver<UiEvent>,
     cmds: UnboundedSender<Cmd>,
 ) -> std::io::Result<Exit> {
+    // This loop runs on the thread that called it (the runtime's `block_on`), never a worker task.
+    term::mark_ui_thread();
     let mut app = App::new(init, cmds);
     // L9.17: over SSH or on a loaded machine, fewer frames and a slower spinner.
     let frame = if app.slow() { FRAME * 3 } else { FRAME };

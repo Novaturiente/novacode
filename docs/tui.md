@@ -82,13 +82,29 @@ The pane closes when the session's window closes. See [config](config.md) for al
 
 `Shift+Enter` needs a terminal that supports the Kitty keyboard protocol, or tmux with `set -s extended-keys on` (novacode turns on xterm's modifyOtherKeys there). Elsewhere use `Ctrl+J` or `\` + `Enter`, which work in every terminal.
 
-Big pastes (more than 5 lines or 1000 characters) collapse to a marker like `[paste #1 +40 lines]`. The full text is sent when you submit.
+Big pastes (more than 5 lines or 1000 characters) collapse to a marker like `[paste #1 +40 lines]`. The full text is sent when you submit, also after you clear the editor and undo.
+
+Long lines wrap at word starts; a word longer than the editor breaks anywhere. A tab is kept as a tab in the text you send and shows as 4 spaces in the editor.
 
 ### @file completion
 
-Type `@` and a few letters to fuzzy-search files in the project (ignored files are skipped). Folders keep the popup open so you can go deeper. Start with `~/`, `/`, `./` or `../` to browse one folder, also outside the project.
+Type `@` and a few letters to fuzzy-search files in the project (ignored files are skipped). Folders keep the popup open so you can go deeper. The file list is read again after each turn and when the session's folder changes, so new files show up. `.gitignore` applies outside git repos too. Start with `~/`, `/`, `./` or `../` to browse one folder, also outside the project.
 
 The path stays in your message and the model reads the file with its tools. Image files you mention (`@shot.png`) are attached to the message as images.
+
+### Approval cards
+
+When a tool needs your permission, a card shows above the editor and takes the keys until you answer:
+
+| Key | Answer |
+|---|---|
+| `y` | Allow once. |
+| `a` | Allow for this session. |
+| `A` | Always allow (saves the rule; not offered for risky commands). |
+| `n` | Deny, then type a reason the model sees: `Enter` sends it, `Esc` denies without one. |
+| `Esc`, `Ctrl+C` | Deny. |
+
+`Enter` never approves. For 400 ms after a card appears every key is ignored, so text you were still typing can't answer it. The reason box after `n` is a normal input: editor keys, wrapping and paste work, and `\` then `Enter` adds a new line.
 
 ### Paste an image
 
@@ -227,7 +243,7 @@ Press `Alt+/` or type `/keys` to see the live table, including your changes. Typ
 | `tui.editor.cursorUp` | `Up` | Cursor up (history at the top). |
 | `tui.editor.cursorDown` | `Down` | Cursor down (history at the bottom). |
 | `tui.editor.cursorLeft` | `Left`, `Ctrl+B` | Cursor left. |
-| `tui.editor.cursorRight` | `Right`, `Ctrl+F` | Cursor right. |
+| `tui.editor.cursorRight` | `Right`, `Ctrl+F` | Cursor right. `Ctrl+F` moves right only inside dialog inputs (question form, `/btw`); in the prompt it searches the transcript. |
 | `tui.editor.cursorWordLeft` | `Alt+Left`, `Ctrl+Left`, `Alt+B` | Word left. |
 | `tui.editor.cursorWordRight` | `Alt+Right`, `Ctrl+Right`, `Alt+F` | Word right. |
 | `tui.editor.cursorLineStart` | `Home`, `Ctrl+A` | Line start. |
