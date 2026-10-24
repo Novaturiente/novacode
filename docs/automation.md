@@ -22,6 +22,8 @@ Only the answer goes to stdout, so you can pipe it. Notices and retries go to st
 
 An empty prompt with nothing piped fails with `-p needs a prompt`. Print mode needs a model: pass `-m provider/model` or set `model` in settings. Without one it stops with `no model: pass -m provider/model or set "model" in settings`. `--bg` and `--rpc` do the same. Only interactive runs pick one for you.
 
+Two notes go to stderr without changing the exit code: `novacode: reply cut at the output token limit` when the reply hit the length limit, and `novacode: the final reply had no text` when the last reply was empty (not after an error or abort).
+
 ### Exit codes
 
 | Code | Meaning |

@@ -6,7 +6,7 @@ This page covers three ways to get more done with less hand-holding: subagents (
 
 A subagent is a separate novacode session started by your main session. The model starts it with the `agent` tool, gives it a task, and keeps working. When the subagent finishes, its final message comes back as a report.
 
-A subagent does not see your conversation. The model must give it a complete task. It dies with its parent.
+A subagent does not see your conversation. The model must give it a complete task. It dies with its parent: when the parent session ends (except on `/reload`), every running subagent is stopped, and the parent waits up to 3 s for them to exit. A stopped subagent ends its own background processes too.
 
 ### Built-in types
 
@@ -47,7 +47,7 @@ There is no separate `resume` action: `send` to a finished agent resumes its ses
 | `cwd` | Working folder. |
 | `after` | Ids of agents that must finish first. The new agent waits in `queued`. If one of them fails or is stopped, it fails too. |
 | `notify` | `wake` (default): the report starts a turn. `next`: rides along with the next turn. `quiet`: panel only. |
-| `worktree` | `true` runs it in a new git worktree under `.worktrees/` on branch `worktree-<title-slug>-<id>` (for example `worktree-fix-parser-a2`). You merge the branch yourself. |
+| `worktree` | `true` runs it in a new git worktree under `.worktrees/` on branch `worktree-<title-slug>-<id>` (for example `worktree-fix-parser-a2`). The name is never reused: if that folder or branch already exists (say from an earlier session), it gets `-2`, `-3` and so on. You merge the branch yourself. |
 | `tools` | Tools for it, picked from the parent's own. Default: the type's tools. |
 | `mcp` | MCP servers it may use. Default: none. |
 
@@ -59,7 +59,8 @@ There is no separate `resume` action: `send` to a finished agent resumes its ses
 - **How many at once.** At most `agents.maxConcurrent` (default 4) subagents run at the same time; more wait as `queued` and start in spawn order as others end. A subagent's own subagents run one at a time, so a tree has at most 8 running. Resuming a finished subagent with `send` takes a slot too.
 - **Permission mode.** A subagent starts in your session's permission mode. While plan mode (or another read-only preset) is on, it starts read-only, and a preset's tool list limits its tools too.
 - **File claims.** Two agents never edit the same file. A subagent that tries `edit`, `write` or `apply_patch` on a file another live agent holds is refused with a message naming the holder. A claim passes down from parent to child. Claims of dead processes are dropped.
-- **Stall and timeout.** A subagent with no activity for `agents.stallMinutes` (default 10) is stopped. One that runs longer than `agents.timeoutMinutes` (default 45) is stopped.
+- **Stall and timeout.** A subagent with no activity for `agents.stallMinutes` (default 10) is stopped. Activity is: starting a run, streaming model output, starting a tool, tool progress, a tool ending, a finished model message, and getting the answer to a question or approval it relayed to you. While it runs `agent wait` on its own subagents, it is not checked for stalls. One that runs longer than `agents.timeoutMinutes` (default 45) is stopped, waiting or not.
+- **Open cards.** When a subagent stops while one of its questions or approvals is still open, the card closes in every window (as denied or dismissed).
 - **Questions and approvals.** If a subagent needs to ask you something or needs an approval, it shows up in your session.
 - **Print mode.** In `-p` runs nobody can approve, so every subagent's `notify` is forced to `wake`.
 

@@ -110,6 +110,32 @@ pub fn create(cwd: &Path, name: &str) -> Result<(PathBuf, String), String> {
     )
 }
 
+/// Like `create`, but never reuses (subagents): a taken name (folder, registered
+/// worktree or branch, say from an earlier session) gets `-2`, `-3`…
+pub fn create_new(cwd: &Path, name: &str) -> Result<(PathBuf, String), String> {
+    let main = repo(cwd)?.main;
+    let listed = git(&main, &["worktree", "list", "--porcelain"])?;
+    let taken = |n: &str| {
+        let path = main.join(".worktrees").join(n);
+        path.exists()
+            || listed
+                .lines()
+                .any(|l| l.strip_prefix("worktree ").is_some_and(|p| Path::new(p) == path))
+            || git(
+                &main,
+                &["show-ref", "--verify", "-q", &format!("refs/heads/worktree-{n}")],
+            )
+            .is_ok()
+    };
+    let mut free = name.to_string();
+    let mut i = 1;
+    while taken(&free) {
+        i += 1;
+        free = format!("{name}-{i}");
+    }
+    enter(&main, &EnterArgs { name: free, base: None })
+}
+
 fn enter(cwd: &Path, a: &EnterArgs) -> Result<(PathBuf, String), String> {
     if a.name.is_empty() || !a.name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
         return Err(format!("bad worktree name `{}`: letters, digits, . _ - only", a.name));
@@ -455,6 +481,8 @@ mod tests {
         assert!(text(&EnterWorktree.execute(json!({"name": "fix-x"}), &c).await).contains("existing"));
         // `-w` / `/worktree` from inside a worktree resolve against the main checkout.
         assert_eq!(create(&wt, "fix-x").unwrap().0, wt);
+        // Subagents never reuse one: the taken name gets a suffix.
+        assert_eq!(create_new(&wt, "fix-x").unwrap().0, root.join(".worktrees/fix-x-2"));
         assert_eq!(here(&wt).unwrap().name().as_deref(), Some("fix-x"));
         assert!(here(&root).is_err());
         let l = list(&wt).unwrap();

@@ -580,6 +580,10 @@ struct Child {
     started_ms: u64,
     ended_ms: Option<u64>,
     last_activity: Instant,
+    /// Calls of its `agent` tool in action `wait` still running: exempt from the stall check.
+    waits: Vec<String>,
+    /// Relayed questions and approvals still open; aborted when it ends (the card closes).
+    relays: Vec<tokio::task::AbortHandle>,
     /// Lines to its stdin; dropping it ends the child.
     tx: Option<mpsc::UnboundedSender<String>>,
     pid: Option<u32>,
@@ -602,6 +606,8 @@ struct Child {
 
 pub struct Supervisor {
     children: Mutex<Vec<Child>>,
+    /// Children ever spawned: the next id (a1, a2…) without holding `children`.
+    next: std::sync::atomic::AtomicUsize,
     changed: Notify,
     place: Place,
     me: String,
@@ -693,6 +699,7 @@ impl Supervisor {
     pub fn new(s: Setup) -> Arc<Self> {
         let sup = Arc::new(Supervisor {
             children: Mutex::default(),
+            next: Default::default(),
             changed: Notify::new(),
             place: Place::from_env(),
             me: s.me.clone(),
@@ -707,23 +714,53 @@ impl Supervisor {
             loop {
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 let Some(s) = weak.upgrade() else { break };
-                let cfg = s.c();
-                let mut stop = Vec::new();
-                for c in s.children.lock().unwrap().iter() {
-                    if matches!(c.status, Status::Running | Status::Starting) {
-                        if c.last_activity.elapsed() > cfg.stall {
-                            stop.push((c.n.clone(), "stalled: no activity"));
-                        } else if c.started.is_some_and(|t| t.elapsed() > cfg.timeout) {
-                            stop.push((c.n.clone(), "timed out"));
-                        }
-                    }
-                }
-                for (n, why) in stop {
+                for (n, why) in s.overdue() {
                     s.stop(&n, why);
                 }
             }
         });
         sup
+    }
+
+    /// Children the watchdog stops, and why.
+    fn overdue(&self) -> Vec<(String, &'static str)> {
+        let cfg = self.c();
+        let mut stop = Vec::new();
+        for c in self.children.lock().unwrap().iter() {
+            if matches!(c.status, Status::Running | Status::Starting) {
+                // Waiting on its own children is not a stall; the overall timeout still applies.
+                if c.waits.is_empty() && c.last_activity.elapsed() > cfg.stall {
+                    stop.push((c.n.clone(), "stalled: no activity"));
+                } else if c.started.is_some_and(|t| t.elapsed() > cfg.timeout) {
+                    stop.push((c.n.clone(), "timed out"));
+                }
+            }
+        }
+        stop
+    }
+
+    /// The parent session ends: stop every child and give them up to 3 s in all to exit.
+    pub async fn stop_all(self: &Arc<Self>) {
+        let live: Vec<(String, Option<u32>)> = self
+            .children
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| !c.status.finished())
+            .map(|c| (c.n.clone(), c.pid))
+            .collect();
+        for (n, _) in &live {
+            self.stop(n, "the parent session ended");
+        }
+        let pids: Vec<u32> = live.into_iter().filter_map(|(_, p)| p).collect();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while pids.iter().any(|p| alive(*p)) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // `stop`'s delayed SIGTERM may never run once the runtime ends; send it now.
+        for p in pids.into_iter().filter(|p| alive(*p)) {
+            let _ = std::process::Command::new("kill").arg(p.to_string()).status();
+        }
     }
 
     /// This session's tool names, once its tool list is built (children get no more).
@@ -927,22 +964,26 @@ impl Supervisor {
             Some(c) => at(&cfg.cwd, c),
             None => cfg.cwd.clone(),
         };
-        let mut g = self.children.lock().unwrap();
-        let n = format!("a{}", g.len() + 1);
+        {
+            let g = self.children.lock().unwrap();
+            for d in &a.after {
+                if !g.iter().any(|c| &c.n == d) {
+                    return Err(format!("`after`: no agent {d}"));
+                }
+            }
+        }
+        let n = format!("a{}", self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
         let title = a.title.unwrap_or(short);
         let read_only = def.read_only || cfg.policy.effective_mode() == novacode_core::policy::Mode::ReadOnly;
         if (a.worktree || def.worktree) && read_only {
             notes.push("no worktree: read-only (plan mode), so the subagent can't change files anyway".into());
         } else if a.worktree || def.worktree {
+            // Git runs without the lock: the watchdog and event handling don't stall on it.
             let name = format!("{}-{n}", slug(&title));
-            let (path, _) = novacode_tools::worktree::create(&cwd, &name)?;
+            let (path, _) = novacode_tools::worktree::create_new(&cwd, &name)?;
             cwd = path;
         }
-        for d in &a.after {
-            if !g.iter().any(|c| &c.n == d) {
-                return Err(format!("`after`: no agent {d}"));
-            }
-        }
+        let mut g = self.children.lock().unwrap();
         g.push(Child {
             n: n.clone(),
             title,
@@ -964,6 +1005,8 @@ impl Supervisor {
             started_ms: 0,
             ended_ms: None,
             last_activity: Instant::now(),
+            waits: Vec::new(),
+            relays: Vec::new(),
             tx: None,
             pid: None,
             last_text: String::new(),
@@ -1049,6 +1092,7 @@ impl Supervisor {
             c.report = None;
             c.delivered = false;
             c.last_activity = Instant::now();
+            c.waits.clear();
             (
                 c.model.clone(),
                 c.agent.clone(),
@@ -1198,7 +1242,8 @@ impl Supervisor {
                 });
             }
             AgentEvent::ToolStart { call } => {
-                let (name, args) = (call.name, call.arguments);
+                let (id, name, args) = (call.id, call.name, call.arguments);
+                let waits = name == "agent" && args.get("action").and_then(Value::as_str) == Some("wait");
                 let what = args
                     .get("path")
                     .or(args.get("command"))
@@ -1208,6 +1253,9 @@ impl Supervisor {
                     .unwrap_or_default();
                 self.with(n, |c| {
                     c.last_activity = Instant::now();
+                    if waits {
+                        c.waits.push(id);
+                    }
                     c.tool_calls += 1;
                     c.log.push_back(format!("{name} {what}").trim().to_string());
                     if c.log.len() > 200 {
@@ -1215,10 +1263,16 @@ impl Supervisor {
                     }
                 });
             }
-            AgentEvent::Stream(StreamEvent::Delta { .. }) => {
-                // Streaming counts as activity; no publish per delta.
+            // Streaming and tool progress count as activity; no publish per event.
+            AgentEvent::Stream(StreamEvent::Delta { .. }) | AgentEvent::ToolUpdate { .. } => {
                 if let Some(c) = self.children.lock().unwrap().iter_mut().find(|c| c.n == n) {
                     c.last_activity = Instant::now();
+                }
+            }
+            AgentEvent::ToolEnd { call_id, .. } => {
+                if let Some(c) = self.children.lock().unwrap().iter_mut().find(|c| c.n == n) {
+                    c.last_activity = Instant::now();
+                    c.waits.retain(|w| *w != call_id);
                 }
             }
             AgentEvent::Message(Message::Assistant(m)) => {
@@ -1256,17 +1310,27 @@ impl Supervisor {
         for q in &mut questions {
             q.question = format!("[{title}] {}", q.question);
         }
-        let (me, n) = (self.clone(), n.to_string());
-        tokio::spawn(async move {
+        let (me, n2) = (self.clone(), n.to_string());
+        let t = tokio::spawn(async move {
             let slot = me.c().slot.clone();
             let replies = slot.ask(questions).await;
-            me.send_line(&n, json!({"type": "answer", "ask": id, "replies": replies}));
+            me.send_line(&n2, json!({"type": "answer", "ask": id, "replies": replies}));
             // Not if it was stopped or finished meanwhile.
-            me.with(&n, |c| {
+            me.with(&n2, |c| {
                 if c.status == Status::Waiting {
                     c.status = Status::Running;
+                    // The wait for the user was no stall.
+                    c.last_activity = Instant::now();
                 }
             });
+        });
+        self.keep_relay(n, &t);
+    }
+
+    fn keep_relay(&self, n: &str, t: &tokio::task::JoinHandle<()>) {
+        self.with(n, |c| {
+            c.relays.retain(|r| !r.is_finished());
+            c.relays.push(t.abort_handle());
         });
     }
 
@@ -1291,8 +1355,8 @@ impl Supervisor {
             rule,
             risky,
         };
-        let (me, n) = (self.clone(), n.to_string());
-        tokio::spawn(async move {
+        let (me, n2) = (self.clone(), n.to_string());
+        let t = tokio::spawn(async move {
             let slot = me.c().slot.clone();
             let answer = match slot.approve(req).await {
                 Approval::Once => json!("once"),
@@ -1300,13 +1364,16 @@ impl Supervisor {
                 Approval::Always => json!("always"),
                 Approval::Deny(why) => json!({"deny": why}),
             };
-            me.send_line(&n, json!({"type": "approval", "approval": id, "answer": answer}));
-            me.with(&n, |c| {
+            me.send_line(&n2, json!({"type": "approval", "approval": id, "answer": answer}));
+            me.with(&n2, |c| {
                 if c.status == Status::Waiting {
                     c.status = Status::Running;
+                    // The wait for the user was no stall.
+                    c.last_activity = Instant::now();
                 }
             });
         });
+        self.keep_relay(n, &t);
     }
 
     fn send_line(&self, n: &str, v: Value) {
@@ -1321,6 +1388,10 @@ impl Supervisor {
             c.ended_ms = Some(novacode_core::session::now_ms());
             c.report = report.or(c.report.take());
             c.tx = None;
+            // Its open cards close in every window (the hub answers a dropped wait).
+            for r in c.relays.drain(..) {
+                r.abort();
+            }
             (
                 c.title.clone(),
                 c.report.clone().unwrap_or_default(),
@@ -1956,6 +2027,145 @@ mod tests {
         }
         let out = sup.wait(vec![], false, Duration::from_secs(20)).await;
         assert_eq!(out.matches("exited before it finished").count(), 3, "{out}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn test_setup(tmp: &Path, exe: PathBuf) -> Setup {
+        Setup {
+            slot: HubSlot::default(),
+            unattended: false,
+            me: "ROOT".into(),
+            home: tmp.to_path_buf(),
+            cwd: tmp.to_path_buf(),
+            trusted: false,
+            defs: defs(&[]).0,
+            parent_picks: true,
+            servers: vec![],
+            stall_min: 10,
+            timeout_min: 45,
+            models: Arc::new(|_: &str, _: &str| None),
+            skill_dirs: vec![],
+            max_running: 4,
+            exe: Some(exe),
+            nerd: false,
+            env: Default::default(),
+            policy: Arc::new(novacode_core::policy::Policy::new(
+                Default::default(),
+                tmp.to_path_buf(),
+                None,
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_progress_agent_wait_and_relays_count_as_activity() {
+        let tmp = std::env::temp_dir().join(format!("nc-act-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // A child that says nothing: every event below comes from the test.
+        let exe = tmp.join("idle.py");
+        std::fs::write(&exe, "#!/usr/bin/env python3\nimport sys\nfor _ in sys.stdin: pass\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sup = Supervisor::new(test_setup(&tmp, exe));
+        {
+            let mut g = sup.cfg.write().unwrap();
+            let mut c = Cfg::clone(&g);
+            c.stall = Duration::from_secs(1);
+            *g = Arc::new(c);
+        }
+        let n = sup
+            .spawn(serde_json::from_value(json!({"task": "t", "model": "p/m"})).unwrap())
+            .unwrap()
+            .0;
+        // Let its run task start (it sets Starting) before the events below.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let idle = || {
+            sup.with(&n, |c| {
+                c.last_activity = Instant::now().checked_sub(Duration::from_secs(60)).unwrap()
+            });
+        };
+        let fresh = || {
+            sup.with(&n, |c| c.last_activity.elapsed() < Duration::from_secs(5))
+                .unwrap()
+        };
+        let stalled = || sup.overdue().iter().any(|(m, _)| *m == n);
+        let mut p = false;
+        idle();
+        assert!(stalled());
+        let call =
+            serde_json::from_value(json!({"id": "w1", "name": "agent", "arguments": {"action": "wait"}})).unwrap();
+        sup.on_event(&n, AgentEvent::ToolStart { call }, &mut p);
+        idle();
+        assert!(!stalled(), "`agent wait` is exempt from the stall check");
+        sup.on_event(
+            &n,
+            AgentEvent::ToolUpdate {
+                call_id: "w1".into(),
+                text: "x".into(),
+            },
+            &mut p,
+        );
+        assert!(fresh(), "ToolUpdate is activity");
+        idle();
+        sup.on_event(
+            &n,
+            AgentEvent::ToolEnd {
+                call_id: "w1".into(),
+                is_error: false,
+                duration_ms: 1,
+            },
+            &mut p,
+        );
+        assert!(fresh(), "ToolEnd is activity");
+        idle();
+        assert!(stalled(), "the exemption ends with the wait");
+        // No window: the approval is refused at once, and the child is back to work, active.
+        sup.relay_approval(&n, "t", 1, "bash".into(), "ls".into(), "r".into(), "".into(), false);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(sup.with(&n, |c| c.status), Some(Status::Running));
+        assert!(fresh(), "answering a relay is activity");
+        sup.stop(&n, "done");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn worktree_names_never_repeat_across_sessions() {
+        let tmp = std::env::temp_dir().join(format!("nc-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                    .args(args)
+                    .current_dir(&tmp)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            )
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "i"]);
+        let exe = fake_child(&tmp);
+        let mut paths = Vec::new();
+        // Two sessions: both number their first child a1.
+        for _ in 0..2 {
+            let sup = Supervisor::new(test_setup(&tmp, exe.clone()));
+            let n = sup
+                .spawn(
+                    serde_json::from_value(json!({"task": "t", "title": "same", "worktree": true, "model": "p/m"}))
+                        .unwrap(),
+                )
+                .unwrap()
+                .0;
+            assert_eq!(n, "a1");
+            paths.push(sup.with(&n, |c| c.cwd.clone()).unwrap());
+            sup.wait(vec![n], false, Duration::from_secs(20)).await;
+        }
+        assert_eq!(paths[0], tmp.join(".worktrees/same-a1"));
+        assert_eq!(paths[1], tmp.join(".worktrees/same-a1-2"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

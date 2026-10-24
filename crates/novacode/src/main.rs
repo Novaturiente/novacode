@@ -1687,9 +1687,19 @@ async fn print_mode(
     drop(hub);
     handle.shutdown();
     let agent = task.await?;
+    // An abort can leave children running.
+    if let Some(s) = &sup {
+        s.stop_all().await;
+    }
     let msg = last.context("no reply")?;
     tracing::info!(stop = ?stop, usage = ?msg.usage, "print mode done");
     let text = msg.text();
+    if matches!(stop, StopReason::Length) {
+        eprintln!("novacode: reply cut at the output token limit");
+    }
+    if text.trim().is_empty() && !matches!(stop, StopReason::Error { .. } | StopReason::Aborted) {
+        eprintln!("novacode: the final reply had no text");
+    }
     if !text.is_empty() && !json {
         let mut out = std::io::stdout().lock();
         writeln!(out, "{text}")?;
@@ -2209,13 +2219,33 @@ async fn serve_headless(ctx: &Ctx, store: Store, model: String) -> anyhow::Resul
     }
     let on_signal = host.hub.handle.clone();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            on_signal.abort();
-            on_signal.shutdown();
+        // SIGTERM too (a parent's `stop`): end cleanly so the process manager's Drop kills its jobs.
+        let int = async {
+            if tokio::signal::ctrl_c().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
+        let term = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut s) => {
+                    s.recv().await;
+                }
+                Err(_) => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = int => {}
+            _ = term => {}
         }
+        on_signal.abort();
+        on_signal.shutdown();
     });
     let agent = task.await?;
     drop(agent);
+    let sup = ctx.sup.lock().unwrap().clone();
+    if let Some(sup) = sup {
+        sup.stop_all().await;
+    }
     live.end("session ended").await;
     // Let the last lines (and the bye) reach RPC clients.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2477,6 +2507,13 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
             && let Some(pm) = agent.processes()
         {
             pm.kill_all();
+        }
+        // Same for subagents: only `/reload` keeps them running.
+        let sup = ctx.sup.lock().unwrap().clone();
+        if !matches!(res, Ok(Exit::Reload))
+            && let Some(sup) = sup
+        {
+            sup.stop_all().await;
         }
         live.end(match &res {
             // Same session again: attached windows reconnect.
