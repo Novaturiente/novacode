@@ -102,6 +102,8 @@ pub struct Agent {
     modes: Option<Arc<crate::modes::Modes>>,
     /// `None` = nobody to ask (print mode, headless): asks become refusals or justifications.
     approver: Option<Arc<dyn Approver>>,
+    /// First loop retry wait; later ones double (L4.6).
+    retry_base: Duration,
     /// Learned tool-schema rejections (L2.20).
     quirks: Arc<Quirks>,
     /// Observer and compaction (L4.5); `None` = compaction off.
@@ -403,6 +405,7 @@ impl Agent {
             policy: Arc::new(Policy::new(Permissions::default(), home, None)),
             modes: None,
             approver: None,
+            retry_base: LOOP_RETRY_BASE,
             quirks: Arc::new(Quirks::ephemeral()),
             memory: None,
             compacted,
@@ -1136,6 +1139,12 @@ impl Agent {
         self
     }
 
+    /// Override the first loop retry wait (default 2 s); tests use a short one.
+    pub fn with_retry_base(mut self, base: Duration) -> Self {
+        self.retry_base = base;
+        self
+    }
+
     /// Permission check for one prepared call (L6.1). `None` = run it; `Some` = the refusal to return.
     async fn authorize(
         &self,
@@ -1143,8 +1152,9 @@ impl Agent {
         read_only: bool,
         args: &serde_json::Value,
         hook: &crate::policy::HookDecision,
+        cancel: &CancellationToken,
     ) -> Option<ToolOutput> {
-        pipeline::authorize(
+        pipeline::authorize_cancellable(
             &self.policy,
             self.approver.as_ref(),
             &call.name,
@@ -1152,6 +1162,7 @@ impl Agent {
             args,
             &self.cfg.cwd,
             hook,
+            cancel,
         )
         .await
     }
@@ -1812,7 +1823,7 @@ impl Agent {
                 } => Some(Duration::from_millis(*ms)),
                 _ => None,
             };
-            let Some(delay) = retry::delay(attempt, server) else {
+            let Some(delay) = loop_delay(self.retry_base, attempt, server) else {
                 return m;
             };
             let (kind, text) = (kind.clone(), m.error_message.clone().unwrap_or_default());
@@ -1927,7 +1938,7 @@ impl Agent {
                 }
             }
             if let Prepared::Ready(t, args, _) = p
-                && let Some(refusal) = self.authorize(call, t.read_only(), args, &decision).await
+                && let Some(refusal) = self.authorize(call, t.read_only(), args, &decision, cancel).await
             {
                 *p = Prepared::Rejected(refusal);
             }
@@ -2104,6 +2115,26 @@ fn sanitize(id: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Loop-level retries (L4.6), on top of the provider's own quick ones (L2.18), sized to outlast overload spells.
+const LOOP_RETRIES: u32 = 4;
+const LOOP_RETRY_BASE: Duration = Duration::from_secs(2);
+
+/// Wait before loop retry `attempt` (0-based): base·2^attempt with up to 25% jitter down,
+/// or the server's delay up to [`retry::MAX_RETRY_DELAY`]; `None` = give up.
+fn loop_delay(base: Duration, attempt: u32, server: Option<Duration>) -> Option<Duration> {
+    use std::hash::{BuildHasher, Hasher};
+    if attempt >= LOOP_RETRIES {
+        return None;
+    }
+    if let Some(d) = server {
+        return (d <= retry::MAX_RETRY_DELAY).then_some(d);
+    }
+    // A fresh RandomState is randomly keyed: enough entropy for jitter without a new dependency.
+    let r = std::collections::hash_map::RandomState::new().build_hasher().finish() as u16;
+    let jitter = 1.0 - 0.25 * (r as f64 / u16::MAX as f64);
+    Some(base.mul_f64(2f64.powi(attempt as i32) * jitter))
 }
 
 fn failed(cfg: &Config, kind: ErrorKind, msg: &str) -> AssistantMessage {
@@ -2338,6 +2369,14 @@ impl SessionHandle {
         let mut q = self.shared.queues.lock().unwrap();
         let q = if steer { &mut q.steering } else { &mut q.follow_up };
         q.pop_back().is_some()
+    }
+
+    /// Drop every queued follow-up that hasn't started; returns how many were removed.
+    pub fn take_follow_ups(&self) -> usize {
+        let mut q = self.shared.queues.lock().unwrap();
+        let n = q.follow_up.len();
+        q.follow_up.clear();
+        n
     }
 
     /// Compact now, or as soon as the running turn ends (`/compact`, L4.5).
