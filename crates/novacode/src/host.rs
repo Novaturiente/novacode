@@ -28,6 +28,8 @@ pub struct Host {
     pub undo: Arc<Mutex<Vec<String>>>,
     pub providers: Arc<Providers>,
     pub limits: models::Limits,
+    /// `memory.model`: set, background models stay on it across `/model`.
+    pub memory_model: Option<String>,
     pub trace: Option<Trace>,
     pub processes: Option<Arc<novacode_tools::process::ProcessManager>>,
     pub mcp: Option<Arc<novacode_core::mcp::Hub>>,
@@ -304,7 +306,15 @@ impl Host {
                 tokio::spawn(async move {
                     let level = me.cur.lock().unwrap().1;
                     match models::switch(&me.providers, &m, level, me.limits, me.trace.clone()).await {
-                        Ok((sw, route)) => {
+                        Ok((mut sw, route)) => {
+                            // Observer and goal judge move to the new provider's small model.
+                            if me.memory_model.is_none() {
+                                let w = models::helper(&me.providers, None, &route, sw.adapter.clone()).await;
+                                if let Some(g) = &me.goals {
+                                    g.set_judge_model(w.clone());
+                                }
+                                sw.helper = Some(w);
+                            }
                             let price = models::price(&me.providers, &route);
                             let ev = UiEvent::ModelSet {
                                 model: route.spec(),

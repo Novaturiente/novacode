@@ -66,6 +66,9 @@ pub struct Switch {
     pub reasoning: bool,
     /// Already clamped to what the new model supports.
     pub thinking: ThinkingLevel,
+    /// The observer's model after the switch (the new provider's small model);
+    /// `None` keeps the current one (a `memory.model` setting).
+    pub helper: Option<crate::memory::Worker>,
 }
 
 /// Live state `/reload` hands to the rebuilt session: everything that isn't config.
@@ -1423,6 +1426,18 @@ impl Agent {
                     provider: s.provider.clone(),
                     model: s.model.clone(),
                 });
+            }
+            // Background model calls follow, so a model given up (e.g. at its limit) isn't used.
+            if let Some(m) = self.memory.as_mut() {
+                if !m.observe {
+                    m.worker = crate::memory::Worker {
+                        adapter: s.adapter.clone(),
+                        provider: s.provider.clone(),
+                        model: s.model.clone(),
+                    };
+                } else if let Some(h) = s.helper {
+                    m.worker = h;
+                }
             }
             self.adapter = s.adapter;
             self.cfg.provider = s.provider;

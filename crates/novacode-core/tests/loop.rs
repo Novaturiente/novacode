@@ -65,7 +65,17 @@ fn cfg(cwd: &Path, home: &Path) -> Config {
 
 /// Send prompts one by one, waiting for each run to settle. Returns all events.
 async fn drive(agent: Agent, prompts: &[&str]) -> (Agent, Vec<AgentEvent>) {
+    drive_with(agent, prompts, |_| {}).await
+}
+
+/// `drive`, after `before` ran on the session handle.
+async fn drive_with(
+    agent: Agent,
+    prompts: &[&str],
+    before: impl FnOnce(&agent::SessionHandle),
+) -> (Agent, Vec<AgentEvent>) {
     let (h, task) = agent::spawn(agent);
+    before(&h);
     let mut rx = h.subscribe();
     let mut events = Vec::new();
     for p in prompts {
@@ -1102,6 +1112,67 @@ async fn compaction_without_the_observer() {
     assert!(observer.requests.lock().unwrap().is_empty(), "the observer never ran");
     let p = format!("{:?}", agent.store.projection());
     assert!(p.contains("Summary of the earlier conversation"), "{p}");
+}
+
+/// A model switch moves background calls too: the observer to the switch's helper,
+/// and (observer off) compaction summaries to the new session model.
+#[tokio::test]
+async fn background_models_follow_a_model_switch() {
+    use novacode_core::agent::Switch;
+    use novacode_core::memory::{Settings, Worker};
+    let big = "lorem ipsum ".repeat(300);
+    let settings = Settings {
+        observe_after: 1000,
+        keep_recent: 2500,
+        compact_at: 6000,
+        chunk_tokens: 3000,
+        reflect_after: u64::MAX,
+        pool_target: u64::MAX,
+    };
+    let prompts: Vec<String> = (0..5).map(|i| format!("task {i} {big}")).collect();
+    let refs: Vec<&str> = prompts.iter().map(String::as_str).collect();
+    for observe in [true, false] {
+        let work = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let (old_main, old_small) = (Faux::new([]), Faux::new([]));
+        let new_main = Faux::new((0..20).map(|i| FauxReply::text(&format!("answer {i} {big}"))));
+        let new_small = Faux::new((0..20).map(notes_reply));
+        let worker = |f: &Faux, model: &str| Worker {
+            adapter: Arc::new(f.clone()),
+            provider: "faux".into(),
+            model: model.into(),
+        };
+        let mut agent = Agent::new(
+            Arc::new(old_main.clone()),
+            vec![],
+            Store::create(&Paths::new(home.path()), work.path(), false),
+            cfg(work.path(), home.path()),
+            Arc::new(LocalEnv),
+        )
+        .with_memory(worker(&old_small, "old-small"), settings.clone());
+        if !observe {
+            agent = agent.without_observer();
+        }
+        let sw = Switch {
+            provider: "faux".into(),
+            model: "new".into(),
+            adapter: Arc::new(new_main.clone()),
+            window_tokens: 200_000,
+            max_tokens: 4096,
+            images: false,
+            reasoning: false,
+            thinking: Default::default(),
+            helper: Some(worker(&new_small, "new-small")),
+        };
+        let (_, events) = drive_with(agent, &refs, |h| h.set_model(sw)).await;
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Compacted { .. })),
+            "observe {observe}"
+        );
+        assert!(old_main.requests.lock().unwrap().is_empty(), "observe {observe}");
+        assert!(old_small.requests.lock().unwrap().is_empty(), "observe {observe}");
+        assert_eq!(!new_small.requests.lock().unwrap().is_empty(), observe);
+    }
 }
 
 /// One prompt followed by many tool calls (the novabrowser session): `/compact`

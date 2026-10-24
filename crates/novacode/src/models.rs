@@ -2,6 +2,7 @@
 //! picker list and `novacode models`.
 
 use futures_util::future::join_all;
+use novacode_ai::adapter::Adapter;
 use novacode_ai::connect::{Providers, Route};
 use novacode_ai::trace::Trace;
 use novacode_base::settings::Settings;
@@ -87,8 +88,57 @@ pub async fn switch(
         images: route.info.images,
         reasoning: route.info.reasoning,
         thinking: route.clamp(route.level.unwrap_or(level)),
+        helper: None,
     };
     Ok((switch, route))
+}
+
+/// The background model (observer, goal judge) for a session on `route`: `explicit`
+/// (`memory.model`), else the provider's small model, else the session's own.
+/// One that can't connect falls back to the session's.
+pub async fn helper(
+    p: &Arc<Providers>,
+    explicit: Option<String>,
+    route: &Route,
+    main: Arc<dyn Adapter>,
+) -> novacode_core::memory::Worker {
+    let small = p.profile(&route.provider).ok().and_then(|pr| {
+        pr.extra
+            .get("smallModel")?
+            .as_str()
+            .map(|m| format!("{}/{m}", route.provider))
+    });
+    let fallback = || novacode_core::memory::Worker {
+        adapter: main.clone(),
+        provider: route.provider.clone(),
+        model: route.model.clone(),
+    };
+    let Some(spec) = explicit.or(small) else {
+        return fallback();
+    };
+    let r = match p.resolve(&spec) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(%e, "memory.model");
+            return fallback();
+        }
+    };
+    let adapter = if r.provider == route.provider {
+        main.clone()
+    } else {
+        match p.adapter(&r.provider, None).await {
+            Ok((a, _)) => a,
+            Err(e) => {
+                tracing::warn!(%e, "memory.model connect");
+                return fallback();
+            }
+        }
+    };
+    novacode_core::memory::Worker {
+        adapter,
+        provider: r.provider,
+        model: r.model,
+    }
 }
 
 /// Live model lists of every connected provider, plus errors worth showing.

@@ -1046,53 +1046,19 @@ impl Ctx {
                 Arc::new(novacode_core::classifier::Classify::new(self.providers.clone())),
                 novacode_ai::classify::find(s)?,
             )),
-            _ => Some(goals::Judge::Model(self.memory_worker(route, main).await)),
+            _ => Some(goals::Judge::Model(std::sync::Mutex::new(
+                self.memory_worker(route, main).await,
+            ))),
         }
     }
 
-    /// The observer's model: `memory.model`, else the provider's small
-    /// model, else the session's own. A worker that can't connect falls back to it.
+    /// The observer's model (see `models::helper`).
     async fn memory_worker(
         &self,
         route: &novacode_ai::connect::Route,
         main: Arc<dyn novacode_ai::adapter::Adapter>,
     ) -> novacode_core::memory::Worker {
-        let small = self.providers.profile(&route.provider).ok().and_then(|p| {
-            p.extra
-                .get("smallModel")?
-                .as_str()
-                .map(|m| format!("{}/{m}", route.provider))
-        });
-        let spec = self.settings.get::<String>("memory.model").or(small);
-        let fallback = || novacode_core::memory::Worker {
-            adapter: main.clone(),
-            provider: route.provider.clone(),
-            model: route.model.clone(),
-        };
-        let Some(spec) = spec else { return fallback() };
-        let r = match self.providers.resolve(&spec) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(%e, "memory.model");
-                return fallback();
-            }
-        };
-        let adapter = if r.provider == route.provider {
-            main.clone()
-        } else {
-            match self.providers.adapter(&r.provider, None).await {
-                Ok((a, _)) => a,
-                Err(e) => {
-                    tracing::warn!(%e, "memory.model connect");
-                    return fallback();
-                }
-            }
-        };
-        novacode_core::memory::Worker {
-            adapter,
-            provider: r.provider,
-            model: r.model,
-        }
+        models::helper(&self.providers, self.settings.get("memory.model"), route, main).await
     }
 
     /// Build the agent for `model` (`provider/model[:level]`). Returns the resolved `provider/model`.
@@ -1943,6 +1909,7 @@ async fn start_session(
         providers: ctx.providers.clone(),
         login: Default::default(),
         limits: models::Limits::new(&ctx.settings),
+        memory_model: ctx.settings.get("memory.model"),
         trace: ctx.trace(),
         processes,
         mcp,
