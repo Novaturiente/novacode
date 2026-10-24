@@ -126,9 +126,12 @@ pub fn load(home: &Path, cwd: &Path, trusted: bool) -> (Vec<Configured>, Vec<Str
         match r {
             Ok(servers) => {
                 for (name, config) in servers {
-                    if name.contains("__") || name.is_empty() {
+                    // Names reach provider tool names (`server__tool`) and the log path.
+                    let valid =
+                        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+                    if name.contains("__") || !valid {
                         warnings.push(format!(
-                            "{}: MCP server name `{name}` may not contain `__`",
+                            "{}: MCP server name `{name}` must be letters, digits, `_` or `-`, without `__`; skipped",
                             f.display()
                         ));
                         continue;
@@ -203,6 +206,27 @@ struct Conn {
     ids: AtomicU64,
 }
 
+/// A stdio request still waiting when dropped: forget it and send `notifications/cancelled`.
+struct CancelOnDrop<'a> {
+    id: u64,
+    pending: &'a Pending,
+    tx: &'a mpsc::UnboundedSender<String>,
+    /// `None` once answered.
+    reason: Option<&'static str>,
+}
+
+impl Drop for CancelOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(reason) = self.reason {
+            self.pending.lock().unwrap().remove(&self.id);
+            let _ = self.tx.send(
+                json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": self.id, "reason": reason}})
+                    .to_string(),
+            );
+        }
+    }
+}
+
 impl Conn {
     /// One JSON-RPC request; `progress` is notified on each progress notification.
     async fn request(&self, method: &str, params: Value, idle: Duration) -> Result<Value, String> {
@@ -217,17 +241,25 @@ impl Conn {
                 let (otx, mut orx) = oneshot::channel();
                 let progress = Arc::new(Notify::new());
                 pending.lock().unwrap().insert(id, (otx, progress.clone()));
+                // Dropped unfinished (Esc drops this future, or the timeout): tell the server to stop.
+                let mut guard = CancelOnDrop {
+                    id,
+                    pending,
+                    tx,
+                    reason: Some("cancelled"),
+                };
                 if tx.send(msg.to_string()).is_err() {
-                    pending.lock().unwrap().remove(&id);
                     return Err("the server has exited".into());
                 }
                 loop {
                     tokio::select! {
-                        r = &mut orx => return r.unwrap_or_else(|_| Err("the server has exited".into())),
+                        r = &mut orx => {
+                            guard.reason = None;
+                            return r.unwrap_or_else(|_| Err("the server has exited".into()));
+                        }
                         _ = progress.notified() => continue,
                         _ = tokio::time::sleep(idle) => {
-                            pending.lock().unwrap().remove(&id);
-                            let _ = tx.send(json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": id, "reason": "timeout"}}).to_string());
+                            guard.reason = Some("timeout");
                             return Err(format!("no answer or progress for {}s", idle.as_secs()));
                         }
                     }
@@ -378,6 +410,10 @@ impl Conn {
     }
 }
 
+fn provider_safe(name: &str) -> bool {
+    (1..=64).contains(&name.len()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 fn answer(v: &Value) -> Result<Value, String> {
     if let Some(e) = v.get("error") {
         return Err(e["message"].as_str().unwrap_or("error").to_string());
@@ -404,8 +440,15 @@ fn spawn_stdio(c: &ServerConfig, cwd: &Path, log: &Path) -> Result<Transport, St
     if let Some(dir) = log.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    // Append, so a reconnect after a crash keeps the stderr that explains it; reset past 1 MiB.
+    let big = std::fs::metadata(log).is_ok_and(|m| m.len() > 1 << 20);
     p.stderr(
-        std::fs::File::create(log)
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(!big)
+            .write(true)
+            .truncate(big)
+            .open(log)
             .map(std::process::Stdio::from)
             .unwrap_or_else(|_| std::process::Stdio::null()),
     );
@@ -612,12 +655,18 @@ impl Hub {
                     .and_then(|o| o.exposure)
                     .or(s.config.exposure)
                     .unwrap_or(Exposure::CodemodeOnly);
+                let name = format!("{}__{}", s.name, t.name);
+                // Providers reject tool names outside ^[a-zA-Z0-9_-]{1,64}$; codemode doesn't send them.
+                if matches!(exposure, Exposure::Listed | Exposure::Deferred) && !provider_safe(&name) {
+                    tracing::warn!("MCP tool `{name}` skipped: provider tool names must match ^[a-zA-Z0-9_-]{{1,64}}$");
+                    continue;
+                }
                 out.push(Arc::new(McpTool {
                     hub: self.clone(),
                     server: s.name.clone(),
                     spec: t.clone(),
                     exposure,
-                    name: format!("{}__{}", s.name, t.name),
+                    name,
                 }));
             }
         }
@@ -956,6 +1005,92 @@ for line in sys.stdin:
             (2, Status::Ready),
             "one start for both calls"
         );
+    }
+
+    #[test]
+    fn bad_server_names_are_skipped() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("mcp.json"),
+            json!({"mcpServers": {"a.b": {"command": "x"}, "ok-1": {"command": "x"}}}).to_string(),
+        )
+        .unwrap();
+        let (servers, warn) = load(home.path(), home.path(), false);
+        assert_eq!(servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["ok-1"]);
+        assert!(warn.len() == 1 && warn[0].contains("`a.b`"), "{warn:?}");
+    }
+
+    /// Esc on a running call: the server hears `notifications/cancelled`, nothing stays pending.
+    #[tokio::test]
+    async fn cancel_tells_the_server() {
+        let home = tempfile::tempdir().unwrap();
+        let script = home.path().join("srv.py");
+        let heard = home.path().join("heard");
+        std::fs::write(
+            &script,
+            r#"
+import json, os, sys
+for line in sys.stdin:
+    m = json.loads(line)
+    if "id" not in m:
+        if m["method"] == "notifications/cancelled":
+            open(os.environ["HEARD"], "a").write(json.dumps(m["params"]))
+        continue
+    if m["method"] == "initialize": r = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "t", "version": "1"}}
+    elif m["method"] == "tools/list": r = {"tools": [{"name": "sleep"}]}
+    else: continue
+    print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": r}), flush=True)
+"#,
+        )
+        .unwrap();
+        let servers = vec![Configured {
+            name: "slow".into(),
+            config: ServerConfig {
+                command: Some("python3".into()),
+                args: vec![script.display().to_string()],
+                env: [("HEARD".to_string(), heard.display().to_string())].into(),
+                ..Default::default()
+            },
+            source: home.path().join("mcp.json"),
+        }];
+        let hub = Hub::start(servers, home.path(), home.path());
+        tokio::time::timeout(Duration::from_secs(10), hub.settle())
+            .await
+            .unwrap();
+        let ctx = ToolCtx {
+            cwd: home.path().into(),
+            env: Arc::new(novacode_tools::LocalEnv),
+            cancel: Default::default(),
+            updates: None,
+            files: Default::default(),
+            session_id: "t".into(),
+            processes: None,
+            native_tools: false,
+            nested: None,
+            script: false,
+        };
+        let tools = hub.tools();
+        let cancel = ctx.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            cancel.cancel();
+        });
+        let out = tools[0].execute(json!({}), &ctx).await;
+        assert!(out.is_error);
+        let mut got = String::new();
+        for _ in 0..50 {
+            got = std::fs::read_to_string(&heard).unwrap_or_default();
+            if !got.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(got.contains("\"reason\": \"cancelled\""), "{got}");
+        let conn = hub.servers[0].conn.lock().await.clone().unwrap();
+        let Transport::Stdio { pending, .. } = &conn.transport else {
+            unreachable!()
+        };
+        assert!(pending.lock().unwrap().is_empty());
     }
 
     #[test]

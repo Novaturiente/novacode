@@ -41,7 +41,8 @@ pub struct Config {
     pub env: BTreeMap<String, String>,
 }
 
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+/// A JSON-RPC `error` answer is `Threw`; exit, closed channel or timeout is `Fatal`.
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, Failure>>>>>;
 
 pub struct ProcessExt {
     name: String,
@@ -140,7 +141,7 @@ impl ProcessExt {
                 if let Some(id) = v["id"].as_u64() {
                     if let Some(done) = p2.lock().unwrap().remove(&id) {
                         let r = match v.get("error") {
-                            Some(e) => Err(e["message"].as_str().unwrap_or("error").to_string()),
+                            Some(e) => Err(Failure::Threw(e["message"].as_str().unwrap_or("error").to_string())),
                             None => Ok(v["result"].clone()),
                         };
                         let _ = done.send(r);
@@ -172,7 +173,7 @@ impl ProcessExt {
                 }
             }
             for (_, done) in p2.lock().unwrap().drain() {
-                let _ = done.send(Err("the extension has exited".into()));
+                let _ = done.send(Err(Failure::Fatal("the extension has exited".into())));
             }
         });
         let mut me = ProcessExt {
@@ -197,7 +198,8 @@ impl ProcessExt {
                 }),
                 Duration::from_secs(10),
             )
-            .await?;
+            .await
+            .map_err(|(Failure::Threw(e) | Failure::Fatal(e))| e)?;
         me.timeout = init["timeoutMs"]
             .as_u64()
             .map(|ms| Duration::from_millis(ms.clamp(1, 60_000)));
@@ -238,20 +240,21 @@ impl ProcessExt {
         Ok(Arc::new(me))
     }
 
-    async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, Failure> {
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
         let (done, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, done);
         let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         if self.tx.send(msg.to_string()).is_err() {
-            return Err("the extension has exited".into());
+            self.pending.lock().unwrap().remove(&id);
+            return Err(Failure::Fatal("the extension has exited".into()));
         }
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(r)) => r,
-            Ok(Err(_)) => Err("the extension has exited".into()),
+            Ok(Err(_)) => Err(Failure::Fatal("the extension has exited".into())),
             Err(_) => {
                 self.pending.lock().unwrap().remove(&id);
-                Err(format!("hung for more than {}s", timeout.as_secs()))
+                Err(Failure::Fatal(format!("hung for more than {}s", timeout.as_secs())))
             }
         }
     }
@@ -284,13 +287,7 @@ impl Backend for ProcessExt {
                 "command" => json!({ "name": name, "args": payload }),
                 _ => json!({ "event": name, "payload": payload }),
             };
-            self.request(kind, params, timeout).await.map_err(|e| {
-                if e.contains("hung") || e.contains("exited") {
-                    Failure::Fatal(e)
-                } else {
-                    Failure::Threw(e)
-                }
-            })
+            self.request(kind, params, timeout).await
         })
     }
 }
@@ -309,6 +306,8 @@ for line in sys.stdin:
     if m["method"] == "initialize":
         greeting = p["settings"]["greeting"]
         r = {"timeoutMs": 20000, "tools": [{"name": "py_upper", "description": "upper", "parameters": {"type": "object"}}], "commands": [{"name": "/pyhi", "description": "hi"}], "events": ["before_tool"]}
+    elif m["method"] == "tool" and p["args"].get("fail"):
+        send({"jsonrpc": "2.0", "id": m["id"], "error": {"code": 1, "message": "process exited 1"}}); continue
     elif m["method"] == "tool": r = p["args"]["t"].upper()
     elif m["method"] == "command":
         send({"jsonrpc": "2.0", "method": "notify", "params": {"text": "ran"}})
@@ -344,6 +343,12 @@ for line in sys.stdin:
         let t = Duration::from_secs(5);
         assert_eq!(e.reg.tools[0].name, "py_upper");
         assert_eq!(e.invoke(0, &json!({"args": {"t": "ab"}}), t).await, Ok(json!("AB")));
+        // The extension's own error is a throw, even when its text says "exited": not fatal.
+        assert_eq!(
+            e.invoke(0, &json!({"args": {"fail": true}}), t).await,
+            Err(Failure::Threw("process exited 1".into()))
+        );
+        assert_eq!(e.invoke(0, &json!({"args": {"t": "cd"}}), t).await, Ok(json!("CD")));
         assert_eq!(e.timeout, Some(Duration::from_secs(20)));
         // `greeting` came in initialize's settings, the last word through a host call.
         assert_eq!(e.invoke(1, &json!("nova"), t).await, Ok(json!("hey nova hey")));

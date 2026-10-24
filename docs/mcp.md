@@ -21,7 +21,7 @@ What novacode supports:
 - **Tools only.** Resources and prompts from a server are not used.
 - The server can't call back: requests for sampling, roots or elicitation are refused.
 
-Inside a session, `/mcp` shows each server's status, tool count, description and the path of its log (`~/.novacode/logs/mcp-<name>.log`).
+Inside a session, `/mcp` shows each server's status, tool count, description and the path of its log (`~/.novacode/logs/mcp-<name>.log`). A stdio server's stderr goes there; each start appends, so a crash's output survives the reconnect, and the file starts over once it is past 1 MiB.
 
 ## Config files
 
@@ -35,7 +35,7 @@ The format is the same `mcpServers` object Claude Code uses.
 
 If the same server name appears more than once, the later file in this order wins: package, then yours, then the project's. Among packages, a project package beats a global one. Within the same scope, the package whose name comes first alphabetically wins. A project `.novacode/mcp.json` is **not** read; use `.mcp.json`. In an untrusted folder `novacode mcp list` tells you the project file is ignored.
 
-Server names can't be empty or contain `__` (a warning is logged and the entry is skipped). A file that isn't valid (broken JSON, or a typo such as an unknown `exposure` value) is skipped as a whole, with a warning in `novacode mcp list` and the log. Set `"disabled": true` on a server to switch it off without deleting it.
+Server names may use only letters, digits, `_` and `-`, can't be empty, and can't contain `__` (a warning is logged and the entry is skipped). A `listed` or `deferred` tool whose full name `<server>__<tool>` is longer than 64 characters or uses other characters is skipped with a warning in the log, since providers refuse such names; as `codemode-only` it works. A file that isn't valid (broken JSON, or a typo such as an unknown `exposure` value) is skipped as a whole, with a warning in `novacode mcp list` and the log. Set `"disabled": true` on a server to switch it off without deleting it.
 
 ```json
 {
@@ -69,7 +69,7 @@ A server is stdio if it has `command`, and HTTP if it has `url`. If both are set
 | `description` | both | One line shown to the model next to the server's name, so it knows when to use it. |
 | `exposure` | both | How the server's tools reach the model. Default `codemode-only`. See below. |
 | `tools` | both | Per-tool overrides: `{ "search": { "exposure": "listed" } }`. |
-| `timeout` | both | Seconds without an answer or progress before a tool call fails. Default `120`. It does not apply to connecting. |
+| `timeout` | both | Seconds without an answer or progress before a tool call fails. Default `120`. It does not apply to connecting. On a timeout, or when you press Esc, a stdio server gets `notifications/cancelled` for that call. |
 | `disabled` | both | `true` skips the server. |
 | `oauth` | HTTP | OAuth client settings (see below). |
 
