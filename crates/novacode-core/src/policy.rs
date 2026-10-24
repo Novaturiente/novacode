@@ -414,6 +414,8 @@ impl Policy {
         let segments = command.map(|c| risk::segments(c).unwrap_or_else(|| vec![c.to_string()]));
         let raw_path = args.get("path").and_then(Value::as_str);
         let abs_path = raw_path.map(|p| expand(p, cwd, &self.home));
+        // Through symlinks, so a link can't route around a path rule.
+        let real_path = abs_path.as_deref().map(real);
         let matches = |r: &Rule, all: bool| -> bool {
             if !r.matches_tool(rule_tool) {
                 return false;
@@ -421,7 +423,9 @@ impl Policy {
             match &segments {
                 Some(segs) if all => !segs.is_empty() && segs.iter().all(|s| r.matches_command(s)),
                 Some(segs) => segs.iter().any(|s| r.matches_command(s)),
-                None if FILE_TOOLS.contains(&lower.as_str()) => r.matches_path(raw_path, abs_path.as_deref()),
+                None if FILE_TOOLS.contains(&lower.as_str()) => {
+                    r.matches_path(raw_path, abs_path.as_deref()) || r.matches_path(None, real_path.as_deref())
+                }
                 None => r.pattern.is_none(),
             }
         };
@@ -498,6 +502,31 @@ impl Policy {
                 }
                 Level::Safe => read_only_bash = true,
                 Level::Low => {}
+            }
+        }
+
+        // File tools refuse protected paths like a catastrophic command, before any allow rule.
+        if MUTATING.contains(&lower.as_str()) {
+            let ctx = risk::Ctx {
+                cwd,
+                home: &self.home,
+                protected: &self.perms.protected.paths,
+            };
+            let real_home = std::fs::canonicalize(&self.home).unwrap_or_else(|_| self.home.clone());
+            let real_ctx = risk::Ctx {
+                home: &real_home,
+                ..ctx
+            };
+            for p in written(&lower, args) {
+                let abs = expand(&p, cwd, &self.home);
+                let why = risk::protected_path(&abs, &ctx)
+                    .or_else(|| risk::protected_path(&real(&abs), &ctx))
+                    .or_else(|| risk::protected_path(&real(&abs), &real_ctx));
+                if let Some(why) = why {
+                    return Verdict::Deny(format!(
+                        "Refused by the safety check: `{tool}` on {p} writes into {why}. It can never run from novacode. Do it another way, or ask the user to do it themselves."
+                    ));
+                }
             }
         }
 
@@ -626,6 +655,45 @@ fn suggest_rule(tool: &str, command: Option<&str>, path: Option<&str>) -> String
         (None, Some(p)) => format!("{name}({p})"),
         _ => name,
     }
+}
+
+/// The paths a file-changing tool call writes.
+fn written(tool: &str, args: &Value) -> Vec<String> {
+    match tool {
+        "apply_patch" => args["patch"]
+            .as_str()
+            .or(args["input"].as_str())
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| {
+                [
+                    "*** Update File: ",
+                    "*** Add File: ",
+                    "*** Delete File: ",
+                    "*** Move to: ",
+                ]
+                .iter()
+                .find_map(|p| l.strip_prefix(p))
+            })
+            .map(|p| p.trim().to_string())
+            .collect(),
+        _ => args["path"]
+            .as_str()
+            .map(|p| p.trim().to_string())
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// `p` with symlinks resolved: the file itself if it exists, else its nearest
+/// existing ancestor plus the rest.
+fn real(p: &Path) -> PathBuf {
+    for a in p.ancestors() {
+        if let Ok(c) = std::fs::canonicalize(a) {
+            return c.join(p.strip_prefix(a).unwrap_or(Path::new("")));
+        }
+    }
+    p.to_path_buf()
 }
 
 fn expand(p: &str, cwd: &Path, home: &Path) -> PathBuf {
@@ -895,6 +963,44 @@ mod tests {
             check(&p, "bash", bash("git reset --hard HEAD~5"), true),
             Verdict::Ask { .. }
         ));
+    }
+
+    #[test]
+    fn file_tools_refuse_protected_paths() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().canonicalize().unwrap();
+        let proj = home.join("proj");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        std::os::unix::fs::symlink(home.join(".ssh"), proj.join("keys")).unwrap();
+        let p = Policy::new(
+            serde_json::from_value(json!({ "allow": ["Write", "Edit"] })).unwrap(),
+            home.clone(),
+            None,
+        );
+        let check = |tool: &str, args: Value| p.check(tool, &args, &proj, false);
+        // Straight in, even with an allow rule.
+        assert!(denied(&check("write", json!({"path": "~/.ssh/authorized_keys"}))));
+        assert!(denied(&check("edit", json!({"path": "../.ssh/config"}))));
+        // Through a project symlink into it.
+        assert!(denied(&check("write", json!({"path": "keys/authorized_keys"}))));
+        let patch = "*** Begin Patch\n*** Add File: keys/x\n+a\n*** End Patch";
+        assert!(denied(&check("apply_patch", json!({"patch": patch}))));
+        // Normal project files and reads still run.
+        assert_eq!(check("write", json!({"path": "src/a.rs"})), Verdict::Allow);
+        assert_eq!(check("read", json!({"path": "keys/config"})), Verdict::Allow);
+        // Path rules see the resolved path too.
+        let deny = Policy::new(
+            serde_json::from_value(json!({ "deny": [format!("Read({}/.ssh/**)", home.display())] })).unwrap(),
+            home.clone(),
+            None,
+        );
+        assert!(denied(&deny.check(
+            "read",
+            &json!({"path": "keys/config"}),
+            &proj,
+            false
+        )));
     }
 
     #[test]

@@ -63,10 +63,12 @@ impl ExecutionEnv for LocalEnv {
         let (p, b) = (path.to_path_buf(), bytes.to_vec());
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                // Keep the file's mode (scripts stay executable); no .bak clutter in user repos.
+                // Write through an existing symlink to its target (a dangling one is still replaced).
+                let p = std::fs::canonicalize(&p).unwrap_or(p);
+                // Keep the file's mode (scripts stay executable); no .bak clutter in user repos,
+                // and a user's own `<file>.bak` is never touched.
                 let mode = std::fs::metadata(&p).ok().map(|m| m.permissions());
-                novacode_base::storage::write_atomic(&p, &b, novacode_base::storage::Durability::Fast)?;
-                let _ = std::fs::remove_file(novacode_base::storage::backup_path(&p));
+                novacode_base::storage::write_atomic_no_backup(&p, &b, novacode_base::storage::Durability::Fast)?;
                 if let Some(m) = mode {
                     std::fs::set_permissions(&p, m)?;
                 }
@@ -170,5 +172,41 @@ impl ExecutionEnv for LocalEnv {
 fn kill_group(pgid: Option<i32>) {
     if let Some(p) = pgid {
         let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(p), nix::sys::signal::Signal::SIGKILL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn write_follows_symlinks_keeps_bak_and_mode() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        // Through a symlink: the target changes, the link stays a link.
+        std::fs::write(p.join("target.txt"), "old").unwrap();
+        std::os::unix::fs::symlink("target.txt", p.join("link.txt")).unwrap();
+        LocalEnv.write(&p.join("link.txt"), b"new").await.unwrap();
+        assert_eq!(std::fs::read_to_string(p.join("target.txt")).unwrap(), "new");
+        assert!(
+            std::fs::symlink_metadata(p.join("link.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        // A user's own `f.bak` survives a write of `f`.
+        std::fs::write(p.join("f"), "one").unwrap();
+        std::fs::write(p.join("f.bak"), "mine").unwrap();
+        LocalEnv.write(&p.join("f"), b"two").await.unwrap();
+        assert_eq!(std::fs::read_to_string(p.join("f")).unwrap(), "two");
+        assert_eq!(std::fs::read_to_string(p.join("f.bak")).unwrap(), "mine");
+        // The mode is kept, and no .bak appears for a file without one.
+        let s = p.join("run.sh");
+        std::fs::write(&s, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&s, std::fs::Permissions::from_mode(0o755)).unwrap();
+        LocalEnv.write(&s, b"#!/bin/sh\necho hi\n").await.unwrap();
+        assert_eq!(std::fs::metadata(&s).unwrap().permissions().mode() & 0o777, 0o755);
+        assert!(!p.join("run.sh.bak").exists());
     }
 }

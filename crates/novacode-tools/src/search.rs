@@ -5,7 +5,7 @@
 use crate::{Tool, ToolCtx, ToolOutput, parse, schema_for};
 use futures_util::future::BoxFuture;
 use grep_regex::RegexMatcherBuilder;
-use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
+use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use ignore::WalkBuilder;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -133,10 +133,13 @@ fn grep(a: GrepArgs, root: PathBuf, cwd: PathBuf, cancel: CancellationToken) -> 
         .line_number(true)
         .before_context(ctxn)
         .after_context(ctxn)
+        // Stop at the first NUL byte: binary files report no matches (not on by default).
+        .binary_detection(BinaryDetection::quit(b'\x00'))
         .build();
     let limit = a.limit.unwrap_or(100).clamp(1, 1000);
     let (mut out, mut matches, mut files) = (Vec::new(), 0usize, 0usize);
-    for entry in WalkBuilder::new(&root).build().flatten() {
+    // `require_git(false)`: honour .gitignore outside a git repo too.
+    for entry in WalkBuilder::new(&root).require_git(false).build().flatten() {
         if cancel.is_cancelled() {
             return ToolOutput::error("cancelled");
         }
@@ -158,7 +161,7 @@ fn grep(a: GrepArgs, root: PathBuf, cwd: PathBuf, cancel: CancellationToken) -> 
             matches: &mut matches,
             limit,
         };
-        let _ = searcher.search_path(&matcher, p, sink); // unreadable/binary files are skipped
+        let _ = searcher.search_path(&matcher, p, sink); // unreadable files error and are skipped; binary ones stop at their first NUL
         if matches > before {
             files += 1;
         }
@@ -225,7 +228,7 @@ impl Tool for Find {
                 let by_name = !a.pattern.contains('/');
                 let limit = a.limit.unwrap_or(1000).clamp(1, 5000);
                 let (mut out, mut total) = (Vec::new(), 0usize);
-                for e in WalkBuilder::new(&root).build().flatten() {
+                for e in WalkBuilder::new(&root).require_git(false).build().flatten() {
                     if cancel.is_cancelled() {
                         return ToolOutput::error("cancelled");
                     }
@@ -362,5 +365,21 @@ mod tests {
         assert_eq!(text(&o), "src/a.rs");
         let o = Ls.execute(json!({}), &c).await;
         assert_eq!(text(&o), ".git/\n.gitignore\nb.txt\nignored/\nsrc/");
+    }
+
+    #[tokio::test]
+    async fn grep_skips_gitignored_and_binary_files_outside_git() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        assert!(!p.join(".git").exists());
+        std::fs::write(p.join(".gitignore"), "junk/\n").unwrap();
+        std::fs::create_dir_all(p.join("junk")).unwrap();
+        std::fs::write(p.join("junk/a.txt"), "needle\n").unwrap();
+        std::fs::write(p.join("bin.dat"), b"needle\n\x00\x01\x02needle\n").unwrap();
+        let c = ctx(p);
+        let o = Grep.execute(json!({"pattern": "needle"}), &c).await;
+        assert_eq!(text(&o), "No matches.");
+        let o = Find.execute(json!({"pattern": "*.txt"}), &c).await;
+        assert_eq!(text(&o), "No files found.");
     }
 }
