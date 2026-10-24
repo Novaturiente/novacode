@@ -8,6 +8,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const UNDO_CAP: usize = 200;
+const HISTORY_CAP: usize = 500;
 const PASTE_LINES: usize = 5;
 const PASTE_CHARS: usize = 1000;
 /// Cells a `\t` takes (ratatui drops control chars, so it is drawn as spaces, like `wrap::sanitize`).
@@ -65,6 +66,19 @@ impl Editor {
             history,
             ..Default::default()
         }
+    }
+
+    /// Put older prompts (other sessions in this folder) before the history; keeps the newest `HISTORY_CAP`.
+    pub fn prepend_history(&mut self, older: Vec<String>) {
+        let mut h = older;
+        h.append(&mut self.history);
+        h.dedup();
+        let cut = h.len().saturating_sub(HISTORY_CAP);
+        h.drain(..cut);
+        // A history position points into the old list.
+        self.hist = None;
+        self.search = None;
+        self.history = h;
     }
 
     pub fn text(&self) -> &str {

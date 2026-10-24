@@ -62,7 +62,7 @@ impl Nested for Runner {
                 Ok(a) => a,
                 Err(out) => return out,
             };
-            if let Some(refusal) = pipeline::authorize(
+            if let Some(refusal) = pipeline::authorize_cancellable(
                 &policy,
                 approver.as_ref(),
                 &call.name,
@@ -70,6 +70,7 @@ impl Nested for Runner {
                 &args,
                 &ctx.cwd,
                 &decision,
+                &ctx.cancel,
             )
             .await
             {

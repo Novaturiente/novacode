@@ -2430,6 +2430,7 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
         });
         let (ctx_tx, mut crx) = mpsc::unbounded_channel();
         let h = host.clone();
+        let history_tx = ui_tx.clone();
         tokio::spawn(async move {
             while let Some(c) = crx.recv().await {
                 if c == Cmd::Quit {
@@ -2487,6 +2488,16 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
                     .collect()
             }),
         };
+        // Older prompts of this folder for Up/Ctrl+R, read off the start path (L9.5).
+        {
+            let (paths, cwd, id, tx) = (ctx.paths.clone(), ctx.cwd.clone(), id.clone(), history_tx);
+            tokio::task::spawn_blocking(move || {
+                let prompts = novacode_core::session::recent_prompts(&paths, &cwd, Some(&id), 500);
+                if !prompts.is_empty() {
+                    let _ = tx.send(UiEvent::History { prompts });
+                }
+            });
+        }
         let t = match &mut screen {
             Some(s) => s,
             None => {

@@ -327,6 +327,39 @@ fn resumed_history_and_narrow_resize() {
 }
 
 #[test]
+fn older_sessions_fill_prompt_history() {
+    let (mut a, mut rx) = app(vec![Message::user("mine")]);
+    a.on_ui(UiEvent::History {
+        prompts: vec!["old one".into(), "old two".into()],
+    });
+    // This session's prompts are newest; the folder's older ones come after them on Up.
+    key(&mut a, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(a.editor_text(), "mine");
+    key(&mut a, KeyCode::Up, KeyModifiers::NONE);
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(rx.try_recv().unwrap(), Cmd::Prompt("old two".into()));
+}
+
+#[test]
+fn esc_puts_queued_follow_ups_back() {
+    let (mut a, mut rx) = app(vec![]);
+    a.on_agent(AgentEvent::AgentStart);
+    for (text, m) in [("use tests", KeyModifiers::NONE), ("then docs", KeyModifiers::ALT)] {
+        for c in text.chars() {
+            key(&mut a, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        key(&mut a, KeyCode::Enter, m);
+    }
+    while rx.try_recv().is_ok() {}
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(rx.try_recv().unwrap(), Cmd::TakeFollowUps);
+    assert_eq!(rx.try_recv().unwrap(), Cmd::Abort);
+    // The host took back one queued follow-up: it returns to the editor; the steer stays queued.
+    a.on_ui(UiEvent::FollowUpsBack { n: 1 });
+    assert_eq!(a.editor_text(), "then docs");
+}
+
+#[test]
 fn interrupted_notice_survives_collapse() {
     let (mut a, _rx) = app(vec![]);
     a.on_agent(AgentEvent::AgentStart);

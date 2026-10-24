@@ -549,6 +549,11 @@ impl Host {
                     ok: self.hub.handle.dequeue(steer),
                 });
             }
+            Cmd::TakeFollowUps => {
+                let _ = ui.send(UiEvent::FollowUpsBack {
+                    n: self.hub.handle.take_follow_ups(),
+                });
+            }
             Cmd::Background => {
                 let n = self.processes.as_ref().map_or(0, |pm| pm.detach_all());
                 let text = match n {

@@ -73,7 +73,7 @@ The pane closes when the session's window closes. See [config](config.md) for al
 | Send | `Enter`. |
 | Move and delete | Emacs-style keys (`Ctrl+A`, `Ctrl+E`, `Ctrl+W`, `Ctrl+K`, `Ctrl+Y`…). Full list below. |
 | Undo | `Ctrl+-`. |
-| Prompt history | `Up` at the top line, `Down` at the bottom line. History is the prompts of the current session. |
+| Prompt history | `Up` at the top line, `Down` at the bottom line. History is the prompts of this session plus this folder's recent sessions (up to 500), read from the session files. |
 | Search history | `Ctrl+R`, type, `Ctrl+R` again for older matches, `Enter` to use, `Esc` to cancel. |
 | Complete | `Tab` or `Enter` in the popup. Works for `/commands` and `@files`. |
 | Edit in your editor | `Ctrl+G` opens `$VISUAL`, else `$EDITOR`, else the first of `nvim`, `nano`, `emacs -nw`, `vim`, `vi` found. Save and quit to bring the text back. In a question form it opens what you are typing, or the focused choice's preview (a plan) to read in full or edit. |
@@ -119,8 +119,8 @@ You can type while a turn runs.
 | `Enter` | **Steer.** The message is delivered before the next model call of the running turn. |
 | `Alt+Enter` | **Follow-up.** The message waits and starts a new turn after this one ends. |
 | `Alt+Up` | Take the newest queued message back into the editor. If it already reached the model you get `too late`. |
-| `Esc` | Abort the running turn. |
-| `Ctrl+C` | With text: clear it. While busy with an empty editor: abort. Idle: press twice to quit. |
+| `Esc` | Abort the running turn. Queued follow-ups (`Alt+Enter`) that haven't started come back into the editor; queued steering still runs. |
+| `Ctrl+C` | With text: clear it. While busy with an empty editor: abort (follow-ups come back as with `Esc`). Idle: press twice to quit. |
 
 ### Shell commands with `!`
 

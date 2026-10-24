@@ -640,6 +640,7 @@ pub async fn attach(
                 | Cmd::Background
                 | Cmd::Processes
                 | Cmd::Dequeue(_)
+                | Cmd::TakeFollowUps
                 | Cmd::LoginList
                 | Cmd::Login { .. }
                 | Cmd::LoginInput(_)

@@ -162,6 +162,9 @@ pub enum Cmd {
     /// Alt+Up: take back the newest queued message; `true` = a steer. The host
     /// answers with [`UiEvent::Dequeued`].
     Dequeue(bool),
+    /// Esc/Ctrl+C abort with follow-ups queued: take back the ones that haven't started.
+    /// The host answers with [`UiEvent::FollowUpsBack`].
+    TakeFollowUps,
     /// `/login` with no provider: the host answers with [`UiEvent::LoginList`].
     LoginList,
     /// Start a login; no method = the host offers the methods when there are several.
@@ -237,6 +240,14 @@ pub enum UiEvent {
     /// Answer to [`Cmd::Dequeue`]: `false` = it already reached the model.
     Dequeued {
         ok: bool,
+    },
+    /// Answer to [`Cmd::TakeFollowUps`]: how many queued follow-ups were taken back.
+    FollowUpsBack {
+        n: usize,
+    },
+    /// Prompts of this folder's other sessions, oldest first, for Up/Ctrl+R (L9.5).
+    History {
+        prompts: Vec<String>,
     },
     LoginList {
         items: Vec<PickItem>,
@@ -547,6 +558,14 @@ impl App {
         }
     }
 
+    /// The user stops the turn: queued follow-ups come back to the editor instead of starting (L3.7).
+    fn abort(&mut self) {
+        if !self.init.attached && self.pending.iter().any(|(_, steer)| !steer) {
+            self.send(Cmd::TakeFollowUps);
+        }
+        self.send(Cmd::Abort);
+    }
+
     fn send(&mut self, c: Cmd) {
         if self.tx.send(c).is_err() {
             self.exit = Some(Exit::Quit);
@@ -621,6 +640,30 @@ impl App {
                         .set_text(&if draft.is_empty() { t } else { format!("{t}\n{draft}") });
                 }
             }
+            UiEvent::FollowUpsBack { n } if n > 0 => {
+                // The newest `n` follow-ups are the ones still queued (older ones already started).
+                let idx: Vec<usize> = self
+                    .pending
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, steer))| !steer)
+                    .map(|(i, _)| i)
+                    .collect();
+                let idx = &idx[idx.len().saturating_sub(n)..];
+                let back: Vec<String> = idx.iter().map(|&i| self.pending[i].0.clone()).collect();
+                for &i in idx.iter().rev() {
+                    self.pending.remove(i);
+                }
+                let draft = self.editor.text().to_string();
+                let mut text = back.join("\n");
+                if !draft.is_empty() {
+                    text = format!("{text}\n{draft}");
+                }
+                self.editor.set_text(&text);
+                self.flash(format!("{} queued follow-up(s) moved back to the editor", back.len()));
+            }
+            UiEvent::FollowUpsBack { .. } => {}
+            UiEvent::History { prompts } => self.editor.prepend_history(prompts),
             UiEvent::LoginList { items } => self.overlay = Some(Overlay::LoginPick(Picker::new("Log in to", items))),
             UiEvent::LoginMethods { provider, items } => {
                 let title = format!("Log in to {provider}");
@@ -1209,7 +1252,7 @@ impl App {
                 if !self.editor.is_empty() {
                     self.editor.clear();
                 } else if self.busy {
-                    self.send(Cmd::Abort);
+                    self.abort();
                 } else if self.last_ctrl_c.is_some_and(|t| now - t < Duration::from_secs(1)) {
                     self.exit = Some(Exit::Quit);
                 } else {
@@ -1222,7 +1265,7 @@ impl App {
             Some(A::TurnsToggle) => self.tr.toggle_all(),
             Some(A::Interrupt) => {
                 if self.busy {
-                    self.send(Cmd::Abort);
+                    self.abort();
                 } else if self.last_esc.is_some_and(|t| now - t < DOUBLE_PRESS) {
                     self.editor.clear();
                 }
