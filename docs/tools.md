@@ -67,7 +67,7 @@ Params: `path`, `content`. Creates missing folders. If the file changed on disk 
 
 ### edit
 
-Params: `path`, `edits` (a list of `old_text` / `new_text`). Each `old_text` must match exactly one place; overlapping matches count too (`}\n}\n` in `}\n}\n}\n` is 2). If an exact match fails, a whitespace and quote tolerant match is tried. All edits apply together or none do. CRLF line endings and a BOM are kept. If the file changed on disk since the agent last read it, `edit` still applies when every `old_text` matches exactly once, and the result says the file had changed. Only a failed match adds "changed on disk since you last read it". Edits to the same file run one at a time. The result is a one-line summary of where it edited. If the match was fuzzy, it also includes the diff so the model can check it.
+Params: `path`, `edits` (a list of `old_text` / `new_text`). Each `old_text` must match exactly one place; overlapping matches count too (`}\n}\n` in `}\n}\n}\n` is 2). If an exact match fails, a whole-line match is tried that ignores trailing spaces and reads curly quotes, dash variants and non-breaking spaces as their plain forms. All edits apply together or none do. Two edits whose matches overlap are refused; merge them into one. CRLF line endings and a BOM are kept. If the file changed on disk since the agent last read it, `edit` still applies when every `old_text` matches exactly once, and the result says the file had changed. Only a failed match adds "changed on disk since you last read it". Edits to the same file run one at a time. The result is a one-line summary of where it edited. If the match was fuzzy, it also includes the diff so the model can check it.
 
 `apply_patch` (a patch-format tool that can replace `edit` for some models) exists in the code but is not turned on in any release path yet, so the model does not see it.
 
@@ -86,7 +86,7 @@ A command that passes its timeout is not killed: it moves to the process manager
 
 ### grep, find, ls
 
-`grep` and `find` respect `.gitignore` and skip hidden files (dotfiles). `ls` lists everything, dotfiles and ignored files included.
+`grep` and `find` respect `.gitignore` (also outside a git repository) and skip hidden files (dotfiles). `grep` also skips binary files (a NUL byte). `ls` lists everything, dotfiles and ignored files included.
 
 | Tool | Params | Default cap |
 |---|---|---|
@@ -109,15 +109,17 @@ A small task list. A call with no fields shows the list. The list is saved with 
 | `start` | The id being worked on now (only one is active). |
 | `note` | What the started item is doing. |
 
+When every item is done or dropped, an `add` without `set` starts a new list instead of appending to the finished one.
+
 The list shows `done/total` first (dropped items are not counted in the total), then one line per item: `○` pending, `◐` active, `✓` done, `✗` dropped.
 
 ### ask_user
 
-Asks you one or more questions in one form. Params: `questions`, each with `question`, an optional `header`, `options` (2 to 6 suggested; one can be marked `recommended`, and each can have a `description` and a `preview`), and `multi` to allow several picks. You can always type your own answer, or press `n` on a choice to add a note that is sent with it (the model sees `choice; note`). If you dismiss the form, the model is told to ask in chat instead.
+Asks you one or more questions in one form. Params: `questions`, each with `question`, an optional `header`, `options` (2 to 6 suggested; one can be marked `recommended`, and each can have a `description` and a `preview`), and `multi` to allow several picks. You can always type your own answer, or press `n` on a choice to add a note that is sent with it (the model sees `choice; note`). If you dismiss the form, the model is told to ask in chat, or to go on with its best judgement and say what it assumed.
 
 ### agent and goal
 
-`agent` runs subagents: actions `spawn`, `list`, `status`, `log`, `read`, `send`, `wait`, `stop`. `goal` takes `set` (`objective`, `criteria`, and `ordered` to do the todo steps in order), `complete` (with `evidence`), `block` (with `reason`) and `status`. See [Subagents](subagents.md).
+`agent` runs subagents: actions `spawn`, `list`, `status`, `log`, `read`, `send`, `wait`, `stop`. `goal` takes `set` (`objective`, `criteria`, and `ordered` to do the todo steps in order), `update` (change the open goal's `objective`, `criteria` or `ordered`), `complete` (with `evidence`), `block` (with `reason`) and `status`. See [Subagents](subagents.md).
 
 ### Plan mode
 
@@ -135,7 +137,7 @@ Asks you one or more questions in one form. Params: `questions`, each with `ques
 
 ### enter_worktree and exit_worktree
 
-`enter_worktree` (params `name` in kebab-case, and `base`, a commit or branch, default `HEAD`) creates or reuses `<repo>/.worktrees/<name>` on branch `worktree-<name>`, copies root `.env` files in, and moves the session there. `exit_worktree` (no params) moves back and asks you whether to keep or remove it; with nobody to ask, it keeps it. Removal refuses uncommitted changes and keeps unmerged branches.
+`enter_worktree` (params `name`, made of letters, digits, `.`, `_` and `-`, and `base`, a commit or branch, default `HEAD`) creates or reuses `<repo>/.worktrees/<name>` on branch `worktree-<name>`, copies root `.env` files in, and moves the session there. `.worktrees/` is hidden from git through `.git/info/exclude`. Inside a worktree it refuses: call `exit_worktree` first. `exit_worktree` (no params) moves back and asks you whether to keep or remove it; with nobody to ask, it keeps it. Removal refuses uncommitted changes and keeps unmerged branches.
 
 ### schedule and session_search
 
@@ -186,7 +188,7 @@ The `process` tool runs commands that keep going across turns: dev servers, watc
 |---|---|
 | `start` | Starts `command` (with a `name`, optional `cwd`) in its own process group. Waits 1.5 seconds and reports it if it fails at once. |
 | `list` | Shows processes with state, pid, command and folder. |
-| `output` | Shows the last `lines` (default 100, max 2000), optionally only lines containing `filter`. |
+| `output` | Shows the last `lines` (default 100, max 2000), optionally only lines containing `filter` (searched in the last 1 MB of output). |
 | `write` | Sends `input` to its stdin; `end` closes stdin. |
 | `stop` | Stops it (SIGTERM, then SIGKILL after 2 seconds). |
 | `watch` | Sets what the model is told about: when it exits (`on_exit`: `wake`, `context` or `ignore`), when an output line matches, or when it prints nothing for `stall_seconds` (at least 5). `start` takes these too. |

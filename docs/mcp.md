@@ -19,9 +19,10 @@ What novacode supports:
 
 - Two transports: **stdio** (a local program) and **streamable HTTP** (a remote URL). The old SSE-only transport is not supported. A Claude-style `"type"` field is ignored: novacode goes by `command` or `url`.
 - **Tools only.** Resources and prompts from a server are not used.
-- The server can't call back: requests for sampling, roots or elicitation are refused.
+- The server can't call back: requests for sampling, roots or elicitation are refused (a `ping` is answered).
+- Over HTTP, novacode opens no listening stream, so notifications the server sends on its own are missed, and a cancelled call sends no `notifications/cancelled`.
 
-Inside a session, `/mcp` shows each server's status, tool count, description and the path of its log (`~/.novacode/logs/mcp-<name>.log`). A stdio server's stderr goes there; each start appends, so a crash's output survives the reconnect, and the file starts over once it is past 1 MiB.
+Inside a session, `/mcp` shows each server's status, tool count, description and the path of its log (`~/.novacode/logs/mcp-<name>.log`). A stdio server's stderr goes there; each start appends, so a crash's output survives the reconnect. A start that finds the file past 1 MiB begins it again (one long run can grow it past that).
 
 ## Config files
 

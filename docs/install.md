@@ -150,7 +150,8 @@ NOVACODE_HOME=/tmp/nc-test novacode
 | `~/.novacode/exhausted.json` | Which subscription accounts are used up, and until when |
 | `~/.novacode/metrics/` | Timing files, when `debug.metrics` is on |
 | `~/.novacode/logs/` | Daily log files (set `NOVACODE_LOG`, for example `NOVACODE_LOG=debug`, to change the level) |
-| `~/.novacode/cache/` | Model catalog and subscription quota caches |
+| `~/.novacode/cache/` | Caches: model catalog, subscription quota, MCP tool lists, built extensions and learned tool-schema workarounds |
+| `*.bak`, `*.lock` | Next to files novacode writes, such as `auth.json.bak` and `settings.json.lock`: the previous version of the file, and the lock that stops two novacode processes writing it at once |
 | `~/.novacode/run/` | Records of live sessions (used by `agents`, `attach`, `status`) |
 | `~/.novacode/docs/` | This documentation for the installed version (rewritten on every update; don't edit it). `/docs` points a session at it |
 

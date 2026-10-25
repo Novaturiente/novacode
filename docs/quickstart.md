@@ -72,7 +72,7 @@ Start a line with `!` to run a shell command yourself. It runs, shows its output
 | Ctrl+L | Pick a model |
 | Shift+Tab | Next thinking level (how much the model reasons before it answers; see [tui](tui.md)) |
 | Ctrl+R | Search prompt history |
-| Ctrl+G | Edit the prompt in `$EDITOR` |
+| Ctrl+G | Edit the prompt in `$VISUAL` or `$EDITOR` |
 | Alt+/ | Show all key bindings |
 
 Type `/` to see the slash commands. The ones you will use first:
@@ -148,7 +148,7 @@ Both exit with `1` when nothing is connected (`doctor` also when it finds a prob
 
 | Command | Does |
 |---|---|
-| `login PROVIDER [--account NAME]` | Log in to a subscription, or save an API key |
+| `login [PROVIDER] [--account NAME] [--method browser\|code\|device]` | Log in to a subscription, or save an API key (no provider: pick from a list) |
 | `logout PROVIDER [--account NAME]` | Remove a login |
 | `models [FILTER] [--all] [--refresh]` | List models; `--refresh` updates the catalog |
 | `auth status` | Show logins and keys |

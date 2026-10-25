@@ -100,7 +100,7 @@ Frontmatter fields:
 | `name` | Type name. Default: the file name without `.md`. |
 | `description` | Shown to the model so it can pick the type. |
 | `tools` | Comma-separated tool names, or a YAML list. Leave it out to give all of the parent's tools. `mcp__server__tool` gives that MCP server (MCP tools come per server). If none of the listed tools is available, the spawn is refused. |
-| `disallowedTools` | Never given, whatever the spawn asks. `mcp__server…` drops that server. |
+| `disallowedTools` | Never given, whatever the spawn asks. `mcp__server…` drops that server. Listing `bash` also removes `process`. |
 | `model` | `provider/model`, `small`, `inherit` (the parent's), a family such as `sonnet`, `opus`, `haiku` (on the parent's provider, when it has the family; else the parent's model), or a model id on the parent's provider. |
 | `thinking` | Thinking level, added to the model as `model:level`. Claude Code's `effort` works too. |
 | `permissionMode` | `plan`: the subagent starts read-only. Other values never give it more than its parent and are ignored (`doctor` lists them). |
@@ -143,6 +143,7 @@ novacode sets a few variables for its subagent processes (`NOVACODE_AGENT_DEPTH`
 | `agents.parentPicksTools` | `true` | The model may pick `tools` and `mcp` when it spawns. Off: only the type's tools, and `tools`/`mcp` in a spawn are ignored. |
 | `agents.<name>.tools` | the type's | Replace the tools of type `<name>` (built-ins too). |
 | `agents.<name>.mcp` | `[]` | MCP servers type `<name>` gets by default. |
+| `agents.env` | `{}` | Environment variables every subagent starts with. |
 
 ```json
 {
@@ -218,7 +219,9 @@ A goal is an objective with completion criteria you can check. novacode keeps wo
 /goal make the test suite pass on Node 22 and Node 20
 ```
 
-The model drafts one clear objective and 1–5 criteria (a test passes, a command prints X, a file has Y). It asks you only if something essential is unclear, writes its steps in the `todo` list, and starts. After each finished turn it is woken to continue.
+The model first drafts 1–5 criteria you can check in the workspace (a test passes, a command prints X, a file has Y) and asks you to approve them in a question form; the draft is the recommended answer's preview, which `Ctrl+G` opens for editing. After you approve, it saves them with `goal` `update`, writes its steps in the `todo` list, and starts. After each finished turn it is woken to continue. While its subagents or background processes are still running, it waits for them instead of starting a new run.
+
+To give the criteria yourself, use `/goal edit`: it puts the goal into the editor as `/goal edit <objective>`, then `Done when:` and one `- criterion` per line. Change it and send it.
 
 | Command | Meaning |
 |---|---|
@@ -226,7 +229,8 @@ The model drafts one clear objective and 1–5 criteria (a test passes, a comman
 | `/goal <objective>` | Start a goal. |
 | `/goal pause` | Stop the loop (only while the goal is active or blocked). |
 | `/goal resume` | Continue a paused or blocked goal (resets the run counter). |
-| `/goal clear` | Drop the goal. |
+| `/goal edit` | Put the goal in the editor to change it; `/goal edit <text>` saves it (see above). |
+| `/goal clear` | Drop the goal (`stop`, `cancel`, `off`, `reset` and `none` work too). |
 | `/goal audit on` / `off` | Turn the completion audit on or off for this goal. |
 
 The goal stops by itself when:
@@ -234,9 +238,12 @@ The goal stops by itself when:
 - you press Esc (paused);
 - two runs in a row make no tool call (paused as stalled);
 - it reaches `goal.maxRuns` automatic runs (paused);
-- the model calls `goal` with `block` because it needs you (blocked).
+- it has used `goal.maxTokens` tokens (paused, after the model summarises what is done and what is left);
+- a turn fails with an error that needs you, such as a bad key (paused). A temporary error (network, rate limit) is retried up to 3 times, after 15, 30 and 45 s, before it pauses;
+- the model calls `goal` with `block` because it needs you (blocked);
+- the judge decides the goal can never be met as stated (failed; start a new goal).
 
-`/goal resume` continues after any of these. The goal is saved per session in `~/.novacode/goals/<session id>.json`, so it survives a restart.
+`/goal resume` continues after any of these except a failed goal. The goal is saved per session in `~/.novacode/goals/<session id>.json`, so it survives a restart.
 
 ### The auditor
 
@@ -249,8 +256,10 @@ When the model says the goal is done, an `auditor` subagent re-checks every crit
 | `goal.audit` | `true` | Check completion with the `auditor` subagent. |
 | `goal.auditModel` | the session's model | Model for the auditor, `provider/model[:level]`. |
 | `goal.maxRuns` | `30` | Automatic runs before it pauses (per start or resume). |
+| `goal.maxTokens` | none | Tokens (prompt and output) the goal may spend before it pauses. |
+| `goal.judge` | the observer's model | After each turn, a model checks the conversation for evidence that the goal is met, not met, or impossible. Met goes to the audit; `off` leaves it to the model's `complete`. |
 
-The model drives a goal with the `goal` tool: `set` (objective, criteria, optional `ordered` to do the todo steps in order, one per run), `complete` (with evidence), `block` (with a reason) and `status`.
+The model drives a goal with the `goal` tool: `set` (objective, criteria, optional `ordered` to do the todo steps in order, one per run), `update` (change the objective, criteria or `ordered`), `complete` (with evidence), `block` (with a reason) and `status`.
 
 Goals need a window or an RPC client. They're not available in a subagent at maximum depth.
 

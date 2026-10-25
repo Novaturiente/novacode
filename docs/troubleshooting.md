@@ -82,7 +82,7 @@ Without metrics files, `stats` tells you to turn the setting on first.
 
 ## Common problems
 
-In print mode (`-p`) novacode exits `0` on success, `1` on an error and `130` when aborted. See [automation](automation.md).
+In print mode (`-p`) novacode exits `0` on success, `1` on an error, `2` on a bad flag and `130` when aborted. See [automation](automation.md).
 
 ### "Account is exhausted" or rate limit errors
 
@@ -193,6 +193,8 @@ novacode couldn't write the session file (disk full, permissions, a read-only mo
 ### Something looks stuck
 
 Press Esc to abort the turn. Open another terminal and run `novacode agents` to see live sessions (ids and prefixes work) and `novacode status` to see what the session is doing (it exits 1 with "no live session" if there is none for this terminal; try `--all`). `novacode stop <id>` ends one. `/debug` shows running processes and queued prompts.
+
+A provider that sends nothing for 120 s fails as a network error and is retried ([providers](providers.md#errors-and-retries)), so a silent server can't hang a turn forever. A subagent with no activity for `agents.stallMinutes` (default 10) is stopped ([subagents](subagents.md#limits-and-safety)).
 
 ## Report a bug
 

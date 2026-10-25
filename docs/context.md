@@ -108,7 +108,7 @@ Each note has an id. The model can call the `recall` tool with a note id to get 
 Compaction runs by itself in three cases:
 
 - After a turn ends, when the context has reached `memory.compactAtTokens`.
-- In the middle of a turn, when the context reaches 95% of the window (only if `compactAtTokens` is below the window).
+- In the middle of a turn, between two model calls, at the same `memory.compactAtTokens` threshold (at most 95% of the window). This is off when `compactAtTokens` is at or above the window.
 - When the provider rejects a request as too long: novacode compacts and retries once. If nothing can be compacted, you get "the context is too long and nothing could be compacted".
 
 You can also run it by hand:

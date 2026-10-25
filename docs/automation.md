@@ -29,7 +29,8 @@ Two notes go to stderr without changing the exit code: `novacode: reply cut at t
 | Code | Meaning |
 |---|---|
 | `0` | The run finished (stopped normally, hit the length limit, or stopped to use tools) |
-| `1` | The model request failed, or novacode could not start (a bad flag, no model, no login) |
+| `1` | The model request failed, or novacode could not start (no model, no login) |
+| `2` | A bad flag or argument (the usage message goes to stderr) |
 | `130` | The run was aborted (for example Ctrl+C) |
 
 ```sh
@@ -235,7 +236,7 @@ Answer with the same number in `approval`:
 {"type":"approval","approval":3,"answer":{"deny":"not now"}}
 ```
 
-`once` allows this call, `session` allows the same rule until the session ends, `always` also saves the rule to your global settings, and `deny` refuses (the text is the reason the model sees). The session waits, with its state set to `blocked`, until someone answers.
+`once` allows this call, `session` allows the same rule until the session ends, `always` also saves the rule to your global settings, and `deny` refuses (the text is the reason the model sees). For a `risky` request, `session` and `always` both allow only that exact command until the session ends, and nothing is saved. The session waits, with its state set to `blocked`, until someone answers.
 
 When the model asks the user something (`ask`), reply with one entry per question, or `null` to dismiss:
 

@@ -25,7 +25,7 @@ The panel has tabs. Switch tabs with `Tab` and `Shift+Tab` or the number keys `1
 | Processes | A list of processes, running ones first: status, run time, command and the last output line. `Enter` or a click opens the process popup. |
 | Usage stats | Bars for context use (and a split into system prompt, tools and messages), cache hits (last request and session) and subscription windows; sparklines of cache hit and cost (or output tokens) per request; token totals and cost; MCP servers with connected or failed state and tool counts; how many skills, prompts, agents, extensions, packages and context files loaded, and running processes and subagents. `Ctrl+Alt+U` opens it. |
 | Timing | Where the time of each task went, with a sparkline of task times. |
-| Files | Files the model edited (not ones it only read), each with `+added −removed` lines since the session started. `Enter` or a click opens the file in your editor: in nvim or vim as a diff against the session start (`-d`), else the file alone. |
+| Files | Files the model edited (not ones it only read), each with `+added −removed` lines since the session started. `Enter` or a click opens the file in your editor: in nvim, vim, vi or gvim as a diff against the session start (`-d`), else the file alone. |
 
 Extensions can add tabs too (see [extensions](extensions.md)).
 
@@ -73,7 +73,7 @@ The pane closes when the session's window closes. See [config](config.md) for al
 | Send | `Enter`. |
 | Move and delete | Emacs-style keys (`Ctrl+A`, `Ctrl+E`, `Ctrl+W`, `Ctrl+K`, `Ctrl+Y`…). Full list below. |
 | Undo | `Ctrl+-`. |
-| Prompt history | `Up` at the top line, `Down` at the bottom line. History is the prompts of this session plus this folder's recent sessions (up to 500), read from the session files. |
+| Prompt history | `Up` at the top line, `Down` at the bottom line. History is the prompts of this session plus those of this folder's 20 newest other session files, up to 500 in all. Subagent sessions among those files are skipped. |
 | Search history | `Ctrl+R`, type, `Ctrl+R` again for older matches, `Enter` to use, `Esc` to cancel. |
 | Complete | `Tab` or `Enter` in the popup. Works for `/commands` and `@files`. |
 | Edit in your editor | `Ctrl+G` opens `$VISUAL`, else `$EDITOR`, else the first of `nvim`, `nano`, `emacs -nw`, `vim`, `vi` found. Save and quit to bring the text back. In a question form it opens what you are typing, or the focused choice's preview (a plan) to read in full or edit. |
@@ -82,7 +82,7 @@ The pane closes when the session's window closes. See [config](config.md) for al
 
 `Shift+Enter` needs a terminal that supports the Kitty keyboard protocol, or tmux with `set -s extended-keys on` (novacode turns on xterm's modifyOtherKeys there). Elsewhere use `Ctrl+J` or `\` + `Enter`, which work in every terminal.
 
-Big pastes (more than 5 lines or 1000 characters) collapse to a marker like `[paste #1 +40 lines]`. The full text is sent when you submit, also after you clear the editor and undo.
+Big pastes (more than 5 lines or 1000 bytes) collapse to a marker like `[paste #1 +40 lines]`. The full text is sent when you submit, also after you clear the editor and undo.
 
 Long lines wrap at word starts; a word longer than the editor breaks anywhere. A tab is kept as a tab in the text you send and shows as 4 spaces in the editor.
 
@@ -119,8 +119,8 @@ You can type while a turn runs.
 | `Enter` | **Steer.** The message is delivered before the next model call of the running turn. |
 | `Alt+Enter` | **Follow-up.** The message waits and starts a new turn after this one ends. |
 | `Alt+Up` | Take the newest queued message back into the editor. If it already reached the model you get `too late`. |
-| `Esc` | Abort the running turn. Queued follow-ups (`Alt+Enter`) that haven't started come back into the editor; queued steering still runs. |
-| `Ctrl+C` | With text: clear it. While busy with an empty editor: abort (follow-ups come back as with `Esc`). Idle: press twice to quit. |
+| `Esc` | Abort the running turn. Queued follow-ups (`Alt+Enter`) that haven't started come back into the editor; queued steering still runs. In an attached window (`novacode attach`) follow-ups stay queued. |
+| `Ctrl+C` | With text: clear it. While busy with an empty editor: abort (follow-ups come back as with `Esc`). Idle: press twice within 1 second to quit. |
 
 ### Shell commands with `!`
 
@@ -157,7 +157,7 @@ Type `/` to see the list. A line that is only `/something` unknown to novacode i
 | `/docs [question]` | Add a hidden note telling the model where novacode's own docs (`~/.novacode/docs/`) and your config files are, then ask the question if you gave one. Use it to have the session set up or customise novacode. |
 | `/usage` | Tokens and cost per route, cache warming, memory workers and subscription windows. |
 | `/debug` | Route, cache, queues, processes, MCP and log paths, for bug reports. |
-| `/ps` | Open the process popup: one process at a time with its live output in the program's own colors (else errors red, warnings yellow, success green, URLs blue). `←`/`→` switch process, `↑`/`↓` and `PageUp`/`PageDown` scroll, `g`/`G` jump to the top or back to the live tail, `Esc` closes. |
+| `/ps` | Open the process popup: one process at a time with its live output in the program's own colors (else errors red, warnings yellow, success green, URLs blue). `←`/`→` (or `h`/`l`) switch process, `↑`/`↓` (or `k`/`j`) and `PageUp`/`PageDown` scroll, `g`/`G` (or `Home`/`End`) jump to the top or back to the live tail, `Esc` or `q` closes. |
 | `/mcp` | MCP servers: status and tool counts. See [mcp](mcp.md). |
 | `/login [provider]` | Log in from a dialog: no provider = a list of all of them. Shows the sign-in URL (`Ctrl+X` copy, `Ctrl+O` open), a device code, or a box for a pasted code / API key; the session reloads after. Several accounts need `novacode login --account` on the command line. See [providers](providers.md). |
 | `/keys` (or `/help`) | Show the key bindings. |

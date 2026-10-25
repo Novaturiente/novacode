@@ -268,17 +268,17 @@ Project settings only apply in folders you trust, so a repository can't start a 
 
 novacode retries failures that are likely to pass on their own: network errors, timeouts, server errors (5xx) and rate limits (429). It does not retry errors that need you, such as a bad key or an invalid request.
 
-**Retry schedule.** Retries happen only before the reply starts.
+**Retry schedule.**
 
-- The provider connection retries twice quickly, after 0.5 s and 1 s.
-- If that fails, the agent loop retries 4 more times, after 2, 4, 8 and 16 s, each with up to 25% random jitter. Each retry shows in the transcript, and Esc cancels it.
-- When the server asks for a specific wait (a `retry-after` header, or Google's retry delay), novacode waits that long instead, up to 60 s. A longer requested wait is not retried; with several accounts, novacode switches account instead.
+- The provider connection retries twice quickly, after 0.5 s and 1 s. It only does this before the reply starts.
+- If that fails, the agent loop retries 4 more times, after 2, 4, 8 and 16 s, each up to 25% shorter (random jitter). Each retry shows in the transcript, and Esc cancels it. The agent loop also retries an error that cuts a reply off mid-stream: the partial reply is dropped from the conversation and the request is sent again.
+- When the server asks for a specific wait, novacode waits that long instead, up to 60 s. A `retry-after` header counts for every retry. Google's retry delay is in the error body, so only the agent loop uses it, after the two quick retries. A longer requested wait is not retried; with several accounts, novacode switches account instead.
 
 **First-response timeout.** If a provider sends no response headers within 120 s, the attempt fails as a network error and is retried. The same 120 s limit applies to any pause between two chunks of a streamed reply.
 
 **Rate limits vs used-up quota (429).** A 429 usually means a per-minute limit. novacode retries it after the delay the server gives (Google sends this in the error body, for example "reset after 2s"). Only a daily quota counts as used up: a Google error naming a per-day quota (`quotaId` with `PerDay`), or wording such as "per day", "daily" or `insufficient_quota`. The word "billing" alone does not count, because Google's per-minute free-tier 429 says "check your plan and billing details". When Google sends a retry delay, the 429 is a rate limit unless it names a per-day quota. That error is not retried: with several accounts, novacode parks the account for an hour and switches to the next one. A rate limit whose wait is over 60 s is handled the same way, and the account is parked until the reset time the server gave.
 
-**Token refresh errors.** Subscription tokens are refreshed about once an hour. If the refresh fails because of a network error, a token-server error (5xx), a timeout (408) or a rate limit (429), the request fails as a temporary error and is retried on the same account. A login that is gone makes novacode switch to the next account: expired or revoked, refused by the token server with any other 4xx (such as 400 or 401), not logged in, or a bad key.
+**Token refresh errors.** Subscription tokens are refreshed when they are less than 5 minutes from expiring. If the refresh fails because of a network error, a token-server error (5xx), a timeout (408) or a rate limit (429), the request fails as a temporary error and is retried on the same account. A login that is gone makes novacode switch to the next account: expired or revoked, refused by the token server with any other 4xx (such as 400 or 401), not logged in, or a bad key.
 
 ## Check and remove
 
