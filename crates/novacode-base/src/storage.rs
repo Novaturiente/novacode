@@ -270,6 +270,14 @@ mod tests {
             .unwrap();
         assert!(other.try_lock().is_err());
         drop(held);
-        assert!(other.try_lock().is_ok());
+        // A process another test forks in this window holds the fd until its exec
+        // (close-on-exec), so allow a short wait.
+        let free = (0..100).any(|_| {
+            other.try_lock().is_ok() || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(free);
     }
 }
