@@ -168,11 +168,10 @@ async fn run(
 ) -> io::Result<ExecResult> {
     let mut child = crate::sandbox::command(sandbox, &spec.command, &spec.cwd)?
         .envs(spec.env.iter().map(|(k, v)| (k, v)))
-        // stdin is /dev/null so nothing can wait on input; a /dev/tty prompt still hangs until the timeout.
+        // stdin is /dev/null so nothing can wait on input.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
         .kill_on_drop(true)
         .spawn()?;
     let pgid = child.id().map(|p| p as i32);

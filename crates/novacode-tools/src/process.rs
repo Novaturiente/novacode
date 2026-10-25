@@ -195,7 +195,6 @@ impl ProcessManager {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .process_group(0)
             .spawn()?;
         let pid = child.id().unwrap_or(0);
         let info = Info {
@@ -995,6 +994,13 @@ mod tests {
         // Another one: the manager dropping kills its group.
         let id2 = pm.start("sleeper", "sleep 30", d.path(), &[], true, None).unwrap();
         let pid2 = pm.list().iter().find(|i| i.id == id2).unwrap().pid;
+        // The group exists once `setsid` has run in the child.
+        for _ in 0..50 {
+            if group_alive(pid2) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(group_alive(pid2));
         drop(pm);
         tokio::time::sleep(Duration::from_millis(200)).await;

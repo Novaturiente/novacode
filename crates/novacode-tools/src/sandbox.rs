@@ -569,7 +569,10 @@ pub fn hint_for(sandbox: Option<&Sandbox>, failed: bool, output: &str) -> Option
 
 /// Builds every model command (L6.5): `bash -c CMD`, or `bwrap <args> -- bash -c CMD`.
 /// `None` runs it outside (the `unsandboxed` argument, or no sandbox). The caller
-/// sets env, stdio and the process group.
+/// sets env and stdio. Every command gets its own process group (pgid = pid) for
+/// group kills, and a new session on Linux, so it can't take the terminal.
+/// Example: `zsh -i` made itself the terminal's foreground group, and novacode was stopped
+/// ("suspended (tty input)") at its next key read.
 pub fn command(sandbox: Option<&Sandbox>, cmd: &str, cwd: &Path) -> io::Result<tokio::process::Command> {
     let mut c = match sandbox {
         Some(s) if s.mode != Mode::Off && s.available() => {
@@ -577,6 +580,7 @@ pub fn command(sandbox: Option<&Sandbox>, cmd: &str, cwd: &Path) -> io::Result<t
             let mut c = tokio::process::Command::new(&l[0]);
             c.args(&l[1..]).args(s.args(cwd)).args(["--", "bash"]);
             c.env_clear().envs(std::env::vars_os().filter(|(k, _)| s.keeps_env(k)));
+            c.process_group(0);
             c
         }
         Some(s) if s.mode == Mode::On && s.symlink.is_some() => {
@@ -590,7 +594,21 @@ pub fn command(sandbox: Option<&Sandbox>, cmd: &str, cwd: &Path) -> io::Result<t
                 "the sandbox is on (`sandbox.mode`), but bubblewrap (bwrap) is not installed or doesn't work here, so the command was not run. Install bubblewrap, set `sandbox.mode` to `auto`, or pass `unsandboxed: true` for this one command",
             ));
         }
-        _ => tokio::process::Command::new("bash"),
+        // `setsid` (util-linux) doesn't fork when the child isn't a group leader, so the pid stays bash's.
+        // pre_exec(setsid) would need `unsafe`, which the workspace forbids.
+        #[cfg(target_os = "linux")]
+        _ => {
+            let mut c = tokio::process::Command::new("setsid");
+            c.arg("bash");
+            c
+        }
+        // shortcut: outside Linux an unsandboxed command can still take the terminal; fix when macOS users hit it.
+        #[cfg(not(target_os = "linux"))]
+        _ => {
+            let mut c = tokio::process::Command::new("bash");
+            c.process_group(0);
+            c
+        }
     };
     c.arg("-c").arg(cmd).current_dir(cwd);
     Ok(c)
@@ -1330,7 +1348,7 @@ mod tests {
             let mut s = Sandbox::new(Config { mode, ..c.clone() });
             s.program = "/nonexistent/bwrap".into();
             let cmd = command(Some(&s), "true", &cwd).unwrap();
-            assert_eq!(cmd.as_std().get_program(), "bash", "{mode:?} runs unsandboxed");
+            assert!(!cmd.as_std().get_args().any(|a| a == "--"), "{mode:?} runs unsandboxed");
         }
         assert_eq!(Mode::parse("on"), Some(Mode::On));
         assert_eq!(Mode::parse("yes"), None);
@@ -1415,7 +1433,10 @@ mod tests {
             );
             let s = Sandbox::new(Config { mode: Mode::Auto, ..c });
             let cmd = command(Some(&s), "true", &cwd).unwrap();
-            assert_eq!(cmd.as_std().get_program(), "bash", "auto runs {path} unsandboxed");
+            assert!(
+                !cmd.as_std().get_args().any(|a| a == "--"),
+                "auto runs {path} unsandboxed"
+            );
         }
         // A symlink outside every writable place can't be swapped: fine.
         // Under the real home, not /tmp: /tmp is writable.
@@ -1604,11 +1625,18 @@ mod tests {
             eprintln!("note: real_no_terminal skipped, script gives no terminal here");
             return;
         }
-        let c = command(Some(&sb), probe, &proj).unwrap();
-        let c = c.as_std();
-        let line: Vec<String> = std::iter::once(c.get_program()).chain(c.get_args()).map(q).collect();
-        let t = in_tty(line.join(" "));
-        assert!(!t.contains("opened"), "/dev/tty opened inside: {t}");
+        for sb in [Some(&sb), None] {
+            let c = command(sb, probe, &proj).unwrap();
+            let c = c.as_std();
+            let line: Vec<String> = std::iter::once(c.get_program()).chain(c.get_args()).map(q).collect();
+            // `; true` keeps the terminal's session leader alive, as novacode's shell is.
+            let t = in_tty(line.join(" ") + "; true");
+            assert!(
+                !t.contains("opened"),
+                "/dev/tty opened (sandboxed: {}): {t}",
+                sb.is_some()
+            );
+        }
     }
 
     /// Real runs: submodule git folders can't be renamed, and the git change
