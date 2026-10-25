@@ -1,0 +1,1 @@
+{ "mcpServers": { "shop": { "command": "python3", "args": ["$EVAL_TASK_DIR/server.py"] } } }
