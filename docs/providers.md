@@ -19,7 +19,7 @@ Four providers use your existing subscription instead of an API key:
 novacode login claude
 ```
 
-novacode prints the URL, opens your browser (`xdg-open`, or `open` on macOS) and waits. With no provider, `novacode login` lets you pick one from a list. For `claude` and `codex` it then asks how to sign in: **Browser** (the default) catches the redirect on `localhost` (port 53692 for Claude, any free port if that one is taken; port 1455 for Codex), so there is nothing to copy. The other method (`code` / `device`) is for SSH or another machine. Pass `--method browser|code|device` to skip the question. Logins are stored in `~/.novacode/auth.json` and tokens refresh by themselves.
+novacode prints the URL, opens your browser (`xdg-open`, or `open` on macOS) and waits. With no provider, `novacode login` lets you pick one from a list. For `claude` and `codex` it then asks how to sign in: **Browser** (the default) catches the redirect on `localhost` (port 53692 for Claude, any free port if that one is taken; port 1455 for Codex), so there is nothing to copy. The other method (`code` / `device`) is for SSH or another machine. Pass `--method browser|code|device` to skip the question. If port 1455 is busy (for example a Codex CLI login is running), novacode asks you to paste the URL the browser ends on instead. Logins are stored in `~/.novacode/auth.json` (or under `$NOVACODE_HOME` if you set it) and tokens refresh by themselves.
 
 The first run picker (see [quickstart](quickstart.md)) starts these logins for you.
 
@@ -29,7 +29,7 @@ Inside a session, `/login` opens a list of every provider (subscriptions first, 
 
 Every login works over SSH. Open the printed URL on any device.
 
-- **claude**: after you approve, the page shows a code. Paste it at the `code:` prompt. The full callback URL works too.
+- **claude**: after you approve, the page shows a code. Paste it at the `paste here` prompt. The full callback URL works too.
 - **codex** and **copilot**: enter the printed code on the page. novacode keeps polling until you approve. Nothing to paste.
 - **antigravity**: novacode listens on `localhost:51121` for the redirect. On a remote machine the browser's redirect to `localhost` will fail to load. That is fine: copy the full URL the browser ended on and paste it into the terminal.
 
@@ -43,9 +43,9 @@ novacode login claude --account work
 novacode login claude --account second
 ```
 
-When an account runs out (quota used up, or a rate limit longer than novacode is willing to wait) before a reply starts, novacode switches to the next account of that provider and tells you in the transcript. It remembers when the limit resets, so a new session doesn't start on a used-up account. Order is `default` first, then by name. Accounts known to be used up go last.
+When an account runs out (quota used up, or a rate limit longer than novacode is willing to wait) before a reply starts, novacode switches to the next account of that provider and tells you in the transcript. It remembers the account, so a new session doesn't start on it: a rate limit until the reset time the server gave, a used-up quota for one hour. These are saved in `~/.novacode/exhausted.json`; delete it to clear them. Order is `default` first, then by name. Accounts known to be used up go last.
 
-novacode never falls back to a metered API key. If every account is used up, the error says when the limit resets and suggests adding an account or switching model with `/model`.
+novacode never falls back to a metered API key. If every account is used up, the error says when a rate limit resets (for a used-up quota it says only `quota used up`) and suggests adding an account or switching model with `/model`.
 
 `--account` only works for subscriptions. API keys have one key per provider.
 
@@ -105,7 +105,7 @@ novacode login openrouter              # asks for the key without echo, checks i
 novacode -m openai/gpt-5 --api-key sk-...
 ```
 
-`novacode login <provider>` checks the key with a free model-list call before saving it. If the check fails it asks whether to save anyway.
+`novacode login <provider>` checks the key with a free model-list call before saving it. If the check fails it asks whether to save anyway. In a script (no terminal) a failed check saves nothing.
 
 ### Keys in settings
 
@@ -156,7 +156,7 @@ novacode models --all        # every provider, connected or not
 novacode models --refresh    # update model info from models.dev first
 ```
 
-Each row shows the model, its context size, whether it supports thinking and images, and, when the catalog has one, the list price per million tokens (on a subscription this is not what you pay). novacode refreshes the model info in the background about once a day.
+Each row shows the model, its context size, whether it supports thinking and images, and, when the catalog has one, the list price per million tokens (on a subscription this is not what you pay). In interactive sessions novacode refreshes the model info in the background about once a day.
 
 ### Thinking levels
 
@@ -270,15 +270,15 @@ novacode retries failures that are likely to pass on their own: network errors, 
 
 **Retry schedule.**
 
-- The provider connection retries twice quickly, after 0.5 s and 1 s. It only does this before the reply starts.
+- The provider connection retries twice quickly, after about 0.5 s and 1 s (each up to 25% shorter). It only does this before the reply starts.
 - If that fails, the agent loop retries 4 more times, after 2, 4, 8 and 16 s, each up to 25% shorter (random jitter). Each retry shows in the transcript, and Esc cancels it. The agent loop also retries an error that cuts a reply off mid-stream: the partial reply is dropped from the conversation and the request is sent again.
 - When the server asks for a specific wait, novacode waits that long instead, up to 60 s. A `retry-after` header counts for every retry. Google's retry delay is in the error body, so only the agent loop uses it, after the two quick retries. A longer requested wait is not retried; with several accounts, novacode switches account instead.
 
 **First-response timeout.** If a provider sends no response headers within 120 s, the attempt fails as a network error and is retried. The same 120 s limit applies to any pause between two chunks of a streamed reply.
 
-**Rate limits vs used-up quota (429).** A 429 usually means a per-minute limit. novacode retries it after the delay the server gives (Google sends this in the error body, for example "reset after 2s"). Only a daily quota counts as used up: a Google error naming a per-day quota (`quotaId` with `PerDay`), or wording such as "per day", "daily" or `insufficient_quota`. The word "billing" alone does not count, because Google's per-minute free-tier 429 says "check your plan and billing details". When Google sends a retry delay, the 429 is a rate limit unless it names a per-day quota. That error is not retried: with several accounts, novacode parks the account for an hour and switches to the next one. A rate limit whose wait is over 60 s is handled the same way, and the account is parked until the reset time the server gave.
+**Rate limits vs used-up quota (429).** A 429 usually means a per-minute limit. novacode retries it after the delay the server gives (Google sends this in the error body, for example "reset after 2s"). Only a daily quota counts as used up. For Google: an error naming a per-day quota (`quotaId` with `PerDay`), or, when Google sends no retry delay, wording such as "per day", "daily" or `insufficient_quota`. For OpenAI-style errors: the code `insufficient_quota`, "insufficient credits", HTTP 402, or "quota exceeded" together with daily wording (or HTTP 403). A plain 429 saying "requests per day" without "quota exceeded" stays a rate limit. The word "billing" alone does not count, because Google's per-minute free-tier 429 says "check your plan and billing details". That error is not retried: with several accounts, novacode parks the account for an hour and switches to the next one. A rate limit whose wait is over 60 s is handled the same way, and the account is parked until the reset time the server gave.
 
-**Token refresh errors.** Subscription tokens are refreshed when they are less than 5 minutes from expiring. If the refresh fails because of a network error, a token-server error (5xx), a timeout (408) or a rate limit (429), the request fails as a temporary error and is retried on the same account. A login that is gone makes novacode switch to the next account: expired or revoked, refused by the token server with any other 4xx (such as 400 or 401), not logged in, or a bad key.
+**Token refresh errors.** Subscription tokens are refreshed when they are less than 5 minutes from expiring. If the refresh fails because of a network error, a token-server error (5xx), a timeout (408) or a rate limit (429), the request fails as a temporary error and is retried on the same account. A login that is gone makes novacode switch to the next account: expired or revoked, refused by the token server with any other 4xx (such as 400 or 401), or not logged in.
 
 ## Check and remove
 
@@ -286,7 +286,7 @@ novacode retries failures that are likely to pass on their own: network errors, 
 novacode auth status
 ```
 
-Shows every login and key, where it comes from (login, settings, or env var), and whether a subscription token is valid. It reads local files only and makes no network calls.
+Shows every login and key, where it comes from (login, settings, or env var), and whether a subscription token is valid. It reads local files only and makes no network calls. It exits with code 1 when no login or key is set.
 
 ```sh
 novacode doctor

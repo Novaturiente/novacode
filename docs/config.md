@@ -6,7 +6,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `compat.claude` | bool | true | Also load skills, agents and commands from `~/.claude` and a trusted project's `.claude`. novacode's own folders win a name. |
+| `compat.claude` | bool | true | Also load skills, agents and commands from `~/.claude` and a trusted project's `.claude`. novacode's own folders win a name. `~/.agents/skills` loads either way. |
 | `model` | string | picked at first run | Default `provider/model[:level]`, e.g. `claude/claude-opus-5-5:medium`. |
 | `thinking` | string | `medium` | Default thinking level: off, minimal, low, medium, high, xhigh, max. |
 | `maxTokens` | number | 16384 | Output cap per reply, clamped to the model's limit. |
@@ -15,7 +15,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `cache.warm` | bool | false | Keep the prompt cache alive with 1-token replays while it pays off. |
 | `providers` | object | {} | Add a provider or change a bundled one: `providers.<id>.{api, name, baseUrl, auth, env, apiKey, keyOptional, catalog, headers, compat}`, merged field by field over the bundled profile. See docs/providers.md. |
 | `models` | object | {} | Per-model catalog overrides, keyed `"<provider>/<id>"`: `contextWindow`, `maxTokens`, `images`, `reasoning` (bools), `name`, `cost`. See docs/providers.md. |
-| `permissions` | object | auto mode | Global only. `mode` auto\|ask\|read-only; `allow`/`ask`/`deny` lists of rules like `Bash(git push:*)`; `protected: {commands, paths}`; `profiles.<name>.tools`, named tool sets. See docs/security.md. |
+| `permissions` | object | auto mode | Global only. `mode` auto\|ask\|read-only; `allow`/`ask`/`deny` lists of rules like `Bash(git push:*)`; `protected: {commands, paths}`; `profiles.<name>.{tools, deny}`, named tool sets. See docs/security.md. |
 | `tools.<name>.exposure` | string | per tool | How a tool reaches the model: `listed` (declared to it), `codemode` (alias `codemode-only`: only codemode scripts call it), `deferred` (found through `tool_search`) or `hidden` (user and UI only). |
 | `hooks` | object | {} | Command hooks: `beforeTool`, `afterTool` and `events.<type>`, each a command or a list; `timeoutMs` (default 5000) limits `beforeTool`, `afterTool` gets twice that. See docs/automation.md. |
 | `hooks.onActivity` | string | unset | Shell command run on working/blocked/idle changes, State JSON on stdin. |
@@ -25,7 +25,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `extensions.<name>` | object | unset | Settings of extension `<name>`: a process extension gets them in `initialize`, any extension through `novacode.settings.get("extensions.<name>")`. |
 | `security.maskSecrets` | bool | false | Also mask well-known secret shapes in tool output (GitHub/AWS/OpenAI/Anthropic/Slack/Google tokens, private keys, `*_TOKEN=`/`*_SECRET=` values) before the model sees them. Your own logins are always masked. |
 | `memory.enabled` | bool | true | Observer notes, compaction from notes and the `recall` tool. Off: compaction still runs, summarised by the session model. |
-| `memory.model` | string | the profile's small model | Model for the observer, reflector and dropper. |
+| `memory.model` | string | the profile's small model | Model for the observer, reflector and dropper. Without a small model (or one that can't connect), the session's model. |
 | `memory.observeAfterTokens` | number | 10000 | New tokens before the observer runs. |
 | `memory.keepRecentTokens` | number | 20000 | Tokens kept verbatim after a compaction. |
 | `memory.compactAtTokens` | number | min(80% of window, 400k) | Context size that triggers auto-compaction. |
@@ -40,7 +40,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `agents.parentPicksTools` | bool | true | The model may pick a subagent's tools (`tools`) and MCP servers (`mcp`) when it spawns one, from its own. Off: only the type's tools. |
 | `agents.env` | object | {} | Environment variables every subagent starts with, e.g. `{"CAVEMAN_DEFAULT_MODE": "off", "PONYTAIL_SUBAGENT_MATCHER": "^$"}` keeps those plugins' `SubagentStart` text out of subagents. |
 | `agents.<name>.tools` | list | the agent file's | Default tools of subagent type `<name>` (built-ins too); a subagent sees only its tools. |
-| `agents.<name>.mcp` | list | [] | MCP servers subagent type `<name>` gets by default (subagents start none otherwise). |
+| `agents.<name>.mcp` | list | the agent file's | MCP servers subagent type `<name>` gets by default (subagents start none otherwise). |
 | `goal.audit` | bool | true | `/goal` completion is checked by the `auditor` subagent before it counts. |
 | `goal.auditModel` | string | the session's model | Model of the goal auditor (`provider/model[:level]`). |
 | `goal.maxRuns` | number | 30 | Automatic continuations of a goal before it pauses (per start or `/goal resume`). |
@@ -51,7 +51,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `debug.metrics` | bool | false | Per-session timing JSONL in `~/.novacode/metrics/` for `novacode stats`. |
 | `notifications.enabled` | bool | true | OSC 777 notification when a turn ends unwatched or needs you. |
 | `tmux.agentState` | bool | true | Set the `@agent_*` pane options inside tmux. |
-| `ui.theme` | string | `auto` | auto, dark (catppuccin-mocha), light (catppuccin-latte) or a file in `~/.novacode/themes`. |
+| `ui.theme` | string | `auto` | auto, dark (catppuccin-mocha), light (catppuccin-latte) or a file in `~/.novacode/themes` or an installed package's `themes` folder. |
 | `ui.turnCollapse` | bool | true | Fold finished turns to one line (Alt+O toggles). |
 | `ui.thinking` | string | `collapsed` | How thinking shows: collapsed, full or hidden. |
 | `ui.userMessage` | object | rounded box | Your messages' box: `border` (rounded, single, heavy, double, ascii, none), `borderColor` and `text` (`#rrggbb` or `{fg, bg, bold, italic, …}`), `paddingX` (1), `paddingY` (0). |

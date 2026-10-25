@@ -43,7 +43,7 @@ The default export gets the frozen `novacode` object (also `globalThis.novacode`
 
 `novacode.apiVersion` is `1`.
 
-**Stability promise.** Within v1, changes are additive only: nothing listed here is renamed or removed, and payloads only gain fields. A breaking change becomes API v2, and v1 keeps working for at least one release after that, with a deprecation notice. The whole surface (this object, hook payloads, UI ops, the process protocol) is snapshot-tested in `crates/novacode-core/tests/api-v1.snap`, so an accidental change fails the build.
+**Stability promise.** Within v1, changes are additive only: nothing listed here is renamed or removed, and payloads only gain fields. A breaking change becomes API v2, and v1 keeps working for at least one release after that, with a deprecation notice. The whole surface (this object, hook payloads, UI ops, the process protocol) is snapshot-tested in `crates/novacode-core/tests/api-v1.snap`, so an accidental change fails `cargo test`.
 
 ### Registering
 
@@ -53,8 +53,8 @@ The default export gets the frozen `novacode` object (also `globalThis.novacode`
   - `details.ui` (a list of [lines](#ui-novacodeui-version-1)) replaces the tool output in the transcript.
   - `exposure` is `listed` (the default: the model sees it), `codemode` (or `codemode-only`: only codemode scripts can call it), `deferred` (found through `tool_search`) or `hidden`. An unknown value counts as `listed`. The setting `tools.<name>.exposure` overrides it.
 - **`registerCommand(name, {description, handler(args)})`**: a `/name` command (a leading `/` in `name` is optional). `args` is the text after the name, trimmed. A returned string is shown as a notice.
-- If two extensions register the same command, the first one loaded wins. Built-in commands always win.
-- **`registerShortcut(key, handler | {handler, description})`**: a key such as `ctrl+alt+d`, shown in Alt+/ help.
+- If two extensions register the same command, the first one loaded wins. Process extensions load first, then script extensions in the folder order above. Built-in commands always win.
+- **`registerShortcut(key, handler | {handler, description})`**: a key such as `ctrl+alt+d`. It works when no built-in key takes it. Alt+/ help does not list it.
 - **`on(event, handler)`**: see Events below.
 
 ### Acting
@@ -71,7 +71,7 @@ The default export gets the frozen `novacode` object (also `globalThis.novacode`
 - **`state.append(kind, data)`** and **`state.entries(kind)`**: your extension's data, kept in the session file and never sent to the model. `entries` returns what you appended under `kind` on the current branch, oldest first, so state follows `/rewind` and `/tree`.
 - **`log(...args)`**: writes one line to novacode's log, `~/.novacode/logs/novacode.log.<date>`, tagged `extension=<name>`. `console.log`, `info`, `warn`, `error` and `debug` do the same.
 
-Every call above returns a promise (except `log`). A failed call rejects with an `Error` whose message starts with the call's name, for example `exec: …`. `remind`, `sendMessage`, `state.*`, `messages`, `complete` and `spawnAgent` need a session, so they fail during setup: call them from a handler. `notify` during setup is only written to the log.
+Every call above returns a promise (except `log`). A failed call rejects with an `Error` whose message starts with the host operation's name, then the reason: `exec: …`, `readFile: …` for `fs.read`, `writeFile: …`, `messages: …`, `settings: …`, `stateAppend: …`, `ui: …`. `remind`, `sendMessage`, `state.*`, `messages`, `complete` and `spawnAgent` need a session, so they fail during setup: call them from a handler. `notify` during setup is only written to the log.
 
 ### UI (`novacode.ui`, version 1)
 
@@ -280,7 +280,7 @@ printf '%s\n' \
 
 Add `"processExtensions": {"hello": {"command": "novacode-hello"}}` to `~/.novacode/settings.json` and run `/reload`. In the TUI, `/hello nova` now shows `hello nova`. The model can call `shout`, and a `git push` it tries is refused with `Blocked by a hook: no pushing while the hello extension is on (hello)`.
 
-When handlers get slow (network calls, language servers) or you need host requests, answer each request from its own task. The two bundled extensions show how: they read stdin in a loop, `tokio::spawn` a task per request, and send every reply through one channel to a single stdout writer. Start from [`extensions/image-gen/src/main.rs`](../extensions/image-gen/src/main.rs) (about 70 lines) for a tool, or [`extensions/lsp/src/main.rs`](../extensions/lsp/src/main.rs) for an `after_tool` hook with `timeoutMs`. Both are their own crates, outside novacode's workspace, so they build and ship on their own.
+When handlers get slow (network calls, language servers) or you need host requests, answer each request from its own task. The two bundled extensions show how: they read stdin in a loop, `tokio::spawn` a task per request, and send every reply through one channel to a single stdout writer. Start from [`extensions/image-gen/src/main.rs`](../extensions/image-gen/src/main.rs) (about 70 lines) for a tool, or [`extensions/lsp/src/main.rs`](../extensions/lsp/src/main.rs) for an `after_tool` hook with `timeoutMs`. Both are their own crates with their own `[workspace]`, outside novacode's workspace. image-gen also depends on `crates/novacode-ai` by path, so build it from a novacode checkout. Both use `NOVACODE_HOME` if set, else `~/.novacode`: image-gen for its login, lsp for its logs.
 
 **Example: image generation.** [`extensions/image-gen`](../extensions/image-gen) adds a `generate_image` tool (Gemini image models through `novacode login antigravity`, or a key in `extensions.image-gen.apiKey`, `GEMINI_API_KEY` or `GOOGLE_API_KEY`). Install with `cargo install --locked --path extensions/image-gen` and add `"processExtensions": {"image-gen": {"command": "novacode-image-gen"}}`.
 

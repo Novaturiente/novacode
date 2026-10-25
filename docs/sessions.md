@@ -24,7 +24,7 @@ One novacode process owns a session file at a time. Opening a session that is op
 |---|---|
 | `novacode` | New session. |
 | `novacode -c` | Continue the most recent session in this folder. |
-| `novacode -r <id>` | Resume a session by id prefix, or by the path of a `.jsonl` file. It looks in this folder first, then in every folder, and takes the first match. |
+| `novacode -r <id>` | Resume a session by id prefix, or by the path of a `.jsonl` file. It looks in this folder first, then in every folder, and takes the first match. Give enough of the id to be unique: if two sessions match, either one may be picked. |
 | `novacode --no-session` | Don't save this session. |
 
 When you quit, novacode prints `resume with: novacode -r <id>` if the session was saved. If it ended inside a worktree, the hint is `novacode -w <name> -r <id>`, which reopens it there from anywhere in the repo.
@@ -51,7 +51,7 @@ A git worktree is a second checkout of the same repo in another folder, on its o
 | `/worktree` | List the repo's worktrees: branch, uncommitted files, commits not in the main checkout. `*` marks this session's. |
 | `/worktree <name>` | Move this session into that worktree, creating it if needed. |
 | `/worktree exit` | Move back to the main checkout and keep the worktree. |
-| `/worktree remove` | Move back and remove it. Git refuses if there are uncommitted changes; an unmerged branch is kept. |
+| `/worktree remove` | Move back and remove it, and delete branch `worktree-<name>` if it is merged. Git refuses if there are uncommitted changes; an unmerged branch is kept. |
 | `enter_worktree`, `exit_worktree` | The same, as tools the model can call (see [tools](tools.md#enter_worktree-and-exit_worktree)). |
 
 **Quitting inside a worktree** asks `Keep the worktree? [Y/n]` on the terminal. `Enter` keeps it; `n` removes it the same way `/worktree remove` does.
@@ -144,7 +144,7 @@ It prints the session id and returns. Other flags such as `-m` work as usual. `-
 |---|---|
 | `novacode agents` | List live sessions: id, state (`working`, `blocked` when it waits for an answer, or `idle`), whether it is background, model and folder. |
 | `novacode attach <id>` | Open a window on a live session. |
-| `novacode status` | One-line status of a live session. Shows this tmux pane's session, else the newest in this folder. |
+| `novacode status` | One-line status of a live session. Shows this tmux pane's session, else the newest in this folder, else the newest live session anywhere. Exits `1` when no live session matches. |
 | `novacode status --all` | Every live session. |
 | `novacode stop <id>` | End a live session, including a background one. |
 

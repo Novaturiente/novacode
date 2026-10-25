@@ -19,12 +19,12 @@ novacode reads these Claude Code files directly. You don't copy anything.
 Rules for these folders:
 
 - novacode's own folders win. If `~/.novacode/skills/review` and `~/.claude/skills/review` both exist, the novacode one is used. `novacode doctor` lists the ones that were skipped.
-- A project's `.claude/` folder (skills, agents, commands) loads only when you [trust](security.md) the folder (`novacode trust`). In an untrusted folder it is ignored and novacode prints a `note:` line (two, if there is also a `.mcp.json`). `~/.claude` always loads.
+- A project's `.claude/` folder (skills, agents, commands) loads only when you [trust](security.md) the folder (`novacode trust`). The first interactive run in such a folder asks whether to trust it. Otherwise an untrusted folder's config is ignored and novacode prints one `note:` line. `~/.claude` loads without trust.
 - To turn all of this off, set `compat.claude` to `false`. See [config](config.md).
 
 ### CLAUDE.md and AGENTS.md
 
-In each folder from `/` down to your working folder, novacode loads one instruction file. The order of preference is `AGENTS.override.md`, then `AGENTS.md`, then `CLAUDE.md`. So a repo with only `CLAUDE.md` works, and a repo with both uses `AGENTS.md`. The same real file is never loaded twice.
+In each folder from `/` down to your working folder, novacode loads one instruction file. The order of preference is `AGENTS.override.md`, then `AGENTS.md`, then `CLAUDE.md` (`AGENTS.MD` and `CLAUDE.MD` also count). So a repo with only `CLAUDE.md` works, and a repo with both uses `AGENTS.md`. The same real file is never loaded twice.
 
 The global file is `~/.novacode/AGENTS.md` (or `CLAUDE.md` in that folder). `~/.claude/CLAUDE.md` is not read. Copy it if you want it:
 
@@ -58,7 +58,7 @@ What it copies:
 | `mcpServers` in `~/.claude.json` | `~/.novacode/mcp.json` |
 | `model` | `model` in settings, only when you have no default model yet and the name maps to a `claude/claude-<name>` model (for example `sonnet`) |
 
-How hooks work after the copy: each hook is stored as a call to `novacode claude-hook <event> <matcher> <command>`. That wrapper applies the Claude Code matcher (a regex on the tool name) and gives your script the input in Claude Code's shape (`tool_name`, `tool_input`, `session_id`, `cwd`, `hook_event_name`), and sets `CLAUDE_PROJECT_DIR`. A block from your script (exit code 2, `"decision": "block"` or a `permissionDecision` of `deny`) blocks the tool call in novacode. Keep `novacode` on your `PATH` so the hooks can run.
+How hooks work after the copy: each hook is stored as a call to `novacode claude-hook <event> <matcher> <command>`. That wrapper applies the Claude Code matcher (a regex on the tool name) and gives your script the input in Claude Code's shape (`tool_name`, `tool_input`, `session_id`, `cwd`, `hook_event_name`), and sets `CLAUDE_PROJECT_DIR`. A block from your script (exit code 2, `"decision": "block"` or a `permissionDecision` of `deny`) blocks the tool call in novacode. A `PostToolUse` block can't undo the call; its reason is shown to the model. Keep `novacode` on your `PATH` so the hooks can run.
 
 What it leaves out, and says so:
 

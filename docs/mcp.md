@@ -19,7 +19,7 @@ What novacode supports:
 
 - Two transports: **stdio** (a local program) and **streamable HTTP** (a remote URL). The old SSE-only transport is not supported. A Claude-style `"type"` field is ignored: novacode goes by `command` or `url`.
 - **Tools only.** Resources and prompts from a server are not used.
-- The server can't call back: requests for sampling, roots or elicitation are refused (a `ping` is answered).
+- The server can't call back. Over stdio, requests for sampling, roots or elicitation are refused and a `ping` is answered. Over HTTP, requests from the server get no answer.
 - Over HTTP, novacode opens no listening stream, so notifications the server sends on its own are missed, and a cancelled call sends no `notifications/cancelled`.
 
 Inside a session, `/mcp` shows each server's status, tool count, description and the path of its log (`~/.novacode/logs/mcp-<name>.log`). A stdio server's stderr goes there; each start appends, so a crash's output survives the reconnect. A start that finds the file past 1 MiB begins it again (one long run can grow it past that).
@@ -74,11 +74,11 @@ A server is stdio if it has `command`, and HTTP if it has `url`. If both are set
 | `disabled` | both | `true` skips the server. |
 | `oauth` | HTTP | OAuth client settings (see below). |
 
-`${VAR}` and `${VAR:-default}` are replaced from your environment in `command`, `args`, `env`, `cwd`, `url` and `headers`.
+`${VAR}` and `${VAR:-default}` are replaced from your environment in `command`, `args`, `env`, `cwd`, `url` and `headers`. An unset variable with no default becomes an empty string, with no warning.
 
 Connecting gives up after 60 seconds. Each step of the handshake (`initialize` and listing the tools) waits at most 30 seconds for an answer. At most 50 pages of tools are read; the rest are dropped without a message.
 
-A stdio server starts in your session's folder, not in the folder of the package that ships its `mcp.json`. A native package has no variable for its folder, so a packaged server should use a command that is on the `PATH` (such as `npx`). A Claude Code plugin gets `${CLAUDE_PLUGIN_ROOT}` (see [packages](packages.md#claude-code-plugins)).
+A stdio server starts in your session's folder, not in the folder of the package that ships its `mcp.json`. A native package has no variable for its folder, so a packaged server should use a command that is on the `PATH` (such as `npx`). A Claude Code plugin gets `${CLAUDE_PLUGIN_ROOT}` (see [packages](packages.md#claude-code-plugins)), and its stdio servers also get `CLAUDE_PLUGIN_ROOT` and `CLAUDE_PLUGIN_DATA` in their environment.
 
 ## `novacode mcp` commands
 
@@ -89,7 +89,7 @@ A stdio server starts in your session's folder, not in the folder of the package
 | `novacode mcp add <name> --url <url>` | Add an HTTP server. |
 | `novacode mcp add … --env KEY=VALUE` | Set an environment variable for a stdio server. Repeat the flag for more. It has no effect with `--url`. |
 | `novacode mcp remove <name>` | Remove a server from `~/.novacode/mcp.json`. Exits 1 if the name isn't there. |
-| `novacode mcp login <name>` | Log in to an HTTP server that uses OAuth. It opens the browser with `xdg-open`; elsewhere, open the printed URL yourself. |
+| `novacode mcp login <name>` | Log in to an HTTP server that uses OAuth. It opens the browser (`xdg-open`, or `open` on macOS); if nothing opens, open the printed URL yourself. It finds only enabled servers, and a project `.mcp.json` only in a trusted folder; otherwise it fails with ``no MCP server `<name>` ``. |
 | `novacode mcp logout <name>` | Forget that server's saved login. |
 
 `add` and `remove` only edit your own file. To change a server in a project `.mcp.json` or a package, edit that file.
@@ -175,7 +175,7 @@ novacode registers itself with the server automatically when the server allows i
 | `oauth` field | Meaning |
 |---|---|
 | `clientId` | Your registered client id. |
-| `clientSecret` | Its secret, if it has one. It is kept as plain text in the config file, so don't put it in a file you commit. |
+| `clientSecret` | Its secret, if it has one. It is kept as plain text in the config file, so don't put it in a file you commit. A login also saves a copy in `~/.novacode/mcp-auth.json`. |
 | `scope` | Scopes to ask for. |
 | `callbackPort` | Fixed loopback port, for clients registered with an exact redirect URI. Default: any free port. |
 
@@ -189,7 +189,7 @@ A [subagent](subagents.md) gets no MCP servers unless you grant them. The model 
 { "agents": { "worker": { "mcp": ["notes"] } } }
 ```
 
-A subagent with MCP servers also gets `codemode`, because that's how it calls them. If `agents.parentPicksTools` is off, the model can't pick servers; only your settings apply. See [Settings](config.md).
+A subagent with MCP servers also gets `codemode`, because that's how it calls them. If `agents.parentPicksTools` is off, the model can't pick servers; only the agent file's `mcpServers` and your `agents.<name>.mcp` apply. See [Settings](config.md).
 
 ## See also
 

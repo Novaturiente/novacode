@@ -8,7 +8,7 @@ novacode runs full screen in your terminal's alternate screen. The mouse is on: 
 
 From top to bottom:
 
-- **Transcript.** Your messages (in a box), the model's replies, tool calls and their output. Finished turns fold to one line by default (`Alt+O` toggles, `ui.turnCollapse`). `Ctrl+O` shows every tool's output in full or short again. `Ctrl+T` shows or folds thinking (`ui.thinking`: `collapsed`, `full` or `hidden`).
+- **Transcript.** Your messages (in a box), the model's replies, tool calls and their output. Finished turns fold their steps (tool calls, notes) to one line by default; the prompt and final reply stay (`Alt+O` toggles, `ui.turnCollapse`). `Ctrl+O` shows every tool's output in full or short again. `Ctrl+T` shows or folds thinking (`ui.thinking`: `collapsed`, `full` or `hidden`).
 - **Editor.** The input box. It grows up to 10 rows.
 - **Status line.** One row under the editor with the activity (`ready`, a spinner, or what novacode waits for) on the left and details on the right. See [Status line](#status-line).
 - **Side panel.** An optional column on the right. See [Side panel](#side-panel).
@@ -175,7 +175,7 @@ In a window opened with `novacode attach`, `/resume`, `/new`, `/tree`, `/rewind`
 |---|---|
 | `/plan` | Plan mode on or off: read-only until you approve a plan. `/plan <task>` turns it on and sends the task. |
 | `/mode <name>` | Switch to a mode preset. `/mode off` leaves it. `/mode` alone lists them. |
-| `/goal <objective>` | Work until the objective is done. `/goal` shows the current goal. Also `/goal pause`, `resume`, `clear` and `audit on` / `audit off`. See [subagents](subagents.md#goals). |
+| `/goal <objective>` | Work until the objective is done. `/goal` shows the current goal. Also `/goal pause`, `resume`, `clear`, `edit` (puts the goal text in the input to change and send back) and `audit on` / `audit off`. See [subagents](subagents.md#goals). |
 
 An active mode shows in the status line (`⏸ <name> mode`).
 
@@ -231,7 +231,7 @@ Press `Alt+/` or type `/keys` to see the live table, including your changes. Typ
 | `tui.altScreen.pageUp` | `PageUp` | Scroll up a page. |
 | `tui.altScreen.pageDown` | `PageDown` | Scroll down a page. |
 | `tui.altScreen.top` | `Ctrl+Home` | Scroll to the top. |
-| `tui.altScreen.bottom` | `Ctrl+End` | Scroll to the bottom. |
+| `tui.altScreen.bottom` | `Ctrl+End`, `Shift+PageDown` | Scroll to the bottom. |
 | `tui.altScreen.previousPrompt` | `Ctrl+Up`, `Ctrl+Shift+Up` | Jump to the previous prompt. |
 | `tui.altScreen.nextPrompt` | `Ctrl+Down`, `Ctrl+Shift+Down` | Jump to the next prompt. |
 | `tui.altScreen.search` | `Ctrl+F`, `Ctrl+Shift+F` | Search the transcript. `Enter` older, `Shift+Enter` newer, `Esc` closes. |

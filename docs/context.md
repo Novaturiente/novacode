@@ -43,7 +43,7 @@ In each folder it loads **one** file, the first that exists:
 2. `AGENTS.md`
 3. `CLAUDE.md`
 
-(`AGENTS.MD` and `CLAUDE.MD` are also accepted.) Files that are empty are skipped. The same real file is never loaded twice, even if it is reachable through a symlink or a worktree. Folders closer to your working directory come later in the prompt, so they are read last.
+(`AGENTS.MD` and `CLAUDE.MD` are also accepted.) An empty file still counts as that folder's file: it loads nothing, and the next name is not tried. So an empty `AGENTS.override.md` hides the `AGENTS.md` next to it. The same real file is never loaded twice, even if it is reachable through a symlink or a worktree. Folders closer to your working directory come later in the prompt, so they are read last.
 
 Each file is wrapped like this in the prompt, so the model knows where it came from:
 
@@ -71,8 +71,8 @@ Providers can reuse the start of a request instead of reading it again, which is
 
 | Setting | Default | Effect |
 |---|---|---|
-| `cacheRetention` | `short` | Set to `long` to ask for a longer cache lifetime: 1 hour on Anthropic, 24 hours on OpenAI. Any other value means `short`. |
-| `cache.warm` | `false` | Keep the cache alive between messages by sending 1-token replays, only while that is expected to save more than it costs. |
+| `cacheRetention` | `short` | Set to `long` to ask Anthropic (Claude) models for a 1-hour cache instead of 5 minutes. Other providers ignore it. Any other value means `short`. |
+| `cache.warm` | `false` | Keep the cache alive between messages by sending 1-token replays, only while that is expected to save more than it costs. Anthropic (Claude) models only, and not while a thinking budget is on. |
 
 ```json
 {
@@ -83,7 +83,7 @@ Providers can reuse the start of a request instead of reading it again, which is
 
 Put this in `~/.novacode/settings.json` (or the project's `.novacode/settings.json`). The full list of settings is in [config](config.md).
 
-When a reply reads much less from the cache than expected, novacode shows a `cache miss` notice with the likely cause: the model changed, the tool list changed, an earlier message changed, the cache expired, or the provider dropped it. A miss right after compaction is expected and is labelled that way.
+When a reply reads much less from the cache than expected, novacode shows a `cache miss` notice with the likely cause: the model changed, the thinking level changed, the tool list changed, an earlier message changed, the cache expired, or the provider dropped it. A miss right after compaction is expected and is labelled that way. Each miss is also logged to `~/.novacode/logs/cache-misses.jsonl`.
 
 ## Memory
 

@@ -8,7 +8,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "compat.claude",
         "bool",
         "true",
-        "Also load skills, agents and commands from `~/.claude` and a trusted project's `.claude`. novacode's own folders win a name.",
+        "Also load skills, agents and commands from `~/.claude` and a trusted project's `.claude`. novacode's own folders win a name. `~/.agents/skills` loads either way.",
     ),
     (
         "model",
@@ -62,7 +62,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "permissions",
         "object",
         "auto mode",
-        "Global only. `mode` auto|ask|read-only; `allow`/`ask`/`deny` lists of rules like `Bash(git push:*)`; `protected: {commands, paths}`; `profiles.<name>.tools`, named tool sets. See docs/security.md.",
+        "Global only. `mode` auto|ask|read-only; `allow`/`ask`/`deny` lists of rules like `Bash(git push:*)`; `protected: {commands, paths}`; `profiles.<name>.{tools, deny}`, named tool sets. See docs/security.md.",
     ),
     (
         "tools.<name>.exposure",
@@ -122,7 +122,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "memory.model",
         "string",
         "the profile's small model",
-        "Model for the observer, reflector and dropper.",
+        "Model for the observer, reflector and dropper. Without a small model (or one that can't connect), the session's model.",
     ),
     (
         "memory.observeAfterTokens",
@@ -206,7 +206,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
     (
         "agents.<name>.mcp",
         "list",
-        "[]",
+        "the agent file's",
         "MCP servers subagent type `<name>` gets by default (subagents start none otherwise).",
     ),
     (
@@ -273,7 +273,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "ui.theme",
         "string",
         "`auto`",
-        "auto, dark (catppuccin-mocha), light (catppuccin-latte) or a file in `~/.novacode/themes`.",
+        "auto, dark (catppuccin-mocha), light (catppuccin-latte) or a file in `~/.novacode/themes` or an installed package's `themes` folder.",
     ),
     (
         "ui.turnCollapse",

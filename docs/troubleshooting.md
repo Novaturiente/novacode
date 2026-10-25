@@ -6,11 +6,11 @@ This page lists the tools novacode gives you to find out what went wrong, where 
 
 | Tool | What it tells you |
 |---|---|
-| `novacode doctor` | Checks every connected provider (one model-list call each), your settings files, your key bindings, and skills, prompts, agents and packages that were skipped or disabled. Exits with a failure code if a provider, setting or key has a problem. |
-| `novacode auth status` | Each login and key, where it comes from, and whether its token is valid |
+| `novacode doctor` | Checks every connected provider (one model-list call each), your settings files, your key bindings, and skills, prompts, agents and packages that were skipped or disabled. Exits with a failure code if a provider, setting or key has a problem, or if no provider is connected. |
+| `novacode auth status` | Each login and key, where it comes from, and when its stored token expires (read from disk, no network check) |
 | `/debug` (in a session) | Session id and file, route, context and cache numbers, queued prompts, processes, MCP server status, the log folder and how many crash logs exist |
 | `novacode mcp list` | Connects to every MCP server and shows `ready` or `failed: <reason>` |
-| `novacode status` | State of a live session |
+| `novacode status` | State of a live session (`--json` for the full record, `--format '{ctx}% {5h}'` for a tmux status line) |
 
 ```sh
 novacode doctor
@@ -86,7 +86,7 @@ In print mode (`-p`) novacode exits `0` on success, `1` on an error, `2` on a ba
 
 ### "Account is exhausted" or rate limit errors
 
-If you have a subscription and it hits its limit, the message says when it resets, for example `claude account `default`: … (resets in 3h 20m). Add another account with `novacode login claude --account <name>`, or switch model with /model.`
+If you have a subscription and it hits its limit, the message says when it resets if the provider told novacode (otherwise it says `quota used up`), for example `claude account `default`: … (resets in 3h 20m). Add another account with `novacode login claude --account <name>`, or switch model with /model.`
 
 You have these options:
 
@@ -140,7 +140,7 @@ See [mcp](mcp.md).
 
 ### Project config isn't loading
 
-Project settings, extensions, hooks, skills, packages and `.mcp.json` load only in folders you trust. In a folder you haven't trusted, novacode prints:
+Project settings, extensions, hooks, skills, packages and `.mcp.json` load only in folders you trust. The first time you start novacode interactively in an untrusted folder that has project config, it asks whether to trust it. If you already answered, or in a non-interactive run, it prints:
 
 ```text
 note: this folder's project config is ignored (not trusted). Run `novacode trust` or pass --trust.
@@ -192,9 +192,9 @@ novacode couldn't write the session file (disk full, permissions, a read-only mo
 
 ### Something looks stuck
 
-Press Esc to abort the turn. Open another terminal and run `novacode agents` to see live sessions (ids and prefixes work) and `novacode status` to see what the session is doing (it exits 1 with "no live session" if there is none for this terminal; try `--all`). `novacode stop <id>` ends one. `/debug` shows running processes and queued prompts.
+Press Esc to abort the turn. Open another terminal and run `novacode agents` to see live sessions (ids and prefixes work) and `novacode status` to see what the session is doing (without a session id it picks this tmux pane's session, else the newest in this folder, else the newest live one anywhere; it exits 1 with "no live session" only when none is running; `--all` lists every one). `novacode stop <id>` ends one. `/debug` shows running processes and queued prompts.
 
-A provider that sends nothing for 120 s fails as a network error and is retried ([providers](providers.md#errors-and-retries)), so a silent server can't hang a turn forever. A subagent with no activity for `agents.stallMinutes` (default 10) is stopped ([subagents](subagents.md#limits-and-safety)).
+A provider that sends nothing for 120 s (no response headers, or a reply that stalls mid-stream) fails with a transient error and is retried ([providers](providers.md#errors-and-retries)), so a silent server can't hang a turn forever. A subagent with no activity for `agents.stallMinutes` (default 10) is stopped ([subagents](subagents.md#limits-and-safety)).
 
 ## Report a bug
 
@@ -206,7 +206,7 @@ Open an issue at <https://github.com/Novaturiente/novacode/issues>.
    novacode debug bundle
    ```
 
-   It writes `novacode-debug-<time>.tar.gz` in the current folder and prints the path. It holds `info.txt` (version, OS, terminal, the names of your logins), your settings (global and project), key bindings and `mcp.json`, the recent logs, crash logs, cache-miss and MCP/extension logs, and the newest session in this folder with its metrics file, if any. Known keys and tokens are masked, and anything shaped like a credential is masked too. Still, look inside before you share it. The session contains your conversation.
+   It writes `novacode-debug-<time>.tar.gz` in the current folder and prints the path. It needs `tar` on your `PATH`. It holds `info.txt` (version, OS, terminal, the names of your logins), your settings (global and project), key bindings and `mcp.json`, the recent logs, crash logs, cache-miss and MCP/extension logs, and the newest session in this folder with its metrics file, if any. Known keys and tokens are masked, and anything shaped like a credential is masked too. Still, look inside before you share it. The session contains your conversation.
 
    | Flag | What it does |
    |---|---|

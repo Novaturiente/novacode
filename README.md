@@ -23,7 +23,7 @@ cd your-project
 novacode
 ```
 
-The first start asks you to log in, pick a model, and decide whether to trust this folder's project config. Then type what you want done.
+The first start asks whether to trust this folder's project config (if it has any), then asks you to log in and pick a model. Then type what you want done.
 
 ```sh
 novacode "fix the failing test"        # start with a prompt
@@ -39,8 +39,8 @@ The full walk-through and a list of every flag and subcommand are in [docs/quick
 | Area | What you get |
 |---|---|
 | **Models** | Subscription logins and API keys, several accounts per provider that rotate when one runs out, custom OpenAI-compatible endpoints and local models, custom providers as a program you write. |
-| **Tools** | Read, write, edit, patch, bash, grep, find, a background process manager, web search and fetch, todos, questions to you, and a JavaScript tool (codemode) that chains many tool calls in one step. |
-| **Safety** | Permission modes (auto, ask, read-only), a command risk check that asks before force pushes and refuses destructive commands, allow/ask/deny rules, project trust, optional secret masking. |
+| **Tools** | Read, write, edit (a patch tool for some models), bash, grep, find, a background process manager, web search and fetch, todos, questions to you, and a JavaScript tool (codemode) that chains many tool calls in one step. |
+| **Safety** | Permission modes (auto, ask, read-only), a command risk check that asks before force pushes and refuses catastrophic commands, allow/ask/deny rules, project trust, optional secret masking. |
 | **Sessions** | Every session is a tree: resume, branch, fork, rewind the conversation and your files, export to JSONL or HTML. Sessions can run in the background and be attached from another terminal. |
 | **Context** | `AGENTS.md`/`CLAUDE.md` files, Agent Skills, prompt templates, notes-based compaction, and memory that carries across sessions. |
 | **Subagents** | Background helper sessions (scout, worker, reviewer, or your own) that see only the tools they're given, plus plan mode and `/goal` (keep working until an auditor agrees it's done). |
@@ -84,7 +84,7 @@ Set `NOVACODE_HOME` to use a different folder than `~/.novacode`. The full list 
 
 ## Reporting a bug
 
-Run `novacode debug bundle`. It writes a `novacode-debug-<time>.tar.gz` with logs, settings and the newest session from this folder, with secrets masked. Attach it to an issue at <https://github.com/Novaturiente/novacode/issues>. See [Troubleshooting](docs/troubleshooting.md) for more.
+Run `novacode debug bundle`. It writes `novacode-debug-<ms>.tar.gz` in the current folder with logs, settings and the newest session from this folder, with secrets masked. Attach it to an issue at <https://github.com/Novaturiente/novacode/issues>. See [Troubleshooting](docs/troubleshooting.md) for more.
 
 ## Developing
 

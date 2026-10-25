@@ -33,8 +33,8 @@ novacode reads these fields, with the meaning Claude Code gives them. `license`,
 | `description` | yes | What the skill does and when to use it. A `SKILL.md` without one is skipped, and novacode warns about it. A loose `.md` file without one is skipped silently. Long descriptions are cut to 1024 characters. |
 | `when_to_use` | no | Added after the description in the skill list. |
 | `name` | no | The skill's name. Defaults to the folder name (or the file name for a loose `.md`). If it differs from the folder name, the system prompt shows the file's path next to it. |
-| `disable-model-invocation` | no | `true` hides the skill from the model. Only you can use it, with `/skill:name`. |
-| `user-invocable` | no | `false` makes it the model's only: no `/skill:` completion, and typing it does nothing. |
+| `disable-model-invocation` | no | `true` hides the skill from the model. Only you can use it, with `/skill:name`; the `skill` tool refuses it. |
+| `user-invocable` | no | `false` makes it the model's only: no `/skill:` completion, and typing `/skill:name` sends that text to the model as typed. |
 | `allowed-tools` | no | Tools that run without asking for the rest of the turn the skill is activated in (until your next message), e.g. `Bash(git commit *) Read`. They never get past `deny` rules, the risk gate or read-only mode. |
 | `disallowed-tools` | no | Tools refused for the rest of that turn. |
 | `context`, `agent` | no | `context: fork` runs the skill as a subagent of type `agent` (default `worker`) with the skill's text as its task. |
@@ -42,9 +42,9 @@ novacode reads these fields, with the meaning Claude Code gives them. `license`,
 
 `allowed-tools`, `disallowed-tools` and `context: fork` apply when the model activates the skill with the `skill` tool. A skill whose file the model just reads gets its text only, and its hooks don't join. Hooks of an activated skill don't survive `/reload` or a resumed session; activate it again.
 
-Not supported (listed by `novacode doctor`): `model`, `effort`, `paths`, `shell`, `background`, and `!` command lines in the text (they would run shell commands from the skill before the model sees it). `${CLAUDE_SKILL_DIR}` in the text is replaced with the skill's folder.
+Not supported (listed by `novacode doctor`): `model`, `effort`, `paths`, `shell`, `background`. `!` command lines in the text are not run; they reach the model as plain text. `${CLAUDE_SKILL_DIR}` in the text is replaced with the skill's folder.
 
-The frontmatter is YAML: lists, nested maps and `yes`/`no` booleans work. It must start on the very first line of the file, between two `---` lines. Frontmatter that isn't valid YAML (often an unquoted `: ` inside a description) is read as plain `key: value` lines instead, and `novacode doctor` says so. In the text, `$ARGUMENTS` (and `$1`, `$2`…) take what you type after `/skill:name`.
+The frontmatter is YAML: lists, nested maps and `yes`/`no` booleans work. It must start on the very first line of the file, between two `---` lines. Frontmatter that isn't valid YAML (often an unquoted `: ` inside a description) is read as plain `key: value` lines instead, and `novacode doctor` says so. If the text has `$ARGUMENTS`, what you type after `/skill:name` goes there (and `$1`, `$2`… are filled too), and nowhere else. Without `$ARGUMENTS`, `$1` stays as it is and your text is added after the skill.
 
 ### Where skills are found
 
@@ -104,7 +104,7 @@ If two different files have the same name, the later one is ignored. To see what
 novacode doctor
 ```
 
-The skills, prompts, agents section lists lines like `skill release-notes: /path/b/SKILL.md is shadowed by /path/a/SKILL.md`, and any package that did not load.
+The skills, prompts, agents section lists lines like ``skill `release-notes`: /path/b/SKILL.md is shadowed by /path/a/SKILL.md``, skills whose frontmatter isn't valid YAML or has unsupported fields, and any package that did not load.
 
 ## Prompt templates
 
@@ -137,7 +137,7 @@ The first folder with a given name wins.
 
 Only `.md` files directly in these folders count. Subfolders are not searched, so there are no namespaced commands like `/team:review`. The command name is the file name without `.md`.
 
-The description shown in the editor's completion list is the `description` frontmatter field. Without one, it is the first line of the file, cut to 60 characters.
+The description shown in the editor's completion list is the `description` frontmatter field. Without one, it is the first non-blank line after the frontmatter, cut to 60 characters (plus `...`).
 
 ### Arguments
 

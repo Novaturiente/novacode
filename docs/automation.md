@@ -18,7 +18,7 @@ git diff | novacode -p "review this diff"
 cat error.log | novacode -p "what went wrong?"
 ```
 
-Only the answer goes to stdout, so you can pipe it. Notices and retries go to stderr. Add `-v` to also print each tool call, the token and cache usage and the session file path to stderr.
+Only the answer goes to stdout, so you can pipe it. novacode exits only after subagents the run started have reported back. Notices and retries go to stderr. Add `-v` to also print each tool call, the token and cache usage and the session file path to stderr.
 
 An empty prompt with nothing piped fails with `-p needs a prompt`. Print mode needs a model: pass `-m provider/model` or set `model` in settings. Without one it stops with `no model: pass -m provider/model or set "model" in settings`. `--bg` and `--rpc` do the same. Only interactive runs pick one for you.
 
@@ -43,7 +43,7 @@ fi
 
 ### Nobody to approve
 
-In print mode there is no one to answer a permission question. Anything that would ask is refused, and the model is told to use an allow rule or run interactively. Questions to the user (`ask_user`) get no answer either. Plan for it:
+In print mode there is no one to answer a permission question. Anything that would ask is refused, and the model is told `The user declined this call: nobody can approve in print mode`. Questions to the user (`ask_user`) get no answer either. Plan for it:
 
 - Add allow rules for the commands you want in your global settings (see [security](security.md)). Permission rules are read from your global settings only.
 - Or limit what the run can do: `--mode read-only` for a review that must not change files, or `--profile scout` for read-only search tools.
@@ -162,8 +162,8 @@ Send one JSON object per line. Add an `id` (any string) to a command to get a `r
 | `approval` | `approval`, `answer` | Answer a permission question |
 | `answer` | `ask`, `replies` | Answer questions from the model |
 | `ext_key` | `ext`, `key`, `tab?`, `node?`, `width?`, `height?` | Send a key or panel action to a script [extension](extensions.md). No data comes back. |
-| `register_tools` | `tools` | Tools your client runs (see below) |
-| `tool_result` | `call`, `content`, `is_error` | The result of a `tool_call` |
+| `register_tools` | `tools` | Tools your client runs (see below). Response data: `{"registered": n}` |
+| `tool_result` | `call`, `content`, `is_error` | The result of a `tool_call`. A call that isn't waiting gets the error `no tool call <n> is waiting` |
 | `shutdown` | | End the session |
 
 A line that isn't a valid command gets `{"type":"response","command":"parse","ok":false,"error":"bad command: …"}`.
@@ -191,7 +191,7 @@ These need the session's own window and answer with an error such as `/resume wo
 | `file?` | Session file (absent with `--no-session`) |
 | `branch?`, `project?` | Git branch and repo name |
 | `started_ms`, `task_started_ms?` | Unix milliseconds: session start, running task start |
-| `processes` | Commands running in the process manager |
+| `processes?` | Commands running in the process manager |
 | `mcp?` | `[ready, configured]` MCP servers |
 
 Fields marked `?` are left out when they have no value.
@@ -267,13 +267,13 @@ The id is printed to stdout; the other lines go to stderr. The session runs in i
 | Command | What it does |
 |---|---|
 | `novacode agents` | List live sessions: id, state (`working`, `blocked` when it waits for an answer, or `idle`), whether it's `bg`, model and folder |
-| `novacode attach ID` | Open a window on a live session. Leaving only detaches; the session keeps running. An id prefix is enough. |
-| `novacode status` | Status of this tmux pane's session, else this folder's newest one |
+| `novacode attach ID` | Open a window on a live session. Leaving only detaches; the session keeps running. An id prefix is enough. Needs a terminal. |
+| `novacode status` | Status of this tmux pane's session, else this folder's newest one, else the newest live session anywhere |
 | `novacode status --session ID` | One live session, by id prefix |
 | `novacode status --all` | Every live session |
 | `novacode status --json` | The full record as JSON lines |
 | `novacode status --format TEMPLATE` | A template, e.g. `'{state} {ctx}% {5h}'` |
-| `novacode stop ID` | End a live session, a background one included |
+| `novacode stop ID` | End a live session, a background one included. It sends the stop request and returns without waiting. An unknown id exits `1`. |
 
 `status` fields are: `session state detail model level ctx ctx_tokens window hit read write miss cost 5h week branch project cwd bg`. It exits with `1` when there is no live session, which makes it easy to use in scripts and in a tmux status line (`#(novacode status --format '{state}')`).
 
@@ -301,7 +301,7 @@ The command gets the full state as JSON on stdin, and these environment variable
 | `NOVACODE_CWD` | Working folder |
 | `NOVACODE_MODEL` | `provider/model` |
 
-The command is killed after 10 seconds. Its output is discarded.
+After 10 seconds novacode kills the shell; processes the command started may keep running. Its output is discarded.
 
 ### tmux agent state
 
@@ -342,8 +342,8 @@ The `hooks` setting runs shell commands around tool calls and on session events.
 
 | Hook | When | What your command can do |
 |---|---|---|
-| `beforeTool` | Before each tool call. Stdin: `{event, tool, args, session, cwd}` | Exit `2` to block the call; stderr is the reason the model sees. Print `{"args": {…}}` on stdout (exit `0`) to change the arguments. Any other exit code, or a timeout, lets the call through. |
-| `afterTool` | After each tool call. Stdin adds `is_error`, `output`, `call_id`, `duration_ms`, `touched` | Whatever it prints on stdout is added to the tool result the model sees. |
+| `beforeTool` | Before each tool call. Stdin: `{event, tool, args, session, cwd}` | Exit `2` to block the call; the model sees `Blocked by a hook: <stderr>`. Print `{"args": {…}}` on stdout (exit `0`) to change the arguments. Any other exit code, or a timeout, lets the call through. |
+| `afterTool` | After each tool call. Stdin adds `is_error`, `output`, `call_id`, `duration_ms`, `touched` | Whatever it prints on stdout is added to the tool result the model sees, as `[hook] <text>`, trimmed to 8000 characters. The `output` it receives is cut to 16000 characters. |
 | `events.<type>` | On each session event, such as `agent_end`, `turn_start`, `tool_end`, `compacted`, plus `session_start` and `session_end`. Stdin: the event JSON (events have a `type` field; `session_start` and `session_end` are `{event, session, cwd}`). `NOVACODE_TOOL` is not set | Observe only. Streaming text and live tool output (`stream`, `tool_update`) don't trigger hooks. |
 
 Each of these takes one command or a list. `timeoutMs` (default `5000`) is the limit for `beforeTool`; `afterTool` gets twice that. Event hooks run in the background (up to 30 seconds each), and `session_end` is waited for up to 5 seconds. A novacode started inside a hook runs no command hooks or plugin hooks of its own (`NOVACODE_HOOKS_DISABLED` is set). It still loads extensions and runs `hooks.onActivity`.

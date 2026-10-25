@@ -13,22 +13,9 @@ novacode
 
 novacode needs a terminal (stdin and stdout must both be one), or it stops with "interactive mode needs a terminal". For pipes and scripts use `-p` (see below).
 
-### 1. Connect
+### 1. Trust prompt
 
-If you have no default model yet, a picker asks how novacode should reach a model:
-
-- **Subscriptions** (Claude, Codex, Antigravity, Copilot) are always listed. Pick one that you are not logged in to yet and novacode starts the login, then lists its models. novacode prints a sign-in URL and tries to open it with `xdg-open`. On macOS or a machine with no browser, open the printed URL yourself. Details are in [providers](providers.md).
-- **API-key providers** show up in the list only when their key is already set: in your environment (for example `OPENROUTER_API_KEY`) or saved with `novacode login <provider>`. `novacode models --all` lists every provider and its env var. Local servers (Ollama, LM Studio) don't appear here; pass `-m ollama/<model>`.
-
-Press Esc to cancel. novacode then exits with "setup cancelled"; run it again. To skip the picker, pass a model: `novacode -m provider/model`, or `provider/model:thinking` such as `-m codex/gpt-5.5:high`.
-
-### 2. Pick a model
-
-novacode asks the provider for its model list. Pick one. It is saved to `~/.novacode/settings.json` as `"model"`, so you won't be asked again. Change it any time with `/model`.
-
-### 3. Trust prompt
-
-If the folder has project config (`.novacode/settings.json`, `.novacode/extensions`, `.novacode/skills`, `.novacode/agents`, `.mcp.json`, or `.claude/skills`, `.claude/agents`, `.claude/commands`), novacode asks whether to trust it. Project config can change settings and run code, so it only loads after you say yes.
+If the folder has project config (`.novacode/settings.json`, `.novacode/extensions`, `.novacode/skills`, `.novacode/agents`, `.mcp.json`, or `.claude/skills`, `.claude/agents`, `.claude/commands`), novacode first asks whether to trust it. Project config can change settings and run code, so it only loads after you say yes.
 
 | Choice | Effect |
 |---|---|
@@ -39,6 +26,19 @@ If the folder has project config (`.novacode/settings.json`, `.novacode/extensio
 
 `AGENTS.md` and `CLAUDE.md` load either way. See [security](security.md).
 
+### 2. Connect
+
+If you have no default model yet, a picker asks how novacode should reach a model:
+
+- **Subscriptions** (Claude, Codex, Antigravity, Copilot) are always listed. Pick one that you are not logged in to yet and novacode starts the login, then lists its models. novacode prints a sign-in URL and tries to open it with `xdg-open` (Linux) or `open` (macOS). If no browser opens, open the printed URL yourself. Details are in [providers](providers.md).
+- **API-key providers** show up in the list only when their key is already set: in your environment (for example `OPENROUTER_API_KEY`) or saved with `novacode login <provider>`. `novacode models --all` lists every provider and its env var. Local servers (Ollama, LM Studio) don't appear here; pass `-m ollama/<model>`.
+
+Press Esc to cancel. novacode then exits with "setup cancelled"; run it again. To skip the picker, pass a model: `novacode -m provider/model`, or `provider/model:thinking` such as `-m codex/gpt-5.5:high`.
+
+### 3. Pick a model
+
+novacode asks the provider for its model list. Pick one. It is saved to `~/.novacode/settings.json` as `"model"`, so you won't be asked again. Change it any time with `/model`.
+
 ## Your first prompt
 
 Type a request and press Enter:
@@ -47,7 +47,7 @@ Type a request and press Enter:
 explain what this project does and how to run its tests
 ```
 
-novacode reads files and runs tools on its own. In the default `auto` mode it asks you before commands that touch shared state, like a force push, and refuses destructive ones. See [security](security.md) for the stricter `ask` and `read-only` modes. Add files to a prompt with `@`:
+novacode reads files and runs tools on its own. In the default `auto` mode it asks you before commands that touch shared state, like a force push, and refuses catastrophic ones such as `rm -rf ~`. Other risky commands, like `rm -rf target`, run without asking. See [security](security.md) for the stricter `ask` and `read-only` modes. Add files to a prompt with `@`:
 
 ```text
 @src/main.rs why does this return early?
@@ -72,7 +72,7 @@ Start a line with `!` to run a shell command yourself. It runs, shows its output
 | Ctrl+L | Pick a model |
 | Shift+Tab | Next thinking level (how much the model reasons before it answers; see [tui](tui.md)) |
 | Ctrl+R | Search prompt history |
-| Ctrl+G | Edit the prompt in `$VISUAL` or `$EDITOR` |
+| Ctrl+G | Edit the prompt in `$VISUAL` or `$EDITOR` (else the first of nvim, nano, emacs, vim, vi) |
 | Alt+/ | Show all key bindings |
 
 Type `/` to see the slash commands. The ones you will use first:
@@ -109,7 +109,7 @@ novacode -p "list the public functions in src/lib.rs"
 git diff | novacode -p "write a commit message for this diff"
 ```
 
-`-p` needs a prompt argument. Piped input is added after the prompt. There is nobody to approve actions in this mode, so requests that would ask you are refused. Add `-m provider/model` to choose a model, and see [automation](automation.md) for `--json` and other options.
+`-p` needs a prompt argument. Piped input is added after the prompt. There is nobody to approve actions in this mode, so requests that would ask you are refused. An untrusted folder's project config is skipped with a note; run `novacode trust` or pass `--trust`. Add `-m provider/model` to choose a model, and see [automation](automation.md) for `--json` and other options.
 
 ## Check your setup
 
@@ -128,7 +128,7 @@ Both exit with `1` when nothing is connected (`doctor` also when it finds a prob
 |---|---|
 | `PROMPT` | Start the interactive session with this prompt |
 | `-p`, `--print PROMPT` | Print mode: answer on stdout, then exit |
-| `--json` | With `-p`: write JSON event lines instead of the answer |
+| `--json` | With `-p`: write JSON lines instead of the answer: one `hello` line, then one event per line |
 | `--rpc` | Speak the JSON protocol on stdin/stdout (not with `-p`) |
 | `--bg [PROMPT]` | Run in the background and print the session id |
 | `-m`, `--model provider/model[:thinking]` | Model for this run |
@@ -140,15 +140,15 @@ Both exit with `1` when nothing is connected (`doctor` also when it finds a prob
 | `--profile NAME` | Limit tools to a named profile, e.g. `scout` |
 | `--trust` | Trust this folder's project config for this run |
 | `--no-context-files` | Don't load `AGENTS.md` / `CLAUDE.md` |
-| `--api-key KEY` | API key for this run only |
-| `-v`, `--verbose` | Tool calls and token usage on stderr |
+| `--api-key KEY` | API key for this run only. Needs a model (`-m` or the `model` setting) |
+| `-v`, `--verbose` | With `-p`: tool calls and token usage on stderr |
 | `--trace` | Record the raw request and stream to a log file |
 | `--profile-startup` | Print startup timings and exit |
 | `-V`, `--version`, `-h`, `--help` | Version and help |
 
 | Command | Does |
 |---|---|
-| `login [PROVIDER] [--account NAME] [--method browser\|code\|device]` | Log in to a subscription, or save an API key (no provider: pick from a list) |
+| `login [PROVIDER] [--account NAME] [--method browser\|code\|device]` | Log in to a subscription, or save an API key (no provider: pick from a list). `--account` is for subscriptions only |
 | `logout PROVIDER [--account NAME]` | Remove a login |
 | `models [FILTER] [--all] [--refresh]` | List models; `--refresh` updates the catalog |
 | `auth status` | Show logins and keys |
@@ -159,7 +159,7 @@ Both exit with `1` when nothing is connected (`doctor` also when it finds a prob
 | `panel --session ID` | The side panel of a live session, full screen |
 | `status [--session ID] [--all] [--json] [--format T]` | State of a live session |
 | `stop ID` | End a live session |
-| `debug bundle` | Pack logs, settings and a session for a bug report |
+| `debug bundle [--session ID \| --no-session] [-o FILE]` | Pack logs, settings and a session for a bug report |
 | `stats [SESSION] [--all] [--turns]` | Timing report (needs `debug.metrics`) |
 | `install SOURCE [--name N] [--ref REF]` | Install a package from a git URL or folder |
 | `uninstall NAME` | Remove a package |

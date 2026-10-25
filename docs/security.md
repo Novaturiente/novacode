@@ -54,13 +54,15 @@ Every `bash` command is split into simple commands (including ones inside `$(...
 |---|---|---|
 | Safe | Reads only. Allowed in read-only mode. | `ls`, `git status` |
 | Low | Changes something ordinary. | writing a file, running a program |
-| Confirm | Destroys data or history in bulk. | `rm -rf target`, `git reset --hard`, `git clean -fd`, `git branch -D`, `find -delete`, `curl ... \| sh`, `sudo ...`, `dd`, `chmod -R` |
+| Confirm | Destroys data or history in bulk. | `rm -rf target`, `git reset --hard`, `git clean -fd`, `git branch -D`, `find -delete`, `curl ... \| sh`, `sudo ...`, `dd of=<file>`, `chmod -R` |
 | Shared | Rewrites or deletes history on a remote, which no local undo can fix. | `git push --force` (and `--force-with-lease`, `--force-if-includes`, `-uf`), `git push origin +main`, `git push --delete`, `git push --mirror`, `git push --prune` |
-| Catastrophic | Targets the system, your home folder or credentials. **Never runs.** | `rm -rf /`, `rm -rf ~`, writing to `/dev/sda`, `mkfs` on a device, `kill -1` (as the last argument), `pkill -f` with a pattern that matches its own command line, fork bombs, anything that deletes or overwrites `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.config/gcloud`, `~/.password-store` or `~/.novacode` |
+| Catastrophic | Targets the system, your home folder or credentials. **Never runs.** | `rm -rf /`, `rm -rf ~`, writing to `/dev/sda`, `mkfs` on a device, `kill -1` (as the last argument), `pkill -f` with a pattern that matches its own command line, fork bombs, a redirect (`>`), `rm`, `cp`, `mv`, `ln`, `install`, `rsync`, `dd of=`, `chmod`/`chown`, `truncate` or `shred` aimed at `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.config/gcloud`, `~/.password-store` or `~/.novacode` |
+
+Only the commands named in that row are checked against these folders. Other commands that write files are not: `tee -a ~/.ssh/authorized_keys`, `sed -i ... ~/.ssh/config`, `awk` printing to a file there, or an interpreter such as `python -c`, `node -e` or `perl -e` writing there are all Low and run in `auto` mode.
 
 System folders count too: `/`, `/bin`, `/boot`, `/dev`, `/etc`, `/home`, `/lib`, `/lib64`, `/opt`, `/proc`, `/root`, `/sbin`, `/srv`, `/sys`, `/usr`, `/var`, and your home folder itself.
 
-More commands that count as Confirm: `git checkout -- .` and `git checkout -f`, `git restore` (unless only `--staged`), `git stash drop` and `clear`, `git reflog expire` and `delete`, `git filter-branch`, `git worktree remove -f`, `truncate`, `shred`, `wipefs`, `mkfs` and `fdisk` (when the target is not a device or protected), `shutdown`, `reboot`, `poweroff`, `halt`, `systemctl poweroff`/`reboot`/`halt`/`suspend`, `crontab -r`, `docker`/`podman` prune or `volume rm`, and `find -exec rm`. A command it cannot parse, or one nested more than 4 levels deep, is Confirm too. `git push origin :branch` is Shared, like `--delete`.
+More commands that count as Confirm: `git checkout -- .` and `git checkout -f`, `git restore` (unless only `--staged`), `git stash drop` and `clear`, `git reflog expire` and `delete`, `git filter-branch`, `git worktree remove -f`, `truncate`, `shred`, `wipefs`, `mkfs`, `fdisk`, `sfdisk`, `parted`, `gdisk`, `mkswap` and `blkdiscard` (when the target is not a device or protected), `shutdown`, `reboot`, `poweroff`, `halt`, `systemctl poweroff`/`reboot`/`halt`/`suspend`, `crontab -r`, `docker`/`podman` prune or `volume rm`, and `find -exec rm`. `truncate`, `shred`, `wipefs`, `mkfs`, `fdisk`, `sfdisk`, `parted`, `gdisk`, `mkswap`, `blkdiscard`, `chmod`, `rmdir` or `dd of=` aimed at a device such as `/dev/sda` is Catastrophic. A bare `dd` without `of=` is Low. A command it cannot parse, or one nested more than 4 levels deep, is Confirm too. `git push origin :branch` is Shared, like `--delete`.
 
 How the gate reads a command:
 
@@ -90,7 +92,7 @@ You can add folders to the protected set and ban commands outright:
 
 A protected command never runs. It matches the command name (so `/usr/bin/sudo` too) and any other word of the command (so `env sudo ls`). Protected paths are treated like credentials: destroying or overwriting them is Catastrophic.
 
-The file tools follow the same list. `write`, `edit` and `apply_patch` are refused, in every mode and past any `allow` rule, when the file is in a credential folder, a protected path, or is your home or a system folder itself. `~/.novacode` is the exception: there the file tools refuse only your logins and trust decisions (`auth.json`, `auth-*.json`, `mcp-auth.json`, `trust.json`), so the agent can still edit `~/.novacode/AGENTS.md` and skills. A change to `settings.json` (in `~/.novacode` or a project's `.novacode`) always asks you first, past any `allow` rule, because it holds the permission rules; with nobody to ask it is refused. Shell commands still treat the whole `~/.novacode` folder as credentials. The path is checked as given and with symlinks resolved, so a project link into `~/.ssh` is refused too. Reads are not affected. Path rules such as `Read(...)` also match the resolved path. A `deny` or `ask` rule matches when either path does. An `allow` rule needs both: a link inside an allowed folder that points outside it is not auto-allowed, and the approval card says where the link resolves to.
+The file tools follow the same list. `write`, `edit` and `apply_patch` are refused, in every mode and past any `allow` rule, when the file is in a credential folder, a protected path, or is your home or a system folder itself. `~/.novacode` is the exception: there the file tools refuse only your logins and trust decisions (`auth.json`, `auth-*.json`, `mcp-auth.json`, `trust.json`), so the agent can still edit `~/.novacode/AGENTS.md` and skills. A change to `settings.json` (in `~/.novacode` or a project's `.novacode`) always asks you first, past any `allow` rule, because it holds the permission rules; with nobody to ask it is refused. This ask covers the file tools only. Shell commands treat the whole `~/.novacode` folder as credentials, so a redirect or `cp` onto `~/.novacode/settings.json` is refused, but `sed -i`, `tee` or an interpreter editing it runs with no ask in `auto` mode. A project's `.novacode/settings.json` is not protected from shell commands at all. The path is checked as given and with symlinks resolved, so a project link into `~/.ssh` is refused too. Reads are not affected. Path rules such as `Read(...)` also match the resolved path. A `deny` or `ask` rule matches when either path does. An `allow` rule needs both: a link inside an allowed folder that points outside it is not auto-allowed, and the approval card says where the link resolves to.
 
 When a tool writes a file, it writes through a symlink to its target (the link stays a link), keeps the file's mode, and never creates or deletes a `<file>.bak` next to it: a `.bak` file of your own is left alone.
 
@@ -144,14 +146,16 @@ Bash commands are matched per simple command. Commands are split at `;`, `&&`, `
 
 Order of checks for each call:
 
-1. Profile, or the tool list of a mode preset (tool not available: refused).
+1. Profile, the active skill's `disallowed-tools` for this turn, or the tool list of a mode preset (tool not available: refused).
 2. `deny` rules.
 3. Protected commands, then the risk gate.
-4. Read-only mode (or a read-only mode preset). `allow` rules do not get around it. File changes, `enter_worktree`, `exit_worktree`, `process` input and commands that aren't read-only are refused. A tool whose effect novacode can't tell (an MCP tool without `readOnlyHint`, an extension tool without `readOnly`, a client tool) asks you, or is refused when nobody can answer; once you allow it, an `allow` rule or a session approval lets it run.
-5. `allow` rules (and what you approved this session), then a plugin `PreToolUse` hook's `"allow"`.
-6. `ask` rules.
-7. `ask` mode.
-8. Otherwise allow.
+4. File tools writing into a credential folder, a protected path, or your home or a system folder itself: refused.
+5. Read-only mode (or a read-only mode preset). `allow` rules do not get around it. File changes, `enter_worktree`, `exit_worktree`, `process` input and commands that aren't read-only are refused. A tool whose effect novacode can't tell (an MCP tool without `readOnlyHint`, an extension tool without `readOnly`, a client tool) asks you, or is refused when nobody can answer; once you allow it, an `allow` rule or a session approval lets it run.
+6. A file tool changing a `settings.json` in `~/.novacode` or a project's `.novacode`: asks you, or is refused when nobody can answer.
+7. `allow` rules (and what you approved this session, and the active skill's allowed tools for this turn), then a plugin `PreToolUse` hook's `"allow"`.
+8. `ask` rules.
+9. `ask` mode.
+10. Otherwise allow.
 
 So a Catastrophic command is refused before any `allow` rule is looked at. `ask` rules still ask in `auto` mode.
 
@@ -222,7 +226,7 @@ novacode --trust               # trust this folder for this run only
 ## Secrets
 
 - **Your own logins are always masked.** API keys, OAuth tokens and similar secrets novacode holds are replaced with `[redacted: <source>]` in tool output before the model sees it. Values shorter than 8 characters are skipped.
-- **Pattern masking is opt-in.** With `security.maskSecrets` on, well-known token shapes are masked too, wherever they come from: GitHub, AWS, OpenAI, Anthropic, Slack and Google keys, private key blocks, and values of `*_TOKEN=` / `*_SECRET=`-style assignments.
+- **Pattern masking is opt-in.** With `security.maskSecrets` on, well-known token shapes are masked too, wherever they come from: GitHub, AWS, OpenAI, Anthropic, Slack and Google keys, private key blocks, and the values (8 characters or more) of `NAME=value` or `NAME: value` assignments whose upper-case name contains `SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`, `API_KEY`, `APIKEY`, `PRIVATE_KEY` or `ACCESS_KEY`.
 
 ```json
 {

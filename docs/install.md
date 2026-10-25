@@ -90,7 +90,7 @@ scripts/build-musl.sh            # binary: target/x86_64-unknown-linux-musl/rele
 scripts/build-musl.sh myserver   # also copies it to myserver:~/.local/bin/novacode over ssh
 ```
 
-The script looks for `musl-gcc` on your `PATH`. Set `MUSL_CC` to use another compiler.
+The script looks for `musl-gcc` on your `PATH`, then for `~/.local/musl/bin/musl-gcc`. Set `MUSL_CC` to use another compiler.
 
 ## Update
 
@@ -135,6 +135,7 @@ NOVACODE_HOME=/tmp/nc-test novacode
 | `~/.novacode/auth.json` | Logins and saved API keys (owner-only permissions) |
 | `~/.novacode/sessions/` | One folder per project, with your saved sessions |
 | `~/.novacode/trust.json` | Which project folders you trusted |
+| `~/.novacode/project-packages.json` | Your yes or no, per project folder, to installing the packages it declares |
 | `~/.novacode/mcp.json` | MCP servers |
 | `~/.novacode/keybindings.json` | Your key bindings |
 | `~/.novacode/mcp-auth.json` | OAuth logins for MCP servers |
@@ -149,7 +150,7 @@ NOVACODE_HOME=/tmp/nc-test novacode
 | `~/.novacode/plugin-data/`, `package-options.json` | Data and options of installed packages |
 | `~/.novacode/exhausted.json` | Which subscription accounts are used up, and until when |
 | `~/.novacode/metrics/` | Timing files, when `debug.metrics` is on |
-| `~/.novacode/logs/` | Daily log files (set `NOVACODE_LOG`, for example `NOVACODE_LOG=debug`, to change the level) |
+| `~/.novacode/logs/` | Daily log files (set `NOVACODE_LOG`, for example `NOVACODE_LOG=debug`, to change the level), plus crash, MCP server, extension and trace logs (see [troubleshooting](troubleshooting.md)) |
 | `~/.novacode/cache/` | Caches: model catalog, subscription quota, MCP tool lists, built extensions and learned tool-schema workarounds |
 | `*.bak`, `*.lock` | Next to files novacode writes, such as `auth.json.bak` and `settings.json.lock`: the previous version of the file, and the lock that stops two novacode processes writing it at once |
 | `~/.novacode/run/` | Records of live sessions (used by `agents`, `attach`, `status`) |

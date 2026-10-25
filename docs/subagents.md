@@ -31,7 +31,7 @@ One tool, several actions:
 | `log {id, limit?}` | Its recent activity lines (default 20). |
 | `read {id, offset?, limit?}` | The full report (`limit` default 20000 characters). Long reports reach the model cut at 6000 characters, with a pointer to `read`. |
 | `send {id, message}` | Steer a running agent, or resume a finished one with a new message. |
-| `wait {ids?, any?, timeout?}` | Block until reports arrive. Default: all started agents, 600 s (max 3600). |
+| `wait {ids?, any?, timeout?}` | Block until reports arrive. Default: every agent whose report hasn't been delivered yet, queued ones included, 600 s (max 3600). |
 | `stop {id}` | Stop it. |
 
 There is no separate `resume` action: `send` to a finished agent resumes its session.
@@ -47,7 +47,7 @@ There is no separate `resume` action: `send` to a finished agent resumes its ses
 | `cwd` | Working folder. |
 | `after` | Ids of agents that must finish first. The new agent waits in `queued`. If one of them fails or is stopped, it fails too. |
 | `notify` | `wake` (default): the report starts a turn. `next`: rides along with the next turn. `quiet`: panel only. |
-| `worktree` | `true` runs it in a new git worktree under `.worktrees/` on branch `worktree-<title-slug>-<id>` (for example `worktree-fix-parser-a2`). The name is never reused: if that folder or branch already exists (say from an earlier session), it gets `-2`, `-3` and so on. You merge the branch yourself. |
+| `worktree` | `true` runs it in a new git worktree under `.worktrees/` on branch `worktree-<title-slug>-<id>` (for example `worktree-fix-parser-a2`). The name is never reused: if that folder or branch already exists (say from an earlier session), it gets `-2`, `-3` and so on. You merge the branch yourself. While the subagent would start read-only (plan mode, or `permissionMode: plan`), no worktree is made and the spawn result says so. |
 | `tools` | Tools for it, picked from the parent's own. Default: the type's tools. |
 | `mcp` | MCP servers it may use. Default: none. |
 
@@ -58,7 +58,7 @@ There is no separate `resume` action: `send` to a finished agent resumes its ses
 - **Depth.** Your session can start subagents, and those can start their own. Theirs cannot. Two levels, no more.
 - **How many at once.** At most `agents.maxConcurrent` (default 4) subagents run at the same time; more wait as `queued` and start in spawn order as others end. A subagent's own subagents run one at a time, so a tree has at most 8 running. Resuming a finished subagent with `send` takes a slot too.
 - **Permission mode.** A subagent starts in your session's permission mode. While plan mode (or another read-only preset) is on, it starts read-only, and a preset's tool list limits its tools too.
-- **File claims.** Two agents never edit the same file. A subagent that tries `edit`, `write` or `apply_patch` on a file another live agent holds is refused with a message naming the holder. A claim passes down from parent to child. Claims of dead processes are dropped.
+- **File claims.** A subagent's first `edit`, `write` or `apply_patch` on a file claims it. Any other agent, your main session included, that then tries one of those tools on that file is refused with a message naming the holder. A claim passes down from parent to child. Claims of dead processes are dropped. Your main session never claims files, so a subagent can still edit a file you changed. Changes made through `bash` or `process` are not checked.
 - **Stall and timeout.** A subagent with no activity for `agents.stallMinutes` (default 10) is stopped. Activity is: starting a run, streaming model output, starting a tool, tool progress, a tool ending, a finished model message, and getting the answer to a question or approval it relayed to you. While it runs `agent wait` on its own subagents, it is not checked for stalls. One that runs longer than `agents.timeoutMinutes` (default 45) is stopped, waiting or not.
 - **Open cards.** When a subagent stops while one of its questions or approvals is still open, the card closes in every window (as denied or dismissed).
 - **Questions and approvals.** If a subagent needs to ask you something or needs an approval, it shows up in your session.
@@ -131,7 +131,7 @@ The text after the frontmatter is the agent's role prompt.
 
 Other names pass through unchanged.
 
-novacode sets a few variables for its subagent processes (`NOVACODE_AGENT_DEPTH`, `NOVACODE_AGENT_CHAIN`, `NOVACODE_AGENT_TITLE`, `NOVACODE_BG_CHILD`). They are internal; don't set them.
+novacode sets a few variables for its subagent processes (`NOVACODE_AGENT_DEPTH`, `NOVACODE_AGENT_CHAIN`, `NOVACODE_AGENT_TITLE`), and `NOVACODE_BG_CHILD` for `--bg` background sessions. They are internal; don't set them.
 
 ### Settings
 
@@ -226,7 +226,7 @@ To give the criteria yourself, use `/goal edit`: it puts the goal into the edito
 | Command | Meaning |
 |---|---|
 | `/goal` or `/goal status` | Show the goal, its state and criteria. |
-| `/goal <objective>` | Start a goal. |
+| `/goal <objective>` | Start a goal. It replaces any open goal and its criteria, without asking. |
 | `/goal pause` | Stop the loop (only while the goal is active or blocked). |
 | `/goal resume` | Continue a paused or blocked goal (resets the run counter). |
 | `/goal edit` | Put the goal in the editor to change it; `/goal edit <text>` saves it (see above). |
@@ -238,7 +238,7 @@ The goal stops by itself when:
 - you press Esc (paused);
 - two runs in a row make no tool call (paused as stalled);
 - it reaches `goal.maxRuns` automatic runs (paused);
-- it has used `goal.maxTokens` tokens (paused, after the model summarises what is done and what is left);
+- its own turns have used `goal.maxTokens` tokens (paused, after the model summarises what is done and what is left). The auditor and the judge don't count;
 - a turn fails with an error that needs you, such as a bad key (paused). A temporary error (network, rate limit) is retried up to 3 times, after 15, 30 and 45 s, before it pauses;
 - the model calls `goal` with `block` because it needs you (blocked);
 - the judge decides the goal can never be met as stated (failed; start a new goal).
@@ -256,8 +256,8 @@ When the model says the goal is done, an `auditor` subagent re-checks every crit
 | `goal.audit` | `true` | Check completion with the `auditor` subagent. |
 | `goal.auditModel` | the session's model | Model for the auditor, `provider/model[:level]`. |
 | `goal.maxRuns` | `30` | Automatic runs before it pauses (per start or resume). |
-| `goal.maxTokens` | none | Tokens (prompt and output) the goal may spend before it pauses. |
-| `goal.judge` | the observer's model | After each turn, a model checks the conversation for evidence that the goal is met, not met, or impossible. Met goes to the audit; `off` leaves it to the model's `complete`. |
+| `goal.maxTokens` | none | Tokens (prompt and output) the goal's own turns may spend before it pauses. |
+| `goal.judge` | the observer's model | After each turn, a model checks the conversation for evidence that the goal is met, not met, or impossible. Met goes to the audit; `off` leaves it to the model's `complete`. A classifier model such as `typesafe/jev-latest` also works: met (or impossible) needs probability 0.8. |
 
 The model drives a goal with the `goal` tool: `set` (objective, criteria, optional `ordered` to do the todo steps in order, one per run), `update` (change the objective, criteria or `ordered`), `complete` (with evidence), `block` (with a reason) and `status`.
 
@@ -267,7 +267,7 @@ Goals need a window or an RPC client. They're not available in a subagent at max
 
 **`todo`** is the model's task list. One call can combine these fields: `set` (replace the list), `add`, `start` (number of the item being worked on), `note`, `done` and `drop` (item numbers). The list shows in the side panel and is kept in the session.
 
-**`schedule`** lets the model message itself later, inside the current session: `add` with `message` and `in` (`90s`, `10m`, `2h`, `1h30m`) or `at` (`HH:MM`, local time), optionally `every` to repeat (at least `1m`; `every` alone starts after one interval); `list`; `cancel` with `id`. A due message starts a turn. If the session was closed, due items fire when you resume it. There is no system cron. `schedule` is found through `tool_search`, so it costs nothing until needed.
+**`schedule`** lets the model message itself later, inside the current session: `add` with `message` and `in` (`90s`, `10m`, `2h`, `1h30m`) or `at` (`HH:MM`, local time), optionally `every` to repeat (at least `1m`; `every` alone starts after one interval); `list`; `cancel` with `id`. A due message starts a turn. If the session was closed, due items fire when you resume it. There is no system cron. `schedule` needs a live window or RPC client, so it is not there in `-p` runs. It is found through `tool_search`, so it costs nothing until needed.
 
 ## See also
 

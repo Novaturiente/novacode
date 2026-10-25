@@ -131,9 +131,9 @@ Asks you one or more questions in one form. Params: `questions`, each with `ques
 
 ### web_fetch and web_search
 
-`web_fetch` takes `url` and an optional `format` (`markdown` by default, `text`, or `html`). Downloads stop at 5 MB and time out after 30 seconds.
+`web_fetch` takes `url` and an optional `format` (`markdown` by default, `text`, or `html`). Only `http://` and `https://` URLs work. Downloads stop at 5 MB and time out after 30 seconds. Content that isn't text (a PDF, an image) is refused; download it with `bash` (`curl -o`).
 
-`web_search` takes `query` and optional `urls` to read closely. It tries these engines in order and uses the first that works: an Antigravity login, a Gemini API key (`GEMINI_API_KEY`), Brave (`BRAVE_API_KEY`), then your SearXNG instance (`web.searxngUrl`). With none set up, it says so. Setting `web.native` lets models that have their own web search use it. See [Config](config.md).
+`web_search` takes `query` and optional `urls` to read closely (only the Antigravity and Gemini engines read `urls`; Brave and SearXNG ignore them). It tries these engines in order and uses the first that works: an Antigravity login, a Gemini API key (`GEMINI_API_KEY`), Brave (`BRAVE_API_KEY`), then your SearXNG instance (`web.searxngUrl`). With none set up, it says so. Setting `web.native` lets models that have their own web search use it. See [Config](config.md).
 
 ### enter_worktree and exit_worktree
 
@@ -141,7 +141,7 @@ Asks you one or more questions in one form. Params: `questions`, each with `ques
 
 ### schedule and session_search
 
-`schedule` has `action` `add` (a `message` plus `in` like `90s`, `10m`, `1h30m`, or `at` as local `HH:MM` for the next time it occurs, and optional `every` for a repeat interval), `list` and `cancel` (with `id`). A due message starts a turn, and fires on resume if the session was closed.
+`schedule` has `action` `add` (a `message` plus `in` like `90s`, `10m`, `1h30m`, or `at` as local `HH:MM` for the next time it occurs, and optional `every` for a repeat interval, at least `1m`), `list` and `cancel` (with `id`). A due message starts a turn, and fires on resume if the session was closed. `at` asks GNU `date` for the time, so it needs Linux.
 
 `session_search` finds earlier messages that contain all your words. Params: `query`, `all_projects` (default: this folder only), `limit` (default 20, max 100). The current session is skipped. Hits are grouped by session.
 
@@ -156,7 +156,7 @@ Once a tool is found:
 
 Either way, permissions and hooks apply to the real tool. `tool_search` and `call` only appear when at least one tool is deferred.
 
-By default `web_fetch`, `web_search`, `enter_worktree`, `exit_worktree`, `schedule` and `session_search` are deferred. MCP tools can be deferred too; see [MCP](mcp.md).
+By default `web_fetch`, `web_search`, `enter_worktree`, `exit_worktree`, `schedule` and `session_search` are deferred. MCP tools are `codemode-only` by default: scripts can call them, the model can't until you set their `exposure`; see [MCP](mcp.md).
 
 ## Tool exposure
 
@@ -215,7 +215,7 @@ return heads.join("\n---\n");
 What a script has:
 
 - `await tools.<name>(args)` calls a tool. It returns the tool's text and throws on error.
-- `await mcp.<server>.<tool>(args)` calls an MCP tool (`mcp.server["tool-name"]` for dashed names).
+- `await mcp.<server>.<tool>(args)` calls an MCP tool (`mcp.server["tool-name"]` for dashed names). A tool that returns structured content gives the script an object, not text.
 - `searchTools(query)`, `describeTool(name)` and `describeNamespace(server)` show what exists and the argument types.
 - `store(key, value)` and `load(key)` keep JSON values between scripts in the same session. They are lost when novacode restarts.
 - `models.getAvailableOfType("classifier")` and `models.classify(model, {...})` for classifier models.
@@ -224,7 +224,7 @@ Only `text(v)`, `console.log(...)`, `image(dataUrl)` and the `return` value reac
 
 Set `transaction: true` and file changes (`write`, `edit`) the script made are undone if it throws. `bash` and MCP effects cannot be undone.
 
-Limits per script: 300 seconds, 500 tool calls, 64 MB of memory, 16 MB of output. Each nested call goes through your permission rules and hooks, and its output through the usual caps.
+Limits per script: 300 seconds, 500 tool calls, 64 MB of memory, 16 MB of output. Each nested call goes through your permission rules and hooks. Its output reaches the script whole: no line cut, no spill file, no size check, and `read` returns the file without clipped lines or the continue hint. Only what the script returns or prints is capped when it reaches the model.
 
 ## User shell commands
 
