@@ -71,6 +71,8 @@ More commands that count as Confirm: `git checkout -- .` and `git checkout -f`, 
 How the gate reads a command:
 
 - **Wrappers and their options.** `nohup`, `time`, `nice`, `ionice`, `command`, `exec`, `builtin`, `unbuffer`, `stdbuf`, `timeout`, `xargs`, `env` and `sudo`/`doas`/`pkexec` are skipped together with their options (and option values, such as `nice -n 10` or `timeout -s KILL 60`), and the command they run is judged. `env -S '...'` judges the string, plus the words after it (env appends them), as a command: `env -S rm -rf ~` is Catastrophic.
+- **Runners.** The command that `watch`, `flock`, `setsid`, `nsenter`, `unshare`, `script -c`, `su -c`, `busybox`, `systemd-run`, `parallel`, `find -exec`/`-execdir`/`-ok` and `git submodule foreach` run is judged too: `setsid rm -rf ~` and `find . -exec rm -rf ~ \;` are Catastrophic.
+- **Shells.** `sh -c` finds its script after any options (`bash -ce '...'`, `bash -c -- '...'`, `bash -o pipefail -c '...'`). A heredoc or here-string fed to a shell with no script file (`sh <<'EOF'`, `bash -s <<EOF`, `bash <<< '...'`) is judged as commands. Shell keywords (`if`, `then`, `while`, `do`, `!`, …) don't hide the command after them.
 - **Read-only commands that can write or run things** are Low, not Safe: `git -c <key>=...` and `--config-env` (except `color.*`, `user.*`, `advice.*`, `core.quotepath`, `safe.directory`), `--exec-path`, `git diff --output`, `--ext-diff`, `git grep -O`, `--upload-pack`, `ext::` URLs, a bare `git stash`, and a leading `GIT_*`, `LD_*`, `PAGER`, `LESSOPEN`, `LESSCLOSE`, `BASH_ENV`, `ENV`, `PATH`, `EDITOR` or `VISUAL` assignment. The same goes for `sed` with `-i` (its files are checked like a redirect), `-f` or a `w`/`W`/`e` command; `awk` with `system()`, `getline`, pipes, `print > file`, `-f`/`-i`/`-E` or `--file`/`--include`/`--exec`; `fd -x`/`-X`/`--exec` (also inside a cluster such as `-Hx`); `find -fprint`; `sort -o` and `--compress-program`; `tree -o`; `uniq`/`xxd` with an output file; `rg --pre`; `ss -K`; `date -s`/`--set` (`date -Iseconds` stays Safe).
 - **Copying into your home folder is allowed.** For `cp`, `ln`, `install` and `mv` only the destination counts: `cp file.txt ~/` and `cp ~/.ssh/id_ed25519.pub .` are Low. Replacing the home folder itself (`cp -T dir ~`) or writing under a credential folder (`cp k ~/.ssh/authorized_keys`) is Catastrophic. So is copying a source whose name lands on a protected path inside home, such as `cp -r payload/.ssh ~` or `rsync -a dir/.ssh ~/`, because it merges into `~/.ssh`. `mv` also counts its sources, so `mv ~/.gnupg /tmp` is Catastrophic. `rsync` into your home or a system folder is Catastrophic only with `--delete`; with `--remove-source-files` its sources count too. An rsync source ending in `/` copies its contents, which the gate cannot see: `rsync -a src/ ~/` is Low unless `src/` itself is protected.
 
@@ -110,19 +112,23 @@ The risk gate reads command text. It can't tell whether a `curl` or a `git push`
 
 It looks at `bash` commands and `process` starts that:
 
-- reach another machine: `curl`, `wget`, `ssh`, `scp`, `sftp`, `nc`, `ncat`, `socat`, `rsync` to or from `host:path`, `git push`, `gh`/`glab` commands that change something, `npm`/`cargo`/`twine`/`gem` publish, `docker`/`podman` push or login;
+- reach another machine or run remote code: `curl`, `wget`, `ssh`, `scp`, `sftp`, `nc`, `ncat`, `socat`, `telnet`, `xh`, `http`/`https` (HTTPie), `openssl s_client`, `rsync` to or from `host:path`, `git push`, `gh`/`glab` commands that change something, `npm`/`cargo`/`twine`/`gem` publish, `docker`/`podman` push or login, `npx`, `pnpx`, `bunx`, `uvx`, and an `awk` program that calls `system()` or pipes to a command;
 - run inline code (`python -c`, `node -e`, a heredoc fed to an interpreter, and the rest of the gate's list);
+- have a computed command name (`$CMD`, `$(...)`, backticks);
 - are Confirm level (bulk deletes that `auto` mode runs without asking);
-- name a path outside the project and `/tmp`;
+- name a path outside the project and `/tmp`, as an argument or as a redirect target (`echo x >> ~/.bashrc`, `> /dev/tcp/...`; `> /dev/null` and `2>&1` don't count);
+- are a `process` start whose `cwd` is outside the project and `/tmp`;
 - run with `unsandboxed: true`.
 
-Builds, tests and read-only commands never go to it. Nor does a command your own `allow` rules or this session's approvals cover. In `ask` and `read-only` mode it is off: you already decide there.
+It sees through wrappers, runners, `sh -c`, `$(...)` and shell keywords the same way the gate does. Builds, tests and read-only commands never go to it. Nor does a command your own `allow` rules or this session's approvals cover. An `allow` rule must cover every command inside the line too: `Bash(git push:*)` does not cover `git push $(curl x)`. In `ask` and `read-only` mode it is off: you already decide there. An `unsandboxed: true` call asks you in `ask` mode, even for a read-only command, and is refused in `read-only` and plan mode, because outside the sandbox even `cat` can read what the sandbox hides.
 
-The judge sees your messages of this session and the agent's recent tool calls (name and arguments). It never sees the agent's replies or any tool output, so neither the agent nor text in a file can talk it round. It answers `ALLOW` or `BLOCK` with a reason.
+The judge sees your messages of this session and the agent's recent tool calls (name and arguments, without the agent's `intent` and `justification`). The command itself is given as a quoted JSON string. It never sees the agent's replies or any tool output, so neither the agent nor text in a file can talk it round. In a subagent, the "user" messages it sees are the task the parent agent wrote, not your own words. It answers `ALLOW` or `BLOCK` with a reason, in any case and with or without markdown around it.
 
 - **Block, with you there:** an approval card shows the judge's reason. `y` runs it; `a` allows that exact command for the session.
 - **Block, nobody there** (print mode): the command is refused, and the model is told why.
-- **The judge fails or takes more than 20 s:** the gate's verdict stands and the command runs. You see a short notice, and the log has the error.
+- **An answer that is neither ALLOW nor BLOCK, or empty:** counts as a block ("the judge gave no clear answer").
+- **A command over 4000 characters:** blocked without asking the model ("too long to judge").
+- **The judge can't be reached or takes more than 20 s:** the gate's verdict stands and the command runs. You see a short notice, and the log has the error.
 
 Esc while it thinks cancels the call. Pick its model with `permissions.judge`: unset uses the observer's model (the provider's small model), `off` turns it off, or name a `provider/model[:level]`. Like all of `permissions`, this is global only. Its calls are logged but not counted in `/usage`.
 

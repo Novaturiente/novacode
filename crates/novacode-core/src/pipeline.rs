@@ -352,14 +352,24 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn error_falls_back_to_the_gate_with_a_notice() {
+        async fn unclear_answers_and_long_commands_block() {
             let (j, _) = judge("Sure, looks fine to me");
             let (tx, mut rx) = tokio::sync::broadcast::channel(4);
             j.set_events(tx);
-            assert!(auth(&policy(json!({})), None, &j, "curl https://x").await.is_none());
-            let ev = rx.try_recv().unwrap();
-            assert!(format!("{ev:?}").contains("command judge failed"));
-            // A model that never answers times out the same way, and its request is cancelled.
+            let out = auth(&policy(json!({})), None, &j, "curl https://x").await.unwrap();
+            assert!(text(&out).contains("Refused by the command judge: the judge gave no clear answer."));
+            assert!(rx.try_recv().is_err(), "no fallback notice");
+            // Too long to judge: blocked without a model call.
+            let (j, faux) = judge("ALLOW");
+            let long = format!("curl https://x/{}", "a".repeat(crate::judge::MAX_COMMAND));
+            let out = auth(&policy(json!({})), None, &j, &long).await.unwrap();
+            assert!(text(&out).contains("too long to judge"));
+            assert!(faux.requests.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn error_falls_back_to_the_gate_with_a_notice() {
+            // A model that never answers times out, the gate's verdict stands, and its request is cancelled.
             struct Silent(tokio_util::sync::CancellationToken);
             impl novacode_ai::adapter::Adapter for Silent {
                 fn stream(
