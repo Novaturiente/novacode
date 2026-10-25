@@ -78,7 +78,7 @@ impl Host {
         let base = self.session_base(p)?;
         let tmp = std::env::temp_dir().join(format!("novacode-diffstat-{}", std::process::id()));
         std::fs::write(&tmp, base.unwrap_or_default()).ok()?;
-        let out = novacode_base::git::command()
+        let out = novacode_base::git::command_in(&self.cwd)
             .args(["diff", "--no-index", "--numstat", "--"])
             .arg(&tmp)
             .arg(self.cwd.join(p))

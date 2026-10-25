@@ -344,6 +344,8 @@ fn sandbox_mode(s: &Settings) -> sbx::Mode {
 /// The sandbox of a session in `cwd` (L6.5): its project folders, the settings'
 /// extra places and the user's protected paths.
 fn session_sandbox(s: &Settings, cwd: &Path, novacode_home: &Path, protected: &[String]) -> Arc<Sandbox> {
+    // Host git pin (L6.5): the project's common git dir, resolved before any model command runs.
+    novacode_base::git::pin_repo(cwd);
     let mode = sandbox_mode(s);
     let mut deny_read = protected.to_vec();
     deny_read.extend(s.get::<Vec<String>>("sandbox.denyRead").unwrap_or_default());
@@ -379,6 +381,7 @@ fn session_sandbox(s: &Settings, cwd: &Path, novacode_home: &Path, protected: &[
             .into_values()
             .flat_map(|p| p.env.names)
             .collect(),
+        histfile: std::env::var_os("HISTFILE").filter(|h| !h.is_empty()).map(Into::into),
     }));
     if mode != sbx::Mode::Off {
         // Checked off the start path: caches the answer and logs the one warning (auto mode).

@@ -68,9 +68,8 @@ pub struct Memories {
 
 /// The project a folder belongs to: the main repo's top (worktrees map back), else the folder.
 fn project_root(cwd: &Path) -> PathBuf {
-    novacode_base::git::command()
+    novacode_base::git::command_in(cwd)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .current_dir(cwd)
         .stderr(std::process::Stdio::null())
         .output()
         .ok()

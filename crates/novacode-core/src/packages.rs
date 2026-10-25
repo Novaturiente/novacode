@@ -525,11 +525,11 @@ pub fn name_of(src: &str) -> Option<String> {
 }
 
 fn git_out(args: &[&str], cwd: Option<&Path>) -> Result<String, String> {
-    let mut c = novacode_base::git::command();
+    let mut c = match cwd {
+        Some(d) => novacode_base::git::command_in(d),
+        None => novacode_base::git::command(),
+    };
     c.args(args).env("GIT_TERMINAL_PROMPT", "0");
-    if let Some(d) = cwd {
-        c.current_dir(d);
-    }
     let o = c.output().map_err(|e| format!("git: {e}"))?;
     if o.status.success() {
         Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())

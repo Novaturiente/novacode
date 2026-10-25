@@ -28,10 +28,14 @@ pub struct Repo {
 }
 
 fn git(repo: &Repo, args: &[&str], index: Option<&Path>) -> Result<String, String> {
-    let mut c = novacode_base::git::bookkeeping();
-    match &repo.shadow {
-        Some(dir) => c.arg("--git-dir").arg(dir).arg("--work-tree").arg(&repo.root),
-        None => c.arg("-C").arg(&repo.root),
+    // The repo's own commands run pinned (L6.5): a planted `commondir` is ignored.
+    let mut c = match &repo.shadow {
+        Some(dir) => {
+            let mut c = novacode_base::git::bookkeeping();
+            c.arg("--git-dir").arg(dir).arg("--work-tree").arg(&repo.root);
+            c
+        }
+        None => novacode_base::git::bookkeeping_in(&repo.root),
     };
     if let Some(i) = index {
         c.env("GIT_INDEX_FILE", i);
@@ -54,9 +58,7 @@ fn git(repo: &Repo, args: &[&str], index: Option<&Path>) -> Result<String, Strin
 
 /// The repo of `cwd`, or a shadow store for it under `home`.
 pub fn resolve(cwd: &Path, home: &Path) -> Option<Repo> {
-    let top = novacode_base::git::bookkeeping()
-        .arg("-C")
-        .arg(cwd)
+    let top = novacode_base::git::bookkeeping_in(cwd)
         .args(["rev-parse", "--show-toplevel"])
         .stderr(Stdio::null())
         .output()

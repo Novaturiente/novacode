@@ -59,6 +59,8 @@ pub struct Config {
     pub git_dirs: Vec<PathBuf>,
     /// Environment variables holding provider keys, dropped from sandboxed commands.
     pub secret_env: Vec<String>,
+    /// `$HISTFILE`, hidden when it exists (`~/` and relative paths from home).
+    pub histfile: Option<PathBuf>,
 }
 
 /// Download caches under home, writable when they exist (none is created).
@@ -81,13 +83,22 @@ const CACHES: &[&str] = &[
     ".cargo/git",
     "go/pkg/mod",
 ];
-/// Private data under home, hidden when it exists: shell history, browser
-/// and mail profiles, the keyring.
+/// Private data under home, hidden when it exists: shell and REPL history,
+/// browser and mail profiles, the keyring, Flatpak app data.
 const PRIVATE: &[&str] = &[
     ".zsh_history",
+    ".zhistory",
+    ".histfile",
+    ".local/state/zsh",
     ".bash_history",
     ".local/share/fish/fish_history",
     ".local/share/atuin",
+    ".python_history",
+    ".node_repl_history",
+    ".psql_history",
+    ".sqlite_history",
+    ".lesshst",
+    ".var/app",
     ".mozilla",
     ".config/google-chrome",
     ".config/chromium",
@@ -292,6 +303,11 @@ impl Sandbox {
         }
         cands.extend(TOKEN_FILES.iter().map(|f| c.home.join(f)));
         cands.extend(PRIVATE.iter().map(|f| c.home.join(f)));
+        cands.extend(
+            c.histfile
+                .iter()
+                .map(|h| expand(&h.to_string_lossy(), &c.home, &c.home)),
+        );
         cands.extend(c.deny_read.iter().map(|p| expand(p, &c.home, &base)));
         let mut symlink = cands.iter().find_map(|p| link_in(p, &write));
         let mut hide: Vec<(PathBuf, bool)> = Vec::new();
@@ -354,6 +370,7 @@ impl Sandbox {
                 top: base.clone(),
                 git_dirs: c.git_dirs.clone(),
                 links: Mutex::new(None),
+                last: Mutex::new(None),
             })
         });
         Sandbox {
@@ -530,9 +547,8 @@ impl Sandbox {
             return None;
         }
         let probe = self.git.clone()?;
-        let state = probe.state();
-        let links = probe.links_at(state.index);
-        Some(GitSnap { probe, state, links })
+        probe.baseline();
+        Some(GitSnap { probe })
     }
 
     /// The line added when a sandboxed command failed on a blocked write.
@@ -711,14 +727,15 @@ fn seccomp_program() -> Option<Vec<u8>> {
     )
 }
 
-/// An index file's identity: (inode, size, mtime s, mtime ns). git replaces
-/// the index by renaming a new file over it, so any write changes it.
-type IndexStat = (u64, u64, i64, i64);
+/// An index file's identity: (inode, size, mtime s, mtime ns, ctime s, ctime ns).
+/// git replaces the index by renaming a new file over it, so any write changes
+/// it; ctime also catches a rewrite in place with the mtime put back.
+type IndexStat = (u64, u64, i64, i64, i64, i64);
 
 fn index_stat(p: &Path) -> Option<IndexStat> {
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::metadata(p).ok()?;
-    Some((m.ino(), m.size(), m.mtime(), m.mtime_nsec()))
+    Some((m.ino(), m.size(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec()))
 }
 
 /// What the git change check reads (L6.5): `.git` stays writable inside the
@@ -732,6 +749,9 @@ struct GitProbe {
     /// The gitlinks (mode 160000 entries) of the index at that stat, read
     /// only when the index changed.
     links: Mutex<Option<(Option<IndexStat>, BTreeSet<String>)>>,
+    /// The state last reported (or the first one seen), kept for the session:
+    /// a change a still-running process makes is reported at the next check.
+    last: Mutex<Option<GitState>>,
 }
 
 /// The parts of the git setup that can make a later git command run a program.
@@ -743,6 +763,11 @@ struct GitState {
     /// Submodule git folders under `<gitdir>/modules` and their `config`.
     modules: BTreeMap<PathBuf, Option<Vec<u8>>>,
     index: Option<IndexStat>,
+    /// The index's gitlinks at `index`.
+    links: BTreeSet<String>,
+    /// Per gitlink: its work tree's `.git` file, or `.git/config` for an
+    /// old-style folder (path relative to the top) and its content.
+    link_files: BTreeMap<String, (PathBuf, Option<Vec<u8>>)>,
 }
 
 impl GitProbe {
@@ -757,6 +782,21 @@ impl GitProbe {
                 modules.insert(d, config);
             }
         }
+        let index = self.git_dirs.first().and_then(|g| index_stat(&g.join("index")));
+        let links = self.links_at(index);
+        let link_files = links
+            .iter()
+            .map(|l| {
+                let dot = Path::new(l).join(".git");
+                let rel = if self.top.join(&dot).is_dir() {
+                    dot.join("config")
+                } else {
+                    dot
+                };
+                let content = std::fs::read(self.top.join(&rel)).ok();
+                (l.clone(), (rel, content))
+            })
+            .collect();
         GitState {
             commondir: self
                 .git_dirs
@@ -765,8 +805,76 @@ impl GitProbe {
                 .collect(),
             gitmodules: std::fs::read(self.top.join(".gitmodules")).ok(),
             modules,
-            index: self.git_dirs.first().and_then(|g| index_stat(&g.join("index"))),
+            index,
+            links,
+            link_files,
         }
+    }
+
+    /// Takes the first state, the one later checks compare against.
+    fn baseline(&self) {
+        let mut last = self.last.lock().unwrap();
+        if last.is_none() {
+            *last = Some(self.state());
+        }
+    }
+
+    /// The changes since the last reported state; that state becomes the new one.
+    fn check(&self) -> Option<String> {
+        let mut last = self.last.lock().unwrap();
+        let new = self.state();
+        let line = last.as_ref().and_then(|old| self.diff(old, &new));
+        *last = Some(new);
+        line
+    }
+
+    /// The line for what changed from `old` to `new`, if anything did.
+    fn diff(&self, old: &GitState, new: &GitState) -> Option<String> {
+        let mut what: Vec<String> = Vec::new();
+        let file = |path: String, a: &Option<Vec<u8>>, b: &Option<Vec<u8>>| match (a, b) {
+            (None, Some(_)) => Some(format!("{path} created")),
+            (Some(_), None) => Some(format!("{path} removed")),
+            (Some(x), Some(y)) if x != y => Some(format!("{path} changed")),
+            _ => None,
+        };
+        for (i, g) in self.git_dirs.iter().enumerate() {
+            let none = None;
+            let (a, b) = (
+                old.commondir.get(i).unwrap_or(&none),
+                new.commondir.get(i).unwrap_or(&none),
+            );
+            what.extend(file(self.show(&g.join("commondir")), a, b));
+        }
+        what.extend(file("`.gitmodules`".into(), &old.gitmodules, &new.gitmodules));
+        for (d, config) in &new.modules {
+            match old.modules.get(d) {
+                None => what.push(format!("new submodule git folder {}", self.show(d))),
+                Some(c) if c != config => what.push(format!("{} changed", self.show(&d.join("config")))),
+                Some(_) => {}
+            }
+        }
+        for d in old.modules.keys().filter(|d| !new.modules.contains_key(*d)) {
+            what.push(format!("submodule git folder {} removed", self.show(d)));
+        }
+        for l in new.links.difference(&old.links) {
+            what.push(format!("new gitlink `{l}` in the index"));
+        }
+        // A gitlink there before and after: its `.git` file or old-style config.
+        for (l, (path, content)) in &new.link_files {
+            match old.link_files.get(l) {
+                Some((p, c)) if p == path => {
+                    what.extend(file(format!("`{}`", path.display()), c, content));
+                }
+                Some(_) => what.push(format!("`{l}/.git` changed")),
+                None => {}
+            }
+        }
+        (!what.is_empty()).then(|| {
+            format!(
+                "[git setup changed: {}; git commands you run may execute it]",
+                what.join(", ")
+            )
+        })
     }
 
     /// The gitlinks of the index at `stat`: cached, read again when it changed.
@@ -788,9 +896,7 @@ impl GitProbe {
 
     /// `git ls-files --stage` entries with mode 160000.
     fn read_links(&self) -> BTreeSet<String> {
-        let out = novacode_base::git::bookkeeping()
-            .arg("-C")
-            .arg(&self.top)
+        let out = novacode_base::git::bookkeeping_in(&self.top)
             .args(["ls-files", "--stage", "-z"])
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -812,67 +918,25 @@ impl GitProbe {
     }
 }
 
-/// The git setup before a sandboxed command ([`Sandbox::git_snapshot`]).
+/// A git change check around a sandboxed command ([`Sandbox::git_snapshot`]).
 pub struct GitSnap {
     probe: Arc<GitProbe>,
-    state: GitState,
-    /// The index's gitlinks at `state.index`.
-    links: BTreeSet<String>,
 }
 
 impl GitSnap {
     /// After the command: the line for its result when git's executable setup
-    /// changed (a new or changed `commondir`, `.gitmodules`, a new, removed or
-    /// changed submodule git folder, a new gitlink in the index).
+    /// changed since the last reported state (a new or changed `commondir`,
+    /// `.gitmodules`, a new, removed or changed submodule git folder, a new
+    /// gitlink in the index, a changed gitlink `.git` file or old-style
+    /// `.git/config`). Also changes another command made meanwhile.
     pub fn changes(&self) -> Option<String> {
-        let p = &self.probe;
-        let (old, new) = (&self.state, p.state());
-        let mut what: Vec<String> = Vec::new();
-        let file = |path: String, a: &Option<Vec<u8>>, b: &Option<Vec<u8>>| match (a, b) {
-            (None, Some(_)) => Some(format!("{path} created")),
-            (Some(_), None) => Some(format!("{path} removed")),
-            (Some(x), Some(y)) if x != y => Some(format!("{path} changed")),
-            _ => None,
-        };
-        for (i, g) in p.git_dirs.iter().enumerate() {
-            let none = None;
-            let (a, b) = (
-                old.commondir.get(i).unwrap_or(&none),
-                new.commondir.get(i).unwrap_or(&none),
-            );
-            what.extend(file(p.show(&g.join("commondir")), a, b));
-        }
-        what.extend(file("`.gitmodules`".into(), &old.gitmodules, &new.gitmodules));
-        for (d, config) in &new.modules {
-            match old.modules.get(d) {
-                None => what.push(format!("new submodule git folder {}", p.show(d))),
-                Some(c) if c != config => what.push(format!("{} changed", p.show(&d.join("config")))),
-                Some(_) => {}
-            }
-        }
-        for d in old.modules.keys().filter(|d| !new.modules.contains_key(*d)) {
-            what.push(format!("submodule git folder {} removed", p.show(d)));
-        }
-        if new.index != old.index {
-            let after = p.links_at(new.index);
-            for l in after.difference(&self.links) {
-                what.push(format!("new gitlink `{l}` in the index"));
-            }
-        }
-        (!what.is_empty()).then(|| {
-            format!(
-                "[git setup changed: {}; git commands you run may execute it]",
-                what.join(", ")
-            )
-        })
+        self.probe.check()
     }
 }
 
 /// The git folder and the shared git folder of `cwd` (one when they're the same).
 pub fn git_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let out = novacode_base::git::command()
-        .arg("-C")
-        .arg(cwd)
+    let out = novacode_base::git::command_in(cwd)
         .args(["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"])
         .stderr(std::process::Stdio::null())
         .output()
@@ -889,9 +953,7 @@ pub fn git_dirs(cwd: &Path) -> Vec<PathBuf> {
 /// (falling back to `cwd`), plus the shared git folder of a worktree when it
 /// lies outside, so commits there work.
 pub fn project_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let out = novacode_base::git::command()
-        .arg("-C")
-        .arg(cwd)
+    let out = novacode_base::git::command_in(cwd)
         .args([
             "rev-parse",
             "--path-format=absolute",
@@ -948,9 +1010,13 @@ mod tests {
             ".cargo/registry",
             ".codex",
             ".mozilla",
+            ".local/state/zsh",
+            ".var/app",
         ] {
             std::fs::create_dir_all(home.join(dir)).unwrap();
         }
+        std::fs::create_dir_all(d.path().join("hist")).unwrap();
+        std::fs::write(d.path().join("hist/zsh"), "x").unwrap();
         std::fs::create_dir_all(proj.join("sub")).unwrap();
         std::fs::create_dir_all(proj.join(".git/hooks")).unwrap();
         // A submodule `a/b` with a nested one `c`, and a linked worktree `w`.
@@ -970,6 +1036,7 @@ mod tests {
             ".config/gh/hosts.yml",
             ".codex/auth.json",
             ".zsh_history",
+            ".python_history",
         ] {
             std::fs::write(home.join(f), "x").unwrap();
         }
@@ -996,6 +1063,7 @@ mod tests {
             credential_dirs: vec![".ssh".into(), ".aws".into(), ".novacode".into()],
             git_dirs: vec![proj.join(".git")],
             secret_env: vec!["My_Provider_Key".into()],
+            histfile: Some(d.path().join("hist/zsh")),
         };
         (d, c)
     }
@@ -1057,9 +1125,14 @@ mod tests {
             ("/dev/null", r("home/.netrc")),
             ("/dev/null", r("home/.config/gh/hosts.yml")),
             ("/dev/null", r("home/.codex/auth.json")),
-            // Private data: shell history, browser profiles.
+            // Private data: shell and REPL history, Flatpak app data, browser
+            // profiles, then `$HISTFILE`; missing ones (`~/.lesshst`, …) skipped.
             ("/dev/null", r("home/.zsh_history")),
+            ("--tmpfs", r("home/.local/state/zsh")),
+            ("/dev/null", r("home/.python_history")),
+            ("--tmpfs", r("home/.var/app")),
             ("--tmpfs", r("home/.mozilla")),
+            ("/dev/null", r("hist/zsh")),
             ("/dev/null", r("proj/.env.secret")),
             ("--chdir", cwd.display().to_string()),
         ]
@@ -1629,6 +1702,9 @@ mod tests {
         std::fs::create_dir_all(&late).unwrap();
         std::fs::write(late.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(late.join("config"), "[core]\n").unwrap();
+        // Made outside a check: the next one reports it (against the last reported state).
+        let t = changed("true").await.unwrap_or_default();
+        assert!(t.contains("new submodule git folder `.git/modules/late`"), "{t}");
         let t = changed(
             r#"mv .git/modules/late .git/modules/old && mkdir .git/modules/late && cp .git/modules/old/HEAD .git/modules/late/ && printf '[core]\n\tfsmonitor = touch PWNED\n' > .git/modules/late/config"#,
         )
@@ -1653,6 +1729,116 @@ mod tests {
         .await;
         assert_eq!(t, None);
         assert!(!proj.join("PWNED").exists());
+        // A still-running background process plants `commondir` after its start
+        // and after a bash call's check: a later bash call reports it, its exit not again.
+        let mut events = pm.events.subscribe();
+        let id = pm
+            .start(
+                "late",
+                "sleep 1; echo /tmp/evil > .git/commondir; sleep 60",
+                &proj,
+                &[],
+                true,
+                s,
+            )
+            .unwrap();
+        assert_eq!(changed("true").await, None);
+        for _ in 0..100 {
+            if proj.join(".git/commondir").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let t = changed("true").await.unwrap_or_default();
+        assert!(t.contains("`.git/commondir` created"), "{t}");
+        pm.stop(&id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        while let Ok(e) = events.try_recv() {
+            if let crate::process::Event::Notice { text, .. } = e {
+                assert!(!text.contains("git setup changed"), "reported again: {text}");
+            }
+        }
+    }
+
+    /// The git change check without bwrap: a rewritten gitlink `.git` file and
+    /// old-style `.git/config`, and a same-size index rewrite with the mtime put back.
+    #[test]
+    fn git_check_links_and_index() {
+        let d = tempfile::tempdir().unwrap();
+        let proj = std::fs::canonicalize(d.path()).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(&proj)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        };
+        if git(&["init", "-q"]).is_none() || git(&["commit", "-q", "--allow-empty", "-m", "x"]).is_none() {
+            eprintln!("note: git_check_links_and_index skipped, git doesn't work here");
+            return;
+        }
+        let head = git(&["rev-parse", "HEAD"]).unwrap();
+        for l in ["sm", "old"] {
+            git(&["update-index", "--add", "--cacheinfo", &format!("160000,{head},{l}")]).unwrap();
+        }
+        std::fs::create_dir_all(proj.join("sm")).unwrap();
+        std::fs::write(proj.join("sm/.git"), "gitdir: ../.git/modules/sm\n").unwrap();
+        std::fs::create_dir_all(proj.join("old/.git")).unwrap();
+        std::fs::write(proj.join("old/.git/config"), "[core]\n").unwrap();
+        let probe = GitProbe {
+            top: proj.clone(),
+            git_dirs: git_dirs(&proj),
+            links: Mutex::new(None),
+            last: Mutex::new(None),
+        };
+        probe.baseline();
+        assert_eq!(probe.check(), None);
+        std::fs::write(proj.join("sm/.git"), "gitdir: /tmp/evil\n").unwrap();
+        std::fs::write(proj.join("old/.git/config"), "[core]\n\tfsmonitor = x\n").unwrap();
+        let t = probe.check().unwrap_or_default();
+        assert!(
+            t.contains("`sm/.git` changed") && t.contains("`old/.git/config` changed"),
+            "{t}"
+        );
+        assert_eq!(probe.check(), None, "reported once");
+        // Two indexes of the same size: `zz` a plain file, then a gitlink.
+        let index = proj.join(".git/index");
+        git(&["update-index", "--add", "--cacheinfo", &format!("100644,{head},zz")]).unwrap();
+        let plain = std::fs::read(&index).unwrap();
+        git(&["update-index", "--cacheinfo", &format!("160000,{head},zz")]).unwrap();
+        let link = std::fs::read(&index).unwrap();
+        assert_eq!(plain.len(), link.len());
+        std::fs::write(&index, &plain).unwrap();
+        assert_eq!(probe.check(), None);
+        let before = index_stat(&index).unwrap();
+        let mtime = std::fs::metadata(&index).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Rewritten in place, mtime put back: only ctime tells.
+        std::fs::write(&index, &link).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&index)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let after = index_stat(&index).unwrap();
+        assert_eq!(
+            (before.0, before.1, before.2, before.3),
+            (after.0, after.1, after.2, after.3),
+            "inode, size and mtime are the same"
+        );
+        let t = probe.check().unwrap_or_default();
+        assert!(t.contains("new gitlink `zz` in the index"), "{t}");
     }
 
     #[test]
