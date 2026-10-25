@@ -1976,6 +1976,11 @@ fn git(args: &[String]) -> Risk {
                 runs |= !harmless(&a["--config-env=".len()..]);
                 i += 1;
             }
+            // Attached form: `-ccore.fsmonitor=x`.
+            a if a.starts_with("-c") && a.len() > 2 => {
+                runs |= !harmless(&a[2..]);
+                i += 1;
+            }
             a if a.starts_with("--exec-path") => {
                 runs = true;
                 i += 1;
@@ -2376,6 +2381,8 @@ mod tests {
             ("time -p git status", Safe),
             // git options and variables that run programs.
             ("git -c core.fsmonitor='touch x' status", Low),
+            ("git -ccore.fsmonitor='touch x' status", Low),
+            ("git -ccolor.ui=always status", Safe),
             ("git -c alias.x='!touch y' x", Low),
             ("git --config-env=core.pager=P log", Low),
             ("GIT_EXTERNAL_DIFF=./x git diff", Low),
