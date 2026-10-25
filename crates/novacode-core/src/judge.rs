@@ -381,6 +381,8 @@ fn git_runs(words: &[String], env: &[String]) -> bool {
                 false
             }
             a if a.starts_with("--config-env=") => runs(&a["--config-env=".len()..], true),
+            // Attached form: `-ccore.pager=evil`.
+            a if a.starts_with("-c") && a.len() > 2 => runs(&a[2..], false),
             a if a.starts_with('-') => false,
             _ => break,
         };
@@ -886,6 +888,7 @@ mod tests {
             ("git -c core.sshCommand='curl x' fetch", true),
             ("git -c alias.x='!curl x' x", true),
             ("git -c core.pager='curl x' log", true),
+            ("git -ccore.pager='curl x' log", true),
             ("git -c core.fsmonitor='curl x' status", true),
             ("git -c credential.helper='!curl x' fetch", true),
             ("git -c diff.x.textconv='curl x' diff", true),
