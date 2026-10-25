@@ -77,10 +77,12 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         (r"\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}", "OpenAI key"),
         (r"\bxox[abprs]-[A-Za-z0-9-]{10,}", "Slack token"),
         (r"\bAIza[0-9A-Za-z_-]{35}\b", "Google API key"),
-        // NAME=value where NAME (any case) says it's a secret: keep the name, mask the value.
-        // Parentheses end a value, so code such as `token = parse();` is left alone.
+        // NAME=value where NAME says it's a secret: keep the name, mask the value.
+        // An upper-case NAME (environment style) masks any value; a lower- or
+        // mixed-case one only a quoted value, so code such as
+        // `token: Option<String>` is left alone. Parentheses end a value too.
         (
-            r#"(?mi)(\b[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*\s*[=:]\s*["']?)[^\s"'()]{8,}"#,
+            r#"(?m)(\b(?:[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*\s*[=:]\s*["']?|(?i:[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*)\s*[=:]\s*["']))[^\s"'()]{8,}"#,
             "secret value",
         ),
     ]
@@ -138,9 +140,25 @@ mod tests {
     fn secret_names_match_in_any_case() {
         let r = Redactor::default().with_patterns(true);
         assert_eq!(
-            r.apply("api_key=abcdefgh1234 Api_Token: 'zyxwvuts9876'").as_deref(),
-            Some("api_key=[redacted: secret value] Api_Token: '[redacted: secret value]'")
+            r.apply("api_key=\"abcdefgh12\" Api_Token: 'abcdefgh12'").as_deref(),
+            Some("api_key=\"[redacted: secret value]\" Api_Token: '[redacted: secret value]'")
+        );
+        assert_eq!(
+            r.apply("GITHUB_TOKEN=ghp_xxxxxxxx API_KEY: abcdefgh12").as_deref(),
+            Some("GITHUB_TOKEN=[redacted: secret value] API_KEY: [redacted: secret value]"),
+            "upper-case names mask unquoted values"
         );
         assert_eq!(r.apply("password=short"), None, "8-character minimum");
+        assert_eq!(r.apply("PASSWORD='short'"), None, "8-character minimum");
+        // Lower- or mixed-case names with an unquoted value are code, not secrets.
+        for code in [
+            "token: Option<String>,",
+            "pub tokens: Vec<String>,",
+            "password: passwordField.value",
+            "let token = parseTokenFromHeader(req)",
+            "api_key=abcdefgh1234",
+        ] {
+            assert_eq!(r.apply(code), None, "{code}");
+        }
     }
 }

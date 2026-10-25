@@ -383,14 +383,16 @@ fn github(src: &str) -> Option<(String, String)> {
     (!o.is_empty() && !r.is_empty() && it.next().is_none()).then(|| (o.to_string(), r.to_string()))
 }
 
-/// The version of a stable `X.Y.Z` tag (`v` and a `name-` prefix allowed); `None`
-/// for a pre-release or a tag that isn't a version.
-fn tag_version(tag: &str) -> Option<(u64, u64, u64)> {
-    static RE: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"^(?:.*[-_/])?v?(\d+)\.(\d+)\.(\d+)$").unwrap());
+/// The version of an `X.Y.Z` tag (`v` and a `name-` prefix allowed); `None` for a
+/// tag that isn't a version. The last field is `false` for a pre-release
+/// (`v2.0.0-rc1`), which orders just below its release.
+fn tag_version(tag: &str) -> Option<(u64, u64, u64, bool)> {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^(?:.*[-_/])?v?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?$").unwrap()
+    });
     let c = RE.captures(tag.trim())?;
     let n = |i: usize| c[i].parse::<u64>().ok();
-    Some((n(1)?, n(2)?, n(3)?))
+    Some((n(1)?, n(2)?, n(3)?, c.get(4).is_none()))
 }
 
 /// Whether an update from tag `cur` may move to release `new`: never to an older
@@ -412,9 +414,13 @@ fn newer_or_same(cur: Option<&str>, new: &str) -> bool {
 /// The highest stable `X.Y.Z` tag (`v` and a `name-` prefix allowed; pre-releases
 /// skipped). On a tie the shorter name wins (`v1.2.0` over `bin-v1.2.0`).
 fn best_tag<'a>(tags: impl Iterator<Item = &'a str>) -> Option<String> {
-    tags.filter_map(|t| Some((tag_version(t)?, std::cmp::Reverse(t.len()), t.trim().to_string())))
-        .max()
-        .map(|(_, _, t)| t)
+    tags.filter_map(|t| {
+        tag_version(t)
+            .filter(|v| v.3)
+            .map(|v| (v, std::cmp::Reverse(t.len()), t.trim().to_string()))
+    })
+    .max()
+    .map(|(_, _, t)| t)
 }
 
 /// Packages that load in this session, in precedence order: a trusted project's
@@ -736,7 +742,11 @@ mod tests {
             (Some("v1.2.0"), "v1.2.0", true),
             (Some("v1.2.0"), "bin-v1.2.0", false),
             (Some("nightly"), "v1.0.0", true),
-            (Some("v2.0.0-rc1"), "v1.0.0", true),
+            (Some("v2.0.0-rc1"), "v1.0.0", false),
+            (Some("v2.0.0-rc1"), "v1.9.9", false),
+            (Some("v2.0.0-rc1"), "v2.0.0", true),
+            (Some("bin-v2.0.0-rc1"), "v2.0.1", true),
+            (Some("v2.0.0"), "v2.0.0-rc1", false),
             (Some("v1.0.0"), "nightly", false),
             (Some("edge"), "nightly", true),
         ] {

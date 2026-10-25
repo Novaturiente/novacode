@@ -35,7 +35,7 @@ Packages follow **releases**, not every commit.
 The latest release is:
 
 1. For a GitHub repo, the release GitHub marks as "Latest". novacode asks GitHub's public API, which needs no token or setup.
-2. Otherwise (another host, no network, or the API limit was hit), the highest version tag: `v1.2.3` or `1.2.3`, also with a name prefix such as `bin-v1.2.3`. Pre-releases like `v2.0.0-rc1` are skipped.
+2. Otherwise (another host, no network, or the API limit was hit), the highest version tag: `v1.2.3` or `1.2.3`, also with a name prefix such as `bin-v1.2.3`. Pre-releases like `v2.0.0-rc1` are skipped. A package pinned to a pre-release counts as just below that release, so `update` never moves it back to an older one.
 3. A repo with no release tags at all is installed at its newest commit and then **stays pinned** there.
 
 ```sh
