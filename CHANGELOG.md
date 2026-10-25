@@ -2,6 +2,12 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.3.2] - 2026-10-26
+
+### Fixed
+
+- **Symlinked config files stay symlinks.** When novacode saved `settings.json` (for example after an "Always" approval), `mcp.json` (`novacode mcp add`/`remove`) or `packages.lock.json` (`novacode install`, `uninstall`, `packages update`), it replaced a symlink with a regular file, so a dotfiles repo deployed with GNU Stow silently stopped getting updates. novacode now writes through the link to its target; the `.bak` copy sits next to the target. A dangling link is still replaced, as before.
+
 ## [0.3.1] - 2026-10-26
 
 ### Fixed
