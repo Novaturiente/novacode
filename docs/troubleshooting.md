@@ -152,6 +152,8 @@ novacode trust --revoke   # take it back
 novacode --trust          # trust it for this run only
 ```
 
+If the project config changed since you trusted the folder, novacode asks again; a non-interactive run ignores it with a note that lists what changed. Run `novacode trust` again to accept the change.
+
 Non-interactive runs (`-p`, `--rpc`, `--bg`) never ask, so they always need `novacode trust` or `--trust`. `AGENTS.md` and `CLAUDE.md` load either way. If you changed trust or settings in a running session, use `/reload`. See [security](security.md).
 
 ### Icons show as boxes or question marks
