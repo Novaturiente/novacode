@@ -69,10 +69,10 @@ package updates: caveman v4.0.1 → v4.1.0, ponytail v5.3.2 → v5.4.0: run `nov
 ```
 
 - It checks the packages `packages update` covers: your own clones. Linked folders are skipped.
-- For a GitHub repo it asks only for GitHub's "Latest" release. For other hosts it takes the highest version tag from `git ls-remote`. A package that follows a branch is checked for a newer commit. Packages without releases are left out, and so is a GitHub repo with version tags but no GitHub release, although `packages update` would move it to its highest tag.
+- For each one it looks up the latest release as above: GitHub's "Latest", else the highest version tag from `git ls-remote` (another host, no GitHub release, or the API can't be asked). A package that follows a branch is checked for a newer commit. Packages without releases are left out.
 - It only reads: no clone is fetched or changed, and nothing is installed.
 - It runs **at most once a day**, in the background, together with the check for novacode itself (see [Install](install.md#update-check)). The answer is cached in `~/.novacode/cache/updates.json`. Every interactive start shows it from the cache, minus the packages you already updated.
-- It is one GitHub API call per package (`git ls-remote` for other hosts and for packages that follow a branch) plus one for novacode. A package whose check fails is left out.
+- It is one GitHub API call per GitHub package, plus `git ls-remote` when that gives no release, plus one call for novacode. Other hosts and packages that follow a branch use `git ls-remote` only. A package whose check fails is left out.
 
 To turn it off, set `"updates": {"check": false}` in `~/.novacode/settings.json`.
 

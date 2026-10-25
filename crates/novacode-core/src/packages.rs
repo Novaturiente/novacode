@@ -304,19 +304,30 @@ enum Remote {
 
 /// Ask the remote, read-only: `ls-remote` and the GitHub API, never a fetch.
 async fn remote_facts(dir: &Path, pin: &Pin) -> Result<Remote, String> {
-    let d = Some(dir);
     if let Some(b) = &pin.branch {
-        let out = git_out(&["ls-remote", "origin", &format!("refs/heads/{b}")], d)?;
+        let out = git_out(&["ls-remote", "origin", &format!("refs/heads/{b}")], Some(dir))?;
         let rev = out
             .split_whitespace()
             .next()
             .ok_or(format!("no branch `{b}` on origin"))?;
         return Ok(Remote::Branch(rev.to_string()));
     }
-    if let Some((owner, repo)) = github(&pin.source) {
-        return Ok(Remote::Release(github_latest(&owner, &repo).await?));
+    let gh = match github(&pin.source) {
+        Some((owner, repo)) => github_latest(&owner, &repo).await,
+        None => Ok(None),
+    };
+    release_or_tags(dir, gh)
+}
+
+/// GitHub's "Latest" when there is one; else (no GitHub release, another host, or
+/// the API can't be asked) the highest remote tag, as [`latest`] does after a fetch.
+fn release_or_tags(dir: &Path, gh: Result<Option<String>, String>) -> Result<Remote, String> {
+    match gh {
+        Ok(Some(t)) => return Ok(Remote::Release(Some(t))),
+        Ok(None) => {}
+        Err(e) => tracing::debug!("update check: GitHub: {e}; using the remote tags"),
     }
-    let out = git_out(&["ls-remote", "--tags", "--refs", "origin"], d)?;
+    let out = git_out(&["ls-remote", "--tags", "--refs", "origin"], Some(dir))?;
     let tags = out
         .lines()
         .filter_map(|l| l.split('\t').nth(1)?.strip_prefix("refs/tags/"));
@@ -923,6 +934,12 @@ mod tests {
         );
         assert_eq!(store.current("p").as_deref(), Some("v1.0.0"));
         assert_eq!(store.current("nope"), None);
+        // A GitHub repo without a release, or an API error: the remote tags decide.
+        let p = store.dir.join("p");
+        let tag = |t: &str| Ok(Remote::Release(Some(t.into())));
+        assert_eq!(release_or_tags(&p, Ok(None)), tag("v1.1.0"));
+        assert_eq!(release_or_tags(&p, Err("rate limited".into())), tag("v1.1.0"));
+        assert_eq!(release_or_tags(&p, Ok(Some("v1.0.5".into()))), tag("v1.0.5"));
     }
 
     #[test]

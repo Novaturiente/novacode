@@ -56,16 +56,18 @@ pub fn auth_status(p: &Providers) -> ExitCode {
             rows.push((pr.id.clone(), kind.into(), src));
         }
     }
-    if rows.is_empty() {
-        eprintln!(
-            "No logins or keys. Run `novacode login <provider>` (claude, codex, antigravity, copilot, or any API-key provider) or set its API key env var."
-        );
-        return ExitCode::FAILURE;
-    }
+    // Local servers that need no key are listed but don't count as a login or key.
+    let none = rows.iter().all(|r| r.1 == "local");
     let w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0);
     let w2 = rows.iter().map(|r| r.1.len()).max().unwrap_or(0);
     for (prov, kind, state) in rows {
         println!("{prov:w$}  {kind:w2$}  {state}");
+    }
+    if none {
+        eprintln!(
+            "No logins or keys. Run `novacode login <provider>` (claude, codex, antigravity, copilot, or any API-key provider) or set its API key env var."
+        );
+        return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
 }
@@ -176,6 +178,24 @@ fn sandbox_line(mode: Mode, works: bool, symlink: Option<&Path>) -> (bool, Strin
 #[cfg(test)]
 mod tests {
     use novacode_tools::sandbox::Mode;
+    use std::process::ExitCode;
+
+    #[test]
+    fn auth_status_fails_with_only_keyless_local_servers() {
+        let load = || {
+            novacode_ai::connect::Providers::load(
+                std::path::Path::new("/nonexistent"),
+                &novacode_base::settings::Settings::default(),
+            )
+        };
+        let mut p = load();
+        p.profiles.retain(|_, pr| pr.key_optional && pr.api_key.is_none());
+        assert!(!p.profiles.is_empty(), "bundled local servers");
+        assert_eq!(super::auth_status(&p), ExitCode::FAILURE);
+        let mut p = load();
+        p.cli_key = Some(("openrouter".into(), "sk-test".into()));
+        assert_eq!(super::auth_status(&p), ExitCode::SUCCESS);
+    }
 
     #[test]
     fn sandbox_lines() {

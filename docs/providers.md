@@ -286,7 +286,7 @@ novacode retries failures that are likely to pass on their own: network errors, 
 novacode auth status
 ```
 
-Shows every login and key, where it comes from (login, settings, or env var), and whether a subscription token is valid. It reads local files only and makes no network calls. It also lists the local servers that need no key (`ollama`, `lmstudio`), so with the bundled providers it exits with code 0 even when you have no login or key.
+Shows every login and key, where it comes from (login, settings, or env var), and whether a subscription token is valid. It reads local files only and makes no network calls. It also lists the local servers that need no key (`ollama`, `lmstudio`), but those don't count: it exits with code 1 when no login or key is set.
 
 ```sh
 novacode doctor

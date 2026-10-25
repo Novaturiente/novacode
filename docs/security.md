@@ -346,7 +346,7 @@ Masking changes what the model reads. It does not stop a command you allow from 
 - novacode has no telemetry and sends no usage data of its own.
 - It talks to the model provider you chose, plus anything you or the agent ask for: MCP servers, `web_fetch`, `web_search`, and `git` for packages.
 - On start (interactive sessions, when the cached copy is old) and with `novacode models --refresh`, it may refresh the model catalog from `https://models.dev/api.json`. The refreshed copy is cached in `~/.novacode/cache/models-dev.json`. This request carries no prompts or session data.
-- At most once a day, at the start of an interactive session, it checks for updates: one GitHub API call for novacode's latest release, and one call per installed package (GitHub API, or `git ls-remote` for other hosts). The requests carry only the user agent `novacode/<version>`. The result is cached in `~/.novacode/cache/updates.json`. Set `updates.check` to `false` to turn this off.
+- At most once a day, at the start of an interactive session, it checks for updates: one GitHub API call for novacode's latest release, and one call per installed package (the GitHub API, or `git ls-remote` for other hosts and for repos without a GitHub release). The requests carry only the user agent `novacode/<version>`. The result is cached in `~/.novacode/cache/updates.json`. Set `updates.check` to `false` to turn this off.
 
 ## Reporting a security issue
 
