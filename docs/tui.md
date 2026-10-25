@@ -156,6 +156,7 @@ Type `/` to see the list. A line that is only `/something` unknown to novacode i
 | `/context` | Where the context window goes. |
 | `/docs [question]` | Add a hidden note telling the model where novacode's own docs (`~/.novacode/docs/`) and your config files are, then ask the question if you gave one. Use it to have the session set up or customise novacode. |
 | `/usage` | Tokens and cost per route, cache warming, memory workers and subscription windows. |
+| `/account [name]` | Subscription accounts of the current provider: `/account` lists them and shows the active one, `/account <name>` sends requests to that account from the next one on. See [providers](providers.md#several-accounts). |
 | `/debug` | Route, cache, queues, processes, MCP and log paths, for bug reports. |
 | `/ps` | Open the process popup: one process at a time with its live output in the program's own colors (else errors red, warnings yellow, success green, URLs blue). `←`/`→` (or `h`/`l`) switch process, `↑`/`↓` (or `k`/`j`) and `PageUp`/`PageDown` scroll, `g`/`G` (or `Home`/`End`) jump to the top or back to the live tail, `Esc` or `q` closes. |
 | `/mcp` | MCP servers: status and tool counts. See [mcp](mcp.md). |

@@ -61,6 +61,9 @@ pub struct State {
     pub cwd: String,
     /// `provider/model`.
     pub model: String,
+    /// The subscription account requests go to (`default`, `mili`, …); absent on API-key routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     pub level: ThinkingLevel,
     pub window_tokens: u64,
     /// A run is in progress (between `agent_start` and `settled`).

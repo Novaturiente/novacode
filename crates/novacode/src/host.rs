@@ -4,6 +4,7 @@
 
 use crate::hub::Hub;
 use crate::{Inputs, ago, attach, export_session, models};
+use novacode_ai::adapter::Adapter;
 use novacode_ai::connect::Providers;
 use novacode_ai::trace::Trace;
 use novacode_base::paths::Paths;
@@ -38,6 +39,8 @@ pub struct Host {
     pub goals: Option<Arc<crate::goals::Goals>>,
     /// The `/login` running now: where pasted text goes, and how to stop it.
     pub login: Mutex<Option<(UnboundedSender<String>, tokio::task::AbortHandle)>>,
+    /// The current model's adapter, for `/account`, and the task copying its account into the state.
+    pub adapter: Mutex<Option<(Arc<dyn Adapter>, tokio::task::AbortHandle)>>,
 }
 
 /// Mode commands (L10.7), handled here so they work in every window and over RPC.
@@ -57,12 +60,35 @@ pub const MODE_COMMANDS: &[(&str, &str)] = &[
         "tokens and cost per route, cache warming, memory workers, subscription windows",
     ),
     (
+        "/account",
+        "subscription account: /account lists them, /account <name> switches",
+    ),
+    (
         "/debug",
         "route, cache, queues, processes, MCP and log paths, for bug reports",
     ),
 ];
 
 impl Host {
+    /// Use `a` from now on for `/account`, and keep `State.account` on its current
+    /// account through rotations and switches (tmux `@agent_account`, status, RPC).
+    pub fn follow_account(&self, a: Arc<dyn Adapter>) {
+        let mut rx = a.follow_account();
+        let account = rx.as_mut().map(|r| r.borrow_and_update().clone());
+        self.hub.update(false, |s| s.account = account);
+        let hub = self.hub.clone();
+        let task = tokio::spawn(async move {
+            let Some(mut rx) = rx else { return };
+            while rx.changed().await.is_ok() && !hub.is_closed() {
+                let name = rx.borrow_and_update().clone();
+                hub.update(false, |s| s.account = Some(name));
+            }
+        });
+        if let Some((_, old)) = self.adapter.lock().unwrap().replace((a, task.abort_handle())) {
+            old.abort();
+        }
+    }
+
     /// `p` (as the tools named it) when the session started: `None` = no checkpoint
     /// to tell; `Some(None)` = it didn't exist yet.
     fn session_base(&self, p: &str) -> Option<Option<String>> {
@@ -188,16 +214,27 @@ impl Host {
                     let file = session::dir_for(&me.paths, &me.cwd).join(format!("{}.jsonl", me.id));
                     let entries = novacode_core::export::read(&file).map(|(_, e)| e).unwrap_or_default();
                     let cur = me.cur.lock().unwrap().0.clone();
+                    let account = me.hub.state().account;
                     let text = format!(
                         "{}\n{}",
                         crate::usage::report(&me.providers, &entries),
-                        crate::usage::quotas(me.paths.home(), &me.providers, &cur).await
+                        crate::usage::quotas(me.paths.home(), &me.providers, &cur, account.as_deref()).await
                     );
                     let _ = ui.send(UiEvent::Page {
                         title: "Usage".into(),
                         text,
                     });
                 });
+            }
+            Cmd::Prompt(t) | Cmd::Steer(t) if t.split_whitespace().next() == Some("/account") => {
+                let arg = t.trim().strip_prefix("/account").unwrap_or("").trim();
+                let a = self.adapter.lock().unwrap().as_ref().map(|(a, _)| a.clone());
+                let (text, error) = match a.map(|a| account_command(a.as_ref(), arg)) {
+                    Some(Ok(t)) => (t, false),
+                    Some(Err(e)) => (e, true),
+                    None => ("no model is connected".into(), true),
+                };
+                let _ = ui.send(UiEvent::Notice { text, error });
             }
             Cmd::Prompt(t) | Cmd::Steer(t) if t.trim() == "/debug" => {
                 let _ = ui.send(UiEvent::Page {
@@ -329,6 +366,7 @@ impl Host {
                                 s.window_tokens = sw.window_tokens;
                                 s.price = price;
                             });
+                            me.follow_account(sw.adapter.clone());
                             me.hub.handle.set_model(sw);
                             let _ = tx.send(ev);
                         }
@@ -890,6 +928,21 @@ impl Host {
         let file = session::dir_for(&self.paths, &self.cwd).join(format!("{}.jsonl", self.id));
         export_session(&self.paths, &file, html, None)
     }
+}
+
+/// `/account` lists the provider's accounts; `/account <name>` switches to one.
+fn account_command(a: &dyn Adapter, arg: &str) -> Result<String, String> {
+    let cur = a
+        .follow_account()
+        .map(|r| r.borrow().clone())
+        .ok_or("this model is not on a subscription login, so it has no accounts")?;
+    if arg.is_empty() {
+        return Ok(format!("accounts: {} (active: {cur})", a.accounts().join(", ")));
+    }
+    a.switch_account(arg)?;
+    Ok(format!(
+        "switched to account `{arg}` from the next request; rotation still moves on when it runs out"
+    ))
 }
 
 fn is_mode_command(t: &str) -> bool {

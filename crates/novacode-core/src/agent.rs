@@ -1088,6 +1088,11 @@ impl Agent {
         &self.cfg
     }
 
+    /// The model adapter the session started with.
+    pub fn adapter(&self) -> &Arc<dyn Adapter> {
+        &self.adapter
+    }
+
     pub fn with_policy(mut self, policy: Policy) -> Self {
         self.policy = Arc::new(policy);
         self

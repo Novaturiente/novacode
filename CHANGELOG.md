@@ -2,6 +2,14 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [Unreleased]
+
+### Added
+
+- **Usage per account.** Subscription usage is cached per login in `~/.novacode/cache/usage/<provider>-<account>.json`, fetched with that account's token, so two Claude accounts no longer share one set of numbers. `<provider>.json` is still written, for the account a session uses.
+- **Which account a session is on.** The tmux pane option `@agent_account`, `account` in `novacode status --json`, the `{account}` field for `--format`, and `account` in the RPC state. They follow account rotation, not only the start.
+- **`/account`** lists the provider's accounts; `/account <name>` switches to one from the next request. Rotation still moves on when that account runs out.
+
 ## [0.3.3] - 2026-10-26
 
 ### Fixed

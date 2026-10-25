@@ -104,6 +104,41 @@ async fn notify(title: &str, body: &str, in_tmux: bool) {
     }
 }
 
+/// The pane's `@agent` options for state `st`, as one tmux command line.
+fn pane_args(p: &str, st: &str, s: &State, proj: Option<&str>) -> Vec<String> {
+    let mut opts = vec![
+        ("@agent", Some("novacode")),
+        ("@agent_state", Some(st)),
+        ("@agent_cwd", Some(s.cwd.as_str())),
+        ("@agent_model", Some(s.model.as_str())),
+        // Unset on API-key routes, so a switch away from a subscription clears it.
+        ("@agent_account", s.account.as_deref()),
+    ];
+    if let Some(f) = s.file.as_deref().filter(|f| !f.is_empty()) {
+        opts.push(("@agent_session", Some(f)));
+    }
+    if let Some(pr) = proj {
+        opts.push(("@agent_project", Some(pr)));
+    }
+    let mut args = Vec::new();
+    for (name, value) in opts {
+        if !args.is_empty() {
+            args.push(";".to_string());
+        }
+        args.extend(["set", "-p", "-t", p].map(String::from));
+        match value {
+            Some(v) => args.extend([name.to_string(), v.to_string()]),
+            None => args.extend(["-u".to_string(), name.to_string()]),
+        }
+    }
+    args
+}
+
+/// The model or account moved: publish the pane options again.
+fn route_changed(last: Option<&State>, s: &State) -> bool {
+    last.is_none_or(|l| l.model != s.model || l.account != s.account)
+}
+
 static HERDR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One request line to herdr; true once it answers anything.
@@ -196,7 +231,7 @@ pub fn spawn(hub: &Arc<Hub>, sinks: Sinks) -> tokio::task::JoinHandle<()> {
             let s = changed.borrow_and_update().clone();
             let prev = last.as_ref().map_or(ActState::Idle, |l| l.activity.state);
             let state_changed = last.as_ref().is_none_or(|l| l.activity.state != s.activity.state);
-            let route_changed = last.as_ref().is_none_or(|l| l.model != s.model);
+            let route_changed = route_changed(last.as_ref(), &s);
             if let Some(p) = &sinks.tmux_pane
                 && last.as_ref().is_none_or(|l| l.processes.len() != s.processes.len())
             {
@@ -223,43 +258,8 @@ pub fn spawn(hub: &Arc<Hub>, sinks: Sinks) -> tokio::task::JoinHandle<()> {
                     st = "done";
                 }
                 let proj = edited_project.clone().or_else(|| cwd_project.clone());
-                let file = s.file.clone().unwrap_or_default();
-                let mut args = vec![
-                    "set",
-                    "-p",
-                    "-t",
-                    p,
-                    "@agent",
-                    "novacode",
-                    ";",
-                    "set",
-                    "-p",
-                    "-t",
-                    p,
-                    "@agent_state",
-                    st,
-                    ";",
-                    "set",
-                    "-p",
-                    "-t",
-                    p,
-                    "@agent_cwd",
-                    &s.cwd,
-                    ";",
-                    "set",
-                    "-p",
-                    "-t",
-                    p,
-                    "@agent_model",
-                    &s.model,
-                ];
-                if !file.is_empty() {
-                    args.extend([";", "set", "-p", "-t", p, "@agent_session", &file]);
-                }
-                if let Some(pr) = &proj {
-                    args.extend([";", "set", "-p", "-t", p, "@agent_project", pr]);
-                }
-                tmux(&args).await;
+                let args = pane_args(p, st, &s, proj.as_deref());
+                tmux(&args.iter().map(String::as_str).collect::<Vec<_>>()).await;
                 if state_changed && sinks.notify && !seen && matches!(st, "done" | "blocked") {
                     let place = Path::new(&s.cwd)
                         .file_name()
@@ -326,6 +326,7 @@ pub fn spawn(hub: &Arc<Hub>, sinks: Sinks) -> tokio::task::JoinHandle<()> {
                 "@agent_cwd",
                 "@agent_project",
                 "@agent_model",
+                "@agent_account",
                 "@agent_bg",
             ] {
                 if !args.is_empty() {
@@ -336,4 +337,39 @@ pub fn spawn(hub: &Arc<Hub>, sinks: Sinks) -> tokio::task::JoinHandle<()> {
             tmux(&args).await;
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_account_is_published_and_a_switch_republishes() {
+        let mut s = State {
+            cwd: "/w".into(),
+            model: "claude/claude-opus-5-5".into(),
+            account: Some("default".into()),
+            ..Default::default()
+        };
+        let line = pane_args("%1", "idle", &s, None).join(" ");
+        assert!(line.contains("set -p -t %1 @agent_account default"), "{line}");
+        assert!(line.contains("@agent_model claude/claude-opus-5-5"), "{line}");
+        // Rotation (or /account) changes only the account: the options go out again.
+        let before = s.clone();
+        s.account = Some("mili".into());
+        assert!(route_changed(Some(&before), &s));
+        assert!(!route_changed(Some(&s), &s));
+        assert!(
+            pane_args("%1", "working", &s, Some("repo"))
+                .join(" ")
+                .contains("@agent_account mili")
+        );
+        // An API-key route has no account: unset it.
+        s.account = None;
+        assert!(
+            pane_args("%1", "idle", &s, None)
+                .join(" ")
+                .contains("set -p -t %1 -u @agent_account")
+        );
+    }
 }

@@ -3,7 +3,8 @@
 //! adapter while the token is unchanged. When an account is exhausted
 //! (quota, or a rate limit longer than the retry policy waits) before any
 //! output, it moves on to the provider's next logged-in account and stays
-//! there. It never falls back to a metered API key.
+//! there. `/account` switches by hand; rotation still applies afterwards.
+//! It never falls back to a metered API key.
 
 use crate::adapter::{Adapter, Builder, EVENT_BUFFER, Request};
 use crate::auth::AuthError;
@@ -27,6 +28,8 @@ struct Inner {
     provider: String,
     accounts: Vec<String>,
     current: AtomicUsize,
+    /// The current account's name, for the tmux pane and status (L8.14, L8.15).
+    named: tokio::sync::watch::Sender<String>,
     trace: Option<Trace>,
     cached: Mutex<Option<Built>>,
     /// Test seam: make the credential lookup fail with this error.
@@ -71,6 +74,7 @@ impl Live {
         Self {
             inner: Arc::new(Inner {
                 provider: provider.into(),
+                named: tokio::sync::watch::Sender::new(accounts[0].clone()),
                 accounts,
                 current: AtomicUsize::new(0),
                 trace,
@@ -122,6 +126,11 @@ fn exhausted(stop: &StopReason) -> bool {
 }
 
 impl Inner {
+    fn set_current(&self, i: usize) {
+        self.current.store(i, Ordering::Relaxed);
+        self.named.send_replace(self.accounts[i].clone());
+    }
+
     async fn adapter(&self, i: usize) -> Result<Arc<dyn Adapter>, AuthFailure> {
         let account = &self.accounts[i];
         #[cfg(test)]
@@ -164,7 +173,7 @@ impl Inner {
                         if tx.send(StreamEvent::Notice { text: note }).await.is_err() {
                             return;
                         }
-                        self.current.store(next, Ordering::Relaxed);
+                        self.set_current(next);
                         continue 'accounts;
                     }
                     return Builder::new(tx, &self.provider, &req.model).fail(kind, msg).await;
@@ -205,7 +214,7 @@ impl Inner {
                     self.providers
                         .auth
                         .mark_exhausted(&self.provider, &self.accounts[i], now_ms() + wait);
-                    self.current.store(next, Ordering::Relaxed);
+                    self.set_current(next);
                     continue 'accounts;
                 }
                 // Last account out too: say when it resets and how to add one.
@@ -249,6 +258,26 @@ impl Adapter for Live {
     fn warm_ttl(&self, req: &Request) -> Option<std::time::Duration> {
         let built = self.inner.cached.lock().unwrap().as_ref().map(|b| b.2.clone());
         built.and_then(|a| a.warm_ttl(req))
+    }
+
+    fn follow_account(&self) -> Option<tokio::sync::watch::Receiver<String>> {
+        Some(self.inner.named.subscribe())
+    }
+
+    fn accounts(&self) -> Vec<String> {
+        self.inner.accounts.clone()
+    }
+
+    fn switch_account(&self, name: &str) -> Result<(), String> {
+        let i = self.inner.accounts.iter().position(|a| a == name).ok_or_else(|| {
+            format!(
+                "no {} account `{name}` in this session (accounts: {})",
+                self.inner.provider,
+                self.inner.accounts.join(", ")
+            )
+        })?;
+        self.inner.set_current(i);
+        Ok(())
     }
 
     fn stream(&self, req: Request, cancel: CancellationToken) -> mpsc::Receiver<StreamEvent> {
@@ -384,6 +413,8 @@ mod tests {
         let (first, _) = p.adapter_for("sub", "default", None).await.unwrap();
         let a = Live::new(p.clone(), "sub", p.auth.accounts("sub"), None, first);
         assert_eq!(a.account(), "default");
+        let mut named = a.follow_account().unwrap();
+        assert_eq!(*named.borrow_and_update(), "default");
         let req = Request {
             tail: Vec::new(),
             model: "m".into(),
@@ -408,6 +439,8 @@ mod tests {
             "{:?}",
             m.error_message
         );
+        assert!(named.has_changed().unwrap(), "rotation publishes the new account");
+        assert_eq!(*named.borrow_and_update(), "work");
         // Another process starts on `work`: the exhaustion was saved.
         assert_eq!(p.auth.accounts("sub"), ["work", "default"]);
         // The next request goes straight to `work`: no notice, no quota error.
@@ -417,6 +450,15 @@ mod tests {
             (StopReason::Stop, "work".to_string()),
             "rotated once and stayed"
         );
+        // `/account`: a manual switch is published too; an unknown name changes nothing.
+        a.switch_account("default").unwrap();
+        assert_eq!(
+            (a.account(), named.borrow_and_update().clone()),
+            ("default".into(), "default".into())
+        );
+        let e = a.switch_account("nope").unwrap_err();
+        assert!(e.contains("accounts: default, work"), "{e}");
+        assert_eq!(a.account(), "default");
     }
 
     #[tokio::test]

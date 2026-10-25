@@ -1,8 +1,8 @@
 //! Subscription quota windows (L8.15, L11.4): 5-hour and weekly usage of the
 //! Claude and Antigravity logins. Every novacode process shares one cache file
-//! per provider, so an endpoint is hit at most once per [`MAX_AGE`].
+//! per provider account, so an endpoint is hit at most once per [`MAX_AGE`].
 
-use crate::auth::{AuthStore, DEFAULT_ACCOUNT};
+use crate::auth::AuthStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -53,8 +53,14 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-fn path(home: &Path, provider: &str) -> PathBuf {
-    home.join("cache").join("usage").join(format!("{provider}.json"))
+/// `<provider>-<account>.json`; `account` `None` = `<provider>.json`, the copy of
+/// whichever account a session used last, kept for readers from before accounts.
+fn path(home: &Path, provider: &str, account: Option<&str>) -> PathBuf {
+    let name = match account {
+        Some(a) => format!("{provider}-{a}.json"),
+        None => format!("{provider}.json"),
+    };
+    home.join("cache").join("usage").join(name)
 }
 
 /// Whether `provider` has quota windows we know how to read.
@@ -188,11 +194,8 @@ fn iso_utc(t: i64) -> String {
     )
 }
 
-async fn fetch(auth: &AuthStore, provider: &str) -> Result<Value, String> {
-    let cred = auth
-        .credential(provider, DEFAULT_ACCOUNT)
-        .await
-        .map_err(|e| e.to_string())?;
+async fn fetch(auth: &AuthStore, provider: &str, account: &str) -> Result<Value, String> {
+    let cred = auth.credential(provider, account).await.map_err(|e| e.to_string())?;
     let http = crate::http::client();
     let req = match provider {
         "claude" => http
@@ -229,13 +232,13 @@ async fn fetch(auth: &AuthStore, provider: &str) -> Result<Value, String> {
     serde_json::from_slice(&bytes).map_err(|e| e.to_string())
 }
 
-/// Quota for `provider`'s default login, from the shared cache, refetched when
-/// older than [`MAX_AGE`]. `None` for providers without quota windows.
-pub async fn cached(home: &Path, auth: &AuthStore, provider: &str, model: &str) -> Option<Quota> {
+/// Quota for one login of `provider`, from the shared cache, refetched with that
+/// account's token when older than [`MAX_AGE`]. `None` for providers without quota windows.
+pub async fn cached(home: &Path, auth: &AuthStore, provider: &str, account: &str, model: &str) -> Option<Quota> {
     if !supported(provider) {
         return None;
     }
-    let file = path(home, provider);
+    let file = path(home, provider, Some(account));
     let mut c: Cache = novacode_base::storage::read_json(&file)
         .ok()
         .flatten()
@@ -247,7 +250,7 @@ pub async fn cached(home: &Path, auth: &AuthStore, provider: &str, model: &str) 
         c.backoff_until_ms = now + 15_000;
         let _ = std::fs::create_dir_all(file.parent().unwrap_or(home));
         let _ = novacode_base::storage::write_json(&file, &c, novacode_base::storage::Durability::Fast);
-        match fetch(auth, provider).await {
+        match fetch(auth, provider, account).await {
             Ok(d) => {
                 c.data = Some(d);
                 c.at_ms = now_ms();
@@ -265,6 +268,12 @@ pub async fn cached(home: &Path, auth: &AuthStore, provider: &str, model: &str) 
         }
         let _ = novacode_base::storage::write_json(&file, &c, novacode_base::storage::Durability::Fast);
     }
+    // The account in use is the one `<provider>.json` readers mean.
+    let _ = novacode_base::storage::write_json(
+        &path(home, provider, None),
+        &c,
+        novacode_base::storage::Durability::Fast,
+    );
     let (five_hour, weekly, monthly) = c.data.as_ref().map(|d| windows(provider, model, d)).unwrap_or_default();
     Some(Quota {
         provider: provider.into(),
@@ -280,6 +289,28 @@ pub async fn cached(home: &Path, auth: &AuthStore, provider: &str, model: &str) 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn each_account_has_its_own_cache_file() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("cache").join("usage");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fresh = |pct: f64| json!({"data": {"five_hour": {"utilization": pct}}, "at_ms": now_ms()});
+        std::fs::write(dir.join("claude-default.json"), fresh(50.0).to_string()).unwrap();
+        std::fs::write(dir.join("claude-mili.json"), fresh(10.0).to_string()).unwrap();
+        let auth = AuthStore::new(home.path().join("auth.json"));
+        // Fresh files: read, no fetch.
+        let q = cached(home.path(), &auth, "claude", "mili", "m").await.unwrap();
+        assert_eq!(q.five_hour.unwrap().used_pct, 10.0);
+        let legacy: Value = serde_json::from_slice(&std::fs::read(dir.join("claude.json")).unwrap()).unwrap();
+        assert_eq!(
+            legacy["data"]["five_hour"]["utilization"], 10.0,
+            "claude.json follows the account in use"
+        );
+        let q = cached(home.path(), &auth, "claude", "default", "m").await.unwrap();
+        assert_eq!(q.five_hour.unwrap().used_pct, 50.0);
+        assert_eq!(path(home.path(), "claude", Some("mili")), dir.join("claude-mili.json"));
+    }
 
     #[test]
     fn reads_codex_windows() {

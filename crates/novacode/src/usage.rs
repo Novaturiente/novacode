@@ -125,8 +125,9 @@ fn num(n: u64) -> String {
     }
 }
 
-/// Quota windows of every subscription with a login, read through the shared cache.
-pub async fn quotas(home: &Path, p: &Providers, current: &str) -> String {
+/// Quota windows of every subscription with a login, read through the shared cache:
+/// the session's `account` for its own provider, `default` for the others.
+pub async fn quotas(home: &Path, p: &Providers, current: &str, account: Option<&str>) -> String {
     let auth = AuthStore::new(home.join("auth.json"));
     let (cur_provider, cur_model) = current.split_once('/').unwrap_or((current, ""));
     let mut s = String::from("Subscription windows\n");
@@ -137,8 +138,12 @@ pub async fn quotas(home: &Path, p: &Providers, current: &str) -> String {
         .filter(|pr| novacode_ai::quota::supported(&pr.id) && p.connected(pr))
         .map(|pr| pr.id.clone())
     {
-        let model = if provider == cur_provider { cur_model } else { "" };
-        let Some(q) = novacode_ai::quota::cached(home, &auth, &provider, model).await else {
+        let (model, acct) = if provider == cur_provider {
+            (cur_model, account.unwrap_or(novacode_ai::auth::DEFAULT_ACCOUNT))
+        } else {
+            ("", novacode_ai::auth::DEFAULT_ACCOUNT)
+        };
+        let Some(q) = novacode_ai::quota::cached(home, &auth, &provider, acct, model).await else {
             continue;
         };
         any = true;

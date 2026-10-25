@@ -49,6 +49,10 @@ novacode never falls back to a metered API key. If every account is used up, the
 
 `--account` only works for subscriptions. API keys have one key per provider.
 
+To switch by hand, type `/account` in a session to list the provider's accounts and see the active one, then `/account work` to move to `work`. The switch applies from the next request on and lasts for this session only. Automatic rotation still applies: if `work` runs out, novacode moves on to the next account. `/account` only knows accounts that were logged in when the session started (or last changed model); after a new `novacode login --account`, use `/reload`.
+
+Usage windows are kept per account in `~/.novacode/cache/usage/<provider>-<account>.json`, each fetched with that account's own token. Only the account a session uses is fetched. `novacode status` (`{account}`, and `account` in `--json`) and the tmux option `@agent_account` show the account in use. See [automation](automation.md).
+
 ## API-key providers
 
 Every other provider uses an API key. List them with:

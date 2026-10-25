@@ -2087,6 +2087,7 @@ async fn start_session(
     let mcp = agent.mcp().cloned();
     let extensions = agent.extensions().cloned();
     let modes = agent.modes().cloned();
+    let adapter = agent.adapter().clone();
     let goals = ctx.goals.lock().unwrap().take();
     let (handle, task) = agent::spawn(agent);
     let hub = hub::Hub::start(handle, history, state, local);
@@ -2104,6 +2105,7 @@ async fn start_session(
         undo: undo.clone(),
         providers: ctx.providers.clone(),
         login: Default::default(),
+        adapter: Default::default(),
         limits: models::Limits::new(&ctx.settings),
         memory_model: ctx.settings.get("memory.model"),
         trace: ctx.trace(),
@@ -2113,6 +2115,7 @@ async fn start_session(
         modes,
         goals: goals.clone(),
     });
+    host.follow_account(adapter);
     let mut live = serve::go_live(&host, bg)?;
     if let Some(g) = goals {
         live.add_task(g.watch(host.hub.handle.clone(), host.processes.clone()));
@@ -2162,17 +2165,19 @@ async fn start_session(
     Ok((live, task))
 }
 
-/// Keep `State.quota` current: at start and after each task.
+/// Keep `State.quota` current: at start, after each task and when the account changes.
 fn quota_task(host: Arc<host::Host>) -> tokio::task::JoinHandle<()> {
     let mut changed = host.hub.changed.subscribe();
     tokio::spawn(async move {
         let auth = AuthStore::new(host.paths.home().join("auth.json"));
         let mut was_busy = true;
+        let mut was_account = None;
         loop {
             let s = changed.borrow_and_update().clone();
-            if was_busy && !s.busy {
+            if (was_busy || s.account != was_account) && !s.busy {
                 let (provider, model) = s.model.split_once('/').unwrap_or((&s.model, ""));
-                if let Some(q) = novacode_ai::quota::cached(host.paths.home(), &auth, provider, model).await
+                let account = s.account.as_deref().unwrap_or(novacode_ai::auth::DEFAULT_ACCOUNT);
+                if let Some(q) = novacode_ai::quota::cached(host.paths.home(), &auth, provider, account, model).await
                     && s.quota.as_ref() != Some(&q)
                 {
                     host.hub.update(false, |st| st.quota = Some(q));
@@ -2190,6 +2195,9 @@ fn quota_task(host: Arc<host::Host>) -> tokio::task::JoinHandle<()> {
                 }
             }
             was_busy = s.busy;
+            if !s.busy {
+                was_account = s.account.clone();
+            }
             if host.hub.is_closed() || changed.changed().await.is_err() {
                 break;
             }

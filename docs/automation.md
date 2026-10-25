@@ -172,7 +172,7 @@ A line that isn't a valid command gets `{"type":"response","command":"parse","ok
 
 ### Slash commands over RPC
 
-`prompt` text starting with `/` runs the command in the session instead of going to the model. These work: `/compact`, `/context`, `/mcp`, `/name <text>`, `/worktree [name|exit|remove]`, `/btw <q>`, `/docs`, `/export [html]`, `/model <id>`, `/thinking <level>`, `/plan`, `/mode`, `/goal`, `/usage`, `/debug`, plus skills, prompt templates and extension commands. `get_commands` lists them.
+`prompt` text starting with `/` runs the command in the session instead of going to the model. These work: `/compact`, `/context`, `/mcp`, `/name <text>`, `/worktree [name|exit|remove]`, `/btw <q>`, `/docs`, `/export [html]`, `/model <id>`, `/thinking <level>`, `/plan`, `/mode`, `/goal`, `/usage`, `/account [name]`, `/debug`, plus skills, prompt templates and extension commands. `get_commands` lists them.
 
 These need the session's own window and answer with an error such as `/resume works only in the session's own window`: `/resume`, `/new`, `/tree`, `/rewind`, `/fork`, `/clone`, `/reload`, `/restart`, `/login`, `/keys`, `/copy`, `/ps`, `/quit`. `/model` and `/thinking` without an argument (the pickers) fail the same way. The session-changing ones also don't work in a window opened with `novacode attach`.
 
@@ -183,6 +183,7 @@ These need the session's own window and answer with an error such as `/resume wo
 | Field | Meaning |
 |---|---|
 | `session`, `cwd`, `model`, `level` | Session id, folder, `provider/model`, thinking level |
+| `account?` | The subscription account requests go to (`default`, `work`, …). It changes when novacode rotates accounts or you use `/account`. Absent on API-key routes. |
 | `window_tokens`, `context_tokens` | Context window size and tokens in use |
 | `compactions` | Compactions on the session's current branch |
 | `busy` | A run is in progress |
@@ -279,7 +280,7 @@ The id is printed to stdout; the other lines go to stderr. The session runs in i
 | `novacode status --format TEMPLATE` | A template, e.g. `'{state} {ctx}% {5h}'` |
 | `novacode stop ID` | End a live session, a background one included. It sends the stop request and returns without waiting. An unknown id exits `1`. |
 
-`status` fields are: `session state detail model level ctx ctx_tokens window hit read write miss cost 5h week branch project cwd bg`. It exits with `1` when there is no live session, which makes it easy to use in scripts and in a tmux status line (`#(novacode status --format '{state}')`).
+`status` fields are: `session state detail model account level ctx ctx_tokens window hit read write miss cost 5h week branch project cwd bg`. It exits with `1` when there is no live session, which makes it easy to use in scripts and in a tmux status line (`#(novacode status --format '{state}')`).
 
 A background session that needs an approval waits in the `blocked` state until you attach and answer. Give it allow rules or `--mode read-only` if you want it to run on its own.
 
@@ -316,6 +317,7 @@ Inside tmux, a session in its own window sets these options on its pane, so your
 | `@agent` | `novacode` |
 | `@agent_state` | `working`, `blocked`, `idle`, or `done` (it finished while you weren't looking at the pane) |
 | `@agent_cwd`, `@agent_model` | Folder and model |
+| `@agent_account` | The subscription account in use, e.g. `default`. Updated when novacode rotates accounts or you use `/account`. Unset on API-key routes. |
 | `@agent_session` | Session file |
 | `@agent_project` | The repo name |
 | `@agent_bg` | How many background processes are running (unset when none) |

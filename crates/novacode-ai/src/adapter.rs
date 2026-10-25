@@ -71,6 +71,19 @@ pub trait Adapter: Send + Sync {
     fn native_tool_changes(&self, _model: &str) -> bool {
         false
     }
+    /// The subscription account requests go to (L2.14): its name now and after every
+    /// switch, rotation or `/account`. `None` = the provider has no accounts.
+    fn follow_account(&self) -> Option<tokio::sync::watch::Receiver<String>> {
+        None
+    }
+    /// The logged-in accounts [`switch_account`](Self::switch_account) can pick.
+    fn accounts(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Send requests to `name` from the next one on (`/account`).
+    fn switch_account(&self, _name: &str) -> Result<(), String> {
+        Err("this provider has no accounts to switch between".into())
+    }
     /// Model ids this account can use right now (the live list, L2.10).
     fn list_models(&self) -> futures_util::future::BoxFuture<'_, Result<Vec<String>, String>> {
         Box::pin(async { Err("this provider has no model list".to_string()) })
