@@ -79,11 +79,11 @@ Params: `path`, `edits` (a list of `old_text` / `new_text`). Each `old_text` mus
 | `timeout` | Seconds. Default 120, max 600. |
 | `intent` | One short sentence on why; shown to you. |
 | `justification` | Only when the safety check asks for it with nobody to approve. See [Security](security.md). |
-| `unsandboxed` | `true` runs this one command outside the [sandbox](security.md#sandbox), for a command that needs what it hides or blocks: Docker, `ssh` with an agent, anything that talks to a unix socket or needs a secret variable. |
+| `unsandboxed` | `true` runs this one command outside the [sandbox](security.md#sandbox), for a command that needs what it hides or blocks: Docker, `ssh` with an agent, anything that talks to a unix socket or needs a secret variable. Read-only mode refuses it, `ask` mode asks first, and in `auto` mode the [command judge](security.md#command-judge) checks every such call. |
 
 On Linux with bubblewrap, commands run in the sandbox: the project, `/tmp` and tool caches are writable, the rest is read-only, credentials and secret environment variables are hidden, and unix sockets are blocked. Each call is a fresh shell: `cd` and `export` don't carry over to the next call. stdout and stderr are merged. stdin is closed, so interactive programs fail instead of hanging. The command sees `NOVACODE_SESSION_ID`. In memory, only the last 4 MB of output is kept.
 
-A command that passes its timeout is not killed: it moves to the process manager and keeps running, and the model gets its id. If it is still running at twice the timeout, you are asked whether to keep it. (Without a process manager, such as in some embedded runs, it is killed at the timeout.)
+A command that passes its timeout is not killed: it moves to the process manager and keeps running, and the model gets its id. If it is still running at twice the timeout, the model gets a notice to keep it running or stop it. (Without a process manager, such as in some embedded runs, it is killed at the timeout.)
 
 ### grep, find, ls
 
@@ -219,10 +219,12 @@ What a script has:
 - `await mcp.<server>.<tool>(args)` calls an MCP tool (`mcp.server["tool-name"]` for dashed names). A tool that returns structured content gives the script an object, not text.
 - A result with images gives `{text, images}`. With structured content too, the images are added to the object as `images` (or it becomes `{structured, images}` when that name is taken or the content is not an object). Each image is `{type: "image", data, mimeType}`, and `image()` takes it as is, so a screenshot tool's picture can reach the model.
 - `searchTools(query)`, `describeTool(name)` and `describeNamespace(server)` show what exists, the argument types and the return type.
-- `store(key, value)` and `load(key)` keep JSON values between scripts in the same session. They are lost when novacode restarts.
+- `store(key, value)` and `load(key)` keep JSON values between scripts in the same session. They are lost when novacode restarts. All stored values together may take 8 MiB; past that, `store` throws.
 - `models.getAvailableOfType("classifier")` and `models.classify(model, {...})` for classifier models.
 
 There are no Node or browser APIs: no `require`/`import`, `fs`, `process`, `fetch` or timers. Everything goes through tools.
+
+Before a script runs, novacode checks it. A name that doesn't exist here (a Node or browser name, an undefined variable), an unknown tool or MCP server, or a wrong or missing argument name stops it with `Script not run:`, the line numbers and the tool's declaration. No call has run at that point. When the check is unsure, the script runs. MCP calls also have their arguments checked against the tool's schema when they are made, and fail without reaching the server. Some errors end with a `Hint:` line about the likely mistake.
 
 The tool description lists each MCP server's tool signatures, as known from the last connect (see [mcp.md](mcp.md)). A server without a known list, or past the size budget, shows its name only.
 

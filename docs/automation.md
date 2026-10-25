@@ -48,6 +48,8 @@ In print mode there is no one to answer a permission question. Anything that wou
 - Add allow rules for the commands you want in your global settings (see [security](security.md)). Permission rules are read from your global settings only.
 - Or limit what the run can do: `--mode read-only` for a review that must not change files, or `--profile scout` for read-only search tools.
 
+The other guard rails work as in the TUI. In `auto` mode the [command judge](security.md#command-judge) still checks risky commands, and a command it blocks is refused with `Refused by the command judge: <reason>`. Commands run in the [sandbox](security.md#sandbox) when bubblewrap works.
+
 ```sh
 novacode --mode read-only -p "list the TODOs in this repo"
 ```
@@ -194,6 +196,7 @@ These need the session's own window and answer with an error such as `/resume wo
 | `started_ms`, `task_started_ms?` | Unix milliseconds: session start, running task start |
 | `processes?` | Commands running in the process manager |
 | `mcp?` | `[ready, configured]` MCP servers |
+| `host?` | `{servers, loaded, parts}`: each MCP server's status and tool count, what loaded (skills, extensions, …) and where the context goes, for the Usage tab |
 
 Fields marked `?` are left out when they have no value.
 

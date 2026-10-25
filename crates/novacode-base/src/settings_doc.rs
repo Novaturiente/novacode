@@ -80,7 +80,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "hooks.onActivity",
         "string",
         "unset",
-        "Shell command run on working/blocked/idle changes, State JSON on stdin.",
+        "Shell command run on working/blocked/idle changes, State JSON on stdin. Killed after 10 s.",
     ),
     (
         "processExtensions",
@@ -128,7 +128,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "sandbox.denyRead",
         "list",
         "[]",
-        "Global only. More files and folders hidden inside the sandbox (`~/` allowed), besides credentials, logins and token files.",
+        "Global only. More files and folders hidden inside the sandbox (`~/` allowed), besides credentials, logins, token files and private data (shell history, browser and mail profiles, the keyring).",
     ),
     (
         "security.maskSecrets",
@@ -164,7 +164,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "memory.compactAtTokens",
         "number",
         "min(80% of window, 400k)",
-        "Context size that triggers auto-compaction.",
+        "Context size that triggers auto-compaction. During a run it fires at 95% of the window at most; a value at or above the window turns auto-compaction off.",
     ),
     (
         "memory.reflectAfterTokens",
@@ -297,7 +297,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "ui.theme",
         "string",
         "`auto`",
-        "auto, dark (catppuccin-mocha), light (catppuccin-latte) or a file in `~/.novacode/themes` or an installed package's `themes` folder.",
+        "auto (follows the terminal background), dark (catppuccin-mocha), light (catppuccin-latte) or a file in `~/.novacode/themes` or an installed package's `themes` folder.",
     ),
     (
         "ui.turnCollapse",
@@ -321,7 +321,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "ui.statusline",
         "object",
         "built-in rows",
-        "`placement` and `rows` of segments (activity, ctx, cache, model, …). Segment names are in docs/tui.md.",
+        "`placement` (`above` the input, else below) and `rows` of segments (activity, ctx, cache, model, …). Segment names are in docs/tui.md.",
     ),
     (
         "ui.icons",

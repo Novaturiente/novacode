@@ -6,7 +6,7 @@ This page lists the tools novacode gives you to find out what went wrong, where 
 
 | Tool | What it tells you |
 |---|---|
-| `novacode doctor` | Checks every connected provider (one model-list call each), your settings files, your key bindings, and skills, prompts, agents and packages that were skipped or disabled. Exits with a failure code if a provider, setting or key has a problem, or if no provider is connected. |
+| `novacode doctor` | Checks every connected provider (one model-list call each), your settings files, your key bindings, and skills, prompts, agents and packages that were skipped or disabled. Exits with a failure code if a provider, setting or key has a problem, if no provider is connected, or if `sandbox.mode` is `on` and the sandbox can't work. |
 | `novacode auth status` | Each login and key, where it comes from, and when its stored token expires (read from disk, no network check) |
 | `/debug` (in a session) | Session id and file, route, context and cache numbers, queued prompts, processes, MCP server status, the log folder and how many crash logs exist |
 | `novacode mcp list` | Connects to every MCP server and shows `ready` or `failed: <reason>` |
@@ -25,9 +25,11 @@ keys
   ✓ no clashes
 skills, prompts, agents
   ✓ nothing shadowed or disabled
+sandbox
+  ✓ on (bubblewrap)
 ```
 
-`✓` is fine and `✗` is a problem (exit code 1). `-` is a local provider whose server isn't running (not a problem). `·` is a skill, prompt or agent that was skipped or shadowed (not a problem).
+`✓` is fine and `✗` is a problem (exit code 1). `-` is a local provider whose server isn't running, or a sandbox that is off or unavailable while `sandbox.mode` is `auto` (commands then run unsandboxed; not a problem). `·` is a skill, prompt or agent that was skipped or shadowed (not a problem).
 
 ## Flags for one run
 
@@ -208,7 +210,7 @@ Open an issue at <https://github.com/Novaturiente/novacode/issues>.
    novacode debug bundle
    ```
 
-   It writes `novacode-debug-<time>.tar.gz` in the current folder and prints the path. It needs `tar` on your `PATH`. It holds `info.txt` (version, OS, terminal, the names of your logins), your settings (global and project), key bindings and `mcp.json`, the recent logs, crash logs, cache-miss and MCP/extension logs, and the newest session in this folder with its metrics file, if any. Known keys and tokens are masked, and anything shaped like a credential is masked too. Still, look inside before you share it. The session contains your conversation.
+   It writes `novacode-debug-<ms>.tar.gz` (Unix milliseconds) in the current folder and prints the path. It needs `tar` on your `PATH`. It holds `info.txt` (version, OS, terminal, the names of your logins), your settings (global and project), key bindings and `mcp.json`, the recent logs, crash logs, cache-miss and MCP/extension logs, and the newest session in this folder with its metrics file, if any. Known keys and tokens are masked, and anything shaped like a credential is masked too. Still, look inside before you share it. The session contains your conversation.
 
    | Flag | What it does |
    |---|---|

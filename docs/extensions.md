@@ -59,7 +59,7 @@ The default export gets the frozen `novacode` object (also `globalThis.novacode`
 
 ### Acting
 
-- **`exec(command, {timeout?})`**: runs `bash -c` in the session folder with no stdin and resolves to `{code, stdout, stderr}`. `code` is `null` when the command was killed. A non-zero exit doesn't throw. Catastrophic commands throw `refused: <reason>`; nothing else is checked or asked. The timeout is in seconds (default 60, at most 600); running past it throws `timed out after <n>s`.
+- **`exec(command, {timeout?})`**: runs `bash -c` in the session folder with no stdin and resolves to `{code, stdout, stderr}`. `code` is `null` when the command was killed. A non-zero exit doesn't throw. Catastrophic commands throw `refused: <reason>`; nothing else is checked or asked, and the command runs outside the sandbox. The timeout is in seconds (default 60, at most 600); running past it throws `timed out after <n>s`.
 - **`fs.read(path)`** / **`fs.write(path, text)`**: a path is relative to the session folder, absolute, or starts with `~/` (your home folder). `write` creates missing parent folders.
 - **`session.messages()`**: the conversation as of the last finished run, without the system prompt. Each message is `{role: user|assistant|tool_result|custom, …}` as stored in the session file (`custom` holds saved reminders).
 - **`complete({messages, system?, maxTokens?})`**: one model call on the session's provider, model and login. `messages` is a list of `{role: user|assistant, content: text}`. No tools are sent, and nothing is stored in the session. Resolves to `{text, usage, model}`, where `usage` is `{input, output, cache_read, cache_write, reasoning?}` in tokens. It counts against your subscription or key like any call, so don't call it in a loop.
@@ -194,7 +194,7 @@ The `ui` ops use snake_case field names. `lines` is a list of [lines](#ui-novaco
 | `stateAppend` / `stateEntries` | `{kind, data}` / `{kind}` | `state.append()` / `state.entries()` |
 | `sendMessage` | `{text, deliverAs?}` | `sendMessage()` |
 
-The notifications `notify`, `remind`, `log` and `ui` also work as `host` ops. An unknown `op` gets an error. Like a script's calls, these run with your permissions: `exec` refuses only catastrophic commands, and nothing asks for approval. Ops that need a session (`messages`, `complete`, `spawnAgent`, `stateAppend`, `sendMessage`, …) fail while you are still answering `initialize`.
+The notifications `notify`, `remind`, `log` and `ui` also work as `host` ops. An unknown `op` gets an error. Like a script's calls, these run with your permissions: `exec` refuses only catastrophic commands, runs outside the sandbox, and nothing asks for approval. Ops that need a session (`messages`, `complete`, `spawnAgent`, `stateAppend`, `sendMessage`, …) fail while you are still answering `initialize`.
 
 ### Writing one in Rust
 

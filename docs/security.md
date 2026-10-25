@@ -12,12 +12,14 @@ What the guard rails do:
 
 - A permission policy checks every tool call before it runs (including calls made from `codemode` scripts).
 - A command risk gate looks at each `bash` command and holds or refuses destructive ones.
+- In `auto` mode, a [command judge](#command-judge) (a small model) checks risky commands, and file writes outside the project, against what you asked for. When it blocks one, you get an approval card.
+- On Linux with bubblewrap, commands run in a [sandbox](#sandbox).
 - Project config that can run code only loads from folders you trust.
 - Your own logins are masked in tool output before the model sees it.
 
 What they do not do: stop a command the gate does not recognise, or stop code that a program you allowed runs on its own.
 
-**Extensions are trusted code.** Tools an [extension](extensions.md) adds go through the rules below like any tool. But the extension's own actions are not held to them. Its `exec` call only refuses Catastrophic commands: no approval cards, no `allow`/`deny` rules, no read-only mode, and your `protected` lists do not apply. Its file read and write calls are not checked at all, and absolute paths work. Only install extensions you trust.
+**Extensions are trusted code.** Tools an [extension](extensions.md) adds go through the rules below like any tool. But the extension's own actions are not held to them. Its `exec` call only refuses Catastrophic commands: no approval cards, no `allow`/`deny` rules, no read-only mode, no judge, no sandbox, and your `protected` lists do not apply. Its file read and write calls are not checked at all, and absolute paths work. Only install extensions you trust.
 
 ## Permission modes
 
@@ -132,7 +134,7 @@ The judge sees your messages of this session and the agent's recent tool calls (
 - **A command over 4000 characters:** blocked without asking the model ("too long to judge").
 - **The judge can't be reached or takes more than 20 s:** the gate's verdict stands and the command runs. You see a short notice, and the log has the error.
 
-Esc while it thinks cancels the call. Pick its model with `permissions.judge`: unset uses the observer's model (the provider's small model), `off` turns it off, or name a `provider/model[:level]`. Like all of `permissions`, this is global only. Its calls are logged but not counted in `/usage`.
+Esc while it thinks cancels the call. Pick its model with `permissions.judge`: unset uses the observer's model (the provider's small model), `off` turns it off, or name a `provider/model[:level]`. A name that doesn't resolve falls back to the observer's model, with a warning in the log. Like all of `permissions`, this is global only. Its calls are logged but not counted in `/usage`.
 
 ## Sandbox
 
@@ -180,7 +182,7 @@ When a sandboxed command fails with `Read-only file system`, the result adds one
 | `sandbox.allowWrite` | More writable folders. |
 | `sandbox.denyRead` | More hidden files and folders. |
 
-With `auto`, novacode checks once whether bubblewrap works. If it doesn't, it logs one warning and commands run unsandboxed. With `on`, commands are refused instead (except `unsandboxed: true` ones). `novacode doctor` shows the state under `sandbox`: `on (bubblewrap)`, `off (setting)`, `unavailable (bwrap not found), commands run unsandboxed`, or `unavailable (<path> is a symlink), …` for the symlink case above.
+With `auto`, novacode checks once whether bubblewrap works. If it doesn't, it logs one warning and commands run unsandboxed. With `on`, commands are refused instead (except `unsandboxed: true` ones). `novacode doctor` shows the state under `sandbox`: `on (bubblewrap)`, `off (setting)`, `unavailable (bwrap not found), commands run unsandboxed`, or `unavailable (<path> is a symlink), …` for the symlink case above. With `on` and the sandbox unavailable, `novacode doctor` exits with code 1.
 
 ## Approval dialogs
 

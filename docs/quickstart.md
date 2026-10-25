@@ -15,7 +15,7 @@ novacode needs a terminal (stdin and stdout must both be one), or it stops with 
 
 ### 1. Trust prompt
 
-If the folder has project config (`.novacode/settings.json`, `.novacode/extensions`, `.novacode/skills`, `.novacode/agents`, `.novacode/packages`, `.novacode/packages.json`, `.mcp.json` here or in a parent folder up to the git top level, or `.claude/skills`, `.claude/agents`, `.claude/commands`), novacode first asks whether to trust it. Project config can change settings and run code, so it only loads after you say yes. If it changes later, novacode asks again (see [security](security.md)).
+If the folder has project config (`.novacode/settings.json`, `.novacode/extensions`, `.novacode/skills`, `.novacode/agents`, `.novacode/packages`, `.novacode/packages.json`, `.novacode/packages.lock.json`, `.mcp.json` here or in a parent folder up to the git top level, or `.claude/skills`, `.claude/agents`, `.claude/commands`), novacode first asks whether to trust it. Project config can change settings and run code, so it only loads after you say yes. If it changes later, novacode asks again (see [security](security.md)).
 
 | Choice | Effect |
 |---|---|
@@ -47,7 +47,7 @@ Type a request and press Enter:
 explain what this project does and how to run its tests
 ```
 
-novacode reads files and runs tools on its own. In the default `auto` mode it asks you before commands that touch shared state, like a force push, and refuses catastrophic ones such as `rm -rf ~`. Other risky commands, like `rm -rf target`, run without asking. See [security](security.md) for the stricter `ask` and `read-only` modes. Add files to a prompt with `@`:
+novacode reads files and runs tools on its own. In the default `auto` mode it asks you before commands that touch shared state, like a force push, and refuses catastrophic ones such as `rm -rf ~`. Other risky commands, like `rm -rf target`, go to a small judge model first: they run unless it thinks you didn't ask for them, and then novacode asks you. On Linux with bubblewrap installed, commands run in a sandbox that hides your credentials and lets them write only in the project and a few caches. See [security](security.md) for the stricter `ask` and `read-only` modes. Add files to a prompt with `@`:
 
 ```text
 @src/main.rs why does this return early?
@@ -72,7 +72,7 @@ Start a line with `!` to run a shell command yourself. It runs, shows its output
 | Ctrl+L | Pick a model |
 | Shift+Tab | Next thinking level (how much the model reasons before it answers; see [tui](tui.md)) |
 | Ctrl+R | Search prompt history |
-| Ctrl+G | Edit the prompt in `$VISUAL` or `$EDITOR` (else the first of nvim, nano, emacs, vim, vi) |
+| Ctrl+G | Edit the prompt in `$VISUAL` or `$EDITOR` (else the first of nvim, nano, emacs, vim found, else vi) |
 | Alt+/ | Show all key bindings |
 
 Type `/` to see the slash commands. The ones you will use first:

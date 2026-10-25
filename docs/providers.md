@@ -30,7 +30,7 @@ Inside a session, `/login` opens a list of every provider (subscriptions first, 
 Every login works over SSH. Open the printed URL on any device.
 
 - **claude**: after you approve, the page shows a code. Paste it at the `paste here` prompt. The full callback URL works too.
-- **codex** and **copilot**: enter the printed code on the page. novacode keeps polling until you approve. Nothing to paste.
+- **codex** and **copilot**: enter the printed code on the page. novacode keeps polling until you approve, for up to 15 minutes. Nothing to paste.
 - **antigravity**: novacode listens on `localhost:51121` for the redirect. On a remote machine the browser's redirect to `localhost` will fail to load. That is fine: copy the full URL the browser ended on and paste it into the terminal.
 
 ### Several accounts
@@ -272,7 +272,7 @@ novacode retries failures that are likely to pass on their own: network errors, 
 
 - The provider connection retries twice quickly, after about 0.5 s and 1 s (each up to 25% shorter). It only does this before the reply starts.
 - If that fails, the agent loop retries 4 more times, after 2, 4, 8 and 16 s, each up to 25% shorter (random jitter). Each retry shows in the transcript, and Esc cancels it. The agent loop also retries an error that cuts a reply off mid-stream: the partial reply is dropped from the conversation and the request is sent again.
-- When the server asks for a specific wait, novacode waits that long instead, up to 60 s. A `retry-after` header counts for every retry. Google's retry delay is in the error body, so only the agent loop uses it, after the two quick retries. A longer requested wait is not retried; with several accounts, novacode switches account instead.
+- When the server asks for a specific wait, novacode waits that long instead, up to 60 s. The two quick retries use a `retry-after` header on any retried error. The agent loop uses the server's wait only for rate limits (429), including Google's retry delay from the error body. A rate limit that asks for a longer wait is not retried; with several accounts, novacode switches account instead. A server error (5xx) that asks for a longer wait skips the quick retries and follows the agent loop's schedule.
 
 **First-response timeout.** If a provider sends no response headers within 120 s, the attempt fails as a network error and is retried. The same 120 s limit applies to any pause between two chunks of a streamed reply.
 
@@ -286,7 +286,7 @@ novacode retries failures that are likely to pass on their own: network errors, 
 novacode auth status
 ```
 
-Shows every login and key, where it comes from (login, settings, or env var), and whether a subscription token is valid. It reads local files only and makes no network calls. It exits with code 1 when no login or key is set.
+Shows every login and key, where it comes from (login, settings, or env var), and whether a subscription token is valid. It reads local files only and makes no network calls. It also lists the local servers that need no key (`ollama`, `lmstudio`), so with the bundled providers it exits with code 0 even when you have no login or key.
 
 ```sh
 novacode doctor

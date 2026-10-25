@@ -35,7 +35,7 @@ Packages follow **releases**, not every commit.
 The latest release is:
 
 1. For a GitHub repo, the release GitHub marks as "Latest". novacode asks GitHub's public API, which needs no token or setup.
-2. Otherwise (another host, no network, or the API limit was hit), the highest version tag: `v1.2.3` or `1.2.3`, also with a name prefix such as `bin-v1.2.3`. Pre-releases like `v2.0.0-rc1` are skipped. A package pinned to a pre-release counts as just below that release, so `update` never moves it back to an older one.
+2. Otherwise (another host, no GitHub release, no network, or the API limit was hit), the highest version tag: `v1.2.3` or `1.2.3`, also with a name prefix such as `bin-v1.2.3`. Pre-releases like `v2.0.0-rc1` are skipped. A package pinned to a pre-release counts as just below that release, so `update` never moves it back to an older one.
 3. A repo with no release tags at all is installed at its newest commit and then **stays pinned** there.
 
 ```sh
@@ -53,7 +53,7 @@ What `packages update` does, by how the package was installed:
 | `--ref <branch>` | Follows the branch: moves to its newest commit. |
 | `--ref <commit>` | Stays only while the repo has no releases. Once it has any, a plain update moves it to the latest release. |
 
-To tell older from newer, novacode compares tag versions (`v1.10.0` is newer than `v1.9.0`). If the installed tag isn't a version (for example `nightly` or `v2.0.0-rc1`), it can't be compared, and the package moves to the latest release. If the installed tag is a version but the latest release isn't, the package stays.
+To tell older from newer, novacode compares tag versions (`v1.10.0` is newer than `v1.9.0`). If the installed tag isn't a version (for example `nightly`), it can't be compared, and the package moves to the latest release. If the installed tag is a version but the latest release isn't, the package stays.
 | A repo without releases | Stays where it is. `--commits` moves it to the newest commit of the default branch. If the repo later starts publishing releases, a plain update moves it to the latest one. |
 
 The command prints one line per package, for example `ponytail: v5.3.1 → v5.3.2`, `caveman: up to date (v4.0.1)` or ``my-pack: no releases; stays at 3f2a9c1d0b5e (`--commits` moves it to the newest commit)``. Linked folders are always current, so update skips them. `packages update` exits `1` if any package failed. A name that isn't installed prints nothing. `packages install` needs a [trusted](security.md) folder and stops with ``this folder isn't trusted; run `novacode trust` first`` otherwise.
@@ -69,10 +69,10 @@ package updates: caveman v4.0.1 → v4.1.0, ponytail v5.3.2 → v5.4.0: run `nov
 ```
 
 - It checks the packages `packages update` covers: your own clones. Linked folders are skipped.
-- For each one it looks up the latest release as above (GitHub's "Latest", else the highest tag from `git ls-remote`). A package that follows a branch is checked for a newer commit. Packages without releases are left out.
+- For a GitHub repo it asks only for GitHub's "Latest" release. For other hosts it takes the highest version tag from `git ls-remote`. A package that follows a branch is checked for a newer commit. Packages without releases are left out, and so is a GitHub repo with version tags but no GitHub release, although `packages update` would move it to its highest tag.
 - It only reads: no clone is fetched or changed, and nothing is installed.
 - It runs **at most once a day**, in the background, together with the check for novacode itself (see [Install](install.md#update-check)). The answer is cached in `~/.novacode/cache/updates.json`. Every interactive start shows it from the cache, minus the packages you already updated.
-- It is one GitHub API call per package (`git ls-remote` for other hosts) plus one for novacode. A package whose check fails is left out.
+- It is one GitHub API call per package (`git ls-remote` for other hosts and for packages that follow a branch) plus one for novacode. A package whose check fails is left out.
 
 To turn it off, set `"updates": {"check": false}` in `~/.novacode/settings.json`.
 
@@ -90,7 +90,7 @@ To turn it off, set `"updates": {"check": false}` in `~/.novacode/settings.json`
 }
 ```
 
-Nothing changes under you. A package stays at its recorded commit until you run `novacode packages update`. If the file isn't valid JSON, `install`, `uninstall`, `packages update` and `packages install` stop with an error that names the file. novacode leaves the damaged file as it is; fix or delete it, then run the command again. `novacode packages` still lists the packages, without their versions. Lock files from older novacode versions (without `tag`) keep working: a plain update moves such a package to its latest release if it has one.
+Nothing changes under you. A package stays at its recorded commit until you run `novacode packages update`. If the file isn't valid JSON, `install` from a git URL, `uninstall`, `packages update` and `packages install` stop with an error that names the file. novacode leaves the damaged file as it is; fix or delete it, then run the command again. `novacode packages` still lists the packages, without their versions. Lock files from older novacode versions (without `tag`) keep working: a plain update moves such a package to its latest release if it has one.
 
 ## List and remove
 
@@ -192,7 +192,9 @@ A repo can list the packages its team uses. Create `.novacode/packages.json`:
 
 The key is the package name and the value is the source (a git URL or a local path). Commit this file and `.novacode/packages.lock.json`. The installed copies live in `.novacode/packages/` (plugin data in `.novacode/plugin-data/`, options in `.novacode/package-options.json`), so add those to `.gitignore`.
 
-Project packages only load in a [trusted folder](security.md). When you open a trusted project that lists packages you don't have:
+Project packages only load in a [trusted folder](security.md). If `packages.json` or the lock file changes later (for example after a `git pull`), novacode asks about the folder again before they load; see [When project config changes](security.md#when-project-config-changes). Installing the project's packages with `novacode packages install` accepts the new files without a new question.
+
+When you open a trusted project that lists packages you don't have:
 
 - In the TUI, novacode asks once: install them, or "Not now (don't ask again here)". The message warns that packages can add tools, hooks and MCP servers that run code. Your answer is kept per project in `~/.novacode/project-packages.json`.
 - In print mode, RPC and other non-interactive runs, it prints a note and installs nothing. The note also appears in the TUI on later runs once you have answered.

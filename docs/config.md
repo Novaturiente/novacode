@@ -18,7 +18,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `permissions` | object | auto mode | Global only. `mode` auto\|ask\|read-only; `allow`/`ask`/`deny` lists of rules like `Bash(git push:*)`; `protected: {commands, paths}`; `profiles.<name>.{tools, deny}`, named tool sets; `judge`: the command judge's model in auto mode, `off` or a `provider/model[:level]` (default the observer's model). See docs/security.md. |
 | `tools.<name>.exposure` | string | per tool | How a tool reaches the model: `listed` (declared to it), `codemode` (alias `codemode-only`: only codemode scripts call it), `deferred` (found through `tool_search`) or `hidden` (user and UI only). |
 | `hooks` | object | {} | Command hooks: `beforeTool`, `afterTool` and `events.<type>`, each a command or a list; `timeoutMs` (default 5000) limits `beforeTool`, `afterTool` gets twice that. See docs/automation.md. |
-| `hooks.onActivity` | string | unset | Shell command run on working/blocked/idle changes, State JSON on stdin. |
+| `hooks.onActivity` | string | unset | Shell command run on working/blocked/idle changes, State JSON on stdin. Killed after 10 s. |
 | `processExtensions` | object | {} | Long-running JSON-RPC extensions in any language: `<name>: {command, args, env}`. See docs/extensions.md. |
 | `modes` | object | {} | Mode presets: `<name>: {prompt, readOnly, tools}`; `plan` is built in. |
 | `updates.check` | bool | true | At interactive start, show when novacode or an installed package has a newer release (checked at most once a day; nothing is installed). See docs/packages.md. |
@@ -26,13 +26,13 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `extensions.<name>` | object | unset | Settings of extension `<name>`: a process extension gets them in `initialize`, any extension through `novacode.settings.get("extensions.<name>")`. |
 | `sandbox.mode` | string | `auto` | Global only. Run the model's `bash` commands and `process` starts in a bubblewrap sandbox: `auto` (when bwrap works; otherwise one warning, then unsandboxed), `on` (refuse commands when it can't sandbox) or `off`. See docs/security.md. |
 | `sandbox.allowWrite` | list | [] | Global only. More folders the sandbox lets commands write to (`~/` allowed), besides the project, `/tmp`, `$TMPDIR` and the tool caches. |
-| `sandbox.denyRead` | list | [] | Global only. More files and folders hidden inside the sandbox (`~/` allowed), besides credentials, logins and token files. |
+| `sandbox.denyRead` | list | [] | Global only. More files and folders hidden inside the sandbox (`~/` allowed), besides credentials, logins, token files and private data (shell history, browser and mail profiles, the keyring). |
 | `security.maskSecrets` | bool | false | Also mask well-known secret shapes in tool output (GitHub/AWS/OpenAI/Anthropic/Slack/Google tokens, private keys, `*_TOKEN=`/`*_SECRET=` values) before the model sees them. Your own logins are always masked. |
 | `memory.enabled` | bool | true | Observer notes, compaction from notes and the `recall` tool. Off: compaction still runs, summarised by the session model. |
 | `memory.model` | string | the profile's small model | Model for the observer, reflector and dropper. Without a small model (or one that can't connect), the session's model. |
 | `memory.observeAfterTokens` | number | 10000 | New tokens before the observer runs. |
 | `memory.keepRecentTokens` | number | 20000 | Tokens kept verbatim after a compaction. |
-| `memory.compactAtTokens` | number | min(80% of window, 400k) | Context size that triggers auto-compaction. |
+| `memory.compactAtTokens` | number | min(80% of window, 400k) | Context size that triggers auto-compaction. During a run it fires at 95% of the window at most; a value at or above the window turns auto-compaction off. |
 | `memory.reflectAfterTokens` | number | 20000 | New conversation tokens before the reflector runs. |
 | `memory.poolTargetTokens` | number | 10000 | Size the dropper trims active notes down to. |
 | `memory.store` | bool | true | Cross-session memory (SQLite) and its start-of-session index. |
@@ -55,11 +55,11 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `debug.metrics` | bool | false | Per-session timing JSONL in `~/.novacode/metrics/` for `novacode stats`. |
 | `notifications.enabled` | bool | true | OSC 777 notification when a turn ends unwatched or needs you. |
 | `tmux.agentState` | bool | true | Set the `@agent_*` pane options inside tmux. |
-| `ui.theme` | string | `auto` | auto, dark (catppuccin-mocha), light (catppuccin-latte) or a file in `~/.novacode/themes` or an installed package's `themes` folder. |
+| `ui.theme` | string | `auto` | auto (follows the terminal background), dark (catppuccin-mocha), light (catppuccin-latte) or a file in `~/.novacode/themes` or an installed package's `themes` folder. |
 | `ui.turnCollapse` | bool | true | Fold finished turns to one line (Alt+O toggles). |
 | `ui.thinking` | string | `collapsed` | How thinking shows: collapsed, full or hidden. |
 | `ui.userMessage` | object | rounded box | Your messages' box: `border` (rounded, single, heavy, double, ascii, none), `borderColor` and `text` (`#rrggbb` or `{fg, bg, bold, italic, …}`), `paddingX` (1), `paddingY` (0). |
-| `ui.statusline` | object | built-in rows | `placement` and `rows` of segments (activity, ctx, cache, model, …). Segment names are in docs/tui.md. |
+| `ui.statusline` | object | built-in rows | `placement` (`above` the input, else below) and `rows` of segments (activity, ctx, cache, model, …). Segment names are in docs/tui.md. |
 | `ui.icons` | string | `nerd` | `unicode` when your font has no Nerd Font glyphs; any other value means `nerd` (`novacode doctor` flags it). |
 | `ui.images` | string | `auto` | Image protocol: auto, kitty, iterm2, sixel, halfblocks or off. |
 | `ui.panel.auto` | bool | true | Open the side panel by itself while todos or subagents run. |

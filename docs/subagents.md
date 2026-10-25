@@ -58,6 +58,7 @@ There is no separate `resume` action: `send` to a finished agent resumes its ses
 - **Depth.** Your session can start subagents, and those can start their own. Theirs cannot. Two levels, no more.
 - **How many at once.** At most `agents.maxConcurrent` (default 4) subagents run at the same time; more wait as `queued` and start in spawn order as others end. A subagent's own subagents run one at a time, so a tree has at most 8 running. Resuming a finished subagent with `send` takes a slot too.
 - **Permission mode.** A subagent starts in your session's permission mode. While plan mode (or another read-only preset) is on, it starts read-only, and a preset's tool list limits its tools too.
+- **Sandbox and judge.** Each subagent is its own novacode process with your global settings, so its commands run in the same [sandbox](security.md#sandbox), and in `auto` mode the [command judge](security.md#command-judge) checks them.
 - **File claims.** A subagent's first `edit`, `write` or `apply_patch` on a file claims it. Any other agent, your main session included, that then tries one of those tools on that file is refused with a message naming the holder. A claim passes down from parent to child. Claims of dead processes are dropped. Your main session never claims files, so a subagent can still edit a file you changed. Changes made through `bash` or `process` are not checked.
 - **Stall and timeout.** A subagent with no activity for `agents.stallMinutes` (default 10) is stopped. Activity is: starting a run, streaming model output, starting a tool, tool progress, a tool ending, a finished model message, and getting the answer to a question or approval it relayed to you. While it runs `agent wait` on its own subagents, it is not checked for stalls. One that runs longer than `agents.timeoutMinutes` (default 45) is stopped, waiting or not.
 - **Open cards.** When a subagent stops while one of its questions or approvals is still open, the card closes in every window (as denied or dismissed).
@@ -154,7 +155,7 @@ novacode sets a few variables for its subagent processes (`NOVACODE_AGENT_DEPTH`
 }
 ```
 
-A subagent that gets MCP servers also gets `codemode`, because MCP tools run through it. The full settings table is in [Settings](config.md).
+A subagent that gets MCP servers also gets `codemode` when its parent has it, because MCP tools run through it. The full settings table is in [Settings](config.md).
 
 ## Plan mode
 

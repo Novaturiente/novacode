@@ -121,7 +121,7 @@ novacode v0.2.6 is available (you have 0.2.3): run `novacode update`
 - Every interactive start shows the note from the cache, until you have updated. `/reload`, `/new` and `/resume` don't show it again.
 - The same check covers your packages (see [Packages](packages.md#update-check)).
 - It is one GitHub API call for novacode plus one per package. It sends only the request itself (user agent `novacode/<version>`), no identifiers.
-- A check that fails stays silent and tries again at the next start.
+- A check where every request fails stays silent and tries again at the next start. If only some requests fail, the rest is cached and the next check is a day later.
 - Nothing is installed: you run `novacode update` yourself.
 - `-p`, `serve` and subagents never check.
 
@@ -169,7 +169,7 @@ NOVACODE_HOME=/tmp/nc-test novacode
 | `~/.novacode/exhausted.json` | Which subscription accounts are used up, and until when |
 | `~/.novacode/metrics/` | Timing files, when `debug.metrics` is on |
 | `~/.novacode/logs/` | Daily log files (set `NOVACODE_LOG`, for example `NOVACODE_LOG=debug`, to change the level), plus crash, MCP server, extension and trace logs (see [troubleshooting](troubleshooting.md)) |
-| `~/.novacode/cache/` | Caches: model catalog, subscription quota, MCP tool lists, built extensions and learned tool-schema workarounds |
+| `~/.novacode/cache/` | Caches: model catalog, subscription quota, MCP tool lists and signatures, the update check (`updates.json`), built extensions and learned tool-schema workarounds |
 | `*.bak`, `*.lock` | Next to files novacode writes, such as `auth.json.bak` and `settings.json.lock`: the previous version of the file, and the lock that stops two novacode processes writing it at once |
 | `~/.novacode/run/` | Records of live sessions (used by `agents`, `attach`, `status`) |
 | `~/.novacode/docs/` | This documentation for the installed version (rewritten on every update; don't edit it). `/docs` points a session at it |
