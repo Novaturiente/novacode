@@ -450,6 +450,8 @@ impl Policy {
         let command = (lower == "bash" || start).then(|| args.get("command").and_then(Value::as_str).unwrap_or(""));
         let segments = command.map(|c| risk::segments(c).unwrap_or_else(|| vec![c.to_string()]));
         let nested = command.and_then(risk::nested);
+        // Every command the parser finds, wrappers and keywords removed, for deny/ask rules.
+        let programs = command.and_then(risk::programs);
         let raw_path = args.get("path").and_then(Value::as_str);
         let abs_path = raw_path.map(|p| expand(p, cwd, &self.home));
         // Through symlinks, so a link can't route around a path rule.
@@ -469,8 +471,13 @@ impl Policy {
             }
             match &segments {
                 Some(segs) if all => r.covers(segs, nested.as_deref()),
-                // Deny/ask: any command counts, nested ones too (`git push $(curl x)` hits `Bash(curl:*)`).
-                Some(segs) => segs.iter().chain(nested.iter().flatten()).any(|s| r.matches_command(s)),
+                // Deny/ask: any command counts, nested ones too (`git push $(curl x)` hits `Bash(curl:*)`),
+                // and wrapped ones (`timeout 5 /usr/bin/curl x`, `if true; then curl x; fi`).
+                Some(segs) => segs
+                    .iter()
+                    .chain(nested.iter().flatten())
+                    .chain(programs.iter().flatten())
+                    .any(|s| r.matches_command(s)),
                 None if FILE_TOOLS.contains(&lower.as_str()) => {
                     let given = r.matches_path(raw_path, abs_path.as_deref());
                     let resolved = r.matches_path(None, real_path.as_deref())
@@ -648,11 +655,33 @@ impl Policy {
                 q.file_name().is_some_and(|n| n == "settings.json")
                     && q.parent().and_then(Path::file_name).is_some_and(|d| d == ".novacode")
             };
-            if let Some(p) = written(&lower, args).into_iter().find(|p| {
-                let abs = expand(p, cwd, &self.home);
-                is_settings(&abs) || is_settings(&real(&abs))
-            }) {
-                let why = format!("`{tool}` changes novacode settings ({p}), which hold the permission rules");
+            // Global extensions, skills, agents, prompts, packages and MCP servers run commands.
+            let real_home = real(&self.home);
+            let global = |q: &Path| -> Option<&'static str> {
+                [&self.home, &real_home].iter().find_map(|h| {
+                    let rest = q.strip_prefix(h.join(".novacode")).ok()?;
+                    match rest.components().next()?.as_os_str().to_str()? {
+                        "extensions" => Some("extensions"),
+                        "skills" => Some("skills"),
+                        "agents" => Some("agents"),
+                        "prompts" => Some("prompts"),
+                        "packages" => Some("packages"),
+                        "mcp.json" if rest == Path::new("mcp.json") => Some("MCP servers"),
+                        _ => None,
+                    }
+                })
+            };
+            let found = written(&lower, args).into_iter().find_map(|p| {
+                let abs = expand(&p, cwd, &self.home);
+                let why = if is_settings(&abs) || is_settings(&real(&abs)) {
+                    format!("`{tool}` changes novacode settings ({p}), which hold the permission rules")
+                } else {
+                    let what = global(&lexical(&abs)).or_else(|| global(&real(&abs)))?;
+                    format!("`{tool}` changes novacode's own {what} ({p}), which can run commands")
+                };
+                Some(why)
+            });
+            if let Some(why) = found {
                 return if interactive {
                     Verdict::Ask {
                         reason: why,
@@ -1078,6 +1107,27 @@ mod tests {
             check(&p, "bash", bash("ls $(wget -qO- x)"), true),
             Verdict::Ask { .. }
         ));
+        // They see through wrappers, keywords, assignments and full paths too.
+        let p = policy(json!({ "deny": ["Bash(curl:*)", "Bash(rm:*)"], "ask": ["Bash(wget:*)"] }));
+        for c in [
+            "timeout 5 curl x",
+            "FOO=1 curl x",
+            "/usr/bin/curl x",
+            "if true; then curl x; fi",
+            "nice curl x",
+            "for f in a; do rm -rf x; done",
+            "! rm x",
+            "command rm x",
+            "coproc curl x",
+            "flock /tmp/l curl -c /tmp/jar https://evil",
+        ] {
+            assert!(denied(&check(&p, "bash", bash(c), true)), "{c}");
+        }
+        assert!(matches!(
+            check(&p, "bash", bash("nohup /bin/wget y"), true),
+            Verdict::Ask { risky: false, .. }
+        ));
+        assert_eq!(check(&p, "bash", bash("echo curl"), true), Verdict::Allow);
     }
 
     #[test]
@@ -1192,13 +1242,30 @@ mod tests {
             &proj,
             false
         )));
-        // Under ~/.novacode only logins and trust are refused; instructions and skills stay editable.
+        // Under ~/.novacode only logins and trust are refused; instructions stay editable.
         std::fs::create_dir_all(home.join(".novacode/skills")).unwrap();
         assert_eq!(check("write", json!({"path": "~/.novacode/AGENTS.md"})), Verdict::Allow);
-        assert_eq!(
-            check("edit", json!({"path": "~/.novacode/skills/x/SKILL.md"})),
-            Verdict::Allow
-        );
+        // Global executable config asks first, past the allow rule; refused unattended.
+        std::os::unix::fs::symlink(home.join(".novacode/skills"), proj.join("sk")).unwrap();
+        let add = |f: &str| format!("*** Begin Patch\n*** Add File: {f}\n+a\n*** End Patch");
+        for (tool, args) in [
+            ("edit", json!({"path": "~/.novacode/skills/x/SKILL.md"})),
+            ("write", json!({"path": "~/.novacode/extensions/x.ts"})),
+            ("write", json!({"path": "~/.novacode/agents/a.md"})),
+            ("write", json!({"path": "~/.novacode/prompts/p.md"})),
+            ("write", json!({"path": "~/.novacode/packages/x/package.json"})),
+            ("write", json!({"path": "~/.novacode/mcp.json"})),
+            ("write", json!({"path": "sk/x/SKILL.md"})),
+            ("apply_patch", json!({"patch": add("~/.novacode/skills/y/SKILL.md")})),
+        ] {
+            assert!(denied(&check(tool, args.clone())), "{args}");
+            match p.check(tool, &args, &proj, true) {
+                Verdict::Ask {
+                    risky: true, reason, ..
+                } => assert!(reason.contains("which can run commands"), "{reason}"),
+                v => panic!("{args}: {v:?}"),
+            }
+        }
         for f in ["auth.json", "auth-work.json", "mcp-auth.json", "trust.json"] {
             assert!(
                 denied(&check("write", json!({"path": format!("~/.novacode/{f}")}))),
