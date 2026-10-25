@@ -846,9 +846,12 @@ impl Supervisor {
 
     fn with<R>(&self, n: &str, f: impl FnOnce(&mut Child) -> R) -> Option<R> {
         let mut g = self.children.lock().unwrap();
-        let c = g
-            .iter_mut()
-            .find(|c| c.n == n || c.session.as_deref().is_some_and(|s| s.starts_with(n)))?;
+        // A name wins over a session-id prefix: a session starting `a3…` must not catch `a3`.
+        let i = g.iter().position(|c| c.n == n).or_else(|| {
+            g.iter()
+                .position(|c| c.session.as_deref().is_some_and(|s| s.starts_with(n)))
+        })?;
+        let c = &mut g[i];
         let r = f(c);
         self.publish(c);
         drop(g);
@@ -1854,7 +1857,9 @@ mod tests {
         let lines = [
             "#!/usr/bin/env python3".to_string(),
             "import sys, json, os, uuid, time".into(),
-            format!("print({hello:?}.replace('SESSION', str(uuid.uuid4())), flush=True)"),
+            // Every session starts like a child name, so a name lookup that matched session
+            // prefixes first would pick the wrong child (it did, 1 run in ~30).
+            format!("print({hello:?}.replace('SESSION', 'a2' + str(uuid.uuid4())), flush=True)"),
             "for line in sys.stdin:".into(),
             "    m = json.loads(line)".into(),
             "    if m['type'] != 'prompt': continue".into(),
