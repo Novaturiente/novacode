@@ -33,8 +33,15 @@ fn repair(raw: &str) -> String {
                 in_str = false;
                 out.push(c);
             }
+            // `\u` is an escape only with 4 hex digits (`\usepackage` isn't).
+            '\\' if chars.peek() == Some(&'u')
+                && chars.clone().skip(1).take(4).filter(char::is_ascii_hexdigit).count() == 4 =>
+            {
+                out.push(c);
+                out.push(chars.next().unwrap_or_default());
+            }
             '\\' => match chars.peek() {
-                Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') => {
+                Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') => {
                     out.push(c);
                     out.push(chars.next().unwrap_or_default());
                 }
@@ -62,6 +69,10 @@ mod tests {
         assert_eq!(
             parse_tool_args("{\"p\":\"C:\\dir\\x\",\"t\":\"a\nb\"}").0,
             json!({"p":"C:\\dir\\x","t":"a\nb"})
+        );
+        assert_eq!(
+            parse_tool_args(r#"{"t":"\usepackage \u00e9"}"#),
+            (json!({"t":"\\usepackage é"}), None)
         );
         assert_eq!(parse_tool_args("[1]"), (json!({}), Some("[1]".into())));
         assert_eq!(parse_tool_args(r#"{"a":"#).1.as_deref(), Some(r#"{"a":"#));

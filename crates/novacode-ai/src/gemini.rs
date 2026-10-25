@@ -320,6 +320,12 @@ fn contents(history: &[Message], ns: &str, model: &str) -> Vec<Value> {
                     })
                     .collect();
                 let text = text.join("\n");
+                // Whitespace-only output is rejected with a 400.
+                let text = if text.trim().is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    text
+                };
                 let response = if *is_error {
                     json!({ "error": text })
                 } else {

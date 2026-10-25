@@ -278,10 +278,12 @@ fn convert(history: &[Message], c: &Compat, ns: &str, model: &str) -> Vec<Value>
                     })
                     .collect();
                 tool_images.extend(content.iter().filter_map(image_part));
-                let text = if text.is_empty() {
+                // Whitespace-only content (a bare `\r\n` from bash) is rejected with a 400.
+                let text = text.join("\n");
+                let text = if text.trim().is_empty() {
                     "(no output)".to_string()
                 } else {
-                    text.join("\n")
+                    text
                 };
                 let mut r = json!({ "role": "tool", "tool_call_id": call_id, "content": text });
                 if c.tool_result_name {

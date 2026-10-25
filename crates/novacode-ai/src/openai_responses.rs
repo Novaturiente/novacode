@@ -309,10 +309,12 @@ fn convert(history: &[Message], ns: &str, model: &str) -> Vec<Value> {
                             _ => None,
                         })
                         .collect();
-                    json!(if t.is_empty() {
+                    // Whitespace-only output is rejected with a 400.
+                    let t = t.join("\n");
+                    json!(if t.trim().is_empty() {
                         "(no output)".to_string()
                     } else {
-                        t.join("\n")
+                        t
                     })
                 };
                 out.push(json!({ "type": "function_call_output", "call_id": call_id, "output": output }));

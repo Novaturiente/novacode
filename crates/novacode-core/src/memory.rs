@@ -6,7 +6,7 @@
 
 use crate::session::{Entry, EntryKind};
 use novacode_ai::adapter::{Adapter, CacheRetention, Request};
-use novacode_types::{Block, Message, StreamEvent, ToolDef, Usage, estimate};
+use novacode_types::{Block, Message, StopReason, StreamEvent, ToolDef, Usage, estimate};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fmt::Write;
@@ -290,6 +290,8 @@ pub fn parse_notes(args: &Value, c: &Chunk, known: &[Note]) -> Vec<Note> {
 
 /// One observer call. The system prompt is fixed and existing notes only grow
 /// at the end between calls, so the worker's own prefix stays cacheable.
+const CUT_OFF: &str = "reply hit the output token limit";
+
 pub async fn observe(w: &Worker, known: &[Note], c: &Chunk, session: &str) -> Result<(Vec<Note>, Usage), String> {
     let mut existing = String::from("Notes already recorded:\n");
     if known.is_empty() {
@@ -319,6 +321,8 @@ pub async fn observe(w: &Worker, known: &[Note], c: &Chunk, session: &str) -> Re
     let mut rx = w.adapter.stream(req, CancellationToken::new());
     while let Some(ev) = rx.recv().await {
         match ev {
+            // A cut-off record_notes call parses as `{}`: fail so the chunk isn't marked covered.
+            StreamEvent::Done(m) if m.stop == StopReason::Length => return Err(CUT_OFF.into()),
             StreamEvent::Done(m) => {
                 let mut notes = Vec::new();
                 for call in m.tool_calls().filter(|t| t.name == "record_notes") {
@@ -621,6 +625,7 @@ async fn ask(
     let mut rx = w.adapter.stream(req, CancellationToken::new());
     while let Some(ev) = rx.recv().await {
         match ev {
+            StreamEvent::Done(m) if m.stop == StopReason::Length => return Err(CUT_OFF.into()),
             StreamEvent::Done(m) => {
                 let args = m
                     .tool_calls()
@@ -898,5 +903,24 @@ mod tests {
         assert_eq!(cut_point(&path, 0, 50), Some(1));
         assert_eq!(cut_point(&path, 0, 1_000_000), None);
         assert_eq!(utc_minute(0), "1970-01-01 00:00");
+    }
+
+    #[tokio::test]
+    async fn cut_off_observer_reply_is_an_error() {
+        use novacode_ai::faux::{Faux, FauxReply};
+        let cut = FauxReply::Message {
+            blocks: vec![Block::text("thinking out loud")],
+            stop: StopReason::Length,
+            usage: Usage::default(),
+        };
+        let w = Worker {
+            adapter: Arc::new(Faux::new([cut])),
+            provider: "faux".into(),
+            model: "m".into(),
+        };
+        let es = [user("a", "use sqlx")];
+        let path: Vec<&Entry> = es.iter().collect();
+        let c = chunk(&path, 0, 1, 1_000_000);
+        assert_eq!(observe(&w, &[], &c, "s").await.unwrap_err(), CUT_OFF);
     }
 }

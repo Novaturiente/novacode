@@ -682,7 +682,13 @@ fn convert_messages(messages: &[Message], ns: &str, native_system: bool) -> (Vec
     let mut held: Vec<Value> = Vec::new();
     // The last wire turn is a user one (prompt or tool_result), so a system turn may follow.
     let mut after_user = false;
+    // Images from failed tool calls: a tool_result with is_error may only hold text,
+    // so they follow the turn's tool results.
+    let mut err_images: Vec<Value> = Vec::new();
     for m in &messages[lead..] {
+        if !err_images.is_empty() && !matches!(m, Message::ToolResult { .. }) {
+            push("user", std::mem::take(&mut err_images), None);
+        }
         match m {
             Message::System { text } if text.is_empty() => {}
             Message::System { text } if native_system => held.push(json!({ "type": "text", "text": text })),
@@ -724,6 +730,13 @@ fn convert_messages(messages: &[Message], ns: &str, native_system: bool) -> (Vec
                 ..
             } => {
                 let mut inner: Vec<Value> = content.iter().filter_map(user_block).collect();
+                if *is_error && inner.iter().any(|b| b["type"] == "image") {
+                    let (imgs, text): (Vec<Value>, Vec<Value>) = inner.into_iter().partition(|b| b["type"] == "image");
+                    inner = text;
+                    err_images
+                        .push(json!({ "type": "text", "text": format!("Images from failed tool call {call_id}:") }));
+                    err_images.extend(imgs);
+                }
                 if inner.is_empty() {
                     inner.push(json!({ "type": "text", "text": "(no output)" }));
                 }
@@ -736,6 +749,7 @@ fn convert_messages(messages: &[Message], ns: &str, native_system: bool) -> (Vec
             }
         }
     }
+    push("user", std::mem::take(&mut err_images), None);
     // At the end, after a user turn, a system turn is allowed as is.
     if !held.is_empty() && after_user {
         push("system", std::mem::take(&mut held), None);
@@ -748,7 +762,8 @@ fn convert_messages(messages: &[Message], ns: &str, native_system: bool) -> (Vec
 
 fn user_block(b: &Block) -> Option<Value> {
     match b {
-        Block::Text { text, .. } if !text.is_empty() => Some(json!({ "type": "text", "text": text })),
+        // Whitespace-only text blocks are rejected with a 400.
+        Block::Text { text, .. } if !text.trim().is_empty() => Some(json!({ "type": "text", "text": text })),
         Block::Image { mime_type, data } => {
             Some(json!({ "type": "image", "source": { "type": "base64", "media_type": mime_type, "data": data } }))
         }
@@ -799,6 +814,45 @@ mod tests {
             images: true,
             session: None,
         }
+    }
+
+    #[test]
+    fn error_result_images_follow_the_tool_results() {
+        let img = Block::Image {
+            mime_type: "image/png".into(),
+            data: "AAAA".into(),
+        };
+        let result = |id: &str, content: Vec<Block>, is_error| Message::ToolResult {
+            call_id: id.into(),
+            tool_name: "shot".into(),
+            content,
+            is_error,
+            details: None,
+        };
+        let (msgs, _) = convert_messages(
+            &[
+                result("c1", vec![Block::text("failed"), img.clone()], true),
+                result("c2", vec![Block::text("\r\n")], false),
+                Message::User {
+                    content: vec![Block::text("next")],
+                },
+            ],
+            PROVIDER,
+            false,
+        );
+        assert_eq!(msgs.len(), 1);
+        let c = &msgs[0]["content"];
+        let types: Vec<&str> = c
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, ["tool_result", "tool_result", "text", "image", "text"]);
+        assert_eq!(c[0]["content"], json!([{"type": "text", "text": "failed"}]));
+        assert_eq!(c[0]["is_error"], json!(true));
+        assert_eq!(c[1]["content"], json!([{"type": "text", "text": "(no output)"}]));
+        assert_eq!(c[4]["text"], "next");
     }
 
     #[test]
