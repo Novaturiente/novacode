@@ -1640,6 +1640,11 @@ const CREDENTIAL_DIRS: &[&str] = &[
     ".novacode",
 ];
 
+/// The credential folders under home; the sandbox hides them too (L6.5).
+pub fn credential_dirs() -> &'static [&'static str] {
+    CREDENTIAL_DIRS
+}
+
 /// Why writing a file at `path` would touch a protected place, or `None`: the
 /// file tools refuse what a catastrophic shell command would (L6.2).
 /// Under `~/.novacode` only the login and trust files count, so the agent can

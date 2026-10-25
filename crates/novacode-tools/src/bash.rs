@@ -26,6 +26,9 @@ struct Args {
     intent: Option<String>,
     /// Only when the safety check asks for it: why this destructive command is needed and safe.
     justification: Option<String>,
+    /// Run outside the sandbox, only for a command that needs what it hides or blocks (e.g. `git push` over SSH, writing outside the project).
+    #[serde(default)]
+    unsandboxed: bool,
 }
 
 impl Tool for Bash {
@@ -59,6 +62,7 @@ impl Tool for Bash {
                 cwd: ctx.cwd.clone(),
                 env: vec![("NOVACODE_SESSION_ID".into(), ctx.session_id.clone())],
                 timeout: Duration::from_secs(secs),
+                unsandboxed: a.unsandboxed,
             };
             if let Some(pm) = &ctx.processes {
                 return run_managed(pm, spec, secs, ctx).await;
@@ -108,15 +112,38 @@ impl Tool for Bash {
                     None => ("[killed by a signal]".to_string(), true),
                 }
             };
+            let note = sandbox_note(ctx, a.unsandboxed, is_error, &out);
             if out.is_empty() && status.is_empty() {
                 out.push_str("(no output)");
             }
             out.push_str(&status);
+            push_note(&mut out, note);
             ToolOutput {
                 is_error,
                 ..ToolOutput::text(out.trim_end().to_string())
             }
         })
+    }
+}
+
+/// L6.5: the mark of a command run outside the sandbox, or the hint for a
+/// sandboxed one that failed on a blocked write.
+pub(crate) fn sandbox_note(ctx: &ToolCtx, unsandboxed: bool, failed: bool, out: &str) -> Option<String> {
+    let sb = ctx.env.sandbox();
+    if unsandboxed {
+        return sb
+            .filter(|s| s.wraps())
+            .map(|_| "[ran outside the sandbox]".to_string());
+    }
+    crate::sandbox::hint_for(sb, failed, out)
+}
+
+fn push_note(out: &mut String, note: Option<String>) {
+    if let Some(n) = note {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&n);
     }
 }
 
@@ -131,7 +158,8 @@ async fn run_managed(
     ctx: &ToolCtx,
 ) -> ToolOutput {
     let name: String = spec.command.lines().next().unwrap_or("").chars().take(40).collect();
-    let id = match pm.start(&name, &spec.command, &spec.cwd, &spec.env, false) {
+    let sb = if spec.unsandboxed { None } else { ctx.env.sandbox() };
+    let id = match pm.start(&name, &spec.command, &spec.cwd, &spec.env, false, sb) {
         Ok(id) => id,
         Err(e) => return ToolOutput::error(format!("could not start bash: {e}")),
     };
@@ -169,6 +197,8 @@ async fn run_managed(
         out.push_str(&format!(
             "[still running: moved to the process manager as {id}. Use the `process` tool to read its output or stop it; you'll be told when it exits]"
         ));
+        let note = sandbox_note(ctx, spec.unsandboxed, false, &out);
+        push_note(&mut out, note);
         return ToolOutput::text(out.trim_end().to_string());
     };
     pm.clear_one(&id);
@@ -177,10 +207,12 @@ async fn run_managed(
         Some(c) => (format!("[exit code {c}]"), true),
         None => ("[killed by a signal]".to_string(), true),
     };
+    let note = sandbox_note(ctx, spec.unsandboxed, is_error, &out);
     if out.is_empty() && status.is_empty() {
         out.push_str("(no output)");
     }
     out.push_str(&status);
+    push_note(&mut out, note);
     ToolOutput {
         is_error,
         ..ToolOutput::text(out.trim_end().to_string())

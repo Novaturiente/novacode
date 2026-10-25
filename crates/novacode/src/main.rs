@@ -13,7 +13,8 @@ use novacode_core::policy::{Approver, Mode, Permissions, Policy};
 use novacode_core::resources;
 use novacode_core::session::{self, Store};
 use novacode_core::trust::{self, TrustStore};
-use novacode_tools::LocalEnv;
+use novacode_tools::SandboxedEnv;
+use novacode_tools::sandbox::{self as sbx, Sandbox};
 use novacode_tui::dialog::PickItem;
 use novacode_tui::keys::Keymap;
 use novacode_tui::{Cmd, Exit, UiEvent};
@@ -331,6 +332,44 @@ enum McpCmd {
 
 fn parse_mode(s: &str) -> Result<Mode, String> {
     serde_json::from_value(serde_json::Value::from(s)).map_err(|_| format!("`{s}`: use auto, ask or read-only"))
+}
+
+/// `sandbox.mode` (L6.5); a bad value is reported by `doctor` and means the default.
+fn sandbox_mode(s: &Settings) -> sbx::Mode {
+    s.get::<String>("sandbox.mode")
+        .and_then(|m| sbx::Mode::parse(&m))
+        .unwrap_or_default()
+}
+
+/// The sandbox of a session in `cwd` (L6.5): its project folders, the settings'
+/// extra places and the user's protected paths.
+fn session_sandbox(s: &Settings, cwd: &Path, novacode_home: &Path, protected: &[String]) -> Arc<Sandbox> {
+    let mode = sandbox_mode(s);
+    let mut deny_read = protected.to_vec();
+    deny_read.extend(s.get::<Vec<String>>("sandbox.denyRead").unwrap_or_default());
+    let sb = Arc::new(Sandbox::new(sbx::Config {
+        mode,
+        project: if mode == sbx::Mode::Off {
+            vec![]
+        } else {
+            sbx::project_dirs(cwd)
+        },
+        home: std::env::var_os("HOME").map(Into::into).unwrap_or_default(),
+        novacode_home: novacode_home.to_path_buf(),
+        tmpdir: std::env::var_os("TMPDIR").map(Into::into),
+        allow_write: s.get("sandbox.allowWrite").unwrap_or_default(),
+        deny_read,
+        credential_dirs: novacode_core::risk::credential_dirs()
+            .iter()
+            .map(|d| d.to_string())
+            .collect(),
+    }));
+    if mode != sbx::Mode::Off {
+        // Checked off the start path: caches the answer and logs the one warning (auto mode).
+        let probe = sb.clone();
+        tokio::task::spawn_blocking(move || probe.available());
+    }
+    sb
 }
 
 fn main() -> ExitCode {
@@ -1154,6 +1193,7 @@ impl Ctx {
         let s = &self.settings;
         let perms: Permissions = s.get("permissions").unwrap_or_default();
         let judge_spec = perms.judge.clone();
+        let sandbox = session_sandbox(s, &self.cwd, self.paths.home(), &perms.protected.paths);
         let mut policy = Policy::new(
             perms,
             std::env::var_os("HOME").map(Into::into).unwrap_or_default(),
@@ -1487,7 +1527,7 @@ impl Ctx {
         };
         let judge = self.command_judge(judge_spec, &route, adapter.clone()).await;
         diag::mark("mcp config + tool list");
-        let mut agent = Agent::new(adapter, tools, store, cfg, Arc::new(LocalEnv))
+        let mut agent = Agent::new(adapter, tools, store, cfg, Arc::new(SandboxedEnv(sandbox)))
             .with_shared_policy(policy)
             .with_modes(modes)
             .with_quirks(self.quirks.clone())

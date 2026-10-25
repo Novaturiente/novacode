@@ -10,6 +10,7 @@ pub mod image;
 pub mod patch;
 pub mod process;
 pub mod read;
+pub mod sandbox;
 pub mod search;
 pub mod todo;
 pub mod toolsearch;
@@ -25,7 +26,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-pub use env::{ExecutionEnv, LocalEnv};
+pub use env::{ExecutionEnv, LocalEnv, SandboxedEnv};
 pub use files::FileState;
 
 /// What a tool returns. `details` is UI-only and never sent to a model.
