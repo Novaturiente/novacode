@@ -67,6 +67,7 @@ impl Tool for Bash {
             if let Some(pm) = &ctx.processes {
                 return run_managed(pm, spec, secs, ctx).await;
             }
+            let git = git_snapshot(ctx, a.unsandboxed);
             let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
             let run = ctx.env.exec(spec, ctx.cancel.clone(), tx);
             let mut buf: Vec<u8> = Vec::new();
@@ -118,12 +119,18 @@ impl Tool for Bash {
             }
             out.push_str(&status);
             push_note(&mut out, note);
+            push_note(&mut out, git.and_then(|g| g.changes()));
             ToolOutput {
                 is_error,
                 ..ToolOutput::text(out.trim_end().to_string())
             }
         })
     }
+}
+
+/// L6.5: the git setup before a sandboxed command, for the change check after it.
+fn git_snapshot(ctx: &ToolCtx, unsandboxed: bool) -> Option<crate::sandbox::GitSnap> {
+    ctx.env.sandbox().filter(|_| !unsandboxed)?.git_snapshot()
 }
 
 /// L6.5: the mark of a command run outside the sandbox, or the hint for a
@@ -201,6 +208,8 @@ async fn run_managed(
         push_note(&mut out, note);
         return ToolOutput::text(out.trim_end().to_string());
     };
+    // The process manager ran the git change check when it exited.
+    let git = pm.git_note(&id);
     pm.clear_one(&id);
     let (status, is_error) = match end.code {
         Some(0) => (String::new(), false),
@@ -213,6 +222,7 @@ async fn run_managed(
     }
     out.push_str(&status);
     push_note(&mut out, note);
+    push_note(&mut out, git);
     ToolOutput {
         is_error,
         ..ToolOutput::text(out.trim_end().to_string())

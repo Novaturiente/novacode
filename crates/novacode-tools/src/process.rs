@@ -104,6 +104,8 @@ struct Proc {
     ask_at_ms: AtomicU64,
     /// Per stream (stdout, stderr): a rotation overwrote an older `.1`, so output is gone.
     dropped: [AtomicBool; 2],
+    /// L6.5: the git change check's line, set when a sandboxed command exited.
+    git_note: Mutex<Option<String>>,
 }
 
 /// A log file rotates into `<file>.1` past this size, so at most 2× is kept per stream.
@@ -186,6 +188,8 @@ impl ProcessManager {
     ) -> std::io::Result<String> {
         std::fs::create_dir_all(&self.dir)?;
         let id = format!("proc_{}", self.next.fetch_add(1, Ordering::Relaxed));
+        // L6.5: git's setup at start, compared when it exits.
+        let git = sandbox.and_then(|s| s.git_snapshot());
         let mut child = crate::sandbox::command(sandbox, command, cwd)?
             .envs(env.iter().map(|(k, v)| (k, v)))
             .stdin(std::process::Stdio::piped())
@@ -220,6 +224,7 @@ impl ProcessManager {
             stall: Mutex::new(None),
             ask_at_ms: AtomicU64::new(0),
             dropped: Default::default(),
+            git_note: Mutex::new(None),
         });
         tokio::spawn(ticker(Arc::downgrade(self), p.clone()));
         self.procs.lock().unwrap().insert(id.clone(), p.clone());
@@ -256,6 +261,9 @@ impl ProcessManager {
             // Background children may hold the pipes; don't wait on them forever.
             let drain = futures_util::future::join_all(pumps);
             let _ = tokio::time::timeout(Duration::from_millis(500), drain).await;
+            // Before `end` is set: a waiting bash call reads the line once it sees the end.
+            let git_note = git.and_then(|g| g.changes());
+            *p.git_note.lock().unwrap() = git_note.clone();
             let stopped = p.stopping.load(Ordering::Relaxed);
             let end = End {
                 at_ms: now_ms(),
@@ -290,9 +298,21 @@ impl ProcessManager {
                         on,
                     });
                 }
+                if let Some(n) = git_note {
+                    let _ = me.events.send(Event::Notice {
+                        id: id.clone(),
+                        text: format!("Process {id} ({name}): {n}"),
+                        on: Attention::Context,
+                    });
+                }
             }
         });
         Ok(id)
+    }
+
+    /// The git change check's line for a process that exited (L6.5).
+    pub fn git_note(&self, id: &str) -> Option<String> {
+        self.get(id)?.git_note.lock().unwrap().clone()
     }
 
     /// Under the map lock: a process `clear`/`clear_one` already forgot must not be

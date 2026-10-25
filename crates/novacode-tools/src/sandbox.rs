@@ -6,12 +6,13 @@
 //! are dropped from the environment.
 //! [`command`] builds every model command, so the bash and process paths can't drift.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// `sandbox.mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -60,16 +61,39 @@ pub struct Config {
     pub secret_env: Vec<String>,
 }
 
-/// Tool caches under home, writable when they exist. The rest of `~/.cargo`
+/// Download caches under home, writable when they exist (none is created).
+/// Only these: shells and editors source files they keep elsewhere in
+/// `~/.cache`, `~/.bun` and `~/.npm` at start. The rest of `~/.cargo`
 /// (binaries, `config.toml`, `env`) stays read-only, also where it doesn't exist yet.
 const CACHES: &[&str] = &[
-    ".cache",
+    ".cache/pip",
+    ".cache/uv",
+    ".cache/go-build",
+    ".cache/pnpm",
+    ".cache/yarn",
+    ".cache/sccache",
+    ".cache/deno",
+    ".cache/typescript",
+    ".cache/huggingface",
+    ".npm/_cacache",
+    ".bun/install/cache",
     ".cargo/registry",
     ".cargo/git",
-    ".rustup",
-    ".npm",
-    ".bun",
-    "go",
+    "go/pkg/mod",
+];
+/// Private data under home, hidden when it exists: shell history, browser
+/// and mail profiles, the keyring.
+const PRIVATE: &[&str] = &[
+    ".zsh_history",
+    ".bash_history",
+    ".local/share/fish/fish_history",
+    ".local/share/atuin",
+    ".mozilla",
+    ".config/google-chrome",
+    ".config/chromium",
+    ".config/BraveSoftware",
+    ".thunderbird",
+    ".local/share/keyrings",
 ];
 /// Token files under home, hidden when they exist.
 const TOKEN_FILES: &[&str] = &[
@@ -130,9 +154,13 @@ pub struct Sandbox {
     mode: Mode,
     /// Writable binds, parents first.
     write: Vec<PathBuf>,
-    /// Git folders bound onto themselves, so they are mount points: renaming
-    /// or removing one fails (`EBUSY`), and a copy can't take its place.
+    /// Git folders bound onto themselves, parents first, so they are mount
+    /// points: renaming or removing one fails (`EBUSY`), and a copy can't take
+    /// its place. Every folder from the git folder down to each submodule git
+    /// folder, `modules` folders included.
     pin: Vec<PathBuf>,
+    /// What the git change check looks at; `None` outside git.
+    git: Option<Arc<GitProbe>>,
     /// A protected path that is a symlink inside a writable place: a bind
     /// can't protect it (the link stays replaceable), so there is no sandbox.
     symlink: Option<PathBuf>,
@@ -263,6 +291,7 @@ impl Sandbox {
             cands.extend(auth);
         }
         cands.extend(TOKEN_FILES.iter().map(|f| c.home.join(f)));
+        cands.extend(PRIVATE.iter().map(|f| c.home.join(f)));
         cands.extend(c.deny_read.iter().map(|p| expand(p, &c.home, &base)));
         let mut symlink = cands.iter().find_map(|p| link_in(p, &write));
         let mut hide: Vec<(PathBuf, bool)> = Vec::new();
@@ -278,12 +307,21 @@ impl Sandbox {
         for g in &c.git_dirs {
             submodule_dirs(&g.join("modules"), 0, &mut git_dirs);
         }
-        let pin: Vec<PathBuf> = c
-            .git_dirs
-            .iter()
-            .filter_map(|g| std::fs::canonicalize(g).ok())
-            .filter(|g| g.is_dir() && !write.contains(g) && write.iter().any(|w| g.starts_with(w)))
-            .collect();
+        // The git folders, their `modules` folders, and every folder down to each submodule git folder.
+        let mut pin_cands: Vec<PathBuf> = Vec::new();
+        for g in &c.git_dirs {
+            pin_cands.extend([g.clone(), g.join("modules")]);
+            for s in git_dirs.iter().filter(|s| s.starts_with(g) && *s != g) {
+                pin_cands.extend(s.ancestors().take_while(|a| *a != g).map(Path::to_path_buf));
+            }
+        }
+        let mut pin: Vec<PathBuf> = Vec::new();
+        for p in pin_cands.iter().filter_map(|g| std::fs::canonicalize(g).ok()) {
+            if p.is_dir() && !write.contains(&p) && write.iter().any(|w| p.starts_with(w)) && !pin.contains(&p) {
+                pin.push(p);
+            }
+        }
+        pin.sort_by_key(|p| p.components().count());
         let mut ro_cands: Vec<PathBuf> = git_dirs
             .iter()
             .flat_map(|g| RO_GIT.iter().map(move |f| g.join(f)))
@@ -311,10 +349,18 @@ impl Sandbox {
                 ro.push(real);
             }
         }
+        let git = (!c.git_dirs.is_empty()).then(|| {
+            Arc::new(GitProbe {
+                top: base.clone(),
+                git_dirs: c.git_dirs.clone(),
+                links: Mutex::new(None),
+            })
+        });
         Sandbox {
             mode: c.mode,
             write,
             pin,
+            git,
             symlink,
             ro,
             hide,
@@ -443,9 +489,11 @@ impl Sandbox {
             "/proc",
             // Kill semantics: killing bwrap (timeout, Esc, `process stop`, novacode dying)
             // ends the pid namespace, so nothing started inside survives, even a `setsid` child.
-            // No `--new-session`: the command stays in the caller's process group for killpg.
             "--unshare-pid",
             "--die-with-parent",
+            // A new session without a terminal: commands can't open `/dev/tty`
+            // (clipboard and reply-injection escapes reach the user's terminal).
+            "--new-session",
         ]
         .map(OsString::from)
         .into();
@@ -473,6 +521,18 @@ impl Sandbox {
         }
         a.extend(["--chdir".into(), cwd.as_os_str().to_owned()]);
         a
+    }
+
+    /// Before a sandboxed command: the git setup to compare against after it
+    /// ([`GitSnap::changes`]). `None` when commands aren't sandboxed or outside git.
+    pub fn git_snapshot(&self) -> Option<GitSnap> {
+        if !self.wraps() {
+            return None;
+        }
+        let probe = self.git.clone()?;
+        let state = probe.state();
+        let links = probe.links_at(state.index);
+        Some(GitSnap { probe, state, links })
     }
 
     /// The line added when a sandboxed command failed on a blocked write.
@@ -651,9 +711,166 @@ fn seccomp_program() -> Option<Vec<u8>> {
     )
 }
 
+/// An index file's identity: (inode, size, mtime s, mtime ns). git replaces
+/// the index by renaming a new file over it, so any write changes it.
+type IndexStat = (u64, u64, i64, i64);
+
+fn index_stat(p: &Path) -> Option<IndexStat> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(p).ok()?;
+    Some((m.ino(), m.size(), m.mtime(), m.mtime_nsec()))
+}
+
+/// What the git change check reads (L6.5): `.git` stays writable inside the
+/// sandbox, so after each sandboxed command novacode looks whether git's
+/// executable setup changed. Nothing is reverted.
+struct GitProbe {
+    /// The work tree's top: `.gitmodules`, and where `ls-files` runs.
+    top: PathBuf,
+    /// The git folder first (its `index`), then the shared one of a worktree.
+    git_dirs: Vec<PathBuf>,
+    /// The gitlinks (mode 160000 entries) of the index at that stat, read
+    /// only when the index changed.
+    links: Mutex<Option<(Option<IndexStat>, BTreeSet<String>)>>,
+}
+
+/// The parts of the git setup that can make a later git command run a program.
+#[derive(Debug, Clone, PartialEq)]
+struct GitState {
+    /// Per git folder: its `commondir` (`None` = missing).
+    commondir: Vec<Option<Vec<u8>>>,
+    gitmodules: Option<Vec<u8>>,
+    /// Submodule git folders under `<gitdir>/modules` and their `config`.
+    modules: BTreeMap<PathBuf, Option<Vec<u8>>>,
+    index: Option<IndexStat>,
+}
+
+impl GitProbe {
+    /// Stats and small reads only; git itself runs only for the index ([`Self::links_at`]).
+    fn state(&self) -> GitState {
+        let mut modules = BTreeMap::new();
+        for g in &self.git_dirs {
+            let mut dirs = Vec::new();
+            submodule_dirs(&g.join("modules"), 0, &mut dirs);
+            for d in dirs {
+                let config = std::fs::read(d.join("config")).ok();
+                modules.insert(d, config);
+            }
+        }
+        GitState {
+            commondir: self
+                .git_dirs
+                .iter()
+                .map(|g| std::fs::read(g.join("commondir")).ok())
+                .collect(),
+            gitmodules: std::fs::read(self.top.join(".gitmodules")).ok(),
+            modules,
+            index: self.git_dirs.first().and_then(|g| index_stat(&g.join("index"))),
+        }
+    }
+
+    /// The gitlinks of the index at `stat`: cached, read again when it changed.
+    fn links_at(&self, stat: Option<IndexStat>) -> BTreeSet<String> {
+        let mut g = self.links.lock().unwrap();
+        if let Some((s, l)) = g.as_ref()
+            && *s == stat
+        {
+            return l.clone();
+        }
+        let links = if stat.is_some() {
+            self.read_links()
+        } else {
+            BTreeSet::new()
+        };
+        *g = Some((stat, links.clone()));
+        links
+    }
+
+    /// `git ls-files --stage` entries with mode 160000.
+    fn read_links(&self) -> BTreeSet<String> {
+        let out = novacode_base::git::bookkeeping()
+            .arg("-C")
+            .arg(&self.top)
+            .args(["ls-files", "--stage", "-z"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        let Ok(out) = out else { return BTreeSet::new() };
+        out.stdout
+            .split(|b| *b == 0)
+            .filter_map(|e| {
+                let e = String::from_utf8_lossy(e);
+                let (meta, path) = e.split_once('\t')?;
+                meta.starts_with("160000 ").then(|| path.to_string())
+            })
+            .collect()
+    }
+
+    /// A path as the user knows it: relative to the work tree when inside it.
+    fn show(&self, p: &Path) -> String {
+        format!("`{}`", p.strip_prefix(&self.top).unwrap_or(p).display())
+    }
+}
+
+/// The git setup before a sandboxed command ([`Sandbox::git_snapshot`]).
+pub struct GitSnap {
+    probe: Arc<GitProbe>,
+    state: GitState,
+    /// The index's gitlinks at `state.index`.
+    links: BTreeSet<String>,
+}
+
+impl GitSnap {
+    /// After the command: the line for its result when git's executable setup
+    /// changed (a new or changed `commondir`, `.gitmodules`, a new, removed or
+    /// changed submodule git folder, a new gitlink in the index).
+    pub fn changes(&self) -> Option<String> {
+        let p = &self.probe;
+        let (old, new) = (&self.state, p.state());
+        let mut what: Vec<String> = Vec::new();
+        let file = |path: String, a: &Option<Vec<u8>>, b: &Option<Vec<u8>>| match (a, b) {
+            (None, Some(_)) => Some(format!("{path} created")),
+            (Some(_), None) => Some(format!("{path} removed")),
+            (Some(x), Some(y)) if x != y => Some(format!("{path} changed")),
+            _ => None,
+        };
+        for (i, g) in p.git_dirs.iter().enumerate() {
+            let none = None;
+            let (a, b) = (
+                old.commondir.get(i).unwrap_or(&none),
+                new.commondir.get(i).unwrap_or(&none),
+            );
+            what.extend(file(p.show(&g.join("commondir")), a, b));
+        }
+        what.extend(file("`.gitmodules`".into(), &old.gitmodules, &new.gitmodules));
+        for (d, config) in &new.modules {
+            match old.modules.get(d) {
+                None => what.push(format!("new submodule git folder {}", p.show(d))),
+                Some(c) if c != config => what.push(format!("{} changed", p.show(&d.join("config")))),
+                Some(_) => {}
+            }
+        }
+        for d in old.modules.keys().filter(|d| !new.modules.contains_key(*d)) {
+            what.push(format!("submodule git folder {} removed", p.show(d)));
+        }
+        if new.index != old.index {
+            let after = p.links_at(new.index);
+            for l in after.difference(&self.links) {
+                what.push(format!("new gitlink `{l}` in the index"));
+            }
+        }
+        (!what.is_empty()).then(|| {
+            format!(
+                "[git setup changed: {}; git commands you run may execute it]",
+                what.join(", ")
+            )
+        })
+    }
+}
+
 /// The git folder and the shared git folder of `cwd` (one when they're the same).
 pub fn git_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let out = std::process::Command::new("git")
+    let out = novacode_base::git::command()
         .arg("-C")
         .arg(cwd)
         .args(["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"])
@@ -672,7 +889,7 @@ pub fn git_dirs(cwd: &Path) -> Vec<PathBuf> {
 /// (falling back to `cwd`), plus the shared git folder of a worktree when it
 /// lies outside, so commits there work.
 pub fn project_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let out = std::process::Command::new("git")
+    let out = novacode_base::git::command()
         .arg("-C")
         .arg(cwd)
         .args([
@@ -720,7 +937,9 @@ mod tests {
         let proj = d.path().join("proj");
         for dir in [
             ".ssh",
-            ".cache",
+            ".cache/pip",
+            ".cache/zsh",
+            ".bun/install/cache",
             ".novacode",
             ".config/gh",
             "extra",
@@ -728,6 +947,7 @@ mod tests {
             ".cargo/bin",
             ".cargo/registry",
             ".codex",
+            ".mozilla",
         ] {
             std::fs::create_dir_all(home.join(dir)).unwrap();
         }
@@ -749,6 +969,7 @@ mod tests {
             ".netrc",
             ".config/gh/hosts.yml",
             ".codex/auth.json",
+            ".zsh_history",
         ] {
             std::fs::write(home.join(f), "x").unwrap();
         }
@@ -801,15 +1022,23 @@ mod tests {
         let a = strs(&Sandbox::new(c).args(&cwd));
         let pairs = entries(&a);
         let want: Vec<(String, String)> = [
-            // Writable, parents first; missing ones (`~/missing`, `~/.npm`, …) skipped.
+            // Writable, parents first; missing ones (`~/missing`, `~/.npm/_cacache`, …) skipped.
             ("--bind", "/tmp".to_string()),
             ("--bind", r("proj")),
-            ("--bind", r("home/.cache")),
             ("--bind", r("home/extra")),
+            // Named download caches only: not `~/.cache/zsh`, `~/.cache` or `~/.bun` as a whole.
+            ("--bind", r("home/.cache/pip")),
             // Of ~/.cargo only the download caches; `~/.cargo/git` is missing.
             ("--bind", r("home/.cargo/registry")),
-            // The git folder onto itself: a mount point can't be renamed.
+            ("--bind", r("home/.bun/install/cache")),
+            // Git folders onto themselves, parents first: a mount point can't be renamed.
+            // Every folder down to each submodule git folder, `modules` included.
             ("--bind", r("proj/.git")),
+            ("--bind", r("proj/.git/modules")),
+            ("--bind", r("proj/.git/modules/a")),
+            ("--bind", r("proj/.git/modules/a/b")),
+            ("--bind", r("proj/.git/modules/a/b/modules")),
+            ("--bind", r("proj/.git/modules/a/b/modules/c")),
             // Read-only inside them: git config and hooks (also of submodules, nested
             // ones first, and worktrees' `config.worktree`), agent config;
             // missing ones (`.git/config.worktree`, `.claude`, `~/.rustup`, …) skipped.
@@ -828,6 +1057,9 @@ mod tests {
             ("/dev/null", r("home/.netrc")),
             ("/dev/null", r("home/.config/gh/hosts.yml")),
             ("/dev/null", r("home/.codex/auth.json")),
+            // Private data: shell history, browser profiles.
+            ("/dev/null", r("home/.zsh_history")),
+            ("--tmpfs", r("home/.mozilla")),
             ("/dev/null", r("proj/.env.secret")),
             ("--chdir", cwd.display().to_string()),
         ]
@@ -837,7 +1069,7 @@ mod tests {
         assert_eq!(pairs, want, "{a:?}");
         assert_eq!(&a[..5], ["--ro-bind", "/", "/", "--dev", "/dev"]);
         assert!(a.contains(&"--unshare-pid".into()) && a.contains(&"--die-with-parent".into()));
-        assert!(!a.contains(&"--new-session".into()), "killpg must reach the command");
+        assert!(a.contains(&"--new-session".into()), "no terminal inside");
         // The whole ~/.novacode stays readable (settings, skills).
         assert!(!a.contains(&r("home/.novacode")));
     }
@@ -1246,6 +1478,181 @@ mod tests {
         pm.stop(&id).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(sleeping("382"), 0, "process stop left a sleep running");
+    }
+
+    /// A temp folder under the real home (not /tmp: /tmp is writable inside).
+    fn home_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(".novacode-sandbox-test")
+            .tempdir_in(std::env::var_os("HOME").unwrap())
+            .unwrap()
+    }
+
+    /// Commands can't open the terminal (`--new-session`). The test makes its
+    /// own terminal with `script`, so it runs without one too.
+    #[tokio::test]
+    async fn real_no_terminal() {
+        let d = home_tempdir();
+        let proj = std::fs::canonicalize(d.path()).unwrap();
+        let sb = Sandbox::new(Config {
+            mode: Mode::On,
+            project: vec![proj.clone()],
+            home: proj.join("home"),
+            novacode_home: proj.join("home/.novacode"),
+            ..Config::default()
+        });
+        if !sb.available() || !have("script") {
+            eprintln!("note: real_no_terminal skipped, bwrap or script is not available here");
+            return;
+        }
+        let q = |s: &OsStr| format!("'{}'", s.to_string_lossy().replace('\'', r"'\''"));
+        let in_tty = |line: String| {
+            let o = std::process::Command::new("script")
+                .args(["-qec", &line, "/dev/null"])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).into_owned()
+        };
+        let probe = "exec 3<>/dev/tty && echo opened";
+        if !in_tty(format!("bash -c {}", q(OsStr::new(probe)))).contains("opened") {
+            eprintln!("note: real_no_terminal skipped, script gives no terminal here");
+            return;
+        }
+        let c = command(Some(&sb), probe, &proj).unwrap();
+        let c = c.as_std();
+        let line: Vec<String> = std::iter::once(c.get_program()).chain(c.get_args()).map(q).collect();
+        let t = in_tty(line.join(" "));
+        assert!(!t.contains("opened"), "/dev/tty opened inside: {t}");
+    }
+
+    /// Real runs: submodule git folders can't be renamed, and the git change
+    /// check reports the reviewer's attacks but not a normal commit.
+    #[tokio::test]
+    async fn real_git_pins_and_change_check() {
+        use crate::Tool;
+        use crate::testutil::{ctx, text};
+        let d = home_tempdir();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(&proj)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !git(&["init", "-q"]) || !git(&["commit", "-q", "--allow-empty", "-m", "x"]) {
+            eprintln!("note: real_git_pins_and_change_check skipped, git doesn't work here");
+            return;
+        }
+        // A submodule git folder, there at the start.
+        let sm = proj.join(".git/modules/sm");
+        std::fs::create_dir_all(&sm).unwrap();
+        std::fs::write(sm.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(sm.join("config"), "[core]\n").unwrap();
+        let sb = Arc::new(Sandbox::new(Config {
+            mode: Mode::On,
+            project: project_dirs(&proj),
+            home: root.join("home"),
+            novacode_home: root.join("home/.novacode"),
+            git_dirs: git_dirs(&proj),
+            ..Config::default()
+        }));
+        if !sb.available() {
+            eprintln!("note: real_git_pins_and_change_check skipped, bwrap is not available here");
+            return;
+        }
+        let s = Some(sb.as_ref());
+        // Pinned: neither the submodule git folder nor `modules` can be renamed.
+        for cmd in ["mv .git/modules/sm .git/modules/old", "mv .git/modules .git/m2"] {
+            let (ok, t) = sh(s, &proj, cmd).await;
+            assert!(!ok && t.contains("busy"), "{cmd}: {t}");
+        }
+        assert!(sm.join("HEAD").exists());
+        let changed = |cmd: &'static str| {
+            let sb = sb.clone();
+            let proj = proj.clone();
+            async move {
+                let snap = sb.git_snapshot().unwrap();
+                let (ok, t) = sh(Some(sb.as_ref()), &proj, cmd).await;
+                assert!(ok, "{cmd}: {t}");
+                snap.changes()
+            }
+        };
+        // A planted `commondir`, through the bash tool: the line ends the result.
+        let mut c = ctx(&proj);
+        c.env = Arc::new(crate::SandboxedEnv(sb.clone()));
+        let o = crate::bash::Bash
+            .execute(serde_json::json!({"command": "echo /tmp/evil > .git/commondir"}), &c)
+            .await;
+        assert_eq!(
+            text(&o),
+            "(no output)\n[git setup changed: `.git/commondir` created; git commands you run may execute it]"
+        );
+        // Through the process manager: bash's result, and `process` start's notice when it exits.
+        let pm = crate::process::ProcessManager::new(&root.join("procs"), "s");
+        c.processes = Some(pm.clone());
+        let o = crate::bash::Bash
+            .execute(serde_json::json!({"command": "echo /tmp/other > .git/commondir"}), &c)
+            .await;
+        assert!(
+            text(&o).ends_with("[git setup changed: `.git/commondir` changed; git commands you run may execute it]"),
+            "{}",
+            text(&o)
+        );
+        let mut events = pm.events.subscribe();
+        pm.start("rm", "rm .git/commondir", &proj, &[], true, s).unwrap();
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Ok(crate::process::Event::Notice { text, .. }) = events.recv().await
+                    && text.contains("git setup changed")
+                {
+                    return text;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(notice.contains("`.git/commondir` removed"), "{notice}");
+        // A submodule added mid-session (not pinned), renamed and replaced by one with `core.fsmonitor`.
+        let late = proj.join(".git/modules/late");
+        std::fs::create_dir_all(&late).unwrap();
+        std::fs::write(late.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(late.join("config"), "[core]\n").unwrap();
+        let t = changed(
+            r#"mv .git/modules/late .git/modules/old && mkdir .git/modules/late && cp .git/modules/old/HEAD .git/modules/late/ && printf '[core]\n\tfsmonitor = touch PWNED\n' > .git/modules/late/config"#,
+        )
+        .await
+        .unwrap_or_default();
+        assert!(
+            t.contains("new submodule git folder `.git/modules/old`")
+                && t.contains("`.git/modules/late/config` changed"),
+            "{t}"
+        );
+        // An embedded repo with `core.fsmonitor`, added as a gitlink.
+        let t = changed(
+            "mkdir nested && cd nested && git init -q && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q --allow-empty -m x && git config core.fsmonitor 'touch PWNED' && cd .. && git add nested 2>/dev/null",
+        )
+        .await
+        .unwrap_or_default();
+        assert!(t.contains("new gitlink `nested` in the index"), "{t}");
+        // A normal commit is not reported.
+        let t = changed(
+            "echo y > f.txt && git add f.txt && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -qm y",
+        )
+        .await;
+        assert_eq!(t, None);
+        assert!(!proj.join("PWNED").exists());
     }
 
     #[test]

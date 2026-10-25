@@ -525,7 +525,7 @@ pub fn name_of(src: &str) -> Option<String> {
 }
 
 fn git_out(args: &[&str], cwd: Option<&Path>) -> Result<String, String> {
-    let mut c = std::process::Command::new("git");
+    let mut c = novacode_base::git::command();
     c.args(args).env("GIT_TERMINAL_PROMPT", "0");
     if let Some(d) = cwd {
         c.current_dir(d);

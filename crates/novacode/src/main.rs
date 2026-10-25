@@ -349,12 +349,10 @@ fn session_sandbox(s: &Settings, cwd: &Path, novacode_home: &Path, protected: &[
     deny_read.extend(s.get::<Vec<String>>("sandbox.denyRead").unwrap_or_default());
     // Download caches of a relocated CARGO_HOME / GOPATH; their binaries and config stay read-only.
     let mut allow_write: Vec<String> = s.get("sandbox.allowWrite").unwrap_or_default();
-    for (var, subs) in [("CARGO_HOME", &["registry", "git"][..]), ("GOPATH", &["pkg"][..])] {
-        if let Some(root) = std::env::var_os(var).filter(|v| !v.is_empty()) {
-            let root = std::path::PathBuf::from(root);
-            allow_write.extend(subs.iter().map(|d| root.join(d).to_string_lossy().into_owned()));
-        }
-    }
+    allow_write.extend(relocated_caches(
+        std::env::var_os("CARGO_HOME").as_deref(),
+        std::env::var_os("GOPATH").as_deref(),
+    ));
     let sb = Arc::new(Sandbox::new(sbx::Config {
         mode,
         project: if mode == sbx::Mode::Off {
@@ -388,6 +386,22 @@ fn session_sandbox(s: &Settings, cwd: &Path, novacode_home: &Path, protected: &[
         tokio::task::spawn_blocking(move || probe.available());
     }
     sb
+}
+
+/// The download caches of `CARGO_HOME` (`registry`, `git`) and of every
+/// `:`-separated `GOPATH` entry (`pkg/mod`). Missing ones are skipped later.
+fn relocated_caches(cargo_home: Option<&std::ffi::OsStr>, gopath: Option<&std::ffi::OsStr>) -> Vec<String> {
+    let cargo = cargo_home
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .into_iter()
+        .flat_map(|r| [r.join("registry"), r.join("git")]);
+    let go = gopath
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|r| r.join("pkg/mod"));
+    cargo.chain(go).map(|p| p.to_string_lossy().into_owned()).collect()
 }
 
 fn main() -> ExitCode {
@@ -3198,6 +3212,17 @@ async fn login(store: &AuthStore, provider: &str, account: &str, method: Option<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relocated_caches_split_gopath() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            super::relocated_caches(Some(OsStr::new("/c")), Some(OsStr::new("/g1::/g2"))),
+            ["/c/registry", "/c/git", "/g1/pkg/mod", "/g2/pkg/mod"]
+        );
+        assert!(super::relocated_caches(Some(OsStr::new("")), Some(OsStr::new(""))).is_empty());
+        assert!(super::relocated_caches(None, None).is_empty());
+    }
+
     #[test]
     fn restart_uses_the_rebuilt_binary() {
         let p = |s: &str| super::live_path(s.into());
