@@ -29,6 +29,7 @@ fn app(history: Vec<Message>) -> (App, mpsc::UnboundedReceiver<Cmd>) {
         level: Default::default(),
         price: None,
         spent: 0.0,
+        compactions: 0,
         commands: vec![],
         draft: String::new(),
         attached: false,
@@ -41,6 +42,38 @@ fn app(history: Vec<Message>) -> (App, mpsc::UnboundedReceiver<Cmd>) {
         procs: Vec::new(),
     };
     (App::new(init, tx), rx)
+}
+
+/// L9.19: an idle compaction shows in the activity line while it runs, then
+/// leaves a full-width divider and the `compacted ×N` status segment.
+#[test]
+fn compaction_shows_while_running_then_leaves_a_divider() {
+    let (mut a, _rx) = app(vec![Message::user("go")]);
+    let s = screen(&mut a, 100, 12);
+    assert!(!s.contains("compacted ×"), "{s}");
+    a.on_agent(AgentEvent::Compacting { tokens_before: 182_000 });
+    let s = screen(&mut a, 100, 12);
+    assert!(s.contains("compacting context"), "{s}");
+    a.on_agent(AgentEvent::Compacted {
+        tokens_before: 182_000,
+        tokens_after: 41_000,
+        notes: 37,
+        fallback: false,
+    });
+    let s = screen(&mut a, 100, 12);
+    assert!(!s.contains("compacting context") && s.contains("ready"), "{s}");
+    assert!(s.contains("compacted ×1"), "{s}");
+    let line = s
+        .lines()
+        .find(|l| l.contains("context compacted"))
+        .unwrap_or_else(|| panic!("{s}"));
+    // The transcript's margins aside, the line runs across the screen.
+    assert!(
+        line.trim_start()
+            .starts_with("━━ context compacted · 182k → 41k tokens · 37 notes ━"),
+        "{line}"
+    );
+    assert!(line.chars().count() >= 97 && line.ends_with('━'), "{line}");
 }
 
 fn screen(app: &mut App, w: u16, h: u16) -> String {
@@ -595,6 +628,7 @@ fn file_completion_in_a_real_folder() {
             level: Default::default(),
             price: None,
             spent: 0.0,
+            compactions: 0,
             commands: vec![],
             draft: String::new(),
             attached: false,

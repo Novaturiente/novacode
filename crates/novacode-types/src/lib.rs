@@ -371,6 +371,10 @@ pub enum AgentEvent {
         /// Stopped on purpose (the `process` tool, session exit).
         stopped: bool,
     },
+    /// A compaction started (L4.5, L9.19); `Compacted` follows when it is done.
+    Compacting {
+        tokens_before: u64,
+    },
     /// The context was compacted (L4.5): earlier messages replaced by notes.
     Compacted {
         tokens_before: u64,

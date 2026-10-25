@@ -671,6 +671,7 @@ pub async fn attach(
         level: state.level,
         price: state.price,
         spent: state.spent,
+        compactions: state.compactions,
         commands: vec![],
         draft: String::new(),
         attached: true,

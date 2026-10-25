@@ -8,9 +8,9 @@ novacode runs full screen in your terminal's alternate screen. The mouse is on: 
 
 From top to bottom:
 
-- **Transcript.** Your messages (in a box), the model's replies, tool calls and their output. Finished turns fold their steps (tool calls, notes) to one line by default; the prompt and final reply stay (`Alt+O` toggles, `ui.turnCollapse`). `Ctrl+O` shows every tool's output in full or short again. `Ctrl+T` shows or folds thinking (`ui.thinking`: `collapsed`, `full` or `hidden`).
+- **Transcript.** Your messages (in a box), the model's replies, tool calls and their output. Finished turns fold their steps (tool calls, notes) to one line by default; the prompt and final reply stay (`Alt+O` toggles, `ui.turnCollapse`). `Ctrl+O` shows every tool's output in full or short again. `Ctrl+T` shows or folds thinking (`ui.thinking`: `collapsed`, `full` or `hidden`). When the context is compacted, a coloured line runs across the transcript: `━━ context compacted · 182k → 41k tokens · 37 notes ━━`. It never folds away. If no notes were available, it says `no notes, earlier messages were dropped` and shows in the error colour.
 - **Editor.** The input box. It grows up to 10 rows.
-- **Status line.** One row under the editor with the activity (`ready`, a spinner, or what novacode waits for) on the left and details on the right. See [Status line](#status-line).
+- **Status line.** One row under the editor with the activity (`ready`, a spinner, or what novacode waits for) on the left and details on the right. While a compaction runs, the activity says `compacting context`. See [Status line](#status-line).
 - **Side panel.** An optional column on the right. See [Side panel](#side-panel).
 
 Above the editor you may also see queued messages (`⏵ queued: …`), the completion popup, approval cards and question forms.
@@ -344,7 +344,7 @@ A token is `"#rrggbb"` or an object with `fg`, `bg` and the flags `bold`, `itali
 ```json
 { "ui": { "statusline": { "placement": "below", "rows": [
   { "left": ["activity"],
-    "right": ["ext", "bg", "ctx", "cache", "cost", "model", "cwd", "git"] }
+    "right": ["ext", "bg", "compactions", "ctx", "cache", "cost", "model", "cwd", "git"] }
 ] } } }
 ```
 
@@ -352,11 +352,12 @@ Segments:
 
 | Segment | Shows |
 |---|---|
-| `activity` | `ready`, a spinner while working, or what it waits for. |
+| `activity` | `ready`, a spinner while working (`compacting context` during a compaction), or what it waits for. |
 | `model` | Model id (without the provider, like pi) and thinking level. |
 | `thinking` | Thinking level alone. |
 | `cwd`, `git` | Folder and branch. |
 | `ctx` | Context window used, in percent. |
+| `compactions` | `compacted ×N`: how often the context of this session branch was compacted. Hidden before the first one. |
 | `cache` | Prompt cache hit rate for the whole session: cached prompt tokens over all prompt tokens so far. The Usage tab has the last request's rate. |
 | `usage_5h`, `usage_week` | Subscription usage windows. |
 | `cost` | Money spent this session on API-key routes. |

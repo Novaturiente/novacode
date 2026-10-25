@@ -119,6 +119,8 @@ You can also run it by hand:
 
 If everything already fits in the part kept as is, `/compact` says so and does nothing.
 
+In the terminal UI you see each compaction. While it runs, the status line says `compacting context`. When it is done, a coloured line runs across the transcript with the sizes before and after and the number of notes, for example `━━ context compacted · 182k → 41k tokens · 37 notes ━━`. That line stays when the turn folds. The `compactions` status segment shows how many compactions this session branch has had (`compacted ×2`). See [Terminal UI](tui.md).
+
 Two more background steps keep the notes small. They run in the same background pass as the observer, after it. A "reflector" turns notes into lasting facts, and a "dropper" removes notes that those facts already cover. The dropper only runs when the reflector made new facts and the active notes are over `memory.poolTargetTokens`.
 
 | Setting | Default | Meaning |
