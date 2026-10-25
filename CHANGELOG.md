@@ -2,6 +2,12 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.3.3] - 2026-10-26
+
+### Fixed
+
+- **Background processes stop when a headless session ends.** Commands started with the `process` tool in a `--rpc` or `--bg` session, which includes every subagent, kept running after the session closed. These sessions now stop them on exit, as the interactive window already did.
+
 ## [0.3.2] - 2026-10-26
 
 ### Fixed
@@ -73,5 +79,7 @@ All notable changes to novacode. Versions follow [semantic versioning](https://s
 - **`novacode auth status`** exits with code 1 when only keyless local servers (`ollama`, `lmstudio`) are listed.
 - **Print mode** notes on stderr when the reply was cut at the output token limit or had no text.
 
+[0.3.3]: https://github.com/Novaturiente/novacode/compare/v0.3.2...v0.3.3
+[0.3.2]: https://github.com/Novaturiente/novacode/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/Novaturiente/novacode/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Novaturiente/novacode/compare/v0.2.6...v0.3.0
