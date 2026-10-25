@@ -347,6 +347,105 @@ pub fn segments(src: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// The simple commands of a line for the command judge (L6.8): each one's words
+/// without leading `VAR=value` words and wrappers (`sudo`, `env`, `timeout`,
+/// `xargs`, `nohup`, …), and whether text reaches its stdin (a pipe, heredoc or
+/// here-string). `$(…)` bodies and `sh -c`/`eval` scripts count as commands of
+/// their own. `None` = it can't be parsed or nests too deeply.
+pub(crate) fn commands(src: &str) -> Option<Vec<(Vec<String>, bool)>> {
+    let mut out = Vec::new();
+    commands_into(src, 0, &mut out)?;
+    Some(out)
+}
+
+fn commands_into(src: &str, depth: u32, out: &mut Vec<(Vec<String>, bool)>) -> Option<()> {
+    if depth > 4 {
+        return None;
+    }
+    let (toks, subs) = lex(src)?;
+    for s in &subs {
+        commands_into(s, depth + 1, out)?;
+    }
+    let (mut words, mut stdin, mut piped) = (Vec::new(), false, false);
+    let mut iter = toks.into_iter().peekable();
+    loop {
+        match iter.next() {
+            Some(Tok::Word(w)) => words.push(w),
+            Some(Tok::Heredoc(_)) => stdin = true,
+            Some(Tok::HereString) => {
+                stdin = true;
+                if matches!(iter.peek(), Some(Tok::Word(_))) {
+                    iter.next();
+                }
+            }
+            // The target stays a word, so its path is seen.
+            Some(Tok::Redirect) => {}
+            sep @ (Some(Tok::Sep(_)) | None) => {
+                let w = unwrap(&words);
+                let name = w.first().map(|f| f.rsplit('/').next().unwrap_or(f));
+                let script = w
+                    .iter()
+                    .position(|a| a == "-c" || (a.starts_with('-') && a.ends_with('c')))
+                    .and_then(|i| w.get(i + 1));
+                match name {
+                    Some(n) if SHELLS.contains(&n) && script.is_some() => {
+                        commands_into(script.map_or("", String::as_str), depth + 1, out)?
+                    }
+                    Some("eval") => commands_into(&w[1..].join(" "), depth + 1, out)?,
+                    Some(_) => out.push((w.to_vec(), stdin || piped)),
+                    None => {}
+                }
+                words.clear();
+                stdin = false;
+                match sep {
+                    Some(Tok::Sep(s)) => piped = s == "|",
+                    _ => break,
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+/// `words` without leading assignments and wrappers (with their options).
+fn unwrap(words: &[String]) -> &[String] {
+    let mut w = words;
+    loop {
+        while w
+            .first()
+            .is_some_and(|f| f.contains('=') && !f.starts_with('-') && !f.starts_with('='))
+        {
+            w = &w[1..];
+        }
+        let Some(first) = w.first() else { return w };
+        let name = first.rsplit('/').next().unwrap_or(first);
+        let args = &w[1..];
+        w = match name {
+            "sudo" | "doas" | "pkexec" => skip_opts(args, SUDO_VALUE_FLAGS),
+            "env" => skip_opts(args, &["-u", "-C", "--unset", "--chdir"]),
+            "timeout" => skip_opts(args, &["-s", "-k", "--signal", "--kill-after"])
+                .get(1..)
+                .unwrap_or_default(),
+            "xargs" => skip_opts(args, XARGS_VALUE_FLAGS),
+            n if WRAPPERS.contains(&n) => skip_opts(args, wrapper_flags(n)),
+            _ => return w,
+        };
+    }
+}
+
+/// An interpreter of the gate's list given code it can't read (L6.8): inline
+/// (`-c`, `-e`, `deno eval`, …), or on stdin with no script file or module.
+pub(crate) fn runs_inline(words: &[String], stdin: bool) -> bool {
+    let Some(first) = words.first() else { return false };
+    let name = first.rsplit('/').next().unwrap_or(first);
+    if !is_interpreter(name) {
+        return false;
+    }
+    let args = &words[1..];
+    let (codes, seen, rest) = interpreter_args(name, args);
+    !codes.is_empty() || (stdin && !seen.contains('m') && args.get(rest).is_none_or(|a| a == "-"))
+}
+
 pub fn classify(src: &str, ctx: &Ctx) -> Risk {
     classify_depth(src, ctx, 0)
 }
@@ -422,7 +521,7 @@ fn redirect(target: &str, ctx: &Ctx) -> Risk {
 }
 
 /// Commands that only read.
-const SAFE: &[&str] = &[
+pub(crate) const SAFE: &[&str] = &[
     "ls",
     "cat",
     "head",
@@ -724,15 +823,7 @@ fn simple(w: &[String], input: &[String], piped: bool, ctx: &Ctx, depth: u32) ->
             }
         }
         n if WRAPPERS.contains(&n) => {
-            let value_flags: &[&str] = match n {
-                "nice" => &["-n", "--adjustment"],
-                "ionice" => &["-c", "-n", "-p", "-P", "-u"],
-                "stdbuf" => &["-i", "-o", "-e"],
-                "time" => &["-o", "-f", "--output", "--format"],
-                "exec" => &["-a"],
-                _ => &[],
-            };
-            let inner = skip_opts(args, value_flags);
+            let inner = skip_opts(args, wrapper_flags(n));
             if inner.is_empty() {
                 Risk::low()
             } else {
@@ -867,6 +958,18 @@ fn simple(w: &[String], input: &[String], piped: bool, ctx: &Ctx, depth: u32) ->
             }
         }
         _ => Risk::low(),
+    }
+}
+
+/// A wrapper's options that take a value.
+fn wrapper_flags(n: &str) -> &'static [&'static str] {
+    match n {
+        "nice" => &["-n", "--adjustment"],
+        "ionice" => &["-c", "-n", "-p", "-P", "-u"],
+        "stdbuf" => &["-i", "-o", "-e"],
+        "time" => &["-o", "-f", "--output", "--format"],
+        "exec" => &["-a"],
+        _ => &[],
     }
 }
 
@@ -1288,11 +1391,9 @@ fn inline_code<'a>(
     (codes, seen, i.min(args.len()))
 }
 
-/// An interpreter: inline code or stdin that names a credential folder or a
-/// protected path is Shared (the user decides; a read can be legitimate).
-/// `perl -i` writes the files after its code.
-fn interpreter(name: &str, args: &[String], input: &[String], ctx: &Ctx) -> Risk {
-    let (codes, seen, rest) = match name {
+/// [`inline_code`] with each interpreter's options.
+fn interpreter_args<'a>(name: &str, args: &'a [String]) -> (Vec<&'a str>, String, usize) {
+    match name {
         "node" | "nodejs" | "bun" => inline_code(args, "", "r", "", &["-e", "-p", "-pe", "-ep", "--eval", "--print"]),
         "deno" => match args.split_first() {
             Some((e, code)) if e == "eval" => (
@@ -1309,7 +1410,14 @@ fn interpreter(name: &str, args: &[String], input: &[String], ctx: &Ctx) -> Risk
         "ruby" => inline_code(args, "e", "IrCE", "F0x", &[]),
         "php" => inline_code(args, "r", "cdzfBRFE", "", &[]),
         _ => inline_code(args, "c", "WXm", "", &[]),
-    };
+    }
+}
+
+/// An interpreter: inline code or stdin that names a credential folder or a
+/// protected path is Shared (the user decides; a read can be legitimate).
+/// `perl -i` writes the files after its code.
+fn interpreter(name: &str, args: &[String], input: &[String], ctx: &Ctx) -> Risk {
+    let (codes, seen, rest) = interpreter_args(name, args);
     let mut r = Risk::low();
     if let Some(what) = codes
         .iter()
@@ -1472,7 +1580,7 @@ fn git_sub(args: &[String], i: usize) -> Risk {
 
 /// Expand `~` and `$HOME`, resolve against the cwd, normalise `.`/`..`, and
 /// strip a trailing `/*` or `/` (deleting `dir/*` is as bad as deleting `dir`).
-fn resolve(arg: &str, ctx: &Ctx) -> PathBuf {
+pub(crate) fn resolve(arg: &str, ctx: &Ctx) -> PathBuf {
     let home = ctx.home.to_string_lossy();
     let mut s = arg.to_string();
     for var in ["${HOME}", "$HOME"] {

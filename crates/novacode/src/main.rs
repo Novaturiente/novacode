@@ -1078,6 +1078,32 @@ impl Ctx {
         })
     }
 
+    /// The command judge (L6.8): `permissions.judge` = `off`, a `provider/model[:level]`,
+    /// or unset (the observer's model, which follows `/model`).
+    async fn command_judge(
+        &self,
+        spec: Option<String>,
+        route: &novacode_ai::connect::Route,
+        main: Arc<dyn novacode_ai::adapter::Adapter>,
+    ) -> Option<Arc<novacode_core::judge::Judge>> {
+        use novacode_core::judge::Judge;
+        let (worker, fixed) = match spec.as_deref() {
+            Some("off") => return None,
+            Some(s) => match self.providers.resolve(s) {
+                Ok(_) => (
+                    models::helper(&self.providers, Some(s.to_string()), route, main).await,
+                    true,
+                ),
+                Err(e) => {
+                    tracing::warn!(%e, "permissions.judge: using the observer's model");
+                    (self.memory_worker(route, main).await, false)
+                }
+            },
+            None => (self.memory_worker(route, main).await, false),
+        };
+        Some(Arc::new(Judge::new(worker, fixed)))
+    }
+
     /// The observer's model (see `models::helper`).
     async fn memory_worker(
         &self,
@@ -1127,6 +1153,7 @@ impl Ctx {
         diag::mark("connect provider");
         let s = &self.settings;
         let perms: Permissions = s.get("permissions").unwrap_or_default();
+        let judge_spec = perms.judge.clone();
         let mut policy = Policy::new(
             perms,
             std::env::var_os("HOME").map(Into::into).unwrap_or_default(),
@@ -1458,6 +1485,7 @@ impl Ctx {
             provider: route.provider.clone(),
             model: route.model.clone(),
         };
+        let judge = self.command_judge(judge_spec, &route, adapter.clone()).await;
         diag::mark("mcp config + tool list");
         let mut agent = Agent::new(adapter, tools, store, cfg, Arc::new(LocalEnv))
             .with_shared_policy(policy)
@@ -1543,6 +1571,9 @@ impl Ctx {
         }
         if let Some(a) = approver {
             agent = agent.with_approver(a);
+        }
+        if let Some(j) = judge {
+            agent = agent.with_judge(j);
         }
         if let Some(c) = carry {
             agent = agent.adopt(c);

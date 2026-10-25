@@ -49,6 +49,9 @@ pub struct Permissions {
     pub deny: Vec<String>,
     pub protected: Protected,
     pub profiles: BTreeMap<String, Profile>,
+    /// The command judge's model (L6.8): `off`, a `provider/model[:level]`, or
+    /// unset (the observer's model). Read by the host, not by the policy.
+    pub judge: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -317,6 +320,32 @@ impl Policy {
 
     pub fn mode(&self) -> Mode {
         self.perms.mode
+    }
+
+    /// The home folder the risk gate resolves `~` against.
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    /// `permissions.protected.paths`.
+    pub fn protected_paths(&self) -> &[String] {
+        &self.perms.protected.paths
+    }
+
+    /// The user's own allow rules or this session's approvals cover this shell
+    /// command, so the command judge (L6.8) leaves it alone.
+    pub fn user_allowed(&self, command: &str) -> bool {
+        if self.session_commands.lock().unwrap().contains(command) {
+            return true;
+        }
+        let segs = risk::segments(command).unwrap_or_else(|| vec![command.to_string()]);
+        let session = self.session_allow.lock().unwrap();
+        !segs.is_empty()
+            && self
+                .allow
+                .iter()
+                .chain(session.iter())
+                .any(|r| r.matches_tool("bash") && segs.iter().all(|s| r.matches_command(s)))
     }
 
     /// The mode a child agent starts with: read-only while a read-only preset

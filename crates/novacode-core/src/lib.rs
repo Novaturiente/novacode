@@ -8,6 +8,7 @@ pub mod codemode;
 pub mod export;
 pub mod extensions;
 pub mod hooks;
+pub mod judge;
 pub mod mcp;
 pub mod mcp_oauth;
 pub mod memory;

@@ -102,6 +102,8 @@ pub struct Agent {
     modes: Option<Arc<crate::modes::Modes>>,
     /// `None` = nobody to ask (print mode, headless): asks become refusals or justifications.
     approver: Option<Arc<dyn Approver>>,
+    /// The command judge (L6.8); `None` = off.
+    judge: Option<Arc<crate::judge::Judge>>,
     /// First loop retry wait; later ones double (L4.6).
     retry_base: Duration,
     /// Learned tool-schema rejections (L2.20).
@@ -257,6 +259,7 @@ fn side_runner(r: &crate::codemode::Runner, tools: Vec<Arc<dyn Tool>>) -> Arc<cr
         budget: r.budget,
         seq: Default::default(),
         hooks: r.hooks.clone(),
+        judge: r.judge.clone(),
     })
 }
 
@@ -405,6 +408,7 @@ impl Agent {
             policy: Arc::new(Policy::new(Permissions::default(), home, None)),
             modes: None,
             approver: None,
+            judge: None,
             retry_base: LOOP_RETRY_BASE,
             quirks: Arc::new(Quirks::ephemeral()),
             memory: None,
@@ -496,6 +500,7 @@ impl Agent {
             budget,
             seq: Default::default(),
             hooks: self.hooks.clone(),
+            judge: self.judge.clone(),
         })
     }
 
@@ -1139,6 +1144,13 @@ impl Agent {
         self
     }
 
+    /// The command judge (L6.8): risky commands the gate allows in auto mode go to it.
+    pub fn with_judge(mut self, judge: Arc<crate::judge::Judge>) -> Self {
+        judge.set_events(self.events.clone());
+        self.judge = Some(judge);
+        self
+    }
+
     /// Override the first loop retry wait (default 2 s); tests use a short one.
     pub fn with_retry_base(mut self, base: Duration) -> Self {
         self.retry_base = base;
@@ -1157,6 +1169,7 @@ impl Agent {
         pipeline::authorize_cancellable(
             &self.policy,
             self.approver.as_ref(),
+            self.judge.as_deref(),
             &call.name,
             read_only,
             args,
@@ -1449,9 +1462,12 @@ impl Agent {
                         provider: s.provider.clone(),
                         model: s.model.clone(),
                     };
-                } else if let Some(h) = s.helper {
+                } else if let Some(h) = s.helper.clone() {
                     m.worker = h;
                 }
+            }
+            if let (Some(j), Some(h)) = (&self.judge, &s.helper) {
+                j.follow(h.clone());
             }
             self.adapter = s.adapter;
             self.cfg.provider = s.provider;
@@ -1922,6 +1938,10 @@ impl Agent {
             .collect();
         // Malformed calls count toward the cap (L3.4); permission refusals don't.
         let all_rejected = prepared.iter().all(|(_, p)| matches!(p, Prepared::Rejected(_)));
+        // What the command judge (L6.8) reads: the user's messages and recent calls, never replies or output.
+        if let Some(j) = &self.judge {
+            j.see(crate::judge::seen(&self.store.branch(), self.store.id()));
+        }
         // Permissions are part of the sequential preflight (L3.3, L6.1); approvals are asked one at a time.
         for (call, p) in &mut prepared {
             // Hooks first (they may rewrite the args), so permissions judge what will run.

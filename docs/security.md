@@ -104,6 +104,28 @@ When a tool writes a file, it writes through a symlink to its target (the link s
 
 In print mode (`-p`) and other runs with no one to answer a question, a held command cannot be approved. novacode gives the model one way forward: call `bash` again with the same command and a `justification` field (at least 12 characters) that says why it is safe. If the justification is there, the command runs and the reason is logged. Without it, the command is refused. This only works for commands held by the risk gate (Confirm and Shared). It does not work for a call held by an `ask` rule or by `ask` mode.
 
+## Command judge
+
+The risk gate reads command text. It can't tell whether a `curl` or a `git push` is what you asked for. In `auto` mode a small model, the **command judge**, checks the risky commands the gate lets through.
+
+It looks at `bash` commands and `process` starts that:
+
+- reach another machine: `curl`, `wget`, `ssh`, `scp`, `sftp`, `nc`, `ncat`, `socat`, `rsync` to or from `host:path`, `git push`, `gh`/`glab` commands that change something, `npm`/`cargo`/`twine`/`gem` publish, `docker`/`podman` push or login;
+- run inline code (`python -c`, `node -e`, a heredoc fed to an interpreter, and the rest of the gate's list);
+- are Confirm level (bulk deletes that `auto` mode runs without asking);
+- name a path outside the project and `/tmp`;
+- run with `unsandboxed: true`.
+
+Builds, tests and read-only commands never go to it. Nor does a command your own `allow` rules or this session's approvals cover. In `ask` and `read-only` mode it is off: you already decide there.
+
+The judge sees your messages of this session and the agent's recent tool calls (name and arguments). It never sees the agent's replies or any tool output, so neither the agent nor text in a file can talk it round. It answers `ALLOW` or `BLOCK` with a reason.
+
+- **Block, with you there:** an approval card shows the judge's reason. `y` runs it; `a` allows that exact command for the session.
+- **Block, nobody there** (print mode): the command is refused, and the model is told why.
+- **The judge fails or takes more than 20 s:** the gate's verdict stands and the command runs. You see a short notice, and the log has the error.
+
+Esc while it thinks cancels the call. Pick its model with `permissions.judge`: unset uses the observer's model (the provider's small model), `off` turns it off, or name a `provider/model[:level]`. Like all of `permissions`, this is global only. Its calls are logged but not counted in `/usage`.
+
 ## Approval dialogs
 
 When something needs your approval, a card shows the tool, the command or path, and why. Answer with:

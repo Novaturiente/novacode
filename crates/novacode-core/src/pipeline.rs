@@ -134,14 +134,16 @@ pub async fn authorize(
     hook: &crate::policy::HookDecision,
 ) -> Option<ToolOutput> {
     let never = tokio_util::sync::CancellationToken::new();
-    authorize_cancellable(policy, approver, tool, read_only, args, cwd, hook, &never).await
+    authorize_cancellable(policy, approver, None, tool, read_only, args, cwd, hook, &never).await
 }
 
 /// [`authorize`], but a cancelled `cancel` ends a pending approval as a deny ("aborted"), not recorded.
+/// `judge`: the command judge (L6.8) looks at risky commands the gate allowed.
 #[allow(clippy::too_many_arguments)]
 pub async fn authorize_cancellable(
     policy: &crate::policy::Policy,
     approver: Option<&Arc<dyn crate::policy::Approver>>,
+    judge: Option<&crate::judge::Judge>,
     tool: &str,
     read_only: bool,
     args: &Value,
@@ -149,9 +151,24 @@ pub async fn authorize_cancellable(
     hook: &crate::policy::HookDecision,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Option<ToolOutput> {
+    use crate::judge::Decision;
     use crate::policy::{Approval, ApprovalRequest, Verdict};
     let (reason, rule, risky) = match policy.check_tool(tool, read_only, args, cwd, approver.is_some(), hook) {
-        Verdict::Allow => return None,
+        Verdict::Allow => {
+            let judge = judge?;
+            let (command, why) = crate::judge::scope(policy, tool, args, cwd)?;
+            match judge.decide(&command, &why, cancel).await {
+                Decision::Allow => return None,
+                Decision::Aborted => return Some(ToolOutput::error("Not run: aborted.")),
+                Decision::Block(reason) if approver.is_none() => {
+                    return Some(ToolOutput::error(format!(
+                        "Refused by the command judge: {reason}. Do it another way, or ask the user to run it."
+                    )));
+                }
+                // Risky: no "always"; a yes is remembered for this exact command.
+                Decision::Block(reason) => (format!("the command judge: {reason}"), command, true),
+            }
+        }
         Verdict::Deny(why) => return Some(ToolOutput::error(why)),
         Verdict::Ask { reason, rule, risky } => (reason, rule, risky),
     };
@@ -235,6 +252,182 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    mod judged {
+        use super::*;
+        use crate::judge::Judge;
+        use crate::policy::{Approval, ApprovalRequest, Approver, HookDecision, Policy};
+        use futures_util::future::BoxFuture;
+        use novacode_ai::faux::{Faux, FauxReply};
+        use std::sync::Mutex;
+
+        /// Answers every card with `answer` and keeps the requests.
+        struct Cards(Approval, Mutex<Vec<ApprovalRequest>>);
+        impl Approver for Cards {
+            fn approve(&self, req: ApprovalRequest) -> BoxFuture<'_, Approval> {
+                self.1.lock().unwrap().push(req);
+                let a = self.0.clone();
+                Box::pin(async move { a })
+            }
+        }
+
+        fn judge(reply: &str) -> (Arc<Judge>, Faux) {
+            let faux = Faux::new([FauxReply::text(reply)]);
+            let w = crate::memory::Worker {
+                adapter: Arc::new(faux.clone()),
+                provider: "faux".into(),
+                model: "small".into(),
+            };
+            (Arc::new(Judge::new(w, false)), faux)
+        }
+
+        fn policy(v: Value) -> Policy {
+            Policy::new(serde_json::from_value(v).unwrap(), "/h".into(), None)
+        }
+
+        async fn auth(p: &Policy, cards: Option<&Arc<Cards>>, j: &Judge, cmd: &str) -> Option<ToolOutput> {
+            let approver = cards.map(|c| c.clone() as Arc<dyn Approver>);
+            let never = tokio_util::sync::CancellationToken::new();
+            authorize_cancellable(
+                p,
+                approver.as_ref(),
+                Some(j),
+                "bash",
+                false,
+                &json!({ "command": cmd }),
+                Path::new("/w"),
+                &HookDecision::None,
+                &never,
+            )
+            .await
+        }
+
+        fn text(o: &ToolOutput) -> String {
+            format!("{:?}", o.content)
+        }
+
+        #[tokio::test]
+        async fn allow_runs_and_the_judge_sees_the_user() {
+            let (j, faux) = judge("ALLOW");
+            j.see(crate::judge::Seen {
+                session: "s".into(),
+                user: vec!["push my branch".into()],
+                calls: vec![],
+            });
+            assert!(
+                auth(&policy(json!({})), None, &j, "git push origin main")
+                    .await
+                    .is_none()
+            );
+            let sent = format!("{:?}", faux.requests.lock().unwrap()[0].messages);
+            assert!(sent.contains("push my branch"));
+            assert_eq!(faux.requests.lock().unwrap().len(), 1);
+            // Builds never reach it.
+            assert!(auth(&policy(json!({})), None, &j, "cargo test").await.is_none());
+            assert_eq!(faux.requests.lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn block_asks_interactive_and_refuses_unattended() {
+            let (j, _) = judge("BLOCK: the user never asked to publish");
+            let p = policy(json!({}));
+            let out = auth(&p, None, &j, "npm publish").await.unwrap();
+            assert!(out.is_error);
+            assert!(text(&out).contains("Refused by the command judge: the user never asked to publish."));
+
+            let (j, _) = judge("BLOCK: pushes to a remote");
+            let yes = Arc::new(Cards(Approval::Session, Mutex::default()));
+            assert!(auth(&p, Some(&yes), &j, "git push").await.is_none());
+            let req = yes.1.lock().unwrap()[0].clone();
+            assert!(req.risky);
+            assert_eq!(req.reason, "the command judge: pushes to a remote");
+            // The yes is remembered for this exact command: no second judge call.
+            assert!(p.user_allowed("git push"));
+
+            let (j, _) = judge("BLOCK: deletes a remote");
+            let no = Arc::new(Cards(Approval::Deny(None), Mutex::default()));
+            let out = auth(&p, Some(&no), &j, "git push other").await.unwrap();
+            assert!(text(&out).contains("The user declined this call."));
+        }
+
+        #[tokio::test]
+        async fn error_falls_back_to_the_gate_with_a_notice() {
+            let (j, _) = judge("Sure, looks fine to me");
+            let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+            j.set_events(tx);
+            assert!(auth(&policy(json!({})), None, &j, "curl https://x").await.is_none());
+            let ev = rx.try_recv().unwrap();
+            assert!(format!("{ev:?}").contains("command judge failed"));
+            // A model that never answers times out the same way, and its request is cancelled.
+            struct Silent(tokio_util::sync::CancellationToken);
+            impl novacode_ai::adapter::Adapter for Silent {
+                fn stream(
+                    &self,
+                    _: novacode_ai::adapter::Request,
+                    cancel: tokio_util::sync::CancellationToken,
+                ) -> tokio::sync::mpsc::Receiver<novacode_types::StreamEvent> {
+                    let (tx, rx) = tokio::sync::mpsc::channel(1);
+                    let seen = self.0.clone();
+                    tokio::spawn(async move {
+                        cancel.cancelled().await;
+                        seen.cancel();
+                        drop(tx);
+                    });
+                    rx
+                }
+            }
+            let stopped = tokio_util::sync::CancellationToken::new();
+            let slow = crate::memory::Worker {
+                adapter: Arc::new(Silent(stopped.clone())),
+                provider: "faux".into(),
+                model: "m".into(),
+            };
+            let j = Judge::new(slow, false).with_timeout(std::time::Duration::from_millis(20));
+            let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+            j.set_events(tx);
+            assert!(auth(&policy(json!({})), None, &j, "curl https://x").await.is_none());
+            assert!(format!("{:?}", rx.try_recv().unwrap()).contains("no answer in"));
+            tokio::time::timeout(std::time::Duration::from_secs(5), stopped.cancelled())
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn allow_rules_and_ask_mode_skip_it() {
+            let (j, faux) = judge("BLOCK: no");
+            let p = policy(json!({ "allow": ["Bash(git push:*)"] }));
+            assert!(auth(&p, None, &j, "git push origin main").await.is_none());
+            let ask = policy(json!({ "mode": "ask" }));
+            let yes = Arc::new(Cards(Approval::Once, Mutex::default()));
+            assert!(auth(&ask, Some(&yes), &j, "git push origin main").await.is_none());
+            assert!(yes.1.lock().unwrap()[0].reason.starts_with("ask mode"));
+            // A refusal by the gate stays a refusal.
+            assert!(auth(&policy(json!({})), None, &j, "rm -rf ~").await.is_some());
+            assert!(faux.requests.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn unsandboxed_calls_are_judged() {
+            let (j, faux) = judge("ALLOW");
+            let never = tokio_util::sync::CancellationToken::new();
+            let args = json!({ "action": "start", "command": "ls", "unsandboxed": true });
+            let p = policy(json!({}));
+            let out = authorize_cancellable(
+                &p,
+                None,
+                Some(&j),
+                "process",
+                false,
+                &args,
+                Path::new("/w"),
+                &HookDecision::None,
+                &never,
+            )
+            .await;
+            assert!(out.is_none());
+            assert_eq!(faux.requests.lock().unwrap().len(), 1);
+        }
     }
 
     fn call(name: &str, args: Value) -> ToolCall {
