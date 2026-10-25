@@ -182,6 +182,16 @@ impl TrustStore {
         self.store(at, true, cwd, Some(fp))
     }
 
+    /// After a change the user agreed to in a folder that was [`State::Trusted`] just before
+    /// (installing its declared packages), keep it trusted: store `dir`'s new fingerprint.
+    pub fn accept_current(&self, dir: &Path) -> io::Result<()> {
+        let map = self.read();
+        let Some(at) = dir.ancestors().find(|a| map.get(*a).is_some_and(|d| d.trusted)) else {
+            return Ok(());
+        };
+        self.store(at, true, dir, Some(fingerprint(dir)))
+    }
+
     fn store(&self, at: &Path, trusted: bool, cwd: &Path, fp: Option<Fingerprint>) -> io::Result<()> {
         let fp = fp.filter(|_| cwd.starts_with(at)).map(|f| (rel_key(at, cwd), f));
         self.update(|m| {
@@ -597,5 +607,24 @@ mod tests {
         write(&dir.join(".mcp.json"), "{\"x\":1}");
         s.trust_with(dir, dir, shown).unwrap();
         assert_eq!(s.state(dir), State::Changed(vec!["changed .mcp.json".into()]));
+    }
+
+    #[test]
+    fn accepting_an_agreed_change_keeps_trust() {
+        let home = tempfile::tempdir().unwrap();
+        let w = tempfile::tempdir().unwrap();
+        let dir = w.path();
+        write(&dir.join(".novacode/packages.json"), "[]");
+        let s = TrustStore::new(home.path().join("trust.json"));
+        // Undecided: accepting does nothing.
+        s.accept_current(dir).unwrap();
+        assert_eq!(s.state(dir), State::Unknown);
+        s.set(dir, true).unwrap();
+        // Installing the declared packages changes the fingerprint…
+        write(&dir.join(".novacode/packages/p/x.md"), "x");
+        assert!(matches!(s.state(dir), State::Changed(_)));
+        // …and accepting that install keeps the folder trusted.
+        s.accept_current(dir).unwrap();
+        assert_eq!(s.state(dir), State::Trusted);
     }
 }

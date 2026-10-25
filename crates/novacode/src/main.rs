@@ -801,10 +801,15 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             what: Some(PkgCmd::Install),
         }) => {
             let cwd = std::env::current_dir()?;
-            if !trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &cwd, false) {
+            let trust_store = TrustStore::new(paths.home().join("trust.json"));
+            if !trust::resolve(&trust_store, &cwd, false) {
                 bail!("this folder isn't trusted; run `novacode trust` first");
             }
             let r = novacode_core::packages::install_project(&cwd).await;
+            // The install changes the project config fingerprint; the user asked for it (L6.3).
+            if let Err(e) = trust_store.accept_current(&cwd) {
+                tracing::warn!(%e, "couldn't store the project config fingerprint");
+            }
             if r.is_empty() {
                 eprintln!("nothing to install");
             }
@@ -2952,11 +2957,17 @@ async fn project_packages(paths: &Paths, cwd: &Path, interactive: bool) -> anyho
         novacode_base::storage::Durability::Durable,
     )?;
     if yes {
+        let store = TrustStore::new(paths.home().join("trust.json"));
+        let was_trusted = store.state(cwd) == trust::State::Trusted;
         for (n, r) in novacode_core::packages::install_project(cwd).await {
             match r {
                 Ok(_) => eprintln!("installed `{n}`"),
                 Err(e) => eprintln!("`{n}` failed: {e}"),
             }
+        }
+        // The install changes the project config fingerprint; the user just agreed to it (L6.3).
+        if was_trusted && let Err(e) = store.accept_current(cwd) {
+            tracing::warn!(%e, "couldn't store the project config fingerprint");
         }
     }
     Ok(())

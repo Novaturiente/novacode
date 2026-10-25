@@ -15,7 +15,7 @@ novacode needs a terminal (stdin and stdout must both be one), or it stops with 
 
 ### 1. Trust prompt
 
-If the folder has project config (`.novacode/settings.json`, `.novacode/extensions`, `.novacode/skills`, `.novacode/agents`, `.mcp.json`, or `.claude/skills`, `.claude/agents`, `.claude/commands`), novacode first asks whether to trust it. Project config can change settings and run code, so it only loads after you say yes.
+If the folder has project config (`.novacode/settings.json`, `.novacode/extensions`, `.novacode/skills`, `.novacode/agents`, `.novacode/packages`, `.novacode/packages.json`, `.mcp.json` here or in a parent folder up to the git top level, or `.claude/skills`, `.claude/agents`, `.claude/commands`), novacode first asks whether to trust it. Project config can change settings and run code, so it only loads after you say yes. If it changes later, novacode asks again (see [security](security.md)).
 
 | Choice | Effect |
 |---|---|
