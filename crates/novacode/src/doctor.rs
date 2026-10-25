@@ -3,6 +3,7 @@
 use futures_util::future::join_all;
 use novacode_ai::connect::Providers;
 use novacode_base::settings::Settings;
+use novacode_tools::sandbox::Mode;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -140,11 +141,50 @@ pub async fn doctor(
     for s in shadowed {
         println!("  · {s}");
     }
+    println!("sandbox");
+    let mode = crate::sandbox_mode(settings);
+    let works = || {
+        novacode_tools::sandbox::Sandbox::new(novacode_tools::sandbox::Config {
+            mode,
+            ..Default::default()
+        })
+        .available()
+    };
+    match sandbox_line(mode, mode != Mode::Off && works()) {
+        (true, line) => println!("  ✓ {line}"),
+        (false, line) => {
+            failed |= mode == Mode::On;
+            println!("  {} {line}", if mode == Mode::On { "✗" } else { "-" });
+        }
+    }
     if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+}
+
+/// The doctor's sandbox line (L6.5), under the `sandbox` heading: (fine, text).
+fn sandbox_line(mode: Mode, works: bool) -> (bool, &'static str) {
+    match (mode, works) {
+        (Mode::Off, _) => (false, "off (setting)"),
+        (_, true) => (true, "on (bubblewrap)"),
+        (Mode::Auto, false) => (false, "unavailable (bwrap not found), commands run unsandboxed"),
+        (Mode::On, false) => (
+            false,
+            "unavailable (bwrap not found), commands are refused (`sandbox.mode` is on)",
+        ),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use novacode_tools::sandbox::Mode;
+
+    #[test]
+    fn sandbox_lines() {
+        assert_eq!(super::sandbox_line(Mode::Auto, true), (true, "on (bubblewrap)"));
+        assert_eq!(super::sandbox_line(Mode::Off, true), (false, "off (setting)"));
+        assert!(super::sandbox_line(Mode::Auto, false).1.contains("run unsandboxed"));
+        assert!(super::sandbox_line(Mode::On, false).1.contains("refused"));
+    }
+
     #[test]
     fn spans() {
         assert_eq!(super::span(3 * 60_000), "3m");

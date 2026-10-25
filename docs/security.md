@@ -1,10 +1,10 @@
 # Security
 
-This page explains what novacode does and does not protect you from: permission modes, the command risk gate, permission rules, project trust, and how secrets are handled.
+This page explains what novacode does and does not protect you from: permission modes, the command risk gate, the sandbox, permission rules, project trust, and how secrets are handled.
 
 ## The threat model
 
-novacode has **no sandbox**. Commands the agent runs with `bash` run as you, with your files, your network and your credentials. The protections below are guard rails that catch mistakes. They are not a wall against a determined attacker or a hostile model.
+Commands the agent runs with `bash` run as you. On Linux with bubblewrap installed, they run in a [sandbox](#sandbox): they can read your files but write only in the project and a few other places, and your credentials are hidden. Without bubblewrap (and on macOS) they run with your files, your network and your credentials. The protections below are guard rails that catch mistakes. They are not a wall against a determined attacker or a hostile model.
 
 If you need real isolation, run novacode inside a container or VM.
 
@@ -104,6 +104,36 @@ When a tool writes a file, it writes through a symlink to its target (the link s
 
 In print mode (`-p`) and other runs with no one to answer a question, a held command cannot be approved. novacode gives the model one way forward: call `bash` again with the same command and a `justification` field (at least 12 characters) that says why it is safe. If the justification is there, the command runs and the reason is logged. Without it, the command is refused. This only works for commands held by the risk gate (Confirm and Shared). It does not work for a call held by an `ask` rule or by `ask` mode.
 
+## Sandbox
+
+On Linux, the commands the model runs (the `bash` tool and `process` starts) run inside [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`). Install it with your package manager (`bubblewrap`). It adds about 10 ms per command.
+
+Inside the sandbox:
+
+- The whole file system is **read-only**.
+- These places are **writable**: the project (the git top level of the session folder, or the folder itself outside git; for a git worktree also the repository's shared `.git` folder), `/tmp`, `$TMPDIR`, the tool caches that exist (`~/.cache`, `~/.cargo`, `~/.rustup`, `~/.npm`, `~/.bun`, `~/go`) and the folders in `sandbox.allowWrite`.
+- These are **hidden** (an empty folder or an empty file): the credential folders the risk gate protects (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.config/gcloud`, `~/.password-store`), novacode's logins and trust list (`auth.json`, `auth-*.json`, `mcp-auth.json`, `trust.json` in `~/.novacode`), token files (`~/.git-credentials`, `~/.netrc`, `~/.cargo/credentials`, `~/.cargo/credentials.toml`, `~/.docker/config.json`, `~/.config/gh/hosts.yml`, `~/.pypirc`, `~/.npmrc`), your `permissions.protected.paths` and the paths in `sandbox.denyRead`. They stay hidden even inside a writable folder.
+- The network stays on. The working folder is the same as outside.
+- Timeouts, Esc and `process stop` still end everything the command started.
+
+The layout is worked out when the session starts; a path that doesn't exist then is skipped.
+
+When a sandboxed command fails with `Read-only file system`, the result adds one line that names the writable places and says how to run the command outside.
+
+**Running one command outside.** `bash` and `process` `start` take `unsandboxed: true` for a command that needs what the sandbox hides or blocks, for example `git push` over SSH. There is no approval card for it, but the risk gate still applies, and the result says `[ran outside the sandbox]`.
+
+**What it doesn't cover:** your own `!` commands, hooks, extensions' `exec`, MCP servers and provider programs. You set those up yourself, so they run as you.
+
+**Settings** (global only, so a project can't turn the sandbox off):
+
+| Key | Meaning |
+|---|---|
+| `sandbox.mode` | `auto` (default), `on` or `off`. |
+| `sandbox.allowWrite` | More writable folders. |
+| `sandbox.denyRead` | More hidden files and folders. |
+
+With `auto`, novacode checks once whether bubblewrap works. If it doesn't, it logs one warning and commands run unsandboxed. With `on`, commands are refused instead (except `unsandboxed: true` ones). `novacode doctor` shows the state under `sandbox`: `on (bubblewrap)`, `off (setting)`, or `unavailable (bwrap not found), commands run unsandboxed`.
+
 ## Approval dialogs
 
 When something needs your approval, a card shows the tool, the command or path, and why. Answer with:
@@ -192,7 +222,7 @@ novacode --profile scout
 
 ## Permissions are global only
 
-`permissions` is read from `~/.novacode/settings.json` only. (Which folders you trust is kept in `~/.novacode/trust.json`, never in settings.) A project's `.novacode/settings.json` cannot widen what the agent may do, even when the folder is trusted.
+`permissions` and `sandbox` are read from `~/.novacode/settings.json` only. (Which folders you trust is kept in `~/.novacode/trust.json`, never in settings.) A project's `.novacode/settings.json` cannot widen what the agent may do, even when the folder is trusted.
 
 ## Project trust
 

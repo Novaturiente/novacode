@@ -79,8 +79,9 @@ Params: `path`, `edits` (a list of `old_text` / `new_text`). Each `old_text` mus
 | `timeout` | Seconds. Default 120, max 600. |
 | `intent` | One short sentence on why; shown to you. |
 | `justification` | Only when the safety check asks for it with nobody to approve. See [Security](security.md). |
+| `unsandboxed` | `true` runs this one command outside the [sandbox](security.md#sandbox), for a command that needs what it hides or blocks. |
 
-Each call is a fresh shell: `cd` and `export` don't carry over to the next call. stdout and stderr are merged. stdin is closed, so interactive programs fail instead of hanging. The command sees `NOVACODE_SESSION_ID`. In memory, only the last 4 MB of output is kept.
+On Linux with bubblewrap, commands run in the sandbox: the project, `/tmp` and tool caches are writable, the rest is read-only, and credentials are hidden. Each call is a fresh shell: `cd` and `export` don't carry over to the next call. stdout and stderr are merged. stdin is closed, so interactive programs fail instead of hanging. The command sees `NOVACODE_SESSION_ID`. In memory, only the last 4 MB of output is kept.
 
 A command that passes its timeout is not killed: it moves to the process manager and keeps running, and the model gets its id. If it is still running at twice the timeout, you are asked whether to keep it. (Without a process manager, such as in some embedded runs, it is killed at the timeout.)
 
@@ -186,7 +187,7 @@ The `process` tool runs commands that keep going across turns: dev servers, watc
 
 | Action | What it does |
 |---|---|
-| `start` | Starts `command` (with a `name`, optional `cwd`) in its own process group. Waits 1.5 seconds and reports it if it fails at once. |
+| `start` | Starts `command` (with a `name`, optional `cwd`) in its own process group, inside the [sandbox](security.md#sandbox) unless `unsandboxed` is true. Waits 1.5 seconds and reports it if it fails at once. |
 | `list` | Shows processes with state, pid, command and folder. |
 | `output` | Shows the last `lines` (default 100, max 2000), optionally only lines containing `filter` (searched in the last 1 MB of output). |
 | `write` | Sends `input` to its stdin; `end` closes stdin. |

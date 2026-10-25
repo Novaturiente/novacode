@@ -173,7 +173,8 @@ impl ProcessManager {
         })
     }
 
-    /// Start `command` with `bash -c` in its own process group, stdin piped.
+    /// Start `command` with `bash -c` in its own process group, stdin piped;
+    /// inside `sandbox` when given (L6.5).
     pub fn start(
         self: &Arc<Self>,
         name: &str,
@@ -181,13 +182,11 @@ impl ProcessManager {
         cwd: &Path,
         env: &[(String, String)],
         listed: bool,
+        sandbox: Option<&crate::sandbox::Sandbox>,
     ) -> std::io::Result<String> {
         std::fs::create_dir_all(&self.dir)?;
         let id = format!("proc_{}", self.next.fetch_add(1, Ordering::Relaxed));
-        let mut child = tokio::process::Command::new("bash")
-            .arg("-c")
-            .arg(command)
-            .current_dir(cwd)
+        let mut child = crate::sandbox::command(sandbox, command, cwd)?
             .envs(env.iter().map(|(k, v)| (k, v)))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -751,6 +750,9 @@ struct Args {
     watches: Option<Vec<Watch>>,
     /// start/watch: be told when it prints nothing for this many seconds.
     stall_seconds: Option<u64>,
+    /// start: run outside the sandbox, only for a command that needs what it hides or blocks.
+    #[serde(default)]
+    unsandboxed: bool,
 }
 
 fn fmt_info(i: &Info) -> String {
@@ -826,7 +828,8 @@ impl crate::Tool for ProcessTool {
                     let name = a.name.clone().unwrap_or_else(|| cmd.chars().take(40).collect());
                     let cwd = a.cwd.as_deref().map_or(ctx.cwd.clone(), |c| ctx.path(c));
                     let env = [("NOVACODE_SESSION_ID".to_string(), ctx.session_id.clone())];
-                    let id = match pm.start(&name, cmd, &cwd, &env, false) {
+                    let sb = if a.unsandboxed { None } else { ctx.env.sandbox() };
+                    let id = match pm.start(&name, cmd, &cwd, &env, false, sb) {
                         Ok(id) => id,
                         Err(e) => return ToolOutput::error(format!("could not start: {e}")),
                     };
@@ -836,12 +839,15 @@ impl crate::Tool for ProcessTool {
                     // A moment for instant failures (bad command, port in use) to show.
                     let ended = pm.wait(&id, Duration::from_millis(1500), |_| {}).await;
                     let tail = pm.output(&id, 20, None).unwrap_or_default();
+                    let failed = ended.as_ref().is_some_and(|e| e.code != Some(0));
+                    let note = crate::bash::sandbox_note(ctx, a.unsandboxed, failed, &tail)
+                        .map_or(String::new(), |n| format!("\n{n}"));
                     match ended {
                         Some(e) => ToolOutput::error(format!(
-                            "{id} ({name}) ended at once ({}):\n{tail}",
+                            "{id} ({name}) ended at once ({}):\n{tail}{note}",
                             e.code.map_or("killed".into(), |c| format!("exit {c}"))
                         )),
-                        None => ToolOutput::text(format!("started {id} ({name}). First output:\n{tail}")),
+                        None => ToolOutput::text(format!("started {id} ({name}). First output:\n{tail}{note}")),
                     }
                 }
                 Action::List => {
@@ -936,6 +942,7 @@ mod tests {
                 d.path(),
                 &[],
                 true,
+                None,
             )
             .unwrap();
         pm.set_watches(
@@ -966,7 +973,7 @@ mod tests {
         assert!(matches!(e, Event::Ended { .. }), "{e:?}");
         assert!(ev.try_recv().is_err());
         // Another one: the manager dropping kills its group.
-        let id2 = pm.start("sleeper", "sleep 30", d.path(), &[], true).unwrap();
+        let id2 = pm.start("sleeper", "sleep 30", d.path(), &[], true, None).unwrap();
         let pid2 = pm.list().iter().find(|i| i.id == id2).unwrap().pid;
         assert!(group_alive(pid2));
         drop(pm);
@@ -987,6 +994,7 @@ mod tests {
                 d.path(),
                 &[],
                 true,
+                None,
             )
             .unwrap();
         pm.set_watches(
@@ -1030,7 +1038,7 @@ mod tests {
         let pm = ProcessManager::new(d.path(), "s");
         let mut ev = pm.events.subscribe();
         // Hidden (bash): no events while it's waited on and finishes.
-        let id = pm.start("quick", "echo hi", d.path(), &[], false).unwrap();
+        let id = pm.start("quick", "echo hi", d.path(), &[], false, None).unwrap();
         let mut got = Vec::new();
         let end = pm
             .wait(&id, Duration::from_secs(5), |c| got.extend_from_slice(c))
@@ -1040,7 +1048,7 @@ mod tests {
         assert!(ev.try_recv().is_err());
         // Timed out, then revealed: the exit wakes the agent with the tail.
         let id = pm
-            .start("slow", "sleep 1; echo done; exit 4", d.path(), &[], false)
+            .start("slow", "sleep 1; echo done; exit 4", d.path(), &[], false, None)
             .unwrap();
         assert!(pm.wait(&id, Duration::from_millis(200), |_| {}).await.is_none());
         pm.reveal(&id, Attention::Wake);

@@ -2,7 +2,7 @@
 
 <!-- Generated from crates/novacode-base/src/settings_doc.rs; edit there. -->
 
-Global settings live in `~/.novacode/settings.json` and project settings in `.novacode/settings.json` (read only when the folder is trusted). Both are JSON with comments; the project wins key by key, except `permissions`, which is global only. Dotted keys are nested objects: `ui.theme` is `{"ui": {"theme": …}}`. A wrong value is reported by `novacode doctor` and treated as unset.
+Global settings live in `~/.novacode/settings.json` and project settings in `.novacode/settings.json` (read only when the folder is trusted). Both are JSON with comments; the project wins key by key, except `permissions` and `sandbox`, which are global only. Dotted keys are nested objects: `ui.theme` is `{"ui": {"theme": …}}`. A wrong value is reported by `novacode doctor` and treated as unset.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
@@ -23,6 +23,9 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `modes` | object | {} | Mode presets: `<name>: {prompt, readOnly, tools}`; `plan` is built in. |
 | `checkpoints.enabled` | bool | true | File checkpoints per prompt, for `/rewind`. |
 | `extensions.<name>` | object | unset | Settings of extension `<name>`: a process extension gets them in `initialize`, any extension through `novacode.settings.get("extensions.<name>")`. |
+| `sandbox.mode` | string | `auto` | Global only. Run the model's `bash` commands and `process` starts in a bubblewrap sandbox: `auto` (when bwrap works; otherwise one warning, then unsandboxed), `on` (refuse commands when it can't sandbox) or `off`. See docs/security.md. |
+| `sandbox.allowWrite` | list | [] | Global only. More folders the sandbox lets commands write to (`~/` allowed), besides the project, `/tmp`, `$TMPDIR` and the tool caches. |
+| `sandbox.denyRead` | list | [] | Global only. More files and folders hidden inside the sandbox (`~/` allowed), besides credentials, logins and token files. |
 | `security.maskSecrets` | bool | false | Also mask well-known secret shapes in tool output (GitHub/AWS/OpenAI/Anthropic/Slack/Google tokens, private keys, `*_TOKEN=`/`*_SECRET=` values) before the model sees them. Your own logins are always masked. |
 | `memory.enabled` | bool | true | Observer notes, compaction from notes and the `recall` tool. Off: compaction still runs, summarised by the session model. |
 | `memory.model` | string | the profile's small model | Model for the observer, reflector and dropper. Without a small model (or one that can't connect), the session's model. |

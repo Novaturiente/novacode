@@ -107,6 +107,24 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "Settings of extension `<name>`: a process extension gets them in `initialize`, any extension through `novacode.settings.get(\"extensions.<name>\")`.",
     ),
     (
+        "sandbox.mode",
+        "string",
+        "`auto`",
+        "Global only. Run the model's `bash` commands and `process` starts in a bubblewrap sandbox: `auto` (when bwrap works; otherwise one warning, then unsandboxed), `on` (refuse commands when it can't sandbox) or `off`. See docs/security.md.",
+    ),
+    (
+        "sandbox.allowWrite",
+        "list",
+        "[]",
+        "Global only. More folders the sandbox lets commands write to (`~/` allowed), besides the project, `/tmp`, `$TMPDIR` and the tool caches.",
+    ),
+    (
+        "sandbox.denyRead",
+        "list",
+        "[]",
+        "Global only. More files and folders hidden inside the sandbox (`~/` allowed), besides credentials, logins and token files.",
+    ),
+    (
         "security.maskSecrets",
         "bool",
         "false",
@@ -340,6 +358,7 @@ pub const CHOICES: &[(&str, &[&str])] = &[
         "tools.<name>.exposure",
         &["listed", "codemode", "codemode-only", "deferred", "hidden"],
     ),
+    ("sandbox.mode", &["auto", "on", "off"]),
     ("ui.thinking", &["collapsed", "full", "hidden"]),
     ("ui.icons", &["nerd", "unicode"]),
     ("ui.images", &["auto", "kitty", "iterm2", "sixel", "halfblocks", "off"]),
@@ -415,7 +434,7 @@ pub fn render() -> String {
          <!-- Generated from crates/novacode-base/src/settings_doc.rs; edit there. -->\n\n\
          Global settings live in `~/.novacode/settings.json` and project settings in \
          `.novacode/settings.json` (read only when the folder is trusted). Both are JSON with \
-         comments; the project wins key by key, except `permissions`, which is global only. \
+         comments; the project wins key by key, except `permissions` and `sandbox`, which are global only. \
          Dotted keys are nested objects: `ui.theme` is `{\"ui\": {\"theme\": …}}`. A wrong value \
          is reported by `novacode doctor` and treated as unset.\n\n\
          | Key | Type | Default | What it does |\n|---|---|---|---|\n",

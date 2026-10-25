@@ -1,10 +1,12 @@
 //! `ExecutionEnv` (L5.2): every file and process access goes through it, so an
 //! SSH or sandbox backend can replace the local one later (L8.11, L6.5).
 
+use crate::sandbox::Sandbox;
 use futures_util::future::BoxFuture;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
@@ -23,6 +25,8 @@ pub struct ExecSpec {
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
     pub timeout: Duration,
+    /// Run outside the sandbox (the `unsandboxed` argument, L6.5).
+    pub unsandboxed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,9 +54,46 @@ pub trait ExecutionEnv: Send + Sync {
         cancel: CancellationToken,
         out: mpsc::Sender<Vec<u8>>,
     ) -> BoxFuture<'a, io::Result<ExecResult>>;
+    /// The sandbox model commands run in (L6.5), also for the process manager.
+    fn sandbox(&self) -> Option<&Sandbox> {
+        None
+    }
 }
 
 pub struct LocalEnv;
+
+/// [`LocalEnv`] whose commands run in the sandbox (L6.5).
+pub struct SandboxedEnv(pub Arc<Sandbox>);
+
+impl ExecutionEnv for SandboxedEnv {
+    fn read<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Vec<u8>>> {
+        LocalEnv.read(path)
+    }
+    fn write<'a>(&'a self, path: &'a Path, bytes: &'a [u8]) -> BoxFuture<'a, io::Result<()>> {
+        LocalEnv.write(path, bytes)
+    }
+    fn remove<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<()>> {
+        LocalEnv.remove(path)
+    }
+    fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Option<FileMeta>>> {
+        LocalEnv.stat(path)
+    }
+    fn canonical<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, PathBuf> {
+        LocalEnv.canonical(path)
+    }
+    fn exec<'a>(
+        &'a self,
+        spec: ExecSpec,
+        cancel: CancellationToken,
+        out: mpsc::Sender<Vec<u8>>,
+    ) -> BoxFuture<'a, io::Result<ExecResult>> {
+        let sb = (!spec.unsandboxed).then_some(self.0.as_ref());
+        Box::pin(run(spec, sb, cancel, out))
+    }
+    fn sandbox(&self) -> Option<&Sandbox> {
+        Some(&self.0)
+    }
+}
 
 impl ExecutionEnv for LocalEnv {
     fn read<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Vec<u8>>> {
@@ -115,58 +156,62 @@ impl ExecutionEnv for LocalEnv {
         cancel: CancellationToken,
         out: mpsc::Sender<Vec<u8>>,
     ) -> BoxFuture<'a, io::Result<ExecResult>> {
-        Box::pin(async move {
-            let mut child = tokio::process::Command::new("bash")
-                .arg("-c")
-                .arg(&spec.command)
-                .current_dir(&spec.cwd)
-                .envs(spec.env.iter().map(|(k, v)| (k, v)))
-                // stdin is /dev/null so nothing can wait on input; a /dev/tty prompt still hangs until the timeout.
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .process_group(0)
-                .kill_on_drop(true)
-                .spawn()?;
-            let pgid = child.id().map(|p| p as i32);
-            let pump = |mut r: Box<dyn tokio::io::AsyncRead + Unpin + Send>, tx: mpsc::Sender<Vec<u8>>| async move {
-                let mut buf = vec![0u8; 16 * 1024];
-                while let Ok(n) = r.read(&mut buf).await {
-                    if n == 0 || tx.send(buf[..n].to_vec()).await.is_err() {
-                        break;
-                    }
-                }
-            };
-            let so = tokio::spawn(pump(Box::new(child.stdout.take().expect("piped")), out.clone()));
-            let se = tokio::spawn(pump(Box::new(child.stderr.take().expect("piped")), out));
-            let (mut timed_out, mut cancelled) = (false, false);
-            let status = tokio::select! {
-                s = child.wait() => Some(s?),
-                _ = tokio::time::sleep(spec.timeout) => { timed_out = true; None }
-                _ = cancel.cancelled() => { cancelled = true; None }
-            };
-            let status = match status {
-                Some(s) => s,
-                None => {
-                    kill_group(pgid);
-                    child.wait().await?
-                }
-            };
-            // Background children may keep the pipes open; don't wait on them forever.
-            let drain = async {
-                let _ = so.await;
-                let _ = se.await;
-            };
-            if tokio::time::timeout(Duration::from_millis(500), drain).await.is_err() {
-                kill_group(pgid);
-            }
-            Ok(ExecResult {
-                code: status.code(),
-                timed_out,
-                cancelled,
-            })
-        })
+        Box::pin(run(spec, None, cancel, out))
     }
+}
+
+async fn run(
+    spec: ExecSpec,
+    sandbox: Option<&Sandbox>,
+    cancel: CancellationToken,
+    out: mpsc::Sender<Vec<u8>>,
+) -> io::Result<ExecResult> {
+    let mut child = crate::sandbox::command(sandbox, &spec.command, &spec.cwd)?
+        .envs(spec.env.iter().map(|(k, v)| (k, v)))
+        // stdin is /dev/null so nothing can wait on input; a /dev/tty prompt still hangs until the timeout.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()?;
+    let pgid = child.id().map(|p| p as i32);
+    let pump = |mut r: Box<dyn tokio::io::AsyncRead + Unpin + Send>, tx: mpsc::Sender<Vec<u8>>| async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        while let Ok(n) = r.read(&mut buf).await {
+            if n == 0 || tx.send(buf[..n].to_vec()).await.is_err() {
+                break;
+            }
+        }
+    };
+    let so = tokio::spawn(pump(Box::new(child.stdout.take().expect("piped")), out.clone()));
+    let se = tokio::spawn(pump(Box::new(child.stderr.take().expect("piped")), out));
+    let (mut timed_out, mut cancelled) = (false, false);
+    let status = tokio::select! {
+        s = child.wait() => Some(s?),
+        _ = tokio::time::sleep(spec.timeout) => { timed_out = true; None }
+        _ = cancel.cancelled() => { cancelled = true; None }
+    };
+    let status = match status {
+        Some(s) => s,
+        None => {
+            kill_group(pgid);
+            child.wait().await?
+        }
+    };
+    // Background children may keep the pipes open; don't wait on them forever.
+    let drain = async {
+        let _ = so.await;
+        let _ = se.await;
+    };
+    if tokio::time::timeout(Duration::from_millis(500), drain).await.is_err() {
+        kill_group(pgid);
+    }
+    Ok(ExecResult {
+        code: status.code(),
+        timed_out,
+        cancelled,
+    })
 }
 
 fn kill_group(pgid: Option<i32>) {

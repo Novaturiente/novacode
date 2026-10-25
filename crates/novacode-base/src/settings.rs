@@ -16,7 +16,7 @@ const MIGRATIONS: &[(&str, &str)] = &[];
 
 /// Top-level keys a project file may not set (L0.6).
 /// shortcut: names fixed with the L6 work in M3; add keys there as they appear.
-const GLOBAL_ONLY: &[&str] = &["permissions"];
+const GLOBAL_ONLY: &[&str] = &["permissions", "sandbox"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
@@ -265,14 +265,24 @@ mod tests {
     #[test]
     fn untrusted_project_and_global_only_keys_are_ignored() {
         let (_d, g, p) = files();
-        fs::write(&p, r#"{ "model": "p", "permissions": { "mode": "auto" } }"#).unwrap();
+        fs::write(
+            &p,
+            r#"{ "model": "p", "permissions": { "mode": "auto" }, "sandbox": { "mode": "off" } }"#,
+        )
+        .unwrap();
         let s = Settings::load(&g, Some(&p), false);
         assert_eq!(s.get::<String>("model"), None);
         assert!(s.diagnostics()[0].message.contains("not trusted"));
         let s = Settings::load(&g, Some(&p), true);
         assert_eq!(s.get::<String>("model").as_deref(), Some("p"));
         assert_eq!(s.get::<Value>("permissions"), None);
+        assert_eq!(
+            s.get::<String>("sandbox.mode"),
+            None,
+            "a project can't turn the sandbox off"
+        );
         assert!(s.diagnostics()[0].message.contains("only allowed in global"));
+        assert!(s.diagnostics()[1].message.contains("`sandbox`"));
     }
 
     #[test]
