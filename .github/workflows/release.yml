@@ -65,9 +65,21 @@ jobs:
     needs: [bench, build]
     runs-on: ubuntu-latest
     steps:
+      # Only for CHANGELOG.md; kept apart so it can't mix with the artifacts.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: src
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes novacode-*
+        # The release body is this version's CHANGELOG.md section (link lines dropped),
+        # then GitHub's generated notes (the compare link); generated notes alone without one.
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          awk -v v="$v" '$0 ~ "^## \\[?"v"\\]?( |$)" {f=1; next} f && /^## / {exit} f && !/^\[[^]]*\]: /' src/CHANGELOG.md > notes.md
+          notes=()
+          if grep -q '[^[:space:]]' notes.md; then notes=(--notes-file notes.md); fi
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" "${notes[@]}" --generate-notes novacode-*

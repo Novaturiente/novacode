@@ -15,8 +15,6 @@ On Windows, use WSL. novacode runs there as a normal Linux program. Other platfo
 
 ## Install a release
 
-> **Note:** there is no release yet. Release binaries, the install script and the AUR packages work from the first release (0.1.0). Until then, [build from source](#build-from-source) or use [cargo](#with-cargo). Both work today.
-
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Novaturiente/novacode/main/scripts/install.sh | sh
 ```
@@ -42,7 +40,7 @@ novacode --version
 
 ## Arch Linux (AUR)
 
-Two packages exist:
+The repo has build files for two packages in `packaging/aur/`. They are not published on the AUR yet, so build them with `makepkg`:
 
 | Package | What it is |
 |---|---|
@@ -50,10 +48,12 @@ Two packages exist:
 | `novacode-bin` | The prebuilt static binary |
 
 ```sh
-paru -S novacode        # or: paru -S novacode-bin
+git clone https://github.com/Novaturiente/novacode
+cd novacode/packaging/aur/novacode-bin   # or: novacode
+makepkg -si
 ```
 
-Both install to `/usr/bin/novacode`. Update them with your AUR helper, not with `novacode update`.
+Both install to `/usr/bin/novacode`. To update, pull the repo and run `makepkg -si` again; `novacode update` leaves them alone.
 
 ## With cargo
 
@@ -134,7 +134,7 @@ Remove the binary:
 ```sh
 rm ~/.local/bin/novacode          # install script
 cargo uninstall novacode          # cargo install
-paru -R novacode                  # AUR (or novacode-bin)
+sudo pacman -R novacode           # Arch package (or novacode-bin)
 ```
 
 Your data stays in `~/.novacode` (settings, logins, sessions). Delete that folder too if you want a clean removal. Projects may also hold a `.novacode/` folder with project settings.

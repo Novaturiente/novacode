@@ -4,17 +4,15 @@
 
 novacode reads and edits your code, runs commands, and works through tasks with you, like Claude Code, pi or Codex. It uses the subscriptions you already pay for (Claude Pro/Max, ChatGPT/Codex, Antigravity, GitHub Copilot) or an API key for about 55 providers, including local models. Your existing Claude Code skills, agents and commands load without moving any files (a documented subset of their fields; `novacode doctor` lists what doesn't apply), and Claude Code plugins (ponytail, caveman, mattpocock/skills, …) install with `novacode install <repo>`, hooks included.
 
-> **Status:** early release (0.2). Linux is the main platform. macOS builds exist but are not tested yet. Windows is not supported; use WSL. Release binaries and AUR packages arrive with the first release; until then, build from source (below and in [docs/install.md](docs/install.md)).
+> **Status:** early release (0.3). Linux is the main platform. macOS builds exist but are not tested yet. Windows is not supported; use WSL.
 
 ## Install
-
-Once the first release is out:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Novaturiente/novacode/main/scripts/install.sh | sh
 ```
 
-Today, build from source: `cargo install --locked --git https://github.com/Novaturiente/novacode novacode` (needs Rust 1.97+, a C compiler and git). All the ways to install (AUR, building from a checkout) are in [docs/install.md](docs/install.md).
+Or build from source: `cargo install --locked --git https://github.com/Novaturiente/novacode novacode` (needs Rust 1.97+, a C compiler and git). All the ways to install (Arch packages, building from a checkout) are in [docs/install.md](docs/install.md).
 
 ## First run
 
@@ -69,7 +67,7 @@ The full walk-through and a list of every flag and subcommand are in [docs/quick
 
 **Extending it:** [MCP servers](docs/mcp.md) · [Extensions](docs/extensions.md) · [Packages](docs/packages.md) · [Scripting and automation](docs/automation.md)
 
-**Reference:** [Settings](docs/config.md) · [Troubleshooting](docs/troubleshooting.md)
+**Reference:** [Settings](docs/config.md) · [Troubleshooting](docs/troubleshooting.md) · [Changelog](https://github.com/Novaturiente/novacode/blob/main/CHANGELOG.md)
 
 ## Files
 
