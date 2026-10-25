@@ -81,11 +81,15 @@ impl Store {
         }
     }
 
-    fn read_lock(&self) -> Lock {
-        std::fs::read_to_string(&self.lock)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+    /// The lockfile; empty when it doesn't exist. One that can't be read or isn't
+    /// valid JSON is an error, so nothing rewrites it and loses its pins.
+    fn read_lock(&self) -> Result<Lock, String> {
+        let text = match std::fs::read_to_string(&self.lock) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Lock::new()),
+            Err(e) => return Err(format!("{}: {e}", self.lock.display())),
+        };
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e} (fix or delete it)", self.lock.display()))
     }
 
     fn write_lock(&self, lock: &Lock) -> Result<(), String> {
@@ -139,6 +143,7 @@ impl Store {
         }
         std::fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
         let local = Path::new(src);
+        let lock = if local.is_dir() { None } else { Some(self.read_lock()?) };
         if local.is_dir() {
             let abs = std::fs::canonicalize(local).map_err(|e| e.to_string())?;
             std::os::unix::fs::symlink(&abs, &dest).map_err(|e| e.to_string())?;
@@ -152,21 +157,21 @@ impl Store {
                 return Err(format!("`{name}`: {e}"));
             }
         };
-        let mut lock = self.read_lock();
+        let mut lock = lock.unwrap_or_default();
         lock.insert(name.clone(), pin);
         self.write_lock(&lock)?;
         Ok(name)
     }
 
-    /// The pin of an installed clone.
+    /// The pin of an installed clone (none when the lockfile is damaged).
     pub fn pin(&self, name: &str) -> Option<Pin> {
-        self.read_lock().remove(name)
+        self.read_lock().ok()?.remove(name)
     }
 
     /// Remove a package: unlink a local one, delete a clone, drop its pin.
     /// `what` is its name, or the URL/path it was installed from. Returns the name.
     pub fn uninstall(&self, what: &str) -> Result<String, String> {
-        let lock = self.read_lock();
+        let lock = self.read_lock()?;
         let norm = |s: &str| s.trim_end_matches('/').trim_end_matches(".git").to_string();
         let local = std::fs::canonicalize(what).ok();
         let p = self
@@ -196,9 +201,14 @@ impl Store {
     /// Move every clone (or one) to its latest release, or a followed branch to
     /// its newest commit. One without releases stays where it is unless
     /// `commits`, which moves it to the newest commit of its default branch.
-    /// Linked folders are always current. Returns (name, what happened or error).
-    pub async fn update(&self, only: Option<&str>, commits: bool) -> Vec<(String, Result<String, String>)> {
-        let mut lock = self.read_lock();
+    /// Linked folders are always current. Returns (name, what happened or error);
+    /// a damaged lockfile is an error and nothing is updated.
+    pub async fn update(
+        &self,
+        only: Option<&str>,
+        commits: bool,
+    ) -> Result<Vec<(String, Result<String, String>)>, String> {
+        let mut lock = self.read_lock()?;
         let mut out = Vec::new();
         for p in self.list() {
             if p.link.is_some() || only.is_some_and(|o| o != p.name) {
@@ -221,7 +231,7 @@ impl Store {
         if let Err(e) = self.write_lock(&lock) {
             tracing::warn!("packages lock: {e}");
         }
-        out
+        Ok(out)
     }
 }
 
@@ -262,6 +272,9 @@ async fn update_one(dir: &Path, old: &Pin, commits: bool) -> Result<Pin, String>
         return Ok(at(head(dir)?, None, Some(b.clone())));
     }
     if let Some(t) = latest(&old.source, dir).await {
+        if !newer_or_same(old.tag.as_deref(), &t) {
+            return Ok(old.clone());
+        }
         git(&["checkout", "-q", "--detach", &format!("refs/tags/{t}")], d)?;
         return Ok(at(head(dir)?, Some(t), None));
     }
@@ -370,17 +383,38 @@ fn github(src: &str) -> Option<(String, String)> {
     (!o.is_empty() && !r.is_empty() && it.next().is_none()).then(|| (o.to_string(), r.to_string()))
 }
 
+/// The version of a stable `X.Y.Z` tag (`v` and a `name-` prefix allowed); `None`
+/// for a pre-release or a tag that isn't a version.
+fn tag_version(tag: &str) -> Option<(u64, u64, u64)> {
+    static RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"^(?:.*[-_/])?v?(\d+)\.(\d+)\.(\d+)$").unwrap());
+    let c = RE.captures(tag.trim())?;
+    let n = |i: usize| c[i].parse::<u64>().ok();
+    Some((n(1)?, n(2)?, n(3)?))
+}
+
+/// Whether an update from tag `cur` may move to release `new`: never to an older
+/// version. Same tag, or a newer version: yes. When `cur` has no version (no tag,
+/// or a tag that isn't one) it can't be compared and the release is taken; a
+/// `new` without a version can't be compared to a versioned `cur`, which stays.
+fn newer_or_same(cur: Option<&str>, new: &str) -> bool {
+    let Some(cur) = cur else { return true };
+    if cur == new {
+        return true;
+    }
+    match (tag_version(cur), tag_version(new)) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(c), Some(n)) => n > c,
+    }
+}
+
 /// The highest stable `X.Y.Z` tag (`v` and a `name-` prefix allowed; pre-releases
 /// skipped). On a tie the shorter name wins (`v1.2.0` over `bin-v1.2.0`).
 fn best_tag<'a>(tags: impl Iterator<Item = &'a str>) -> Option<String> {
-    let re = regex::Regex::new(r"^(?:.*[-_/])?v?(\d+)\.(\d+)\.(\d+)$").ok()?;
-    tags.filter_map(|t| {
-        let c = re.captures(t.trim())?;
-        let n = |i: usize| c[i].parse::<u64>().ok();
-        Some(((n(1)?, n(2)?, n(3)?), std::cmp::Reverse(t.len()), t.trim().to_string()))
-    })
-    .max()
-    .map(|(_, _, t)| t)
+    tags.filter_map(|t| Some((tag_version(t)?, std::cmp::Reverse(t.len()), t.trim().to_string())))
+        .max()
+        .map(|(_, _, t)| t)
 }
 
 /// Packages that load in this session, in precedence order: a trusted project's
@@ -461,7 +495,10 @@ pub fn missing(cwd: &Path) -> Vec<String> {
 /// lockfile has one, else its latest release. Returns (name, result).
 pub async fn install_project(cwd: &Path) -> Vec<(String, Result<String, String>)> {
     let store = Store::project(cwd);
-    let lock = store.read_lock();
+    let lock = match store.read_lock() {
+        Ok(l) => l,
+        Err(e) => return missing(cwd).into_iter().map(|n| (n, Err(e.clone()))).collect(),
+    };
     let want = declared(cwd);
     let mut out = Vec::new();
     for n in missing(cwd) {
@@ -540,7 +577,7 @@ mod tests {
         commit(r.path(), &g, "one");
         let url = format!("file://{}", r.path().display());
         store.install(&url, Some("cloned"), Want::Latest).await.unwrap();
-        let first = store.read_lock()["cloned"].rev.clone();
+        let first = store.read_lock().unwrap()["cloned"].rev.clone();
         assert_eq!(first.len(), 40, "the commit is pinned");
         let l = store.list();
         assert_eq!(
@@ -549,7 +586,7 @@ mod tests {
         );
         assert!(l[1].link.is_some() && l[1].dir.join("skills").is_dir());
         assert!(
-            !store.lock.exists() || !store.read_lock().contains_key("local"),
+            !store.lock.exists() || !store.read_lock().unwrap().contains_key("local"),
             "links aren't pinned"
         );
         assert!(
@@ -561,12 +598,12 @@ mod tests {
 
         // No releases: a plain update leaves it; --commits moves it.
         commit(r.path(), &g, "two");
-        let up = store.update(None, false).await;
+        let up = store.update(None, false).await.unwrap();
         assert!(up[0].1.as_ref().unwrap().contains("no releases"), "{up:?}");
-        assert_eq!(store.read_lock()["cloned"].rev, first, "untagged stays pinned");
-        let up = store.update(None, true).await;
+        assert_eq!(store.read_lock().unwrap()["cloned"].rev, first, "untagged stays pinned");
+        let up = store.update(None, true).await.unwrap();
         assert!(up.iter().all(|(_, r)| r.is_ok()), "{:?}", up);
-        let second = store.read_lock()["cloned"].rev.clone();
+        let second = store.read_lock().unwrap()["cloned"].rev.clone();
         assert_ne!(first, second, "--commits moves the pin");
 
         // Releases appear: a plain update takes the highest one.
@@ -577,13 +614,13 @@ mod tests {
         tag("bin-v1.2.0");
         commit(r.path(), &g, "four");
         tag("v2.0.0-rc1");
-        let up = store.update(Some("cloned"), false).await;
+        let up = store.update(Some("cloned"), false).await.unwrap();
         assert!(up[0].1.as_ref().unwrap().ends_with("→ v1.2.0"), "{up:?}");
         let pin = store.pin("cloned").unwrap();
         assert_eq!(pin.tag.as_deref(), Some("v1.2.0"));
         assert!(store.dir.join("cloned/three").exists() && !store.dir.join("cloned/four").exists());
         assert!(
-            store.update(None, false).await[0]
+            store.update(None, false).await.unwrap()[0]
                 .1
                 .as_ref()
                 .unwrap()
@@ -607,15 +644,26 @@ mod tests {
         assert_eq!(s2.pin("latest").unwrap().tag.as_deref(), Some("v1.2.0"));
         s2.install(&url, Some("old"), Want::Ref("v1.0.0")).await.unwrap();
         assert!(!s2.dir.join("old/three").exists());
-        let up = s2.update(Some("old"), false).await;
+        let up = s2.update(Some("old"), false).await.unwrap();
         assert!(
             up[0].1.as_ref().unwrap().contains("v1.0.0 → v1.2.0"),
             "a pinned tag still moves: {up:?}"
         );
+        // The latest release is older than the installed tag (a release was
+        // withdrawn): the package stays, never moves back.
+        tag("v3.0.0");
+        s2.install(&url, Some("ahead"), Want::Ref("v3.0.0")).await.unwrap();
+        g(&["tag", "-d", "v3.0.0"]);
+        git(&["tag", "-d", "v3.0.0"], Some(&s2.dir.join("ahead"))).unwrap();
+        let before = head(&s2.dir.join("ahead")).unwrap();
+        let up = s2.update(Some("ahead"), false).await.unwrap();
+        assert_eq!(up[0].1.as_deref(), Ok("up to date (v3.0.0)"), "{up:?}");
+        assert_eq!(s2.pin("ahead").unwrap().tag.as_deref(), Some("v3.0.0"));
+        assert_eq!(head(&s2.dir.join("ahead")).unwrap(), before);
         s2.install(&url, Some("edge"), Want::Ref("main")).await.unwrap();
         assert_eq!(s2.pin("edge").unwrap().branch.as_deref(), Some("main"));
         commit(r.path(), &g, "five");
-        s2.update(Some("edge"), false).await;
+        s2.update(Some("edge"), false).await.unwrap();
         assert!(s2.dir.join("edge/five").exists(), "a branch is followed");
         assert!(s2.install(&url, Some("bad"), Want::Ref("nope")).await.is_err());
         assert!(!s2.dir.join("bad").exists(), "a failed install leaves nothing");
@@ -624,8 +672,76 @@ mod tests {
         assert_eq!(store.uninstall(src.path().to_str().unwrap()).unwrap(), "local");
         assert_eq!(store.uninstall(&format!("{url}/")).unwrap(), "cloned");
         assert!(store.uninstall("cloned").is_err());
-        assert!(store.list().is_empty() && store.read_lock().is_empty());
+        assert!(store.list().is_empty() && store.read_lock().unwrap().is_empty());
         assert!(src.path().join("skills").is_dir(), "the linked source is untouched");
+    }
+
+    #[tokio::test]
+    async fn damaged_lock_is_an_error_and_left_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::global(home.path());
+        assert_eq!(store.read_lock(), Ok(Lock::new()), "a missing lock is empty");
+        let (r, g) = repo();
+        commit(r.path(), &g, "one");
+        let url = format!("file://{}", r.path().display());
+        store.install(&url, Some("a"), Want::Latest).await.unwrap();
+        std::fs::write(&store.lock, "{broken").unwrap();
+        let named = |e: String| {
+            assert!(
+                e.contains("packages.lock.json") && e.contains("key must be a string"),
+                "{e}"
+            );
+        };
+        named(store.install(&url, Some("b"), Want::Latest).await.unwrap_err());
+        assert!(!store.dir.join("b").exists(), "nothing cloned");
+        named(store.update(None, false).await.unwrap_err());
+        named(store.uninstall("a").unwrap_err());
+        assert!(store.dir.join("a").is_dir(), "nothing removed");
+        assert_eq!(store.pin("a"), None);
+        assert_eq!(
+            std::fs::read_to_string(&store.lock).unwrap(),
+            "{broken",
+            "never rewritten"
+        );
+
+        // A project's damaged lock: each missing package fails, nothing installs.
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(proj.path().join(".novacode")).unwrap();
+        std::fs::write(
+            proj.path().join(".novacode/packages.json"),
+            format!(r#"{{"packages": {{"team": "{url}"}}}}"#),
+        )
+        .unwrap();
+        std::fs::write(proj.path().join(".novacode/packages.lock.json"), "[").unwrap();
+        let r = install_project(proj.path()).await;
+        assert!(
+            r.len() == 1 && r[0].1.as_ref().is_err_and(|e| e.contains("packages.lock.json")),
+            "{r:?}"
+        );
+        assert_eq!(missing(proj.path()), ["team"]);
+        assert_eq!(
+            std::fs::read_to_string(proj.path().join(".novacode/packages.lock.json")).unwrap(),
+            "["
+        );
+    }
+
+    #[test]
+    fn never_back_to_an_older_release() {
+        for (cur, new, move_) in [
+            (None, "v1.0.0", true),
+            (Some("v1.0.0"), "v1.2.0", true),
+            (Some("1.0.0"), "v1.0.1", true),
+            (Some("v1.10.0"), "v1.9.0", false),
+            (Some("v2.0.0"), "v1.2.0", false),
+            (Some("v1.2.0"), "v1.2.0", true),
+            (Some("v1.2.0"), "bin-v1.2.0", false),
+            (Some("nightly"), "v1.0.0", true),
+            (Some("v2.0.0-rc1"), "v1.0.0", true),
+            (Some("v1.0.0"), "nightly", false),
+            (Some("edge"), "nightly", true),
+        ] {
+            assert_eq!(newer_or_same(cur, new), move_, "{cur:?} -> {new}");
+        }
     }
 
     #[test]

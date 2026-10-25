@@ -707,7 +707,11 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         }) => {
             let mut bad = false;
             let store = novacode_core::packages::Store::global(paths.home());
-            for (n, r) in store.update(name.as_deref(), commits).await {
+            for (n, r) in store
+                .update(name.as_deref(), commits)
+                .await
+                .map_err(anyhow::Error::msg)?
+            {
                 match r {
                     Ok(msg) => eprintln!("{n}: {msg}"),
                     Err(e) => {

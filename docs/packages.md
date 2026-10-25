@@ -48,10 +48,12 @@ What `packages update` does, by how the package was installed:
 
 | Installed as | `packages update` |
 |---|---|
-| Latest release (the default) | Moves to the latest release as defined above. It doesn't compare versions: if GitHub's "Latest" is older than the installed tag, the package moves back to it. |
-| `--ref <tag>` | The same: a pinned tag moves to the latest release, even an older one. Reinstall with `--ref` to hold a tag. |
+| Latest release (the default) | Moves to the latest release as defined above, but never to an older release. If GitHub's "Latest" is older than the installed tag, the package stays where it is. |
+| `--ref <tag>` | The same: a pinned tag moves to a newer latest release, never to an older one. Reinstall with `--ref` to hold a tag. |
 | `--ref <branch>` | Follows the branch: moves to its newest commit. |
 | `--ref <commit>` | Stays only while the repo has no releases. Once it has any, a plain update moves it to the latest release. |
+
+To tell older from newer, novacode compares tag versions (`v1.10.0` is newer than `v1.9.0`). If the installed tag isn't a version (for example `nightly` or `v2.0.0-rc1`), it can't be compared, and the package moves to the latest release. If the installed tag is a version but the latest release isn't, the package stays.
 | A repo without releases | Stays where it is. `--commits` moves it to the newest commit of the default branch. If the repo later starts publishing releases, a plain update moves it to the latest one. |
 
 The command prints one line per package, for example `ponytail: v5.3.1 → v5.3.2`, `caveman: up to date (v4.0.1)` or ``my-pack: no releases; stays at 3f2a9c1d0b5e (`--commits` moves it to the newest commit)``. Linked folders are always current, so update skips them. `packages update` exits `1` if any package failed. A name that isn't installed prints nothing. `packages install` needs a [trusted](security.md) folder and stops with ``this folder isn't trusted; run `novacode trust` first`` otherwise.
@@ -72,7 +74,7 @@ The command prints one line per package, for example `ponytail: v5.3.1 → v5.3.
 }
 ```
 
-Nothing changes under you. A package stays at its recorded commit until you run `novacode packages update`. If the file isn't valid JSON, novacode reads it as empty and the next install, uninstall or update rewrites it without the old entries. Lock files from older novacode versions (without `tag`) keep working: a plain update moves such a package to its latest release if it has one.
+Nothing changes under you. A package stays at its recorded commit until you run `novacode packages update`. If the file isn't valid JSON, `install`, `uninstall`, `packages update` and `packages install` stop with an error that names the file. novacode leaves the damaged file as it is; fix or delete it, then run the command again. `novacode packages` still lists the packages, without their versions. Lock files from older novacode versions (without `tag`) keep working: a plain update moves such a package to its latest release if it has one.
 
 ## List and remove
 
