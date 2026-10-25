@@ -383,6 +383,8 @@ fn session_sandbox(s: &Settings, cwd: &Path, novacode_home: &Path, protected: &[
 }
 
 fn main() -> ExitCode {
+    // First, while nothing else is open: no inherited descriptor reaches commands (L6.5).
+    sbx::close_inherited_fds();
     let cli = Cli::parse();
     let paths = match Paths::from_env() {
         Ok(p) => p,
@@ -617,7 +619,9 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
                         shadowed.push(format!("package `{}`: {s} is skipped", pkg.name));
                     }
                 }
-                return Ok(doctor::doctor(&p, &settings, problems, shadowed).await);
+                let perms: Permissions = settings.get("permissions").unwrap_or_default();
+                let sb = session_sandbox(&settings, &cwd, paths.home(), &perms.protected.paths);
+                return Ok(doctor::doctor(&p, &settings, &sb, problems, shadowed).await);
             }
             return Ok(doctor::auth_status(&p));
         }
