@@ -10,11 +10,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
+    let out = novacode_base::git::command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -255,7 +254,7 @@ pub fn here(cwd: &Path) -> Result<Here, String> {
     let branch = git(&r.top, &["branch", "--show-current"]).unwrap_or_default();
     // The .env copies made on entry aren't the user's changes.
     let copies = env_copies(&r);
-    let dirty = git(&r.top, &["status", "--porcelain"])
+    let dirty = git(&r.top, &["status", "--porcelain", "--ignore-submodules=all"])
         .unwrap_or_default()
         .lines()
         .filter(|l| !copies.iter().any(|c| l.trim_start_matches("?? ") == c))
@@ -441,7 +440,7 @@ mod tests {
         let root = d.path().canonicalize().unwrap();
         let sh = |a: &[&str]| {
             assert!(
-                Command::new("git")
+                std::process::Command::new("git")
                     .arg("-C")
                     .arg(&root)
                     .args(a)

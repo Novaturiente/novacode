@@ -53,9 +53,8 @@ pub struct EnvState {
 
 /// Read the current day (local time) and git position.
 pub fn env_state(cwd: &Path) -> EnvState {
-    let out = |cmd: &str, args: &[&str]| {
-        Command::new(cmd)
-            .args(args)
+    let out = |mut cmd: Command, args: &[&str]| {
+        cmd.args(args)
             .current_dir(cwd)
             .stderr(std::process::Stdio::null())
             .output()
@@ -64,10 +63,13 @@ pub fn env_state(cwd: &Path) -> EnvState {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|s| !s.is_empty())
     };
-    let git = out("git", &["rev-parse", "--abbrev-ref", "HEAD", "--short", "HEAD"]);
+    let git = out(
+        novacode_base::git::command(),
+        &["rev-parse", "--abbrev-ref", "HEAD", "--short", "HEAD"],
+    );
     let mut lines = git.as_deref().unwrap_or_default().lines().map(str::to_string);
     EnvState {
-        date: out("date", &["+%Y-%m-%d"]).unwrap_or_else(utc_today),
+        date: out(Command::new("date"), &["+%Y-%m-%d"]).unwrap_or_else(utc_today),
         branch: lines.next(),
         head: lines.next(),
     }
@@ -77,8 +79,8 @@ pub fn env_state(cwd: &Path) -> EnvState {
 pub fn environment(cwd: &Path, env: &EnvState) -> String {
     let mut s = format!("Working directory: {}\nDate: {}", cwd.display(), env.date);
     if let (Some(b), Some(h)) = (&env.branch, &env.head) {
-        let dirty = Command::new("git")
-            .args(["status", "--porcelain"])
+        let dirty = novacode_base::git::command()
+            .args(["status", "--porcelain", "--ignore-submodules=all"])
             .current_dir(cwd)
             .output()
             .ok()

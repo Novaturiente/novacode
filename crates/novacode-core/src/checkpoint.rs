@@ -11,7 +11,7 @@
 //! edit/write tools first change it, so only those changes rewind.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// A snapshot's tree id and the untracked files it skipped.
 pub type Snapshot = Result<(String, Vec<String>), String>;
@@ -28,7 +28,7 @@ pub struct Repo {
 }
 
 fn git(repo: &Repo, args: &[&str], index: Option<&Path>) -> Result<String, String> {
-    let mut c = Command::new("git");
+    let mut c = novacode_base::git::bookkeeping();
     match &repo.shadow {
         Some(dir) => c.arg("--git-dir").arg(dir).arg("--work-tree").arg(&repo.root),
         None => c.arg("-C").arg(&repo.root),
@@ -54,7 +54,7 @@ fn git(repo: &Repo, args: &[&str], index: Option<&Path>) -> Result<String, Strin
 
 /// The repo of `cwd`, or a shadow store for it under `home`.
 pub fn resolve(cwd: &Path, home: &Path) -> Option<Repo> {
-    let top = Command::new("git")
+    let top = novacode_base::git::bookkeeping()
         .arg("-C")
         .arg(cwd)
         .args(["rev-parse", "--show-toplevel"])
@@ -74,7 +74,7 @@ pub fn resolve(cwd: &Path, home: &Path) -> Option<Repo> {
     let dir = home.join("checkpoints").join(format!("{h:016x}"));
     if !dir.join("HEAD").exists() {
         std::fs::create_dir_all(&dir).ok()?;
-        Command::new("git")
+        novacode_base::git::bookkeeping()
             .args(["init", "--bare", "-q"])
             .arg(&dir)
             .status()
@@ -320,6 +320,7 @@ pub fn undo(store: &crate::session::Store, repo: &Repo, undo: &str) -> Result<us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn snapshot_and_rewind_in_a_repo() {

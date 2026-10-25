@@ -73,7 +73,7 @@ type Snap = HashMap<PathBuf, Option<(SystemTime, u64)>>;
 
 /// shortcut: git-only (`ls-files -m -o -d`); a bash call outside a repo reports no touched files. Upgrade to an mtime walk if non-git projects need it.
 async fn snapshot(cwd: &Path) -> Option<Snap> {
-    let o = tokio::process::Command::new("git")
+    let o = tokio::process::Command::from(novacode_base::git::command())
         .args(["ls-files", "-z", "-m", "-o", "-d", "--exclude-standard"])
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())

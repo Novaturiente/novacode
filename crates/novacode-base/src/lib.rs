@@ -1,5 +1,6 @@
 //! Shared foundations (L0): paths, storage, settings, ids, logging.
 
+pub mod git;
 pub mod logging;
 pub mod paths;
 pub mod redact;
