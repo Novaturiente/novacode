@@ -411,21 +411,43 @@ pub fn programs(src: &str) -> Option<Vec<String>> {
     )
 }
 
-/// `args` of git without its leading global options (`-C`, `-c`, `--git-dir`,
-/// `--work-tree`, `--namespace` with their values; `--no-pager`, `-p`,
-/// `--paginate`, `--bare`), for deny and ask rules (L6.1).
-fn git_globals(args: &[String]) -> &[String] {
+/// `args` of git without its leading global options, for deny and ask rules
+/// and the judge (L6.1): `-C`, `-c`, `--git-dir`, `--work-tree`, `--namespace`
+/// with their values (also attached: `-C.`, `-ck=v`, `--git-dir=x`), the
+/// `--opt=value` ones (`--exec-path`, `--config-env`, `--attr-source`,
+/// `--super-prefix`, `--list-cmds`) and the plain flags (`-p`, `-P`,
+/// `--no-pager`, `--bare`, `--no-optional-locks`, the pathspec flags, …).
+pub(crate) fn git_globals(args: &[String]) -> &[String] {
+    const VALUE_EQ: &[&str] = &[
+        "--git-dir=",
+        "--work-tree=",
+        "--namespace=",
+        "--exec-path=",
+        "--config-env=",
+        "--attr-source=",
+        "--super-prefix=",
+        "--list-cmds=",
+    ];
     let mut i = 0;
     while let Some(a) = args.get(i) {
         i += match a.as_str() {
             "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" => 2,
-            "--no-pager" | "-p" | "--paginate" | "--bare" => 1,
-            a if ["--git-dir=", "--work-tree=", "--namespace="]
-                .iter()
-                .any(|p| a.starts_with(p)) =>
-            {
-                1
-            }
+            "-p"
+            | "-P"
+            | "--paginate"
+            | "--no-pager"
+            | "--bare"
+            | "--exec-path"
+            | "--no-optional-locks"
+            | "--literal-pathspecs"
+            | "--glob-pathspecs"
+            | "--noglob-pathspecs"
+            | "--icase-pathspecs"
+            | "--no-replace-objects"
+            | "--no-lazy-fetch"
+            | "--no-advice" => 1,
+            a if a.starts_with("-C") || a.starts_with("-c") => 1,
+            a if VALUE_EQ.iter().any(|p| a.starts_with(p)) => 1,
             _ => break,
         };
     }
