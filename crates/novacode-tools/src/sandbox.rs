@@ -405,12 +405,11 @@ impl Sandbox {
     }
 
     /// Where children open the seccomp program (novacode's memfd, written once),
-    /// or `None` without a filter for this CPU.
+    /// or `None` without a filter for this CPU or OS.
     fn filter_path(&self) -> Option<String> {
         let memfd = self.filter.get_or_init(|| {
             let made = seccomp_program().map(|bytes| -> io::Result<File> {
-                let fd = nix::sys::memfd::memfd_create(c"novacode-seccomp", nix::sys::memfd::MFdFlags::MFD_CLOEXEC)?;
-                let mut f = File::from(fd);
+                let mut f = memfd()?;
                 f.write_all(&bytes)?;
                 Ok(f)
             });
@@ -702,6 +701,19 @@ fn program(arches: &[ArchRules]) -> Vec<Insn> {
     }
     p.push(ret(RET_ALLOW));
     p
+}
+
+/// An anonymous in-memory file for the seccomp program.
+#[cfg(target_os = "linux")]
+fn memfd() -> io::Result<File> {
+    let fd = nix::sys::memfd::memfd_create(c"novacode-seccomp", nix::sys::memfd::MFdFlags::MFD_CLOEXEC)?;
+    Ok(File::from(fd))
+}
+
+/// memfd is Linux-only, like bubblewrap: elsewhere the sandbox is never available.
+#[cfg(not(target_os = "linux"))]
+fn memfd() -> io::Result<File> {
+    Err(io::Error::other("memfd needs Linux"))
 }
 
 /// The filter for this CPU as bytes for `bwrap --seccomp`, or `None` on another architecture.
