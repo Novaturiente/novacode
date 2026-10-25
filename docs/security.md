@@ -298,7 +298,7 @@ novacode --trust               # trust this folder for this run only
 ## Secrets
 
 - **Your own logins are always masked.** API keys, OAuth tokens and similar secrets novacode holds are replaced with `[redacted: <source>]` in tool output before the model sees it. Values shorter than 8 characters are skipped.
-- **Pattern masking is opt-in.** With `security.maskSecrets` on, well-known token shapes are masked too, wherever they come from: GitHub, AWS, OpenAI, Anthropic, Slack and Google keys, private key blocks, and the values (8 characters or more) of `NAME=value` or `NAME: value` assignments whose name, in any case (`api_key=` too), contains `SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`, `API_KEY`, `APIKEY`, `PRIVATE_KEY` or `ACCESS_KEY`.
+- **Pattern masking is opt-in.** With `security.maskSecrets` on, well-known token shapes are masked too, wherever they come from: GitHub, AWS, OpenAI, Anthropic, Slack and Google keys, private key blocks, and the values (8 characters or more) of `NAME=value` or `NAME: value` assignments whose name contains `SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`, `API_KEY`, `APIKEY`, `PRIVATE_KEY` or `ACCESS_KEY`. An upper-case name (`GITHUB_TOKEN=…`) masks any value. A lower- or mixed-case name (`api_key`, `Api_Token`) masks only a quoted value (`api_key = "…"`), so code such as `token: Option<String>` is left alone.
 
 ```json
 {
