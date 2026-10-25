@@ -260,7 +260,8 @@ fn side_runner(r: &crate::codemode::Runner, tools: Vec<Arc<dyn Tool>>) -> Arc<cr
         seq: Default::default(),
         hooks: r.hooks.clone(),
         judge: r.judge.clone(),
-        wait: r.wait.clone(),
+        // Its own clock: a side question's waits are not the main script's.
+        wait: Default::default(),
     })
 }
 
@@ -2706,5 +2707,36 @@ async fn warmer(shared: Arc<Shared>, events: broadcast::Sender<AgentEvent>) {
                 w.status = "stopped: the warm request failed".into();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `/btw` runner keeps its own user-wait clock, apart from the main one.
+    #[test]
+    fn side_runner_has_its_own_wait_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = crate::codemode::Runner {
+            tools: vec![],
+            policy: Arc::new(Policy::new(Permissions::default(), dir.path().into(), None)),
+            approver: None,
+            spill_dir: dir.path().into(),
+            redactor: Redactor::default(),
+            budget: Budget {
+                window_tokens: 100_000,
+                used_tokens: 0,
+            },
+            seq: Default::default(),
+            hooks: Default::default(),
+            judge: None,
+            wait: Default::default(),
+        };
+        let side = side_runner(&main, vec![]);
+        let _waiting = main.wait.begin();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(main.wait.now() >= Duration::from_millis(20));
+        assert_eq!(side.wait.now(), Duration::ZERO);
     }
 }

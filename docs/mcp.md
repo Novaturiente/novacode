@@ -146,7 +146,7 @@ The cache is keyed by server name only. If you change a server's config, run `no
 
 After each connect, novacode also writes the server's tools (name, description, argument schema, output schema) to `~/.novacode/cache/mcp-tools/<name>.json`. The file is only rewritten when its content changed. The next session reads it at start and the `codemode` tool's description lists the signatures of the server's `codemode-only` tools, so the model can call them without looking them up first. The list has a size budget: tools past it, and servers without a cache, get only the server's name line as before.
 
-The file also holds a fingerprint of how the server is launched: its `command`, `args`, `url` and the names of its `env` variables (not their values). If you change any of those, the old file is ignored until the server has connected again.
+The file also holds a fingerprint of how the server is launched: its `command`, `args`, `url` and the names of its `env` variables and `headers` (not their values). When the command or an argument looks like a relative path (it doesn't start with `/` or `~` and holds a `/` or `.`), the session's folder is part of it too, since the same config can start another server in another folder. If any of those changes, the old file is ignored until the server has connected again.
 
 ## OAuth for remote servers
 

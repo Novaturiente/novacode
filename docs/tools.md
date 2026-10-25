@@ -217,22 +217,22 @@ What a script has:
 
 - `await tools.<name>(args)` calls a tool. It returns the tool's text and throws on error. `tools.bash` throws when the command exits non-zero; the error holds the output.
 - `await mcp.<server>.<tool>(args)` calls an MCP tool (`mcp.server["tool-name"]` for dashed names). A tool that returns structured content gives the script an object, not text.
-- A result with images gives `{text, images}`. Each image is `{type: "image", data, mimeType}`, and `image()` takes it as is, so a screenshot tool's picture can reach the model.
+- A result with images gives `{text, images}`. With structured content too, the images are added to the object as `images` (or it becomes `{structured, images}` when that name is taken or the content is not an object). Each image is `{type: "image", data, mimeType}`, and `image()` takes it as is, so a screenshot tool's picture can reach the model.
 - `searchTools(query)`, `describeTool(name)` and `describeNamespace(server)` show what exists, the argument types and the return type.
+- `store(key, value)` and `load(key)` keep JSON values between scripts in the same session. They are lost when novacode restarts.
+- `models.getAvailableOfType("classifier")` and `models.classify(model, {...})` for classifier models.
 
 There are no Node or browser APIs: no `require`/`import`, `fs`, `process`, `fetch` or timers. Everything goes through tools.
 
 The tool description lists each MCP server's tool signatures, as known from the last connect (see [mcp.md](mcp.md)). A server without a known list, or past the size budget, shows its name only.
-- `store(key, value)` and `load(key)` keep JSON values between scripts in the same session. They are lost when novacode restarts.
-- `models.getAvailableOfType("classifier")` and `models.classify(model, {...})` for classifier models.
 
-Only `text(v)`, `console.log(...)`, `image(dataUrl)` and the `return` value reach the model. Big intermediate results stay in the script.
+Only `text(v)`, `console.log(...)`, `image(dataUrl or an item of images)` and the `return` value reach the model. Big intermediate results stay in the script.
 
 Set `transaction: true` and file changes (`write`, `edit`) the script made are undone if it throws. `bash` and MCP effects cannot be undone.
 
 Every result ends with a footer line such as `[3 calls · 1.2 s · stored: a, b]`: the number of calls, the run time and the stored keys. When a script fails, the reply also lists the calls that ran (the last 20), so you can see which side effects already happened.
 
-A refused call stops the script's tool use. A refusal is a user decline, a deny rule, a hook block, a judge block, or a call nobody can approve. The script can catch the error, but every later call fails at once and the reply says the script stopped after a refused call. So a script can't try a variant of something you said no to.
+A refused call stops the script's tool use. A refusal is a user decline, a deny rule, a hook block, a judge block, or a call nobody can approve. The script can catch the error, but every later call fails at once and the reply says the script stopped after a refused call. The refusal also cancels the script's calls that are still running or waiting: their approval cards close and they don't run. So a script can't try a variant of something you said no to, not even one started at the same time.
 
 Limits per script: 300 seconds, 500 tool calls, 64 MB of memory, 16 MB of output. Time spent waiting on you (approval cards, `ask_user`) does not count toward the 300 seconds. Each nested call goes through your permission rules and hooks. Its output reaches the script whole: no line cut, no spill file, no size check, and `read` returns the file without clipped lines or the continue hint. Only what the script returns or prints is capped when it reaches the model.
 

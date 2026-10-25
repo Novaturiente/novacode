@@ -1532,7 +1532,7 @@ impl Ctx {
             .iter()
             .filter(|s| s.config.exposure != Some(novacode_tools::Exposure::Hidden))
             .flat_map(|s| {
-                novacode_core::mcp::cached_signatures(self.paths.home(), &s.name, &s.config)
+                novacode_core::mcp::cached_signatures(self.paths.home(), &self.cwd, &s.name, &s.config)
                     .into_iter()
                     .filter(|t| {
                         let tool = &t.name[s.name.len() + 2..];

@@ -165,6 +165,13 @@ impl Nested for Runner {
             {
                 return refused(refusal);
             }
+            // The script's token: cancelled by its first refusal, so a call allowed
+            // just as that lands still doesn't run.
+            if ctx.cancel.is_cancelled() {
+                return refused(ToolOutput::error(
+                    "Not run: this script stopped calling tools after a refused call.",
+                ));
+            }
             let started = hooks.start(&call.name, &ctx.cwd).await;
             let mut out = pipeline::run(tool.as_ref(), args.clone(), accept, &ctx, &spill, budget, &redactor).await;
             hooks
@@ -194,7 +201,7 @@ pub struct Codemode {
 const DESCRIPTION: &str = "Run a short JavaScript/TypeScript script that calls tools, to chain several calls (or MCP calls) and return only the result you need. \
 `await tools.<name>(args)` calls any tool, deferred ones too (resolves to its full text output: never clipped or paged, so `JSON.parse(await tools.read({path}))` works; throws on error, and `tools.bash` throws on a non-zero exit with the output in the error); `await mcp.<server>.<tool>(args)` calls an MCP tool (`mcp.server[\"tool-name\"]` for dashed names) and resolves to an object when the tool has an output schema. A result with images resolves to `{text, images}`. \
 An uncaught error stops the script; the reply then lists the calls that ran. There are no Node or browser APIs (no require/import, fs, process, fetch, timers): everything goes through tools. \
-Use `Promise.all` for parallel calls. Only `text(v)`, `console.log(...)`, `image(dataUrl)` and the `return` value reach you. \
+Use `Promise.all` for parallel calls. Only `text(v)`, `console.log(...)`, `image(dataUrl or an item of images)` and the `return` value reach you. \
 `await searchTools(query)`, `await describeTool(name)` and `await describeNamespace(server)` show what exists, its argument types and return type. `store(key, v)`/`load(key)` keep JSON across scripts. \
 Classifier models answer typed questions about JSON with probabilities: `await models.getAvailableOfType(\"classifier\")`, then \
 `await models.classify(model, {state, questions: {id: {type: \"choice\"|\"score\"|\"bool\", instructions, criteria}}})` (check `stopReason`).";
@@ -307,6 +314,10 @@ fn targets(name: &str, args: &Value, ctx: &ToolCtx) -> Vec<PathBuf> {
 
 struct ScriptHost {
     nested: Arc<dyn Nested>,
+    /// Its `cancel` is the script's own child token: the first refusal cancels it,
+    /// which ends the approval cards still open and cancels the calls still running.
+    /// The script itself keeps running (the engine follows only the outer token);
+    /// its later calls fail with the stop message.
     ctx: ToolCtx,
     updates: Option<tokio::sync::mpsc::Sender<String>>,
     /// Transaction mode: each touched file's content before the script (None = didn't exist).
@@ -354,6 +365,7 @@ impl Host for ScriptHost {
         let fut = self.nested.call(name.clone(), args, self.ctx.clone());
         let updates = self.updates.clone();
         let log = self.log.clone();
+        let stop = self.ctx.cancel.clone();
         Box::pin(async move {
             let t0 = Instant::now();
             let out = fut.await;
@@ -368,6 +380,7 @@ impl Host for ScriptHost {
                 l.ran.push(line);
                 if refusal && l.refused.is_none() {
                     l.refused = Some(first_line(&out));
+                    stop.cancel();
                 }
             }
             let text: String = out
@@ -382,10 +395,6 @@ impl Host for ScriptHost {
             if out.is_error {
                 return Err(text);
             }
-            // MCP tools hand back structured content when they have it.
-            if let Some(s) = out.details.as_ref().and_then(|d| d.get("structured")) {
-                return Ok(s.clone());
-            }
             let images: Vec<Value> = out
                 .content
                 .iter()
@@ -396,12 +405,28 @@ impl Host for ScriptHost {
                     _ => None,
                 })
                 .collect();
-            if images.is_empty() {
-                Ok(Value::String(text))
-            } else {
-                Ok(json!({ "text": text, "images": images }))
-            }
+            Ok(script_value(
+                text,
+                images,
+                out.details.as_ref().and_then(|d| d.get("structured")),
+            ))
         })
+    }
+}
+
+/// What a nested call resolves to in the script. MCP tools hand back structured
+/// content when they have it; images ride along with it or with the text.
+fn script_value(text: String, images: Vec<Value>, structured: Option<&Value>) -> Value {
+    match (structured, images.is_empty()) {
+        (Some(s), true) => s.clone(),
+        (Some(Value::Object(m)), false) if !m.contains_key("images") => {
+            let mut m = m.clone();
+            m.insert("images".into(), Value::Array(images));
+            Value::Object(m)
+        }
+        (Some(s), false) => json!({ "structured": s, "images": images }),
+        (None, true) => Value::String(text),
+        (None, false) => json!({ "text": text, "images": images }),
     }
 }
 
@@ -465,6 +490,7 @@ impl Tool for Codemode {
                 })
                 .collect();
             let mut inner = ctx.clone();
+            inner.cancel = ctx.cancel.child_token();
             inner.nested = None;
             inner.updates = None;
             inner.script = true;
@@ -741,6 +767,91 @@ mod tests {
                 Approval::Once
             })
         }
+    }
+
+    #[test]
+    fn images_ride_along_with_structured_content() {
+        let img = || vec![json!({ "type": "image", "data": "x", "mimeType": "image/png" })];
+        let s = json!({ "sum": 3 });
+        assert_eq!(script_value("t".into(), vec![], Some(&s)), s);
+        assert_eq!(
+            script_value("t".into(), img(), Some(&s)),
+            json!({ "sum": 3, "images": img() })
+        );
+        let has = json!({ "images": 1 });
+        assert_eq!(
+            script_value("t".into(), img(), Some(&has)),
+            json!({ "structured": has, "images": img() })
+        );
+        assert_eq!(
+            script_value("t".into(), img(), Some(&json!([1]))),
+            json!({ "structured": [1], "images": img() })
+        );
+        assert_eq!(script_value("t".into(), vec![], None), json!("t"));
+        assert_eq!(
+            script_value("t".into(), img(), None),
+            json!({ "text": "t", "images": img() })
+        );
+    }
+
+    /// Records that it ran.
+    struct Marks(Arc<AtomicBool>);
+    impl Tool for Marks {
+        fn name(&self) -> &str {
+            "mark"
+        }
+        fn description(&self) -> &str {
+            "marks"
+        }
+        fn schema(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        fn read_only(&self) -> bool {
+            true
+        }
+        fn execute<'a>(&'a self, _args: Value, _ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput> {
+            self.0.store(true, Ordering::SeqCst);
+            Box::pin(async { ToolOutput::text("ok") })
+        }
+    }
+
+    /// An allowed call on the script's stopped token is refused and doesn't run.
+    #[tokio::test]
+    async fn allowed_call_after_the_stop_does_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let runner = Runner {
+            tools: vec![Arc::new(Marks(ran.clone()))],
+            policy: Arc::new(Policy::new(Permissions::default(), dir.path().into(), None)),
+            approver: None,
+            spill_dir: dir.path().into(),
+            redactor: Redactor::default(),
+            budget: Budget {
+                window_tokens: 100_000,
+                used_tokens: 0,
+            },
+            seq: Default::default(),
+            hooks: Default::default(),
+            judge: None,
+            wait: Default::default(),
+        };
+        let ctx = ToolCtx {
+            cwd: dir.path().into(),
+            env: Arc::new(novacode_tools::LocalEnv),
+            cancel: Default::default(),
+            updates: None,
+            files: Default::default(),
+            session_id: "t".into(),
+            processes: None,
+            native_tools: false,
+            nested: None,
+            script: true,
+        };
+        ctx.cancel.cancel();
+        let out = runner.call("mark".into(), json!({}), ctx).await;
+        assert!(out.is_error);
+        assert_eq!(out.details.as_ref().unwrap()["refused"], true);
+        assert!(!ran.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
