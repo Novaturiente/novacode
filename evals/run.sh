@@ -17,12 +17,14 @@ runs="${EVAL_RUNS:-1}"
 [ $# -gt 0 ] || set -- $(for d in */; do [ -f "$d/prompt.md" ] && basename "$d"; done)
 
 # Sum the token usage of every assistant message in the JSONL event files and write
-# the last reply's text to $1. Prints "in=N out=N cache=N".
+# the last reply's text to $1. Also counts codemode tool results and the failed ones
+# (is_error). Prints "in=N out=N cache=N codemode=N cm_fail=N".
 tokens() { # reply-file events-file...
   python3 - "$@" <<'EOF'
 import json, sys
 tot = {"input": 0, "output": 0, "cache_read": 0}
 reply = ""
+cm = cm_fail = 0
 for path in sys.argv[2:]:
     try:
         lines = open(path).read().splitlines()
@@ -34,13 +36,18 @@ for path in sys.argv[2:]:
         except ValueError:
             continue
         e = m.get("event") if m.get("type") == "event" else None
-        if not e or e.get("type") != "message" or e.get("role") != "assistant":
+        if not e or e.get("type") != "message":
+            continue
+        if e.get("role") == "tool_result" and e.get("tool_name") == "codemode":
+            cm += 1
+            cm_fail += bool(e.get("is_error"))
+        if e.get("role") != "assistant":
             continue
         for k in tot:
             tot[k] += e.get("usage", {}).get(k, 0)
         reply = "".join(b.get("text", "") for b in e.get("content", []) if b.get("type") == "text")
 open(sys.argv[1], "w").write(reply + "\n")
-print("in=%d out=%d cache=%d" % (tot["input"], tot["output"], tot["cache_read"]))
+print("in=%d out=%d cache=%d codemode=%d cm_fail=%d" % (tot["input"], tot["output"], tot["cache_read"], cm, cm_fail))
 EOF
 }
 

@@ -13,7 +13,7 @@ Each task folder has `files/` (copied into a fresh git repo under `/tmp`), `prom
 
 ## What a run prints
 
-One line per run: task, `PASS`/`FAIL`, seconds, tokens and the work folder. Tokens are summed over every assistant message of the run (both prompts for a two-prompt task): `in` input, `out` output, `cache` cache-read. They come from the `--json` event stream, saved as `.events.jsonl` (and `.events2.jsonl`) in the work folder. The last reply's text is in `.reply`, stderr in `.stderr`.
+One line per run: task, `PASS`/`FAIL`, seconds, tokens and the work folder. Tokens are summed over every assistant message of the run (both prompts for a two-prompt task): `in` input, `out` output, `cache` cache-read. `codemode` is the number of codemode scripts the main agent ran, `cm_fail` how many of them failed (their result was an error). They come from the `--json` event stream, saved as `.events.jsonl` (and `.events2.jsonl`) in the work folder. The last reply's text is in `.reply`, stderr in `.stderr`.
 
 With `EVAL_RUNS=N` every task runs N times, each in a fresh work folder, and a `<task> k/N passed` line follows its runs. Models aren't deterministic, so one run says little about a change; use several runs to compare.
 
@@ -36,6 +36,7 @@ Each run gets its own `NOVACODE_HOME` and `HOME` (a temp folder), which holds on
 | `multi-file-bug` | Fix a cause in another module |
 | `refactor-callers` | Change a signature, update callers |
 | `mcp-lookup` | Get a value from an MCP tool |
+| `codemode-traps` | MCP through codemode: odd argument names, text and object results, an image |
 | `resume` | Finish work from the saved session |
 | `parallel-investigate` | Fix 4 modules, subagents allowed |
 
