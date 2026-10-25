@@ -46,6 +46,9 @@ fn write_impl(
     mode: Option<u32>,
     keep_backup: bool,
 ) -> io::Result<()> {
+    // Write through a symlink to its target, so a linked config (dotfiles/stow) stays linked.
+    // A dangling link or a missing file: keep `path` as given.
+    let path = &fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let dir = path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
@@ -114,15 +117,18 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
         Ok(v) => return Ok(Some(v)),
         Err(e) => e,
     };
-    let bak = backup_path(path);
+    // `.bak` lives next to a symlink's target (see `write_impl`).
+    let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let bak = backup_path(&real);
     if let Ok(b) = fs::read(&bak)
         && let Ok(v) = serde_json::from_slice(&b)
     {
         tracing::warn!(path = %path.display(), error = %err, "corrupt file, restored from .bak");
         let tmp_restore = fs::read(&bak)?;
-        // Restore without overwriting .bak with the corrupt primary.
-        let _ = fs::remove_file(path);
-        write_atomic(path, &tmp_restore, Durability::Durable)?;
+        // Restore without overwriting .bak with the corrupt primary; remove the
+        // symlink's target, not the link itself.
+        let _ = fs::remove_file(&real);
+        write_atomic(&real, &tmp_restore, Durability::Durable)?;
         return Ok(Some(v));
     }
     Err(io::Error::new(io::ErrorKind::InvalidData, err))
@@ -232,6 +238,46 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn write_goes_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let home = dir.path().join("home");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(real.join("settings.json"), b"{}").unwrap();
+        let link = home.join("settings.json");
+        symlink("../real/settings.json", &link).unwrap();
+        write_atomic(&link, b"{\"a\":1}", Durability::Fast).unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(real.join("settings.json")).unwrap(), b"{\"a\":1}");
+        assert_eq!(fs::read(real.join("settings.json.bak")).unwrap(), b"{}");
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 1, "stray file in home/");
+        assert_eq!(fs::read_dir(&real).unwrap().count(), 2, "temp file left in real/");
+
+        // Restoring a corrupt primary from .bak keeps the link too.
+        fs::write(real.join("settings.json"), b"{ torn").unwrap();
+        let v: serde_json::Value = read_json(&link).unwrap().unwrap();
+        assert_eq!(v, serde_json::json!({}));
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(real.join("settings.json")).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn dangling_symlink_and_missing_path_still_get_written() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let dangling = dir.path().join("d.json");
+        symlink("nowhere/x.json", &dangling).unwrap();
+        write_atomic(&dangling, b"1", Durability::Fast).unwrap();
+        assert!(fs::symlink_metadata(&dangling).unwrap().file_type().is_file());
+        assert_eq!(fs::read(&dangling).unwrap(), b"1");
+        let fresh = dir.path().join("new/f.json");
+        write_atomic(&fresh, b"2", Durability::Durable).unwrap();
+        assert_eq!(fs::read(&fresh).unwrap(), b"2");
     }
 
     #[test]
