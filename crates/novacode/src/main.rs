@@ -905,7 +905,8 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     }
     let cwd = std::env::current_dir()?;
     let trust_store = TrustStore::new(paths.home().join("trust.json"));
-    let (trusted, note) = project_trust(&trust_store, &cwd, cli.trust, interactive, interactive)?;
+    let checked = (!cli.trust).then(|| trust_store.check(&cwd));
+    let (trusted, note) = project_trust(&trust_store, &cwd, checked, interactive, interactive)?;
     if let Some(n) = note {
         eprintln!("note: {n}");
     }
@@ -1014,11 +1015,12 @@ struct Ctx {
 
 impl Ctx {
     /// `/reload`: read trust, settings and provider config again. CLI flags stay.
-    fn reload(&mut self) -> Vec<String> {
+    /// `checked` = the trust check the caller already made (None with `--trust`).
+    fn reload(&mut self, checked: Option<(trust::State, trust::Fingerprint)>) -> Vec<String> {
         // A `novacode trust` since start applies; only a changed project config asks.
         let store = TrustStore::new(self.paths.home().join("trust.json"));
         let mut notes = Vec::new();
-        match project_trust(&store, &self.cwd, self.cli.trust, false, true) {
+        match project_trust(&store, &self.cwd, checked, false, true) {
             Ok((t, note)) => {
                 self.trusted = t;
                 notes.extend(note);
@@ -2734,16 +2736,13 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
             *ctx.carry.lock().unwrap() = Some(carry);
             // A changed project config asks again in a full-screen prompt: leave the TUI
             // screen first (the loop enters it again).
-            if !ctx.cli.trust
-                && trust::has_project_config(&ctx.cwd)
-                && matches!(
-                    TrustStore::new(ctx.paths.home().join("trust.json")).state(&ctx.cwd),
-                    trust::State::Changed(_)
-                )
-            {
+            // The state is checked once: the prompt shows it and trusting stores it.
+            let checked =
+                (!ctx.cli.trust).then(|| TrustStore::new(ctx.paths.home().join("trust.json")).check(&ctx.cwd));
+            if matches!(checked, Some((trust::State::Changed(_), _))) && trust::has_project_config(&ctx.cwd) {
                 screen = None;
             }
-            notices.extend(ctx.reload());
+            notices.extend(ctx.reload(checked));
             info.push("reloaded settings, keys, theme, extensions, MCP servers, skills and context files".into());
             store = agent.store;
             continue;
@@ -2952,23 +2951,23 @@ async fn project_packages(paths: &Paths, cwd: &Path, interactive: bool) -> anyho
 /// Whether `cwd`'s project config loads (L6.3), and a note when it is ignored.
 /// Asks when the folder was never decided (`ask_new`) or its project config
 /// changed since it was trusted (`ask_changed`); otherwise ignores it.
+/// `checked` = `store.check(cwd)`, made once by the caller; None = `--trust`.
 fn project_trust(
     store: &TrustStore,
     cwd: &Path,
-    cli_trust: bool,
+    checked: Option<(trust::State, trust::Fingerprint)>,
     ask_new: bool,
     ask_changed: bool,
 ) -> anyhow::Result<(bool, Option<String>)> {
-    if cli_trust {
+    let Some((state, fp)) = checked else {
         return Ok((true, None));
-    }
-    let state = store.state(cwd);
+    };
     if state == trust::State::Trusted || !trust::has_project_config(cwd) {
         return Ok((state == trust::State::Trusted, None));
     }
     Ok(match state {
-        trust::State::Unknown if ask_new => (ask_trust(store, cwd, None)?, None),
-        trust::State::Changed(c) if ask_changed => (ask_trust(store, cwd, Some(&c))?, None),
+        trust::State::Unknown if ask_new => (ask_trust(store, cwd, None, fp)?, None),
+        trust::State::Changed(c) if ask_changed => (ask_trust(store, cwd, Some(&c), fp)?, None),
         trust::State::Changed(c) => (
             false,
             Some(format!(
@@ -2984,7 +2983,13 @@ fn project_trust(
 }
 
 /// The trust prompt; `changed` = what changed since the folder was trusted (asking again).
-fn ask_trust(store: &TrustStore, cwd: &Path, changed: Option<&[String]>) -> anyhow::Result<bool> {
+/// Trusting stores `fp`, the fingerprint of what the prompt is about.
+fn ask_trust(
+    store: &TrustStore,
+    cwd: &Path,
+    changed: Option<&[String]>,
+    fp: trust::Fingerprint,
+) -> anyhow::Result<bool> {
     let parent = cwd.parent().unwrap_or(cwd).to_path_buf();
     let item = |label: String, value: &str| PickItem {
         label,
@@ -2998,7 +3003,7 @@ fn ask_trust(store: &TrustStore, cwd: &Path, changed: Option<&[String]>) -> anyh
             c.join(", ")
         ),
         None => format!(
-            "{} has project config (.novacode/settings.json, extensions, MCP, hooks or skills).",
+            "{} has project config (.novacode/settings.json, extensions, packages, MCP, hooks or skills).",
             cwd.display()
         ),
     };
@@ -3018,11 +3023,11 @@ fn ask_trust(store: &TrustStore, cwd: &Path, changed: Option<&[String]>) -> anyh
     )?;
     Ok(match pick.as_deref() {
         Some("this") => {
-            store.set(cwd, true)?;
+            store.trust_with(cwd, cwd, fp)?;
             true
         }
         Some("parent") => {
-            store.set_from(&parent, true, cwd)?;
+            store.trust_with(&parent, cwd, fp)?;
             true
         }
         Some("session") => true,

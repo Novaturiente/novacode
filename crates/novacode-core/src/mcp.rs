@@ -91,9 +91,21 @@ pub fn expand(s: &str) -> String {
     out
 }
 
-/// The nearest `.mcp.json` from `cwd` up.
+/// The folders a project `.mcp.json` is read from, nearest first: `cwd` up to the
+/// git top level (the first folder with `.git`), or only `cwd` outside git.
+pub fn project_dirs(cwd: &Path) -> Vec<&Path> {
+    match cwd.ancestors().position(|d| d.join(".git").exists()) {
+        Some(top) => cwd.ancestors().take(top + 1).collect(),
+        None => vec![cwd],
+    }
+}
+
+/// The nearest `.mcp.json` in [`project_dirs`].
 pub fn project_file(cwd: &Path) -> Option<PathBuf> {
-    cwd.ancestors().map(|d| d.join(".mcp.json")).find(|p| p.is_file())
+    project_dirs(cwd)
+        .into_iter()
+        .map(|d| d.join(".mcp.json"))
+        .find(|p| p.is_file())
 }
 
 /// Global servers, then the project's (when trusted) replacing same-named ones.
@@ -1096,5 +1108,25 @@ for line in sys.stdin:
     #[test]
     fn expands_env() {
         assert_eq!(expand("a${NOVACODE_NOPE:-x}b"), "axb");
+    }
+
+    #[test]
+    fn project_file_stops_at_the_git_top() {
+        let d = tempfile::tempdir().unwrap();
+        let (top, proj) = (d.path(), d.path().join("proj"));
+        let src = proj.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(top.join(".mcp.json"), "{}").unwrap();
+        // Outside git: only the session folder.
+        assert_eq!(project_dirs(&src), [src.as_path()]);
+        assert_eq!(project_file(&src), None);
+        // Inside git: up to the top level, not above it.
+        std::fs::create_dir(proj.join(".git")).unwrap();
+        assert_eq!(project_dirs(&src), [src.as_path(), proj.as_path()]);
+        assert_eq!(project_file(&src), None);
+        std::fs::write(proj.join(".mcp.json"), "{}").unwrap();
+        assert_eq!(project_file(&src), Some(proj.join(".mcp.json")));
+        std::fs::write(src.join(".mcp.json"), "{}").unwrap();
+        assert_eq!(project_file(&src), Some(src.join(".mcp.json")));
     }
 }
