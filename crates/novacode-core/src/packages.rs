@@ -198,6 +198,61 @@ impl Store {
         Ok(name)
     }
 
+    /// The pin of an installed clone; without a lockfile entry, its origin and
+    /// checked-out commit (as `update` treats it).
+    fn pin_or_head(&self, lock: &Lock, p: &Package) -> Pin {
+        lock.get(&p.name).cloned().unwrap_or_else(|| Pin {
+            source: git_out(&["remote", "get-url", "origin"], Some(&p.dir)).unwrap_or_default(),
+            rev: head(&p.dir).unwrap_or_default(),
+            tag: None,
+            branch: None,
+        })
+    }
+
+    /// The version (as [`version_of`]) a clone is at now; `None` when it isn't
+    /// installed, is linked, or the lockfile is damaged.
+    pub fn current(&self, name: &str) -> Option<String> {
+        let lock = self.read_lock().ok()?;
+        let p = self.list().into_iter().find(|p| p.name == name && p.link.is_none())?;
+        Some(version_of(&self.pin_or_head(&lock, &p)))
+    }
+
+    /// L11.13: which clones `update` would move, read-only (no clone is fetched
+    /// or changed). A followed branch: its remote head against the pin. Otherwise
+    /// the latest release (GitHub's "Latest", else the best remote tag); packages
+    /// without releases are left out. A package whose remote can't be asked is
+    /// skipped (logged). Returns the updates and how many packages answered.
+    pub async fn check(&self) -> (Vec<Available>, usize) {
+        let lock = match self.read_lock() {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!("update check: {e}");
+                return (vec![], 0);
+            }
+        };
+        let (mut out, mut answered) = (Vec::new(), 0);
+        for p in self.list() {
+            if p.link.is_some() {
+                continue;
+            }
+            let pin = self.pin_or_head(&lock, &p);
+            match remote_facts(&p.dir, &pin).await {
+                Ok(facts) => {
+                    answered += 1;
+                    if let Some(to) = available_to(&pin, &facts) {
+                        out.push(Available {
+                            name: p.name.clone(),
+                            from: version_of(&pin),
+                            to,
+                        });
+                    }
+                }
+                Err(e) => tracing::warn!(package = %p.name, "update check: {e}"),
+            }
+        }
+        (out, answered)
+    }
+
     /// Move every clone (or one) to its latest release, or a followed branch to
     /// its newest commit. One without releases stays where it is unless
     /// `commits`, which moves it to the newest commit of its default branch.
@@ -214,12 +269,7 @@ impl Store {
             if p.link.is_some() || only.is_some_and(|o| o != p.name) {
                 continue;
             }
-            let old = lock.get(&p.name).cloned().unwrap_or_else(|| Pin {
-                source: git_out(&["remote", "get-url", "origin"], Some(&p.dir)).unwrap_or_default(),
-                rev: head(&p.dir).unwrap_or_default(),
-                tag: None,
-                branch: None,
-            });
+            let old = self.pin_or_head(&lock, &p);
             let r = update_one(&p.dir, &old, commits).await;
             let r = r.map(|new| {
                 let msg = describe(&old, &new);
@@ -232,6 +282,59 @@ impl Store {
             tracing::warn!("packages lock: {e}");
         }
         Ok(out)
+    }
+}
+
+/// A package update the check found (L11.13): from the version it is at to the
+/// one `update` would take (as [`version_of`] writes them).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Available {
+    pub name: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// What a package's remote says: a followed branch's head commit, or the latest
+/// release tag (`None` without releases).
+#[derive(Debug, PartialEq)]
+enum Remote {
+    Branch(String),
+    Release(Option<String>),
+}
+
+/// Ask the remote, read-only: `ls-remote` and the GitHub API, never a fetch.
+async fn remote_facts(dir: &Path, pin: &Pin) -> Result<Remote, String> {
+    let d = Some(dir);
+    if let Some(b) = &pin.branch {
+        let out = git_out(&["ls-remote", "origin", &format!("refs/heads/{b}")], d)?;
+        let rev = out
+            .split_whitespace()
+            .next()
+            .ok_or(format!("no branch `{b}` on origin"))?;
+        return Ok(Remote::Branch(rev.to_string()));
+    }
+    if let Some((owner, repo)) = github(&pin.source) {
+        return Ok(Remote::Release(github_latest(&owner, &repo).await?));
+    }
+    let out = git_out(&["ls-remote", "--tags", "--refs", "origin"], d)?;
+    let tags = out
+        .lines()
+        .filter_map(|l| l.split('\t').nth(1)?.strip_prefix("refs/tags/"));
+    Ok(Remote::Release(best_tag(tags)))
+}
+
+/// The version an update would move `pin` to, given what its remote says; `None`
+/// when it is current, has no releases, or the release isn't newer.
+fn available_to(pin: &Pin, remote: &Remote) -> Option<String> {
+    match remote {
+        Remote::Branch(rev) => (*rev != pin.rev).then(|| {
+            let b = pin.branch.as_deref().unwrap_or_default();
+            format!("{b}@{}", &rev[..rev.len().min(12)])
+        }),
+        Remote::Release(Some(t)) => {
+            (pin.tag.as_deref() != Some(t.as_str()) && newer_or_same(pin.tag.as_deref(), t)).then(|| t.clone())
+        }
+        Remote::Release(None) => None,
     }
 }
 
@@ -341,7 +444,7 @@ pub async fn latest(src: &str, dir: &Path) -> Option<String> {
         .is_ok()
     };
     if let Some((owner, repo)) = github(src)
-        && let Some(t) = github_latest(&owner, &repo).await
+        && let Ok(Some(t)) = github_latest(&owner, &repo).await
         && have(&t)
     {
         return Some(t);
@@ -350,22 +453,27 @@ pub async fn latest(src: &str, dir: &Path) -> Option<String> {
     best_tag(tags.lines())
 }
 
-async fn github_latest(owner: &str, repo: &str) -> Option<String> {
+/// GitHub's "Latest" release tag: `Ok(None)` when the repo has none (404), an
+/// error when the API can't be asked (network, rate limit).
+async fn github_latest(owner: &str, repo: &str) -> Result<Option<String>, String> {
     let r = reqwest::Client::builder()
         .user_agent(concat!("novacode/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .ok()?
+        .map_err(|e| e.to_string())?
         .get(format!("https://api.github.com/repos/{owner}/{repo}/releases/latest"))
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
-        .ok()?;
-    if !r.status().is_success() {
-        return None;
+        .map_err(|e| e.to_string())?;
+    if r.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
     }
-    let v: Value = serde_json::from_str(&r.text().await.ok()?).ok()?;
-    v["tag_name"].as_str().map(str::to_string)
+    if !r.status().is_success() {
+        return Err(format!("GitHub API: {}", r.status()));
+    }
+    let v: Value = serde_json::from_str(&r.text().await.map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    Ok(v["tag_name"].as_str().map(str::to_string))
 }
 
 /// `owner/repo` of a GitHub URL (https, ssh or scp form).
@@ -752,6 +860,69 @@ mod tests {
         ] {
             assert_eq!(newer_or_same(cur, new), move_, "{cur:?} -> {new}");
         }
+    }
+
+    #[test]
+    fn check_decides_from_remote_facts() {
+        let pin = |tag: Option<&str>, branch: Option<&str>| Pin {
+            source: "https://example.com/a/b".into(),
+            rev: "a".repeat(40),
+            tag: tag.map(Into::into),
+            branch: branch.map(Into::into),
+        };
+        let rel = |t: Option<&str>| Remote::Release(t.map(Into::into));
+        let at = pin(Some("v4.0.1"), None);
+        assert_eq!(available_to(&at, &rel(Some("v4.1.0"))).as_deref(), Some("v4.1.0"));
+        assert_eq!(available_to(&at, &rel(Some("v4.0.1"))), None, "current");
+        assert_eq!(available_to(&at, &rel(Some("v3.9.0"))), None, "older release");
+        assert_eq!(available_to(&at, &rel(None)), None, "no releases");
+        let untagged = pin(None, None);
+        assert_eq!(available_to(&untagged, &rel(None)), None);
+        assert_eq!(available_to(&untagged, &rel(Some("v1.0.0"))).as_deref(), Some("v1.0.0"));
+        let edge = pin(None, Some("main"));
+        assert_eq!(available_to(&edge, &Remote::Branch("a".repeat(40))), None);
+        assert_eq!(
+            available_to(&edge, &Remote::Branch("b".repeat(40))).as_deref(),
+            Some("main@bbbbbbbbbbbb")
+        );
+    }
+
+    #[tokio::test]
+    async fn check_reads_remote_without_fetching() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::global(home.path());
+        let (r, g) = repo();
+        commit(r.path(), &g, "one");
+        g(&["tag", "v1.0.0"]);
+        let url = format!("file://{}", r.path().display());
+        store.install(&url, Some("p"), Want::Latest).await.unwrap();
+        store.install(&url, Some("edge"), Want::Ref("main")).await.unwrap();
+        assert_eq!(store.check().await, (vec![], 2));
+        commit(r.path(), &g, "two");
+        g(&["tag", "v1.1.0"]);
+        let before = head(&store.dir.join("p")).unwrap();
+        let (found, answered) = store.check().await;
+        assert_eq!(answered, 2);
+        assert_eq!(
+            found[1],
+            Available {
+                name: "p".into(),
+                from: "v1.0.0".into(),
+                to: "v1.1.0".into()
+            }
+        );
+        assert!(found[0].name == "edge" && found[0].to.starts_with("main@"), "{found:?}");
+        assert_eq!(head(&store.dir.join("p")).unwrap(), before, "not checked out");
+        assert!(
+            git(
+                &["rev-parse", "-q", "--verify", "refs/tags/v1.1.0"],
+                Some(&store.dir.join("p"))
+            )
+            .is_err(),
+            "not fetched"
+        );
+        assert_eq!(store.current("p").as_deref(), Some("v1.0.0"));
+        assert_eq!(store.current("nope"), None);
     }
 
     #[test]

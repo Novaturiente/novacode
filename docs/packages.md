@@ -60,6 +60,22 @@ The command prints one line per package, for example `ponytail: v5.3.1 → v5.3.
 
 `install`, `uninstall`, `packages update` and `packages config` work on your own packages in `~/.novacode/`. They don't change a project's packages.
 
+### Update check
+
+An interactive session tells you when `packages update` has something to do, in one line:
+
+```
+package updates: caveman v4.0.1 → v4.1.0, ponytail v5.3.2 → v5.4.0: run `novacode packages update`
+```
+
+- It checks the packages `packages update` covers: your own clones. Linked folders are skipped.
+- For each one it looks up the latest release as above (GitHub's "Latest", else the highest tag from `git ls-remote`). A package that follows a branch is checked for a newer commit. Packages without releases are left out.
+- It only reads: no clone is fetched or changed, and nothing is installed.
+- It runs **at most once a day**, in the background, together with the check for novacode itself (see [Install](install.md#update-check)). The answer is cached in `~/.novacode/cache/updates.json`. Every interactive start shows it from the cache, minus the packages you already updated.
+- It is one GitHub API call per package (`git ls-remote` for other hosts) plus one for novacode. A package whose check fails is left out.
+
+To turn it off, set `"updates": {"check": false}` in `~/.novacode/settings.json`.
+
 ### The lock file
 
 `packages.lock.json` maps each cloned package to its source, commit, and the tag or branch it follows:
