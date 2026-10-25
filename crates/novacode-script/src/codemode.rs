@@ -70,6 +70,9 @@ pub struct Outcome {
     pub truncated: bool,
 }
 
+/// Most a script's store may hold, as JSON (L7.17).
+const STORE_CAP: usize = 8 << 20;
+
 const PRELUDE: &str = r#"
 ((bridge) => {
   const stringify = JSON.stringify, parse = JSON.parse;
@@ -95,13 +98,20 @@ const PRELUDE: &str = r#"
   const EXIT = Object.freeze({ exit: true });
   globalThis.exit = () => { throw EXIT; };
   globalThis.__EXIT = EXIT;
+  // MCP tools are named as the script reaches them (`mcp.S.T`).
+  const labels = {};
   const call = async (name, args) => {
     // Async frames are lost after the await, so note the script's line now.
     // The wrapper adds one line; name the model's own line (caught errors skip fix_lines).
     const m = /script\.js:(\d+)/.exec(new Error().stack || "");
     const site = m ? `line ${Math.max(1, Number(m[1]) - 1)}` : "";
     const r = parse(await bridge.call(String(name), stringify(args === undefined ? {} : args)));
-    if (!r.ok) { const e = new Error(`${name}: ${r.error}${site ? ` (at ${site})` : ""}`); e.tool = name; throw e; }
+    if (!r.ok) {
+      // The site goes on the first line; a declaration may follow.
+      const [head, ...rest] = String(r.error).split("\n");
+      const e = new Error([`${labels[name] || name}: ${head}${site ? ` (at ${site})` : ""}`, ...rest].join("\n"));
+      e.tool = name; throw e;
+    }
     return r.value;
   };
   globalThis.callTool = call;
@@ -122,6 +132,7 @@ const PRELUDE: &str = r#"
   for (const t of list) if (t.namespace) {
     const short = t.name.slice(t.namespace.length + 2);
     (spaces[t.namespace] ||= {})[short] = (a) => call(t.name, a);
+    labels[t.name] = `mcp.${t.namespace}.${short}`;
   }
   globalThis.mcp = new Proxy(spaces, { get(o, s) { if (typeof s !== "string" || s === "then") return undefined; if (!(s in o)) throw new Error(`unknown MCP server '${s}'. Servers: ${Object.keys(o).join(", ") || "none"}`); return o[s]; } });
   globalThis.ALL_TOOLS = list.map((t) => ({ name: t.namespace ? `mcp.${t.namespace}.${t.name.slice(t.namespace.length + 2)}` : t.name, description: t.description }));
@@ -141,7 +152,9 @@ const PRELUDE: &str = r#"
       classify: (model, context) => call("classify", { ...context, model: spec(model) }),
     });
   }
-  globalThis.store = (k, v) => { bridge.set(String(k), stringify(v === undefined ? null : v)); return v; };
+  globalThis.store = (k, v) => { const e = bridge.set(String(k), stringify(v === undefined ? null : v)); if (e) throw new Error(e); return v; };
+  // Missing in QuickJS; a JSON copy covers what scripts use it for.
+  if (typeof globalThis.structuredClone !== "function") globalThis.structuredClone = (v) => (v === undefined ? undefined : parse(stringify(v)));
   globalThis.load = (k) => { const r = bridge.get(String(k)); return r === "" ? undefined : parse(r); };
 })
 "#;
@@ -174,7 +187,7 @@ impl Shared {
 }
 
 /// The JS name a tool is reached by, for search results and errors.
-fn js_name(t: &ToolInfo) -> String {
+pub(crate) fn js_name(t: &ToolInfo) -> String {
     match &t.namespace {
         Some(ns) => format!("mcp.{ns}.{}", &t.name[ns.len() + 2..]),
         None => format!("tools.{}", t.name),
@@ -221,7 +234,12 @@ pub fn declaration(t: &ToolInfo) -> String {
         format!("{{ {} }}", fields.join("; "))
     }
     let first = t.description.lines().next().unwrap_or("");
-    format!("/** {first} */\n{}(args: {}): Promise<any>", js_name(t), obj(&t.schema))
+    let ret = t.output_schema.as_ref().map(ty).unwrap_or_else(|| "string".into());
+    format!(
+        "/** {first} */\n{}(args: {}): Promise<{ret}>",
+        js_name(t),
+        obj(&t.schema)
+    )
 }
 
 /// Word-overlap search over names and descriptions (codemode's `searchTools`).
@@ -348,12 +366,14 @@ async fn on_thread(body: String, shared: Arc<Shared>, started: Instant) -> Resul
     let rt = AsyncRuntime::new().map_err(|e| format!("could not create the JS runtime: {e}"))?;
     rt.set_memory_limit(shared.limits.memory_bytes).await;
     rt.set_max_stack_size(1 << 20).await;
-    let deadline = started + shared.limits.timeout;
+    // Time spent waiting on the user doesn't count toward the timeout.
+    let timeout = shared.limits.timeout;
+    let host = shared.host.clone();
+    let expired = move || Instant::now() >= started + timeout + host.user_wait();
     let flag = shared.cancelled.clone();
-    rt.set_interrupt_handler(Some(Box::new(move || {
-        flag.load(Ordering::Relaxed) || Instant::now() >= deadline
-    })))
-    .await;
+    let past = expired.clone();
+    rt.set_interrupt_handler(Some(Box::new(move || flag.load(Ordering::Relaxed) || past())))
+        .await;
     let ctx = AsyncContext::full(&rt)
         .await
         .map_err(|e| format!("could not create the JS context: {e}"))?;
@@ -363,7 +383,12 @@ async fn on_thread(body: String, shared: Arc<Shared>, started: Instant) -> Resul
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     };
-    let timeout = shared.limits.timeout;
+    let timed_out = async move {
+        while !expired() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    let code = body.clone();
     let script = ctx.async_with(async |ctx| -> Result<Option<Value>, String> {
         let bridge = bridge(&ctx, &shared).map_err(|e| format!("could not set up the script: {e}"))?;
         let prelude: Function = ctx.eval(PRELUDE).catch(&ctx).map_err(|e| format!("prelude: {e}"))?;
@@ -371,6 +396,19 @@ async fn on_thread(body: String, shared: Arc<Shared>, started: Instant) -> Resul
             .call::<_, ()>((bridge,))
             .catch(&ctx)
             .map_err(|e| format!("prelude: {e}"))?;
+        // Pre-run checks (L7.17) against what this engine really defines.
+        let globals: Vec<String> = ctx
+            .eval("Object.getOwnPropertyNames(globalThis)")
+            .catch(&ctx)
+            .map_err(|e| format!("prelude: {e}"))?;
+        let (problems, decls) = crate::check::check(&body, &globals.into_iter().collect(), &shared.tools);
+        if !problems.is_empty() {
+            let mut e = format!("Script not run:\n{}", problems.join("\n"));
+            if !decls.is_empty() {
+                e.push_str(&format!("\n\n{}", decls.join("\n\n")));
+            }
+            return Err(e);
+        }
         let mut opts = rquickjs::context::EvalOptions::default();
         opts.global = true;
         opts.strict = false;
@@ -406,7 +444,7 @@ async fn on_thread(body: String, shared: Arc<Shared>, started: Instant) -> Resul
     });
     let result = tokio::select! {
         r = script => r,
-        _ = tokio::time::sleep(timeout) => Err(format!("timed out after {}s", timeout.as_secs())),
+        _ = timed_out => Err(format!("timed out after {}s", timeout.as_secs())),
         _ = cancelled => Err("cancelled".into()),
     };
     let result = match result {
@@ -414,6 +452,10 @@ async fn on_thread(body: String, shared: Arc<Shared>, started: Instant) -> Resul
             Err(format!("cancelled ({e})"))
         }
         Err(e) if e.contains("interrupted") => Err(format!("timed out after {}s ({e})", timeout.as_secs())),
+        Err(e) => match crate::check::hint(&e, &code) {
+            Some(h) if !e.starts_with("Script not run:") => Err(format!("{e}\nHint: {h}")),
+            _ => Err(e),
+        },
         r => r,
     };
     drop(ctx);
@@ -492,10 +534,21 @@ fn bridge<'js>(ctx: &rquickjs::Ctx<'js>, shared: &Arc<Shared>) -> rquickjs::Resu
     b.set(
         "set",
         Function::new(ctx.clone(), move |k: String, raw: String| {
-            s.store
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(k, serde_json::from_str(&raw).unwrap_or(Value::Null));
+            let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+            let mut store = s.store.lock().unwrap_or_else(|e| e.into_inner());
+            let others: usize = store
+                .iter()
+                .filter(|(key, _)| **key != k)
+                .map(|(_, v)| v.to_string().len())
+                .sum();
+            if others + v.to_string().len() > STORE_CAP {
+                return format!(
+                    "store is full (8 MiB): storing `{k}` ({} bytes) would pass it; keep less, or store(key, null) to free a key",
+                    v.to_string().len()
+                );
+            }
+            store.insert(k, v);
+            String::new()
         })?,
     )?;
     let s = shared.clone();
@@ -532,9 +585,9 @@ async fn call(s: &Arc<Shared>, name: String, raw: String) -> String {
     if s.cancelled.load(Ordering::Relaxed) {
         return env(Err("cancelled".into()));
     }
-    if !s.tools.iter().any(|t| t.name == name) {
+    let Some(tool) = s.tools.iter().find(|t| t.name == name) else {
         return env(Err("unknown tool".into()));
-    }
+    };
     if s.calls.fetch_add(1, Ordering::SeqCst) >= s.limits.max_calls {
         return env(Err(format!(
             "tool call limit reached ({} per script)",
@@ -546,6 +599,13 @@ async fn call(s: &Arc<Shared>, name: String, raw: String) -> String {
         Ok(v) => v,
         Err(e) => return env(Err(format!("arguments are not JSON: {e}"))),
     };
+    // MCP servers get checked arguments; built-in tools parse their own (serde aliases).
+    if tool.namespace.is_some()
+        && let Err(e) = crate::check::validate(&tool.schema, &args)
+    {
+        return env(Err(format!("{e}\n{}", declaration(tool))));
+    }
+    let decl = tool.namespace.is_none().then(|| declaration(tool));
     struct AbortOnDrop(tokio::task::JoinHandle<Result<Value, String>>);
     impl Drop for AbortOnDrop {
         fn drop(&mut self) {
@@ -554,6 +614,9 @@ async fn call(s: &Arc<Shared>, name: String, raw: String) -> String {
     }
     let mut h = AbortOnDrop(s.outer.spawn(s.host.call(name, args)));
     match (&mut h.0).await {
+        Ok(Err(e)) if decl.is_some() && e.contains("invalid arguments") => {
+            env(Err(format!("{e}\n{}", decl.unwrap_or_default())))
+        }
         Ok(r) => env(r),
         Err(e) => env(Err(format!("tool task failed: {e}"))),
     }
@@ -647,7 +710,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn runs_calls_in_parallel_with_clean_output() {
         let t = Instant::now();
-        let o = go("const [a, b, c] = await Promise.all([tools.read({q: 1}), mcp.ctx7.search({q: 2}), tools.read({q: 3})]);\nconsole.log('n', 3);\ntext({ a: a.tool, b: b.tool });\nstore('k', c.args.q);\nreturn load('k');").await;
+        let o = go("const [a, b, c] = await Promise.all([tools.read({q: 1}), mcp.ctx7.search({q: '2'}), tools.read({q: 3})]);\nconsole.log('n', 3);\ntext({ a: a.tool, b: b.tool });\nstore('k', c.args.q);\nreturn load('k');").await;
         assert_eq!(o.error, None);
         assert!(t.elapsed() < Duration::from_millis(280), "parallel: {:?}", t.elapsed());
         assert_eq!(o.calls, 3);
@@ -694,6 +757,328 @@ mod tests {
         let o =
             go("return [(await searchTools('search'))[0].name, (await describeTool('mcp.ctx7.search')).includes('q: string')];").await;
         assert_eq!(o.result, Some(json!(["mcp.ctx7.search", true])));
+        let o = go("return describeTool('read')").await;
+        assert!(o.result.unwrap().as_str().unwrap().ends_with("): Promise<string>"));
+        let mut t = tools().remove(0);
+        t.output_schema = Some(json!({"type": "object", "properties": {"n": {"type": "integer"}}}));
+        assert!(declaration(&t).ends_with("): Promise<{ n?: number }>"));
+    }
+
+    /// Records calls; `bash` fails like a non-zero exit, `read` without `path`
+    /// fails like serde, everything else returns text.
+    #[derive(Default)]
+    struct Count(AtomicUsize);
+    impl Host for Count {
+        fn call(&self, name: String, args: Value) -> BoxFuture<'static, Result<Value, String>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                match name.as_str() {
+                    "bash" => Err("exit code 1".into()),
+                    "read" if args.get("path").is_none() => Err("invalid arguments: missing field `path`".into()),
+                    _ => Ok(json!("some text")),
+                }
+            })
+        }
+    }
+
+    fn rich() -> Vec<ToolInfo> {
+        let t = |n: &str, ns: Option<&str>, schema: Value| ToolInfo {
+            name: n.into(),
+            description: format!("{n} does things"),
+            schema,
+            namespace: ns.map(String::from),
+            output_schema: None,
+        };
+        vec![
+            t(
+                "read",
+                None,
+                json!({"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer"}}, "required": ["path"]}),
+            ),
+            t(
+                "bash",
+                None,
+                json!({"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}),
+            ),
+            t(
+                "ctx7__search",
+                Some("ctx7"),
+                json!({"type": "object", "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"},
+                    "mode": {"enum": ["a", "b"]},
+                    "opts": {"type": "object", "properties": {"deep": {"type": "boolean"}}},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "any": {"anyOf": [{"type": "string"}]}
+                }, "required": ["query"]}),
+            ),
+        ]
+    }
+
+    /// Runs `code` against [`rich`] tools; returns the outcome and the host calls made.
+    async fn checked(code: &str) -> (Outcome, usize) {
+        let host = Arc::new(Count::default());
+        let o = run(
+            code,
+            host.clone(),
+            rich(),
+            Map::new(),
+            Limits::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        (o, host.0.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_names_fail_before_any_call() {
+        // The read on line 1 would run first; a failed check means no call at all.
+        let (o, n) = checked("await tools.read({path: 'a'});\nconst e = require('fs');\nreturn proces.env;").await;
+        let e = o.error.unwrap();
+        assert_eq!(n, 0, "no host call: {e}");
+        assert!(e.starts_with("Script not run:"), "{e}");
+        assert!(
+            e.contains("line 2: `require` doesn't exist here: scripts have no Node or browser APIs"),
+            "{e}"
+        );
+        assert!(e.contains("line 3: `proces` is not defined"), "{e}");
+        let (o, n) = checked("import fs from 'fs';\nreturn 1;").await;
+        assert!(o.error.unwrap().contains("`import` doesn't exist here") && n == 0);
+        let (o, _) = checked("const m = await import('fs');").await;
+        assert!(o.error.unwrap().contains("`import()` doesn't exist here"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn valid_scripts_pass_the_checks() {
+        let (o, n) = checked(
+            "const env = typeof process === 'undefined' ? {} : process.env;\n\
+             const local = 1;\ntotal = 2;\n\
+             const ok = ['read' in tools, Object.keys(tools).length, typeof tools.call];\n\
+             await tools.call({name: 'read', arguments: {path: 'a'}});\n\
+             await tools.read({...{path: 'a'}});\nawait tools.read({path: 'a', file: 1});\n\
+             return [local, total, ok];",
+        )
+        .await;
+        assert_eq!(o.result, Some(json!([1, 2, [true, 2, "function"]])), "{:?}", o.error);
+        assert_eq!(n, 3);
+        // A script that writes globals skips the missing-name check.
+        let (o, _) = checked("globalThis.made = 3;\nreturn made;").await;
+        assert_eq!(o.result, Some(json!(3)), "{:?}", o.error);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_tools_name_the_nearest() {
+        let (o, n) = checked(
+            "await tools.raed({path: 'a'});\nawait mcp.ctx8.search({query: 'q'});\n\
+             await mcp.ctx7.serch({});\nawait callTool('bassh', {});\nawait tools['zzzzzzzz']();",
+        )
+        .await;
+        let e = o.error.unwrap();
+        assert_eq!(n, 0);
+        for want in [
+            "line 1: `tools.raed` is not a tool (nearest: tools.read)",
+            "line 2: `mcp.ctx8` is not a MCP server (nearest: mcp.ctx7)",
+            "line 3: `mcp.ctx7.serch` is not a tool (nearest: mcp.ctx7.search)",
+            "line 4: `callTool(\"bassh\")` is not a tool (nearest: tools.bash)",
+            "line 5: `tools.zzzzzzzz` is not a tool; find tools with searchTools",
+        ] {
+            assert!(e.contains(want), "{want}\n{e}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn literal_arguments_are_checked() {
+        let (o, n) = checked("const a = 1;\nawait tools.read({file_path: 'x'});").await;
+        let e = o.error.unwrap();
+        assert_eq!(n, 0);
+        assert!(
+            e.contains("line 2: tools.read has no `file_path` (did you mean `path`?)"),
+            "{e}"
+        );
+        assert!(
+            e.contains("tools.read(args: { path: string; offset?: number }): Promise<string>"),
+            "{e}"
+        );
+        let (o, _) = checked("await mcp.ctx7.search({limit: 3});").await;
+        let e = o.error.unwrap();
+        assert!(e.contains("line 1: mcp.ctx7.search is missing required `query`"), "{e}");
+        assert!(e.contains("mcp.ctx7.search(args:"), "{e}");
+        // A built-in missing a property with no near key is left to the tool.
+        let (o, n) = checked("try { await tools.read({}) } catch (e) { return e.message }").await;
+        assert_eq!(n, 1);
+        assert!(
+            o.result
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .starts_with("read: invalid arguments")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mcp_arguments_are_validated_at_call_time() {
+        let msg = async |args: &str| -> String {
+            let (o, n) = checked(&format!(
+                "const a = {args};\ntry {{ await mcp.ctx7.search(a) }} catch (e) {{ return e.message }}"
+            ))
+            .await;
+            assert_eq!(n, 0, "{args}");
+            o.result.and_then(|v| v.as_str().map(String::from)).unwrap_or_default()
+        };
+        let e = msg("{q: 'x'}").await;
+        assert!(
+            e.starts_with("mcp.ctx7.search: missing required \"query\"; \"q\" is not a parameter (did you mean \"query\"?) (at line 2)\n"),
+            "{e}"
+        );
+        assert!(e.contains("\nmcp.ctx7.search(args: {"), "declaration: {e}");
+        assert!(msg("{query: 1}").await.contains("\"query\" must be string"));
+        assert!(
+            msg("{query: 'x', mode: 'c'}")
+                .await
+                .contains("\"mode\" must be one of \"a\", \"b\"")
+        );
+        assert!(
+            msg("{query: 'x', limit: 1.5}")
+                .await
+                .contains("\"limit\" must be integer")
+        );
+        assert!(
+            msg("{query: 'x', opts: {deep: 'yes'}}")
+                .await
+                .contains("\"opts.deep\" must be boolean")
+        );
+        assert!(
+            msg("{query: 'x', tags: ['a', 2]}")
+                .await
+                .contains("\"tags[1]\" must be string")
+        );
+        // Extras alone, numbers as integers, and anyOf parts pass.
+        let (o, n) = checked("await mcp.ctx7.search({query: 'x', limit: 2, extra: 1, any: 5}); return 1").await;
+        assert_eq!((o.error, n), (None, 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn builtin_argument_errors_carry_the_declaration() {
+        let (o, _) = checked("const a = {};\nawait tools.read(a);").await;
+        let e = o.error.unwrap();
+        assert!(
+            e.contains(
+                "read: invalid arguments: missing field `path` (at line 2)\n/** read does things */\ntools.read(args:"
+            ),
+            "{e}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn store_is_capped() {
+        let o = go(
+            "store('a', 'x'.repeat(5 << 20));\nlet m;\ntry { store('b', 'x'.repeat(4 << 20)); } catch (e) { m = e.message; }\n\
+             store('a', 'y'.repeat(5 << 20));\nreturn [m, load('b') === undefined, load('a')[0]];",
+        )
+        .await;
+        let r = o.result.unwrap();
+        assert!(r[0].as_str().unwrap().starts_with("store is full (8 MiB)"), "{r}");
+        assert_eq!((&r[1], &r[2]), (&json!(true), &json!("y")));
+        assert_eq!(o.store.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_scripts_get_one_hint() {
+        let hint = async |code: &str| -> String {
+            let e = checked(code).await.0.error.unwrap();
+            assert_eq!(e.matches("Hint: ").count(), 1, "{e}");
+            e
+        };
+        // `eval` turns the missing-name check off, so this fails at run time.
+        assert!(
+            hint("eval('1');\nprocess.exit(1);")
+                .await
+                .contains("Hint: scripts have no Node or browser APIs")
+        );
+        assert!(
+            hint("(await tools.read({path: 'a'})).map((x) => x);")
+                .await
+                .contains("Hint: tools.* return text")
+        );
+        assert!(
+            hint("const r = undefined;\nr.x;")
+                .await
+                .contains("Hint: tools.* return text")
+        );
+        assert!(
+            hint("JSON.parse(await tools.read({path: 'a'}));")
+                .await
+                .contains("Hint: tool output is plain text")
+        );
+        assert!(
+            hint("await tools.bash({command: 'false'});")
+                .await
+                .contains("Hint: tools.bash throws on a non-zero exit")
+        );
+        assert!(
+            hint("const s = `a `b` c`;")
+                .await
+                .contains("Hint: a backtick inside a template string")
+        );
+        // No hint for other errors.
+        assert!(!checked("throw new Error('x')").await.0.error.unwrap().contains("Hint"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn structured_clone_is_a_json_copy() {
+        let o = go("const a = {x: [1]};\nconst b = structuredClone(a);\nb.x.push(2);\nreturn [a.x.length, b.x.length, structuredClone(undefined) === undefined];").await;
+        assert_eq!(o.result, Some(json!([1, 2, true])), "{:?}", o.error);
+    }
+
+    /// A call that waits `wait` on the user; `counts` = whether it reports that wait.
+    struct Waits {
+        wait: Duration,
+        counts: bool,
+        since: Mutex<Option<Instant>>,
+    }
+    impl Host for Waits {
+        fn call(&self, _: String, _: Value) -> BoxFuture<'static, Result<Value, String>> {
+            *self.since.lock().unwrap() = Some(Instant::now());
+            let wait = self.wait;
+            Box::pin(async move {
+                tokio::time::sleep(wait).await;
+                Ok(json!("ok"))
+            })
+        }
+        fn user_wait(&self) -> Duration {
+            match *self.since.lock().unwrap() {
+                Some(t) if self.counts => t.elapsed().min(self.wait),
+                _ => Duration::ZERO,
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn user_wait_does_not_count_toward_the_timeout() {
+        for counts in [true, false] {
+            let host = Arc::new(Waits {
+                wait: Duration::from_millis(700),
+                counts,
+                since: Mutex::new(None),
+            });
+            let o = run(
+                "await tools.read({q: 'a'});\nreturn 1;",
+                host,
+                tools(),
+                Map::new(),
+                Limits {
+                    timeout: Duration::from_millis(300),
+                    ..Limits::default()
+                },
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+            if counts {
+                assert_eq!((o.result, o.error), (Some(json!(1)), None));
+            } else {
+                assert!(o.error.unwrap().contains("timed out"));
+            }
+        }
     }
 
     /// Context creation + TS strip cost (ARCHITECTURE §6 "to verify").
