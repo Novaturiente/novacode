@@ -723,17 +723,12 @@ impl Host {
 
     /// Every slash command: built-ins, then templates and skills (L8.9).
     fn unknown_command(&self, t: &str) -> bool {
-        let name = t.split_whitespace().next().unwrap_or_default();
-        let shaped = name.len() > 1
-            && name[1..]
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "-_:".contains(c))
-            && name.as_bytes()[0] == b'/';
-        shaped
-            && !self
+        lone_command(t).is_some_and(|name| {
+            !self
                 .commands()
                 .iter()
                 .any(|(c, _)| c == name || c.split_whitespace().next() == Some(name))
+        })
     }
 
     pub fn commands(&self) -> Vec<(String, String)> {
@@ -900,4 +895,38 @@ impl Host {
 fn is_mode_command(t: &str) -> bool {
     let first = t.split_whitespace().next().unwrap_or_default();
     matches!(first, "/plan" | "/mode")
+}
+
+/// The line is one `/command`-shaped word and nothing else (L8.9). `/tmp is full` is a
+/// prompt, so only a lone word can be rejected as a typo.
+fn lone_command(t: &str) -> Option<&str> {
+    let mut words = t.split_whitespace();
+    let name = words.next()?;
+    let shaped = name.len() > 1
+        && name.as_bytes()[0] == b'/'
+        && name[1..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_:".contains(c));
+    (shaped && words.next().is_none()).then_some(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lone_command;
+
+    #[test]
+    fn only_a_lone_slash_word_counts_as_a_command() {
+        for (line, want) in [
+            ("/typo", Some("/typo")),
+            ("  /re-load ", Some("/re-load")),
+            ("/tmp is full", None),
+            ("/typo more words", None),
+            ("/home/nova/x", None),
+            ("/", None),
+            ("hello", None),
+            ("", None),
+        ] {
+            assert_eq!(lone_command(line), want, "{line:?}");
+        }
+    }
 }

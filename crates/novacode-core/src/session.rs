@@ -681,17 +681,16 @@ pub const SUBAGENT_TASK_PREFIX: &str = "You are subagent ";
 
 /// Typed prompts from this cwd's recent sessions, oldest first, at most `max` (L9.5 history).
 /// Subagent sessions (same folder, first prompt from the parent) are skipped.
-/// Newest sessions are read first (at most 20 files), skipping session `exclude`.
+/// Newest sessions are read first (at most 20 user sessions), skipping session `exclude`.
 /// Prompt text = the text blocks of stored user messages, joined as the TUI joins them.
 pub fn recent_prompts(paths: &Paths, cwd: &Path, exclude: Option<&str>, max: usize) -> Vec<String> {
     let mut chunks: Vec<Vec<String>> = Vec::new();
-    let mut have = 0;
+    let (mut have, mut sessions) = (0, 0);
     let files = list(paths, cwd)
         .into_iter()
-        .filter(|p| exclude.is_none_or(|x| p.file_stem().is_none_or(|s| s != x)))
-        .take(20);
+        .filter(|p| exclude.is_none_or(|x| p.file_stem().is_none_or(|s| s != x)));
     for path in files {
-        if have >= max {
+        if have >= max || sessions >= 20 {
             break;
         }
         let Ok(bytes) = std::fs::read(&path) else { continue };
@@ -716,9 +715,11 @@ pub fn recent_prompts(paths: &Paths, cwd: &Path, exclude: Option<&str>, max: usi
             })
             .filter(|t| !t.trim().is_empty())
             .collect();
+        // Skipped before counting, so subagent sessions can't crowd out the user's.
         if found.first().is_some_and(|t| t.starts_with(SUBAGENT_TASK_PREFIX)) {
             continue;
         }
+        sessions += 1;
         let keep = found.len().min(max - have);
         found.drain(..found.len() - keep);
         have += keep;
@@ -1080,6 +1081,12 @@ mod tests {
         // A subagent's session in the same folder is not the user's history.
         let child = format!("{SUBAGENT_TASK_PREFIX}\"scout\" task");
         write(&[child.as_str(), "more"]);
+        assert_eq!(recent_prompts(&paths, cwd, None, 10), ["a", "b", "c", "d"]);
+        // More than 20 newer subagent sessions don't crowd out the user's.
+        for _ in 0..21 {
+            write(&[child.as_str()]);
+        }
+        assert_eq!(list(&paths, cwd).len(), 24);
         assert_eq!(recent_prompts(&paths, cwd, None, 10), ["a", "b", "c", "d"]);
     }
 

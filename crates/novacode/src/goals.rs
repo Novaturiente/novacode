@@ -96,8 +96,12 @@ impl Goal {
 
 /// Who decides whether a goal is met after each run.
 pub enum Judge {
-    /// A model (the small one by default) that reads the conversation; it follows `/model`.
-    Model(Mutex<novacode_core::memory::Worker>),
+    /// A model that reads the conversation: the observer's model by default (it follows
+    /// `/model`), or the `provider/model` set in `goal.judge` (`fixed`: it stays).
+    Model {
+        worker: Mutex<novacode_core::memory::Worker>,
+        fixed: bool,
+    },
     /// A classifier model (`goal.judge`, e.g. `typesafe/jev-latest`): calibrated
     /// probabilities instead of a reason; "met" needs at least 0.8.
     Classifier(
@@ -137,8 +141,8 @@ pub struct Goals {
 impl Goals {
     /// After a model switch: the default judge uses the new provider's small model.
     pub fn set_judge_model(&self, w: novacode_core::memory::Worker) {
-        if let Some(Judge::Model(cur)) = &self.cfg.judge {
-            *cur.lock().unwrap() = w;
+        if let Some(Judge::Model { worker, fixed: false }) = &self.cfg.judge {
+            *worker.lock().unwrap() = w;
         }
     }
 
@@ -487,8 +491,8 @@ impl Goals {
             .join("\n");
         let goal = goal_text(g);
         match j {
-            Judge::Model(w) => {
-                let w = w.lock().unwrap().clone();
+            Judge::Model { worker, .. } => {
+                let w = worker.lock().unwrap().clone();
                 let req = novacode_ai::adapter::Request {
                     tail: Vec::new(),
                     model: w.model.clone(),
