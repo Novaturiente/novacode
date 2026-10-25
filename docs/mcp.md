@@ -128,9 +128,9 @@ return page;
 
 Inside scripts, `searchTools(query)`, `describeTool(name)` and `describeNamespace(server)` show what exists and the argument types. Tool calls from a script go through the same permission rules and hooks as direct calls.
 
-Write a good `description` for each server. The model only knows a `codemode-only` server by its name and that line.
+Write a good `description` for each server. Without a signature cache (below), the model only knows a `codemode-only` server by its name and that line.
 
-What comes back from a call: text and images are passed on, an embedded text resource becomes text, and anything else is shown as JSON. If the server marks the result as an error, the tool call fails with it. If the server also returns `structuredContent`, a `codemode` script gets that data instead of the text.
+What comes back from a call: text and images are passed on, an embedded text resource becomes text, and anything else is shown as JSON. If the server marks the result as an error, the tool call fails with it. If the server also returns `structuredContent`, a `codemode` script gets that data instead of the text. When the tool declares an `outputSchema`, novacode keeps it, so the script's declaration for that tool shows the shape of the result.
 
 ## Connecting and the tool cache
 
@@ -141,6 +141,12 @@ A server whose tool list is cached doesn't start with the session: it shows as `
 The tool list is fixed when the session starts. So the first time you add a server, its tools are not visible in that session until the list has been fetched; start a new session after `novacode mcp list` (or after the first session has connected). A call to a server that isn't connected yet waits for the connection. If a stdio server dies, the next call starts it again. If a connect failed, the next call tries again too.
 
 The cache is keyed by server name only. If you change a server's config, run `novacode mcp list` to refresh it.
+
+### The signature cache
+
+After each connect, novacode also writes the server's tools (name, description, argument schema, output schema) to `~/.novacode/cache/mcp-tools/<name>.json`. The file is only rewritten when its content changed. The next session reads it at start and the `codemode` tool's description lists the signatures of the server's `codemode-only` tools, so the model can call them without looking them up first. The list has a size budget: tools past it, and servers without a cache, get only the server's name line as before.
+
+The file also holds a fingerprint of how the server is launched: its `command`, `args`, `url` and the names of its `env` variables (not their values). If you change any of those, the old file is ignored until the server has connected again.
 
 ## OAuth for remote servers
 
