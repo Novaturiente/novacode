@@ -186,7 +186,13 @@ impl Nested for Runner {
             .iter()
             .map(|t| {
                 let ns = t.name().split_once("__").map(|(s, _)| s.to_string());
-                (pipeline::def(t.as_ref()), ns, t.output_schema())
+                // Scripts get whole output, so no `accept_large_output` guard field.
+                let def = ToolDef {
+                    name: t.name().into(),
+                    description: t.description().into(),
+                    schema: t.schema(),
+                };
+                (def, ns, t.output_schema())
             })
             .collect()
     }
@@ -557,7 +563,11 @@ fn render(mut o: engine::Outcome, undo: Option<Undo>, log: &Log) -> ToolOutput {
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
-        text.push_str(&format!("Script failed: {e}"));
+        if e.starts_with("Script not run:") {
+            text.push_str(e);
+        } else {
+            text.push_str(&format!("Script failed: {e}"));
+        }
         if let Some(u) = &undo {
             let n = rollback(&u.lock().unwrap());
             if n > 0 {
@@ -735,6 +745,35 @@ mod tests {
             r,
             "hi\n(the script stopped calling tools after a refused call)\n[2 calls · 1.2 s]"
         );
+        // A pre-run check failure isn't prefixed twice.
+        let none = Log {
+            refused: None,
+            ran: vec![],
+        };
+        let t = text_of(&render(outcome(0, Some("Script not run:\nline 1: x"), 0), None, &none));
+        assert!(t.starts_with("hi\nScript not run:\nline 1: x"), "{t}");
+    }
+
+    #[test]
+    fn scripts_see_schemas_without_the_guard_field() {
+        let r = Runner {
+            tools: novacode_tools::builtins(false),
+            policy: Arc::new(Policy::new(Permissions::default(), PathBuf::new(), None)),
+            approver: None,
+            spill_dir: PathBuf::new(),
+            redactor: Redactor::default(),
+            budget: Budget {
+                window_tokens: 100_000,
+                used_tokens: 0,
+            },
+            seq: Default::default(),
+            hooks: Default::default(),
+            judge: None,
+            wait: Default::default(),
+        };
+        let read = r.tools().into_iter().find(|(d, ..)| d.name == "read").unwrap().0;
+        assert!(read.schema["properties"].get("path").is_some());
+        assert!(read.schema["properties"].get("accept_large_output").is_none());
     }
 
     struct Sleepy(&'static str, bool, u64);
