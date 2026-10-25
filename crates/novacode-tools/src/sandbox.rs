@@ -1,10 +1,15 @@
 //! Sandbox (L6.5): commands the model runs (`bash`, `process` start) run under
 //! bubblewrap. The whole file system is read-only; the project, `/tmp` and the
 //! tool caches are writable; credentials are hidden; the network stays on.
+//! Executable state inside writable places (git config and hooks, tool binaries)
+//! stays read-only, unix sockets are blocked by a seccomp filter, and secrets
+//! are dropped from the environment.
 //! [`command`] builds every model command, so the bash and process paths can't drift.
 
-use std::ffi::OsString;
-use std::io;
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -48,6 +53,11 @@ pub struct Config {
     pub deny_read: Vec<String>,
     /// Credential folders under home, the risk gate's list (`risk::credential_dirs`, L6.2).
     pub credential_dirs: Vec<String>,
+    /// The git folder and the shared git folder of the project ([`git_dirs`]):
+    /// their `config` and `hooks` stay read-only.
+    pub git_dirs: Vec<PathBuf>,
+    /// Environment variables holding provider keys, dropped from sandboxed commands.
+    pub secret_env: Vec<String>,
 }
 
 /// Tool caches under home, writable when they exist.
@@ -62,6 +72,48 @@ const TOKEN_FILES: &[&str] = &[
     ".config/gh/hosts.yml",
     ".pypirc",
     ".npmrc",
+    ".claude/.credentials.json",
+    ".codex/auth.json",
+    ".config/hub",
+    ".azure",
+    ".terraform.d/credentials.tfrc.json",
+    ".pgpass",
+    ".vault-token",
+    ".config/rclone",
+];
+/// Tool binaries and config under home, read-only inside the writable caches:
+/// a planted shim or `rustc-wrapper` would run outside the sandbox later.
+const RO_HOME: &[&str] = &[
+    ".cargo/bin",
+    ".cargo/config",
+    ".cargo/config.toml",
+    ".cargo/env",
+    ".rustup",
+    ".bun/bin",
+    "go/bin",
+];
+/// Project files novacode and other agents run or load, read-only when they exist.
+const RO_PROJECT: &[&str] = &[".novacode", ".claude", ".mcp.json"];
+/// Files in a git folder that git runs commands from (`core.fsmonitor`, hooks).
+const RO_GIT: &[&str] = &["config", "config.worktree", "hooks"];
+/// Parts of variable names that mark a secret (upper-cased match).
+const SECRET_PARTS: &[&str] = &[
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "API_KEY",
+    "APIKEY",
+    "ACCESS_KEY",
+    "PRIVATE_KEY",
+    "CREDENTIAL",
+];
+/// Variables that point at agents and desktop services.
+const SECRET_NAMES: &[&str] = &[
+    "SSH_AUTH_SOCK",
+    "GPG_AGENT_INFO",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "DOCKER_HOST",
 ];
 /// novacode's login and trust files (plus `auth-*.json`).
 const NOVACODE_FILES: &[&str] = &["auth.json", "mcp-auth.json", "trust.json"];
@@ -70,10 +122,15 @@ pub struct Sandbox {
     mode: Mode,
     /// Writable binds, parents first.
     write: Vec<PathBuf>,
+    /// Read-only binds inside the writable ones.
+    ro: Vec<PathBuf>,
     /// (path, is a folder): folders get an empty read-only tmpfs, files `/dev/null`.
     hide: Vec<(PathBuf, bool)>,
+    secret_env: Vec<String>,
     program: PathBuf,
     works: OnceLock<bool>,
+    /// The seccomp program in a memfd, written once; `None` on another CPU architecture.
+    filter: OnceLock<Option<File>>,
 }
 
 fn expand(p: &str, home: &Path, base: &Path) -> PathBuf {
@@ -135,13 +192,83 @@ impl Sandbox {
                 hide.push((real, m.is_dir()));
             }
         }
+        let mut ro: Vec<PathBuf> = Vec::new();
+        let ro_cands = c
+            .git_dirs
+            .iter()
+            .flat_map(|g| RO_GIT.iter().map(move |f| g.join(f)))
+            .chain(RO_PROJECT.iter().map(|f| base.join(f)))
+            .chain(RO_HOME.iter().map(|f| c.home.join(f)));
+        for p in ro_cands {
+            if let Ok(real) = std::fs::canonicalize(&p)
+                && !ro.contains(&real)
+            {
+                ro.push(real);
+            }
+        }
         Sandbox {
             mode: c.mode,
             write,
+            ro,
             hide,
+            secret_env: c.secret_env,
             program: PathBuf::from("bwrap"),
             works: OnceLock::new(),
+            filter: OnceLock::new(),
         }
+    }
+
+    /// The start of every bwrap command line. With the seccomp filter it goes
+    /// through `sh`, which opens the program on fd 3 for `bwrap --seccomp 3`
+    /// (passing an fd to a child directly needs `unsafe`, which the workspace forbids).
+    /// Each command opens it afresh: bwrap reads the fd to its end.
+    fn launcher(&self) -> Vec<OsString> {
+        match self.filter_path() {
+            Some(path) => vec![
+                "sh".into(),
+                "-c".into(),
+                format!("exec \"$0\" --seccomp 3 \"$@\" 3<{path}").into(),
+                self.program.clone().into(),
+            ],
+            None => vec![self.program.clone().into()],
+        }
+    }
+
+    /// Where children open the seccomp program (novacode's memfd, written once),
+    /// or `None` without a filter for this CPU.
+    fn filter_path(&self) -> Option<String> {
+        let memfd = self.filter.get_or_init(|| {
+            let made = seccomp_program().map(|bytes| -> io::Result<File> {
+                let fd = nix::sys::memfd::memfd_create(c"novacode-seccomp", nix::sys::memfd::MFdFlags::MFD_CLOEXEC)?;
+                let mut f = File::from(fd);
+                f.write_all(&bytes)?;
+                Ok(f)
+            });
+            match made {
+                Some(Ok(f)) => Some(f),
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, "sandbox: could not write the seccomp filter; unix sockets stay reachable");
+                    None
+                }
+                None => {
+                    tracing::warn!(
+                        "sandbox: no seccomp filter for this CPU architecture; unix sockets stay reachable inside the sandbox"
+                    );
+                    None
+                }
+            }
+        });
+        memfd
+            .as_ref()
+            .map(|m| format!("/proc/{}/fd/{}", std::process::id(), m.as_raw_fd()))
+    }
+
+    /// The variable is passed into sandboxed commands (not a secret).
+    fn keeps_env(&self, name: &OsStr) -> bool {
+        let n = name.to_string_lossy().to_ascii_uppercase();
+        !(SECRET_NAMES.contains(&n.as_str())
+            || SECRET_PARTS.iter().any(|p| n.contains(p))
+            || self.secret_env.iter().any(|s| s.eq_ignore_ascii_case(&n)))
     }
 
     pub fn mode(&self) -> Mode {
@@ -152,7 +279,10 @@ impl Sandbox {
     /// check logs the one warning.
     pub fn available(&self) -> bool {
         *self.works.get_or_init(|| {
-            let ok = std::process::Command::new(&self.program)
+            // Probed with the filter, as commands run: a kernel without seccomp counts as no sandbox.
+            let l = self.launcher();
+            let ok = std::process::Command::new(&l[0])
+                .args(&l[1..])
                 .args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"])
                 .args(["--unshare-pid", "--die-with-parent", "true"])
                 .stdin(std::process::Stdio::null())
@@ -192,11 +322,18 @@ impl Sandbox {
         ]
         .map(OsString::from)
         .into();
-        for w in &self.write {
+        // A path deleted since the start is skipped: bwrap would fail on it, or
+        // create it on the host as an empty file.
+        let live = |p: &Path| p.symlink_metadata().is_ok();
+        for w in self.write.iter().filter(|p| live(p)) {
             a.extend(["--bind".into(), w.clone().into(), w.clone().into()]);
         }
+        // After the writable ones, so they win inside them.
+        for r in self.ro.iter().filter(|p| live(p)) {
+            a.extend(["--ro-bind".into(), r.clone().into(), r.clone().into()]);
+        }
         // Last, so they win inside writable folders.
-        for (h, dir) in &self.hide {
+        for (h, dir) in self.hide.iter().filter(|(p, _)| live(p)) {
             if *dir {
                 a.extend(["--tmpfs".into(), h.clone().into()]);
                 a.extend(["--remount-ro".into(), h.clone().into()]);
@@ -231,8 +368,10 @@ pub fn hint_for(sandbox: Option<&Sandbox>, failed: bool, output: &str) -> Option
 pub fn command(sandbox: Option<&Sandbox>, cmd: &str, cwd: &Path) -> io::Result<tokio::process::Command> {
     let mut c = match sandbox {
         Some(s) if s.mode != Mode::Off && s.available() => {
-            let mut c = tokio::process::Command::new(&s.program);
-            c.args(s.args(cwd)).args(["--", "bash"]);
+            let l = s.launcher();
+            let mut c = tokio::process::Command::new(&l[0]);
+            c.args(&l[1..]).args(s.args(cwd)).args(["--", "bash"]);
+            c.env_clear().envs(std::env::vars_os().filter(|(k, _)| s.keeps_env(k)));
             c
         }
         Some(s) if s.mode == Mode::On => {
@@ -244,6 +383,141 @@ pub fn command(sandbox: Option<&Sandbox>, cmd: &str, cwd: &Path) -> io::Result<t
     };
     c.arg("-c").arg(cmd).current_dir(cwd);
     Ok(c)
+}
+
+/// The rules for one syscall architecture (`seccomp_data.arch`).
+struct ArchRules {
+    arch: u32,
+    /// (syscall number, argument index, value): the call with that argument
+    /// (its low 32 bits) equal to the value fails with EPERM.
+    rules: &'static [(u32, u32, u32)],
+    /// x86_64: also refuse x32 syscalls (bit 30 of the number), which share the arch value.
+    x32: bool,
+}
+
+const AF_UNIX: u32 = 1;
+const TIOCSTI: u32 = 0x5412;
+/// socketcall's first argument for `socket`: the domain itself is behind a pointer.
+const SYS_SOCKET: u32 = 1;
+
+/// x86_64, and 32-bit x86 programs on it (int 0x80).
+const X86_64: &[ArchRules] = &[
+    ArchRules {
+        arch: 0xc000_003e,                            // AUDIT_ARCH_X86_64
+        rules: &[(41, 0, AF_UNIX), (16, 1, TIOCSTI)], // socket, ioctl
+        x32: true,
+    },
+    ArchRules {
+        arch: 0x4000_0003,                                                   // AUDIT_ARCH_I386
+        rules: &[(359, 0, AF_UNIX), (102, 0, SYS_SOCKET), (54, 1, TIOCSTI)], // socket, socketcall, ioctl
+        x32: false,
+    },
+];
+
+/// aarch64, and 32-bit ARM programs on it.
+const AARCH64: &[ArchRules] = &[
+    ArchRules {
+        arch: 0xc000_00b7,                             // AUDIT_ARCH_AARCH64
+        rules: &[(198, 0, AF_UNIX), (29, 1, TIOCSTI)], // socket, ioctl
+        x32: false,
+    },
+    ArchRules {
+        arch: 0x4000_0028,                                                   // AUDIT_ARCH_ARM
+        rules: &[(281, 0, AF_UNIX), (102, 0, SYS_SOCKET), (54, 1, TIOCSTI)], // socket, socketcall, ioctl
+        x32: false,
+    },
+];
+
+/// Classic BPF instruction (`struct sock_filter`).
+#[derive(Debug, Clone, Copy)]
+struct Insn {
+    code: u16,
+    jt: u8,
+    jf: u8,
+    k: u32,
+}
+
+const LD_ABS: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
+const JEQ: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
+const JGE: u16 = 0x35; // BPF_JMP | BPF_JGE | BPF_K
+const RET: u16 = 0x06; // BPF_RET | BPF_K
+const RET_ALLOW: u32 = 0x7fff_0000; // SECCOMP_RET_ALLOW
+const RET_EPERM: u32 = 0x0005_0000 | 1; // SECCOMP_RET_ERRNO | EPERM
+
+fn jump(code: u16, k: u32, jt: u8, jf: u8) -> Insn {
+    Insn { code, jt, jf, k }
+}
+fn ld(off: u32) -> Insn {
+    jump(LD_ABS, off, 0, 0)
+}
+fn ret(k: u32) -> Insn {
+    jump(RET, k, 0, 0)
+}
+
+/// The filter: per architecture, the listed calls fail with EPERM, all else is allowed.
+/// `seccomp_data`: `nr` at 0, `arch` at 4, `args[i]` at 16 + 8i (low half first, little-endian).
+fn program(arches: &[ArchRules]) -> Vec<Insn> {
+    let mut p = vec![ld(4)];
+    for a in arches {
+        let mut b = vec![ld(0)];
+        if a.x32 {
+            b.extend([jump(JGE, 0x4000_0000, 0, 1), ret(RET_EPERM)]);
+        }
+        for &(nr, arg, value) in a.rules {
+            b.extend([
+                jump(JEQ, nr, 0, 4),
+                ld(16 + 8 * arg),
+                jump(JEQ, value, 0, 1),
+                ret(RET_EPERM),
+                ret(RET_ALLOW),
+            ]);
+        }
+        b.push(ret(RET_ALLOW));
+        p.push(jump(JEQ, a.arch, 0, b.len() as u8));
+        p.extend(b);
+    }
+    p.push(ret(RET_ALLOW));
+    p
+}
+
+/// The filter for this CPU as bytes for `bwrap --seccomp`, or `None` on another architecture.
+fn seccomp_program() -> Option<Vec<u8>> {
+    let arches: &[ArchRules] = if cfg!(all(target_arch = "x86_64", target_endian = "little")) {
+        X86_64
+    } else if cfg!(all(target_arch = "aarch64", target_endian = "little")) {
+        AARCH64
+    } else {
+        return None;
+    };
+    Some(
+        program(arches)
+            .iter()
+            .flat_map(|i| {
+                let mut b = Vec::with_capacity(8);
+                b.extend(i.code.to_ne_bytes());
+                b.extend([i.jt, i.jf]);
+                b.extend(i.k.to_ne_bytes());
+                b
+            })
+            .collect(),
+    )
+}
+
+/// The git folder and the shared git folder of `cwd` (one when they're the same).
+pub fn git_dirs(cwd: &Path) -> Vec<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success());
+    let mut dirs: Vec<PathBuf> = out
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(PathBuf::from).collect())
+        .unwrap_or_default();
+    dirs.dedup();
+    dirs
 }
 
 /// The writable project folders of a session: the git top level of `cwd`
@@ -296,20 +570,33 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let home = d.path().join("home");
         let proj = d.path().join("proj");
-        for dir in [".ssh", ".cache", ".novacode", ".config/gh", "extra", "proj-secret"] {
+        for dir in [
+            ".ssh",
+            ".cache",
+            ".novacode",
+            ".config/gh",
+            "extra",
+            "proj-secret",
+            ".cargo/bin",
+            ".codex",
+        ] {
             std::fs::create_dir_all(home.join(dir)).unwrap();
         }
         std::fs::create_dir_all(proj.join("sub")).unwrap();
+        std::fs::create_dir_all(proj.join(".git/hooks")).unwrap();
         for f in [
             ".novacode/auth.json",
             ".novacode/auth-work.json",
             ".novacode/settings.json",
             ".netrc",
             ".config/gh/hosts.yml",
+            ".codex/auth.json",
         ] {
             std::fs::write(home.join(f), "x").unwrap();
         }
-        std::fs::write(proj.join(".env.secret"), "x").unwrap();
+        for f in [".env.secret", ".git/config", ".mcp.json"] {
+            std::fs::write(proj.join(f), "x").unwrap();
+        }
         let c = Config {
             mode: Mode::On,
             project: vec![proj.clone()],
@@ -319,8 +606,23 @@ mod tests {
             allow_write: vec!["~/extra".into(), "~/missing".into()],
             deny_read: vec![".env.secret".into(), "~/nope".into()],
             credential_dirs: vec![".ssh".into(), ".aws".into(), ".novacode".into()],
+            git_dirs: vec![proj.join(".git")],
+            secret_env: vec!["My_Provider_Key".into()],
         };
         (d, c)
+    }
+
+    /// The `--bind`, read-only, hide and `--chdir` entries of an argument list.
+    fn entries(a: &[String]) -> Vec<(String, String)> {
+        a.iter()
+            .enumerate()
+            .filter(|(i, s)| {
+                ["--bind", "--tmpfs", "--chdir"].contains(&s.as_str())
+                    || *s == "/dev/null"
+                    || (*s == "--ro-bind" && *i > 0 && a[i + 1] != "/dev/null")
+            })
+            .map(|(i, s)| (s.clone(), a[i + 1].clone()))
+            .collect()
     }
 
     #[test]
@@ -330,24 +632,27 @@ mod tests {
         let r = |p: &str| root.join(p).display().to_string();
         let cwd = root.join("proj/sub");
         let a = strs(&Sandbox::new(c).args(&cwd));
-        let pairs: Vec<(String, String)> = a
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| ["--bind", "--tmpfs", "--chdir"].contains(&s.as_str()) || *s == "/dev/null")
-            .map(|(i, s)| (s.clone(), a[i + 1].clone()))
-            .collect();
+        let pairs = entries(&a);
         let want: Vec<(String, String)> = [
-            // Writable, parents first; missing ones (`~/missing`, `~/.cargo`, …) skipped.
+            // Writable, parents first; missing ones (`~/missing`, `~/.npm`, …) skipped.
             ("--bind", "/tmp".to_string()),
             ("--bind", r("proj")),
             ("--bind", r("home/.cache")),
+            ("--bind", r("home/.cargo")),
             ("--bind", r("home/extra")),
+            // Read-only inside them: git config and hooks, agent config, tool binaries;
+            // missing ones (`config.worktree`, `.claude`, `~/.rustup`, …) skipped.
+            ("--ro-bind", r("proj/.git/config")),
+            ("--ro-bind", r("proj/.git/hooks")),
+            ("--ro-bind", r("proj/.mcp.json")),
+            ("--ro-bind", r("home/.cargo/bin")),
             // Hidden: folders get a tmpfs, files /dev/null; `.aws` and `~/nope` don't exist.
             ("--tmpfs", r("home/.ssh")),
             ("/dev/null", r("home/.novacode/auth.json")),
             ("/dev/null", r("home/.novacode/auth-work.json")),
             ("/dev/null", r("home/.netrc")),
             ("/dev/null", r("home/.config/gh/hosts.yml")),
+            ("/dev/null", r("home/.codex/auth.json")),
             ("/dev/null", r("proj/.env.secret")),
             ("--chdir", cwd.display().to_string()),
         ]
@@ -360,6 +665,141 @@ mod tests {
         assert!(!a.contains(&"--new-session".into()), "killpg must reach the command");
         // The whole ~/.novacode stays readable (settings, skills).
         assert!(!a.contains(&r("home/.novacode")));
+    }
+
+    #[test]
+    fn vanished_paths_are_skipped() {
+        let (d, c) = setup();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let s = Sandbox::new(c);
+        // Deleted mid-session: a writable folder, a read-only one, a hidden file and folder.
+        std::fs::remove_dir(root.join("home/extra")).unwrap();
+        std::fs::remove_dir(root.join("home/.cargo/bin")).unwrap();
+        std::fs::remove_file(root.join("home/.netrc")).unwrap();
+        std::fs::remove_dir(root.join("home/.ssh")).unwrap();
+        let a = strs(&s.args(&root.join("proj")));
+        for gone in ["home/extra", "home/.cargo/bin", "home/.netrc", "home/.ssh"] {
+            let p = root.join(gone).display().to_string();
+            assert!(!a.contains(&p), "{gone} still bound: {a:?}");
+        }
+        assert!(a.contains(&root.join("home/.config/gh/hosts.yml").display().to_string()));
+    }
+
+    #[test]
+    fn secret_env_table() {
+        let (_d, c) = setup();
+        let s = Sandbox::new(c);
+        for (name, kept) in [
+            ("PATH", true),
+            ("HOME", true),
+            ("LANG", true),
+            ("GEMINI_API_KEY", false),
+            ("DIGITALOCEAN_API_TOKEN", false),
+            ("github_token", false),
+            ("AWS_SECRET_ACCESS_KEY", false),
+            ("AWS_ACCESS_KEY_ID", false),
+            ("PGPASSWORD", false),
+            ("FTP_PASSWD", false),
+            ("STRIPE_APIKEY", false),
+            ("SSH_PRIVATE_KEY", false),
+            ("GOOGLE_APPLICATION_CREDENTIALS", false),
+            ("SSH_AUTH_SOCK", false),
+            ("GPG_AGENT_INFO", false),
+            ("DBUS_SESSION_BUS_ADDRESS", false),
+            ("DOCKER_HOST", false),
+            // A provider's key variable from the profiles, matched case-insensitively.
+            ("MY_PROVIDER_KEY", false),
+            ("MY_PROVIDER", true),
+        ] {
+            assert_eq!(s.keeps_env(OsStr::new(name)), kept, "{name}");
+        }
+    }
+
+    /// Runs a filter on one syscall: (nr, arch, args).
+    fn bpf(p: &[Insn], nr: u32, arch: u32, args: [u64; 6]) -> u32 {
+        let load = |off: u32| match off {
+            0 => nr,
+            4 => arch,
+            o => {
+                let (i, hi) = (((o - 16) / 8) as usize, (o - 16) % 8 == 4);
+                (if hi { args[i] >> 32 } else { args[i] }) as u32
+            }
+        };
+        let (mut pc, mut acc) = (0usize, 0u32);
+        loop {
+            let i = p[pc];
+            pc += 1;
+            match i.code {
+                LD_ABS => acc = load(i.k),
+                RET => return i.k,
+                JEQ | JGE => {
+                    let hit = if i.code == JEQ { acc == i.k } else { acc >= i.k };
+                    pc += usize::from(if hit { i.jt } else { i.jf });
+                }
+                c => panic!("unknown op {c:#x}"),
+            }
+        }
+    }
+
+    #[test]
+    fn seccomp_filter_table() {
+        let (x86, i386, arm64, arm) = (0xc000_003e, 0x4000_0003, 0xc000_00b7, 0x4000_0028);
+        let (x, a) = (program(X86_64), program(AARCH64));
+        let unix = [1, 1, 0, 0, 0, 0];
+        let inet = [2, 1, 0, 0, 0, 0];
+        let tiocsti = [0, 0x5412, 0, 0, 0, 0];
+        for (p, nr, arch, args, want, what) in [
+            (&x, 41, x86, unix, RET_EPERM, "socket(AF_UNIX)"),
+            // The kernel takes the domain as int: high bits don't hide AF_UNIX.
+            (
+                &x,
+                41,
+                x86,
+                [(7 << 32) | 1, 1, 0, 0, 0, 0],
+                RET_EPERM,
+                "socket(AF_UNIX | high bits)",
+            ),
+            (&x, 41, x86, inet, RET_ALLOW, "socket(AF_INET)"),
+            (&x, 53, x86, unix, RET_ALLOW, "socketpair(AF_UNIX)"),
+            (&x, 16, x86, tiocsti, RET_EPERM, "ioctl(TIOCSTI)"),
+            (&x, 16, x86, [0, 0x5401, 0, 0, 0, 0], RET_ALLOW, "ioctl(TCGETS)"),
+            (&x, 0x4000_0029, x86, unix, RET_EPERM, "x32 socket"),
+            (&x, 0, x86, unix, RET_ALLOW, "read"),
+            (&x, 359, i386, unix, RET_EPERM, "i386 socket(AF_UNIX)"),
+            (
+                &x,
+                102,
+                i386,
+                [1, 0, 0, 0, 0, 0],
+                RET_EPERM,
+                "i386 socketcall(SYS_SOCKET)",
+            ),
+            (
+                &x,
+                102,
+                i386,
+                [8, 0, 0, 0, 0, 0],
+                RET_ALLOW,
+                "i386 socketcall(SYS_SOCKETPAIR)",
+            ),
+            (&x, 54, i386, tiocsti, RET_EPERM, "i386 ioctl(TIOCSTI)"),
+            (&x, 41, 0x1234, unix, RET_ALLOW, "unknown arch"),
+            (&a, 198, arm64, unix, RET_EPERM, "arm64 socket(AF_UNIX)"),
+            (&a, 198, arm64, inet, RET_ALLOW, "arm64 socket(AF_INET)"),
+            (&a, 199, arm64, unix, RET_ALLOW, "arm64 socketpair"),
+            (&a, 29, arm64, tiocsti, RET_EPERM, "arm64 ioctl(TIOCSTI)"),
+            (&a, 0x4000_0029, arm64, unix, RET_ALLOW, "arm64 has no x32"),
+            (&a, 281, arm, unix, RET_EPERM, "arm socket(AF_UNIX)"),
+            (&a, 54, arm, tiocsti, RET_EPERM, "arm ioctl(TIOCSTI)"),
+            // x86_64's socket number on arm64 is another call.
+            (&a, 41, arm64, unix, RET_ALLOW, "arm64 nr 41"),
+        ] {
+            assert_eq!(bpf(p, nr, arch, args), want, "{what}");
+        }
+        // bwrap reads whole `struct sock_filter`s.
+        if let Some(b) = seccomp_program() {
+            assert_eq!(b.len() % 8, 0);
+        }
     }
 
     #[test]
@@ -496,5 +936,94 @@ mod tests {
     fn project_dirs_fall_back_to_cwd() {
         let d = tempfile::tempdir().unwrap();
         assert_eq!(project_dirs(d.path()), vec![d.path().to_path_buf()]);
+        assert!(git_dirs(d.path()).is_empty());
+    }
+
+    /// Runs `cmd` through [`command`]: (success, stdout + stderr).
+    async fn sh(sb: Option<&Sandbox>, cwd: &Path, cmd: &str) -> (bool, String) {
+        let o = command(sb, cmd, cwd).unwrap().output().await.unwrap();
+        let mut t = String::from_utf8_lossy(&o.stdout).into_owned();
+        t.push_str(&String::from_utf8_lossy(&o.stderr));
+        (o.status.success(), t.trim().to_string())
+    }
+
+    fn have(bin: &str) -> bool {
+        std::process::Command::new("sh")
+            .args(["-c", &format!("command -v {bin}")])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// Real runs: unix sockets, the environment, read-only git state, vanished paths.
+    #[tokio::test]
+    async fn real_filter_env_and_read_only() {
+        let base = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let d = tempfile::Builder::new()
+            .prefix(".novacode-sandbox-test")
+            .tempdir_in(&base)
+            .unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (home, proj) = (root.join("home"), root.join("proj"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(proj.join(".git/hooks")).unwrap();
+        std::fs::write(proj.join(".git/config"), "[core]\n").unwrap();
+        std::fs::write(proj.join("secret.txt"), "S").unwrap();
+        let sb = Sandbox::new(Config {
+            mode: Mode::On,
+            project: vec![proj.clone()],
+            home: home.clone(),
+            novacode_home: home.join(".novacode"),
+            deny_read: vec!["secret.txt".into()],
+            git_dirs: vec![proj.join(".git")],
+            // HOME stands in for a provider key: the test can't set variables.
+            secret_env: vec!["HOME".into()],
+            ..Config::default()
+        });
+        if !sb.available() {
+            eprintln!("note: real_filter_env_and_read_only skipped, bwrap is not available here");
+            return;
+        }
+        let s = Some(&sb);
+        // Secrets are dropped, the rest stays; `unsandboxed` (no sandbox) keeps everything.
+        let probe = r#"echo "${HOME-unset} ${PATH:+path}""#;
+        assert_eq!(sh(s, &proj, probe).await, (true, "unset path".into()));
+        assert_ne!(sh(None, &proj, probe).await.1, "unset path");
+        // Git config and hooks are read-only; the rest of .git stays writable.
+        let (ok, t) = sh(s, &proj, "echo x >> .git/config").await;
+        assert!(!ok && t.contains("Read-only file system"), "{t}");
+        let (ok, t) = sh(s, &proj, "touch .git/hooks/pre-commit").await;
+        assert!(!ok && t.contains("Read-only file system"), "{t}");
+        assert!(sh(s, &proj, "touch .git/index.lock").await.0);
+        // A hidden file deleted mid-session: commands still run, and it is not recreated.
+        std::fs::remove_file(proj.join("secret.txt")).unwrap();
+        assert_eq!(sh(s, &proj, "echo ok").await, (true, "ok".into()));
+        assert!(!proj.join("secret.txt").exists());
+        // Unix sockets.
+        if seccomp_program().is_none() {
+            eprintln!("note: no seccomp filter for this CPU, unix socket checks skipped");
+            return;
+        }
+        if have("python3") {
+            let (ok, t) = sh(s, &proj, r#"python3 -c "import socket; socket.socket(socket.AF_UNIX)""#).await;
+            assert!(!ok && t.contains("Operation not permitted"), "{t}");
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            let tcp = format!(
+                r#"python3 -c "import socket; socket.create_connection(('127.0.0.1', {port})); socket.socketpair(); print('ok')""#
+            );
+            assert_eq!(sh(s, &proj, &tcp).await, (true, "ok".into()));
+        } else {
+            eprintln!("note: python3 missing, socket checks skipped");
+        }
+        // Desktop and Docker sockets reachable outside are refused inside.
+        for (bin, cmd) in [("busctl", "busctl --user list"), ("docker", "docker version")] {
+            if !have(bin) || !sh(None, &proj, cmd).await.0 {
+                eprintln!("note: `{cmd}` doesn't work outside, its check is skipped");
+                continue;
+            }
+            let (ok, t) = sh(s, &proj, cmd).await;
+            assert!(!ok, "{cmd} reached its socket inside: {t}");
+        }
     }
 }
