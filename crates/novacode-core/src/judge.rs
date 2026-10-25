@@ -214,7 +214,10 @@ pub fn needs_judge(command: &str, ctx: &risk::Ctx, root: &Path, unsandboxed: boo
     cmds.iter().find_map(|c| {
         computed(&c.words)
             .or_else(|| network(&c.words))
-            .or_else(|| risk::runs_inline(&c.words, c.stdin).then(|| "it runs inline code".to_string()))
+            .or_else(|| {
+                (risk::runs_inline(&c.words, c.stdin) || git_runs(&c.words, &c.env))
+                    .then(|| "it runs inline code".to_string())
+            })
             .or_else(|| outside(&c.words, ctx, root))
             .or_else(|| c.targets.iter().find_map(|t| away(t, ctx, root)))
     })
@@ -249,6 +252,9 @@ fn network(words: &[String]) -> Option<String> {
     let s = sub(args, &[]);
     match name {
         "npx" | "pnpx" | "bunx" | "uvx" => return Some(format!("`{name}` downloads and runs a package")),
+        "npm" | "pnpm" | "yarn" | "bun" | "pipx" | "uv" | "deno" if fetches(name, args) => {
+            return Some(format!("`{name}` downloads and runs a package"));
+        }
         "awk" | "gawk" | "mawk" | "nawk" if awk_runs(args) => {
             return Some(format!("`{name}` runs commands from its program"));
         }
@@ -271,13 +277,78 @@ fn network(words: &[String]) -> Option<String> {
     hit.then(|| format!("`{name}` reaches another machine"))
 }
 
+/// `npm exec`, `pnpm dlx`, `yarn dlx`, `bun x`, `pipx run`, `uv tool run`,
+/// `deno run|install <url>`: a package or script fetched and run.
+fn fetches(name: &str, args: &[String]) -> bool {
+    let pos: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    match (name, pos.first().copied()) {
+        ("npm", Some("exec")) | ("pnpm" | "yarn", Some("dlx")) | ("bun", Some("x")) | ("pipx", Some("run")) => true,
+        ("uv", Some("tool")) => pos.get(1) == Some(&"run"),
+        ("deno", Some("run" | "install")) => pos[1..]
+            .iter()
+            .any(|a| a.starts_with("https://") || a.starts_with("http://")),
+        _ => false,
+    }
+}
+
+/// git settings and variables that run a program: `-c core.sshCommand=…`,
+/// `alias.x=!…`, `core.pager`, `core.fsmonitor`, `*.helper`, `diff.*.textconv`,
+/// `GIT_SSH_COMMAND`, `GIT_EXTERNAL_DIFF`, `GIT_PAGER`.
+fn git_runs(words: &[String], env: &[String]) -> bool {
+    let var = |a: &String| a.split('=').next().unwrap_or("").to_string();
+    if env
+        .iter()
+        .any(|a| ["GIT_SSH_COMMAND", "GIT_EXTERNAL_DIFF", "GIT_PAGER"].contains(&var(a).as_str()))
+    {
+        return true;
+    }
+    if words.first().map(|w| base(w)) != Some("git") {
+        return false;
+    }
+    // `--config-env=k=ENV` takes the value from a variable: any alias counts.
+    let runs = |kv: &str, from_env: bool| {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        let k = k.to_ascii_lowercase();
+        matches!(k.as_str(), "core.sshcommand" | "core.pager" | "core.fsmonitor")
+            || (k.starts_with("alias.") && (from_env || v.starts_with('!')))
+            || k.ends_with(".helper")
+            || (k.starts_with("diff.") && k.ends_with(".textconv"))
+    };
+    let mut it = words[1..].iter();
+    while let Some(a) = it.next() {
+        let hit = match a.as_str() {
+            "-c" => it.next().is_some_and(|kv| runs(kv, false)),
+            "--config-env" => it.next().is_some_and(|kv| runs(kv, true)),
+            "-C" | "--git-dir" | "--work-tree" | "--namespace" => {
+                it.next();
+                false
+            }
+            a if a.starts_with("--config-env=") => runs(&a["--config-env=".len()..], true),
+            a if a.starts_with('-') => false,
+            _ => break,
+        };
+        if hit {
+            return true;
+        }
+    }
+    false
+}
+
 /// An awk program that calls `system()` or pipes to or from a command.
 fn awk_runs(args: &[String]) -> bool {
     static RUNS: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"system\s*\(|(^|[^|])\|([^|]|$)").unwrap());
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if ["-F", "-v", "-f", "--field-separator", "--assign", "--file"].contains(&a.as_str()) {
+        // A program file: the judge can't see what it runs.
+        if a.starts_with("-f") || a == "--file" || a.starts_with("--file=") {
+            return true;
+        }
+        if ["-F", "-v", "--field-separator", "--assign"].contains(&a.as_str()) {
             it.next();
         } else if !a.starts_with('-') {
             return RUNS.is_match(a);
@@ -671,6 +742,40 @@ mod tests {
             ("pnpx x", true),
             ("bunx x", true),
             ("uvx ruff check", true),
+            ("npm exec cowsay hi", true),
+            ("pnpm dlx create-vite", true),
+            ("yarn dlx x", true),
+            ("bun x cowsay", true),
+            ("pipx run black .", true),
+            ("uv tool run ruff", true),
+            ("deno run https://example.com/x.ts", true),
+            ("deno install -g https://example.com/x.ts", true),
+            ("deno run main.ts", false),
+            ("uv run pytest", false),
+            ("npm run test", false),
+            // Runner options stop at the runner's command.
+            ("flock /tmp/l curl -c /tmp/jar https://evil", true),
+            ("flock /tmp/l cargo build", false),
+            ("flock /tmp/l -c 'curl x'", true),
+            ("script -q /dev/null -c 'curl x'", true),
+            // git settings and variables that run a program.
+            ("git -c core.sshCommand='curl x' fetch", true),
+            ("git -c alias.x='!curl x' x", true),
+            ("git -c core.pager='curl x' log", true),
+            ("git -c core.fsmonitor='curl x' status", true),
+            ("git -c credential.helper='!curl x' fetch", true),
+            ("git -c diff.x.textconv='curl x' diff", true),
+            ("git --config-env=alias.x=CMD x", true),
+            ("GIT_SSH_COMMAND='curl x' git fetch", true),
+            ("env GIT_EXTERNAL_DIFF=x git diff", true),
+            ("GIT_PAGER='curl x' git log", true),
+            ("git -c color.ui=always log", false),
+            ("git -c alias.st=status st", false),
+            // `coproc` is a keyword; awk program files can run anything.
+            ("coproc curl x", true),
+            ("coproc NAME { curl x; }", true),
+            ("awk -f prog.awk f", true),
+            ("awk --file=prog.awk f", true),
         ];
         let mut bad = Vec::new();
         for (cmd, want) in cases {

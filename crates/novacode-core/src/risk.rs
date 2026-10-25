@@ -359,6 +359,8 @@ pub(crate) struct Simple {
     /// It runs inside another command (`$(…)`, `sh -c`, `eval`, a heredoc fed to a
     /// shell, `find -exec`, `watch`, …), not in place of the line's own words.
     pub nested: bool,
+    /// Its `VAR=value` words, also those after `env` or `sudo`.
+    pub env: Vec<String>,
 }
 
 /// The simple commands of a line for the command judge (L6.8): wrappers (`sudo`,
@@ -381,6 +383,28 @@ pub fn nested(src: &str) -> Option<Vec<String>> {
             .into_iter()
             .filter(|s| s.nested && !s.words.is_empty())
             .map(|s| s.words.join(" "))
+            .collect(),
+    )
+}
+
+/// Every command of `src` the parser finds, as text, with wrappers, keywords
+/// and assignments removed and the program as its base name: deny and ask
+/// rules match these (`timeout 5 /usr/bin/curl x` hits `Bash(curl:*)`, L6.1).
+/// `None` = it can't be parsed.
+pub fn programs(src: &str) -> Option<Vec<String>> {
+    Some(
+        commands(src)?
+            .into_iter()
+            .filter_map(|s| {
+                let (first, rest) = s.words.split_first()?;
+                let base = first.rsplit('/').next().unwrap_or(first);
+                Some(
+                    std::iter::once(base)
+                        .chain(rest.iter().map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            })
             .collect(),
     )
 }
@@ -454,14 +478,15 @@ fn simple_into(words: &[String], at: &Here, targets: Vec<String>, out: &mut Vec<
                 stdin: at.stdin,
                 targets,
                 nested,
+                env: Vec::new(),
             });
         }
     };
-    let Some(w) = keywords(words) else {
+    let Some(kw) = keywords(words) else {
         push(out, &[], targets, at.nested);
         return Some(());
     };
-    let w = match unwrap(w) {
+    let w = match unwrap(kw) {
         Inner::Words(w) => w,
         Inner::Script(s) => {
             push(out, &[], targets, at.nested);
@@ -499,7 +524,20 @@ fn simple_into(words: &[String], at: &Here, targets: Vec<String>, out: &mut Vec<
             Inner::Script(s) => commands_into(&s, deeper, true, out)?,
         }
     }
-    push(out, w, targets, at.nested);
+    if !w.is_empty() || !targets.is_empty() {
+        let env = kw[..kw.len() - w.len()]
+            .iter()
+            .filter(|a| a.contains('=') && !a.starts_with('-') && !a.starts_with('='))
+            .cloned()
+            .collect();
+        out.push(Simple {
+            words: w.to_vec(),
+            stdin: at.stdin,
+            targets,
+            nested: at.nested,
+            env,
+        });
+    }
     Some(())
 }
 
@@ -509,9 +547,10 @@ fn keywords(words: &[String]) -> Option<&[String]> {
     let mut w = words;
     loop {
         match w.first().map(String::as_str) {
-            Some("if" | "then" | "else" | "elif" | "fi" | "while" | "until" | "do" | "done" | "esac" | "in" | "!") => {
-                w = &w[1..]
-            }
+            Some(
+                "if" | "then" | "else" | "elif" | "fi" | "while" | "until" | "do" | "done" | "esac" | "in" | "!"
+                | "coproc",
+            ) => w = &w[1..],
             Some("for" | "select") => return None,
             Some("case") => w = &w[w.iter().position(|a| a == "in").map_or(w.len(), |i| i + 1)..],
             Some(p) if p.ends_with(')') && !p.contains("$(") => w = &w[1..],
@@ -665,14 +704,20 @@ fn runner<'a>(name: &str, args: &'a [String]) -> Vec<Inner<'a>> {
                 script(rest)
             }
         }
-        "flock" => match opt_value(args, 'c', "--command") {
-            Some(s) => vec![Inner::Script(s.to_string())],
-            None => words(
-                skip_opts(args, &["-w", "--timeout", "-E", "--conflict-exit-code"])
-                    .get(1..)
-                    .unwrap_or_default(),
-            ),
-        },
+        "flock" => {
+            // Options end at the lock file; `-c` is read only before it or right after
+            // it, so `flock /tmp/l curl -c jar` runs `curl`.
+            let rest = skip_opts(
+                args,
+                &["-w", "--timeout", "-E", "--conflict-exit-code", "-c", "--command"],
+            );
+            let opts = &args[..args.len() - rest.len()];
+            match (opt_value(opts, 'c', "--command"), rest.get(1).map(String::as_str)) {
+                (Some(s), _) => vec![Inner::Script(s.to_string())],
+                (None, Some("-c" | "--command")) => script(rest.get(2..3).unwrap_or_default()),
+                (None, _) => words(rest.get(1..).unwrap_or_default()),
+            }
+        }
         "setsid" => words(skip_opts(args, &[])),
         "nsenter" => words(skip_opts(args, &["-t", "--target", "-S", "--setuid", "-G", "--setgid"])),
         "unshare" => words(skip_opts(
@@ -1202,7 +1247,7 @@ fn simple_base(w: &[String], input: &[String], piped: bool, ctx: &Ctx, depth: u3
         }
         "eval" => classify_depth(&rest(), ctx, depth + 1).max(Risk::low()),
         // Shell keywords: what follows them is the command (`$(…)` is checked on its own).
-        "if" | "then" | "else" | "elif" | "while" | "until" | "do" | "!" => {
+        "if" | "then" | "else" | "elif" | "while" | "until" | "do" | "!" | "coproc" => {
             if args.is_empty() {
                 Risk::safe()
             } else {
@@ -2141,6 +2186,9 @@ mod tests {
             ("watch -n 1 rm -rf ~", Catastrophic),
             ("flock /tmp/l rm -rf ~", Catastrophic),
             ("flock /tmp/l -c 'rm -rf ~'", Catastrophic),
+            ("flock /tmp/l rm -c x -rf ~", Catastrophic),
+            ("flock -w 5 /tmp/l rm -rf ~", Catastrophic),
+            ("coproc rm -rf ~", Catastrophic),
             ("nsenter -t 1 rm -rf ~", Catastrophic),
             ("unshare -r rm -rf ~", Catastrophic),
             ("script -qc 'rm -rf ~' /dev/null", Catastrophic),
