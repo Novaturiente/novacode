@@ -277,7 +277,8 @@ A project folder can ship config that changes settings and runs code. novacode o
 - `.novacode/extensions`
 - `.novacode/skills`
 - `.novacode/agents`
-- `.mcp.json`
+- `.novacode/packages`, `.novacode/packages.json` and `.novacode/packages.lock.json` (project [packages](packages.md))
+- `.mcp.json`, in the current folder or a parent folder up to the git top level (see [mcp](mcp.md))
 - project-level Claude Code config under `.claude`: `skills`, `agents` and `commands` (when `compat.claude` is on)
 
 `AGENTS.md`, `CLAUDE.md` and the project's `.novacode/prompts` are plain text and always load.
@@ -304,9 +305,13 @@ novacode --trust               # trust this folder for this run only
 
 ### When project config changes
 
-Trust covers the project config as it was when you said yes, like direnv's `allow`. novacode keeps a fingerprint of it in `trust.json`: the names and contents of every file in the gated entries listed above. Creating one that wasn't there (say a new `.mcp.json`) changes it too. Other files, `AGENTS.md`, `CLAUDE.md` and `.novacode/prompts` don't count.
+Trust covers the project config as it was when you said yes, like direnv's `allow`. novacode keeps a fingerprint of it in `trust.json`: the names and full contents of every file in the gated entries listed above, the `.mcp.json` of each parent folder up to the git top level included. Creating one that wasn't there (say a new `.mcp.json`) changes it too. Other files, `.git` folders inside packages, `AGENTS.md`, `CLAUDE.md` and `.novacode/prompts` don't count.
 
-The config can change after you trusted it: through `git pull`, a command the agent ran, the agent's own edits, or you. The next start or `/reload` then asks again. The prompt lists what changed (for example `added .mcp.json, changed .novacode/extensions`) and offers the same choices. Saying yes stores the new fingerprint.
+The fingerprint is kept per folder you work in. A folder below a trusted folder that you open for the first time asks too when it has project config the trusted folder's fingerprints never covered, for example its own `.novacode/extensions` (the prompt says `new project config`). It loads without asking when it has no project config, or only config already trusted unchanged, such as the top folder's `.mcp.json`. Entries written by older versions, which have no fingerprint yet, take the current one without asking.
+
+novacode checks at most 4096 paths per gated entry and reads at most 256 MiB of files in total. Config bigger than that can't be checked, so it always counts as changed (`too many files to check`).
+
+The config can change after you trusted it: through `git pull`, a command the agent ran, the agent's own edits, or you. The next start or `/reload` then asks again. The prompt lists what changed (for example `added .mcp.json, changed .novacode/extensions`) and offers the same choices. Saying yes stores the fingerprint of the config the prompt showed, so a change made while the prompt was open asks again next time.
 
 Non-interactive runs (`-p`, `--rpc`, `--bg`) can't ask. They ignore the changed config and print a note. Run `novacode trust` to trust it again (this stores the current fingerprint), or pass `--trust` for one run.
 

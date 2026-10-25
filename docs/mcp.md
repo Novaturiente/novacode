@@ -32,7 +32,7 @@ The format is the same `mcpServers` object Claude Code uses.
 |---|---|
 | `mcp.json` in an installed [package](packages.md) (a Claude Code plugin uses `.mcp.json` and the manifest's `mcpServers`) | Lowest priority. |
 | `~/.novacode/mcp.json` | Yours. Written by `novacode mcp add` and `remove`. |
-| `.mcp.json` in your project | Read only in [trusted](security.md) folders. novacode looks in the current folder and then upward to the nearest one. Highest priority. |
+| `.mcp.json` in your project | Read only in [trusted](security.md) folders. novacode looks in the current folder and then upward to the git top level, and uses the nearest one. Outside a git repo it looks only in the current folder. Highest priority. |
 
 If the same server name appears more than once, the later file in this order wins: package, then yours, then the project's. Among packages, a project package beats a global one. Within the same scope, the package whose name comes first alphabetically wins. A project `.novacode/mcp.json` is **not** read; use `.mcp.json`. In an untrusted folder `novacode mcp list` tells you the project file is ignored.
 

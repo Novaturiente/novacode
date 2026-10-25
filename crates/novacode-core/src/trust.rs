@@ -11,8 +11,8 @@
 use novacode_base::storage::{self, Durability};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::io::{self, Read};
+use std::path::{Component, Path, PathBuf};
 
 pub struct TrustStore {
     path: PathBuf,
@@ -24,18 +24,26 @@ const PROJECT_CONFIG: &[&str] = &[
     ".novacode/extensions",
     ".novacode/skills",
     ".novacode/agents",
+    ".novacode/packages",
+    ".novacode/packages.json",
+    ".novacode/packages.lock.json",
     ".mcp.json",
     ".claude/skills",
     ".claude/agents",
     ".claude/commands",
 ];
 
-/// Files above this size are hashed by size and mtime, not content.
-const MAX_FILE: u64 = 1 << 20;
-/// Paths hashed per fingerprint at most; the rest are cut off.
+/// Paths hashed per config entry at most.
 const MAX_PATHS: usize = 4096;
+/// File bytes hashed per fingerprint at most.
+const MAX_BYTES: u64 = 256 << 20;
+/// The change reported when a cap is hit: the config can't be checked, so it counts as changed.
+const TOO_MANY: &str = "too many files to check";
+/// The change reported for config a trusted entry never saw from this folder.
+const NEW: &str = "new project config";
 
-/// Per `PROJECT_CONFIG` entry that exists: FNV-1a 64 of its paths and contents, as hex.
+/// Per config entry that exists (`PROJECT_CONFIG` names, and `../.mcp.json` style
+/// keys for parent folders' `.mcp.json`): FNV-1a 64 of its paths and contents, as hex.
 pub type Fingerprint = BTreeMap<String, String>;
 
 /// One `trust.json` entry. Old files store a bare `true`/`false`.
@@ -112,26 +120,39 @@ impl TrustStore {
         dir.ancestors().find_map(|a| map.get(a).map(|d| d.trusted))
     }
 
-    /// The decision for `dir` with its fingerprint checked. A trusted entry with no
-    /// fingerprint for `dir` yet (first start after upgrade) takes the current one silently.
+    /// The decision for `dir` with its fingerprint checked.
     pub fn state(&self, dir: &Path) -> State {
+        self.check(dir).0
+    }
+
+    /// The decision for `dir` with its fingerprint checked, and that fingerprint (to
+    /// store with [`TrustStore::trust_with`] when the user trusts what was shown).
+    /// A trusted entry with no fingerprint for `dir` yet takes the current one silently
+    /// when the entry has none at all (old format) or every config file `dir` reads is
+    /// one the entry already saw unchanged; otherwise `dir` counts as changed.
+    pub fn check(&self, dir: &Path) -> (State, Fingerprint) {
+        let (now, complete) = scan(dir);
         let map = self.read();
         let Some((at, d)) = dir.ancestors().find_map(|a| map.get(a).map(|d| (a, d))) else {
-            return State::Unknown;
+            return (State::Unknown, now);
         };
         if !d.trusted {
-            return State::Untrusted;
+            return (State::Untrusted, now);
+        }
+        if !complete {
+            return (State::Changed(vec![TOO_MANY.into()]), now);
         }
         let key = rel_key(at, dir);
-        let now = fingerprint(dir);
-        match d.fingerprints.get(&key) {
+        let state = match d.fingerprints.get(&key) {
             Some(old) if *old == now => State::Trusted,
             Some(old) => State::Changed(changes(old, &now)),
+            None if !d.fingerprints.is_empty() && !all_seen(at, d, dir, &now) => State::Changed(vec![NEW.into()]),
             None => {
                 let at = at.to_path_buf();
+                let fp = now.clone();
                 let r = self.update(|m| {
                     if let Some(d) = m.get_mut(&at) {
-                        d.fingerprints.insert(key, now);
+                        d.fingerprints.insert(key, fp);
                     }
                 });
                 if let Err(e) = r {
@@ -139,7 +160,8 @@ impl TrustStore {
                 }
                 State::Trusted
             }
-        }
+        };
+        (state, now)
     }
 
     /// Record a decision for `dir` (and everything below it); trusting stores its current fingerprint.
@@ -150,7 +172,18 @@ impl TrustStore {
     /// Record a decision for `at`, taken in `cwd` (itself or a folder below it):
     /// trusting stores `cwd`'s current fingerprint.
     pub fn set_from(&self, at: &Path, trusted: bool, cwd: &Path) -> io::Result<()> {
-        let fp = (trusted && cwd.starts_with(at)).then(|| (rel_key(at, cwd), fingerprint(cwd)));
+        let fp = trusted.then(|| fingerprint(cwd));
+        self.store(at, trusted, cwd, fp)
+    }
+
+    /// Trust `at`, taken in `cwd`, storing `fp`: the fingerprint the user was shown
+    /// ([`TrustStore::check`]), not one taken after the answer.
+    pub fn trust_with(&self, at: &Path, cwd: &Path, fp: Fingerprint) -> io::Result<()> {
+        self.store(at, true, cwd, Some(fp))
+    }
+
+    fn store(&self, at: &Path, trusted: bool, cwd: &Path, fp: Option<Fingerprint>) -> io::Result<()> {
+        let fp = fp.filter(|_| cwd.starts_with(at)).map(|f| (rel_key(at, cwd), f));
         self.update(|m| {
             let d = m.entry(at.to_path_buf()).or_default();
             d.trusted = trusted;
@@ -174,11 +207,41 @@ fn rel_key(at: &Path, dir: &Path) -> String {
     }
 }
 
-/// What differs between two fingerprints, one line per `PROJECT_CONFIG` entry.
-fn changes(old: &Fingerprint, now: &Fingerprint) -> Vec<String> {
-    PROJECT_CONFIG
+/// `p` with `.` and `..` removed without touching the disk.
+fn lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// True when every config file in `now` (taken in `dir`) is one entry `d` (at `at`)
+/// already stored a fingerprint for, with the same hash: e.g. a parent's `.mcp.json`
+/// trusted from the parent.
+fn all_seen(at: &Path, d: &Decision, dir: &Path, now: &Fingerprint) -> bool {
+    let seen: BTreeMap<PathBuf, &String> = d
+        .fingerprints
         .iter()
-        .filter_map(|name| match (old.get(*name), now.get(*name)) {
+        .flat_map(|(folder, fp)| fp.iter().map(move |(k, h)| (lexical(&at.join(folder).join(k)), h)))
+        .collect();
+    now.iter().all(|(k, h)| seen.get(&lexical(&dir.join(k))) == Some(&h))
+}
+
+/// What differs between two fingerprints, one line per config entry.
+fn changes(old: &Fingerprint, now: &Fingerprint) -> Vec<String> {
+    let mut names: Vec<&String> = old.keys().chain(now.keys()).collect();
+    names.sort();
+    names.dedup();
+    names
+        .into_iter()
+        .filter_map(|name| match (old.get(name), now.get(name)) {
             (None, Some(_)) => Some(format!("added {name}")),
             (Some(_), None) => Some(format!("removed {name}")),
             (Some(a), Some(b)) if a != b => Some(format!("changed {name}")),
@@ -187,9 +250,24 @@ fn changes(old: &Fingerprint, now: &Fingerprint) -> Vec<String> {
         .collect()
 }
 
-/// True when `dir` has project config that trust would gate.
+/// The config files `dir` loads that exist, as (fingerprint key, path, folder it sits
+/// in): its own `PROJECT_CONFIG` entries, then the `.mcp.json` of each parent folder
+/// the MCP loader reads ([`crate::mcp::project_dirs`]), keyed `../.mcp.json`, `../../.mcp.json`.
+fn entries(dir: &Path) -> Vec<(String, PathBuf, &Path)> {
+    let mut v: Vec<_> = PROJECT_CONFIG
+        .iter()
+        .map(|n| (n.to_string(), dir.join(n), dir))
+        .collect();
+    for (up, a) in crate::mcp::project_dirs(dir).into_iter().enumerate().skip(1) {
+        v.push(("../".repeat(up) + ".mcp.json", a.join(".mcp.json"), a));
+    }
+    v.retain(|(_, p, _)| p.exists());
+    v
+}
+
+/// True when `dir` has project config that trust would gate (its parents' `.mcp.json` included).
 pub fn has_project_config(dir: &Path) -> bool {
-    PROJECT_CONFIG.iter().any(|p| dir.join(p).exists())
+    !entries(dir).is_empty()
 }
 
 /// Resolve trust without a UI: `--trust` wins, then a stored decision whose
@@ -199,28 +277,41 @@ pub fn resolve(store: &TrustStore, dir: &Path, cli_trust: bool) -> bool {
     cli_trust || store.state(dir) == State::Trusted
 }
 
-/// The fingerprint of `dir`'s project config: each `PROJECT_CONFIG` entry that
-/// exists, hashed over its sorted relative paths and file contents. Missing
+/// The fingerprint of `dir`'s project config: each config entry that exists
+/// ([`entries`]), hashed over its sorted relative paths and file contents. Missing
 /// entries are left out, so creating one changes the fingerprint.
 pub fn fingerprint(dir: &Path) -> Fingerprint {
-    let mut budget = MAX_PATHS;
-    PROJECT_CONFIG
-        .iter()
-        .filter(|name| dir.join(name).exists())
-        .map(|name| {
-            let mut h = Fnv::new();
-            hash_path(&mut h, dir, &dir.join(name), &mut budget);
-            (name.to_string(), format!("{:016x}", h.0))
-        })
-        .collect()
+    scan(dir).0
 }
 
-fn hash_path(h: &mut Fnv, root: &Path, path: &Path, budget: &mut usize) {
-    if *budget == 0 {
-        h.write(b"\0cut");
-        return;
+/// [`fingerprint`], and false when a cap was hit (the fingerprint doesn't cover
+/// everything): `MAX_PATHS` paths per entry or `MAX_BYTES` file bytes in total.
+fn scan(dir: &Path) -> (Fingerprint, bool) {
+    scan_capped(dir, MAX_BYTES)
+}
+
+fn scan_capped(dir: &Path, max_bytes: u64) -> (Fingerprint, bool) {
+    let mut bytes = max_bytes;
+    let mut complete = true;
+    let fp = entries(dir)
+        .into_iter()
+        .map(|(key, path, root)| {
+            let mut h = Fnv::new();
+            let mut paths = MAX_PATHS;
+            complete &= hash_path(&mut h, root, &path, &mut paths, &mut bytes);
+            (key, format!("{:016x}", h.0))
+        })
+        .collect();
+    (fp, complete)
+}
+
+/// Hash `path` (relative to `root`) and everything below it; false when a budget ran out.
+/// `.git` folders are skipped: nothing loads from them, and git rewrites them on its own.
+fn hash_path(h: &mut Fnv, root: &Path, path: &Path, paths: &mut usize, bytes: &mut u64) -> bool {
+    if *paths == 0 {
+        return false;
     }
-    *budget -= 1;
+    *paths -= 1;
     h.write(path.strip_prefix(root).unwrap_or(path).to_string_lossy().as_bytes());
     h.write(b"\0");
     if let Ok(target) = std::fs::read_link(path) {
@@ -228,26 +319,40 @@ fn hash_path(h: &mut Fnv, root: &Path, path: &Path, budget: &mut usize) {
         h.write(target.to_string_lossy().as_bytes());
         h.write(b"\0");
     }
-    let Ok(meta) = std::fs::metadata(path) else { return };
+    let Ok(meta) = std::fs::metadata(path) else { return true };
     if meta.is_dir() {
         let mut kids: Vec<PathBuf> = std::fs::read_dir(path)
-            .map(|rd| rd.flatten().map(|e| e.path()).collect())
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| !p.ends_with(".git"))
+                    .collect()
+            })
             .unwrap_or_default();
         kids.sort();
-        for k in kids {
-            hash_path(h, root, &k, budget);
+        kids.iter().all(|k| hash_path(h, root, k, paths, bytes))
+    } else if let Ok(mut f) = std::fs::File::open(path) {
+        let mut buf = vec![0; 64 << 10];
+        let mut len = 0u64;
+        loop {
+            match f.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if n as u64 > *bytes {
+                        return false;
+                    }
+                    *bytes -= n as u64;
+                    len += n as u64;
+                    h.write(&buf[..n]);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
         }
-    } else if meta.len() > MAX_FILE {
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_nanos());
-        h.write(&meta.len().to_le_bytes());
-        h.write(&mtime.to_le_bytes());
-    } else if let Ok(bytes) = std::fs::read(path) {
-        h.write(&(bytes.len() as u64).to_le_bytes());
-        h.write(&bytes);
+        h.write(&len.to_le_bytes());
+        true
+    } else {
+        true
     }
 }
 
@@ -366,5 +471,131 @@ mod tests {
         // Revoking keeps working as before.
         s.set(&sub, false).unwrap();
         assert_eq!(s.state(&sub), State::Untrusted);
+    }
+
+    fn write(p: &Path, text: &str) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+
+    #[test]
+    fn packages_count_as_project_config() {
+        let home = tempfile::tempdir().unwrap();
+        let w = tempfile::tempdir().unwrap();
+        let dir = w.path();
+        let s = TrustStore::new(home.path().join("trust.json"));
+        s.set(dir, true).unwrap();
+        for (file, change) in [
+            (".novacode/packages/evil/hooks/hooks.json", "added .novacode/packages"),
+            (".novacode/packages.json", "added .novacode/packages.json"),
+            (".novacode/packages.lock.json", "added .novacode/packages.lock.json"),
+        ] {
+            write(&dir.join(file), "{}");
+            assert_eq!(s.state(dir), State::Changed(vec![change.into()]), "{file}");
+            s.set(dir, true).unwrap();
+        }
+        // A package's git metadata isn't loaded, so it doesn't count.
+        write(&dir.join(".novacode/packages/evil/.git/FETCH_HEAD"), "x");
+        assert_eq!(s.state(dir), State::Trusted);
+    }
+
+    #[test]
+    fn parent_mcp_json_up_to_the_git_top_counts() {
+        let home = tempfile::tempdir().unwrap();
+        let w = tempfile::tempdir().unwrap();
+        let proj = w.path().join("proj");
+        let src = proj.join("src");
+        std::fs::create_dir_all(proj.join(".git")).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        let s = TrustStore::new(home.path().join("trust.json"));
+        s.set(&proj, true).unwrap();
+        // Above the git top level: never read, so never asked about.
+        write(&w.path().join(".mcp.json"), "{}");
+        assert!(!has_project_config(&src));
+        // Planted in the project top while working in `src`.
+        write(&proj.join(".mcp.json"), "{}");
+        assert!(has_project_config(&src));
+        assert_eq!(s.state(&src), State::Changed(vec![NEW.into()]));
+        assert_eq!(s.state(&proj), State::Changed(vec!["added .mcp.json".into()]));
+        // Trusted from the top: `src` sees the same file unchanged and takes it silently.
+        s.set(&proj, true).unwrap();
+        assert_eq!(s.state(&src), State::Trusted);
+        write(&proj.join(".mcp.json"), "{\"x\":1}");
+        assert_eq!(s.state(&src), State::Changed(vec!["changed ../.mcp.json".into()]));
+    }
+
+    #[test]
+    fn new_config_below_a_trusted_entry_asks() {
+        let home = tempfile::tempdir().unwrap();
+        let w = tempfile::tempdir().unwrap();
+        let x = w.path().join("crates/x");
+        std::fs::create_dir_all(&x).unwrap();
+        write(&w.path().join(".novacode/settings.json"), "{}");
+        let s = TrustStore::new(home.path().join("trust.json"));
+        s.set(w.path(), true).unwrap();
+        // No config of its own: nothing to ask about.
+        assert_eq!(s.state(&x), State::Trusted);
+        let y = w.path().join("crates/y");
+        write(&y.join(".novacode/extensions/evil.ts"), "evil");
+        assert_eq!(s.state(&y), State::Changed(vec![NEW.into()]));
+        assert_eq!(s.state(&y), State::Changed(vec![NEW.into()]), "not adopted");
+        s.set_from(w.path(), true, &y).unwrap();
+        assert_eq!(s.state(&y), State::Trusted);
+    }
+
+    #[test]
+    fn caps_fail_closed_and_large_files_hash_by_content() {
+        let home = tempfile::tempdir().unwrap();
+        let w = tempfile::tempdir().unwrap();
+        let dir = w.path();
+        let skills = dir.join(".novacode/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        for i in 0..MAX_PATHS {
+            std::fs::write(skills.join(format!("{i}.md")), "").unwrap();
+        }
+        write(&dir.join(".mcp.json"), "{}");
+        // One entry over its path budget doesn't starve the others.
+        let before = fingerprint(dir);
+        write(&dir.join(".mcp.json"), "{\"x\":1}");
+        assert_eq!(changes(&before, &fingerprint(dir)), ["changed .mcp.json"]);
+        // But the state fails closed, even right after trusting.
+        let s = TrustStore::new(home.path().join("trust.json"));
+        s.set(dir, true).unwrap();
+        assert_eq!(s.state(dir), State::Changed(vec![TOO_MANY.into()]));
+        std::fs::remove_dir_all(&skills).unwrap();
+        s.set(dir, true).unwrap();
+        assert_eq!(s.state(dir), State::Trusted);
+
+        // A same-size swap of a large file with its mtime put back is seen.
+        let big = dir.join(".novacode/extensions/big.js");
+        write(&big, &"a".repeat(3 << 20));
+        let a = fingerprint(dir);
+        let mtime = std::fs::metadata(&big).unwrap().modified().unwrap();
+        write(&big, &("b".to_string() + &"a".repeat((3 << 20) - 1)));
+        std::fs::File::options()
+            .write(true)
+            .open(&big)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert_ne!(fingerprint(dir), a);
+        // The byte cap.
+        assert!(scan_capped(dir, 4 << 20).1);
+        assert!(!scan_capped(dir, 1 << 20).1);
+    }
+
+    #[test]
+    fn trust_with_stores_the_fingerprint_shown() {
+        let home = tempfile::tempdir().unwrap();
+        let w = tempfile::tempdir().unwrap();
+        let dir = w.path();
+        write(&dir.join(".mcp.json"), "{}");
+        let s = TrustStore::new(home.path().join("trust.json"));
+        let (state, shown) = s.check(dir);
+        assert_eq!(state, State::Unknown);
+        // Changed while the prompt was open: the answer covers only what was shown.
+        write(&dir.join(".mcp.json"), "{\"x\":1}");
+        s.trust_with(dir, dir, shown).unwrap();
+        assert_eq!(s.state(dir), State::Changed(vec!["changed .mcp.json".into()]));
     }
 }
