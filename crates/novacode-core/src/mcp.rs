@@ -6,6 +6,7 @@
 
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
+use novacode_script::codemode::ToolInfo;
 use novacode_tools::{Exposure, Tool, ToolCtx, ToolOutput};
 use novacode_types::Block;
 use serde::Deserialize;
@@ -175,6 +176,93 @@ pub struct ToolSpec {
     /// `readOnlyHint` here lets the tool run in read-only mode.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub annotations: Value,
+    /// JSON schema of `structuredContent`, when the server declares one.
+    #[serde(default, rename = "outputSchema", skip_serializing_if = "Value::is_null")]
+    pub output_schema: Value,
+}
+
+/// A tool's exposure: its entry in the server's `tools` map, then the server's
+/// `exposure`, default codemode-only. The `tools.<server>__<tool>.exposure`
+/// setting wins over this and is applied by the caller.
+pub fn exposure(config: &ServerConfig, tool: &str) -> Exposure {
+    config
+        .tools
+        .get(tool)
+        .and_then(|o| o.exposure)
+        .or(config.exposure)
+        .unwrap_or(Exposure::CodemodeOnly)
+}
+
+/// Hash of what launches a server: command, args, url and env names (not values).
+/// A cached signature list from another launch config is ignored.
+pub fn fingerprint(c: &ServerConfig) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut put = |s: &str| {
+        for b in s.bytes().chain([0]) {
+            h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    put(c.command.as_deref().unwrap_or(""));
+    put(&c.args.len().to_string());
+    c.args.iter().for_each(|a| put(a));
+    put(c.url.as_deref().unwrap_or(""));
+    c.env.keys().for_each(|k| put(k));
+    format!("{h:016x}")
+}
+
+/// `<home>/cache/mcp-tools/<server>.json`: the codemode signature cache (L7.17).
+fn signatures_path(home: &Path, server: &str) -> PathBuf {
+    home.join("cache").join("mcp-tools").join(format!("{server}.json"))
+}
+
+/// Write a server's tool list to the signature cache, only when it changed.
+/// Tool names are the MCP names, without the `server__` prefix (the file is per server).
+pub fn write_signatures(home: &Path, server: &str, config: &ServerConfig, tools: &[ToolSpec]) {
+    let tools: Vec<Value> = tools
+        .iter()
+        .map(|t| json!({"name": t.name, "description": t.description, "schema": t.input_schema, "output_schema": t.output_schema}))
+        .collect();
+    let v = json!({"fingerprint": fingerprint(config), "tools": tools});
+    let path = signatures_path(home, server);
+    if novacode_base::storage::read_json::<Value>(&path)
+        .ok()
+        .flatten()
+        .as_ref()
+        == Some(&v)
+    {
+        return;
+    }
+    if let Err(e) = novacode_base::storage::write_json(&path, &v, novacode_base::storage::Durability::Fast) {
+        tracing::warn!(server, "MCP signature cache: {e}");
+    }
+}
+
+/// The cached tools of a server as codemode sees them (`server__tool`, namespace
+/// `server`); empty when there is no cache or it came from another launch config.
+pub fn cached_signatures(home: &Path, server: &str, config: &ServerConfig) -> Vec<ToolInfo> {
+    let Some(v) = novacode_base::storage::read_json::<Value>(&signatures_path(home, server))
+        .ok()
+        .flatten()
+    else {
+        return Vec::new();
+    };
+    if v["fingerprint"].as_str() != Some(fingerprint(config).as_str()) {
+        return Vec::new();
+    }
+    v["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            Some(ToolInfo {
+                name: format!("{server}__{}", t["name"].as_str()?),
+                description: t["description"].as_str().unwrap_or_default().to_string(),
+                schema: t["schema"].clone(),
+                namespace: Some(server.to_string()),
+                output_schema: t["output_schema"].is_object().then(|| t["output_schema"].clone()),
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -594,6 +682,7 @@ impl Hub {
             Ok(Ok((conn, tools))) => {
                 let path = self.cache_dir.join(format!("{}.json", s.name));
                 let _ = novacode_base::storage::write_json(&path, &tools, novacode_base::storage::Durability::Fast);
+                write_signatures(&self.home, &s.name, &s.config, &tools);
                 *s.tools.lock().unwrap() = tools;
                 let _ = s.status.send_replace(Status::Ready);
                 *slot = Some(conn.clone());
@@ -660,13 +749,7 @@ impl Hub {
         let mut out: Vec<Arc<dyn Tool>> = Vec::new();
         for s in &self.servers {
             for t in s.tools.lock().unwrap().iter() {
-                let exposure = s
-                    .config
-                    .tools
-                    .get(&t.name)
-                    .and_then(|o| o.exposure)
-                    .or(s.config.exposure)
-                    .unwrap_or(Exposure::CodemodeOnly);
+                let exposure = exposure(&s.config, &t.name);
                 let name = format!("{}__{}", s.name, t.name);
                 // Providers reject tool names outside ^[a-zA-Z0-9_-]{1,64}$; codemode doesn't send them.
                 if matches!(exposure, Exposure::Listed | Exposure::Deferred) && !provider_safe(&name) {
@@ -767,6 +850,12 @@ impl Tool for McpTool {
     fn read_only(&self) -> bool {
         self.spec.annotations["readOnlyHint"] == true
     }
+    fn output_schema(&self) -> Option<Value> {
+        self.spec
+            .output_schema
+            .is_object()
+            .then(|| self.spec.output_schema.clone())
+    }
     fn execute<'a>(&'a self, args: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
             let call = self.hub.call(&self.server, &self.spec.name, args);
@@ -852,7 +941,7 @@ for line in sys.stdin:
     m = json.loads(line)
     if "id" not in m: continue
     if m["method"] == "initialize": r = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "t", "version": "1"}}
-    elif m["method"] == "tools/list": r = {"tools": [{"name": "add", "description": "Add two numbers", "inputSchema": {"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}}}]}
+    elif m["method"] == "tools/list": r = {"tools": [{"name": "add", "description": "Add two numbers", "inputSchema": {"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}}, "outputSchema": {"type": "object", "properties": {"sum": {"type": "number"}}}}]}
     elif m["method"] == "tools/call":
         a = m["params"]["arguments"]
         if m["params"]["name"] == "add": r = {"content": [{"type": "text", "text": str(a["a"] + a["b"])}], "structuredContent": {"sum": a["a"] + a["b"]}}
@@ -883,6 +972,14 @@ for line in sys.stdin:
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name(), "calc__add");
         assert_eq!(tools[0].exposure(), Exposure::CodemodeOnly);
+        assert_eq!(
+            tools[0].output_schema().unwrap()["properties"]["sum"]["type"],
+            "number",
+            "outputSchema reaches Tool::output_schema"
+        );
+        let sigs = cached_signatures(home.path(), "calc", &servers[0].config);
+        assert_eq!(sigs.len(), 1, "connect wrote the signature cache");
+        assert_eq!(sigs[0].name, "calc__add");
         let ctx = ToolCtx {
             cwd: home.path().into(),
             env: Arc::new(novacode_tools::LocalEnv),
@@ -1016,6 +1113,82 @@ for line in sys.stdin:
             (starts(), hub.status()[0].1.clone()),
             (2, Status::Ready),
             "one start for both calls"
+        );
+    }
+
+    /// L7.17: the signature cache round trips, is ignored for another launch
+    /// config, and is not rewritten when nothing changed.
+    #[test]
+    fn signature_cache_round_trip_and_fingerprint() {
+        let home = tempfile::tempdir().unwrap();
+        let config = ServerConfig {
+            command: Some("srv".into()),
+            args: vec!["--x".into()],
+            env: [("TOKEN".to_string(), "a".to_string())].into(),
+            ..Default::default()
+        };
+        let spec = ToolSpec {
+            name: "add".into(),
+            description: "Add".into(),
+            input_schema: json!({"type": "object"}),
+            annotations: Value::Null,
+            output_schema: json!({"type": "object", "properties": {"sum": {"type": "number"}}}),
+        };
+        write_signatures(home.path(), "calc", &config, std::slice::from_ref(&spec));
+        let got = cached_signatures(home.path(), "calc", &config);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            (
+                got[0].name.as_str(),
+                got[0].namespace.as_deref(),
+                got[0].description.as_str()
+            ),
+            ("calc__add", Some("calc"), "Add")
+        );
+        assert_eq!(got[0].schema, spec.input_schema);
+        assert_eq!(got[0].output_schema.as_ref(), Some(&spec.output_schema));
+
+        // An env value is not part of the launch config's fingerprint; a name, args or command is.
+        let mut same = config.clone();
+        same.env.insert("TOKEN".into(), "b".into());
+        assert_eq!(cached_signatures(home.path(), "calc", &same).len(), 1);
+        for changed in [
+            ServerConfig {
+                args: vec!["--y".into()],
+                ..config.clone()
+            },
+            ServerConfig {
+                command: Some("other".into()),
+                ..config.clone()
+            },
+            ServerConfig {
+                env: [("KEY".to_string(), "a".to_string())].into(),
+                ..config.clone()
+            },
+        ] {
+            assert!(cached_signatures(home.path(), "calc", &changed).is_empty());
+        }
+        assert!(cached_signatures(home.path(), "none", &config).is_empty());
+
+        // Changed content is rewritten; unchanged content is not (mtime stays).
+        let path = signatures_path(home.path(), "calc");
+        let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let original = v.clone();
+        v["marker"] = json!(1);
+        std::fs::write(&path, v.to_string()).unwrap();
+        write_signatures(home.path(), "calc", &config, std::slice::from_ref(&spec));
+        assert!(
+            !std::fs::read_to_string(&path).unwrap().contains("marker"),
+            "changed file rewritten"
+        );
+        std::fs::write(&path, original.to_string()).unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        write_signatures(home.path(), "calc", &config, std::slice::from_ref(&spec));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "same content not rewritten"
         );
     }
 

@@ -1526,7 +1526,26 @@ impl Ctx {
             .filter(|s| s.config.exposure != Some(novacode_tools::Exposure::Hidden))
             .map(|s| (s.name.clone(), s.config.description.clone().unwrap_or_default()))
             .collect();
-        all.push(Arc::new(novacode_core::codemode::Codemode::new(&described)));
+        // Last session's tool lists (L7.17): codemode-only tools get signatures in the
+        // description. Small file reads only; servers are not waited for.
+        let cached: Vec<_> = servers
+            .iter()
+            .filter(|s| s.config.exposure != Some(novacode_tools::Exposure::Hidden))
+            .flat_map(|s| {
+                novacode_core::mcp::cached_signatures(self.paths.home(), &s.name, &s.config)
+                    .into_iter()
+                    .filter(|t| {
+                        let tool = &t.name[s.name.len() + 2..];
+                        self.settings
+                            .get(&format!("tools.{}.exposure", t.name))
+                            .unwrap_or_else(|| novacode_core::mcp::exposure(&s.config, tool))
+                            == novacode_tools::Exposure::CodemodeOnly
+                    })
+            })
+            .collect();
+        all.push(Arc::new(novacode_core::codemode::Codemode::with_signatures(
+            &described, &cached,
+        )));
         for w in &mcp_warnings {
             tracing::warn!("mcp config: {w}");
         }
