@@ -1,5 +1,5 @@
 //! The user docs ship inside the binary and are written to `~/.novacode/docs/` when the
-//! version changes, so every install path (AUR, tarball, cargo, `novacode update`) has
+//! version or the shipped pages change, so every install path (AUR, tarball, cargo, `novacode update`) has
 //! docs that match the running binary. `/docs` points the session at them.
 
 use novacode_base::paths::Paths;
@@ -39,11 +39,26 @@ pub fn dir(paths: &Paths) -> PathBuf {
     paths.home().join("docs")
 }
 
-/// Write the docs when the copy on disk is from another version. Cheap when current
-/// (one small file read); a failure only means `/docs` points at stale or no files.
+/// `<version> <hash of the shipped pages>`: a docs edit without a version bump still
+/// counts as new. FNV-1a 64 over README and every page name and text.
+fn stamp() -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in std::iter::once(README).chain(PAGES.iter().flat_map(|(n, t)| [*n, *t])) {
+        // A 0 byte between parts, so moving text from one part to the next changes the hash.
+        for b in part.bytes().chain([0]) {
+            h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    format!("{VERSION} {h:016x}")
+}
+
+/// Write the docs when the copy on disk is from another version or other pages. Cheap
+/// when current (one small file read and hashing the in-binary text); a failure only
+/// means `/docs` points at stale or no files.
 pub fn install(paths: &Paths) -> std::io::Result<()> {
     let d = dir(paths);
-    if std::fs::read_to_string(d.join("VERSION")).is_ok_and(|v| v.trim() == VERSION) {
+    let stamp = stamp();
+    if std::fs::read_to_string(d.join("VERSION")).is_ok_and(|v| v.trim() == stamp) {
         return Ok(());
     }
     // Our own folder: rebuilt whole so pages removed upstream disappear.
@@ -53,7 +68,7 @@ pub fn install(paths: &Paths) -> std::io::Result<()> {
     for (name, text) in PAGES {
         std::fs::write(d.join(name), text)?;
     }
-    std::fs::write(d.join("VERSION"), VERSION)
+    std::fs::write(d.join("VERSION"), stamp)
 }
 
 fn title(text: &str) -> &str {
@@ -143,6 +158,22 @@ mod tests {
         std::fs::write(d.join("gone.md"), "x").unwrap();
         install(&paths).unwrap();
         assert!(!d.join("gone.md").exists() && std::fs::read_to_string(d.join("tools.md")).unwrap() != "edited");
+        // Same version, other pages (an older build's hash): rewritten too.
+        assert_eq!(std::fs::read_to_string(d.join("VERSION")).unwrap(), stamp());
+        assert!(stamp().starts_with(&format!("{VERSION} ")));
+        std::fs::write(d.join("VERSION"), format!("{VERSION} 0000000000000000")).unwrap();
+        std::fs::write(d.join("tools.md"), "edited").unwrap();
+        install(&paths).unwrap();
+        assert_ne!(
+            std::fs::read_to_string(d.join("tools.md")).unwrap(),
+            "edited",
+            "pages changed: rewritten"
+        );
+        // An old install's VERSION (version only) is rewritten.
+        std::fs::write(d.join("VERSION"), VERSION).unwrap();
+        std::fs::write(d.join("tools.md"), "edited").unwrap();
+        install(&paths).unwrap();
+        assert_ne!(std::fs::read_to_string(d.join("tools.md")).unwrap(), "edited");
 
         let b = brief(&paths, &tmp);
         assert!(b.contains("- tools.md: Tools") && b.contains(&format!("· {}", tmp.join(".mcp.json").display())));

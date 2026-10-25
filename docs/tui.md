@@ -73,7 +73,7 @@ The pane closes when the session's window closes. See [config](config.md) for al
 | Send | `Enter`. |
 | Move and delete | Emacs-style keys (`Ctrl+A`, `Ctrl+E`, `Ctrl+W`, `Ctrl+K`, `Ctrl+Y`…). Full list below. |
 | Undo | `Ctrl+-`. |
-| Prompt history | `Up` at the top line, `Down` at the bottom line. History is the prompts of this session plus those of this folder's 20 newest other session files, up to 500 in all. Subagent sessions among those files are skipped. |
+| Prompt history | `Up` at the top line, `Down` at the bottom line. History is the prompts of this session plus those of this folder's 20 newest other user sessions, up to 500 in all. Subagent sessions are skipped and don't count toward the 20. |
 | Search history | `Ctrl+R`, type, `Ctrl+R` again for older matches, `Enter` to use, `Esc` to cancel. |
 | Complete | `Tab` or `Enter` in the popup. Works for `/commands` and `@files`. |
 | Edit in your editor | `Ctrl+G` opens `$VISUAL`, else `$EDITOR`, else the first of `nvim`, `nano`, `emacs -nw`, `vim`, `vi` found. Save and quit to bring the text back. In a question form it opens what you are typing, or the focused choice's preview (a plan) to read in full or edit. |

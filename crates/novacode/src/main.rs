@@ -1046,10 +1046,32 @@ impl Ctx {
                 Arc::new(novacode_core::classifier::Classify::new(self.providers.clone())),
                 novacode_ai::classify::find(s)?,
             )),
-            _ => Some(goals::Judge::Model(std::sync::Mutex::new(
-                self.memory_worker(route, main).await,
-            ))),
+            Some(s) => match self.providers.resolve(s) {
+                Ok(_) => Some(goals::Judge::Model {
+                    worker: std::sync::Mutex::new(
+                        models::helper(&self.providers, Some(s.to_string()), route, main).await,
+                    ),
+                    fixed: true,
+                }),
+                Err(e) => {
+                    tracing::warn!(%e, "goal.judge: using the observer's model");
+                    self.default_judge(route, main).await
+                }
+            },
+            None => self.default_judge(route, main).await,
         }
+    }
+
+    /// The observer's model as goal judge; it follows `/model`.
+    async fn default_judge(
+        &self,
+        route: &novacode_ai::connect::Route,
+        main: Arc<dyn novacode_ai::adapter::Adapter>,
+    ) -> Option<goals::Judge> {
+        Some(goals::Judge::Model {
+            worker: std::sync::Mutex::new(self.memory_worker(route, main).await),
+            fixed: false,
+        })
     }
 
     /// The observer's model (see `models::helper`).

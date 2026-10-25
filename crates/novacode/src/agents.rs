@@ -1667,7 +1667,7 @@ impl AgentTool {
                  send {{id, message}} (steers a running agent, resumes a finished one); \
                  wait {{ids?, any?, timeout?}} (blocks until reports arrive, default all, 600 s); stop {{id}}.\n\
                  Reports arrive by themselves (notify wake starts a turn); don't poll. \
-                 Two agents never edit the same file: the second is refused.\n{tools}\nAgents:\n{}",
+                 A subagent's edit/write claims the file: other agents, you included, are refused on it (you claim none; bash isn't checked).\n{tools}\nAgents:\n{}",
                 agents.join("\n")
             ),
             sup,

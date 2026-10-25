@@ -257,7 +257,7 @@ When the model says the goal is done, an `auditor` subagent re-checks every crit
 | `goal.auditModel` | the session's model | Model for the auditor, `provider/model[:level]`. |
 | `goal.maxRuns` | `30` | Automatic runs before it pauses (per start or resume). |
 | `goal.maxTokens` | none | Tokens (prompt and output) the goal's own turns may spend before it pauses. |
-| `goal.judge` | the observer's model | After each turn, a model checks the conversation for evidence that the goal is met, not met, or impossible. Met goes to the audit; `off` leaves it to the model's `complete`. A classifier model such as `typesafe/jev-latest` also works: met (or impossible) needs probability 0.8. |
+| `goal.judge` | the observer's model | After each turn, a model checks the conversation for evidence that the goal is met, not met, or impossible. Met goes to the audit; `off` leaves it to the model's `complete`. A `provider/model` sets the judge model; it stays on that model after `/model`. If it can't be resolved, the observer's model is used and a warning goes to the log. A classifier model such as `typesafe/jev-latest` also works: met (or impossible) needs probability 0.8. |
 
 The model drives a goal with the `goal` tool: `set` (objective, criteria, optional `ordered` to do the todo steps in order, one per run), `update` (change the objective, criteria or `ordered`), `complete` (with evidence), `block` (with a reason) and `status`.
 
