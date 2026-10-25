@@ -4,10 +4,10 @@
 use crate::codemode::{ToolInfo, declaration, js_name};
 use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
-use oxc_ast::ast::{Argument, Expression, ObjectPropertyKind, PropertyKey, UnaryOperator};
+use oxc_ast::ast::{Argument, BinaryOperator, Expression, ObjectPropertyKind, PropertyKey, UnaryOperator};
 use oxc_parser::Parser;
-use oxc_semantic::{Scoping, SemanticBuilder};
-use oxc_span::SourceType;
+use oxc_semantic::{AstNodes, NodeId, Scoping, SemanticBuilder};
+use oxc_span::{GetSpan, SourceType};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
@@ -41,6 +41,43 @@ fn node_msg(name: &str) -> String {
 }
 
 const MAX_PROBLEMS: usize = 5;
+
+/// `Object.prototype` members: every object, `tools` and `mcp.S` included, has them.
+const PROTO: &[&str] = &[
+    "constructor",
+    "hasOwnProperty",
+    "isPrototypeOf",
+    "propertyIsEnumerable",
+    "toString",
+    "toLocaleString",
+    "valueOf",
+    "__proto__",
+    "__defineGetter__",
+    "__defineSetter__",
+    "__lookupGetter__",
+    "__lookupSetter__",
+];
+
+/// `id` sits in the `try` block (not the handler or finalizer) of a `try` in its
+/// own function: the script expects it may throw there.
+fn in_try(nodes: &AstNodes, mut id: NodeId) -> bool {
+    loop {
+        let up = nodes.parent_id(id);
+        match nodes.kind(up) {
+            AstKind::TryStatement(t) => {
+                if matches!(nodes.kind(id), AstKind::BlockStatement(b) if b.span == t.block.span) {
+                    return true;
+                }
+            }
+            AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) | AstKind::Program(_) => return false,
+            _ => {}
+        }
+        if up == id {
+            return false;
+        }
+        id = up;
+    }
+}
 
 /// Problems in `js` (the wrapped script the engine runs), each naming the model's
 /// line, plus the declarations of the tools they concern. `globals` = what the
@@ -95,6 +132,7 @@ pub fn check(js: &str, globals: &HashSet<String>, tools: &[ToolInfo]) -> (Vec<St
                 }
                 let parent = nodes.kind(up);
                 let typeof_ = matches!(parent, AstKind::UnaryExpression(u) if u.operator == UnaryOperator::Typeof);
+                let delete = matches!(parent, AstKind::UnaryExpression(u) if u.operator == UnaryOperator::Delete);
                 if name == "globalThis" {
                     // Anything but a plain property read may define globals.
                     let read = matches!(
@@ -120,7 +158,7 @@ pub fn check(js: &str, globals: &HashSet<String>, tools: &[ToolInfo]) -> (Vec<St
                 let e = refs.entry(name).or_default();
                 e.1 |= r.is_write();
                 e.2 |= typeof_;
-                if r.is_read() && !typeof_ && e.0.is_none() {
+                if r.is_read() && !typeof_ && !delete && e.0.is_none() && !in_try(nodes, node.id()) {
                     e.0 = Some(id.span.start);
                 }
             }
@@ -147,17 +185,79 @@ pub fn check(js: &str, globals: &HashSet<String>, tools: &[ToolInfo]) -> (Vec<St
     }
 
     // b. Unknown tools; c. literal argument names.
+    // Feature tests: `"x" in tools` / `"x" in mcp` / `"x" in mcp.S`, or a member read
+    // that isn't called (`if (tools.x)`). Keyed by ("tools" | "mcp" | server, name).
+    let callees: HashSet<(u32, u32)> = nodes
+        .iter()
+        .filter_map(|n| match n.kind() {
+            AstKind::CallExpression(call) => {
+                let s = call.callee.without_parentheses().span();
+                Some((s.start, s.end))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut tested: HashSet<(&str, &str)> = HashSet::new();
+    for node in nodes.iter() {
+        let (object, prop, span) = match node.kind() {
+            AstKind::BinaryExpression(b) if b.operator == BinaryOperator::In => {
+                let Expression::StringLiteral(s) = b.left.without_parentheses() else {
+                    continue;
+                };
+                (&b.right, Some(s.value.as_str()), None)
+            }
+            AstKind::StaticMemberExpression(m) => (&m.object, Some(m.property.name.as_str()), Some(m.span)),
+            AstKind::ComputedMemberExpression(m) => {
+                (&m.object, m.static_property_name().map(|s| s.as_str()), Some(m.span))
+            }
+            _ => continue,
+        };
+        let Some(prop) = prop else { continue };
+        match span {
+            // `"x" in <object>`
+            None => {
+                if is_global(object, "tools", scoping) {
+                    tested.insert(("tools", prop));
+                } else if is_global(object, "mcp", scoping) {
+                    tested.insert(("mcp", prop));
+                } else if let Some(Target::Server(s)) = object
+                    .without_parentheses()
+                    .get_member_expr()
+                    .and_then(|m| target(m.object(), m.static_property_name(), scoping))
+                {
+                    tested.insert((s, prop));
+                }
+            }
+            Some(sp) if !callees.contains(&(sp.start, sp.end)) => match target(object, Some(prop), scoping) {
+                Some(Target::Tool(n)) => {
+                    tested.insert(("tools", n));
+                }
+                Some(Target::Mcp(s, n)) => {
+                    tested.insert((s, n));
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
     for node in nodes.iter() {
         match node.kind() {
+            // Reading an unknown server throws at run time; only `"S" in mcp` guards it.
             AstKind::StaticMemberExpression(m) => {
-                c.member(&m.object, Some(m.property.name.as_str()), m.span.start, scoping)
+                if let Some(Target::Server(s)) = target(&m.object, Some(m.property.name.as_str()), scoping)
+                    && !tested.contains(&("mcp", s))
+                {
+                    c.server(s, m.span.start);
+                }
             }
-            AstKind::ComputedMemberExpression(m) => c.member(
-                &m.object,
-                m.static_property_name().map(|s| s.as_str()),
-                m.span.start,
-                scoping,
-            ),
+            AstKind::ComputedMemberExpression(m) => {
+                if let Some(Target::Server(s)) =
+                    target(&m.object, m.static_property_name().map(|s| s.as_str()), scoping)
+                    && !tested.contains(&("mcp", s))
+                {
+                    c.server(s, m.span.start);
+                }
+            }
             AstKind::CallExpression(call) => {
                 let callee = call.callee.without_parentheses();
                 let (tool, arg) = if let Expression::Identifier(id) = callee
@@ -169,6 +269,7 @@ pub fn check(js: &str, globals: &HashSet<String>, tools: &[ToolInfo]) -> (Vec<St
                             let name = s.value.as_str();
                             match tools.iter().find(|t| t.name == name) {
                                 Some(t) => (t, call.arguments.get(1)),
+                                None if tested.contains(&("tools", name)) => continue,
                                 None => {
                                     c.unknown(s.span.start, &format!("callTool(\"{name}\")"), name, tools.iter());
                                     continue;
@@ -178,17 +279,30 @@ pub fn check(js: &str, globals: &HashSet<String>, tools: &[ToolInfo]) -> (Vec<St
                         _ => continue,
                     }
                 } else {
+                    let at = callee.span().start;
                     match callee
                         .get_member_expr()
                         .and_then(|m| target(m.object(), m.static_property_name(), scoping))
                     {
                         Some(Target::Tool(n)) => match tools.iter().find(|t| t.name == n) {
                             Some(t) => (t, call.arguments.first()),
-                            None => continue,
+                            None => {
+                                if !tested.contains(&("tools", n)) {
+                                    c.unknown(at, &format!("tools.{n}"), n, tools.iter());
+                                }
+                                continue;
+                            }
                         },
                         Some(Target::Mcp(s, n)) => match find_mcp(tools, s, n) {
                             Some(t) => (t, call.arguments.first()),
-                            None => continue,
+                            None => {
+                                // An unknown server is reported on its own.
+                                if tools.iter().any(|t| t.namespace.as_deref() == Some(s)) && !tested.contains(&(s, n))
+                                {
+                                    c.unknown(at, &format!("mcp.{s}.{n}"), n, tools.iter());
+                                }
+                                continue;
+                            }
                         },
                         _ => continue,
                     }
@@ -247,7 +361,7 @@ fn is_global(e: &Expression, name: &str, scoping: &Scoping) -> bool {
 /// What `object.prop` names: `tools.X`, `mcp.S` or `mcp.S.T`.
 fn target<'a>(object: &Expression<'a>, prop: Option<&'a str>, scoping: &Scoping) -> Option<Target<'a>> {
     let prop = prop?;
-    if prop == "then" {
+    if prop == "then" || PROTO.contains(&prop) {
         return None;
     }
     if is_global(object, "tools", scoping) {
@@ -292,30 +406,20 @@ impl Checker<'_> {
         }
     }
 
-    fn member(&mut self, object: &Expression, prop: Option<&str>, at: u32, scoping: &Scoping) {
+    fn server(&mut self, s: &str, at: u32) {
         let tools = self.tools;
-        match target(object, prop, scoping) {
-            Some(Target::Tool(n)) if !tools.iter().any(|t| t.name == n) => {
-                self.unknown(at, &format!("tools.{n}"), n, tools.iter());
-            }
-            Some(Target::Server(s)) if !tools.iter().any(|t| t.namespace.as_deref() == Some(s)) => {
-                let mut servers: Vec<(String, String)> = tools
-                    .iter()
-                    .filter_map(|t| t.namespace.clone())
-                    .map(|s| (format!("mcp.{s}"), s))
-                    .collect();
-                servers.sort();
-                servers.dedup();
-                let near = nearest(s, servers.iter().map(|(js, s)| (js.as_str(), s.as_str())));
-                self.push_at(at, unknown_msg(&format!("mcp.{s}"), "MCP server", &near));
-            }
-            Some(Target::Mcp(s, n))
-                if tools.iter().any(|t| t.namespace.as_deref() == Some(s)) && find_mcp(tools, s, n).is_none() =>
-            {
-                self.unknown(at, &format!("mcp.{s}.{n}"), n, tools.iter());
-            }
-            _ => {}
+        if tools.iter().any(|t| t.namespace.as_deref() == Some(s)) {
+            return;
         }
+        let mut servers: Vec<(String, String)> = tools
+            .iter()
+            .filter_map(|t| t.namespace.clone())
+            .map(|s| (format!("mcp.{s}"), s))
+            .collect();
+        servers.sort();
+        servers.dedup();
+        let near = nearest(s, servers.iter().map(|(js, s)| (js.as_str(), s.as_str())));
+        self.push_at(at, unknown_msg(&format!("mcp.{s}"), "MCP server", &near));
     }
 
     fn unknown<'t>(&mut self, at: u32, what: &str, name: &str, tools: impl Iterator<Item = &'t ToolInfo>) {
@@ -460,10 +564,21 @@ fn walk(s: &Value, v: &Value, path: &str, errs: &mut Vec<String>, extras: &mut V
         Value::Array(a) => a.iter().filter_map(|t| t.as_str()).collect(),
         _ => vec![],
     };
+    // OpenAPI-style `nullable: true` allows null whatever the type.
+    if v.is_null() && s["nullable"] == Value::Bool(true) {
+        return;
+    }
+    // Lax servers coerce numeric strings (`"5"`), so those pass unchanged.
+    let num = v.as_str().and_then(|x| x.parse::<f64>().ok()).filter(|f| f.is_finite());
     let fits = |t: &str| match t {
         "string" => v.is_string(),
-        "number" => v.is_number(),
-        "integer" => v.is_i64() || v.is_u64() || v.as_f64().is_some_and(|f| f.fract() == 0.0),
+        "number" => v.is_number() || num.is_some(),
+        "integer" => {
+            v.is_i64()
+                || v.is_u64()
+                || v.as_f64().is_some_and(|f| f.fract() == 0.0)
+                || num.is_some_and(|f| f.fract() == 0.0)
+        }
         "boolean" => v.is_boolean(),
         "array" => v.is_array(),
         "object" => v.is_object(),

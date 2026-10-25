@@ -65,7 +65,12 @@ pub fn to_js(src: &str, module: bool) -> String {
         return src.to_string();
     }
     let mut program = ret.program;
-    let scoping = SemanticBuilder::new().build(&program).semantic.into_scoping();
+    // The transformer needs evaluated enum members to lower `enum` / `const enum`.
+    let scoping = SemanticBuilder::new()
+        .with_enum_eval(true)
+        .build(&program)
+        .semantic
+        .into_scoping();
     let t = Transformer::new(&alloc, Path::new("script.ts"), &TransformOptions::default())
         .build_with_scoping(scoping, &mut program);
     if !t.diagnostics.is_empty() {
