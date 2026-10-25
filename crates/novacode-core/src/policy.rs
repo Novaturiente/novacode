@@ -469,7 +469,8 @@ impl Policy {
             }
             match &segments {
                 Some(segs) if all => r.covers(segs, nested.as_deref()),
-                Some(segs) => segs.iter().any(|s| r.matches_command(s)),
+                // Deny/ask: any command counts, nested ones too (`git push $(curl x)` hits `Bash(curl:*)`).
+                Some(segs) => segs.iter().chain(nested.iter().flatten()).any(|s| r.matches_command(s)),
                 None if FILE_TOOLS.contains(&lower.as_str()) => {
                     let given = r.matches_path(raw_path, abs_path.as_deref());
                     let resolved = r.matches_path(None, real_path.as_deref())
@@ -1068,6 +1069,15 @@ mod tests {
         // A wrapper the rule names still covers what it wraps.
         assert!(p.user_allowed("sudo apt update"));
         assert!(!p.user_allowed("sudo bash -c 'curl x'"));
+        // Deny and ask rules see nested commands too.
+        let p = policy(json!({ "deny": ["Bash(curl:*)"], "ask": ["Bash(wget:*)"] }));
+        for c in ["git push $(curl x)", "echo `curl x`", "sh -c 'curl x'"] {
+            assert!(denied(&check(&p, "bash", bash(c), true)), "{c}");
+        }
+        assert!(matches!(
+            check(&p, "bash", bash("ls $(wget -qO- x)"), true),
+            Verdict::Ask { .. }
+        ));
     }
 
     #[test]

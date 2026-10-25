@@ -80,9 +80,10 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         // NAME=value where NAME says it's a secret: keep the name, mask the value.
         // An upper-case NAME (environment style) masks any value; a lower- or
         // mixed-case one only a quoted value, so code such as
-        // `token: Option<String>` is left alone. Parentheses end a value too.
+        // `token: Option<String>` is left alone. Parentheses end a value too, and a
+        // value already masked by a pattern above (`[redacted: …]`) isn't masked again.
         (
-            r#"(?m)(\b(?:[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*\s*[=:]\s*["']?|(?i:[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*)\s*[=:]\s*["']))[^\s"'()]{8,}"#,
+            r#"(?m)(\b(?:[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*\s*[=:]\s*["']?|(?i:[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*)\s*[=:]\s*["']))[^\s"'()\[][^\s"'()]{7,}"#,
             "secret value",
         ),
     ]
@@ -147,6 +148,12 @@ mod tests {
             r.apply("GITHUB_TOKEN=ghp_xxxxxxxx API_KEY: abcdefgh12").as_deref(),
             Some("GITHUB_TOKEN=[redacted: secret value] API_KEY: [redacted: secret value]"),
             "upper-case names mask unquoted values"
+        );
+        // A token-shaped value is masked once, not again by the assignment pattern.
+        assert_eq!(
+            r.apply("GITHUB_TOKEN=ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8")
+                .as_deref(),
+            Some("GITHUB_TOKEN=[redacted: GitHub token]")
         );
         assert_eq!(r.apply("password=short"), None, "8-character minimum");
         assert_eq!(r.apply("PASSWORD='short'"), None, "8-character minimum");

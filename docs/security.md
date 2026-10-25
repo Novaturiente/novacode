@@ -158,7 +158,7 @@ The layout is worked out when the session starts; a path that doesn't exist then
 
 When a sandboxed command fails with `Read-only file system`, the result adds one line that names the writable places and says how to run the command outside.
 
-**Running one command outside.** `bash` and `process` `start` take `unsandboxed: true` for a command that needs what the sandbox hides or blocks, for example `git push` over SSH. Such a command gets your full environment. There is no approval card for it, but the risk gate still applies, the [command judge](#command-judge) checks every such call (its block asks you), and the result says `[ran outside the sandbox]`.
+**Running one command outside.** `bash` and `process` `start` take `unsandboxed: true` for a command that needs what the sandbox hides or blocks, for example `git push` over SSH. Such a command gets your full environment. In `auto` mode there is no approval card for it, but the risk gate still applies, the [command judge](#command-judge) checks every such call (its block asks you), and the result says `[ran outside the sandbox]`. In `ask` mode it always asks. In `read-only` and plan mode it is refused.
 
 **What it doesn't cover:** your own `!` commands, hooks, extensions' `exec`, MCP servers and provider programs. You set those up yourself, so they run as you.
 
