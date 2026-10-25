@@ -62,7 +62,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "permissions",
         "object",
         "auto mode",
-        "Global only. `mode` auto|ask|read-only; `allow`/`ask`/`deny` lists of rules like `Bash(git push:*)`; `protected: {commands, paths}`; `profiles.<name>.{tools, deny}`, named tool sets. See docs/security.md.",
+        "Global only. `mode` auto|ask|read-only; `allow`/`ask`/`deny` lists of rules like `Bash(git push:*)`; `protected: {commands, paths}`; `profiles.<name>.{tools, deny}`, named tool sets; `judge`: the command judge's model in auto mode, `off` or a `provider/model[:level]` (default the observer's model). See docs/security.md.",
     ),
     (
         "tools.<name>.exposure",

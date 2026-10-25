@@ -32,6 +32,8 @@ pub struct Runner {
     pub budget: Budget,
     pub seq: AtomicUsize,
     pub hooks: Arc<crate::hooks::Hooks>,
+    /// The command judge (L6.8), `None` = off.
+    pub judge: Option<Arc<crate::judge::Judge>>,
 }
 
 impl Nested for Runner {
@@ -45,12 +47,13 @@ impl Nested for Runner {
             replay: None,
         };
         let prepared = pipeline::prepare(&self.tools, &call);
-        let (policy, approver, redactor, budget, hooks) = (
+        let (policy, approver, redactor, budget, hooks, judge) = (
             self.policy.clone(),
             self.approver.clone(),
             self.redactor.clone(),
             self.budget,
             self.hooks.clone(),
+            self.judge.clone(),
         );
         let spill = self.spill_dir.join(format!("{}-script-{n}.txt", ctx.session_id));
         Box::pin(async move {
@@ -65,6 +68,7 @@ impl Nested for Runner {
             if let Some(refusal) = pipeline::authorize_cancellable(
                 &policy,
                 approver.as_ref(),
+                judge.as_deref(),
                 &call.name,
                 tool.read_only(),
                 &args,
