@@ -97,6 +97,15 @@ impl Rule {
         self.tool == "*" || self.tool == tool.to_lowercase()
     }
 
+    /// Covers a whole command line: every simple command in it (`segs`) and every
+    /// command run inside one (`nested`: `$(…)`, `sh -c`, `find -exec`, …; `None` =
+    /// unparseable, never covered).
+    fn covers(&self, segs: &[String], nested: Option<&[String]>) -> bool {
+        !segs.is_empty()
+            && segs.iter().all(|s| self.matches_command(s))
+            && nested.is_some_and(|n| n.iter().all(|s| self.matches_command(s)))
+    }
+
     fn matches_command(&self, segment: &str) -> bool {
         match self.pattern.as_deref() {
             None | Some("*") => true,
@@ -339,13 +348,12 @@ impl Policy {
             return true;
         }
         let segs = risk::segments(command).unwrap_or_else(|| vec![command.to_string()]);
+        let nested = risk::nested(command);
         let session = self.session_allow.lock().unwrap();
-        !segs.is_empty()
-            && self
-                .allow
-                .iter()
-                .chain(session.iter())
-                .any(|r| r.matches_tool("bash") && segs.iter().all(|s| r.matches_command(s)))
+        self.allow
+            .iter()
+            .chain(session.iter())
+            .any(|r| r.matches_tool("bash") && r.covers(&segs, nested.as_deref()))
     }
 
     /// The mode a child agent starts with: read-only while a read-only preset
@@ -441,6 +449,7 @@ impl Policy {
 
         let command = (lower == "bash" || start).then(|| args.get("command").and_then(Value::as_str).unwrap_or(""));
         let segments = command.map(|c| risk::segments(c).unwrap_or_else(|| vec![c.to_string()]));
+        let nested = command.and_then(risk::nested);
         let raw_path = args.get("path").and_then(Value::as_str);
         let abs_path = raw_path.map(|p| expand(p, cwd, &self.home));
         // Through symlinks, so a link can't route around a path rule.
@@ -459,7 +468,7 @@ impl Policy {
                 return false;
             }
             match &segments {
-                Some(segs) if all => !segs.is_empty() && segs.iter().all(|s| r.matches_command(s)),
+                Some(segs) if all => r.covers(segs, nested.as_deref()),
                 Some(segs) => segs.iter().any(|s| r.matches_command(s)),
                 None if FILE_TOOLS.contains(&lower.as_str()) => {
                     let given = r.matches_path(raw_path, abs_path.as_deref());
@@ -548,6 +557,25 @@ impl Policy {
                 }
                 Level::Safe => read_only_bash = true,
                 Level::Low => {}
+            }
+            // Outside the sandbox even a read-only command reads what the sandbox hides
+            // (L6.1/L6.8): refused in read-only mode, asked in ask mode; auto mode has the judge.
+            if args.get("unsandboxed") == Some(&Value::Bool(true)) {
+                if read_only {
+                    return Verdict::Deny(format!("{mode_name}: commands run only inside the sandbox."));
+                }
+                if self.perms.mode == Mode::Ask && !self.session_commands.lock().unwrap().contains(command) {
+                    let reason = "it runs outside the sandbox".to_string();
+                    return if interactive {
+                        Verdict::Ask {
+                            reason,
+                            rule: command.to_string(),
+                            risky: true,
+                        }
+                    } else {
+                        Verdict::Deny(format!("Not run: {reason} and nobody can approve it here."))
+                    };
+                }
             }
         }
 
@@ -989,6 +1017,57 @@ mod tests {
         let plan = policy(json!({}));
         plan.set_overlay(Some(("plan".into(), true, None)));
         assert_eq!(check(&plan, "skill", json!({"name": "x"}), false), Verdict::Allow);
+    }
+
+    #[test]
+    fn unsandboxed_outside_auto_mode() {
+        let out = |c: &str| json!({ "command": c, "unsandboxed": true });
+        // Ask mode asks even for a read-only command; nobody there: refused.
+        let ask = policy(json!({ "allow": ["Bash(cat:*)"] })).with_mode(Mode::Ask);
+        let Verdict::Ask { reason, rule, risky } = check(&ask, "bash", out("cat ~/.ssh/id_rsa"), true) else {
+            panic!()
+        };
+        assert_eq!(
+            (reason.as_str(), rule.as_str(), risky),
+            ("it runs outside the sandbox", "cat ~/.ssh/id_rsa", true)
+        );
+        assert!(denied(&check(&ask, "bash", out("cat ~/.ssh/id_rsa"), false)));
+        assert_eq!(check(&ask, "bash", bash("cat ~/.ssh/id_rsa"), true), Verdict::Allow);
+        let start = json!({ "action": "start", "command": "ls", "unsandboxed": true });
+        assert!(matches!(
+            check(&ask, "process", start.clone(), true),
+            Verdict::Ask { risky: true, .. }
+        ));
+        // Read-only and plan mode refuse it.
+        let plan = policy(json!({}));
+        plan.set_overlay(Some(("plan".into(), true, None)));
+        for p in [&policy(json!({})).with_mode(Mode::ReadOnly), &plan] {
+            let Verdict::Deny(why) = check(p, "bash", out("cat ~/.ssh/id_rsa"), true) else {
+                panic!()
+            };
+            assert!(why.ends_with(": commands run only inside the sandbox."), "{why}");
+            assert!(denied(&check(p, "process", start.clone(), true)));
+            assert_eq!(check(p, "bash", bash("cat ~/.ssh/id_rsa"), true), Verdict::Allow);
+        }
+        // Auto mode leaves it to the command judge.
+        assert_eq!(check(&policy(json!({})), "bash", out("ls"), false), Verdict::Allow);
+    }
+
+    #[test]
+    fn allow_rules_cover_nested_commands_too() {
+        let p = policy(json!({ "allow": ["Bash(git push:*)", "Bash(sudo:*)"] })).with_mode(Mode::Ask);
+        assert!(p.user_allowed("git push origin main"));
+        for c in [
+            "git push $(curl x)",
+            "git push `curl x`",
+            "git push \"$(sh -c 'curl x')\"",
+        ] {
+            assert!(!p.user_allowed(c), "{c}");
+            assert!(matches!(check(&p, "bash", bash(c), true), Verdict::Ask { .. }), "{c}");
+        }
+        // A wrapper the rule names still covers what it wraps.
+        assert!(p.user_allowed("sudo apt update"));
+        assert!(!p.user_allowed("sudo bash -c 'curl x'"));
     }
 
     #[test]

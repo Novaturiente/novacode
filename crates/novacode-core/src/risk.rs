@@ -347,55 +347,85 @@ pub fn segments(src: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// The simple commands of a line for the command judge (L6.8): each one's words
-/// without leading `VAR=value` words and wrappers (`sudo`, `env`, `timeout`,
-/// `xargs`, `nohup`, …), and whether text reaches its stdin (a pipe, heredoc or
-/// here-string). `$(…)` bodies and `sh -c`/`eval` scripts count as commands of
+/// A simple command of a line, for the command judge (L6.8) and allow rules (L6.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Simple {
+    /// Its words, without leading `VAR=value` words, shell keywords and wrappers.
+    pub words: Vec<String>,
+    /// Text reaches its stdin (a pipe, heredoc or here-string).
+    pub stdin: bool,
+    /// Where its `>`/`>>` redirects write.
+    pub targets: Vec<String>,
+    /// It runs inside another command (`$(…)`, `sh -c`, `eval`, a heredoc fed to a
+    /// shell, `find -exec`, `watch`, …), not in place of the line's own words.
+    pub nested: bool,
+}
+
+/// The simple commands of a line for the command judge (L6.8): wrappers (`sudo`,
+/// `env`, `timeout`, `xargs`, `nohup`, …) and shell keywords are stripped, and
+/// what runners (`watch`, `setsid`, `find -exec`, `su -c`, …), `$(…)` bodies,
+/// `sh -c`/`eval` scripts and heredocs fed to a shell run count as commands of
 /// their own. `None` = it can't be parsed or nests too deeply.
-pub(crate) fn commands(src: &str) -> Option<Vec<(Vec<String>, bool)>> {
+pub(crate) fn commands(src: &str) -> Option<Vec<Simple>> {
     let mut out = Vec::new();
-    commands_into(src, 0, &mut out)?;
+    commands_into(src, 0, false, &mut out)?;
     Some(out)
 }
 
-fn commands_into(src: &str, depth: u32, out: &mut Vec<(Vec<String>, bool)>) -> Option<()> {
+/// The commands of `src` that run inside another one, as text: an allow rule
+/// that covers the line's own commands must cover these too (L6.1).
+/// `None` = it can't be parsed.
+pub fn nested(src: &str) -> Option<Vec<String>> {
+    Some(
+        commands(src)?
+            .into_iter()
+            .filter(|s| s.nested && !s.words.is_empty())
+            .map(|s| s.words.join(" "))
+            .collect(),
+    )
+}
+
+fn commands_into(src: &str, depth: u32, nested: bool, out: &mut Vec<Simple>) -> Option<()> {
     if depth > 4 {
         return None;
     }
     let (toks, subs) = lex(src)?;
     for s in &subs {
-        commands_into(s, depth + 1, out)?;
+        commands_into(s, depth + 1, true, out)?;
     }
     let (mut words, mut stdin, mut piped) = (Vec::new(), false, false);
+    let (mut input, mut targets) = (Vec::new(), Vec::new());
     let mut iter = toks.into_iter().peekable();
     loop {
         match iter.next() {
             Some(Tok::Word(w)) => words.push(w),
-            Some(Tok::Heredoc(_)) => stdin = true,
+            Some(Tok::Heredoc(body)) => {
+                stdin = true;
+                input.push(body);
+            }
             Some(Tok::HereString) => {
                 stdin = true;
-                if matches!(iter.peek(), Some(Tok::Word(_))) {
+                if let Some(Tok::Word(w)) = iter.peek() {
+                    input.push(w.clone());
                     iter.next();
                 }
             }
-            // The target stays a word, so its path is seen.
-            Some(Tok::Redirect) => {}
-            sep @ (Some(Tok::Sep(_)) | None) => {
-                let w = unwrap(&words);
-                let name = w.first().map(|f| f.rsplit('/').next().unwrap_or(f));
-                let script = w
-                    .iter()
-                    .position(|a| a == "-c" || (a.starts_with('-') && a.ends_with('c')))
-                    .and_then(|i| w.get(i + 1));
-                match name {
-                    Some(n) if SHELLS.contains(&n) && script.is_some() => {
-                        commands_into(script.map_or("", String::as_str), depth + 1, out)?
-                    }
-                    Some("eval") => commands_into(&w[1..].join(" "), depth + 1, out)?,
-                    Some(_) => out.push((w.to_vec(), stdin || piped)),
-                    None => {}
+            Some(Tok::Redirect) => {
+                if let Some(Tok::Word(t)) = iter.peek() {
+                    targets.push(t.clone());
+                    iter.next();
                 }
+            }
+            sep @ (Some(Tok::Sep(_)) | None) => {
+                let at = Here {
+                    stdin: stdin || piped,
+                    input: &input,
+                    depth,
+                    nested,
+                };
+                simple_into(&words, &at, std::mem::take(&mut targets), out)?;
                 words.clear();
+                input.clear();
                 stdin = false;
                 match sep {
                     Some(Tok::Sep(s)) => piped = s == "|",
@@ -407,8 +437,98 @@ fn commands_into(src: &str, depth: u32, out: &mut Vec<(Vec<String>, bool)>) -> O
     Some(())
 }
 
-/// `words` without leading assignments and wrappers (with their options).
-fn unwrap(words: &[String]) -> &[String] {
+/// Where a simple command sits, for [`simple_into`].
+struct Here<'a> {
+    stdin: bool,
+    /// Heredoc bodies and here-strings fed to it.
+    input: &'a [String],
+    depth: u32,
+    nested: bool,
+}
+
+fn simple_into(words: &[String], at: &Here, targets: Vec<String>, out: &mut Vec<Simple>) -> Option<()> {
+    let push = |out: &mut Vec<Simple>, words: &[String], targets: Vec<String>, nested: bool| {
+        if !words.is_empty() || !targets.is_empty() {
+            out.push(Simple {
+                words: words.to_vec(),
+                stdin: at.stdin,
+                targets,
+                nested,
+            });
+        }
+    };
+    let Some(w) = keywords(words) else {
+        push(out, &[], targets, at.nested);
+        return Some(());
+    };
+    let w = match unwrap(w) {
+        Inner::Words(w) => w,
+        Inner::Script(s) => {
+            push(out, &[], targets, at.nested);
+            return commands_into(&s, at.depth + 1, true, out);
+        }
+    };
+    let Some(first) = w.first() else {
+        push(out, &[], targets, at.nested);
+        return Some(());
+    };
+    let name = first.rsplit('/').next().unwrap_or(first);
+    let args = &w[1..];
+    let deeper = at.depth + 1;
+    if SHELLS.contains(&name) {
+        let (c, s, script) = shell_args(args);
+        if let (true, Some(script)) = (c, script) {
+            push(out, &[], targets, at.nested);
+            return commands_into(script, deeper, true, out);
+        }
+        if !c && (s || script.is_none_or(|f| f == "-")) {
+            for body in at.input {
+                commands_into(body, deeper, true, out)?;
+            }
+        }
+    } else if name == "eval" {
+        push(out, &[], targets, at.nested);
+        return commands_into(&args.join(" "), deeper, true, out);
+    }
+    for inner in runner(name, args) {
+        match inner {
+            Inner::Words(iw) => {
+                let inner_at = Here { nested: true, ..*at };
+                simple_into(iw, &inner_at, Vec::new(), out)?;
+            }
+            Inner::Script(s) => commands_into(&s, deeper, true, out)?,
+        }
+    }
+    push(out, w, targets, at.nested);
+    Some(())
+}
+
+/// `words` without leading shell keywords; `None` when they aren't a command
+/// (`for x in a b`). A `case x in` head and a `pattern)` are skipped too.
+fn keywords(words: &[String]) -> Option<&[String]> {
+    let mut w = words;
+    loop {
+        match w.first().map(String::as_str) {
+            Some("if" | "then" | "else" | "elif" | "fi" | "while" | "until" | "do" | "done" | "esac" | "in" | "!") => {
+                w = &w[1..]
+            }
+            Some("for" | "select") => return None,
+            Some("case") => w = &w[w.iter().position(|a| a == "in").map_or(w.len(), |i| i + 1)..],
+            Some(p) if p.ends_with(')') && !p.contains("$(") => w = &w[1..],
+            _ => return Some(w),
+        }
+    }
+}
+
+/// What a wrapper or runner runs: words of a command, or a script to parse.
+enum Inner<'a> {
+    Words(&'a [String]),
+    Script(String),
+}
+
+/// `words` without leading assignments and wrappers (with their options);
+/// `env -S` gives its split string as a script.
+fn unwrap(words: &[String]) -> Inner<'_> {
     let mut w = words;
     loop {
         while w
@@ -417,19 +537,267 @@ fn unwrap(words: &[String]) -> &[String] {
         {
             w = &w[1..];
         }
-        let Some(first) = w.first() else { return w };
+        let Some(first) = w.first() else { return Inner::Words(w) };
         let name = first.rsplit('/').next().unwrap_or(first);
         let args = &w[1..];
         w = match name {
             "sudo" | "doas" | "pkexec" => skip_opts(args, SUDO_VALUE_FLAGS),
-            "env" => skip_opts(args, &["-u", "-C", "--unset", "--chdir"]),
+            "env" => match env_split(args) {
+                Ok(line) => return Inner::Script(line),
+                Err(i) => &args[i..],
+            },
             "timeout" => skip_opts(args, &["-s", "-k", "--signal", "--kill-after"])
                 .get(1..)
                 .unwrap_or_default(),
             "xargs" => skip_opts(args, XARGS_VALUE_FLAGS),
             n if WRAPPERS.contains(&n) => skip_opts(args, wrapper_flags(n)),
-            _ => return w,
+            _ => return Inner::Words(w),
         };
+    }
+}
+
+/// `env`'s arguments: `Ok(line)` for `-S`/`--split-string` (the string plus the
+/// words after it, which env appends), else `Err(index of the command)`.
+fn env_split(args: &[String]) -> Result<String, usize> {
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        let split = if a == "-S" || a == "--split-string" {
+            i += 1;
+            Some(args.get(i).map_or("", String::as_str))
+        } else {
+            a.strip_prefix("--split-string=")
+                .or_else(|| a.strip_prefix("-S").filter(|s| !s.is_empty()))
+        };
+        if let Some(s) = split {
+            let tail = args[(i + 1).min(args.len())..]
+                .iter()
+                .map(|a| format!("'{}'", a.replace('\'', r"'\''")));
+            return Ok(std::iter::once(s.to_string()).chain(tail).collect::<Vec<_>>().join(" "));
+        }
+        if a == "--" {
+            return Err(i + 1);
+        }
+        if !a.starts_with('-') {
+            break;
+        }
+        i += if ["-u", "-C", "--unset", "--chdir"].contains(&a.as_str()) {
+            2
+        } else {
+            1
+        };
+    }
+    Err(i.min(args.len()))
+}
+
+/// A shell's options: (`-c` given, `-s` given, the first word after the options:
+/// the `-c` script, else the script file). `bash -ce 'x'`, `bash -c -- 'x'` and
+/// `bash -o pipefail -c 'x'` all give `x`.
+fn shell_args(args: &[String]) -> (bool, bool, Option<&String>) {
+    let (mut c, mut s) = (false, false);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--" {
+            return (c, s, it.next());
+        }
+        if a.starts_with("--") {
+            if a == "--rcfile" || a == "--init-file" {
+                it.next();
+            }
+            continue;
+        }
+        if a.len() > 1 && (a.starts_with('-') || a.starts_with('+')) {
+            if a.starts_with('-') {
+                c |= a.contains('c');
+                s |= a.contains('s');
+            }
+            if a.ends_with('o') || a.ends_with('O') {
+                it.next();
+            }
+            continue;
+        }
+        return (c, s, Some(a));
+    }
+    (c, s, None)
+}
+
+/// The value of `-<letter>` (alone, attached, or ending a cluster such as `-qc`)
+/// or `--<long>` / `--<long>=v`, anywhere in `args`.
+fn opt_value<'a>(args: &'a [String], letter: char, long: &str) -> Option<&'a str> {
+    for (i, a) in args.iter().enumerate() {
+        let next = || args.get(i + 1).map(String::as_str);
+        if a == long {
+            return next();
+        }
+        if let Some(v) = a.strip_prefix(long).and_then(|r| r.strip_prefix('=')) {
+            return Some(v);
+        }
+        if a.len() > 1
+            && a.starts_with('-')
+            && !a.starts_with("--")
+            && let Some(j) = a.find(letter)
+        {
+            let rest = &a[j + letter.len_utf8()..];
+            return if rest.is_empty() { next() } else { Some(rest) };
+        }
+    }
+    None
+}
+
+/// What a runner runs (L6.2, L6.8): `watch`, `flock`, `setsid`, `nsenter`,
+/// `unshare`, `script -c`, `su -c`, `busybox`, `systemd-run`, `parallel`,
+/// `find -exec`/`-execdir`/`-ok`, `git submodule foreach`.
+fn runner<'a>(name: &str, args: &'a [String]) -> Vec<Inner<'a>> {
+    let words = |w: &'a [String]| if w.is_empty() { vec![] } else { vec![Inner::Words(w)] };
+    let script = |w: &[String]| {
+        if w.is_empty() {
+            vec![]
+        } else {
+            vec![Inner::Script(w.join(" "))]
+        }
+    };
+    match name {
+        "watch" => {
+            let rest = skip_opts(args, &["-n", "--interval", "-q", "--equexit"]);
+            if args.iter().any(|a| a == "-x" || a == "--exec") {
+                words(rest)
+            } else {
+                // watch runs its words through `sh -c`.
+                script(rest)
+            }
+        }
+        "flock" => match opt_value(args, 'c', "--command") {
+            Some(s) => vec![Inner::Script(s.to_string())],
+            None => words(
+                skip_opts(args, &["-w", "--timeout", "-E", "--conflict-exit-code"])
+                    .get(1..)
+                    .unwrap_or_default(),
+            ),
+        },
+        "setsid" => words(skip_opts(args, &[])),
+        "nsenter" => words(skip_opts(args, &["-t", "--target", "-S", "--setuid", "-G", "--setgid"])),
+        "unshare" => words(skip_opts(
+            args,
+            &[
+                "--propagation",
+                "--setgroups",
+                "--map-user",
+                "--map-group",
+                "--map-users",
+                "--map-groups",
+                "-S",
+                "--setuid",
+                "-G",
+                "--setgid",
+                "-R",
+                "--root",
+                "-w",
+                "--wd",
+            ],
+        )),
+        "script" => opt_value(args, 'c', "--command")
+            .map(|s| Inner::Script(s.to_string()))
+            .into_iter()
+            .collect(),
+        "su" => opt_value(args, 'c', "--command")
+            .or_else(|| opt_value(args, '\0', "--session-command"))
+            .map(|s| Inner::Script(s.to_string()))
+            .into_iter()
+            .collect(),
+        "busybox" => match args.first() {
+            Some(a) if !a.starts_with('-') => words(args),
+            _ => vec![],
+        },
+        "systemd-run" => words(skip_opts(
+            args,
+            &[
+                "-u",
+                "--unit",
+                "-p",
+                "--property",
+                "--description",
+                "--slice",
+                "-E",
+                "--setenv",
+                "-M",
+                "--machine",
+                "-H",
+                "--host",
+                "--uid",
+                "--gid",
+                "--nice",
+                "--working-directory",
+                "--service-type",
+                "--on-active",
+                "--on-boot",
+                "--on-startup",
+                "--on-unit-active",
+                "--on-unit-inactive",
+                "--on-calendar",
+                "--timer-property",
+                "--path-property",
+                "--socket-property",
+            ],
+        )),
+        "parallel" => {
+            let rest = skip_opts(
+                args,
+                &[
+                    "-j",
+                    "--jobs",
+                    "-S",
+                    "--sshlogin",
+                    "--sshloginfile",
+                    "-a",
+                    "--arg-file",
+                    "--colsep",
+                    "-I",
+                    "-d",
+                    "--delimiter",
+                    "-n",
+                    "--max-args",
+                    "-N",
+                    "--results",
+                    "--joblog",
+                    "--tmpdir",
+                    "--timeout",
+                    "-E",
+                    "--workdir",
+                ],
+            );
+            let end = rest.iter().position(|a| a.starts_with(":::")).unwrap_or(rest.len());
+            script(&rest[..end])
+        }
+        "find" => {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < args.len() {
+                if ["-exec", "-execdir", "-ok", "-okdir"].contains(&args[i].as_str()) {
+                    let end = args[i + 1..]
+                        .iter()
+                        .position(|a| a == ";" || a == "+")
+                        .map_or(args.len(), |p| p + i + 1);
+                    out.extend(words(&args[i + 1..end]));
+                    i = end;
+                }
+                i += 1;
+            }
+            out
+        }
+        "git" => {
+            let Some(i) = args.iter().position(|a| a == "submodule") else {
+                return vec![];
+            };
+            let rest = &args[i + 1..];
+            let j = rest.iter().position(|a| !a.starts_with('-')).unwrap_or(rest.len());
+            if rest.get(j).is_some_and(|a| a == "foreach") {
+                let cmd = &rest[j + 1..];
+                let k = cmd.iter().position(|a| !a.starts_with('-')).unwrap_or(cmd.len());
+                script(&cmd[k..])
+            } else {
+                vec![]
+            }
+        }
+        _ => vec![],
     }
 }
 
@@ -748,8 +1116,25 @@ fn command(words: &[String], input: &[String], piped: bool, ctx: &Ctx, depth: u3
     }
 }
 
-/// A simple command without its leading assignments.
+/// A simple command without its leading assignments: its own risk and that of
+/// what a runner (`watch`, `setsid`, `find -exec`, `su -c`, …) runs.
 fn simple(w: &[String], input: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
+    let Some(first) = w.first() else {
+        return Risk::safe();
+    };
+    let name = first.rsplit('/').next().unwrap_or(first);
+    let mut r = simple_base(w, input, piped, ctx, depth);
+    for inner in runner(name, &w[1..]) {
+        let ran = match inner {
+            Inner::Words(iw) => command(iw, input, piped, ctx, depth + 1),
+            Inner::Script(s) => classify_depth(&s, ctx, depth + 1),
+        };
+        r = r.max(ran).max(Risk::low());
+    }
+    r
+}
+
+fn simple_base(w: &[String], input: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
     let Some(first) = w.first() else {
         return Risk::safe();
     };
@@ -766,46 +1151,13 @@ fn simple(w: &[String], input: &[String], piped: bool, ctx: &Ctx, depth: u32) ->
             };
             Risk::new(Level::Confirm, format!("runs as root ({name})")).max(inner_risk)
         }
-        "env" => {
-            let mut i = 0;
-            while let Some(a) = args.get(i) {
-                let split = if a == "-S" || a == "--split-string" {
-                    i += 1;
-                    Some(args.get(i).map_or("", String::as_str))
-                } else {
-                    a.strip_prefix("--split-string=")
-                        .or_else(|| a.strip_prefix("-S").filter(|s| !s.is_empty()))
-                };
-                if let Some(s) = split {
-                    // `-S` splits this string into the command, and env appends the words after it.
-                    let tail: Vec<String> = args[(i + 1).min(args.len())..]
-                        .iter()
-                        .map(|a| format!("'{}'", a.replace('\'', r"'\''")))
-                        .collect();
-                    let line = std::iter::once(s.to_string()).chain(tail).collect::<Vec<_>>().join(" ");
-                    return classify_depth(&line, ctx, depth + 1);
-                }
-                if a == "--" {
-                    i += 1;
-                    break;
-                }
-                if !a.starts_with('-') {
-                    break;
-                }
-                i += if ["-u", "-C", "--unset", "--chdir"].contains(&a.as_str()) {
-                    2
-                } else {
-                    1
-                };
-            }
+        "env" => match env_split(args) {
+            // `-S` splits this string into the command, and env appends the words after it.
+            Ok(line) => classify_depth(&line, ctx, depth + 1),
             // command() skips (and judges) the `VAR=value` words.
-            let rest = &args[i.min(args.len())..];
-            if rest.is_empty() {
-                Risk::safe()
-            } else {
-                command(rest, input, piped, ctx, depth)
-            }
-        }
+            Err(i) if i < args.len() => command(&args[i..], input, piped, ctx, depth),
+            Err(_) => Risk::safe(),
+        },
         "timeout" => {
             // Options, then the duration, then the command.
             let rest = skip_opts(args, &["-s", "-k", "--signal", "--kill-after"]);
@@ -831,16 +1183,19 @@ fn simple(w: &[String], input: &[String], piped: bool, ctx: &Ctx, depth: u32) ->
             }
         }
         n if SHELLS.contains(&n) => {
-            if let Some(i) = args
-                .iter()
-                .position(|a| a == "-c" || (a.starts_with('-') && a.ends_with('c')))
-            {
-                match args.get(i + 1) {
+            let (c, s, first) = shell_args(args);
+            if c {
+                match first {
                     Some(script) => classify_depth(script, ctx, depth + 1).max(Risk::low()),
                     None => Risk::new(Level::Confirm, "shell -c without a script"),
                 }
             } else if piped {
                 Risk::new(Level::Confirm, "pipes downloaded or generated text into a shell")
+            } else if s || first.is_none_or(|f| f == "-") {
+                // A heredoc or here-string is the script.
+                input
+                    .iter()
+                    .fold(Risk::low(), |r, body| r.max(classify_depth(body, ctx, depth + 1)))
             } else {
                 Risk::low()
             }
@@ -1767,6 +2122,34 @@ mod tests {
             ("for f in a b; do rm -rf ~; done", Catastrophic),
             ("for f in $(rm -rf ~); do echo $f; done", Catastrophic),
             ("if true; then git push --force; fi", Shared),
+            // Keywords, runners and shell scripts on stdin don't hide the command (L6.2/L6.8).
+            ("if true; then rm -rf ~; fi", Catastrophic),
+            ("for d in x; do rm -rf ~; done", Catastrophic),
+            ("! rm -rf ~", Catastrophic),
+            ("find . -exec rm -rf ~ \\;", Catastrophic),
+            ("find . -execdir rm -rf ~ +", Catastrophic),
+            ("sh <<'EOF'\nrm -rf ~\nEOF", Catastrophic),
+            ("bash <<< 'rm -rf ~'", Catastrophic),
+            ("bash -s <<EOF\nrm -rf ~\nEOF", Catastrophic),
+            ("bash script.sh <<EOF\nrm -rf ~\nEOF", Low),
+            ("bash <<'EOF'\necho hi\nEOF", Low),
+            ("bash -ce 'rm -rf ~'", Catastrophic),
+            ("bash -c -- 'rm -rf ~'", Catastrophic),
+            ("bash -o pipefail -c 'rm -rf ~'", Catastrophic),
+            ("setsid rm -rf ~", Catastrophic),
+            ("watch 'rm -rf ~'", Catastrophic),
+            ("watch -n 1 rm -rf ~", Catastrophic),
+            ("flock /tmp/l rm -rf ~", Catastrophic),
+            ("flock /tmp/l -c 'rm -rf ~'", Catastrophic),
+            ("nsenter -t 1 rm -rf ~", Catastrophic),
+            ("unshare -r rm -rf ~", Catastrophic),
+            ("script -qc 'rm -rf ~' /dev/null", Catastrophic),
+            ("su -c 'rm -rf ~'", Catastrophic),
+            ("busybox rm -rf ~", Catastrophic),
+            ("systemd-run --user rm -rf ~", Catastrophic),
+            ("parallel 'rm -rf ~' ::: a", Catastrophic),
+            ("git submodule foreach 'rm -rf ~'", Catastrophic),
+            ("setsid cargo build", Low),
             // Heredoc bodies are data (the screenshot case: JS with `=>` and `{`).
             (
                 "cat > ./q.mjs <<'EOF'\nconst f = (s)=>{ return a > b; };\nconsole.log(x >> 2);\nEOF",
