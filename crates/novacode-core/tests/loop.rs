@@ -1677,6 +1677,52 @@ async fn codemode_stops_after_a_refusal_and_gets_images() {
     assert!(result_text(&results[1]).starts_with("shot\n[1 call · "));
 }
 
+/// L7.17: the first refusal also stops the script's calls already in flight: a
+/// parallel write waiting on its approval card is ended and never runs.
+#[tokio::test]
+async fn codemode_refusal_stops_calls_in_flight() {
+    use novacode_core::policy::{Permissions, Policy};
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let script = "const r = await Promise.allSettled([tools.write({path: 'x.txt', content: 'x'}), tools.bash({command: 'git push origin main'})]);\n\
+                  return r.map(x => x.status + ': ' + (x.reason ? x.reason.message : x.value)).join('\\n');";
+    let faux = Faux::new([
+        tools_reply(vec![call("a", "codemode", json!({ "code": script }))]),
+        FauxReply::text("done"),
+    ]);
+    let mut tools = novacode_tools::builtins(false);
+    tools.push(Arc::new(novacode_core::codemode::Codemode::default()));
+    let perms: Permissions = serde_json::from_value(json!({ "deny": ["Bash(git push:*)"], "ask": ["Write"] })).unwrap();
+    let asked = Arc::new(tokio::sync::Notify::new());
+    let agent = Agent::new(
+        Arc::new(faux),
+        tools,
+        Store::create(&Paths::new(home.path()), work.path(), true),
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_policy(Policy::new(perms, home.path().into(), None))
+    .with_approver(Arc::new(Never(asked.clone())));
+    let (agent, _) = tokio::time::timeout(std::time::Duration::from_secs(10), drive(agent, &["go"]))
+        .await
+        .expect("the open approval ends with the refusal");
+    let results: Vec<Message> = agent
+        .store
+        .projection()
+        .into_iter()
+        .filter(|m| matches!(m, Message::ToolResult { .. }))
+        .collect();
+    let out = result_text(&results[0]);
+    assert!(
+        out.starts_with("rejected: write: Not run: aborted. (at line 1)\nrejected: bash: Denied"),
+        "{out}"
+    );
+    assert!(!work.path().join("x.txt").exists());
+    tokio::time::timeout(std::time::Duration::ZERO, asked.notified())
+        .await
+        .expect("the write's card was open when the refusal landed");
+}
+
 /// Extension context injection without cache misses: `remind` notes are saved and
 /// re-sent unchanged; `before_request` text rides after the cached prefix of one
 /// request only and is never stored.

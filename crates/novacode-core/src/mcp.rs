@@ -193,9 +193,10 @@ pub fn exposure(config: &ServerConfig, tool: &str) -> Exposure {
         .unwrap_or(Exposure::CodemodeOnly)
 }
 
-/// Hash of what launches a server: command, args, url and env names (not values).
-/// A cached signature list from another launch config is ignored.
-pub fn fingerprint(c: &ServerConfig) -> String {
+/// Hash of what launches a server: command, args, url, env and header names (not
+/// values), and the session `cwd` when the command or an arg looks like a relative
+/// path. A cached signature list from another launch config is ignored.
+pub fn fingerprint(c: &ServerConfig, cwd: &Path) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut put = |s: &str| {
         for b in s.bytes().chain([0]) {
@@ -207,6 +208,13 @@ pub fn fingerprint(c: &ServerConfig) -> String {
     c.args.iter().for_each(|a| put(a));
     put(c.url.as_deref().unwrap_or(""));
     c.env.keys().for_each(|k| put(k));
+    c.headers.keys().for_each(|k| put(k));
+    // shortcut: any non-absolute word with `/` or `.` counts as a relative path;
+    // a false hit only costs a cache miss in another directory.
+    let relative = |s: &str| !s.starts_with('/') && !s.starts_with('~') && (s.contains('/') || s.contains('.'));
+    if c.command.iter().chain(&c.args).any(|s| relative(s)) {
+        put(&cwd.to_string_lossy());
+    }
     format!("{h:016x}")
 }
 
@@ -217,12 +225,12 @@ fn signatures_path(home: &Path, server: &str) -> PathBuf {
 
 /// Write a server's tool list to the signature cache, only when it changed.
 /// Tool names are the MCP names, without the `server__` prefix (the file is per server).
-pub fn write_signatures(home: &Path, server: &str, config: &ServerConfig, tools: &[ToolSpec]) {
+pub fn write_signatures(home: &Path, cwd: &Path, server: &str, config: &ServerConfig, tools: &[ToolSpec]) {
     let tools: Vec<Value> = tools
         .iter()
         .map(|t| json!({"name": t.name, "description": t.description, "schema": t.input_schema, "output_schema": t.output_schema}))
         .collect();
-    let v = json!({"fingerprint": fingerprint(config), "tools": tools});
+    let v = json!({"fingerprint": fingerprint(config, cwd), "tools": tools});
     let path = signatures_path(home, server);
     if novacode_base::storage::read_json::<Value>(&path)
         .ok()
@@ -239,14 +247,14 @@ pub fn write_signatures(home: &Path, server: &str, config: &ServerConfig, tools:
 
 /// The cached tools of a server as codemode sees them (`server__tool`, namespace
 /// `server`); empty when there is no cache or it came from another launch config.
-pub fn cached_signatures(home: &Path, server: &str, config: &ServerConfig) -> Vec<ToolInfo> {
+pub fn cached_signatures(home: &Path, cwd: &Path, server: &str, config: &ServerConfig) -> Vec<ToolInfo> {
     let Some(v) = novacode_base::storage::read_json::<Value>(&signatures_path(home, server))
         .ok()
         .flatten()
     else {
         return Vec::new();
     };
-    if v["fingerprint"].as_str() != Some(fingerprint(config).as_str()) {
+    if v["fingerprint"].as_str() != Some(fingerprint(config, cwd).as_str()) {
         return Vec::new();
     }
     v["tools"]
@@ -682,7 +690,7 @@ impl Hub {
             Ok(Ok((conn, tools))) => {
                 let path = self.cache_dir.join(format!("{}.json", s.name));
                 let _ = novacode_base::storage::write_json(&path, &tools, novacode_base::storage::Durability::Fast);
-                write_signatures(&self.home, &s.name, &s.config, &tools);
+                write_signatures(&self.home, &self.cwd, &s.name, &s.config, &tools);
                 *s.tools.lock().unwrap() = tools;
                 let _ = s.status.send_replace(Status::Ready);
                 *slot = Some(conn.clone());
@@ -977,7 +985,7 @@ for line in sys.stdin:
             "number",
             "outputSchema reaches Tool::output_schema"
         );
-        let sigs = cached_signatures(home.path(), "calc", &servers[0].config);
+        let sigs = cached_signatures(home.path(), home.path(), "calc", &servers[0].config);
         assert_eq!(sigs.len(), 1, "connect wrote the signature cache");
         assert_eq!(sigs[0].name, "calc__add");
         let ctx = ToolCtx {
@@ -1134,8 +1142,9 @@ for line in sys.stdin:
             annotations: Value::Null,
             output_schema: json!({"type": "object", "properties": {"sum": {"type": "number"}}}),
         };
-        write_signatures(home.path(), "calc", &config, std::slice::from_ref(&spec));
-        let got = cached_signatures(home.path(), "calc", &config);
+        let cwd = home.path();
+        write_signatures(home.path(), cwd, "calc", &config, std::slice::from_ref(&spec));
+        let got = cached_signatures(home.path(), cwd, "calc", &config);
         assert_eq!(got.len(), 1);
         assert_eq!(
             (
@@ -1148,10 +1157,10 @@ for line in sys.stdin:
         assert_eq!(got[0].schema, spec.input_schema);
         assert_eq!(got[0].output_schema.as_ref(), Some(&spec.output_schema));
 
-        // An env value is not part of the launch config's fingerprint; a name, args or command is.
+        // An env value is not part of the launch config's fingerprint; a name, args, command or header name is.
         let mut same = config.clone();
         same.env.insert("TOKEN".into(), "b".into());
-        assert_eq!(cached_signatures(home.path(), "calc", &same).len(), 1);
+        assert_eq!(cached_signatures(home.path(), cwd, "calc", &same).len(), 1);
         for changed in [
             ServerConfig {
                 args: vec!["--y".into()],
@@ -1165,10 +1174,19 @@ for line in sys.stdin:
                 env: [("KEY".to_string(), "a".to_string())].into(),
                 ..config.clone()
             },
+            ServerConfig {
+                headers: [("Authorization".to_string(), "a".to_string())].into(),
+                ..config.clone()
+            },
         ] {
-            assert!(cached_signatures(home.path(), "calc", &changed).is_empty());
+            assert!(cached_signatures(home.path(), cwd, "calc", &changed).is_empty());
         }
-        assert!(cached_signatures(home.path(), "none", &config).is_empty());
+        assert!(cached_signatures(home.path(), cwd, "none", &config).is_empty());
+        // No path-like word: the session cwd doesn't matter.
+        assert_eq!(
+            cached_signatures(home.path(), Path::new("/elsewhere"), "calc", &config).len(),
+            1
+        );
 
         // Changed content is rewritten; unchanged content is not (mtime stays).
         let path = signatures_path(home.path(), "calc");
@@ -1176,7 +1194,7 @@ for line in sys.stdin:
         let original = v.clone();
         v["marker"] = json!(1);
         std::fs::write(&path, v.to_string()).unwrap();
-        write_signatures(home.path(), "calc", &config, std::slice::from_ref(&spec));
+        write_signatures(home.path(), cwd, "calc", &config, std::slice::from_ref(&spec));
         assert!(
             !std::fs::read_to_string(&path).unwrap().contains("marker"),
             "changed file rewritten"
@@ -1184,12 +1202,37 @@ for line in sys.stdin:
         std::fs::write(&path, original.to_string()).unwrap();
         let before = std::fs::metadata(&path).unwrap().modified().unwrap();
         std::thread::sleep(Duration::from_millis(20));
-        write_signatures(home.path(), "calc", &config, std::slice::from_ref(&spec));
+        write_signatures(home.path(), cwd, "calc", &config, std::slice::from_ref(&spec));
         assert_eq!(
             std::fs::metadata(&path).unwrap().modified().unwrap(),
             before,
             "same content not rewritten"
         );
+    }
+
+    /// A relative script path means another server in another directory; an absolute one doesn't.
+    #[test]
+    fn fingerprint_has_the_cwd_only_for_relative_paths() {
+        let (a, b) = (Path::new("/work/a"), Path::new("/work/b"));
+        let rel = |command: &str, args: &[&str]| ServerConfig {
+            command: Some(command.into()),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        for c in [
+            rel("node", &["dist/server.js"]),
+            rel("python3", &["srv.py"]),
+            rel("./bin/srv", &[]),
+        ] {
+            assert_ne!(fingerprint(&c, a), fingerprint(&c, b), "{:?}", c.args);
+        }
+        for c in [
+            rel("node", &["/opt/srv/server.js"]),
+            rel("/usr/bin/srv", &["--stdio"]),
+            rel("npx", &["-y", "~/srv"]),
+        ] {
+            assert_eq!(fingerprint(&c, a), fingerprint(&c, b), "{:?}", c.args);
+        }
     }
 
     #[test]
