@@ -77,9 +77,10 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         (r"\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}", "OpenAI key"),
         (r"\bxox[abprs]-[A-Za-z0-9-]{10,}", "Slack token"),
         (r"\bAIza[0-9A-Za-z_-]{35}\b", "Google API key"),
-        // NAME=value where NAME says it's a secret: keep the name, mask the value.
+        // NAME=value where NAME (any case) says it's a secret: keep the name, mask the value.
+        // Parentheses end a value, so code such as `token = parse();` is left alone.
         (
-            r#"(?m)(\b[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*\s*[=:]\s*["']?)[^\s"']{8,}"#,
+            r#"(?mi)(\b[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*\s*[=:]\s*["']?)[^\s"'()]{8,}"#,
             "secret value",
         ),
     ]
@@ -131,5 +132,15 @@ mod tests {
             "code isn't a secret"
         );
         assert_eq!(r.apply("max_tokens: 4096"), None);
+    }
+
+    #[test]
+    fn secret_names_match_in_any_case() {
+        let r = Redactor::default().with_patterns(true);
+        assert_eq!(
+            r.apply("api_key=abcdefgh1234 Api_Token: 'zyxwvuts9876'").as_deref(),
+            Some("api_key=[redacted: secret value] Api_Token: '[redacted: secret value]'")
+        );
+        assert_eq!(r.apply("password=short"), None, "8-character minimum");
     }
 }

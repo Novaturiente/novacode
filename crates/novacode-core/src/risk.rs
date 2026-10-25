@@ -59,6 +59,10 @@ enum Tok {
     Sep(String),
     /// `>` or `>>` (any fd).
     Redirect,
+    /// A heredoc body, at the place of its `<<DELIM` (L6.2: inline code fed to an interpreter).
+    Heredoc(String),
+    /// `<<<`: the next word is fed on stdin.
+    HereString,
 }
 
 /// Split into words and operators, honouring quotes. `$(…)` and backtick
@@ -93,8 +97,9 @@ fn lex(src: &str) -> Option<(Vec<Tok>, Vec<String>)> {
     let mut subs = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
-    // Heredocs opened on this line: (delimiter, strip leading tabs, delimiter quoted).
-    let mut heredocs: Vec<(String, bool, bool)> = Vec::new();
+    // Heredocs opened on this line: (delimiter, strip leading tabs, delimiter quoted,
+    // index of its `Tok::Heredoc`).
+    let mut heredocs: Vec<(String, bool, bool, usize)> = Vec::new();
     let c: Vec<char> = src.chars().collect();
     let mut i = 0;
     let flush = |word: &mut String, in_word: &mut bool, toks: &mut Vec<Tok>| {
@@ -178,7 +183,7 @@ fn lex(src: &str) -> Option<(Vec<Tok>, Vec<String>)> {
                     // Heredoc bodies are data, not commands. Unquoted ones still expand
                     // `$(…)` and backticks, so those are classified.
                     i += 1;
-                    for (delim, strip, quoted) in std::mem::take(&mut heredocs) {
+                    for (delim, strip, quoted, at) in std::mem::take(&mut heredocs) {
                         let mut body = String::new();
                         while i < c.len() {
                             let end = c[i..].iter().position(|&x| x == '\n').map_or(c.len(), |p| p + i);
@@ -194,6 +199,7 @@ fn lex(src: &str) -> Option<(Vec<Tok>, Vec<String>)> {
                         if !quoted {
                             subs.extend(expansions(&body)?);
                         }
+                        toks[at] = Tok::Heredoc(body);
                     }
                     continue;
                 }
@@ -239,7 +245,13 @@ fn lex(src: &str) -> Option<(Vec<Tok>, Vec<String>)> {
                 }
                 toks.push(Tok::Redirect);
             }
-            '<' if c.get(i + 1) == Some(&'<') && c.get(i + 2) != Some(&'<') => {
+            '<' if c.get(i + 1) == Some(&'<') && c.get(i + 2) == Some(&'<') => {
+                flush(&mut word, &mut in_word, &mut toks);
+                toks.push(Tok::HereString);
+                i += 3;
+                continue;
+            }
+            '<' if c.get(i + 1) == Some(&'<') => {
                 // `<<DELIM` / `<<-DELIM`: the body starts on the next line.
                 flush(&mut word, &mut in_word, &mut toks);
                 i += 2;
@@ -275,7 +287,8 @@ fn lex(src: &str) -> Option<(Vec<Tok>, Vec<String>)> {
                 if delim.is_empty() {
                     return None;
                 }
-                heredocs.push((delim, strip, quoted));
+                heredocs.push((delim, strip, quoted, toks.len()));
+                toks.push(Tok::Heredoc(String::new()));
                 continue;
             }
             '<' => flush(&mut word, &mut in_word, &mut toks),
@@ -325,6 +338,7 @@ pub fn segments(src: &str) -> Option<Vec<String>> {
                 }
             }
             Tok::Redirect => cur.push(">".into()),
+            Tok::Heredoc(_) | Tok::HereString => {}
         }
     }
     if !cur.is_empty() {
@@ -353,11 +367,20 @@ fn classify_depth(src: &str, ctx: &Ctx, depth: u32) -> Risk {
         risk = risk.max(classify_depth(s, ctx, depth + 1));
     }
     let mut words: Vec<String> = Vec::new();
+    // Text fed on stdin (heredoc bodies, here-strings).
+    let mut input: Vec<String> = Vec::new();
     let mut piped = false;
     let mut iter = toks.into_iter().peekable();
     loop {
         match iter.next() {
             Some(Tok::Word(w)) => words.push(w),
+            Some(Tok::Heredoc(body)) => input.push(body),
+            Some(Tok::HereString) => {
+                if let Some(Tok::Word(w)) = iter.peek() {
+                    input.push(w.clone());
+                    iter.next();
+                }
+            }
             Some(Tok::Redirect) => {
                 if let Some(Tok::Word(target)) = iter.next() {
                     risk = risk.max(redirect(&target, ctx));
@@ -367,9 +390,10 @@ fn classify_depth(src: &str, ctx: &Ctx, depth: u32) -> Risk {
             }
             sep @ (Some(Tok::Sep(_)) | None) => {
                 if !words.is_empty() {
-                    risk = risk.max(command(&words, piped, ctx, depth));
+                    risk = risk.max(command(&words, &input, piped, ctx, depth));
                 }
                 words.clear();
+                input.clear();
                 match sep {
                     Some(Tok::Sep(s)) => piped = s == "|",
                     _ => break,
@@ -602,7 +626,8 @@ fn getopt<'a>(args: &'a [String], value_short: &str, value_long: &[&str]) -> Opt
     o
 }
 
-fn command(words: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
+/// `input` is the text fed on stdin by heredocs and here-strings.
+fn command(words: &[String], input: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
     // Leading `VAR=value` assignments.
     let mut w: &[String] = words;
     let mut runs_var = false;
@@ -615,7 +640,7 @@ fn command(words: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
             break;
         }
     }
-    let r = simple(w, piped, ctx, depth);
+    let r = simple(w, input, piped, ctx, depth);
     // `GIT_EXTERNAL_DIFF=… git diff`, `PAGER=… git log`: the variable runs a program.
     if runs_var && r.level == Level::Safe {
         Risk::low()
@@ -625,7 +650,7 @@ fn command(words: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
 }
 
 /// A simple command without its leading assignments.
-fn simple(w: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
+fn simple(w: &[String], input: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
     let Some(first) = w.first() else {
         return Risk::safe();
     };
@@ -638,7 +663,7 @@ fn simple(w: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
             let inner_risk = if inner.is_empty() {
                 Risk::safe()
             } else {
-                command(inner, piped, ctx, depth)
+                command(inner, input, piped, ctx, depth)
             };
             Risk::new(Level::Confirm, format!("runs as root ({name})")).max(inner_risk)
         }
@@ -679,14 +704,14 @@ fn simple(w: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
             if rest.is_empty() {
                 Risk::safe()
             } else {
-                command(rest, piped, ctx, depth)
+                command(rest, input, piped, ctx, depth)
             }
         }
         "timeout" => {
             // Options, then the duration, then the command.
             let rest = skip_opts(args, &["-s", "-k", "--signal", "--kill-after"]);
             match rest.get(1..) {
-                Some(c) if !c.is_empty() => command(c, piped, ctx, depth),
+                Some(c) if !c.is_empty() => command(c, input, piped, ctx, depth),
                 _ => Risk::low(),
             }
         }
@@ -695,7 +720,7 @@ fn simple(w: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
             if rest.is_empty() {
                 Risk::low()
             } else {
-                command(rest, piped, ctx, depth).max(Risk::low())
+                command(rest, input, piped, ctx, depth).max(Risk::low())
             }
         }
         n if WRAPPERS.contains(&n) => {
@@ -711,7 +736,7 @@ fn simple(w: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
             if inner.is_empty() {
                 Risk::low()
             } else {
-                command(inner, piped, ctx, depth)
+                command(inner, input, piped, ctx, depth)
             }
         }
         n if SHELLS.contains(&n) => {
@@ -735,7 +760,7 @@ fn simple(w: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
             if args.is_empty() {
                 Risk::safe()
             } else {
-                command(args, piped, ctx, depth)
+                command(args, input, piped, ctx, depth)
             }
         }
         "for" | "done" | "fi" => Risk::safe(),
@@ -830,7 +855,10 @@ fn simple(w: &[String], piped: bool, ctx: &Ctx, depth: u32) -> Risk {
             }
         }
         "git" => git(args),
-        "sed" => sed(args),
+        "sed" => sed(args, ctx),
+        "tee" => tee(args, ctx),
+        "awk" | "gawk" => awk(&name, args, ctx),
+        n if is_interpreter(n) => interpreter(n, args, input, ctx),
         n if SAFE.contains(&n) => {
             if writes_or_runs(n, args) {
                 Risk::low()
@@ -1084,16 +1112,268 @@ fn targets<S: AsRef<str>>(args: &[S], ctx: &Ctx, verb: &str) -> Risk {
 
 /// `sed` only reads unless it edits in place, runs a script file, or its script
 /// writes (`w`, `W`) or executes (`e`). A `w`/`e` the check can't rule out counts.
-fn sed(args: &[String]) -> Risk {
+/// The files it edits in place are checked like a redirect target.
+fn sed(args: &[String], ctx: &Ctx) -> Risk {
     let short = |a: &String, c: char| a.starts_with('-') && !a.starts_with("--") && a.contains(c);
     let in_place = args.iter().any(|a| a.starts_with("--in-place") || short(a, 'i'));
     let script_file = args.iter().any(|a| a.starts_with("--file") || short(a, 'f'));
     let writes = regex::Regex::new(r"(^|[/;{}0-9$p]\s*)[wWe](\s|;|$)").unwrap();
-    if in_place || script_file || args.iter().any(|a| !a.starts_with('-') && writes.is_match(a)) {
+    if in_place {
+        written(sed_files(args), ctx)
+    } else if script_file || args.iter().any(|a| !a.starts_with('-') && writes.is_match(a)) {
         Risk::low()
     } else {
         Risk::safe()
     }
+}
+
+/// The files of a sed command: every plain word when a script is given with
+/// `-e`/`-f`, else every plain word after the first (the script).
+fn sed_files(args: &[String]) -> Vec<&str> {
+    let mut pos = Vec::new();
+    let mut script = false;
+    let mut it = args.iter().map(String::as_str);
+    while let Some(a) = it.next() {
+        if a == "--" {
+            pos.extend(it);
+            break;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            let name = long.split('=').next().unwrap_or("");
+            script |= name == "expression" || name == "file";
+            if !long.contains('=') && ["expression", "file", "line-length"].contains(&name) {
+                it.next();
+            }
+        } else if a.len() > 1 && a.starts_with('-') {
+            for (j, c) in a.char_indices().skip(1) {
+                match c {
+                    'e' | 'f' | 'l' => {
+                        script |= c != 'l';
+                        if j + 1 == a.len() {
+                            it.next();
+                        }
+                        break;
+                    }
+                    // The rest is the backup suffix (`-i.bak`).
+                    'i' => break,
+                    _ => {}
+                }
+            }
+        } else {
+            pos.push(a);
+        }
+    }
+    if script { pos } else { pos.into_iter().skip(1).collect() }
+}
+
+/// A command that writes `files`: each is checked like a redirect target; at least Low.
+fn written<S: AsRef<str>>(files: impl IntoIterator<Item = S>, ctx: &Ctx) -> Risk {
+    files
+        .into_iter()
+        .fold(Risk::low(), |r, f| r.max(redirect(f.as_ref(), ctx)))
+}
+
+/// `tee`: every word that isn't an option is a file it writes.
+fn tee(args: &[String], ctx: &Ctx) -> Risk {
+    let files = match args.iter().position(|a| a == "--") {
+        Some(i) => args[..i]
+            .iter()
+            .filter(|a| !a.starts_with('-') || *a == "-")
+            .chain(&args[i + 1..])
+            .collect::<Vec<_>>(),
+        None => args.iter().filter(|a| !a.starts_with('-') || *a == "-").collect(),
+    };
+    written(files, ctx)
+}
+
+/// `awk`/`gawk`: `-i inplace` writes the files after the program, and the
+/// program's `print > "path"` writes that path.
+fn awk(name: &str, args: &[String], ctx: &Ctx) -> Risk {
+    static TARGET: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"\bprintf?\b[^;}]*?>{1,2}\s*"([^"]+)""#).unwrap());
+    let mut r = if name == "awk" && !writes_or_runs("awk", args) {
+        Risk::safe()
+    } else {
+        Risk::low()
+    };
+    let o = getopt(
+        args,
+        "fvFilE",
+        &["file", "assign", "field-separator", "include", "load", "exec"],
+    );
+    let (prog, files) = if o.has(|k| ["f", "file", "E", "exec"].contains(&k)) {
+        (None, &o.pos[..])
+    } else {
+        match o.pos.split_first() {
+            Some((p, f)) => (Some(*p), f),
+            None => (None, &o.pos[..]),
+        }
+    };
+    let inplace = o
+        .opts
+        .iter()
+        .any(|(k, v)| (k == "i" || k == "include") && v.is_some_and(|v| v.trim_end_matches(".awk") == "inplace"));
+    if inplace {
+        r = r.max(written(files, ctx));
+    }
+    for t in prog.into_iter().flat_map(|p| TARGET.captures_iter(p)) {
+        r = r.max(written([&t[1]], ctx));
+    }
+    r
+}
+
+/// Interpreters whose inline code (or a script fed on stdin) the gate can't read.
+fn is_interpreter(name: &str) -> bool {
+    name.strip_prefix("python")
+        .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        || ["node", "nodejs", "deno", "bun", "perl", "ruby", "php"].contains(&name)
+}
+
+/// Short options of an interpreter, up to the first plain word: the values of
+/// the `code` letters (attached or the next word) and of the `long` names
+/// (exact, the next word or `=value`). `value` letters take a value too;
+/// `attached` letters take the rest of their word. Returns (code, letters
+/// seen, index of the first word that isn't an option).
+fn inline_code<'a>(
+    args: &'a [String],
+    code: &str,
+    value: &str,
+    attached: &str,
+    long: &[&str],
+) -> (Vec<&'a str>, String, usize) {
+    let mut codes = Vec::new();
+    let mut seen = String::new();
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        i += 1;
+        if a == "--" {
+            break;
+        }
+        if long.contains(&a.as_str()) {
+            codes.extend(args.get(i).map(String::as_str));
+            i += 1;
+            continue;
+        }
+        if let Some(v) = long.iter().find_map(|l| a.strip_prefix(&format!("{l}="))) {
+            codes.push(v);
+            continue;
+        }
+        if a.starts_with("--") {
+            continue;
+        }
+        if a.len() < 2 || !a.starts_with('-') {
+            i -= 1;
+            break;
+        }
+        for (j, c) in a.char_indices().skip(1) {
+            seen.push(c);
+            let rest = &a[j + c.len_utf8()..];
+            if code.contains(c) || value.contains(c) {
+                let v = if rest.is_empty() {
+                    i += 1;
+                    args.get(i - 1).map(String::as_str)
+                } else {
+                    Some(rest)
+                };
+                if code.contains(c) {
+                    codes.extend(v);
+                }
+                break;
+            }
+            if attached.contains(c) {
+                break;
+            }
+        }
+    }
+    (codes, seen, i.min(args.len()))
+}
+
+/// An interpreter: inline code or stdin that names a credential folder or a
+/// protected path is Shared (the user decides; a read can be legitimate).
+/// `perl -i` writes the files after its code.
+fn interpreter(name: &str, args: &[String], input: &[String], ctx: &Ctx) -> Risk {
+    let (codes, seen, rest) = match name {
+        "node" | "nodejs" | "bun" => inline_code(args, "", "r", "", &["-e", "-p", "-pe", "-ep", "--eval", "--print"]),
+        "deno" => match args.split_first() {
+            Some((e, code)) if e == "eval" => (
+                code.iter()
+                    .map(String::as_str)
+                    .filter(|a| !a.starts_with('-'))
+                    .collect(),
+                String::new(),
+                args.len(),
+            ),
+            _ => (Vec::new(), String::new(), 0),
+        },
+        "perl" => inline_code(args, "eE", "", "iIMmlx0dCFDV", &[]),
+        "ruby" => inline_code(args, "e", "IrCE", "F0x", &[]),
+        "php" => inline_code(args, "r", "cdzfBRFE", "", &[]),
+        _ => inline_code(args, "c", "WXm", "", &[]),
+    };
+    let mut r = Risk::low();
+    if let Some(what) = codes
+        .iter()
+        .copied()
+        .chain(input.iter().map(String::as_str))
+        .find_map(|t| mentions(t, ctx))
+    {
+        r = Risk::new(
+            Level::Shared,
+            format!("inline code mentions {what}; novacode can't see what it does"),
+        );
+    }
+    if name == "perl" && seen.contains('i') {
+        let files = &args[rest..];
+        r = r.max(written(
+            if codes.is_empty() {
+                files.get(1..).unwrap_or_default()
+            } else {
+                files
+            },
+            ctx,
+        ));
+    }
+    r
+}
+
+/// The credential folder or protected path that `code` names, if any:
+/// `~/.ssh`, `$HOME/.ssh`, `${HOME}/.ssh` or the absolute path.
+fn mentions(code: &str, ctx: &Ctx) -> Option<String> {
+    let home = ctx.home.to_string_lossy();
+    // (path under home, how to name it); protected paths outside home are matched whole.
+    let mut under: Vec<(String, String)> = CREDENTIAL_DIRS
+        .iter()
+        .map(|d| (d.to_string(), format!("~/{d}")))
+        .collect();
+    let mut outside = Vec::new();
+    for extra in ctx.protected {
+        let p = resolve(extra, ctx);
+        let what = format!("the protected path {extra}");
+        match p.strip_prefix(ctx.home) {
+            Ok(rel) if !rel.as_os_str().is_empty() => under.push((rel.to_string_lossy().into_owned(), what)),
+            _ => outside.push((p.to_string_lossy().into_owned(), what)),
+        }
+    }
+    // A name ends where no path-name letter follows (`~/.aws` is not `~/.awsome`).
+    let ends = |rest: &str| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '-');
+    let found = |needle: &str| code.match_indices(needle).any(|(i, _)| ends(&code[i + needle.len()..]));
+    for (rel, what) in &under {
+        if found(&format!("~/{rel}")) || found(&format!("{home}/{rel}")) {
+            return Some(what.clone());
+        }
+        // shortcut: `HOME`, then any punctuation, then `/<folder>` counts as a mention:
+        // `$HOME/.ssh`, `${HOME}/.ssh`, `process.env.HOME+'/.aws'`, `os.environ['HOME'] + "/.ssh"`.
+        // A path built any other way (a variable, `join`) is not seen; that is the sandbox's job.
+        let tail = format!("/{rel}");
+        let after_home = code.match_indices("HOME").any(|(i, _)| {
+            let rest = code[i + 4..].trim_start_matches(|c: char| !c.is_alphanumeric() && c != '/');
+            rest.strip_prefix(&tail).is_some_and(ends)
+        });
+        if after_home {
+            return Some(what.clone());
+        }
+    }
+    outside.into_iter().find(|(abs, _)| found(abs)).map(|(_, what)| what)
 }
 
 fn git(args: &[String]) -> Risk {
@@ -1544,6 +1824,57 @@ mod tests {
             ("cp -t ~/.ssh k", Catastrophic),
             ("install -m 600 k ~/.ssh/id_rsa", Catastrophic),
             ("cp k ~/secrets", Catastrophic),
+            // Explicit writers are checked like a redirect (E1/L6.2).
+            ("tee -a ~/.ssh/authorized_keys", Catastrophic),
+            ("echo x | tee ~/.novacode/settings.json", Catastrophic),
+            ("echo x | tee -a out.txt -- ~/.aws/config", Catastrophic),
+            ("tee out.txt", Low),
+            ("echo x | tee /dev/null", Low),
+            ("sed -i s/a/b/ ~/.ssh/config", Catastrophic),
+            ("sed -i s/a/b/ ~/.novacode/settings.json", Catastrophic),
+            ("sed --in-place=.bak -e s/a/b/ ~/secrets/x", Catastrophic),
+            ("sed -i.bak s/a/b/ notes.txt ~/.kube/config", Catastrophic),
+            ("sed -i -e s/a/b/ notes.txt", Low),
+            ("sed -i ~/.ssh/x notes.txt", Low),
+            ("sed -n p ~/.ssh/config", Safe),
+            ("perl -pi -e 's/a/b/' ~/.gnupg/gpg.conf", Catastrophic),
+            ("perl -i.bak -pe 's/a/b/' notes.txt", Low),
+            ("perl -pe 's/a/b/' ~/.gnupg/gpg.conf", Low),
+            ("awk '{print > \"/home/u/.ssh/x\"}' f", Catastrophic),
+            ("awk '{printf \"%s\", $1 >> \"/home/u/.aws/c\"}' f", Catastrophic),
+            ("gawk -i inplace '{print}' ~/.ssh/config", Catastrophic),
+            ("awk -i inplace '{print}' notes.txt", Low),
+            ("awk '{print}' ~/.ssh/config", Safe),
+            // Inline code naming a credential folder asks (E1/L6.2).
+            (
+                "python3 -c \"open('/home/u/.ssh/authorized_keys','a').write('k')\"",
+                Shared,
+            ),
+            (
+                "node -e \"require('fs').readFileSync(process.env.HOME+'/.aws/credentials')\"",
+                Shared,
+            ),
+            ("node --eval=\"x(process.env.HOME + \\\"/.kube\\\")\"", Shared),
+            ("python3 - <<EOF\nopen('~/.ssh/x')\nEOF", Shared),
+            ("node <<'EOF'\nfs.readFileSync(`${HOME}/.gnupg/k`)\nEOF", Shared),
+            ("python3 <<< \"open('$HOME/.ssh/x')\"", Shared),
+            (
+                "python3.12 -c \"import os; os.path.expanduser('~/.novacode/auth.json')\"",
+                Shared,
+            ),
+            ("sudo python -Bc 'open(\"/home/u/.password-store/x\")'", Shared),
+            ("deno eval 'Deno.readTextFile(\"/home/u/.ssh/id\")'", Shared),
+            ("bun -e 'Bun.file(\"~/.aws/x\")'", Shared),
+            ("perl -e 'open F, \"<$ENV{HOME}/.ssh/x\"'", Shared),
+            ("ruby -e 'File.read(\"~/.config/gcloud/x\")'", Shared),
+            ("php -r 'file_get_contents(\"~/secrets/x\");'", Shared),
+            ("python3 -c 'print(\"~/.awsome\")'", Low),
+            ("python3 -c 'print(1)'", Low),
+            ("python3 script.py ~/.ssh/x", Low),
+            (
+                "python3 -c 'import shutil; shutil.rmtree(\"/\")' && rm -rf ~",
+                Catastrophic,
+            ),
         ];
         let mut bad = Vec::new();
         for (cmd, want) in cases {

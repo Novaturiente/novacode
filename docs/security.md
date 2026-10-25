@@ -55,10 +55,14 @@ Every `bash` command is split into simple commands (including ones inside `$(...
 | Safe | Reads only. Allowed in read-only mode. | `ls`, `git status` |
 | Low | Changes something ordinary. | writing a file, running a program |
 | Confirm | Destroys data or history in bulk. | `rm -rf target`, `git reset --hard`, `git clean -fd`, `git branch -D`, `find -delete`, `curl ... \| sh`, `sudo ...`, `dd of=<file>`, `chmod -R` |
-| Shared | Rewrites or deletes history on a remote, which no local undo can fix. | `git push --force` (and `--force-with-lease`, `--force-if-includes`, `-uf`), `git push origin +main`, `git push --delete`, `git push --mirror`, `git push --prune` |
-| Catastrophic | Targets the system, your home folder or credentials. **Never runs.** | `rm -rf /`, `rm -rf ~`, writing to `/dev/sda`, `mkfs` on a device, `kill -1` (as the last argument), `pkill -f` with a pattern that matches its own command line, fork bombs, a redirect (`>`), `rm`, `cp`, `mv`, `ln`, `install`, `rsync`, `dd of=`, `chmod`/`chown`, `truncate` or `shred` aimed at `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.config/gcloud`, `~/.password-store` or `~/.novacode` |
+| Shared | Rewrites or deletes history on a remote, which no local undo can fix. Also inline code that names a credential folder or protected path: novacode can't see what it does. | `python3 -c "open('~/.ssh/...')"`, `git push --force` (and `--force-with-lease`, `--force-if-includes`, `-uf`), `git push origin +main`, `git push --delete`, `git push --mirror`, `git push --prune` |
+| Catastrophic | Targets the system, your home folder or credentials. **Never runs.** | `rm -rf /`, `rm -rf ~`, writing to `/dev/sda`, `mkfs` on a device, `kill -1` (as the last argument), `pkill -f` with a pattern that matches its own command line, fork bombs, a redirect (`>`), `tee`, `sed -i`, `perl -i`, `awk -i inplace`, an `awk` `print > "file"`, `rm`, `cp`, `mv`, `ln`, `install`, `rsync`, `dd of=`, `chmod`/`chown`, `truncate` or `shred` aimed at `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.config/gcloud`, `~/.password-store` or `~/.novacode` |
 
-Only the commands named in that row are checked against these folders. Other commands that write files are not: `tee -a ~/.ssh/authorized_keys`, `sed -i ... ~/.ssh/config`, `awk` printing to a file there, or an interpreter such as `python -c`, `node -e` or `perl -e` writing there are all Low and run in `auto` mode.
+Only the commands named in that row are checked against these folders. So `tee -a ~/.ssh/authorized_keys` and `sed -i ... ~/.novacode/settings.json` never run.
+
+Code the gate can't read is checked by name only. Inline code (`python -c`, `node -e`/`--eval`/`-p`, `deno eval`, `bun -e`, `perl -e`, `ruby -e`, `php -r`), or a heredoc or here-string fed to one of these, that names a credential folder or one of your protected paths is Shared: it asks you. A name counts as `~/.ssh`, `$HOME/.ssh`, `${HOME}/.ssh`, the full path, or `HOME` followed by `/.ssh` (as in `process.env.HOME + '/.ssh'`). It is not refused, because reading a public key there can be fine.
+
+What the gate can't see still runs: a script on disk (`python3 fix.py`), a path built another way inside the code, or any other program that writes files. That is what the sandbox is for.
 
 System folders count too: `/`, `/bin`, `/boot`, `/dev`, `/etc`, `/home`, `/lib`, `/lib64`, `/opt`, `/proc`, `/root`, `/sbin`, `/srv`, `/sys`, `/usr`, `/var`, and your home folder itself.
 
@@ -67,13 +71,13 @@ More commands that count as Confirm: `git checkout -- .` and `git checkout -f`, 
 How the gate reads a command:
 
 - **Wrappers and their options.** `nohup`, `time`, `nice`, `ionice`, `command`, `exec`, `builtin`, `unbuffer`, `stdbuf`, `timeout`, `xargs`, `env` and `sudo`/`doas`/`pkexec` are skipped together with their options (and option values, such as `nice -n 10` or `timeout -s KILL 60`), and the command they run is judged. `env -S '...'` judges the string, plus the words after it (env appends them), as a command: `env -S rm -rf ~` is Catastrophic.
-- **Read-only commands that can write or run things** are Low, not Safe: `git -c <key>=...` and `--config-env` (except `color.*`, `user.*`, `advice.*`, `core.quotepath`, `safe.directory`), `--exec-path`, `git diff --output`, `--ext-diff`, `git grep -O`, `--upload-pack`, `ext::` URLs, a bare `git stash`, and a leading `GIT_*`, `LD_*`, `PAGER`, `LESSOPEN`, `LESSCLOSE`, `BASH_ENV`, `ENV`, `PATH`, `EDITOR` or `VISUAL` assignment. The same goes for `sed` with `-i`, `-f` or a `w`/`W`/`e` command; `awk` with `system()`, `getline`, pipes, `print > file`, `-f`/`-i`/`-E` or `--file`/`--include`/`--exec`; `fd -x`/`-X`/`--exec` (also inside a cluster such as `-Hx`); `find -fprint`; `sort -o` and `--compress-program`; `tree -o`; `uniq`/`xxd` with an output file; `rg --pre`; `ss -K`; `date -s`/`--set` (`date -Iseconds` stays Safe).
+- **Read-only commands that can write or run things** are Low, not Safe: `git -c <key>=...` and `--config-env` (except `color.*`, `user.*`, `advice.*`, `core.quotepath`, `safe.directory`), `--exec-path`, `git diff --output`, `--ext-diff`, `git grep -O`, `--upload-pack`, `ext::` URLs, a bare `git stash`, and a leading `GIT_*`, `LD_*`, `PAGER`, `LESSOPEN`, `LESSCLOSE`, `BASH_ENV`, `ENV`, `PATH`, `EDITOR` or `VISUAL` assignment. The same goes for `sed` with `-i` (its files are checked like a redirect), `-f` or a `w`/`W`/`e` command; `awk` with `system()`, `getline`, pipes, `print > file`, `-f`/`-i`/`-E` or `--file`/`--include`/`--exec`; `fd -x`/`-X`/`--exec` (also inside a cluster such as `-Hx`); `find -fprint`; `sort -o` and `--compress-program`; `tree -o`; `uniq`/`xxd` with an output file; `rg --pre`; `ss -K`; `date -s`/`--set` (`date -Iseconds` stays Safe).
 - **Copying into your home folder is allowed.** For `cp`, `ln`, `install` and `mv` only the destination counts: `cp file.txt ~/` and `cp ~/.ssh/id_ed25519.pub .` are Low. Replacing the home folder itself (`cp -T dir ~`) or writing under a credential folder (`cp k ~/.ssh/authorized_keys`) is Catastrophic. So is copying a source whose name lands on a protected path inside home, such as `cp -r payload/.ssh ~` or `rsync -a dir/.ssh ~/`, because it merges into `~/.ssh`. `mv` also counts its sources, so `mv ~/.gnupg /tmp` is Catastrophic. `rsync` into your home or a system folder is Catastrophic only with `--delete`; with `--remove-source-files` its sources count too. An rsync source ending in `/` copies its contents, which the gate cannot see: `rsync -a src/ ~/` is Low unless `src/` itself is protected.
 
 What each level does depends on the mode:
 
 - **Catastrophic**: refused in every mode. The model is told to do it another way or ask you to run it yourself.
-- **Shared**: asks you, even in `auto` mode; refused in `read-only` mode.
+- **Shared**: asks you, even in `auto` mode; refused in `read-only` mode. Without anyone to ask, it needs a `justification`.
 - **Confirm**: asks you in `ask` mode. In `auto` mode it runs without asking (it is logged). In `read-only` mode (and plan mode) it is refused without asking: read-only means no changes.
 - **Safe / Low**: no gate action.
 
@@ -226,7 +230,7 @@ novacode --trust               # trust this folder for this run only
 ## Secrets
 
 - **Your own logins are always masked.** API keys, OAuth tokens and similar secrets novacode holds are replaced with `[redacted: <source>]` in tool output before the model sees it. Values shorter than 8 characters are skipped.
-- **Pattern masking is opt-in.** With `security.maskSecrets` on, well-known token shapes are masked too, wherever they come from: GitHub, AWS, OpenAI, Anthropic, Slack and Google keys, private key blocks, and the values (8 characters or more) of `NAME=value` or `NAME: value` assignments whose upper-case name contains `SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`, `API_KEY`, `APIKEY`, `PRIVATE_KEY` or `ACCESS_KEY`.
+- **Pattern masking is opt-in.** With `security.maskSecrets` on, well-known token shapes are masked too, wherever they come from: GitHub, AWS, OpenAI, Anthropic, Slack and Google keys, private key blocks, and the values (8 characters or more) of `NAME=value` or `NAME: value` assignments whose name, in any case (`api_key=` too), contains `SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`, `API_KEY`, `APIKEY`, `PRIVATE_KEY` or `ACCESS_KEY`.
 
 ```json
 {
