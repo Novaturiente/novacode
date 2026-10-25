@@ -42,6 +42,36 @@ fn verify(data: &[u8], sums: &str) -> Result<(), String> {
     }
 }
 
+/// The tag of the release repo's latest GitHub release.
+async fn latest_tag(http: &reqwest::Client) -> anyhow::Result<String> {
+    let latest: serde_json::Value = serde_json::from_str(
+        &http
+            .get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?,
+    )?;
+    Ok(latest["tag_name"].as_str().unwrap_or_default().to_string())
+}
+
+/// Release `tag` is a newer version than `current`.
+pub fn newer(tag: &str, current: &str) -> bool {
+    matches!((parse(tag), parse(current)), (Some(n), Some(c)) if n > c)
+}
+
+/// L11.13: the latest release tag when it is newer than this binary, for every
+/// install kind; an error when GitHub can't be asked (10 s timeout).
+pub async fn check() -> anyhow::Result<Option<String>> {
+    let http = reqwest::Client::builder()
+        .user_agent(concat!("novacode/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let tag = latest_tag(&http).await?;
+    Ok(newer(&tag, env!("CARGO_PKG_VERSION")).then_some(tag))
+}
+
 pub async fn run() -> anyhow::Result<ExitCode> {
     match install_kind() {
         "release" => {}
@@ -69,16 +99,7 @@ pub async fn run() -> anyhow::Result<ExitCode> {
     let http = reqwest::Client::builder()
         .user_agent(concat!("novacode/", env!("CARGO_PKG_VERSION")))
         .build()?;
-    let latest: serde_json::Value = serde_json::from_str(
-        &http
-            .get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?,
-    )?;
-    let tag = latest["tag_name"].as_str().unwrap_or_default();
+    let tag = &latest_tag(&http).await?;
     let (Some(new), Some(cur)) = (parse(tag), parse(env!("CARGO_PKG_VERSION"))) else {
         anyhow::bail!("can't read the latest release's version `{tag}`");
     };
@@ -133,6 +154,7 @@ mod tests {
         assert_eq!(parse("v1.10.2"), Some((1, 10, 2)));
         assert!(parse("v0.2.0") > parse("0.1.9"));
         assert_eq!(parse("nightly"), None);
+        assert!(newer("v0.2.6", "0.2.3") && !newer("v0.2.3", "0.2.3") && !newer("nightly", "0.2.3"));
         let sum = format!("{:x}  novacode.tar.gz\n", Sha256::digest(b"abc"));
         assert!(verify(b"abc", &sum).is_ok());
         assert!(verify(b"abd", &sum).unwrap_err().contains("mismatch"));

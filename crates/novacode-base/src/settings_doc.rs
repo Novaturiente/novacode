@@ -95,6 +95,12 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "Mode presets: `<name>: {prompt, readOnly, tools}`; `plan` is built in.",
     ),
     (
+        "updates.check",
+        "bool",
+        "true",
+        "At interactive start, show when novacode or an installed package has a newer release (checked at most once a day; nothing is installed). See docs/packages.md.",
+    ),
+    (
         "checkpoints.enabled",
         "bool",
         "true",

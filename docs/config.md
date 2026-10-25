@@ -21,6 +21,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `hooks.onActivity` | string | unset | Shell command run on working/blocked/idle changes, State JSON on stdin. |
 | `processExtensions` | object | {} | Long-running JSON-RPC extensions in any language: `<name>: {command, args, env}`. See docs/extensions.md. |
 | `modes` | object | {} | Mode presets: `<name>: {prompt, readOnly, tools}`; `plan` is built in. |
+| `updates.check` | bool | true | At interactive start, show when novacode or an installed package has a newer release (checked at most once a day; nothing is installed). See docs/packages.md. |
 | `checkpoints.enabled` | bool | true | File checkpoints per prompt, for `/rewind`. |
 | `extensions.<name>` | object | unset | Settings of extension `<name>`: a process extension gets them in `initialize`, any extension through `novacode.settings.get("extensions.<name>")`. |
 | `sandbox.mode` | string | `auto` | Global only. Run the model's `bash` commands and `process` starts in a bubblewrap sandbox: `auto` (when bwrap works; otherwise one warning, then unsandboxed), `on` (refuse commands when it can't sandbox) or `off`. See docs/security.md. |

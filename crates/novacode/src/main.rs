@@ -42,6 +42,7 @@ mod serve;
 mod stats;
 mod status;
 mod update;
+mod updates;
 mod usage;
 mod wire;
 
@@ -2596,6 +2597,8 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
         let (ctx_tx, mut crx) = mpsc::unbounded_channel();
         let h = host.clone();
         let history_tx = ui_tx.clone();
+        // L11.13: once per process; cached notes now, else a background check.
+        info.extend(updates::at_start(ctx.paths.home(), &ctx.settings, ui_tx.clone()));
         tokio::spawn(async move {
             while let Some(c) = crx.recv().await {
                 if c == Cmd::Quit {

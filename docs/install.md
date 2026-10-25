@@ -109,6 +109,24 @@ What happens depends on how you installed:
 
 If you are already current it says `novacode X is the newest release`. The binary's folder must be writable by you, because the update replaces the file. Updates use GitHub's latest (non-prerelease) release. An update never touches your files in `~/.novacode`. The docs ship inside the binary: the first run of a new version rewrites `~/.novacode/docs/` to match it, whichever way you installed.
 
+### Update check
+
+An interactive session tells you when a newer release is out, however you installed:
+
+```
+novacode v0.2.6 is available (you have 0.2.3): run `novacode update`
+```
+
+- novacode asks GitHub for its latest release **at most once a day**, in the background. It caches the answer in `~/.novacode/cache/updates.json`.
+- Every interactive start shows the note from the cache, until you have updated. `/reload`, `/new` and `/resume` don't show it again.
+- The same check covers your packages (see [Packages](packages.md#update-check)).
+- It is one GitHub API call for novacode plus one per package. It sends only the request itself (user agent `novacode/<version>`), no identifiers.
+- A check that fails stays silent and tries again at the next start.
+- Nothing is installed: you run `novacode update` yourself.
+- `-p`, `serve` and subagents never check.
+
+To turn it off, set `"updates": {"check": false}` in `~/.novacode/settings.json`.
+
 ## Uninstall
 
 Remove the binary:
