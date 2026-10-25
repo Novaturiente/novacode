@@ -260,6 +260,7 @@ fn side_runner(r: &crate::codemode::Runner, tools: Vec<Arc<dyn Tool>>) -> Arc<cr
         seq: Default::default(),
         hooks: r.hooks.clone(),
         judge: r.judge.clone(),
+        wait: r.wait.clone(),
     })
 }
 
@@ -501,6 +502,7 @@ impl Agent {
             seq: Default::default(),
             hooks: self.hooks.clone(),
             judge: self.judge.clone(),
+            wait: Default::default(),
         })
     }
 

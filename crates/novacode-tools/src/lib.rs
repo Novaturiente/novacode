@@ -115,6 +115,11 @@ pub trait Nested: Send + Sync {
     /// What a script can call: definitions, the MCP server of `server__tool` names,
     /// and the declared output schema ([`Tool::output_schema`]).
     fn tools(&self) -> Vec<(ToolDef, Option<String>, Option<Value>)>;
+    /// Session clock of time spent waiting on the user (approval cards, `ask_user`),
+    /// a wait still going counted up to now. Scripts take differences of it.
+    fn user_wait(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
 }
 
 /// Which end of a long output to keep (L5.3).

@@ -1424,7 +1424,13 @@ async fn codemode_chains_through_the_pipeline() {
         .filter(|m| matches!(m, Message::ToolResult { .. }))
         .map(result_text)
         .collect();
-    assert_eq!(results[0], "both read\npush refused");
+    assert!(
+        results[0].starts_with(
+            "both read\npush refused\n(the script stopped calling tools after a refused call)\n[3 calls · "
+        ),
+        "{}",
+        results[0]
+    );
     assert!(
         results[1].contains("Script failed: Error: stop") && results[1].contains("2 file(s) restored"),
         "{}",
@@ -1485,7 +1491,10 @@ async fn read_only_holds_for_nested_calls() {
         .filter(|m| matches!(m, Message::ToolResult { .. }))
         .map(result_text)
         .collect();
-    assert_eq!(results[0], "refused,refused", "{results:?}");
+    assert!(
+        results[0].starts_with("refused,refused\n(the script stopped calling tools after a refused call)\n[2 calls · "),
+        "{results:?}"
+    );
     assert!(results[1].contains("can't change files"), "{results:?}");
     for f in ["by-script", "w.txt", "c.txt"] {
         assert!(!work.path().join(f).exists(), "{f}");
@@ -1579,7 +1588,93 @@ async fn codemode_gets_whole_tool_output() {
         .filter(|m| matches!(m, Message::ToolResult { .. }))
         .map(result_text)
         .collect();
-    assert_eq!(out[0], "5000 3000 \"rows\": [");
+    assert!(out[0].starts_with("5000 3000 \"rows\": [\n[2 calls · "), "{}", out[0]);
+}
+
+/// A tool result with an image, for codemode.
+struct Snap;
+impl novacode_tools::Tool for Snap {
+    fn name(&self) -> &str {
+        "snap"
+    }
+    fn description(&self) -> &str {
+        "takes a screenshot"
+    }
+    fn schema(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    fn read_only(&self) -> bool {
+        true
+    }
+    fn execute<'a>(
+        &'a self,
+        _args: Value,
+        _ctx: &'a novacode_tools::ToolCtx,
+    ) -> futures_util::future::BoxFuture<'a, novacode_tools::ToolOutput> {
+        Box::pin(async {
+            novacode_tools::ToolOutput {
+                content: vec![
+                    Block::text("shot"),
+                    Block::Image {
+                        mime_type: "image/png".into(),
+                        data: "iVBORw0KGgo=".into(),
+                    },
+                ],
+                is_error: false,
+                details: None,
+            }
+        })
+    }
+}
+
+/// L7.17: a script that catches a refusal can't call tools after it, and a
+/// nested result's images reach the script as `{text, images}`.
+#[tokio::test]
+async fn codemode_stops_after_a_refusal_and_gets_images() {
+    use novacode_core::policy::{Permissions, Policy};
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let refused = "try { await tools.bash({command: 'git push origin main'}); } catch (e) {}\n\
+                   try { await tools.write({path: 'x.txt', content: 'x'}); return 'wrote'; } catch (e) { return e.message; }";
+    let snap = "const r = await tools.snap({});\nimage(r.images[0]);\nreturn r.text;";
+    let faux = Faux::new([
+        tools_reply(vec![call("a", "codemode", json!({ "code": refused }))]),
+        tools_reply(vec![call("b", "codemode", json!({ "code": snap }))]),
+        FauxReply::text("done"),
+    ]);
+    let mut tools = novacode_tools::builtins(false);
+    tools.push(Arc::new(Snap));
+    tools.push(Arc::new(novacode_core::codemode::Codemode::default()));
+    let perms: Permissions = serde_json::from_value(json!({ "deny": ["Bash(git push:*)"] })).unwrap();
+    let agent = Agent::new(
+        Arc::new(faux),
+        tools,
+        Store::create(&Paths::new(home.path()), work.path(), true),
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_policy(Policy::new(perms, home.path().into(), None));
+    let (agent, _) = drive(agent, &["go"]).await;
+    let results: Vec<Message> = agent
+        .store
+        .projection()
+        .into_iter()
+        .filter(|m| matches!(m, Message::ToolResult { .. }))
+        .collect();
+    let first = result_text(&results[0]);
+    assert!(
+        first.starts_with("write: not run: this script stopped calling tools after a refused call (Denied"),
+        "{first}"
+    );
+    assert!(!work.path().join("x.txt").exists());
+    let Message::ToolResult { content, .. } = &results[1] else {
+        unreachable!()
+    };
+    assert!(
+        matches!(&content[0], Block::Image { data, mime_type } if data == "iVBORw0KGgo=" && mime_type == "image/png"),
+        "{content:?}"
+    );
+    assert!(result_text(&results[1]).starts_with("shot\n[1 call · "));
 }
 
 /// Extension context injection without cache misses: `remind` notes are saved and
