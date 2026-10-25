@@ -163,11 +163,43 @@ struct Shared {
     host: Arc<dyn Host>,
     outer: tokio::runtime::Handle,
     tools: Vec<ToolInfo>,
-    store: Mutex<Map<String, Value>>,
+    store: Mutex<Store>,
     items: Mutex<(Vec<Item>, usize, bool)>,
     calls: AtomicUsize,
     cancelled: Arc<AtomicBool>,
     limits: Limits,
+}
+
+/// The script's store, with each key's JSON size and their total, so `store()`
+/// checks the cap without re-serialising every value.
+struct Store {
+    map: Map<String, Value>,
+    sizes: std::collections::HashMap<String, usize>,
+    total: usize,
+}
+
+impl Store {
+    fn new(map: Map<String, Value>) -> Self {
+        let sizes: std::collections::HashMap<String, usize> =
+            map.iter().map(|(k, v)| (k.clone(), v.to_string().len())).collect();
+        let total = sizes.values().sum();
+        Store { map, sizes, total }
+    }
+
+    /// Stores `v` under `k`, or says why not.
+    fn set(&mut self, k: String, v: Value) -> Result<(), String> {
+        let size = v.to_string().len();
+        let others = self.total - self.sizes.get(&k).copied().unwrap_or(0);
+        if others + size > STORE_CAP {
+            return Err(format!(
+                "store is full (8 MiB): storing `{k}` ({size} bytes) would pass it; keep less, or store(key, null) to free a key"
+            ));
+        }
+        self.total = others + size;
+        self.sizes.insert(k.clone(), size);
+        self.map.insert(k, v);
+        Ok(())
+    }
 }
 
 impl Shared {
@@ -293,7 +325,7 @@ pub async fn run(
         host,
         outer: tokio::runtime::Handle::current(),
         tools,
-        store: Mutex::new(store),
+        store: Mutex::new(Store::new(store)),
         items: Mutex::new((Vec::new(), 0, false)),
         calls: AtomicUsize::new(0),
         cancelled: cancel,
@@ -319,7 +351,7 @@ pub async fn run(
         Err(e) => (Err(format!("could not start the script thread: {e}")), Duration::ZERO),
     };
     let (items, _, truncated) = std::mem::take(&mut *shared.items.lock().unwrap_or_else(|e| e.into_inner()));
-    let store = std::mem::take(&mut *shared.store.lock().unwrap_or_else(|e| e.into_inner()));
+    let store = std::mem::take(&mut shared.store.lock().unwrap_or_else(|e| e.into_inner()).map);
     let (result, error) = match out {
         Ok(r) => (r, None),
         Err(e) => (None, Some(e)),
@@ -398,7 +430,8 @@ async fn on_thread(body: String, shared: Arc<Shared>, started: Instant) -> Resul
             .map_err(|e| format!("prelude: {e}"))?;
         // Pre-run checks (L7.17) against what this engine really defines.
         let globals: Vec<String> = ctx
-            .eval("Object.getOwnPropertyNames(globalThis)")
+            // Global names include `Object.prototype`'s (`hasOwnProperty`, `toString`, …).
+            .eval("[...Object.getOwnPropertyNames(globalThis), ...Object.getOwnPropertyNames(Object.prototype)]")
             .catch(&ctx)
             .map_err(|e| format!("prelude: {e}"))?;
         let (problems, decls) = crate::check::check(&body, &globals.into_iter().collect(), &shared.tools);
@@ -536,19 +569,7 @@ fn bridge<'js>(ctx: &rquickjs::Ctx<'js>, shared: &Arc<Shared>) -> rquickjs::Resu
         Function::new(ctx.clone(), move |k: String, raw: String| {
             let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
             let mut store = s.store.lock().unwrap_or_else(|e| e.into_inner());
-            let others: usize = store
-                .iter()
-                .filter(|(key, _)| **key != k)
-                .map(|(_, v)| v.to_string().len())
-                .sum();
-            if others + v.to_string().len() > STORE_CAP {
-                return format!(
-                    "store is full (8 MiB): storing `{k}` ({} bytes) would pass it; keep less, or store(key, null) to free a key",
-                    v.to_string().len()
-                );
-            }
-            store.insert(k, v);
-            String::new()
+            store.set(k, v).err().unwrap_or_default()
         })?,
     )?;
     let s = shared.clone();
@@ -558,6 +579,7 @@ fn bridge<'js>(ctx: &rquickjs::Ctx<'js>, shared: &Arc<Shared>) -> rquickjs::Resu
             s.store
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
+                .map
                 .get(&k)
                 .map(Value::to_string)
                 .unwrap_or_default()
@@ -864,6 +886,43 @@ mod tests {
         // A script that writes globals skips the missing-name check.
         let (o, _) = checked("globalThis.made = 3;\nreturn made;").await;
         assert_eq!(o.result, Some(json!(3)), "{:?}", o.error);
+        // Reads guarded by `try`, feature tests, `Object.prototype` names, `delete`.
+        for (code, want) in [
+            (
+                "let e;\ntry { e = process.env } catch (x) { e = {} }\nreturn 1;",
+                json!(1),
+            ),
+            (
+                "if ('web_search' in tools) await tools.web_search({q: 1});\nreturn 1;",
+                json!(1),
+            ),
+            ("if (mcp.ctx7.search_issues) return 1;\nreturn 2;", json!(2)),
+            ("return mcp.ctx7.hasOwnProperty('search');", json!(true)),
+            ("if ('gh' in mcp) await mcp.gh.search({});\nreturn 1;", json!(1)),
+            (
+                "if (Object.keys(tools).includes('web_search') && tools.web_search) await tools.web_search({});\nreturn 3;",
+                json!(3),
+            ),
+            (
+                "return [hasOwnProperty === Object.prototype.hasOwnProperty, toString.name, valueOf.name];",
+                json!([true, "toString", "valueOf"]),
+            ),
+            ("return delete notdefined;", json!(true)),
+        ] {
+            let (o, _) = checked(code).await;
+            assert_eq!(o.result, Some(want), "{code}: {:?}", o.error);
+        }
+        // Only the `try` block is guarded, not the handler.
+        let (o, _) = checked("try { 1 } catch (x) { process.exit(1) }\nreturn 1;").await;
+        assert!(o.error.unwrap().contains("`process` doesn't exist here"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn typescript_enums_run() {
+        let o = go("enum Color { Red, Green }\nconst c: Color = Color.Green;\nreturn c;").await;
+        assert_eq!(o.result, Some(json!(1)), "{:?}", o.error);
+        let o = go("const enum E { A = 1 }\nreturn E.A;").await;
+        assert_eq!(o.result, Some(json!(1)), "{:?}", o.error);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -955,6 +1014,24 @@ mod tests {
         // Extras alone, numbers as integers, and anyOf parts pass.
         let (o, n) = checked("await mcp.ctx7.search({query: 'x', limit: 2, extra: 1, any: 5}); return 1").await;
         assert_eq!((o.error, n), (None, 1));
+        // Lax inputs: numeric strings for numbers, null where `nullable: true`.
+        let (o, n) = checked("await mcp.ctx7.search({query: 'x', limit: '5'}); return 1").await;
+        assert_eq!((o.error, n), (None, 1));
+        assert!(
+            msg("{query: 'x', limit: '1.5'}")
+                .await
+                .contains("\"limit\" must be integer")
+        );
+        assert!(
+            msg("{query: 'x', limit: 'five'}")
+                .await
+                .contains("\"limit\" must be integer")
+        );
+        let schema = json!({"type": "object", "properties": {
+            "a": {"type": "string", "nullable": true}, "b": {"type": "string"}, "n": {"type": "number"}
+        }});
+        assert!(crate::check::validate(&schema, &json!({"a": null, "n": "2.5"})).is_ok());
+        assert!(crate::check::validate(&schema, &json!({"b": null})).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -980,6 +1057,26 @@ mod tests {
         assert!(r[0].as_str().unwrap().starts_with("store is full (8 MiB)"), "{r}");
         assert_eq!((&r[1], &r[2]), (&json!(true), &json!("y")));
         assert_eq!(o.store.len(), 1);
+        // Overwriting with a smaller value frees space; the cap still holds after.
+        let o = go(
+            "store('a', 'x'.repeat(5 << 20));\nstore('a', 1);\nstore('b', 'x'.repeat(7 << 20));\n\
+             try { store('c', 'x'.repeat(1 << 20)); return 'stored' } catch (e) { return e.message }",
+        )
+        .await;
+        assert!(o.result.unwrap().as_str().unwrap().starts_with("store is full"));
+        // The incoming store counts toward the cap.
+        let mut full = Map::new();
+        full.insert("old".into(), json!("x".repeat(8 << 20)));
+        let o = run(
+            "try { store('n', 'abc'); return 'stored' } catch (e) { return e.message }",
+            Arc::new(Echo),
+            tools(),
+            full,
+            Limits::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        assert!(o.result.unwrap().as_str().unwrap().starts_with("store is full"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
