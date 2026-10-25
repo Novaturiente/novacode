@@ -683,7 +683,20 @@ impl Policy {
             // Global extensions, skills, agents, prompts, packages and MCP servers run commands,
             // and so do Claude-compatible ones and shell startup files.
             let real_home = real(&self.home);
+            // zsh reads its startup files from `$ZDOTDIR` when set: the whole folder asks.
+            // `ZDOTDIR=$HOME` is covered by the home entries; the whole home doesn't ask.
+            let zdotdir: Vec<PathBuf> = std::env::var_os("ZDOTDIR")
+                .map(PathBuf::from)
+                .filter(|d| d.is_absolute())
+                .map(|d| vec![lexical(&d), real(&d)])
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|d| *d != self.home && *d != real_home)
+                .collect();
             let global = |q: &Path| -> Option<&'static str> {
+                if zdotdir.iter().any(|z| q.starts_with(z)) {
+                    return Some("a shell startup file");
+                }
                 [&self.home, &real_home].iter().find_map(|h| {
                     let rest = q.strip_prefix(h).ok()?;
                     GLOBAL_CONFIG
@@ -837,6 +850,11 @@ const GLOBAL_CONFIG: &[(&str, bool, &str)] = &[
     (".zshrc", false, "a shell startup file"),
     (".zprofile", false, "a shell startup file"),
     (".zshenv", false, "a shell startup file"),
+    (".zlogin", false, "a shell startup file"),
+    (".zlogout", false, "a shell startup file"),
+    (".bash_login", false, "a shell startup file"),
+    (".bash_logout", false, "a shell startup file"),
+    (".config/zsh", true, "a shell startup file"),
     (".config/fish/config.fish", false, "a shell startup file"),
     (".config/fish/conf.d", true, "a shell startup file"),
 ];
@@ -1239,6 +1257,24 @@ mod tests {
             "git -c x=y push origin",
             "git --git-dir=.git --work-tree . -p push",
             "git --bare --namespace n push",
+            // R18/L6.1: every git global option.
+            "git -C. push",
+            "git -ck=v push",
+            "git -P push",
+            "git --no-optional-locks push",
+            "git --literal-pathspecs push",
+            "git --glob-pathspecs push",
+            "git --noglob-pathspecs push",
+            "git --icase-pathspecs push",
+            "git --no-replace-objects push",
+            "git --no-lazy-fetch push",
+            "git --no-advice push",
+            "git --exec-path push",
+            "git --exec-path=/x push",
+            "git --config-env=a=B push",
+            "git --attr-source=HEAD push",
+            "git --super-prefix=x push",
+            "git --list-cmds=main push",
         ] {
             assert!(denied(&check(&p, "bash", bash(c), true)), "{c}");
         }
@@ -1427,6 +1463,12 @@ mod tests {
             ("edit", json!({"path": "~/.zshenv"})),
             ("edit", json!({"path": "~/.config/fish/config.fish"})),
             ("write", json!({"path": "~/.config/fish/conf.d/x.fish"})),
+            // R18/L6.1: login and logout files, ~/.config/zsh.
+            ("edit", json!({"path": "~/.zlogin"})),
+            ("edit", json!({"path": "~/.zlogout"})),
+            ("edit", json!({"path": "~/.bash_login"})),
+            ("edit", json!({"path": "~/.bash_logout"})),
+            ("write", json!({"path": "~/.config/zsh/aliases.zsh"})),
             ("write", json!({"path": "rc"})),
             ("write", json!({"path": "csk/x/SKILL.md"})),
         ] {
@@ -1456,6 +1498,48 @@ mod tests {
                 ),
                 "{path}"
             );
+        }
+    }
+
+    /// `$ZDOTDIR` is read at check time: each case runs [`zdotdir_case`] in a
+    /// child test process with its own environment (no `set_var` in tests).
+    #[test]
+    fn zdotdir_is_a_startup_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().canonicalize().unwrap();
+        // Set to a folder, set to home itself, unset.
+        for zdot in [Some(home.join("zdot")), Some(home.clone()), None] {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--exact", "policy::tests::zdotdir_case", "--ignored"])
+                .env("NOVACODE_TEST_HOME", &home)
+                .env_remove("ZDOTDIR");
+            if let Some(z) = &zdot {
+                cmd.env("ZDOTDIR", z);
+            }
+            let out = cmd.output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success() && text.contains("1 passed"), "{zdot:?}: {text}");
+        }
+    }
+
+    #[test]
+    #[ignore = "run by zdotdir_is_a_startup_folder"]
+    fn zdotdir_case() {
+        let home = PathBuf::from(std::env::var_os("NOVACODE_TEST_HOME").unwrap());
+        let zdot = std::env::var_os("ZDOTDIR").map(PathBuf::from);
+        let p = Policy::new(
+            serde_json::from_value(json!({ "allow": ["Write"] })).unwrap(),
+            home.clone(),
+            None,
+        );
+        let write = |path: PathBuf| p.check("write", &json!({"path": path}), &home, true);
+        let startup = |v: &Verdict| matches!(v, Verdict::Ask { risky: true, reason, .. } if reason.contains("shell startup file"));
+        let inside = write(home.join("zdot/.zshrc"));
+        match zdot {
+            // `ZDOTDIR=$HOME` doesn't make the whole home ask.
+            Some(z) if z == home => assert_eq!(write(home.join("notes.md")), Verdict::Allow),
+            Some(_) => assert!(startup(&inside), "{inside:?}"),
+            None => assert_eq!(inside, Verdict::Allow),
         }
     }
 
