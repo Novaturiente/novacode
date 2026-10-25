@@ -831,6 +831,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
                 trust.set(&dir, false)?;
                 eprintln!("distrusted {} (its project config won't load)", dir.display());
             } else {
+                // Also stores the current fingerprint of its project config.
                 trust.set(&dir, true)?;
                 eprintln!("trusted {} and the folders below it", dir.display());
             }
@@ -896,15 +897,9 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     }
     let cwd = std::env::current_dir()?;
     let trust_store = TrustStore::new(paths.home().join("trust.json"));
-    let mut trusted = trust::resolve(&trust_store, &cwd, cli.trust);
-    if !trusted && trust::has_project_config(&cwd) {
-        if interactive && trust_store.decision(&cwd).is_none() {
-            trusted = ask_trust(&trust_store, &cwd)?;
-        } else {
-            eprintln!(
-                "note: this folder's project config is ignored (not trusted). Run `novacode trust` or pass --trust."
-            );
-        }
+    let (trusted, note) = project_trust(&trust_store, &cwd, cli.trust, interactive, interactive)?;
+    if let Some(n) = note {
+        eprintln!("note: {n}");
     }
     if trusted {
         project_packages(&paths, &cwd, interactive).await?;
@@ -1012,12 +1007,19 @@ struct Ctx {
 impl Ctx {
     /// `/reload`: read trust, settings and provider config again. CLI flags stay.
     fn reload(&mut self) -> Vec<String> {
-        // A `novacode trust` since start applies; no prompt here.
-        self.trusted = trust::resolve(
-            &TrustStore::new(self.paths.home().join("trust.json")),
-            &self.cwd,
-            self.cli.trust,
-        );
+        // A `novacode trust` since start applies; only a changed project config asks.
+        let store = TrustStore::new(self.paths.home().join("trust.json"));
+        let mut notes = Vec::new();
+        match project_trust(&store, &self.cwd, self.cli.trust, false, true) {
+            Ok((t, note)) => {
+                self.trusted = t;
+                notes.extend(note);
+            }
+            Err(e) => {
+                self.trusted = false;
+                notes.push(format!("trust prompt failed: {e}"));
+            }
+        }
         self.settings = Settings::load(
             &self.paths.settings(),
             Some(&Paths::project_settings(&self.cwd)),
@@ -1027,7 +1029,8 @@ impl Ctx {
         p.cli_key = self.providers.cli_key.clone();
         self.providers = Arc::new(p);
         self.quirks = Arc::new(novacode_ai::schema::Quirks::load(self.paths.home()));
-        self.settings.diagnostics().into_iter().map(|d| d.message).collect()
+        notes.extend(self.settings.diagnostics().into_iter().map(|d| d.message));
+        notes
     }
 
     fn resource_dirs(&self, kind: &str, claude: &str) -> Vec<std::path::PathBuf> {
@@ -2721,6 +2724,17 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
                 ctx.cwd = carry.cwd.clone();
             }
             *ctx.carry.lock().unwrap() = Some(carry);
+            // A changed project config asks again in a full-screen prompt: leave the TUI
+            // screen first (the loop enters it again).
+            if !ctx.cli.trust
+                && trust::has_project_config(&ctx.cwd)
+                && matches!(
+                    TrustStore::new(ctx.paths.home().join("trust.json")).state(&ctx.cwd),
+                    trust::State::Changed(_)
+                )
+            {
+                screen = None;
+            }
             notices.extend(ctx.reload());
             info.push("reloaded settings, keys, theme, extensions, MCP servers, skills and context files".into());
             store = agent.store;
@@ -2927,18 +2941,61 @@ async fn project_packages(paths: &Paths, cwd: &Path, interactive: bool) -> anyho
     Ok(())
 }
 
-fn ask_trust(store: &TrustStore, cwd: &Path) -> anyhow::Result<bool> {
+/// Whether `cwd`'s project config loads (L6.3), and a note when it is ignored.
+/// Asks when the folder was never decided (`ask_new`) or its project config
+/// changed since it was trusted (`ask_changed`); otherwise ignores it.
+fn project_trust(
+    store: &TrustStore,
+    cwd: &Path,
+    cli_trust: bool,
+    ask_new: bool,
+    ask_changed: bool,
+) -> anyhow::Result<(bool, Option<String>)> {
+    if cli_trust {
+        return Ok((true, None));
+    }
+    let state = store.state(cwd);
+    if state == trust::State::Trusted || !trust::has_project_config(cwd) {
+        return Ok((state == trust::State::Trusted, None));
+    }
+    Ok(match state {
+        trust::State::Unknown if ask_new => (ask_trust(store, cwd, None)?, None),
+        trust::State::Changed(c) if ask_changed => (ask_trust(store, cwd, Some(&c))?, None),
+        trust::State::Changed(c) => (
+            false,
+            Some(format!(
+                "this folder's project config changed since you trusted it ({}), so it is ignored. Run `novacode trust` to trust it again or pass --trust.",
+                c.join(", ")
+            )),
+        ),
+        _ => (
+            false,
+            Some("this folder's project config is ignored (not trusted). Run `novacode trust` or pass --trust.".into()),
+        ),
+    })
+}
+
+/// The trust prompt; `changed` = what changed since the folder was trusted (asking again).
+fn ask_trust(store: &TrustStore, cwd: &Path, changed: Option<&[String]>) -> anyhow::Result<bool> {
     let parent = cwd.parent().unwrap_or(cwd).to_path_buf();
     let item = |label: String, value: &str| PickItem {
         label,
         detail: String::new(),
         value: value.into(),
     };
-    let body = [
-        format!(
+    let first = match changed {
+        Some(c) => format!(
+            "{}'s project config changed since you trusted it: {}.",
+            cwd.display(),
+            c.join(", ")
+        ),
+        None => format!(
             "{} has project config (.novacode/settings.json, extensions, MCP, hooks or skills).",
             cwd.display()
         ),
+    };
+    let body = [
+        first,
         "Trusting it lets that config change settings and run code. AGENTS.md and CLAUDE.md load either way.".into(),
     ];
     let pick = novacode_tui::prompt::select(
@@ -2957,7 +3014,7 @@ fn ask_trust(store: &TrustStore, cwd: &Path) -> anyhow::Result<bool> {
             true
         }
         Some("parent") => {
-            store.set(&parent, true)?;
+            store.set_from(&parent, true, cwd)?;
             true
         }
         Some("session") => true,

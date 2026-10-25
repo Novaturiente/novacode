@@ -298,6 +298,16 @@ novacode --trust               # trust this folder for this run only
 
 `--revoke` writes a "no" for that folder, which also beats trust inherited from a parent folder. Without a stored decision at the folder or any parent, a folder is untrusted and the prompt appears. In print mode there is no prompt: the project config is ignored, and a note on stderr says so. Run `/reload` in a session to pick up a `novacode trust` you ran meanwhile.
 
+### When project config changes
+
+Trust covers the project config as it was when you said yes, like direnv's `allow`. novacode keeps a fingerprint of it in `trust.json`: the names and contents of every file in the gated entries listed above. Creating one that wasn't there (say a new `.mcp.json`) changes it too. Other files, `AGENTS.md`, `CLAUDE.md` and `.novacode/prompts` don't count.
+
+The config can change after you trusted it: through `git pull`, a command the agent ran, the agent's own edits, or you. The next start or `/reload` then asks again. The prompt lists what changed (for example `added .mcp.json, changed .novacode/extensions`) and offers the same choices. Saying yes stores the new fingerprint.
+
+Non-interactive runs (`-p`, `--rpc`, `--bg`) can't ask. They ignore the changed config and print a note. Run `novacode trust` to trust it again (this stores the current fingerprint), or pass `--trust` for one run.
+
+A folder trusted with an older novacode has no fingerprint yet. It takes the current one silently on the next start. The same happens the first time you work in a folder below a trusted parent.
+
 ## Secrets
 
 - **Your own logins are always masked.** API keys, OAuth tokens and similar secrets novacode holds are replaced with `[redacted: <source>]` in tool output before the model sees it. Values shorter than 8 characters are skipped.
