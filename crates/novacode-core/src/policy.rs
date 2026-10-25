@@ -196,7 +196,7 @@ pub trait Approver: Send + Sync {
     fn approve(&self, req: ApprovalRequest) -> BoxFuture<'_, Approval>;
 }
 
-const MUTATING: &[&str] = &["write", "edit", "apply_patch"];
+pub(crate) const MUTATING: &[&str] = &["write", "edit", "apply_patch"];
 /// Built-in tools that only read, or change only the session itself; they run in
 /// read-only mode. `process` start is checked as its command, `agent` children
 /// inherit the mode, and `codemode`/`call` calls are checked one by one.
@@ -356,6 +356,28 @@ impl Policy {
             .any(|r| r.matches_tool("bash") && r.covers(&segs, nested.as_deref()))
     }
 
+    /// The user's own allow rules or this session's "allow" answers cover this
+    /// file-tool call, so the command judge (L6.8) leaves it alone.
+    pub fn user_allowed_file(&self, tool: &str, args: &Value, cwd: &Path) -> bool {
+        let lower = tool.to_lowercase();
+        let path = PathArg::new(args, cwd, &self.home);
+        let session = self.session_allow.lock().unwrap();
+        self.allow.iter().chain(session.iter()).any(|r| {
+            r.matches_tool(tool)
+                && if FILE_TOOLS.contains(&lower.as_str()) {
+                    path.matches(r, true)
+                } else {
+                    r.pattern.is_none()
+                }
+        })
+    }
+
+    /// The user said yes to this exact judged call (a command, or `Tool(<path>)`)
+    /// for the session.
+    pub fn approved(&self, key: &str) -> bool {
+        self.session_commands.lock().unwrap().contains(key)
+    }
+
     /// The mode a child agent starts with: read-only while a read-only preset
     /// (plan mode) is on, else the session's own.
     pub fn effective_mode(&self) -> Mode {
@@ -452,19 +474,8 @@ impl Policy {
         let nested = command.and_then(risk::nested);
         // Every command the parser finds, wrappers and keywords removed, for deny/ask rules.
         let programs = command.and_then(risk::programs);
-        let raw_path = args.get("path").and_then(Value::as_str);
-        let abs_path = raw_path.map(|p| expand(p, cwd, &self.home));
-        // Through symlinks, so a link can't route around a path rule.
-        let real_path = abs_path.as_deref().map(real);
-        // The resolved path as a relative or `~/` path too, for rules written that way.
-        let real_short: Vec<String> = match &real_path {
-            Some(rp) => [(real(cwd), ""), (real(&self.home), "~/")]
-                .iter()
-                .filter_map(|(base, pre)| Some(format!("{pre}{}", rp.strip_prefix(base).ok()?.to_str()?)))
-                .collect(),
-            None => Vec::new(),
-        };
-        let links_away = real_path.is_some() && real_path.as_deref() != abs_path.as_deref().map(lexical).as_deref();
+        let path = PathArg::new(args, cwd, &self.home);
+        let raw_path = path.raw;
         let matches = |r: &Rule, all: bool| -> bool {
             if !r.matches_tool(rule_tool) {
                 return false;
@@ -478,17 +489,7 @@ impl Policy {
                     .chain(nested.iter().flatten())
                     .chain(programs.iter().flatten())
                     .any(|s| r.matches_command(s)),
-                None if FILE_TOOLS.contains(&lower.as_str()) => {
-                    let given = r.matches_path(raw_path, abs_path.as_deref());
-                    let resolved = r.matches_path(None, real_path.as_deref())
-                        || real_short.iter().any(|s| r.matches_path(Some(s), None));
-                    // Allow needs both: a link inside an allowed area must not reach outside it.
-                    if all {
-                        given && (resolved || !links_away)
-                    } else {
-                        given || resolved
-                    }
-                }
+                None if FILE_TOOLS.contains(&lower.as_str()) => path.matches(r, all),
                 None => r.pattern.is_none(),
             }
         };
@@ -565,6 +566,30 @@ impl Policy {
                 }
                 Level::Safe => read_only_bash = true,
                 Level::Low => {}
+            }
+            // A computed command name (`$x`, `$(…)`) may run what a deny or ask rule names:
+            // with such rules it asks (refused unattended), unless approved this session.
+            if !read_only
+                && self
+                    .deny
+                    .iter()
+                    .chain(self.ask.iter())
+                    .any(|r| r.matches_tool(rule_tool))
+                && risk::commands(command).is_some_and(|c| c.iter().any(|s| risk::computed(&s.words)))
+                && !self.session_commands.lock().unwrap().contains(command)
+            {
+                let reason = "the command name is computed".to_string();
+                return if interactive {
+                    Verdict::Ask {
+                        reason,
+                        rule: command.to_string(),
+                        risky: true,
+                    }
+                } else {
+                    Verdict::Deny(format!(
+                        "Not run: {reason}, so your deny and ask rules can't check it, and nobody can approve it here. Write the command name out."
+                    ))
+                };
             }
             // Outside the sandbox even a read-only command reads what the sandbox hides
             // (L6.1/L6.8): refused in read-only mode, asked in ask mode; auto mode has the judge.
@@ -655,20 +680,22 @@ impl Policy {
                 q.file_name().is_some_and(|n| n == "settings.json")
                     && q.parent().and_then(Path::file_name).is_some_and(|d| d == ".novacode")
             };
-            // Global extensions, skills, agents, prompts, packages and MCP servers run commands.
+            // Global extensions, skills, agents, prompts, packages and MCP servers run commands,
+            // and so do Claude-compatible ones and shell startup files.
             let real_home = real(&self.home);
             let global = |q: &Path| -> Option<&'static str> {
                 [&self.home, &real_home].iter().find_map(|h| {
-                    let rest = q.strip_prefix(h.join(".novacode")).ok()?;
-                    match rest.components().next()?.as_os_str().to_str()? {
-                        "extensions" => Some("extensions"),
-                        "skills" => Some("skills"),
-                        "agents" => Some("agents"),
-                        "prompts" => Some("prompts"),
-                        "packages" => Some("packages"),
-                        "mcp.json" if rest == Path::new("mcp.json") => Some("MCP servers"),
-                        _ => None,
-                    }
+                    let rest = q.strip_prefix(h).ok()?;
+                    GLOBAL_CONFIG
+                        .iter()
+                        .find(|(p, folder, _)| {
+                            if *folder {
+                                rest.starts_with(p)
+                            } else {
+                                rest == Path::new(p)
+                            }
+                        })
+                        .map(|g| g.2)
                 })
             };
             let found = written(&lower, args).into_iter().find_map(|p| {
@@ -677,7 +704,7 @@ impl Policy {
                     format!("`{tool}` changes novacode settings ({p}), which hold the permission rules")
                 } else {
                     let what = global(&lexical(&abs)).or_else(|| global(&real(&abs)))?;
-                    format!("`{tool}` changes novacode's own {what} ({p}), which can run commands")
+                    format!("`{tool}` changes {what} ({p}), which can run commands")
                 };
                 Some(why)
             });
@@ -713,8 +740,8 @@ impl Policy {
         }
 
         let ask = |reason: String| Verdict::Ask {
-            reason: match &real_path {
-                Some(rp) if links_away && raw_path.is_some() => {
+            reason: match &path.real {
+                Some(rp) if path.links_away && raw_path.is_some() => {
                     format!("{reason}; {} resolves to {}", raw_path.unwrap_or(""), rp.display())
                 }
                 _ => reason,
@@ -790,8 +817,80 @@ fn suggest_rule(tool: &str, command: Option<&str>, path: Option<&str>) -> String
     }
 }
 
+/// Global config that runs commands: (path under home, a folder, what it is).
+/// File tools ask before writing there (L6.1).
+const GLOBAL_CONFIG: &[(&str, bool, &str)] = &[
+    (".novacode/extensions", true, "novacode's own extensions"),
+    (".novacode/skills", true, "novacode's own skills"),
+    (".novacode/agents", true, "novacode's own agents"),
+    (".novacode/prompts", true, "novacode's own prompts"),
+    (".novacode/packages", true, "novacode's own packages"),
+    (".novacode/mcp.json", false, "novacode's own MCP servers"),
+    (".claude/skills", true, "Claude-compatible skills"),
+    (".claude/agents", true, "Claude-compatible agents"),
+    (".claude/commands", true, "Claude-compatible commands"),
+    (".claude/settings.json", false, "Claude-compatible settings (hooks)"),
+    (".agents/skills", true, "Claude-compatible skills"),
+    (".bashrc", false, "a shell startup file"),
+    (".bash_profile", false, "a shell startup file"),
+    (".profile", false, "a shell startup file"),
+    (".zshrc", false, "a shell startup file"),
+    (".zprofile", false, "a shell startup file"),
+    (".zshenv", false, "a shell startup file"),
+    (".config/fish/config.fish", false, "a shell startup file"),
+    (".config/fish/conf.d", true, "a shell startup file"),
+];
+
+/// A file tool's `path` argument as given, absolute, and with symlinks
+/// resolved, for path rules.
+struct PathArg<'a> {
+    raw: Option<&'a str>,
+    abs: Option<PathBuf>,
+    /// Through symlinks, so a link can't route around a path rule.
+    real: Option<PathBuf>,
+    /// The resolved path as a relative or `~/` path too, for rules written that way.
+    short: Vec<String>,
+    /// The resolved path differs from the given one.
+    links_away: bool,
+}
+
+impl<'a> PathArg<'a> {
+    fn new(args: &'a Value, cwd: &Path, home: &Path) -> Self {
+        let raw = args.get("path").and_then(Value::as_str);
+        let abs = raw.map(|p| expand(p, cwd, home));
+        let real_path = abs.as_deref().map(real);
+        let short = match &real_path {
+            Some(rp) => [(real(cwd), ""), (real(home), "~/")]
+                .iter()
+                .filter_map(|(base, pre)| Some(format!("{pre}{}", rp.strip_prefix(base).ok()?.to_str()?)))
+                .collect(),
+            None => Vec::new(),
+        };
+        let links_away = real_path.is_some() && real_path.as_deref() != abs.as_deref().map(lexical).as_deref();
+        Self {
+            raw,
+            abs,
+            real: real_path,
+            short,
+            links_away,
+        }
+    }
+
+    fn matches(&self, r: &Rule, all: bool) -> bool {
+        let given = r.matches_path(self.raw, self.abs.as_deref());
+        let resolved =
+            r.matches_path(None, self.real.as_deref()) || self.short.iter().any(|s| r.matches_path(Some(s), None));
+        // Allow needs both: a link inside an allowed area must not reach outside it.
+        if all {
+            given && (resolved || !self.links_away)
+        } else {
+            given || resolved
+        }
+    }
+}
+
 /// The paths a file-changing tool call writes.
-fn written(tool: &str, args: &Value) -> Vec<String> {
+pub(crate) fn written(tool: &str, args: &Value) -> Vec<String> {
     match tool {
         "apply_patch" => args["patch"]
             .as_str()
@@ -820,7 +919,7 @@ fn written(tool: &str, args: &Value) -> Vec<String> {
 
 /// `p` with symlinks resolved: the file itself if it exists, else its nearest
 /// existing ancestor plus the rest.
-fn real(p: &Path) -> PathBuf {
+pub(crate) fn real(p: &Path) -> PathBuf {
     real_depth(p, 0)
 }
 
@@ -842,7 +941,7 @@ fn real_depth(p: &Path, depth: u32) -> PathBuf {
 }
 
 /// `p` with `.` and `..` folded away, without touching the disk.
-fn lexical(p: &Path) -> PathBuf {
+pub(crate) fn lexical(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in p.components() {
         match c {
@@ -856,7 +955,7 @@ fn lexical(p: &Path) -> PathBuf {
     out
 }
 
-fn expand(p: &str, cwd: &Path, home: &Path) -> PathBuf {
+pub(crate) fn expand(p: &str, cwd: &Path, home: &Path) -> PathBuf {
     match p.strip_prefix("~/") {
         Some(rest) => home.join(rest),
         None => cwd.join(p),
@@ -1131,6 +1230,56 @@ mod tests {
     }
 
     #[test]
+    fn deny_rules_see_trap_git_options_and_computed_names() {
+        let p = policy(json!({ "deny": ["Bash(git push:*)", "Bash(curl:*)"] }));
+        // git's global options don't hide the subcommand.
+        for c in [
+            "git -C . push",
+            "git --no-pager push",
+            "git -c x=y push origin",
+            "git --git-dir=.git --work-tree . -p push",
+            "git --bare --namespace n push",
+        ] {
+            assert!(denied(&check(&p, "bash", bash(c), true)), "{c}");
+        }
+        assert_eq!(check(&p, "bash", bash("git -C . status"), true), Verdict::Allow);
+        // A `trap` body is a command too.
+        assert!(denied(&check(&p, "bash", bash("trap 'curl x' EXIT"), true)));
+        // `command -v` only looks the name up.
+        assert_eq!(check(&p, "bash", bash("command -v curl"), true), Verdict::Allow);
+        assert!(denied(&check(&p, "bash", bash("command curl x"), true)));
+        // A computed command name asks while deny or ask rules exist; refused unattended.
+        let c = "x=curl; $x https://e";
+        match check(&p, "bash", bash(c), true) {
+            Verdict::Ask { reason, rule, risky } => {
+                assert_eq!(
+                    (reason.as_str(), rule.as_str(), risky),
+                    ("the command name is computed", c, true)
+                )
+            }
+            v => panic!("{v:?}"),
+        }
+        assert!(denied(&check(&p, "bash", bash(c), false)));
+        let ask = policy(json!({ "ask": ["Bash(wget:*)"] }));
+        assert!(matches!(
+            check(&ask, "bash", bash("$(echo wget) x"), true),
+            Verdict::Ask { .. }
+        ));
+        // Approved for the session: no second card.
+        let req = ApprovalRequest {
+            tool: "bash".into(),
+            args: bash(c),
+            reason: String::new(),
+            rule: c.into(),
+            risky: true,
+        };
+        p.record(&req, &Approval::Session);
+        assert_eq!(check(&p, "bash", bash(c), true), Verdict::Allow);
+        // No rules: auto mode runs it (the gate holds it as Confirm, the judge looks at it).
+        assert_eq!(check(&policy(json!({})), "bash", bash(c), false), Verdict::Allow);
+    }
+
+    #[test]
     fn hook_decisions() {
         let hook = |p: &Policy, tool: &str, args: Value, h: HookDecision| {
             p.check_tool(tool, false, &args, Path::new(CWD), true, &h)
@@ -1247,6 +1396,13 @@ mod tests {
         assert_eq!(check("write", json!({"path": "~/.novacode/AGENTS.md"})), Verdict::Allow);
         // Global executable config asks first, past the allow rule; refused unattended.
         std::os::unix::fs::symlink(home.join(".novacode/skills"), proj.join("sk")).unwrap();
+        // Through symlinks too: a project link to ~/.bashrc or ~/.claude/skills.
+        std::fs::create_dir_all(home.join(".claude/skills")).unwrap();
+        std::os::unix::fs::symlink(home.join(".bashrc"), proj.join("rc")).unwrap();
+        std::os::unix::fs::symlink(home.join(".claude/skills"), proj.join("csk")).unwrap();
+        // Not every dotfile: only the startup files themselves.
+        assert_eq!(check("write", json!({"path": "~/.bashrc.d.txt"})), Verdict::Allow);
+        assert_eq!(check("write", json!({"path": "~/.claude/notes.md"})), Verdict::Allow);
         let add = |f: &str| format!("*** Begin Patch\n*** Add File: {f}\n+a\n*** End Patch");
         for (tool, args) in [
             ("edit", json!({"path": "~/.novacode/skills/x/SKILL.md"})),
@@ -1257,6 +1413,22 @@ mod tests {
             ("write", json!({"path": "~/.novacode/mcp.json"})),
             ("write", json!({"path": "sk/x/SKILL.md"})),
             ("apply_patch", json!({"patch": add("~/.novacode/skills/y/SKILL.md")})),
+            // Claude-compatible config and shell startup files (R15/L6.1).
+            ("write", json!({"path": "~/.claude/skills/x/SKILL.md"})),
+            ("write", json!({"path": "~/.claude/agents/a.md"})),
+            ("write", json!({"path": "~/.claude/commands/c.md"})),
+            ("edit", json!({"path": "~/.claude/settings.json"})),
+            ("write", json!({"path": "~/.agents/skills/x/SKILL.md"})),
+            ("edit", json!({"path": "~/.bashrc"})),
+            ("edit", json!({"path": "~/.bash_profile"})),
+            ("edit", json!({"path": "~/.profile"})),
+            ("edit", json!({"path": "~/.zshrc"})),
+            ("edit", json!({"path": "~/.zprofile"})),
+            ("edit", json!({"path": "~/.zshenv"})),
+            ("edit", json!({"path": "~/.config/fish/config.fish"})),
+            ("write", json!({"path": "~/.config/fish/conf.d/x.fish"})),
+            ("write", json!({"path": "rc"})),
+            ("write", json!({"path": "csk/x/SKILL.md"})),
         ] {
             assert!(denied(&check(tool, args.clone())), "{args}");
             match p.check(tool, &args, &proj, true) {

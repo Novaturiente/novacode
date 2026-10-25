@@ -398,6 +398,8 @@ pub fn programs(src: &str) -> Option<Vec<String>> {
             .filter_map(|s| {
                 let (first, rest) = s.words.split_first()?;
                 let base = first.rsplit('/').next().unwrap_or(first);
+                // git's global options don't change the subcommand: `git -C . push` is a `git push`.
+                let rest = if base == "git" { git_globals(rest) } else { rest };
                 Some(
                     std::iter::once(base)
                         .chain(rest.iter().map(String::as_str))
@@ -407,6 +409,42 @@ pub fn programs(src: &str) -> Option<Vec<String>> {
             })
             .collect(),
     )
+}
+
+/// `args` of git without its leading global options (`-C`, `-c`, `--git-dir`,
+/// `--work-tree`, `--namespace` with their values; `--no-pager`, `-p`,
+/// `--paginate`, `--bare`), for deny and ask rules (L6.1).
+fn git_globals(args: &[String]) -> &[String] {
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        i += match a.as_str() {
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" => 2,
+            "--no-pager" | "-p" | "--paginate" | "--bare" => 1,
+            a if ["--git-dir=", "--work-tree=", "--namespace="]
+                .iter()
+                .any(|p| a.starts_with(p)) =>
+            {
+                1
+            }
+            _ => break,
+        };
+    }
+    &args[i.min(args.len())..]
+}
+
+/// A command name built at run time (`$x`, `$(…)`, backticks): nobody can tell
+/// from the text what runs (L6.2, L6.8).
+pub(crate) fn computed(words: &[String]) -> bool {
+    words
+        .first()
+        .is_some_and(|f| f.is_empty() || f.contains('$') || f.contains('`'))
+}
+
+/// `command -v`/`-V` only looks a name up; it doesn't run it.
+fn lookup_only(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|a| a.starts_with('-') && *a != "-" && *a != "--")
+        .any(|a| a.contains('v') || a.contains('V'))
 }
 
 fn commands_into(src: &str, depth: u32, nested: bool, out: &mut Vec<Simple>) -> Option<()> {
@@ -589,6 +627,7 @@ fn unwrap(words: &[String]) -> Inner<'_> {
                 .get(1..)
                 .unwrap_or_default(),
             "xargs" => skip_opts(args, XARGS_VALUE_FLAGS),
+            "command" if lookup_only(args) => return Inner::Words(w),
             n if WRAPPERS.contains(&n) => skip_opts(args, wrapper_flags(n)),
             _ => return Inner::Words(w),
         };
@@ -684,7 +723,7 @@ fn opt_value<'a>(args: &'a [String], letter: char, long: &str) -> Option<&'a str
 
 /// What a runner runs (L6.2, L6.8): `watch`, `flock`, `setsid`, `nsenter`,
 /// `unshare`, `script -c`, `su -c`, `busybox`, `systemd-run`, `parallel`,
-/// `find -exec`/`-execdir`/`-ok`, `git submodule foreach`.
+/// `find -exec`/`-execdir`/`-ok`, `git submodule foreach`, `trap '<script>'`.
 fn runner<'a>(name: &str, args: &'a [String]) -> Vec<Inner<'a>> {
     let words = |w: &'a [String]| if w.is_empty() { vec![] } else { vec![Inner::Words(w)] };
     let script = |w: &[String]| {
@@ -719,6 +758,11 @@ fn runner<'a>(name: &str, args: &'a [String]) -> Vec<Inner<'a>> {
             }
         }
         "setsid" => words(skip_opts(args, &[])),
+        // `trap '<script>' SIGNAL…`: the shell runs the script later (on exit, a signal).
+        "trap" => match skip_opts(args, &[]).first() {
+            Some(body) if body != "-" => vec![Inner::Script(body.clone())],
+            _ => vec![],
+        },
         "nsenter" => words(skip_opts(args, &["-t", "--target", "-S", "--setuid", "-G", "--setgid"])),
         "unshare" => words(skip_opts(
             args,
@@ -1183,10 +1227,14 @@ fn simple_base(w: &[String], input: &[String], piped: bool, ctx: &Ctx, depth: u3
     let Some(first) = w.first() else {
         return Risk::safe();
     };
+    if computed(w) {
+        return Risk::new(Level::Confirm, "the command name is computed");
+    }
     let name = first.rsplit('/').next().unwrap_or(first).to_string();
     let args = &w[1..];
     let rest = || args.join(" ");
     match name.as_str() {
+        "command" if lookup_only(args) => Risk::safe(),
         "sudo" | "doas" | "pkexec" => {
             let inner = skip_opts(args, SUDO_VALUE_FLAGS);
             let inner_risk = if inner.is_empty() {
@@ -2198,6 +2246,22 @@ mod tests {
             ("parallel 'rm -rf ~' ::: a", Catastrophic),
             ("git submodule foreach 'rm -rf ~'", Catastrophic),
             ("setsid cargo build", Low),
+            // A `trap` body is a script the shell runs later (R15/L6.2).
+            ("trap 'rm -rf ~' EXIT", Catastrophic),
+            ("trap -- 'rm -rf ~' EXIT INT", Catastrophic),
+            ("trap \"sh -c 'rm -rf /'\" EXIT", Catastrophic),
+            ("trap 'echo bye' EXIT", Low),
+            ("trap - EXIT", Low),
+            // A computed command name can't be read (R15/L6.2).
+            ("x=rm; $x -rf ~", Confirm),
+            ("${CMD} build", Confirm),
+            ("$(echo rm) -rf ~", Confirm),
+            ("`echo rm` -rf ~", Confirm),
+            ("sudo $x", Confirm),
+            // `command -v`/`-V` only looks a name up.
+            ("command -v curl", Safe),
+            ("command -V rm -rf", Safe),
+            ("command -pv git", Safe),
             // Heredoc bodies are data (the screenshot case: JS with `=>` and `{`).
             (
                 "cat > ./q.mjs <<'EOF'\nconst f = (s)=>{ return a > b; };\nconsole.log(x >> 2);\nEOF",

@@ -156,8 +156,8 @@ pub async fn authorize_cancellable(
     let (reason, rule, risky) = match policy.check_tool(tool, read_only, args, cwd, approver.is_some(), hook) {
         Verdict::Allow => {
             let judge = judge?;
-            let (command, why) = crate::judge::scope(policy, tool, args, cwd)?;
-            match judge.decide(&command, &why, cancel).await {
+            let (subject, why) = crate::judge::scope(policy, tool, args, cwd)?;
+            match judge.decide(&subject, &why, cancel).await {
                 Decision::Allow => return None,
                 Decision::Aborted => return Some(ToolOutput::error("Not run: aborted.")),
                 Decision::Block(reason) if approver.is_none() => {
@@ -165,8 +165,8 @@ pub async fn authorize_cancellable(
                         "Refused by the command judge: {reason}. Do it another way, or ask the user to run it."
                     )));
                 }
-                // Risky: no "always"; a yes is remembered for this exact command.
-                Decision::Block(reason) => (format!("the command judge: {reason}"), command, true),
+                // Risky: no "always"; a yes is remembered for this exact command (or file and tool).
+                Decision::Block(reason) => (format!("the command judge: {reason}"), subject.key(), true),
             }
         }
         Verdict::Deny(why) => return Some(ToolOutput::error(why)),
@@ -287,20 +287,120 @@ mod tests {
         }
 
         async fn auth(p: &Policy, cards: Option<&Arc<Cards>>, j: &Judge, cmd: &str) -> Option<ToolOutput> {
+            auth_tool(p, cards, j, "bash", json!({ "command": cmd }), Path::new("/w")).await
+        }
+
+        async fn auth_tool(
+            p: &Policy,
+            cards: Option<&Arc<Cards>>,
+            j: &Judge,
+            tool: &str,
+            args: Value,
+            cwd: &Path,
+        ) -> Option<ToolOutput> {
             let approver = cards.map(|c| c.clone() as Arc<dyn Approver>);
             let never = tokio_util::sync::CancellationToken::new();
             authorize_cancellable(
                 p,
                 approver.as_ref(),
                 Some(j),
-                "bash",
+                tool,
                 false,
-                &json!({ "command": cmd }),
-                Path::new("/w"),
+                &args,
+                cwd,
                 &HookDecision::None,
                 &never,
             )
             .await
+        }
+
+        #[tokio::test]
+        async fn file_writes_outside_the_project_are_judged() {
+            let w = Path::new("/w");
+            let write = |path: &str, content: &str| json!({ "path": path, "content": content });
+            // Inside the project or /tmp: no judge call.
+            let (j, faux) = judge("BLOCK: no");
+            let p = policy(json!({}));
+            for path in ["a.txt", "/w/sub/b.txt", "/tmp/x"] {
+                assert!(
+                    auth_tool(&p, None, &j, "write", write(path, "x"), w).await.is_none(),
+                    "{path}"
+                );
+            }
+            assert!(faux.requests.lock().unwrap().is_empty());
+
+            // Outside: the judge sees the tool, the path and the start of the content.
+            let long = format!("echo pwned\n{}", "a".repeat(3000));
+            let out = auth_tool(&p, None, &j, "write", write("~/.local/bin/x", &long), w)
+                .await
+                .unwrap();
+            assert!(text(&out).contains("Refused by the command judge: no."));
+            let sent = format!("{:?}", faux.requests.lock().unwrap()[0].messages);
+            assert!(sent.contains("writes /h/.local/bin/x, outside the project"), "{sent}");
+            assert!(sent.contains("The `write` tool writes this path"), "{sent}");
+            assert!(
+                sent.contains("echo pwned") && !sent.contains(&"a".repeat(1001)),
+                "{sent}"
+            );
+
+            // edit and apply_patch too.
+            let (j, faux) = judge("BLOCK: no");
+            let edit = json!({ "path": "../other/f.rs", "edits": [{ "old_text": "a", "new_text": "b" }] });
+            assert!(auth_tool(&p, None, &j, "edit", edit, w).await.is_some());
+            assert!(format!("{:?}", faux.requests.lock().unwrap()[0].messages).contains("/other/f.rs"));
+            let (j, faux) = judge("BLOCK: no");
+            let patch = "*** Begin Patch\n*** Add File: /srv/x\n+a\n*** End Patch";
+            assert!(
+                auth_tool(&p, None, &j, "apply_patch", json!({ "input": patch }), w)
+                    .await
+                    .is_some()
+            );
+            assert!(format!("{:?}", faux.requests.lock().unwrap()[0].messages).contains("apply_patch"));
+
+            // A block asks a present user; a yes is remembered for that tool and path.
+            let (j, faux) = judge("BLOCK: not asked for");
+            let yes = Arc::new(Cards(Approval::Session, Mutex::default()));
+            let args = write("/srv/www/index.html", "hi");
+            assert!(auth_tool(&p, Some(&yes), &j, "write", args.clone(), w).await.is_none());
+            let req = yes.1.lock().unwrap()[0].clone();
+            assert_eq!((req.rule.as_str(), req.risky), ("Write(/srv/www/index.html)", true));
+            assert!(auth_tool(&p, Some(&yes), &j, "write", args, w).await.is_none());
+            assert_eq!(faux.requests.lock().unwrap().len(), 1);
+
+            // An allow rule covering the path, or ask mode, skips the judge.
+            let (j, faux) = judge("BLOCK: no");
+            let allowed = policy(json!({ "allow": ["Write(/srv/**)"] }));
+            assert!(
+                auth_tool(&allowed, None, &j, "write", write("/srv/a", "x"), w)
+                    .await
+                    .is_none()
+            );
+            let ask = policy(json!({ "mode": "ask" }));
+            let once = Arc::new(Cards(Approval::Once, Mutex::default()));
+            assert!(
+                auth_tool(&ask, Some(&once), &j, "write", write("/srv/a", "x"), w)
+                    .await
+                    .is_none()
+            );
+            assert!(faux.requests.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn file_writes_through_a_link_out_of_the_project_are_judged() {
+            let proj = tempfile::tempdir().unwrap();
+            let away = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+            let proj_path = proj.path().canonicalize().unwrap();
+            std::os::unix::fs::symlink(away.path(), proj_path.join("out")).unwrap();
+            let (j, faux) = judge("BLOCK: no");
+            let p = policy(json!({}));
+            let args = json!({ "path": "out/x", "content": "x" });
+            assert!(auth_tool(&p, None, &j, "write", args, &proj_path).await.is_some());
+            let sent = format!("{:?}", faux.requests.lock().unwrap()[0].messages);
+            let real = away.path().canonicalize().unwrap().join("x");
+            assert!(
+                sent.contains(&format!("writes {}, outside the project", real.display())),
+                "{sent}"
+            );
         }
 
         fn text(o: &ToolOutput) -> String {
