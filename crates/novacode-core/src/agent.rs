@@ -982,6 +982,7 @@ impl Agent {
             };
             (from, path[cut].id.clone())
         };
+        self.emit(AgentEvent::Compacting { tokens_before });
         self.emit(AgentEvent::Stream(StreamEvent::Notice {
             text: format!("compacting: {why}"),
         }));

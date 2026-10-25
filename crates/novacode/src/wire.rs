@@ -79,6 +79,9 @@ pub struct State {
     /// Context in use (last reply's usage plus estimates since), in tokens.
     #[serde(default)]
     pub context_tokens: u64,
+    /// Compactions on the session's current branch (L9.19).
+    #[serde(default)]
+    pub compactions: u32,
     #[serde(default)]
     pub cache: CacheStats,
     /// Session token totals.

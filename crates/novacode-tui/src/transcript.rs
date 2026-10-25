@@ -27,6 +27,11 @@ pub enum Item {
         /// replayed one). Errors and replies to the user's own commands stay in view.
         folds: bool,
     },
+    /// A full-width line that never folds: the context was compacted (L9.19).
+    Divider {
+        text: String,
+        error: bool,
+    },
 }
 
 pub struct Tool {
@@ -240,6 +245,14 @@ impl Transcript {
             text: text.into(),
             error,
             folds,
+        });
+    }
+
+    /// A full-width divider that stays in view when its turn folds (a compaction, L9.19).
+    pub fn divider(&mut self, text: impl Into<String>, error: bool) {
+        self.turn().items.push(Item::Divider {
+            text: text.into(),
+            error,
         });
     }
 
@@ -704,8 +717,10 @@ fn lay_turn(
             && turn.items[..idx]
                 .iter()
                 .all(|i| matches!(i, Item::User(_) | Item::Image(_)));
-        let is_step = !matches!(item, Item::User(_) | Item::Notice { folds: false, .. })
-            && Some(idx) != final_reply
+        let is_step = !matches!(
+            item,
+            Item::User(_) | Item::Notice { folds: false, .. } | Item::Divider { .. }
+        ) && Some(idx) != final_reply
             && !prompt_image;
         if turn.done && turn.foldable() && !folded && is_step {
             folded = true;
@@ -768,6 +783,7 @@ fn lay_turn(
                     }
                 }
             }
+            Item::Divider { text, error } => lines.push(divider(text, *error, width, t)),
             Item::Notice { text, error, .. } => {
                 let st = if *error { t.error } else { t.dim };
                 // Multi-line notices (`!cmd` output) keep their lines.
@@ -1240,6 +1256,19 @@ fn reminder_line(text: &str) -> Option<String> {
     Some(line)
 }
 
+/// `━━ text ━━…` exactly `width` cells wide; a long text is cut with `…`.
+fn divider(text: &str, error: bool, width: usize, t: &Theme) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
+    let st = if error { t.error } else { t.accent }.add_modifier(ratatui::style::Modifier::BOLD);
+    let head = wrap::truncate(vec![Span::styled(format!("━━ {} ", sanitize(text)), st)], width);
+    let mut spans = head.spans;
+    let fill = width.saturating_sub(wrap::width(&spans));
+    spans.push(Span::styled("━".repeat(fill), st));
+    Line::from(spans)
+}
+
 #[cfg(test)]
 mod reminder_tests {
     use super::reminder_line;
@@ -1323,6 +1352,57 @@ mod reminder_tests {
             s.contains("retry failed hard") && s.contains("done it") && s.contains("model → x"),
             "{s}"
         );
+    }
+
+    #[test]
+    fn a_compaction_divider_fills_the_width_and_never_folds() {
+        use novacode_types::{AssistantMessage, Block, Message, StopReason};
+        let theme = crate::theme::Theme::default();
+        let mut tr = super::Transcript::default();
+        tr.on_message(&Message::user("go"));
+        tr.notice("a step note", false);
+        tr.divider("context compacted · 182k → 41k tokens · 37 notes", false);
+        tr.on_message(&Message::Assistant(AssistantMessage {
+            content: vec![Block::text("done it")],
+            stop: StopReason::Stop,
+            usage: Default::default(),
+            provider: "p".into(),
+            model: "m".into(),
+            response_id: None,
+            error_message: None,
+            thinking_level: None,
+        }));
+        tr.settle();
+        let v = tr.layout(80, &theme);
+        let line = v
+            .lines
+            .iter()
+            .find(|l| crate::wrap::plain(l).contains("context compacted"))
+            .expect("the divider stays after the turn folds");
+        assert_eq!(crate::wrap::width(&line.spans), 80);
+        let text = crate::wrap::plain(line);
+        assert!(
+            text.starts_with("━━ context compacted · 182k → 41k tokens · 37 notes ━"),
+            "{text}"
+        );
+        assert!(text.ends_with('━'), "{text}");
+        let all: Vec<String> = v.lines.iter().map(crate::wrap::plain).collect();
+        assert!(all.iter().any(|l| l.contains("▸ 1 note")), "{all:?}");
+        assert!(!all.iter().any(|l| l.contains("a step note")), "{all:?}");
+        assert!(
+            line.spans[0]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        // Narrow: cut to the width, never wider, no panic.
+        for w in [0, 1, 5, 20] {
+            let l = super::divider("context compacted · 1k → 0k tokens · no notes", true, w, &theme);
+            assert_eq!(crate::wrap::width(&l.spans), w);
+            if w > 0 {
+                assert_eq!(l.spans[0].style.fg, theme.error.fg);
+            }
+        }
     }
 
     #[test]

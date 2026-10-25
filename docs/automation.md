@@ -130,7 +130,7 @@ Every message has a `type`.
 |---|---|
 | `hello` | Always first: `protocol`, `version`, `capabilities`, and the session `state` |
 | `history` | The session's messages so far (sent right after `hello`) |
-| `event` | A loop event in `event`: `agent_start`, `turn_start`, `stream`, `message`, `tool_start`, `tool_update`, `tool_end`, `retry`, `agent_end`, `settled`, `compacted`, `prompt_taken_back` (Esc before the first reply took the prompt off the branch; `text` holds it), … Streamed text arrives as `stream` events with `"stream":"delta"` |
+| `event` | A loop event in `event`: `agent_start`, `turn_start`, `stream`, `message`, `tool_start`, `tool_update`, `tool_end`, `retry`, `agent_end`, `settled`, `compacting` (a compaction started, with `tokens_before`), `compacted`, `prompt_taken_back` (Esc before the first reply took the prompt off the branch; `text` holds it), … Streamed text arrives as `stream` events with `"stream":"delta"` |
 | `response` | The answer to a command that had an `id`: `command`, `ok`, `data`, `error` |
 | `ui` | A notice, page or list for the user, tagged by `ui.kind` |
 | `approve` | A permission question (see below) |
@@ -182,6 +182,7 @@ These need the session's own window and answer with an error such as `/resume wo
 |---|---|
 | `session`, `cwd`, `model`, `level` | Session id, folder, `provider/model`, thinking level |
 | `window_tokens`, `context_tokens` | Context window size and tokens in use |
+| `compactions` | Compactions on the session's current branch |
 | `busy` | A run is in progress |
 | `activity` | `{state, detail}`: `working`, `blocked` or `idle`, and what it is doing |
 | `spent`, `price?` | USD spent on API-key routes, and the route's prices |

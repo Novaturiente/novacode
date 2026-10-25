@@ -97,6 +97,8 @@ pub struct Init {
     pub price: Option<Cost>,
     /// USD already spent on API-key routes in this session (resumed history).
     pub spent: f64,
+    /// Compactions on the session's current branch (L9.19), for the `compactions` segment.
+    pub compactions: u32,
     /// Extra slash commands for completion: prompt templates and `/skill:name` (L4.10, L4.11).
     pub commands: Vec<(String, String)>,
     /// Editor text to start with (a prompt taken back by `/rewind` or `/tree`).
@@ -386,6 +388,8 @@ pub struct App {
     tx: UnboundedSender<Cmd>,
     init: Init,
     pub busy: bool,
+    /// A compaction is running (L9.19); it can run while idle (after a turn, `/compact`).
+    pub compacting: bool,
     /// `/reload` during a turn: done when the turn ends, so the turn isn't cut off.
     reload_after: bool,
     /// Running processes in the manager (L5.11), for the status line.
@@ -513,6 +517,7 @@ impl App {
             tx,
             init,
             busy: false,
+            compacting: false,
             reload_after: false,
             procs,
             activity: String::new(),
@@ -854,6 +859,10 @@ impl App {
                 );
                 self.procs.remove(&id);
             }
+            AgentEvent::Compacting { .. } => {
+                self.compacting = true;
+                self.activity = "compacting context".into();
+            }
             AgentEvent::Compacted {
                 tokens_before,
                 tokens_after,
@@ -861,23 +870,31 @@ impl App {
                 fallback,
             } => {
                 self.ctx = tokens_after;
+                self.compacting = false;
+                if self.busy {
+                    self.activity = "working".into();
+                } else {
+                    self.activity.clear();
+                }
+                self.init.compactions += 1;
                 let how = if fallback {
-                    "no notes were available, earlier messages were dropped".to_string()
+                    "no notes, earlier messages were dropped".to_string()
                 } else {
                     format!("{notes} notes")
                 };
-                self.tr.notice(
+                self.tr.divider(
                     format!(
-                        "compacted: {}k → {}k tokens ({how})",
+                        "context compacted · {}k → {}k tokens · {how}",
                         tokens_before / 1000,
                         tokens_after / 1000
                     ),
-                    false,
+                    fallback,
                 );
             }
             AgentEvent::Ui { ext, op } => self.ui_op(&ext, op),
             AgentEvent::Settled => {
                 self.busy = false;
+                self.compacting = false;
                 self.activity.clear();
                 if std::mem::take(&mut self.reload_after) {
                     self.exit = Some(Exit::Reload);
@@ -2188,6 +2205,9 @@ impl App {
             },
         );
         let t = &self.theme;
+        if let Some(c) = crate::statusline::compactions(self.init.compactions, t) {
+            v.insert("compactions".into(), c);
+        }
         if !self.procs.is_empty() {
             v.insert("bg".into(), Value_::text(format!("⚙ {}", self.procs.len()), t.accent));
         }
@@ -2348,7 +2368,7 @@ impl App {
                 },
                 t.warn,
             ));
-        } else if self.busy {
+        } else if self.busy || self.compacting {
             left.push(Span::styled(
                 format!(" {} ", SPINNER[self.spinner % SPINNER.len()]),
                 t.accent,

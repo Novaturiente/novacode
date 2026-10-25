@@ -142,7 +142,7 @@ pub async fn run_in(
                 Some(ev) => app.on_agent(ev),
                 None => break Ok(Exit::Quit),
             },
-            _ = spin.tick(), if app.busy => {
+            _ = spin.tick(), if app.busy || app.compacting => {
                 app.spinner += 1;
                 app.tr.tick();
                 app.dirty = true;

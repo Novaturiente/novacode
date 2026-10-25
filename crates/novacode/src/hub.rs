@@ -55,6 +55,14 @@ pub struct Hub {
     pub unattended: std::sync::atomic::AtomicBool,
 }
 
+/// Compactions on a session branch (L9.19): the hub state's `compactions` at start.
+pub fn compactions(branch: &[&novacode_core::session::Entry]) -> u32 {
+    branch
+        .iter()
+        .filter(|e| matches!(e.kind, novacode_core::session::EntryKind::Compaction { .. }))
+        .count() as u32
+}
+
 fn activity_state(busy: bool, blocked: bool) -> ActState {
     if blocked {
         ActState::Blocked
@@ -128,9 +136,9 @@ impl Hub {
                 BlockKind::ToolCall => format!("writing {} call", name.as_deref().unwrap_or("tool")),
                 _ => "writing".into(),
             }),
-            AgentEvent::Stream(StreamEvent::Notice { text }) if text.starts_with("compacting") => {
-                Some("compacting".into())
-            }
+            AgentEvent::Compacting { .. } => Some("compacting".into()),
+            // Back to plain work; an idle session's detail is cleared below.
+            AgentEvent::Compacted { .. } => Some("working".into()),
             AgentEvent::ToolStart { call } => Some(format!("tool:{}", call.name)),
             AgentEvent::Retry { .. } => Some("retrying".into()),
             _ => None,
@@ -142,7 +150,7 @@ impl Hub {
         {
             g.state.activity.detail = d;
         }
-        if matches!(ev, AgentEvent::Settled) {
+        if matches!(ev, AgentEvent::Settled) || matches!(ev, AgentEvent::Compacted { .. }) && !g.state.busy {
             g.state.activity.detail.clear();
         }
         let blocked = !g.approvals.is_empty() || !g.asks.is_empty();
@@ -150,7 +158,10 @@ impl Hub {
         match &ev {
             AgentEvent::AgentStart => g.state.task_started_ms = Some(novacode_core::session::now_ms()),
             AgentEvent::Settled => g.state.task_started_ms = None,
-            AgentEvent::Compacted { tokens_after, .. } => g.state.context_tokens = *tokens_after,
+            AgentEvent::Compacted { tokens_after, .. } => {
+                g.state.context_tokens = *tokens_after;
+                g.state.compactions += 1;
+            }
             AgentEvent::Stream(StreamEvent::Notice { text }) if text.starts_with("cache miss:") => {
                 g.state.cache.last_miss = Some(text.trim_start_matches("cache miss:").trim().to_string());
             }
@@ -540,5 +551,39 @@ impl novacode_tools::ask::Asker for HubSlot {
             let hub = self.0.get().and_then(|w| w.upgrade())?;
             hub.ask_user(questions).await
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use novacode_core::session::{Entry, EntryKind};
+
+    #[test]
+    fn compactions_counts_the_branch_compaction_entries() {
+        let entry = |id: &str, kind| Entry {
+            id: id.into(),
+            parent: None,
+            ts_ms: 0,
+            kind,
+        };
+        let compaction = || EntryKind::Compaction {
+            system: String::new(),
+            summary: "s".into(),
+            first_kept: "m".into(),
+            tokens_before: 1000,
+            notes: 3,
+        };
+        let message = || EntryKind::Message {
+            message: novacode_types::Message::user("hi"),
+        };
+        let entries = [
+            entry("a", message()),
+            entry("b", compaction()),
+            entry("c", message()),
+            entry("d", compaction()),
+        ];
+        let branch: Vec<&Entry> = entries.iter().collect();
+        assert_eq!(super::compactions(&branch), 2);
+        assert_eq!(super::compactions(&branch[..1]), 0);
     }
 }

@@ -1069,6 +1069,19 @@ async fn compaction_without_notes_falls_back() {
             assert!(tokens_after < tokens_before, "{tokens_after} >= {tokens_before}");
         }
     }
+    // L9.19: each compaction is announced before its work, with the same starting size.
+    let marks: Vec<(bool, u64)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Compacting { tokens_before } => Some((true, *tokens_before)),
+            AgentEvent::Compacted { tokens_before, .. } => Some((false, *tokens_before)),
+            _ => None,
+        })
+        .collect();
+    assert!(!marks.is_empty() && marks.len().is_multiple_of(2), "{marks:?}");
+    for pair in marks.chunks(2) {
+        assert_eq!(pair, [(true, pair[0].1), (false, pair[0].1)], "{marks:?}");
+    }
     let p = format!("{:?}", agent.store.projection());
     assert!(p.contains("Summary of the earlier conversation"), "{p}");
 }

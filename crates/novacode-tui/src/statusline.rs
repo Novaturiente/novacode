@@ -33,6 +33,7 @@ pub const SEGMENTS: &[&str] = &[
     "queue",
     "mcp",
     "wtpath",
+    "compactions",
 ];
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -114,7 +115,17 @@ impl Default for Config {
             rows: vec![Row {
                 left: ids(&["activity"]),
                 // Dropped from the end on narrow screens: extension segments stay longest.
-                right: ids(&["ext", "bg", "ctx", "cache", "cost", "model", "cwd", "git"]),
+                right: ids(&[
+                    "ext",
+                    "bg",
+                    "compactions",
+                    "ctx",
+                    "cache",
+                    "cost",
+                    "model",
+                    "cwd",
+                    "git",
+                ]),
                 sep: two(),
             }],
             above: false,
@@ -172,6 +183,11 @@ impl Value_ {
             pct: None,
         }
     }
+}
+
+/// The `compactions` segment (L9.19): `compacted ×N`, nothing before the first one.
+pub fn compactions(n: u32, t: &Theme) -> Option<Value_> {
+    (n > 0).then(|| Value_::text(format!("compacted ×{n}"), t.dim))
 }
 
 /// Lay out every row. `values` holds the segments that have something to show;
@@ -293,5 +309,18 @@ mod tests {
         let ctx = lines[0].spans.iter().find(|s| s.content == "ctx 95%").unwrap();
         assert_eq!(ctx.style, t.error, "above the last threshold");
         assert_eq!(Config::parse(Some(&json!({"rows": 3}))).0, Config::default());
+    }
+
+    #[test]
+    fn compactions_segment_counts_and_hides_at_zero() {
+        let t = Theme::default();
+        assert!(compactions(0, &t).is_none());
+        let v = compactions(2, &t).unwrap();
+        let text: String = v.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "compacted ×2");
+        assert_eq!(v.spans[0].style, t.dim);
+        let c = Config::default();
+        let ids: Vec<&str> = c.rows[0].right.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids[2..4], ["compactions", "ctx"]);
     }
 }

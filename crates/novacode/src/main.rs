@@ -2076,6 +2076,7 @@ async fn start_session(
     for m in &history {
         state.add(m);
     }
+    state.compactions = hub::compactions(&agent.store.branch());
     // Priced per reply at its own model's rate (models::spent), not the current one.
     state.price = price;
     state.spent = models::spent(&ctx.providers, agent.store.entries());
@@ -2635,6 +2636,7 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
             info: std::mem::take(&mut info),
             price: state.price,
             spent: state.spent,
+            compactions: state.compactions,
             commands,
             draft: std::mem::take(&mut draft),
             attached: false,
