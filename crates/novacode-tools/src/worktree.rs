@@ -13,9 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = novacode_base::git::command()
-        .arg("-C")
-        .arg(dir)
+    let out = novacode_base::git::command_in(dir)
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
@@ -152,6 +150,8 @@ fn enter(cwd: &Path, a: &EnterArgs) -> Result<(PathBuf, String), String> {
         .lines()
         .any(|l| l.strip_prefix("worktree ").is_some_and(|p| Path::new(p) == path));
     if registered {
+        // L6.5: novacode's git commands in the worktree use the main checkout's common dir.
+        novacode_base::git::pin(&path, &r.common);
         return Ok((
             path,
             format!(
@@ -192,6 +192,7 @@ fn enter(cwd: &Path, a: &EnterArgs) -> Result<(PathBuf, String), String> {
         )
     }
     .map_err(|e| format!("git worktree add failed: {e}"))?;
+    novacode_base::git::pin(&path, &r.common);
     // Root .env* files are untracked by design; the worktree needs them to run.
     let mut copied = Vec::new();
     for f in std::fs::read_dir(&r.top).into_iter().flatten().flatten() {

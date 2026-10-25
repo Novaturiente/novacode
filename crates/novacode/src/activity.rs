@@ -46,9 +46,7 @@ impl Sinks {
 
 /// Repo name for a folder (main checkout, so worktrees map back); `None` outside git.
 pub async fn project(dir: &Path) -> Option<String> {
-    let out = Command::from(novacode_base::git::command())
-        .arg("-C")
-        .arg(dir)
+    let out = Command::from(novacode_base::git::command_in(dir))
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .stderr(std::process::Stdio::null())
         .output()

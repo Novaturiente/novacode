@@ -64,7 +64,7 @@ pub fn env_state(cwd: &Path) -> EnvState {
             .filter(|s| !s.is_empty())
     };
     let git = out(
-        novacode_base::git::command(),
+        novacode_base::git::command_in(cwd),
         &["rev-parse", "--abbrev-ref", "HEAD", "--short", "HEAD"],
     );
     let mut lines = git.as_deref().unwrap_or_default().lines().map(str::to_string);
@@ -79,9 +79,8 @@ pub fn env_state(cwd: &Path) -> EnvState {
 pub fn environment(cwd: &Path, env: &EnvState) -> String {
     let mut s = format!("Working directory: {}\nDate: {}", cwd.display(), env.date);
     if let (Some(b), Some(h)) = (&env.branch, &env.head) {
-        let dirty = novacode_base::git::command()
+        let dirty = novacode_base::git::command_in(cwd)
             .args(["status", "--porcelain", "--ignore-submodules=all"])
-            .current_dir(cwd)
             .output()
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
