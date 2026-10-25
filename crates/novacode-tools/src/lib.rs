@@ -112,8 +112,9 @@ pub fn exposed(tools: Vec<Arc<dyn Tool>>, overrides: impl Fn(&str) -> Option<Exp
 /// (codemode, L3.11): same lookup, permissions, hooks and output guards.
 pub trait Nested: Send + Sync {
     fn call(&self, name: String, args: Value, ctx: ToolCtx) -> BoxFuture<'static, ToolOutput>;
-    /// What a script can call: definitions plus the MCP server of `server__tool` names.
-    fn tools(&self) -> Vec<(ToolDef, Option<String>)>;
+    /// What a script can call: definitions, the MCP server of `server__tool` names,
+    /// and the declared output schema ([`Tool::output_schema`]).
+    fn tools(&self) -> Vec<(ToolDef, Option<String>, Option<Value>)>;
 }
 
 /// Which end of a long output to keep (L5.3).
@@ -192,6 +193,11 @@ pub trait Tool: Send + Sync {
     /// Lines for the prompt's `tool_guidelines` section, sent only while this tool is listed.
     fn guidelines(&self) -> &[&str] {
         &[]
+    }
+    /// JSON schema of the structured result a codemode script receives (MCP
+    /// `outputSchema`); `None` = the script gets the output text.
+    fn output_schema(&self) -> Option<Value> {
+        None
     }
     fn execute<'a>(&'a self, args: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput>;
 

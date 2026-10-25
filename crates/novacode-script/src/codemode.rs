@@ -12,6 +12,11 @@ use std::time::{Duration, Instant};
 /// Something a script can call: `name` is the tool's real name (`server__tool` for MCP).
 pub trait Host: Send + Sync + 'static {
     fn call(&self, name: String, args: Value) -> BoxFuture<'static, Result<Value, String>>;
+    /// Time this script's calls have spent waiting on the user so far (approval
+    /// cards, `ask_user`), including a wait still going; it doesn't count toward the timeout.
+    fn user_wait(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -21,6 +26,8 @@ pub struct ToolInfo {
     pub schema: Value,
     /// MCP server for `server__tool` names; reached as `mcp.<server>.<tool>()`.
     pub namespace: Option<String>,
+    /// JSON schema of the structured result (MCP `outputSchema`); `None` = text.
+    pub output_schema: Option<Value>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -576,6 +583,7 @@ mod tests {
             description: format!("{n} does things"),
             schema: json!({"type": "object", "properties": {"q": {"type": "string", "description": "query"}}, "required": ["q"]}),
             namespace: ns.map(String::from),
+            output_schema: None,
         };
         vec![t("read", None), t("fail", None), t("ctx7__search", Some("ctx7"))]
     }
@@ -600,6 +608,7 @@ mod tests {
             description: String::new(),
             schema: json!({}),
             namespace: None,
+            output_schema: None,
         });
         let o = run(
             "const m = await models.getModelOfType('classifier', 'x', 'jev');

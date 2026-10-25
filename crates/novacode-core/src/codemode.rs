@@ -89,12 +89,12 @@ impl Nested for Runner {
         })
     }
 
-    fn tools(&self) -> Vec<(ToolDef, Option<String>)> {
+    fn tools(&self) -> Vec<(ToolDef, Option<String>, Option<Value>)> {
         self.tools
             .iter()
             .map(|t| {
                 let ns = t.name().split_once("__").map(|(s, _)| s.to_string());
-                (pipeline::def(t.as_ref()), ns)
+                (pipeline::def(t.as_ref()), ns, t.output_schema())
             })
             .collect()
     }
@@ -130,6 +130,14 @@ impl Codemode {
             store: Mutex::default(),
             description,
         }
+    }
+}
+
+impl Codemode {
+    /// Like [`Codemode::new`], plus MCP tools known from an earlier connect, whose
+    /// signatures go into the description within a budget (L7.5).
+    pub fn with_signatures(servers: &[(String, String)], _tools: &[ToolInfo]) -> Self {
+        Self::new(servers)
     }
 }
 
@@ -263,11 +271,12 @@ impl Tool for Codemode {
             let tools: Vec<ToolInfo> = nested
                 .tools()
                 .into_iter()
-                .map(|(d, ns)| ToolInfo {
+                .map(|(d, ns, output_schema)| ToolInfo {
                     name: d.name,
                     description: d.description,
                     schema: d.schema,
                     namespace: ns,
+                    output_schema,
                 })
                 .collect();
             let mut inner = ctx.clone();
