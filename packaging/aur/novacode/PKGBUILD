@@ -1,7 +1,7 @@
 # Maintainer: Novaturiente
 # shortcut: sha256sums SKIP until the first release; set them with updpkgsums.
 pkgname=novacode
-pkgver=0.2.6
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="A lightweight, fast, extensible coding agent harness"
 arch=('x86_64' 'aarch64')
