@@ -2386,7 +2386,7 @@ async fn serve_headless(ctx: &Ctx, store: Store, model: String) -> anyhow::Resul
     }
     let on_signal = host.hub.handle.clone();
     tokio::spawn(async move {
-        // SIGTERM too (a parent's `stop`): end cleanly so the process manager's Drop kills its jobs.
+        // SIGTERM too (a parent's `stop`): end cleanly so the processes are stopped below.
         let int = async {
             if tokio::signal::ctrl_c().await.is_err() {
                 std::future::pending::<()>().await;
@@ -2408,6 +2408,10 @@ async fn serve_headless(ctx: &Ctx, store: Store, model: String) -> anyhow::Resul
         on_signal.shutdown();
     });
     let agent = task.await?;
+    // Explicit, as in the window: `host.processes` holds a clone, so the manager's Drop doesn't run.
+    if let Some(pm) = agent.processes() {
+        pm.kill_all();
+    }
     drop(agent);
     let sup = ctx.sup.lock().unwrap().clone();
     if let Some(sup) = sup {
