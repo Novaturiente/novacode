@@ -347,6 +347,14 @@ fn session_sandbox(s: &Settings, cwd: &Path, novacode_home: &Path, protected: &[
     let mode = sandbox_mode(s);
     let mut deny_read = protected.to_vec();
     deny_read.extend(s.get::<Vec<String>>("sandbox.denyRead").unwrap_or_default());
+    // Download caches of a relocated CARGO_HOME / GOPATH; their binaries and config stay read-only.
+    let mut allow_write: Vec<String> = s.get("sandbox.allowWrite").unwrap_or_default();
+    for (var, subs) in [("CARGO_HOME", &["registry", "git"][..]), ("GOPATH", &["pkg"][..])] {
+        if let Some(root) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+            let root = std::path::PathBuf::from(root);
+            allow_write.extend(subs.iter().map(|d| root.join(d).to_string_lossy().into_owned()));
+        }
+    }
     let sb = Arc::new(Sandbox::new(sbx::Config {
         mode,
         project: if mode == sbx::Mode::Off {
@@ -357,7 +365,7 @@ fn session_sandbox(s: &Settings, cwd: &Path, novacode_home: &Path, protected: &[
         home: std::env::var_os("HOME").map(Into::into).unwrap_or_default(),
         novacode_home: novacode_home.to_path_buf(),
         tmpdir: std::env::var_os("TMPDIR").map(Into::into),
-        allow_write: s.get("sandbox.allowWrite").unwrap_or_default(),
+        allow_write,
         deny_read,
         credential_dirs: novacode_core::risk::credential_dirs()
             .iter()
