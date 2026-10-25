@@ -2,6 +2,12 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.3.1] - 2026-10-26
+
+### Fixed
+
+- **novacode no longer gets suspended after an unsandboxed command.** A command such as `zsh -i` could take over the terminal, and novacode then stopped at the next key press (`zsh: suspended (tty input) novacode`). On Linux, unsandboxed `bash` commands and `process` starts now run in their own session (`setsid`), with no terminal, like sandboxed ones already did. A `/dev/tty` prompt (for example `sudo` asking for a password) now fails at once instead of hanging until the timeout.
+
 ## [0.3.0] - 2026-10-25
 
 ### Changed: new defaults you will notice
@@ -61,4 +67,5 @@ All notable changes to novacode. Versions follow [semantic versioning](https://s
 - **`novacode auth status`** exits with code 1 when only keyless local servers (`ollama`, `lmstudio`) are listed.
 - **Print mode** notes on stderr when the reply was cut at the output token limit or had no text.
 
+[0.3.1]: https://github.com/Novaturiente/novacode/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Novaturiente/novacode/compare/v0.2.6...v0.3.0
