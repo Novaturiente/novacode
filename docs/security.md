@@ -4,7 +4,7 @@ This page explains what novacode does and does not protect you from: permission 
 
 ## The threat model
 
-Commands the agent runs with `bash` run as you. On Linux with bubblewrap installed, they run in a [sandbox](#sandbox): they can read your files but write only in the project and a few other places, and your credentials are hidden. Without bubblewrap (and on macOS) they run with your files, your network and your credentials. The protections below are guard rails that catch mistakes. They are not a wall against a determined attacker or a hostile model.
+Commands the agent runs with `bash` run as you. On Linux with bubblewrap installed, they run in a [sandbox](#sandbox): they can read your files but write only in the project and a few other places, they can't reach desktop services or Docker, and your credentials and secret environment variables are hidden. Without bubblewrap (and on macOS) they run with your files, your network and your credentials. The protections below are guard rails that catch mistakes. They are not a wall against a determined attacker or a hostile model.
 
 If you need real isolation, run novacode inside a container or VM.
 
@@ -134,15 +134,25 @@ Inside the sandbox:
 
 - The whole file system is **read-only**.
 - These places are **writable**: the project (the git top level of the session folder, or the folder itself outside git; for a git worktree also the repository's shared `.git` folder), `/tmp`, `$TMPDIR`, the tool caches that exist (`~/.cache`, `~/.cargo`, `~/.rustup`, `~/.npm`, `~/.bun`, `~/go`) and the folders in `sandbox.allowWrite`.
-- These are **hidden** (an empty folder or an empty file): the credential folders the risk gate protects (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.config/gcloud`, `~/.password-store`), novacode's logins and trust list (`auth.json`, `auth-*.json`, `mcp-auth.json`, `trust.json` in `~/.novacode`), token files (`~/.git-credentials`, `~/.netrc`, `~/.cargo/credentials`, `~/.cargo/credentials.toml`, `~/.docker/config.json`, `~/.config/gh/hosts.yml`, `~/.pypirc`, `~/.npmrc`), your `permissions.protected.paths` and the paths in `sandbox.denyRead`. They stay hidden even inside a writable folder.
+- These stay **read-only** even inside a writable place, because a program novacode or you run later outside the sandbox would execute them: the git `config`, `config.worktree` and `hooks` of the project's git folder (and of a worktree's shared one), the project's `.novacode/`, `.claude/` and `.mcp.json`, and the tool binaries and config `~/.cargo/bin`, `~/.cargo/config`, `~/.cargo/config.toml`, `~/.cargo/env`, `~/.rustup`, `~/.bun/bin` and `~/go/bin`.
+- These are **hidden** (an empty folder or an empty file): the credential folders the risk gate protects (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.config/gcloud`, `~/.password-store`), novacode's logins and trust list (`auth.json`, `auth-*.json`, `mcp-auth.json`, `trust.json` in `~/.novacode`), token files (`~/.git-credentials`, `~/.netrc`, `~/.cargo/credentials`, `~/.cargo/credentials.toml`, `~/.docker/config.json`, `~/.config/gh/hosts.yml`, `~/.pypirc`, `~/.npmrc`, `~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.config/hub`, `~/.azure`, `~/.terraform.d/credentials.tfrc.json`, `~/.pgpass`, `~/.vault-token`, `~/.config/rclone`), your `permissions.protected.paths` and the paths in `sandbox.denyRead`. They stay hidden even inside a writable folder.
+- **Unix sockets are blocked.** A seccomp filter makes creating one fail with `Operation not permitted`. Through such sockets a command could ask a program outside to act for it: D-Bus and systemd can start a command outside the sandbox, Docker can mount your home folder as root, and agents such as ssh-agent and gpg-agent sign with your keys. The filter also blocks typing into the terminal (`TIOCSTI`). Network sockets and `socketpair` still work. The filter exists for x86_64 and aarch64; on another CPU the sandbox runs without it and logs a warning.
+- **Secret environment variables are dropped:** the key variables of every provider, any name containing `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `API_KEY`, `APIKEY`, `ACCESS_KEY`, `PRIVATE_KEY` or `CREDENTIAL` (in any case), and `SSH_AUTH_SOCK`, `GPG_AGENT_INFO`, `DBUS_SESSION_BUS_ADDRESS` and `DOCKER_HOST`.
 - The network stays on. The working folder is the same as outside.
 - Timeouts, Esc and `process stop` still end everything the command started.
 
-The layout is worked out when the session starts; a path that doesn't exist then is skipped.
+The layout is worked out when the session starts; a path that doesn't exist then is skipped. A path deleted later is skipped from then on, so commands keep working and the path is not created again.
+
+**What needs `unsandboxed: true`:** anything that talks to a unix socket or needs a secret variable. Examples: Docker and Podman, `ssh` or `git push` through an ssh agent, `gpg` signing, `systemctl --user`, and anything else that talks to a desktop service.
+
+**What stays open:**
+
+- The tool caches stay writable so downloads work. A command can plant a file there (a poisoned package or build cache) that a tool you run later outside the sandbox executes.
+- The project stays writable. The model can create files in it that novacode or another tool runs later, for example a missing `.novacode/` or `.mcp.json` (read-only only once it exists), or code that your tests or build run.
 
 When a sandboxed command fails with `Read-only file system`, the result adds one line that names the writable places and says how to run the command outside.
 
-**Running one command outside.** `bash` and `process` `start` take `unsandboxed: true` for a command that needs what the sandbox hides or blocks, for example `git push` over SSH. There is no approval card for it, but the risk gate still applies, the [command judge](#command-judge) checks every such call (its block asks you), and the result says `[ran outside the sandbox]`.
+**Running one command outside.** `bash` and `process` `start` take `unsandboxed: true` for a command that needs what the sandbox hides or blocks, for example `git push` over SSH. Such a command gets your full environment. There is no approval card for it, but the risk gate still applies, the [command judge](#command-judge) checks every such call (its block asks you), and the result says `[ran outside the sandbox]`.
 
 **What it doesn't cover:** your own `!` commands, hooks, extensions' `exec`, MCP servers and provider programs. You set those up yourself, so they run as you.
 

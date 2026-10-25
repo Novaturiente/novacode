@@ -363,6 +363,16 @@ fn session_sandbox(s: &Settings, cwd: &Path, novacode_home: &Path, protected: &[
             .iter()
             .map(|d| d.to_string())
             .collect(),
+        git_dirs: if mode == sbx::Mode::Off {
+            vec![]
+        } else {
+            sbx::git_dirs(cwd)
+        },
+        // Provider key variables, also custom ones from `providers` settings.
+        secret_env: novacode_ai::catalog::profiles(s.get::<serde_json::Value>("providers").as_ref())
+            .into_values()
+            .flat_map(|p| p.env.names)
+            .collect(),
     }));
     if mode != sbx::Mode::Off {
         // Checked off the start path: caches the answer and logs the one warning (auto mode).

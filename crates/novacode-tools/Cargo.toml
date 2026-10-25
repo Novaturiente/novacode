@@ -24,7 +24,7 @@ grep-matcher = "0.1"
 ignore = "0.4"
 globset = "0.4"
 regex = "1"
-nix = { version = "0.30", features = ["signal"] }
+nix = { version = "0.30", features = ["signal", "fs"] }
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico"], optional = true }
 
