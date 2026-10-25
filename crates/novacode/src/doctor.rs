@@ -3,7 +3,8 @@
 use futures_util::future::join_all;
 use novacode_ai::connect::Providers;
 use novacode_base::settings::Settings;
-use novacode_tools::sandbox::Mode;
+use novacode_tools::sandbox::{Mode, Sandbox};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -74,6 +75,7 @@ pub fn auth_status(p: &Providers) -> ExitCode {
 pub async fn doctor(
     p: &Arc<Providers>,
     settings: &Settings,
+    sandbox: &Sandbox,
     key_problems: Vec<String>,
     shadowed: Vec<String>,
 ) -> ExitCode {
@@ -142,15 +144,8 @@ pub async fn doctor(
         println!("  · {s}");
     }
     println!("sandbox");
-    let mode = crate::sandbox_mode(settings);
-    let works = || {
-        novacode_tools::sandbox::Sandbox::new(novacode_tools::sandbox::Config {
-            mode,
-            ..Default::default()
-        })
-        .available()
-    };
-    match sandbox_line(mode, mode != Mode::Off && works()) {
+    let mode = sandbox.mode();
+    match sandbox_line(mode, mode != Mode::Off && sandbox.available(), sandbox.symlink()) {
         (true, line) => println!("  ✓ {line}"),
         (false, line) => {
             failed |= mode == Mode::On;
@@ -161,14 +156,19 @@ pub async fn doctor(
 }
 
 /// The doctor's sandbox line (L6.5), under the `sandbox` heading: (fine, text).
-fn sandbox_line(mode: Mode, works: bool) -> (bool, &'static str) {
+/// `symlink`: a protected path that is a symlink, which makes it unavailable.
+fn sandbox_line(mode: Mode, works: bool, symlink: Option<&Path>) -> (bool, String) {
+    let why = match symlink {
+        Some(p) => format!("{} is a symlink", p.display()),
+        None => "bwrap not found".into(),
+    };
     match (mode, works) {
-        (Mode::Off, _) => (false, "off (setting)"),
-        (_, true) => (true, "on (bubblewrap)"),
-        (Mode::Auto, false) => (false, "unavailable (bwrap not found), commands run unsandboxed"),
+        (Mode::Off, _) => (false, "off (setting)".into()),
+        (_, true) => (true, "on (bubblewrap)".into()),
+        (Mode::Auto, false) => (false, format!("unavailable ({why}), commands run unsandboxed")),
         (Mode::On, false) => (
             false,
-            "unavailable (bwrap not found), commands are refused (`sandbox.mode` is on)",
+            format!("unavailable ({why}), commands are refused (`sandbox.mode` is on)"),
         ),
     }
 }
@@ -179,10 +179,24 @@ mod tests {
 
     #[test]
     fn sandbox_lines() {
-        assert_eq!(super::sandbox_line(Mode::Auto, true), (true, "on (bubblewrap)"));
-        assert_eq!(super::sandbox_line(Mode::Off, true), (false, "off (setting)"));
-        assert!(super::sandbox_line(Mode::Auto, false).1.contains("run unsandboxed"));
-        assert!(super::sandbox_line(Mode::On, false).1.contains("refused"));
+        use std::path::Path;
+        let line = |m, w, s: Option<&str>| super::sandbox_line(m, w, s.map(Path::new));
+        assert_eq!(line(Mode::Auto, true, None), (true, "on (bubblewrap)".into()));
+        assert_eq!(line(Mode::Off, true, None), (false, "off (setting)".into()));
+        assert_eq!(
+            line(Mode::Auto, false, None).1,
+            "unavailable (bwrap not found), commands run unsandboxed"
+        );
+        assert!(line(Mode::On, false, None).1.contains("refused"));
+        assert_eq!(
+            line(Mode::Auto, false, Some("/p/.git/hooks")).1,
+            "unavailable (/p/.git/hooks is a symlink), commands run unsandboxed"
+        );
+        assert!(
+            line(Mode::On, false, Some("/p/.mcp.json"))
+                .1
+                .starts_with("unavailable (/p/.mcp.json is a symlink), commands are refused")
+        );
     }
 
     #[test]

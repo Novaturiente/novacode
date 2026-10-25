@@ -60,8 +60,17 @@ pub struct Config {
     pub secret_env: Vec<String>,
 }
 
-/// Tool caches under home, writable when they exist.
-const CACHES: &[&str] = &[".cache", ".cargo", ".rustup", ".npm", ".bun", "go"];
+/// Tool caches under home, writable when they exist. The rest of `~/.cargo`
+/// (binaries, `config.toml`, `env`) stays read-only, also where it doesn't exist yet.
+const CACHES: &[&str] = &[
+    ".cache",
+    ".cargo/registry",
+    ".cargo/git",
+    ".rustup",
+    ".npm",
+    ".bun",
+    "go",
+];
 /// Token files under home, hidden when they exist.
 const TOKEN_FILES: &[&str] = &[
     ".git-credentials",
@@ -83,19 +92,13 @@ const TOKEN_FILES: &[&str] = &[
 ];
 /// Tool binaries and config under home, read-only inside the writable caches:
 /// a planted shim or `rustc-wrapper` would run outside the sandbox later.
-const RO_HOME: &[&str] = &[
-    ".cargo/bin",
-    ".cargo/config",
-    ".cargo/config.toml",
-    ".cargo/env",
-    ".rustup",
-    ".bun/bin",
-    "go/bin",
-];
+const RO_HOME: &[&str] = &[".rustup", ".bun/bin", "go/bin"];
 /// Project files novacode and other agents run or load, read-only when they exist.
 const RO_PROJECT: &[&str] = &[".novacode", ".claude", ".mcp.json"];
 /// Files in a git folder that git runs commands from (`core.fsmonitor`, hooks).
 const RO_GIT: &[&str] = &["config", "config.worktree", "hooks"];
+/// How deep submodule git folders (`<gitdir>/modules/**`) are searched.
+const MODULES_DEPTH: usize = 8;
 /// Parts of variable names that mark a secret (upper-cased match).
 const SECRET_PARTS: &[&str] = &[
     "TOKEN",
@@ -108,6 +111,11 @@ const SECRET_PARTS: &[&str] = &[
     "PRIVATE_KEY",
     "CREDENTIAL",
 ];
+/// Name endings that mark a secret (`DEPLOY_KEY`, `SIGNING_KEYS`).
+const SECRET_ENDS: &[&str] = &["_KEY", "_KEYS"];
+/// Underscore-separated words that mark a secret (`GH_AUTH`, `AUTH_TOKEN`;
+/// not `GIT_AUTHOR_NAME`).
+const SECRET_WORDS: &[&str] = &["AUTH"];
 /// Variables that point at agents and desktop services.
 const SECRET_NAMES: &[&str] = &[
     "SSH_AUTH_SOCK",
@@ -122,6 +130,12 @@ pub struct Sandbox {
     mode: Mode,
     /// Writable binds, parents first.
     write: Vec<PathBuf>,
+    /// Git folders bound onto themselves, so they are mount points: renaming
+    /// or removing one fails (`EBUSY`), and a copy can't take its place.
+    pin: Vec<PathBuf>,
+    /// A protected path that is a symlink inside a writable place: a bind
+    /// can't protect it (the link stays replaceable), so there is no sandbox.
+    symlink: Option<PathBuf>,
     /// Read-only binds inside the writable ones.
     ro: Vec<PathBuf>,
     /// (path, is a folder): folders get an empty read-only tmpfs, files `/dev/null`.
@@ -131,6 +145,72 @@ pub struct Sandbox {
     works: OnceLock<bool>,
     /// The seccomp program in a memfd, written once; `None` on another CPU architecture.
     filter: OnceLock<Option<File>>,
+}
+
+/// The first symlink on `p` (itself or a folder above it) that sits in a writable
+/// place, when `p` exists: a command could swap that link for its own.
+fn link_in(p: &Path, write: &[PathBuf]) -> Option<PathBuf> {
+    p.symlink_metadata().ok()?;
+    p.ancestors()
+        .filter(|a| a.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()))
+        .find(|a| {
+            a.parent()
+                .and_then(|d| std::fs::canonicalize(d).ok())
+                .is_some_and(|d| write.iter().any(|w| d.starts_with(w)))
+        })
+        .map(Path::to_path_buf)
+}
+
+/// Submodule git folders under `dir` (`<gitdir>/modules`): a folder with a
+/// `HEAD` is one (its own `modules` holds nested ones); other folders are parts
+/// of a submodule name with slashes. Symlinks are not followed.
+fn submodule_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth >= MODULES_DEPTH {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut dirs: Vec<PathBuf> = rd
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect();
+    dirs.sort();
+    for d in dirs {
+        if d.join("HEAD").is_file() {
+            submodule_dirs(&d.join("modules"), depth + 1, out);
+            out.push(d);
+        } else {
+            submodule_dirs(&d, depth + 1, out);
+        }
+    }
+}
+
+/// Closes every file descriptor above 2 that novacode inherited from its parent
+/// (a shell can pass a pipe on fd 13), so none reaches the commands it runs.
+/// Call it first in `main`, while nothing else is open. Closing, not marking
+/// close-on-exec: setting the flag on a bare number needs `unsafe`, which the
+/// workspace forbids, and novacode never uses an inherited descriptor.
+pub fn close_inherited_fds() {
+    close_fds(&open_fds());
+}
+
+/// The descriptors above 2 open in this process.
+fn open_fds() -> Vec<i32> {
+    let Ok(rd) = std::fs::read_dir("/proc/self/fd") else {
+        return vec![];
+    };
+    // Collected first: the listing's own descriptor is closed when `rd` drops.
+    rd.flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse().ok())
+        .filter(|&fd| fd > 2)
+        .collect()
+}
+
+fn close_fds(fds: &[i32]) {
+    for &fd in fds {
+        // EBADF for the listing's own descriptor, already closed.
+        let _ = nix::unistd::close(fd);
+    }
 }
 
 fn expand(p: &str, home: &Path, base: &Path) -> PathBuf {
@@ -184,6 +264,7 @@ impl Sandbox {
         }
         cands.extend(TOKEN_FILES.iter().map(|f| c.home.join(f)));
         cands.extend(c.deny_read.iter().map(|p| expand(p, &c.home, &base)));
+        let mut symlink = cands.iter().find_map(|p| link_in(p, &write));
         let mut hide: Vec<(PathBuf, bool)> = Vec::new();
         for p in cands {
             if let (Ok(real), Ok(m)) = (std::fs::canonicalize(&p), std::fs::metadata(&p))
@@ -192,13 +273,37 @@ impl Sandbox {
                 hide.push((real, m.is_dir()));
             }
         }
-        let mut ro: Vec<PathBuf> = Vec::new();
-        let ro_cands = c
+        // Submodule git folders get the same protection as the project's.
+        let mut git_dirs = c.git_dirs.clone();
+        for g in &c.git_dirs {
+            submodule_dirs(&g.join("modules"), 0, &mut git_dirs);
+        }
+        let pin: Vec<PathBuf> = c
             .git_dirs
+            .iter()
+            .filter_map(|g| std::fs::canonicalize(g).ok())
+            .filter(|g| g.is_dir() && !write.contains(g) && write.iter().any(|w| g.starts_with(w)))
+            .collect();
+        let mut ro_cands: Vec<PathBuf> = git_dirs
             .iter()
             .flat_map(|g| RO_GIT.iter().map(move |f| g.join(f)))
             .chain(RO_PROJECT.iter().map(|f| base.join(f)))
-            .chain(RO_HOME.iter().map(|f| c.home.join(f)));
+            .chain(RO_HOME.iter().map(|f| c.home.join(f)))
+            .collect();
+        // Linked worktrees' own config (`extensions.worktreeConfig`).
+        for g in &c.git_dirs {
+            if let Ok(rd) = std::fs::read_dir(g.join("worktrees")) {
+                let mut wt: Vec<PathBuf> = rd.flatten().map(|e| e.path().join("config.worktree")).collect();
+                wt.sort();
+                ro_cands.extend(wt);
+            }
+        }
+        // A worktree's `.git` file says where its git folder is.
+        if base.join(".git").is_file() {
+            ro_cands.push(base.join(".git"));
+        }
+        symlink = symlink.or_else(|| ro_cands.iter().chain(&c.git_dirs).find_map(|p| link_in(p, &write)));
+        let mut ro: Vec<PathBuf> = Vec::new();
         for p in ro_cands {
             if let Ok(real) = std::fs::canonicalize(&p)
                 && !ro.contains(&real)
@@ -209,6 +314,8 @@ impl Sandbox {
         Sandbox {
             mode: c.mode,
             write,
+            pin,
+            symlink,
             ro,
             hide,
             secret_env: c.secret_env,
@@ -268,6 +375,8 @@ impl Sandbox {
         let n = name.to_string_lossy().to_ascii_uppercase();
         !(SECRET_NAMES.contains(&n.as_str())
             || SECRET_PARTS.iter().any(|p| n.contains(p))
+            || SECRET_ENDS.iter().any(|e| n.ends_with(e))
+            || n.split('_').any(|w| SECRET_WORDS.contains(&w))
             || self.secret_env.iter().any(|s| s.eq_ignore_ascii_case(&n)))
     }
 
@@ -275,10 +384,28 @@ impl Sandbox {
         self.mode
     }
 
+    /// The protected path that is a symlink in a writable place, which makes
+    /// the sandbox unavailable for this session.
+    pub fn symlink(&self) -> Option<&Path> {
+        self.symlink.as_deref()
+    }
+
     /// bwrap works here: checked once, then cached. In `auto` mode a failed
-    /// check logs the one warning.
+    /// check logs the one warning; a protected symlink logs it in both modes.
     pub fn available(&self) -> bool {
         *self.works.get_or_init(|| {
+            if let Some(p) = &self.symlink {
+                let then = if self.mode == Mode::On {
+                    "commands are refused"
+                } else {
+                    "commands run unsandboxed"
+                };
+                tracing::warn!(
+                    "sandbox: {} is a symlink in a writable place, so the sandbox can't protect it; {then}",
+                    p.display()
+                );
+                return false;
+            }
             // Probed with the filter, as commands run: a kernel without seccomp counts as no sandbox.
             let l = self.launcher();
             let ok = std::process::Command::new(&l[0])
@@ -328,6 +455,9 @@ impl Sandbox {
         for w in self.write.iter().filter(|p| live(p)) {
             a.extend(["--bind".into(), w.clone().into(), w.clone().into()]);
         }
+        for g in self.pin.iter().filter(|p| live(p)) {
+            a.extend(["--bind".into(), g.clone().into(), g.clone().into()]);
+        }
         // After the writable ones, so they win inside them.
         for r in self.ro.iter().filter(|p| live(p)) {
             a.extend(["--ro-bind".into(), r.clone().into(), r.clone().into()]);
@@ -374,6 +504,12 @@ pub fn command(sandbox: Option<&Sandbox>, cmd: &str, cwd: &Path) -> io::Result<t
             c.env_clear().envs(std::env::vars_os().filter(|(k, _)| s.keeps_env(k)));
             c
         }
+        Some(s) if s.mode == Mode::On && s.symlink.is_some() => {
+            return Err(io::Error::other(format!(
+                "the sandbox is on (`sandbox.mode`), but {} is a symlink in a writable place, which the sandbox can't protect, so the command was not run. Replace the symlink with the real file or folder and restart, set `sandbox.mode` to `auto`, or pass `unsandboxed: true` for this one command",
+                s.symlink.as_deref().unwrap_or(Path::new("")).display()
+            )));
+        }
         Some(s) if s.mode == Mode::On => {
             return Err(io::Error::other(
                 "the sandbox is on (`sandbox.mode`), but bubblewrap (bwrap) is not installed or doesn't work here, so the command was not run. Install bubblewrap, set `sandbox.mode` to `auto`, or pass `unsandboxed: true` for this one command",
@@ -391,6 +527,8 @@ struct ArchRules {
     /// (syscall number, argument index, value): the call with that argument
     /// (its low 32 bits) equal to the value fails with EPERM.
     rules: &'static [(u32, u32, u32)],
+    /// Calls that always fail with EPERM.
+    deny: &'static [u32],
     /// x86_64: also refuse x32 syscalls (bit 30 of the number), which share the arch value.
     x32: bool,
 }
@@ -399,17 +537,22 @@ const AF_UNIX: u32 = 1;
 const TIOCSTI: u32 = 0x5412;
 /// socketcall's first argument for `socket`: the domain itself is behind a pointer.
 const SYS_SOCKET: u32 = 1;
+/// io_uring_setup, io_uring_enter, io_uring_register (the same numbers on every
+/// architecture): io_uring creates and connects sockets without the filtered calls.
+const IO_URING: &[u32] = &[425, 426, 427];
 
 /// x86_64, and 32-bit x86 programs on it (int 0x80).
 const X86_64: &[ArchRules] = &[
     ArchRules {
         arch: 0xc000_003e,                            // AUDIT_ARCH_X86_64
         rules: &[(41, 0, AF_UNIX), (16, 1, TIOCSTI)], // socket, ioctl
+        deny: IO_URING,
         x32: true,
     },
     ArchRules {
         arch: 0x4000_0003,                                                   // AUDIT_ARCH_I386
         rules: &[(359, 0, AF_UNIX), (102, 0, SYS_SOCKET), (54, 1, TIOCSTI)], // socket, socketcall, ioctl
+        deny: IO_URING,
         x32: false,
     },
 ];
@@ -419,11 +562,13 @@ const AARCH64: &[ArchRules] = &[
     ArchRules {
         arch: 0xc000_00b7,                             // AUDIT_ARCH_AARCH64
         rules: &[(198, 0, AF_UNIX), (29, 1, TIOCSTI)], // socket, ioctl
+        deny: IO_URING,
         x32: false,
     },
     ArchRules {
         arch: 0x4000_0028,                                                   // AUDIT_ARCH_ARM
         rules: &[(281, 0, AF_UNIX), (102, 0, SYS_SOCKET), (54, 1, TIOCSTI)], // socket, socketcall, ioctl
+        deny: IO_URING,
         x32: false,
     },
 ];
@@ -462,6 +607,9 @@ fn program(arches: &[ArchRules]) -> Vec<Insn> {
         let mut b = vec![ld(0)];
         if a.x32 {
             b.extend([jump(JGE, 0x4000_0000, 0, 1), ret(RET_EPERM)]);
+        }
+        for &nr in a.deny {
+            b.extend([jump(JEQ, nr, 0, 1), ret(RET_EPERM)]);
         }
         for &(nr, arg, value) in a.rules {
             b.extend([
@@ -578,12 +726,22 @@ mod tests {
             "extra",
             "proj-secret",
             ".cargo/bin",
+            ".cargo/registry",
             ".codex",
         ] {
             std::fs::create_dir_all(home.join(dir)).unwrap();
         }
         std::fs::create_dir_all(proj.join("sub")).unwrap();
         std::fs::create_dir_all(proj.join(".git/hooks")).unwrap();
+        // A submodule `a/b` with a nested one `c`, and a linked worktree `w`.
+        for dir in [
+            ".git/modules/a/b/hooks",
+            ".git/modules/a/b/modules/c/hooks",
+            ".git/modules/a/b/objects/pack",
+            ".git/worktrees/w",
+        ] {
+            std::fs::create_dir_all(proj.join(dir)).unwrap();
+        }
         for f in [
             ".novacode/auth.json",
             ".novacode/auth-work.json",
@@ -594,7 +752,16 @@ mod tests {
         ] {
             std::fs::write(home.join(f), "x").unwrap();
         }
-        for f in [".env.secret", ".git/config", ".mcp.json"] {
+        for f in [
+            ".env.secret",
+            ".git/config",
+            ".mcp.json",
+            ".git/modules/a/b/HEAD",
+            ".git/modules/a/b/config",
+            ".git/modules/a/b/modules/c/HEAD",
+            ".git/modules/a/b/modules/c/config",
+            ".git/worktrees/w/config.worktree",
+        ] {
             std::fs::write(proj.join(f), "x").unwrap();
         }
         let c = Config {
@@ -638,14 +805,22 @@ mod tests {
             ("--bind", "/tmp".to_string()),
             ("--bind", r("proj")),
             ("--bind", r("home/.cache")),
-            ("--bind", r("home/.cargo")),
             ("--bind", r("home/extra")),
-            // Read-only inside them: git config and hooks, agent config, tool binaries;
-            // missing ones (`config.worktree`, `.claude`, `~/.rustup`, …) skipped.
+            // Of ~/.cargo only the download caches; `~/.cargo/git` is missing.
+            ("--bind", r("home/.cargo/registry")),
+            // The git folder onto itself: a mount point can't be renamed.
+            ("--bind", r("proj/.git")),
+            // Read-only inside them: git config and hooks (also of submodules, nested
+            // ones first, and worktrees' `config.worktree`), agent config;
+            // missing ones (`.git/config.worktree`, `.claude`, `~/.rustup`, …) skipped.
             ("--ro-bind", r("proj/.git/config")),
             ("--ro-bind", r("proj/.git/hooks")),
+            ("--ro-bind", r("proj/.git/modules/a/b/modules/c/config")),
+            ("--ro-bind", r("proj/.git/modules/a/b/modules/c/hooks")),
+            ("--ro-bind", r("proj/.git/modules/a/b/config")),
+            ("--ro-bind", r("proj/.git/modules/a/b/hooks")),
             ("--ro-bind", r("proj/.mcp.json")),
-            ("--ro-bind", r("home/.cargo/bin")),
+            ("--ro-bind", r("proj/.git/worktrees/w/config.worktree")),
             // Hidden: folders get a tmpfs, files /dev/null; `.aws` and `~/nope` don't exist.
             ("--tmpfs", r("home/.ssh")),
             ("/dev/null", r("home/.novacode/auth.json")),
@@ -674,11 +849,11 @@ mod tests {
         let s = Sandbox::new(c);
         // Deleted mid-session: a writable folder, a read-only one, a hidden file and folder.
         std::fs::remove_dir(root.join("home/extra")).unwrap();
-        std::fs::remove_dir(root.join("home/.cargo/bin")).unwrap();
+        std::fs::remove_dir(root.join("proj/.git/hooks")).unwrap();
         std::fs::remove_file(root.join("home/.netrc")).unwrap();
         std::fs::remove_dir(root.join("home/.ssh")).unwrap();
         let a = strs(&s.args(&root.join("proj")));
-        for gone in ["home/extra", "home/.cargo/bin", "home/.netrc", "home/.ssh"] {
+        for gone in ["home/extra", "proj/.git/hooks", "home/.netrc", "home/.ssh"] {
             let p = root.join(gone).display().to_string();
             assert!(!a.contains(&p), "{gone} still bound: {a:?}");
         }
@@ -710,6 +885,18 @@ mod tests {
             // A provider's key variable from the profiles, matched case-insensitively.
             ("MY_PROVIDER_KEY", false),
             ("MY_PROVIDER", true),
+            // Names ending in `_KEY`/`_KEYS`, and `AUTH` as a word.
+            ("DEPLOY_KEY", false),
+            ("signing_keys", false),
+            ("MY_AUTH", false),
+            ("AUTH_TOKEN", false),
+            ("GH_AUTH", false),
+            ("AUTH", false),
+            ("GIT_AUTHOR_NAME", true),
+            ("GIT_AUTHOR_EMAIL", true),
+            ("OAUTHLIB_DEBUG", true),
+            ("KEYBOARD", true),
+            ("KEYS_DIR", true),
         ] {
             assert_eq!(s.keeps_env(OsStr::new(name)), kept, "{name}");
         }
@@ -784,6 +971,17 @@ mod tests {
             ),
             (&x, 54, i386, tiocsti, RET_EPERM, "i386 ioctl(TIOCSTI)"),
             (&x, 41, 0x1234, unix, RET_ALLOW, "unknown arch"),
+            // io_uring makes sockets without socket(): refused whatever its arguments.
+            (&x, 425, x86, inet, RET_EPERM, "io_uring_setup"),
+            (&x, 426, x86, inet, RET_EPERM, "io_uring_enter"),
+            (&x, 427, x86, inet, RET_EPERM, "io_uring_register"),
+            (&x, 424, x86, inet, RET_ALLOW, "pidfd_send_signal"),
+            (&x, 425, i386, inet, RET_EPERM, "i386 io_uring_setup"),
+            (&x, 427, i386, inet, RET_EPERM, "i386 io_uring_register"),
+            (&a, 425, arm64, inet, RET_EPERM, "arm64 io_uring_setup"),
+            (&a, 426, arm64, inet, RET_EPERM, "arm64 io_uring_enter"),
+            (&a, 427, arm, inet, RET_EPERM, "arm io_uring_register"),
+            (&a, 428, arm64, inet, RET_ALLOW, "arm64 open_tree"),
             (&a, 198, arm64, unix, RET_EPERM, "arm64 socket(AF_UNIX)"),
             (&a, 198, arm64, inet, RET_ALLOW, "arm64 socket(AF_INET)"),
             (&a, 199, arm64, unix, RET_ALLOW, "arm64 socketpair"),
@@ -823,6 +1021,124 @@ mod tests {
             hint_for(Some(&s), true, "Read-only file system").is_none(),
             "not sandboxed"
         );
+    }
+
+    /// A worktree: its `.git` file is read-only, its git folder and the shared
+    /// one (writable, outside the worktree) are mount points.
+    #[test]
+    fn worktree_layout() {
+        let d = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (wt, common) = (root.join("wt"), root.join("main/.git"));
+        let gd = common.join("worktrees/wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(common.join("hooks")).unwrap();
+        std::fs::create_dir_all(&gd).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", gd.display())).unwrap();
+        std::fs::write(common.join("config"), "").unwrap();
+        let s = Sandbox::new(Config {
+            project: vec![wt.clone(), common.clone()],
+            home: root.join("home"),
+            novacode_home: root.join("home/.novacode"),
+            git_dirs: vec![gd.clone(), common.clone()],
+            ..Config::default()
+        });
+        assert!(s.symlink().is_none());
+        let a = strs(&s.args(&wt));
+        let pairs = entries(&a);
+        let s = |p: &Path| p.display().to_string();
+        for want in [
+            ("--bind", s(&common)),
+            ("--bind", s(&gd)),
+            ("--ro-bind", s(&common.join("config"))),
+            ("--ro-bind", s(&common.join("hooks"))),
+            ("--ro-bind", s(&wt.join(".git"))),
+        ] {
+            assert!(pairs.contains(&(want.0.to_string(), want.1.clone())), "{want:?}: {a:?}");
+        }
+        // The shared folder is bound once, as a writable place.
+        assert_eq!(a.iter().filter(|x| **x == s(&common)).count(), 2, "{a:?}");
+    }
+
+    /// A protected path that is a symlink in a writable place: no sandbox.
+    #[test]
+    fn protected_symlinks_make_it_unavailable() {
+        // Untouched layout: fine.
+        assert!(Sandbox::new(setup().1).symlink().is_none());
+        type Make = fn(&Path);
+        let cases: [(&str, Make); 3] = [
+            ("proj/.git/hooks", |r| {
+                std::fs::remove_dir(r.join("proj/.git/hooks")).unwrap();
+                std::os::unix::fs::symlink("../realhooks", r.join("proj/.git/hooks")).unwrap();
+            }),
+            // Dangling: the target can be created inside.
+            ("proj/.claude", |r| {
+                std::os::unix::fs::symlink("elsewhere", r.join("proj/.claude")).unwrap();
+            }),
+            // A hidden file under a linked folder.
+            ("proj/linked", |r| {
+                std::fs::create_dir_all(r.join("home/extra/real")).unwrap();
+                std::fs::write(r.join("home/extra/real/.env.secret"), "x").unwrap();
+                std::os::unix::fs::symlink(r.join("home/extra/real"), r.join("proj/linked")).unwrap();
+            }),
+        ];
+        for (path, make) in cases {
+            let (d, mut c) = setup();
+            let root = std::fs::canonicalize(d.path()).unwrap();
+            make(&root);
+            let cwd = c.project[0].clone();
+            c.deny_read.push("linked/.env.secret".into());
+            let s = Sandbox::new(c.clone());
+            assert_eq!(s.symlink(), Some(root.join(path).as_path()), "{path}");
+            assert!(!s.available() && !s.wraps(), "{path}");
+            let e = command(Some(&s), "true", &cwd).unwrap_err().to_string();
+            assert!(
+                e.contains(&root.join(path).display().to_string()) && e.contains("symlink"),
+                "{e}"
+            );
+            let s = Sandbox::new(Config { mode: Mode::Auto, ..c });
+            let cmd = command(Some(&s), "true", &cwd).unwrap();
+            assert_eq!(cmd.as_std().get_program(), "bash", "auto runs {path} unsandboxed");
+        }
+        // A symlink outside every writable place can't be swapped: fine.
+        // Under the real home, not /tmp: /tmp is writable.
+        let d = tempfile::Builder::new()
+            .prefix(".novacode-sandbox-test")
+            .tempdir_in(std::env::var_os("HOME").unwrap())
+            .unwrap();
+        let home = d.path().join("home");
+        std::fs::create_dir_all(home.join("real")).unwrap();
+        std::fs::create_dir_all(d.path().join("proj")).unwrap();
+        std::fs::write(home.join("real/secret"), "x").unwrap();
+        std::os::unix::fs::symlink(home.join("real"), home.join("cfg")).unwrap();
+        let s = Sandbox::new(Config {
+            project: vec![d.path().join("proj")],
+            home: home.clone(),
+            novacode_home: home.join(".novacode"),
+            deny_read: vec!["~/cfg/secret".into()],
+            ..Config::default()
+        });
+        assert!(s.symlink().is_none());
+        assert!(strs(&s.args(d.path())).contains(&home.join("real/secret").display().to_string()));
+    }
+
+    /// Inherited descriptors are closed, so commands don't get them.
+    #[test]
+    fn inherited_fds_are_closed() {
+        use std::os::fd::IntoRawFd;
+        // `dup` leaves the copy without close-on-exec, like a descriptor from a parent shell.
+        let fd = nix::unistd::dup(std::io::stderr()).unwrap().into_raw_fd();
+        assert!(open_fds().contains(&fd));
+        let seen = || {
+            std::process::Command::new("sh")
+                .args(["-c", &format!("test -e /proc/self/fd/{fd}")])
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(seen(), "fd {fd} should reach a child before");
+        close_fds(&[fd]);
+        assert!(!seen(), "fd {fd} still reaches a child");
     }
 
     /// Processes whose command line is exactly `sleep <secs>`.
@@ -965,7 +1281,7 @@ mod tests {
             .unwrap();
         let root = std::fs::canonicalize(d.path()).unwrap();
         let (home, proj) = (root.join("home"), root.join("proj"));
-        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(home.join(".cargo/registry")).unwrap();
         std::fs::create_dir_all(proj.join(".git/hooks")).unwrap();
         std::fs::write(proj.join(".git/config"), "[core]\n").unwrap();
         std::fs::write(proj.join("secret.txt"), "S").unwrap();
@@ -995,6 +1311,22 @@ mod tests {
         let (ok, t) = sh(s, &proj, "touch .git/hooks/pre-commit").await;
         assert!(!ok && t.contains("Read-only file system"), "{t}");
         assert!(sh(s, &proj, "touch .git/index.lock").await.0);
+        // The git folder can't be swapped for a copy with a planted `core.fsmonitor`.
+        let (ok, t) = sh(
+            s,
+            &proj,
+            r#"mv .git .git-old && cp -a .git-old .git && printf '[core]\n\tfsmonitor = touch PWNED\n' > .git/config"#,
+        )
+        .await;
+        assert!(!ok && t.contains("busy"), "{t}");
+        assert!(!proj.join(".git-old").exists());
+        assert!(!sh(s, &proj, "rm -rf .git").await.0);
+        assert_eq!(std::fs::read_to_string(proj.join(".git/config")).unwrap(), "[core]\n");
+        // ~/.cargo: config can't be created, the download cache is writable.
+        let cargo = home.join(".cargo");
+        let (ok, t) = sh(s, &proj, &format!("touch {}/config.toml", cargo.display())).await;
+        assert!(!ok && t.contains("Read-only file system"), "{t}");
+        assert!(sh(s, &proj, &format!("touch {}/registry/x", cargo.display())).await.0);
         // A hidden file deleted mid-session: commands still run, and it is not recreated.
         std::fs::remove_file(proj.join("secret.txt")).unwrap();
         assert_eq!(sh(s, &proj, "echo ok").await, (true, "ok".into()));
@@ -1013,6 +1345,12 @@ mod tests {
                 r#"python3 -c "import socket; socket.create_connection(('127.0.0.1', {port})); socket.socketpair(); print('ok')""#
             );
             assert_eq!(sh(s, &proj, &tcp).await, (true, "ok".into()));
+            // io_uring_setup(1, NULL): EFAULT or ENOSYS outside, EPERM (1) inside.
+            let uring = r#"python3 -c "import ctypes; l = ctypes.CDLL(None, use_errno=True); print(l.syscall(425, 1, None), ctypes.get_errno())""#;
+            match sh(s, &proj, uring).await {
+                (true, t) => assert_eq!(t, "-1 1", "io_uring_setup inside"),
+                (false, t) => eprintln!("note: python3 without ctypes, io_uring check skipped: {t}"),
+            }
         } else {
             eprintln!("note: python3 missing, socket checks skipped");
         }
