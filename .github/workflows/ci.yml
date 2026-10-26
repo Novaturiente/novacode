@@ -60,7 +60,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
-      - run: cargo test --workspace --locked --no-fail-fast
+      # Also after a clippy failure: one run shows both.
+      - if: success() || failure()
+        run: cargo test --workspace --locked --no-fail-fast
   # L11.12 budgets on every change, warning only: shared runners are noisy, so an
   # OVER row is printed but doesn't fail the job. The release workflow still enforces it.
   bench:

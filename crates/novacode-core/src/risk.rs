@@ -2089,7 +2089,7 @@ pub(crate) fn resolve(arg: &str, ctx: &Ctx) -> PathBuf {
         && d.is_ascii_alphabetic()
         && (rest.is_empty() || rest[0] == b'/')
     {
-        s = format!("{}:/{}", *d as char, &s[2..].trim_start_matches('/'));
+        s = format!("{}:/{}", *d as char, s[2..].trim_start_matches('/'));
     }
     let p = Path::new(&s);
     // `has_root`: on Windows `/dev/sda` has no drive, so isn't "absolute", but isn't relative either.
