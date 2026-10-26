@@ -372,12 +372,17 @@ mod tests {
 
             // An allow rule covering the path, or ask mode, skips the judge.
             let (j, faux) = judge("BLOCK: no");
-            let allowed = policy(json!({ "allow": ["Write(/srv/**)"] }));
-            assert!(
-                auth_tool(&allowed, None, &j, "write", write("/srv/a", "x"), w)
-                    .await
-                    .is_none()
-            );
+            // Unix only: the cwd `/w` has no drive, so on Windows `canonicalize` adds one
+            // and `/srv/a` looks linked away. A real Windows cwd has a drive.
+            #[cfg(unix)]
+            {
+                let allowed = policy(json!({ "allow": ["Write(/srv/**)"] }));
+                assert!(
+                    auth_tool(&allowed, None, &j, "write", write("/srv/a", "x"), w)
+                        .await
+                        .is_none()
+                );
+            }
             let ask = policy(json!({ "mode": "ask" }));
             let once = Arc::new(Cards(Approval::Once, Mutex::default()));
             assert!(
