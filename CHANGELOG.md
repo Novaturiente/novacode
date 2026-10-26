@@ -2,6 +2,20 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.5.0] - 2026-10-26
+
+### Added
+
+- **`/websearch`** picks the web search engine tried first (`auto`, `antigravity`, `gemini`, `brave`, `searxng`); `/websearch <engine>` sets it directly. Saved as the setting `web.search`, read on every search. The other engines stay as fallbacks, and an answer from a fallback says which engine failed first.
+
+### Changed
+
+- **`/account` opens a picker** of the current provider's accounts, with the active one marked. The pick is saved per provider in `~/.novacode/selected.json`: new sessions start on it, and Antigravity web search and `/usage` use it instead of always `default`. Automatic rotation still moves on when an account runs out, without changing the saved pick.
+
+### Fixed
+
+- **Commands the host answers itself no longer leave a stuck prompt box.** `/account`, `/mode`, `/goal ...` and `/usage` left their own text shown as a pending prompt below the reply until the next turn ended.
+
 ## [0.4.0] - 2026-10-26
 
 ### Added
@@ -87,6 +101,7 @@ All notable changes to novacode. Versions follow [semantic versioning](https://s
 - **`novacode auth status`** exits with code 1 when only keyless local servers (`ollama`, `lmstudio`) are listed.
 - **Print mode** notes on stderr when the reply was cut at the output token limit or had no text.
 
+[0.5.0]: https://github.com/Novaturiente/novacode/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Novaturiente/novacode/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/Novaturiente/novacode/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/Novaturiente/novacode/compare/v0.3.1...v0.3.2
