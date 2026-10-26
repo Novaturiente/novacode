@@ -146,6 +146,41 @@ fn kill_group(pid: u32) {
     );
 }
 
+/// Windows: each command's Job Object by pid; dropping one kills everything in it.
+#[cfg(windows)]
+static JOBS: Mutex<BTreeMap<u32, win32job::Job>> = Mutex::new(BTreeMap::new());
+
+/// Put `child` and every process it starts into one Job Object (Windows), so a
+/// kill reaches children whose parent already exited. Unix: process groups do this.
+// shortcut: a child may start processes before it is assigned; spawn it suspended if that leaks.
+pub fn adopt(child: &tokio::process::Child) {
+    #[cfg(windows)]
+    if let (Some(pid), Some(h)) = (child.id(), child.raw_handle()) {
+        let mut info = win32job::ExtendedLimitInfo::new();
+        info.limit_kill_on_job_close();
+        let job = win32job::Job::create_with_limit_info(&info).and_then(|j| {
+            j.assign_process(h as isize)?;
+            Ok(j)
+        });
+        match job {
+            Ok(j) => {
+                JOBS.lock().unwrap().insert(pid, j);
+            }
+            Err(e) => tracing::warn!(pid, error = %e, "no job object; kills fall back to taskkill"),
+        }
+    }
+    #[cfg(unix)]
+    let _ = child;
+}
+
+/// The command `pid` ended: free its job (Windows), which ends what it left running.
+pub fn release(pid: u32) {
+    #[cfg(windows)]
+    JOBS.lock().unwrap().remove(&pid);
+    #[cfg(unix)]
+    let _ = pid;
+}
+
 // Windows has no SIGTERM for console programs: stop is a hard kill.
 #[cfg(windows)]
 fn kill_group(pid: u32) {
@@ -165,10 +200,13 @@ fn kill_group_hard(pid: u32) {
     );
 }
 
+/// Drops `pid`'s Job Object; without one (an orphan of an earlier novacode),
 /// `taskkill /T` kills `pid` and the children it can still see.
-// shortcut: misses children whose parent already exited (`cmd &`), use a Job Object when that leaks processes.
 #[cfg(windows)]
 fn kill_group_hard(pid: u32) {
+    if JOBS.lock().unwrap().remove(&pid).is_some() {
+        return;
+    }
     let _ = std::process::Command::new("taskkill")
         .args(["/F", "/T", "/PID", &pid.to_string()])
         .stdout(std::process::Stdio::null())
@@ -184,7 +222,10 @@ fn group_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn group_alive(pid: u32) -> bool {
-    pid_alive(pid)
+    match JOBS.lock().unwrap().get(&pid) {
+        Some(j) => j.query_process_id_list().is_ok_and(|l| !l.is_empty()),
+        None => pid_alive(pid),
+    }
 }
 
 /// A process with this pid exists.
@@ -244,6 +285,7 @@ impl ProcessManager {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()?;
+        adopt(&child);
         let pid = child.id().unwrap_or(0);
         let info = Info {
             id: id.clone(),
@@ -308,6 +350,7 @@ impl ProcessManager {
             // Background children may hold the pipes; don't wait on them forever.
             let drain = futures_util::future::join_all(pumps);
             let _ = tokio::time::timeout(Duration::from_millis(500), drain).await;
+            release(pid);
             // Before `end` is set: a waiting bash call reads the line once it sees the end.
             let git_note = git.and_then(|g| g.changes());
             *p.git_note.lock().unwrap() = git_note.clone();

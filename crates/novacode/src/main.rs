@@ -856,7 +856,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Some(Command::Trust { path, revoke }) => {
-            let dir = std::fs::canonicalize(path.unwrap_or(std::env::current_dir()?))?;
+            let dir = novacode_base::platform::canonicalize(path.unwrap_or(std::env::current_dir()?))?;
             let trust = TrustStore::new(paths.home().join("trust.json"));
             if revoke {
                 trust.set(&dir, false)?;

@@ -468,7 +468,10 @@ mod tests {
         let wt = root.join(".worktrees/fix-x");
         assert!(!o.is_error, "{}", text(&o));
         let set = o.details.as_ref().unwrap()["set_cwd"].as_str().unwrap().to_string();
-        assert_eq!(std::fs::canonicalize(set).unwrap(), std::fs::canonicalize(&wt).unwrap());
+        assert_eq!(
+            novacode_base::platform::canonicalize(set).unwrap(),
+            novacode_base::platform::canonicalize(&wt).unwrap()
+        );
         assert_eq!(std::fs::read_to_string(wt.join(".env")).unwrap(), "K=1\n");
         // The folder is excluded, so the main checkout stays clean.
         assert_eq!(git(&root, &["status", "--porcelain"]).unwrap(), "?? .env");

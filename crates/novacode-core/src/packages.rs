@@ -145,7 +145,7 @@ impl Store {
         let local = Path::new(src);
         let lock = if local.is_dir() { None } else { Some(self.read_lock()?) };
         if local.is_dir() {
-            let abs = std::fs::canonicalize(local).map_err(|e| e.to_string())?;
+            let abs = novacode_base::platform::canonicalize(local).map_err(|e| e.to_string())?;
             novacode_base::platform::link_dir(&abs, &dest).map_err(|e| e.to_string())?;
             return Ok(name);
         }
@@ -173,7 +173,7 @@ impl Store {
     pub fn uninstall(&self, what: &str) -> Result<String, String> {
         let lock = self.read_lock()?;
         let norm = |s: &str| s.trim_end_matches('/').trim_end_matches(".git").to_string();
-        let local = std::fs::canonicalize(what).ok();
+        let local = novacode_base::platform::canonicalize(what).ok();
         let p = self
             .list()
             .into_iter()
@@ -181,7 +181,11 @@ impl Store {
             .or_else(|| {
                 self.list().into_iter().find(|p| {
                     lock.get(&p.name).is_some_and(|pin| norm(&pin.source) == norm(what))
-                        || (local.is_some() && p.link.as_ref().and_then(|l| std::fs::canonicalize(l).ok()) == local)
+                        || (local.is_some()
+                            && p.link
+                                .as_ref()
+                                .and_then(|l| novacode_base::platform::canonicalize(l).ok())
+                                == local)
                 })
             })
             .ok_or(format!("`{what}` is not installed (see `novacode packages`)"))?;

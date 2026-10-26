@@ -506,7 +506,13 @@ fn away(p: &str, ctx: &risk::Ctx, root: &Path) -> Option<String> {
 
 /// In the project or `/tmp` (on Windows, `%TEMP%`).
 fn inside(p: &Path, root: &Path) -> bool {
-    p.starts_with(root) || p.starts_with("/tmp") || (cfg!(windows) && p.starts_with(std::env::temp_dir()))
+    p.starts_with(root) || p.starts_with("/tmp") || (cfg!(windows) && in_temp(p))
+}
+
+/// Under `%TEMP%`, as given (`RUNNER~1`) or resolved (`runneradmin`).
+fn in_temp(p: &Path) -> bool {
+    let t = std::env::temp_dir();
+    p.starts_with(&t) || novacode_base::platform::canonicalize(&t).is_ok_and(|c| p.starts_with(c))
 }
 
 /// The project folder of `cwd`: its git top level, else `cwd`.

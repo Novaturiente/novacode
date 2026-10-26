@@ -80,7 +80,7 @@ impl AuthStore {
         // A symlinked auth.json (an isolated home sharing the login) is written and
         // locked at its target, so a token refresh reaches every home that uses it.
         Self {
-            path: std::fs::canonicalize(&path).unwrap_or(path),
+            path: novacode_base::platform::canonicalize(&path).unwrap_or(path),
         }
     }
 

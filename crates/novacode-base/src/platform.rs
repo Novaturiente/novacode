@@ -113,6 +113,20 @@ pub fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// [`std::fs::canonicalize`], but on Windows without `\\?\` for plain drive paths:
+/// git and bash can't read `\\?\C:\…`. Longer than 260 chars keeps it (the prefix is what lets that work).
+pub fn canonicalize(p: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let c = std::fs::canonicalize(p)?;
+    #[cfg(windows)]
+    if let Some(s) = c.to_str().and_then(|s| s.strip_prefix(r"\\?\"))
+        && s.as_bytes().get(1) == Some(&b':')
+        && s.len() < 260
+    {
+        return Ok(PathBuf::from(s));
+    }
+    Ok(c)
+}
+
 /// `p` for splicing into a `bash -c` string: Git Bash reads `C:/x`, a `\` is an escape there.
 pub fn slash_path(p: &Path) -> String {
     let s = p.display().to_string();

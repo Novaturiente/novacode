@@ -549,7 +549,10 @@ mod tests {
         assert_eq!(skipped.len(), 2, "{skipped:?}");
         let mcp = parts.mcp();
         let srv = &mcp[0].1.as_ref().unwrap()["srv"];
-        assert_eq!(srv["command"], format!("{}/bin/s", r.display()));
+        assert_eq!(
+            srv["command"],
+            format!("{}/bin/s", novacode_base::platform::slash_path(r))
+        );
         assert_eq!(srv["args"][0], "x1", "secrets fill MCP configs");
         assert!(srv["env"]["CLAUDE_PLUGIN_ROOT"].is_string());
         // Text the model reads never gets a secret.

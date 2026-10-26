@@ -619,7 +619,7 @@ impl Policy {
                 home: &self.home,
                 protected: &self.perms.protected.paths,
             };
-            let real_home = std::fs::canonicalize(&self.home).unwrap_or_else(|_| self.home.clone());
+            let real_home = novacode_base::platform::canonicalize(&self.home).unwrap_or_else(|_| self.home.clone());
             let real_ctx = risk::Ctx {
                 home: &real_home,
                 ..ctx
@@ -944,7 +944,7 @@ pub(crate) fn real(p: &Path) -> PathBuf {
 fn real_depth(p: &Path, depth: u32) -> PathBuf {
     for a in p.ancestors() {
         let rest = p.strip_prefix(a).unwrap_or(Path::new(""));
-        if let Ok(c) = std::fs::canonicalize(a) {
+        if let Ok(c) = novacode_base::platform::canonicalize(a) {
             return c.join(rest);
         }
         // A dangling link: writing through it creates its target.

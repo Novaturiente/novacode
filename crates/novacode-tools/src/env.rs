@@ -105,7 +105,7 @@ impl ExecutionEnv for LocalEnv {
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 // Write through an existing symlink to its target (a dangling one is still replaced).
-                let p = std::fs::canonicalize(&p).unwrap_or(p);
+                let p = novacode_base::platform::canonicalize(&p).unwrap_or(p);
                 // Keep the file's mode (scripts stay executable); no .bak clutter in user repos,
                 // and a user's own `<file>.bak` is never touched.
                 let mode = std::fs::metadata(&p).ok().map(|m| m.permissions());
@@ -143,11 +143,7 @@ impl ExecutionEnv for LocalEnv {
     }
 
     fn canonical<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, PathBuf> {
-        Box::pin(async move {
-            tokio::fs::canonicalize(path)
-                .await
-                .unwrap_or_else(|_| path.to_path_buf())
-        })
+        Box::pin(async move { novacode_base::platform::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()) })
     }
 
     fn exec<'a>(
@@ -174,6 +170,7 @@ async fn run(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
+    crate::process::adopt(&child);
     let pgid = child.id();
     let pump = |mut r: Box<dyn tokio::io::AsyncRead + Unpin + Send>, tx: mpsc::Sender<Vec<u8>>| async move {
         let mut buf = vec![0u8; 16 * 1024];
@@ -205,6 +202,9 @@ async fn run(
     };
     if tokio::time::timeout(Duration::from_millis(500), drain).await.is_err() {
         kill_group(pgid);
+    }
+    if let Some(p) = pgid {
+        crate::process::release(p);
     }
     Ok(ExecResult {
         code: status.code(),

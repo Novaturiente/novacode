@@ -2114,7 +2114,6 @@ pub(crate) fn resolve(arg: &str, ctx: &Ctx) -> PathBuf {
     out
 }
 
-#[cfg(unix)]
 const SYSTEM_DIRS: &[&str] = &[
     "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/opt", "/proc", "/root", "/sbin", "/srv", "/sys",
     "/usr", "/var",
@@ -2195,11 +2194,12 @@ fn is_system(p: &Path) -> bool {
 fn is_system(p: &Path) -> bool {
     let f = fold(p);
     let s = f.to_string_lossy();
+    // No drive: Git Bash's `/`, `/usr`, … (its `/` holds the `/c` drive mounts).
     let Some(rest) = s
         .strip_prefix(|c: char| c.is_ascii_alphabetic())
         .and_then(|r| r.strip_prefix(':'))
     else {
-        return false;
+        return SYSTEM_DIRS.iter().any(|d| f == fold(Path::new(d)));
     };
     [
         "",

@@ -24,7 +24,7 @@ impl Seen {
     /// The name `name` at `path` loads under, or `None`. A package's file whose
     /// name is taken loads as `<package>:<name>` (L7.14).
     pub fn admit(&mut self, kind: &str, name: &str, path: &Path) -> Option<String> {
-        let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let real = novacode_base::platform::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if !self.files.insert(real.clone()) {
             return None;
         }

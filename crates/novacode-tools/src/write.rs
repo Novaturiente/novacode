@@ -69,7 +69,7 @@ mod tests {
         assert!(!o.is_error, "{o:?}");
         assert_eq!(std::fs::read_to_string(d.path().join("x/y/f.txt")).unwrap(), "hi");
         // Someone else changes the file: the next write is refused.
-        let real = std::fs::canonicalize(d.path().join("x/y/f.txt")).unwrap();
+        let real = novacode_base::platform::canonicalize(d.path().join("x/y/f.txt")).unwrap();
         c.files.saw(&real, 1);
         assert!(
             Write

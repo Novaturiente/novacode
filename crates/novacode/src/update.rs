@@ -86,7 +86,7 @@ pub async fn run() -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
     }
-    let exe = std::fs::canonicalize(std::env::current_exe()?)?;
+    let exe = novacode_base::platform::canonicalize(std::env::current_exe()?)?;
     // A release binary repackaged by a package manager (novacode-bin) belongs to it.
     if exe.starts_with("/usr") {
         println!(

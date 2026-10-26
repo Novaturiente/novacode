@@ -30,6 +30,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", features = ["signal", "fs"] }
 
+# L11.14: process-tree kills (the workspace forbids `unsafe`).
+[target.'cfg(windows)'.dependencies]
+win32job = "2"
+
 [features]
 default = ["images"]
 # Convert and shrink images (L2.22). Off: only images that already fit are sent.

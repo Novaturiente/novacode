@@ -450,9 +450,9 @@ impl Claims {
             .map(|p| {
                 let p = at(&self.cwd, &p);
                 // A new file has no real path yet: resolve its folder.
-                std::fs::canonicalize(&p).unwrap_or_else(|_| {
+                novacode_base::platform::canonicalize(&p).unwrap_or_else(|_| {
                     p.parent()
-                        .and_then(|d| std::fs::canonicalize(d).ok())
+                        .and_then(|d| novacode_base::platform::canonicalize(d).ok())
                         .map(|d| d.join(p.file_name().unwrap_or_default()))
                         .unwrap_or(p)
                 })

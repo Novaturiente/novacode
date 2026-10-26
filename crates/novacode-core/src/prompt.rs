@@ -185,7 +185,7 @@ pub fn context_files(cwd: &Path, home: &Path) -> Vec<(PathBuf, String)> {
         let Some(p) = NAMES.iter().map(|n| d.join(n)).find(|p| p.is_file()) else {
             continue;
         };
-        let real = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+        let real = novacode_base::platform::canonicalize(&p).unwrap_or_else(|_| p.clone());
         if !seen.insert(real) {
             continue;
         }

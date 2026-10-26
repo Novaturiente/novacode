@@ -229,7 +229,8 @@ async fn api_v1_surface() {
     }
 
     out += "\n## provider programs: requests sent (method, params keys)\n";
-    out += &provider_requests(d.path()).await;
+    // The fake provider is Python: text mode writes `\r\n` on Windows.
+    out += &provider_requests(d.path()).await.replace("\r\n", "\n");
 
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/api-v1.snap");
     if std::env::var_os("UPDATE_SNAPSHOTS").is_some() || !path.exists() {

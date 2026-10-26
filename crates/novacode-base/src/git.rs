@@ -60,7 +60,7 @@ fn in_dir(mut c: Command, dir: &Path) -> Command {
 
 /// Pins `root`'s common git dir to `common_dir`, replacing an earlier pin of it.
 pub fn pin(root: &Path, common_dir: &Path) {
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let root = crate::platform::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut pins = PINS.lock().unwrap();
     pins.retain(|(r, _)| *r != root);
     pins.push((root, common_dir.to_path_buf()));
@@ -91,7 +91,7 @@ pub fn pin_repo(dir: &Path) -> Option<PathBuf> {
 
 /// The pinned common git dir for `dir`: the deepest pinned root holding it.
 pub fn pinned(dir: &Path) -> Option<PathBuf> {
-    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let dir = crate::platform::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     PINS.lock()
         .unwrap()
         .iter()
@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn pin_table() {
         let d = tempfile::tempdir().unwrap();
-        let r = std::fs::canonicalize(d.path()).unwrap();
+        let r = crate::platform::canonicalize(d.path()).unwrap();
         for sub in ["a/b/c", "a/wt/x", "ab", "other"] {
             std::fs::create_dir_all(r.join(sub)).unwrap();
         }
@@ -206,7 +206,7 @@ mod tests {
     #[test]
     fn planted_commondir_is_ignored() {
         let d = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(d.path()).unwrap();
+        let root = crate::platform::canonicalize(d.path()).unwrap();
         let p = root.join("proj");
         std::fs::create_dir_all(&p).unwrap();
         if !git(&p, &["init", "-q"]) || !git(&p, &["commit", "-q", "--allow-empty", "-m", "x"]) {
@@ -218,7 +218,7 @@ mod tests {
         assert!(git(&p, &["commit", "-qm", "f"]));
         // Resolved at session start, before anything is planted.
         // git prints `C:/…` on Windows: compare the folders, not the strings.
-        let real = |c: PathBuf| std::fs::canonicalize(c).unwrap();
+        let real = |c: PathBuf| crate::platform::canonicalize(c).unwrap();
         assert_eq!(pin_repo(&p).map(real), Some(p.join(".git")));
         // Worktrees work pinned: their common dir is the main repo's `.git`.
         let wt = root.join("wt");

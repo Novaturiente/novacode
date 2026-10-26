@@ -23,7 +23,8 @@ fn clip(s: &str) -> &str {
 }
 
 fn rel(p: &Path, base: &Path) -> String {
-    p.strip_prefix(base).unwrap_or(p).display().to_string()
+    // `/` on Windows too: the model pastes these into bash commands.
+    novacode_base::platform::slash_path(p.strip_prefix(base).unwrap_or(p))
 }
 
 /// Run blocking search work off the async threads.
@@ -245,7 +246,7 @@ impl Tool for Find {
                             } else {
                                 ""
                             };
-                            out.push(format!("{}{dir}", r.display()));
+                            out.push(format!("{}{dir}", novacode_base::platform::slash_path(r)));
                         }
                     }
                 }
@@ -353,7 +354,7 @@ mod tests {
         let c = ctx(p);
 
         let o = Grep.execute(json!({"pattern": "alpha", "glob": "*.rs"}), &c).await;
-        assert_eq!(text(&o).replace('\\', "/"), "src/a.rs:1: fn alpha() {}");
+        assert_eq!(text(&o), "src/a.rs:1: fn alpha() {}");
         let o = Grep.execute(json!({"pattern": "alpha.x", "literal": true}), &c).await;
         assert_eq!(text(&o), "b.txt:1: alpha.x");
         let o = Grep.execute(json!({"pattern": "fn", "limit": 1}), &c).await;

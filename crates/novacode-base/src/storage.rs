@@ -47,7 +47,7 @@ fn write_impl(
 ) -> io::Result<()> {
     // Write through a symlink to its target, so a linked config (dotfiles/stow) stays linked.
     // A dangling link or a missing file: keep `path` as given.
-    let path = &fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = &crate::platform::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let dir = path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
@@ -119,7 +119,7 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
         Err(e) => e,
     };
     // `.bak` lives next to a symlink's target (see `write_impl`).
-    let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let real = crate::platform::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let bak = backup_path(&real);
     if let Ok(b) = fs::read(&bak)
         && let Ok(v) = serde_json::from_slice(&b)
