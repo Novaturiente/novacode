@@ -113,6 +113,12 @@ pub fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// `p` for splicing into a `bash -c` string: Git Bash reads `C:/x`, a `\` is an escape there.
+pub fn slash_path(p: &Path) -> String {
+    let s = p.display().to_string();
+    if cfg!(windows) { s.replace('\\', "/") } else { s }
+}
+
 /// Make `link` point at the dir `target`.
 #[cfg(unix)]
 pub fn link_dir(target: &Path, link: &Path) -> io::Result<()> {

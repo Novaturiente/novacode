@@ -33,7 +33,8 @@ pub fn command() -> Command {
 /// for, whose hooks are theirs to run.
 pub fn bookkeeping() -> Command {
     let mut c = command();
-    c.args(["-c", "core.hooksPath=/dev/null"]);
+    // autocrlf off: a checkpoint restores the bytes it saved (Git for Windows turns it on).
+    c.args(["-c", "core.hooksPath=/dev/null", "-c", "core.autocrlf=false"]);
     c
 }
 
@@ -120,7 +121,14 @@ mod tests {
         assert_eq!(args(&c), ["-c", "core.fsmonitor=false"]);
         assert_eq!(
             args(&bookkeeping()),
-            ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]
+            [
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.autocrlf=false"
+            ]
         );
     }
 
@@ -209,7 +217,9 @@ mod tests {
         assert!(git(&p, &["add", "f.txt"]));
         assert!(git(&p, &["commit", "-qm", "f"]));
         // Resolved at session start, before anything is planted.
-        assert_eq!(pin_repo(&p), Some(p.join(".git")));
+        // git prints `C:/…` on Windows: compare the folders, not the strings.
+        let real = |c: PathBuf| std::fs::canonicalize(c).unwrap();
+        assert_eq!(pin_repo(&p).map(real), Some(p.join(".git")));
         // Worktrees work pinned: their common dir is the main repo's `.git`.
         let wt = root.join("wt");
         let o = command_in(&p)

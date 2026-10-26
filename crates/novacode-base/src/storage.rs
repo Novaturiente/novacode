@@ -86,6 +86,8 @@ fn write_impl(
             }
         }
         fs::rename(&tmp, path)?;
+        // Windows can't open a folder as a file; NTFS journals the rename itself.
+        #[cfg(unix)]
         if durability == Durability::Durable {
             File::open(dir)?.sync_all()?;
         }

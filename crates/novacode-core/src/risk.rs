@@ -2092,7 +2092,8 @@ pub(crate) fn resolve(arg: &str, ctx: &Ctx) -> PathBuf {
         s = format!("{}:/{}", *d as char, &s[2..].trim_start_matches('/'));
     }
     let p = Path::new(&s);
-    let joined = if p.is_absolute() {
+    // `has_root`: on Windows `/dev/sda` has no drive, so isn't "absolute", but isn't relative either.
+    let joined = if p.is_absolute() || p.has_root() {
         p.to_path_buf()
     } else {
         ctx.cwd.join(p)

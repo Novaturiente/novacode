@@ -449,7 +449,7 @@ pub fn expand(text: &str, skills: &[Skill], templates: &[Template]) -> String {
         let raw = crate::plugin::fill_for(&k.path, raw);
         let base = k.path.parent().unwrap_or(Path::new("/"));
         let body = frontmatter(&raw).1.trim();
-        let body = &body.replace("${CLAUDE_SKILL_DIR}", &base.display().to_string());
+        let body = &body.replace("${CLAUDE_SKILL_DIR}", &novacode_base::platform::slash_path(base));
         // `$ARGUMENTS` (and `$1`…) in the body take the arguments, as in Claude Code.
         let placed = body.contains("$ARGUMENTS");
         let body = if placed {

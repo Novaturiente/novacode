@@ -504,9 +504,9 @@ fn away(p: &str, ctx: &risk::Ctx, root: &Path) -> Option<String> {
     (!fine).then(|| format!("it names {p}, outside the project"))
 }
 
-/// In the project or `/tmp`.
+/// In the project or `/tmp` (on Windows, `%TEMP%`).
 fn inside(p: &Path, root: &Path) -> bool {
-    p.starts_with(root) || p.starts_with("/tmp")
+    p.starts_with(root) || p.starts_with("/tmp") || (cfg!(windows) && p.starts_with(std::env::temp_dir()))
 }
 
 /// The project folder of `cwd`: its git top level, else `cwd`.
@@ -949,7 +949,10 @@ mod tests {
         let cwd = Path::new("/home/u/proj");
         let start = |dir: &str| serde_json::json!({ "action": "start", "command": "make", "cwd": dir });
         let why = scope(&p, "process", &start("/srv/app"), cwd).map(|s| s.1);
-        assert_eq!(why.as_deref(), Some("it runs in /srv/app, outside the project"));
+        assert_eq!(
+            why.map(|w| w.replace('\\', "/")).as_deref(),
+            Some("it runs in /srv/app, outside the project")
+        );
         assert!(scope(&p, "process", &start("../other"), cwd).is_some());
         assert!(scope(&p, "process", &start("~/elsewhere"), cwd).is_some());
         assert!(scope(&p, "process", &start("sub"), cwd).is_none());

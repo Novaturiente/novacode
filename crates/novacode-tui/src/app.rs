@@ -2427,6 +2427,8 @@ fn list_files(cwd: &str) -> Vec<String> {
         .flatten()
         .filter_map(|e| {
             let rel = e.path().strip_prefix(root).ok()?.to_string_lossy().into_owned();
+            // One form everywhere: `src/main.rs`, as typed after `@`.
+            let rel = if cfg!(windows) { rel.replace('\\', "/") } else { rel };
             if rel.is_empty() {
                 return None;
             }

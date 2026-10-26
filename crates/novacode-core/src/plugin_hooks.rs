@@ -253,7 +253,10 @@ impl PluginHooks {
             };
             let s = s.replace("${CLAUDE_PROJECT_DIR}", &project);
             match &skill_dir {
-                Some(d) => s.replace("${CLAUDE_SKILL_DIR}", d),
+                Some(d) => s.replace(
+                    "${CLAUDE_SKILL_DIR}",
+                    &novacode_base::platform::slash_path(Path::new(d)),
+                ),
                 None => s,
             }
         };

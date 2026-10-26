@@ -3288,6 +3288,8 @@ async fn login(store: &AuthStore, provider: &str, account: &str, method: Option<
 
 #[cfg(test)]
 mod tests {
+    // GOPATH splits on `;` on Windows.
+    #[cfg(unix)]
     #[test]
     fn relocated_caches_split_gopath() {
         use std::ffi::OsStr;

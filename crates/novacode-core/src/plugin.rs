@@ -354,8 +354,14 @@ impl Parts {
             return s.to_string();
         }
         let mut out = s
-            .replace("${CLAUDE_PLUGIN_ROOT}", &self.root.display().to_string())
-            .replace("${CLAUDE_PLUGIN_DATA}", &self.data_dir().display().to_string());
+            .replace(
+                "${CLAUDE_PLUGIN_ROOT}",
+                &novacode_base::platform::slash_path(&self.root),
+            )
+            .replace(
+                "${CLAUDE_PLUGIN_DATA}",
+                &novacode_base::platform::slash_path(&self.data_dir()),
+            );
         let sensitive: Vec<String> = self
             .option_specs()
             .into_iter()

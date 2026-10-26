@@ -321,7 +321,8 @@ mod tests {
             // Inside the project or /tmp: no judge call.
             let (j, faux) = judge("BLOCK: no");
             let p = policy(json!({}));
-            for path in ["a.txt", "/w/sub/b.txt", "/tmp/x"] {
+            let tmp = std::env::temp_dir().join("x").display().to_string();
+            for path in ["a.txt", "/w/sub/b.txt", tmp.as_str()] {
                 assert!(
                     auth_tool(&p, None, &j, "write", write(path, "x"), w).await.is_none(),
                     "{path}"

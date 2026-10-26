@@ -669,6 +669,16 @@ fn head(dir: &Path) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// `file:///C:/x` on Windows, `file:///x` elsewhere.
+    fn file_url(p: &Path) -> String {
+        let s = novacode_base::platform::slash_path(p);
+        if s.starts_with('/') {
+            format!("file://{s}")
+        } else {
+            format!("file:///{s}")
+        }
+    }
+
     fn repo() -> (tempfile::TempDir, impl Fn(&[&str])) {
         let repo = tempfile::tempdir().unwrap();
         let p = repo.path().to_path_buf();
@@ -700,7 +710,7 @@ mod tests {
         );
         let (r, g) = repo();
         commit(r.path(), &g, "one");
-        let url = format!("file://{}", r.path().display());
+        let url = file_url(r.path());
         store.install(&url, Some("cloned"), Want::Latest).await.unwrap();
         let first = store.read_lock().unwrap()["cloned"].rev.clone();
         assert_eq!(first.len(), 40, "the commit is pinned");
@@ -808,7 +818,7 @@ mod tests {
         assert_eq!(store.read_lock(), Ok(Lock::new()), "a missing lock is empty");
         let (r, g) = repo();
         commit(r.path(), &g, "one");
-        let url = format!("file://{}", r.path().display());
+        let url = file_url(r.path());
         store.install(&url, Some("a"), Want::Latest).await.unwrap();
         std::fs::write(&store.lock, "{broken").unwrap();
         let named = |e: String| {
@@ -905,7 +915,7 @@ mod tests {
         let (r, g) = repo();
         commit(r.path(), &g, "one");
         g(&["tag", "v1.0.0"]);
-        let url = format!("file://{}", r.path().display());
+        let url = file_url(r.path());
         store.install(&url, Some("p"), Want::Latest).await.unwrap();
         store.install(&url, Some("edge"), Want::Ref("main")).await.unwrap();
         assert_eq!(store.check().await, (vec![], 2));
@@ -994,7 +1004,7 @@ mod tests {
         // Declared in the project, pinned by its committed lock on install.
         let (r, g) = repo();
         commit(r.path(), &g, "one");
-        let url = format!("file://{}", r.path().display());
+        let url = file_url(r.path());
         std::fs::create_dir_all(proj.path().join(".novacode")).unwrap();
         std::fs::write(
             proj.path().join(".novacode/packages.json"),

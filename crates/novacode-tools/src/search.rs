@@ -353,7 +353,7 @@ mod tests {
         let c = ctx(p);
 
         let o = Grep.execute(json!({"pattern": "alpha", "glob": "*.rs"}), &c).await;
-        assert_eq!(text(&o), "src/a.rs:1: fn alpha() {}");
+        assert_eq!(text(&o).replace('\\', "/"), "src/a.rs:1: fn alpha() {}");
         let o = Grep.execute(json!({"pattern": "alpha.x", "literal": true}), &c).await;
         assert_eq!(text(&o), "b.txt:1: alpha.x");
         let o = Grep.execute(json!({"pattern": "fn", "limit": 1}), &c).await;

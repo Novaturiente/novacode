@@ -273,7 +273,7 @@ mod tests {
             )
             .await;
         assert!(o.is_error && text(&o).contains("timeout"), "{}", text(&o));
-        assert!(t0.elapsed() < Duration::from_secs(5));
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
     }
 
     /// L5.8: a timed-out command keeps running in the process manager.
