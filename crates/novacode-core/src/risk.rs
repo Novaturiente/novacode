@@ -1528,7 +1528,7 @@ fn writes_or_runs(name: &str, args: &[String]) -> bool {
 
 /// An exact home or system folder (not a credential or user-protected path).
 fn is_exact_dir(p: &Path, ctx: &Ctx) -> bool {
-    p == ctx.home || SYSTEM_DIRS.iter().any(|d| p == Path::new(d))
+    same(p, ctx.home) || is_system(p)
 }
 
 /// Writing to `dest`: into an exact home or system folder (`into`, the file lands
@@ -2058,7 +2058,11 @@ fn git_sub(args: &[String], i: usize) -> Risk {
 pub(crate) fn resolve(arg: &str, ctx: &Ctx) -> PathBuf {
     let home = ctx.home.to_string_lossy();
     let mut s = arg.to_string();
-    for var in ["${HOME}", "$HOME"] {
+    #[cfg(windows)]
+    let vars = ["${HOME}", "$HOME", "${USERPROFILE}", "$USERPROFILE"];
+    #[cfg(unix)]
+    let vars = ["${HOME}", "$HOME"];
+    for var in vars {
         if let Some(rest) = s.strip_prefix(var) {
             s = format!("{home}{rest}");
         }
@@ -2078,6 +2082,14 @@ pub(crate) fn resolve(arg: &str, ctx: &Ctx) -> PathBuf {
     }
     if s == "*" || s == ".*" {
         s = ".".into();
+    }
+    // Git Bash names drives `/c/...`.
+    #[cfg(windows)]
+    if let [b'/', d, rest @ ..] = s.as_bytes()
+        && d.is_ascii_alphabetic()
+        && (rest.is_empty() || rest[0] == b'/')
+    {
+        s = format!("{}:/{}", *d as char, &s[2..].trim_start_matches('/'));
     }
     let p = Path::new(&s);
     let joined = if p.is_absolute() {
@@ -2101,6 +2113,7 @@ pub(crate) fn resolve(arg: &str, ctx: &Ctx) -> PathBuf {
     out
 }
 
+#[cfg(unix)]
 const SYSTEM_DIRS: &[&str] = &[
     "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/opt", "/proc", "/root", "/sbin", "/srv", "/sys",
     "/usr", "/var",
@@ -2115,9 +2128,87 @@ const CREDENTIAL_DIRS: &[&str] = &[
     ".novacode",
 ];
 
+/// Windows' own credential stores under home, on top of [`CREDENTIAL_DIRS`].
+#[cfg(windows)]
+const WINDOWS_CREDENTIAL_DIRS: &[&str] = &[
+    "AppData/Roaming/Microsoft/Credentials",
+    "AppData/Local/Microsoft/Credentials",
+    "AppData/Roaming/Microsoft/Protect",
+    "AppData/Roaming/gcloud",
+    "AppData/Roaming/GitHub CLI",
+];
+#[cfg(unix)]
+const WINDOWS_CREDENTIAL_DIRS: &[&str] = &[];
+
 /// The credential folders under home; the sandbox hides them too (L6.5).
 pub fn credential_dirs() -> &'static [&'static str] {
     CREDENTIAL_DIRS
+}
+
+/// The form protected paths are compared in. Unix: as is.
+#[cfg(unix)]
+fn fold(p: &Path) -> std::borrow::Cow<'_, Path> {
+    std::borrow::Cow::Borrowed(p)
+}
+
+/// Windows: NTFS ignores case and drops trailing dots and spaces, and `canonicalize`
+/// adds `\\?\`; so `\\?\C:\Users\X\.SSH.` folds to `c:\users\x\.ssh`.
+#[cfg(windows)]
+fn fold(p: &Path) -> std::borrow::Cow<'_, Path> {
+    let s = p.to_string_lossy().replace('/', "\\");
+    let s = match s.strip_prefix(r"\\?\UNC\") {
+        Some(r) => format!(r"\\{r}"),
+        None => s.strip_prefix(r"\\?\").map_or(s.clone(), str::to_string),
+    };
+    let low = s.to_lowercase();
+    let kept: Vec<&str> = low
+        .split('\\')
+        .map(|c| {
+            if matches!(c, "" | "." | "..") {
+                c
+            } else {
+                c.trim_end_matches(['.', ' '])
+            }
+        })
+        .collect();
+    std::borrow::Cow::Owned(PathBuf::from(kept.join("\\")))
+}
+
+/// `a` and `b` name the same place.
+fn same(a: &Path, b: &Path) -> bool {
+    fold(a) == fold(b)
+}
+
+/// `p` is `dir` or inside it.
+fn under(p: &Path, dir: &Path) -> bool {
+    fold(p).starts_with(fold(dir))
+}
+
+#[cfg(unix)]
+fn is_system(p: &Path) -> bool {
+    SYSTEM_DIRS.iter().any(|d| p == Path::new(d))
+}
+
+/// A drive root or one of Windows' own top folders on any drive.
+#[cfg(windows)]
+fn is_system(p: &Path) -> bool {
+    let f = fold(p);
+    let s = f.to_string_lossy();
+    let Some(rest) = s
+        .strip_prefix(|c: char| c.is_ascii_alphabetic())
+        .and_then(|r| r.strip_prefix(':'))
+    else {
+        return false;
+    };
+    [
+        "",
+        "windows",
+        "program files",
+        "program files (x86)",
+        "programdata",
+        "users",
+    ]
+    .contains(&rest.trim_matches('\\'))
 }
 
 /// Why writing a file at `path` would touch a protected place, or `None`: the
@@ -2127,7 +2218,8 @@ pub fn credential_dirs() -> &'static [&'static str] {
 pub fn protected_path(path: &Path, ctx: &Ctx) -> Option<String> {
     let p = resolve(&path.to_string_lossy(), ctx);
     let nova = ctx.home.join(".novacode");
-    if let Ok(rest) = p.strip_prefix(&nova)
+    let (folded, nova) = (fold(&p), fold(&nova));
+    if let Ok(rest) = folded.strip_prefix(&nova)
         && !rest.as_os_str().is_empty()
     {
         let mut parts = rest.components();
@@ -2147,15 +2239,14 @@ pub fn protected_path(path: &Path, ctx: &Ctx) -> Option<String> {
 
 /// Why `p` is protected, or `None`.
 fn protected(p: &Path, ctx: &Ctx) -> Option<String> {
-    if SYSTEM_DIRS.iter().any(|d| p == Path::new(d)) {
+    if is_system(p) {
         return Some(format!("the system folder {}", p.display()));
     }
-    if p == ctx.home {
+    if same(p, ctx.home) {
         return Some("your home folder".into());
     }
-    for d in CREDENTIAL_DIRS {
-        let dir = ctx.home.join(d);
-        if p == dir || p.starts_with(&dir) {
+    for d in CREDENTIAL_DIRS.iter().chain(WINDOWS_CREDENTIAL_DIRS) {
+        if under(p, &ctx.home.join(d)) {
             return Some(format!("credentials in ~/{d}"));
         }
     }
@@ -2166,7 +2257,7 @@ fn protected(p: &Path, ctx: &Ctx) -> Option<String> {
 fn extra_protected(p: &Path, ctx: &Ctx) -> Option<String> {
     for extra in ctx.protected {
         let e = resolve(extra, ctx);
-        if p == e || p.starts_with(&e) {
+        if under(p, &e) {
             return Some(format!("the protected path {extra}"));
         }
     }
@@ -2193,6 +2284,53 @@ fn is_device(p: &Path) -> bool {
 mod tests {
     use super::*;
     use Level::*;
+
+    /// L11.14: case, trailing dots and spaces, `\\?\`, `/c/` drive paths and
+    /// `$USERPROFILE` all reach the same protected place.
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_fold_before_matching() {
+        let protected = vec!["~/secrets".to_string()];
+        let ctx = Ctx {
+            cwd: Path::new(r"C:\Users\u\proj"),
+            home: Path::new(r"C:\Users\u"),
+            protected: &protected,
+        };
+        let hit = |p: &str| protected_path(Path::new(p), &ctx);
+        for p in [
+            r"C:\Users\u\.ssh\authorized_keys",
+            r"c:/users/U/.SSH/authorized_keys",
+            r"C:\Users\u\.ssh.\authorized_keys",
+            r"C:\Users\u\.ssh \k",
+            r"\\?\C:\Users\u\.ssh\k",
+            r"C:\Users\u\AppData\Roaming\Microsoft\Protect\x",
+            r"C:\Users\u\SECRETS\a",
+            r"C:\Users\u\.novacode\AUTH.json",
+            r"C:\Users\u",
+            r"C:\",
+            r"C:\Windows",
+            r"d:\Program Files",
+        ] {
+            assert!(hit(p).is_some(), "{p}");
+        }
+        for p in [
+            r"C:\Users\u\proj\a.txt",
+            r"C:\Users\u\.sshx\k",
+            r"C:\Users\u\.novacode\AGENTS.md",
+        ] {
+            assert!(hit(p).is_none(), "{p}: {:?}", hit(p));
+        }
+        let lvl = |c: &str| classify(c, &ctx).level;
+        for c in [
+            "rm -rf /c/Users/u/.ssh",
+            "rm -rf $USERPROFILE/.ssh",
+            "rm -rf ~/.SSH",
+            "echo x > /c/users/u/.ssh/authorized_keys",
+        ] {
+            assert_eq!(lvl(c), Catastrophic, "{c}");
+        }
+        assert_ne!(lvl("rm -rf /c/Users/u/proj/target"), Catastrophic);
+    }
 
     fn level(cmd: &str) -> Level {
         let protected = vec!["~/secrets".to_string()];
