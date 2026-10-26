@@ -96,4 +96,22 @@ jobs:
           awk -v v="$v" '$0 ~ "^## \\[?"v"\\]?( |$)" {f=1; next} f && /^## / {exit} f && !/^\[[^]]*\]: /' src/CHANGELOG.md > notes.md
           notes=()
           if grep -q '[^[:space:]]' notes.md; then notes=(--notes-file notes.md); fi
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" "${notes[@]}" --generate-notes novacode-*
+          # vX.Y.Z-rc.N is a pre-release: never "latest", so `novacode update` and the installers skip it.
+          pre=()
+          case "$GITHUB_REF_NAME" in *-*) pre=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" "${pre[@]}" "${notes[@]}" --generate-notes novacode-*
+  # L11.14: the published Windows asset installs with install.ps1 and runs.
+  verify-windows:
+    needs: publish
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - shell: pwsh
+        env:
+          NOVACODE_VERSION: ${{ github.ref_name }}
+        run: |
+          ./scripts/install.ps1
+          & "$env:LOCALAPPDATA\novacode\bin\novacode.exe" --version
+          & "$env:LOCALAPPDATA\novacode\bin\novacode.exe" doctor
