@@ -118,16 +118,32 @@ impl Rule {
 
     fn matches_path(&self, raw: Option<&str>, abs: Option<&Path>) -> bool {
         let Some(p) = self.pattern.as_deref() else { return true };
-        // globset matches Windows paths with `/`; a `\` in a pattern would be literal there.
-        let p = if cfg!(windows) {
-            p.replace('\\', "/")
-        } else {
-            p.to_string()
+        // Windows: globset compares paths with `/`, and NTFS ignores case; a `\` that
+        // doesn't escape a glob character is a separator.
+        let p = if cfg!(windows) { windows_glob(p) } else { p.to_string() };
+        let Ok(glob) = globset::GlobBuilder::new(&p).case_insensitive(cfg!(windows)).build() else {
+            return false;
         };
-        let Ok(glob) = globset::Glob::new(&p) else { return false };
         let m = glob.compile_matcher();
         raw.is_some_and(|r| m.is_match(r)) || abs.is_some_and(|a| m.is_match(a))
     }
+}
+
+/// A Windows rule pattern with `\` separators in globset's `/` form; `\[` and the like stay escapes.
+fn windows_glob(p: &str) -> String {
+    let mut out = String::with_capacity(p.len());
+    let mut it = p.chars().peekable();
+    while let Some(c) = it.next() {
+        match (c, it.peek()) {
+            ('\\', Some(n)) if "[]{}*?\\".contains(*n) => {
+                out.push(c);
+                out.push(it.next().unwrap_or_default());
+            }
+            ('\\', _) => out.push('/'),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 impl std::fmt::Display for Rule {
@@ -682,9 +698,14 @@ impl Policy {
         // novacode's settings hold the permission rules: a file tool changes them only with the user's yes,
         // ahead of any allow rule (the agent mustn't widen its own permissions).
         if MUTATING.contains(&lower.as_str()) {
+            use crate::risk::{fold, same, under};
+            let name = |s: &str| fold(Path::new(s)).into_owned();
             let is_settings = |q: &Path| {
-                q.file_name().is_some_and(|n| n == "settings.json")
-                    && q.parent().and_then(Path::file_name).is_some_and(|d| d == ".novacode")
+                let q = fold(q);
+                q.file_name().is_some_and(|n| n == name("settings.json").as_os_str())
+                    && q.parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|d| d == name(".novacode").as_os_str())
             };
             // Global extensions, skills, agents, prompts, packages and MCP servers run commands,
             // and so do Claude-compatible ones and shell startup files.
@@ -697,21 +718,23 @@ impl Policy {
                 .map(|d| vec![lexical(&d), real(&d)])
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|d| *d != self.home && *d != real_home)
+                .filter(|d| !same(d, &self.home) && !same(d, &real_home))
                 .collect();
             let global = |q: &Path| -> Option<&'static str> {
-                if zdotdir.iter().any(|z| q.starts_with(z)) {
+                if zdotdir.iter().any(|z| under(q, z)) {
                     return Some("a shell startup file");
                 }
+                let q = fold(q);
                 [&self.home, &real_home].iter().find_map(|h| {
-                    let rest = q.strip_prefix(h).ok()?;
+                    let h = fold(h);
+                    let rest = q.strip_prefix(&h).ok()?;
                     GLOBAL_CONFIG
                         .iter()
                         .find(|(p, folder, _)| {
                             if *folder {
-                                rest.starts_with(p)
+                                rest.starts_with(name(p))
                             } else {
-                                rest == Path::new(p)
+                                rest == name(p)
                             }
                         })
                         .map(|g| g.2)
@@ -1506,6 +1529,29 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// L11.14 review a1: settings and global config ask whatever the Windows spelling.
+    #[cfg(windows)]
+    #[test]
+    fn windows_settings_spellings_ask() {
+        let p = Policy::new(Default::default(), r"C:\Users\u".into(), None);
+        let cwd = Path::new(r"C:\Users\u\proj");
+        for path in [
+            r"C:\Users\u\.NOVACODE\Settings.json",
+            r"C:\Users\u\.novacode\settings.json.",
+            r"c:/users/u/.novacode/settings.json::$DATA",
+            r"C:\Users\u\.novacode\Skills\x\SKILL.md",
+        ] {
+            assert!(
+                matches!(p.check("write", &json!({"path": path}), cwd, true), Verdict::Ask { .. }),
+                "{path}"
+            );
+        }
+        // Rules: case-insensitive, `\` as a separator, `\[` still an escape.
+        let rule = |r: &str| Rule::parse(r).unwrap();
+        assert!(rule(r"Write(C:\Proj\**)").matches_path(None, Some(Path::new(r"c:\proj\a.txt"))));
+        assert!(rule(r"Edit(config\[prod\].json)").matches_path(Some("config[prod].json"), None));
     }
 
     /// `$ZDOTDIR` is read at check time: each case runs [`zdotdir_case`] in a

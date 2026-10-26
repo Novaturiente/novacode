@@ -7,14 +7,27 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The user's home dir: `$HOME` (on Windows, else `%USERPROFILE%`).
+/// The user's home dir: `$HOME`.
+#[cfg(unix)]
 pub fn home() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME");
-    #[cfg(windows)]
-    let home = home
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// `%HOME%`, else `%USERPROFILE%`, as a full Windows path: Git Bash's `/c/Users/u`
+/// becomes `c:/Users/u`, and 8.3 short names are expanded.
+#[cfg(windows)]
+pub fn home() -> Option<PathBuf> {
+    let h = std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
-        .or_else(|| std::env::var_os("USERPROFILE"));
-    home.map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE"))?;
+    let s = h.to_string_lossy();
+    let p = match s.as_bytes() {
+        [b'/', d, rest @ ..] if d.is_ascii_alphabetic() && (rest.is_empty() || rest[0] == b'/') => {
+            PathBuf::from(format!("{}:/{}", *d as char, s[2..].trim_start_matches('/')))
+        }
+        _ => PathBuf::from(&h),
+    };
+    Some(canonicalize(&p).unwrap_or(p))
 }
 
 /// The program for `bash -c CMD`.

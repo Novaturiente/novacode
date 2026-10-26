@@ -491,7 +491,16 @@ fn away(p: &str, ctx: &risk::Ctx, root: &Path) -> Option<String> {
         || p.starts_with("${HOME}")
         || p == ".."
         || p.starts_with("../")
-        || p.contains("/../");
+        || p.contains("/../")
+        // Windows: `C:\x`, `\\srv\share`, `\x`, `..\x` and its home variables.
+        || (cfg!(windows)
+            && (Path::new(p).is_absolute()
+                || p.starts_with('\\')
+                || p.starts_with("..\\")
+                || p.contains("\\..\\")
+                || ["$USERPROFILE", "${USERPROFILE}", "$APPDATA", "${APPDATA}", "$LOCALAPPDATA", "${LOCALAPPDATA}"]
+                    .iter()
+                    .any(|v| p.starts_with(v))));
     if !pathy || p.contains("://") {
         return None;
     }

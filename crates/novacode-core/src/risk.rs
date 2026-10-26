@@ -1917,19 +1917,30 @@ fn interpreter(name: &str, args: &[String], input: &[String], ctx: &Ctx) -> Risk
 /// The credential folder or protected path that `code` names, if any:
 /// `~/.ssh`, `$HOME/.ssh`, `${HOME}/.ssh` or the absolute path.
 fn mentions(code: &str, ctx: &Ctx) -> Option<String> {
-    let home = ctx.home.to_string_lossy();
+    // Windows: compared lower-cased with `/`, so `C:\Users\u\.SSH` is `c:/users/u/.ssh`.
+    let norm = |s: &str| {
+        if cfg!(windows) {
+            s.replace('\\', "/").to_lowercase()
+        } else {
+            s.to_string()
+        }
+    };
+    let code = &norm(code);
+    let home = norm(&ctx.home.to_string_lossy());
+    let home_word = if cfg!(windows) { "home" } else { "HOME" };
     // (path under home, how to name it); protected paths outside home are matched whole.
     let mut under: Vec<(String, String)> = CREDENTIAL_DIRS
         .iter()
-        .map(|d| (d.to_string(), format!("~/{d}")))
+        .chain(WINDOWS_CREDENTIAL_DIRS)
+        .map(|d| (norm(d), format!("~/{d}")))
         .collect();
     let mut outside = Vec::new();
     for extra in ctx.protected {
         let p = resolve(extra, ctx);
         let what = format!("the protected path {extra}");
         match p.strip_prefix(ctx.home) {
-            Ok(rel) if !rel.as_os_str().is_empty() => under.push((rel.to_string_lossy().into_owned(), what)),
-            _ => outside.push((p.to_string_lossy().into_owned(), what)),
+            Ok(rel) if !rel.as_os_str().is_empty() => under.push((norm(&rel.to_string_lossy()), what)),
+            _ => outside.push((norm(&p.to_string_lossy()), what)),
         }
     }
     // A name ends where no path-name letter follows (`~/.aws` is not `~/.awsome`).
@@ -1943,7 +1954,7 @@ fn mentions(code: &str, ctx: &Ctx) -> Option<String> {
         // `$HOME/.ssh`, `${HOME}/.ssh`, `process.env.HOME+'/.aws'`, `os.environ['HOME'] + "/.ssh"`.
         // A path built any other way (a variable, `join`) is not seen; that is the sandbox's job.
         let tail = format!("/{rel}");
-        let after_home = code.match_indices("HOME").any(|(i, _)| {
+        let after_home = code.match_indices(home_word).any(|(i, _)| {
             let rest = code[i + 4..].trim_start_matches(|c: char| !c.is_alphanumeric() && c != '/');
             rest.strip_prefix(&tail).is_some_and(ends)
         });
@@ -2059,12 +2070,21 @@ pub(crate) fn resolve(arg: &str, ctx: &Ctx) -> PathBuf {
     let home = ctx.home.to_string_lossy();
     let mut s = arg.to_string();
     #[cfg(windows)]
-    let vars = ["${HOME}", "$HOME", "${USERPROFILE}", "$USERPROFILE"];
+    let vars = [
+        ("${HOME}", ""),
+        ("$HOME", ""),
+        ("${USERPROFILE}", ""),
+        ("$USERPROFILE", ""),
+        ("${APPDATA}", "/AppData/Roaming"),
+        ("$APPDATA", "/AppData/Roaming"),
+        ("${LOCALAPPDATA}", "/AppData/Local"),
+        ("$LOCALAPPDATA", "/AppData/Local"),
+    ];
     #[cfg(unix)]
-    let vars = ["${HOME}", "$HOME"];
-    for var in vars {
+    let vars = [("${HOME}", ""), ("$HOME", "")];
+    for (var, sub) in vars {
         if let Some(rest) = s.strip_prefix(var) {
-            s = format!("{home}{rest}");
+            s = format!("{home}{sub}{rest}");
         }
     }
     if s == "~" || s.starts_with("~/") {
@@ -2092,8 +2112,9 @@ pub(crate) fn resolve(arg: &str, ctx: &Ctx) -> PathBuf {
         s = format!("{}:/{}", *d as char, s[2..].trim_start_matches('/'));
     }
     let p = Path::new(&s);
-    // `has_root`: on Windows `/dev/sda` has no drive, so isn't "absolute", but isn't relative either.
-    let joined = if p.is_absolute() || p.has_root() {
+    // A `/`-led path without a drive is Git Bash's own (`/`, `/dev/sda`); a `\`-led one
+    // is on the cwd's drive, which `join` keeps. Unix: `/`-led is absolute.
+    let joined = if p.is_absolute() || s.starts_with('/') {
         p.to_path_buf()
     } else {
         ctx.cwd.join(p)
@@ -2110,6 +2131,11 @@ pub(crate) fn resolve(arg: &str, ctx: &Ctx) -> PathBuf {
     }
     if out.as_os_str().is_empty() {
         out.push("/");
+    }
+    // 8.3 short names (`PROGRA~1`) only resolve on disk.
+    #[cfg(windows)]
+    if out.to_string_lossy().contains('~') {
+        out = crate::policy::real(&out);
     }
     out
 }
@@ -2147,40 +2173,59 @@ pub fn credential_dirs() -> &'static [&'static str] {
 
 /// The form protected paths are compared in. Unix: as is.
 #[cfg(unix)]
-fn fold(p: &Path) -> std::borrow::Cow<'_, Path> {
+pub(crate) fn fold(p: &Path) -> std::borrow::Cow<'_, Path> {
     std::borrow::Cow::Borrowed(p)
 }
 
-/// Windows: NTFS ignores case and drops trailing dots and spaces, and `canonicalize`
-/// adds `\\?\`; so `\\?\C:\Users\X\.SSH.` folds to `c:\users\x\.ssh`.
+/// Windows: every spelling of one file folds to one form, so
+/// `\\.\C:\Users\X\.SSH.\k:s` and `\\localhost\c$\users\x\.ssh\k` are `C:\USERS\X\.SSH\K`:
+/// the `\\?\`, `\\.\` and `\??\` prefixes and admin shares (`\\host\C$`) name a drive,
+/// `name:stream` writes `name` (alternate data streams), and NTFS ignores case
+/// (it compares upper-cased) and drops trailing dots and spaces.
 #[cfg(windows)]
-fn fold(p: &Path) -> std::borrow::Cow<'_, Path> {
+pub(crate) fn fold(p: &Path) -> std::borrow::Cow<'_, Path> {
     let s = p.to_string_lossy().replace('/', "\\");
-    let s = match s.strip_prefix(r"\\?\UNC\") {
-        Some(r) => format!(r"\\{r}"),
-        None => s.strip_prefix(r"\\?\").map_or(s.clone(), str::to_string),
+    let s = if let Some(r) = s.strip_prefix(r"\\?\UNC\").or_else(|| s.strip_prefix(r"\\.\UNC\")) {
+        format!(r"\\{r}")
+    } else if let Some(r) = [r"\\?\", r"\\.\", r"\??\"].iter().find_map(|x| s.strip_prefix(x)) {
+        r.to_string()
+    } else {
+        s.clone()
     };
-    let low = s.to_lowercase();
-    let kept: Vec<&str> = low
+    let share = s
+        .strip_prefix(r"\\")
+        .and_then(|r| r.split_once('\\'))
+        .and_then(|(_, r)| {
+            let (share, rest) = r.split_once('\\').unwrap_or((r, ""));
+            match share.as_bytes() {
+                [d, b'$'] if d.is_ascii_alphabetic() => Some(format!("{}:\\{rest}", *d as char)),
+                _ => None,
+            }
+        });
+    let s = share.unwrap_or(s);
+    let parts: Vec<String> = s
         .split('\\')
-        .map(|c| {
-            if matches!(c, "" | "." | "..") {
+        .enumerate()
+        .map(|(i, c)| {
+            let drive = i == 0 && matches!(c.as_bytes(), [d, b':'] if d.is_ascii_alphabetic());
+            let c = if drive { c } else { c.split(':').next().unwrap_or("") };
+            let c = if matches!(c, "" | "." | "..") {
                 c
             } else {
                 c.trim_end_matches(['.', ' '])
-            }
+            };
+            c.chars().flat_map(char::to_uppercase).collect()
         })
         .collect();
-    std::borrow::Cow::Owned(PathBuf::from(kept.join("\\")))
+    std::borrow::Cow::Owned(PathBuf::from(parts.join("\\")))
 }
-
 /// `a` and `b` name the same place.
-fn same(a: &Path, b: &Path) -> bool {
+pub(crate) fn same(a: &Path, b: &Path) -> bool {
     fold(a) == fold(b)
 }
 
 /// `p` is `dir` or inside it.
-fn under(p: &Path, dir: &Path) -> bool {
+pub(crate) fn under(p: &Path, dir: &Path) -> bool {
     fold(p).starts_with(fold(dir))
 }
 
@@ -2203,11 +2248,11 @@ fn is_system(p: &Path) -> bool {
     };
     [
         "",
-        "windows",
-        "program files",
-        "program files (x86)",
-        "programdata",
-        "users",
+        "WINDOWS",
+        "PROGRAM FILES",
+        "PROGRAM FILES (X86)",
+        "PROGRAMDATA",
+        "USERS",
     ]
     .contains(&rest.trim_matches('\\'))
 }
@@ -2225,11 +2270,13 @@ pub fn protected_path(path: &Path, ctx: &Ctx) -> Option<String> {
     {
         let mut parts = rest.components();
         let first = parts.next().map(|c| c.as_os_str().to_string_lossy().into_owned());
+        // Names in `fold`'s form (upper case on Windows).
+        let f = |s: &str| fold(Path::new(s)).to_string_lossy().into_owned();
         let cred = first.as_deref().is_some_and(|n| {
-            n == "auth.json"
-                || n == "mcp-auth.json"
-                || n == "trust.json"
-                || (n.starts_with("auth-") && n.ends_with(".json"))
+            n == f("auth.json")
+                || n == f("mcp-auth.json")
+                || n == f("trust.json")
+                || (n.starts_with(&f("auth-")) && n.ends_with(&f(".json")))
         });
         if !(cred && parts.next().is_none()) {
             return extra_protected(&p, ctx);
@@ -2238,17 +2285,33 @@ pub fn protected_path(path: &Path, ctx: &Ctx) -> Option<String> {
     protected(&p, ctx)
 }
 
+/// The home folders to protect: `ctx.home`, and on Windows `%USERPROFILE%` too,
+/// where Windows keeps its own stores when `HOME` points elsewhere.
+fn homes(ctx: &Ctx) -> Vec<PathBuf> {
+    #[allow(unused_mut)]
+    let mut v = vec![ctx.home.to_path_buf()];
+    #[cfg(windows)]
+    if let Some(u) = std::env::var_os("USERPROFILE").map(PathBuf::from)
+        && !same(&u, ctx.home)
+    {
+        v.push(u);
+    }
+    v
+}
+
 /// Why `p` is protected, or `None`.
 fn protected(p: &Path, ctx: &Ctx) -> Option<String> {
     if is_system(p) {
         return Some(format!("the system folder {}", p.display()));
     }
-    if same(p, ctx.home) {
-        return Some("your home folder".into());
-    }
-    for d in CREDENTIAL_DIRS.iter().chain(WINDOWS_CREDENTIAL_DIRS) {
-        if under(p, &ctx.home.join(d)) {
-            return Some(format!("credentials in ~/{d}"));
+    for home in homes(ctx) {
+        if same(p, &home) {
+            return Some("your home folder".into());
+        }
+        for d in CREDENTIAL_DIRS.iter().chain(WINDOWS_CREDENTIAL_DIRS) {
+            if under(p, &home.join(d)) {
+                return Some(format!("credentials in ~/{d}"));
+            }
         }
     }
     extra_protected(p, ctx)
@@ -2309,6 +2372,14 @@ mod tests {
             r"C:\Users\u\AppData\Roaming\Microsoft\Protect\x",
             r"C:\Users\u\SECRETS\a",
             r"C:\Users\u\.novacode\AUTH.json",
+            // Review a1: streams, device and admin-share prefixes.
+            r"C:\Users\u\.novacode\trust.json::$DATA",
+            r"C:\Users\u\.ssh::$INDEX_ALLOCATION\authorized_keys",
+            r"\\.\C:\Users\u\.ssh\authorized_keys",
+            r"\??\C:\Users\u\.ssh\k",
+            r"\\localhost\C$\Users\u\.ssh\k",
+            r"\\127.0.0.1\c$\users\u\.ssh\k",
+            r"\\?\UNC\localhost\C$\Users\u\.ssh\k",
             r"C:\Users\u",
             r"C:\",
             r"C:\Windows",
@@ -2329,10 +2400,21 @@ mod tests {
             "rm -rf $USERPROFILE/.ssh",
             "rm -rf ~/.SSH",
             "echo x > /c/users/u/.ssh/authorized_keys",
+            "rm -rf //localhost/c$/Users/u/.ssh",
+            r"rm -rf '\Users\u\.ssh'",
+            r"rm -rf '\Windows'",
+            "rm -rf $APPDATA/Microsoft/Protect",
+            "rm -rf ${LOCALAPPDATA}/Microsoft/Credentials",
         ] {
             assert_eq!(lvl(c), Catastrophic, "{c}");
         }
         assert_ne!(lvl("rm -rf /c/Users/u/proj/target"), Catastrophic);
+        // Inline code naming a credential folder in Windows form asks, as on Unix.
+        assert_eq!(lvl(r#"python3 -c "open(r'C:\Users\u\.SSH\id_rsa','a')""#), Shared);
+        // 8.3 short names resolve on disk (when the drive has them).
+        if Path::new(r"C:\PROGRA~1").exists() {
+            assert_eq!(lvl("rm -rf C:/PROGRA~1"), Catastrophic);
+        }
     }
 
     fn level(cmd: &str) -> Level {
