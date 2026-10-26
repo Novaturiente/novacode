@@ -573,7 +573,8 @@ fn file_scope(policy: &Policy, tool: &str, args: &Value, cwd: &Path) -> Option<(
         let out = [lexical(&abs), real(&abs)].into_iter().find(|q| !fine(q))?;
         let s = Subject::File {
             tool: tool.to_string(),
-            path: out.display().to_string(),
+            // `/` on Windows too: this is the rule a yes saves, and rules are globs.
+            path: novacode_base::platform::slash_path(&out),
             head: head(args),
         };
         (!policy.approved(&s.key())).then_some(s)

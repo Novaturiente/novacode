@@ -118,7 +118,13 @@ impl Rule {
 
     fn matches_path(&self, raw: Option<&str>, abs: Option<&Path>) -> bool {
         let Some(p) = self.pattern.as_deref() else { return true };
-        let Ok(glob) = globset::Glob::new(p) else { return false };
+        // globset matches Windows paths with `/`; a `\` in a pattern would be literal there.
+        let p = if cfg!(windows) {
+            p.replace('\\', "/")
+        } else {
+            p.to_string()
+        };
+        let Ok(glob) = globset::Glob::new(&p) else { return false };
         let m = glob.compile_matcher();
         raw.is_some_and(|r| m.is_match(r)) || abs.is_some_and(|a| m.is_match(a))
     }
@@ -825,7 +831,7 @@ fn suggest_rule(tool: &str, command: Option<&str>, path: Option<&str>) -> String
             let words: Vec<&str> = c.split_whitespace().take(2).collect();
             format!("{name}({}:*)", words.join(" "))
         }
-        (None, Some(p)) => format!("{name}({p})"),
+        (None, Some(p)) => format!("{name}({})", novacode_base::platform::slash_path(Path::new(p))),
         _ => name,
     }
 }
