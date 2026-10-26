@@ -4,12 +4,18 @@
 
 novacode reads and edits your code, runs commands, and works through tasks with you, like Claude Code, pi or Codex. It uses the subscriptions you already pay for (Claude Pro/Max, ChatGPT/Codex, Antigravity, GitHub Copilot) or an API key for about 55 providers, including local models. Your existing Claude Code skills, agents and commands load without moving any files (a documented subset of their fields; `novacode doctor` lists what doesn't apply), and Claude Code plugins (ponytail, caveman, mattpocock/skills, …) install with `novacode install <repo>`, hooks included.
 
-> **Status:** early release (0.3). Linux is the main platform. macOS builds exist but are not tested yet. Windows is not supported; use WSL.
+> **Status:** early release (0.3). Linux is the main platform. macOS builds exist but are not tested yet. Windows x86_64 builds are experimental: tested in CI, not yet by hand. They need Git for Windows and have no command sandbox.
 
 ## Install
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Novaturiente/novacode/main/scripts/install.sh | sh
+```
+
+On Windows, in PowerShell (install [Git for Windows](https://git-scm.com/download/win) first):
+
+```powershell
+irm https://raw.githubusercontent.com/Novaturiente/novacode/main/scripts/install.ps1 | iex
 ```
 
 Or build from source: `cargo install --locked --git https://github.com/Novaturiente/novacode novacode` (needs Rust 1.97+, a C compiler and git). All the ways to install (Arch packages, building from a checkout) are in [docs/install.md](docs/install.md).
@@ -57,7 +63,7 @@ The full walk-through and a list of every flag and subcommand are in [docs/quick
 | Subagents, plan mode, MCP | Built in | Extensions | Built in |
 | Command risk check and approvals | Built in | Extension | Built in |
 | Extensions | TS/JS (no npm) or any language | TS with npm | Plugins and hooks |
-| Windows | No (WSL works) | Yes | Yes |
+| Windows | Experimental (needs Git Bash, no sandbox) | Yes | Yes |
 
 ## Documentation
 

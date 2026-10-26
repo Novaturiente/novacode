@@ -34,3 +34,7 @@ clap.workspace = true
 tokio = { workspace = true, features = ["signal", "net"] }
 tokio-util.workspace = true
 
+# L11.14: `novacode update` replaces the running .exe, which Windows won't rename over.
+[target.'cfg(windows)'.dependencies]
+self-replace = "1"
+

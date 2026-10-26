@@ -28,6 +28,7 @@ jobs:
           - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, cross: true }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, cross: true }
           - { target: aarch64-apple-darwin, os: macos-14, cross: false }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, cross: false }
     runs-on: ${{ matrix.os }}
     env:
       NOVACODE_INSTALL: release
@@ -51,16 +52,29 @@ jobs:
       - if: ${{ !matrix.cross }}
         run: cargo build --release --locked -p novacode --target ${{ matrix.target }}
       - name: package
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           v="${GITHUB_REF_NAME#v}"
           a="novacode-$v-${{ matrix.target }}.tar.gz"
           tar -czf "$a" -C "target/${{ matrix.target }}/release" novacode
           (command -v sha256sum >/dev/null && sha256sum "$a" || shasum -a 256 "$a") > "$a.sha256"
+      # L11.14: a .zip with novacode.exe; the .sha256 line has the same format as sha256sum's.
+      - name: package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $v = "$env:GITHUB_REF_NAME".TrimStart('v')
+          $a = "novacode-$v-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/novacode.exe" -DestinationPath $a
+          $h = (Get-FileHash -Algorithm SHA256 $a).Hash.ToLower()
+          Set-Content -NoNewline -Path "$a.sha256" -Value "$h  $a`n"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: novacode-*.tar.gz*
+          path: |
+            novacode-*.tar.gz*
+            novacode-*.zip*
   publish:
     needs: [bench, build]
     runs-on: ubuntu-latest

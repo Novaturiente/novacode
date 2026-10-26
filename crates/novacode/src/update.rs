@@ -19,6 +19,7 @@ fn target() -> Option<&'static str> {
         ("linux", "x86_64") => Some("x86_64-unknown-linux-musl"),
         ("linux", "aarch64") => Some("aarch64-unknown-linux-musl"),
         ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        ("windows", "x86_64") => Some("x86_64-pc-windows-msvc"),
         _ => None,
     }
 }
@@ -107,7 +108,8 @@ pub async fn run() -> anyhow::Result<ExitCode> {
         println!("novacode {} is the newest release", env!("CARGO_PKG_VERSION"));
         return Ok(ExitCode::SUCCESS);
     }
-    let asset = format!("novacode-{}-{target}.tar.gz", tag.trim_start_matches('v'));
+    let ext = if cfg!(windows) { "zip" } else { "tar.gz" };
+    let asset = format!("novacode-{}-{target}.{ext}", tag.trim_start_matches('v'));
     let base = format!("https://github.com/{REPO}/releases/download/{tag}/{asset}");
     println!("downloading {asset}");
     let data = http.get(&base).send().await?.error_for_status()?.bytes().await?;
@@ -127,19 +129,27 @@ pub async fn run() -> anyhow::Result<ExitCode> {
     std::fs::create_dir_all(&tmp)?;
     let tarball = tmp.join(&asset);
     std::fs::write(&tarball, &data)?;
-    let ok = std::process::Command::new("tar")
-        .arg("-xzf")
+    // Windows: its own bsdtar reads .zip; Git Bash's tar on PATH would not.
+    let tar = match std::env::var_os("SystemRoot") {
+        Some(r) if cfg!(windows) => std::path::PathBuf::from(r).join("System32").join("tar.exe"),
+        _ => "tar".into(),
+    };
+    let ok = std::process::Command::new(tar)
+        .arg(if cfg!(windows) { "-xf" } else { "-xzf" })
         .arg(&tarball)
         .arg("-C")
         .arg(&tmp)
         .status()?
         .success();
-    let new_bin = tmp.join("novacode");
+    let new_bin = tmp.join(if cfg!(windows) { "novacode.exe" } else { "novacode" });
     if !ok || !new_bin.is_file() {
         let _ = std::fs::remove_dir_all(&tmp);
         anyhow::bail!("the release archive has no `novacode` binary; nothing changed");
     }
+    #[cfg(unix)]
     std::fs::rename(&new_bin, &exe)?;
+    #[cfg(windows)]
+    self_replace::self_replace(&new_bin)?;
     let _ = std::fs::remove_dir_all(&tmp);
     println!("updated to {tag}; running sessions keep the old version until /restart");
     Ok(ExitCode::SUCCESS)

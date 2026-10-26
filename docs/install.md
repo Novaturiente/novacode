@@ -9,9 +9,9 @@ This page shows how to install novacode, update it, remove it, and where it keep
 | Linux x86_64 | yes (static, musl) | supported |
 | Linux arm64 | yes (static, musl) | supported |
 | macOS arm64 (Apple silicon) | yes | untested, experimental |
-| Windows | no | not supported |
+| Windows x86_64 | yes (.zip) | experimental: tested in CI, not yet by hand |
 
-On Windows, use WSL. novacode runs there as a normal Linux program. Other platforms (for example macOS on Intel) have no prebuilt binary; build from source.
+On Windows, novacode runs the model's commands in Git Bash, so [Git for Windows](https://git-scm.com/download/win) must be installed. It finds `bash.exe` through `git` on your `PATH` or the default install folders; set `NOVACODE_BASH` to use another one. There is no command sandbox on Windows: `sandbox.mode` `auto` warns once and runs commands unsandboxed, and the approval policy still applies. WSL also works: novacode runs there as a normal Linux program. Other platforms (for example macOS on Intel) have no prebuilt binary; build from source.
 
 ## Install a release
 
@@ -31,6 +31,16 @@ If `~/.local/bin` is not on your `PATH`, the script tells you to add it. Add thi
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
+
+### Windows
+
+In PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Novaturiente/novacode/main/scripts/install.ps1 | iex
+```
+
+The script downloads the `.zip` for `x86_64-pc-windows-msvc`, checks its SHA-256 checksum, puts `novacode.exe` in `%LOCALAPPDATA%\novacode\bin` and adds that folder to your user `PATH` (open a new terminal afterwards). `NOVACODE_BIN_DIR` and `NOVACODE_REPO` work as above.
 
 Check the result:
 
