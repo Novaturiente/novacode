@@ -363,7 +363,7 @@ fn session_sandbox(s: &Settings, cwd: &Path, novacode_home: &Path, protected: &[
         } else {
             sbx::project_dirs(cwd)
         },
-        home: std::env::var_os("HOME").map(Into::into).unwrap_or_default(),
+        home: novacode_base::platform::home().unwrap_or_default(),
         novacode_home: novacode_home.to_path_buf(),
         tmpdir: std::env::var_os("TMPDIR").map(Into::into),
         allow_write,
@@ -1246,7 +1246,7 @@ impl Ctx {
         let sandbox = session_sandbox(s, &self.cwd, self.paths.home(), &perms.protected.paths);
         let mut policy = Policy::new(
             perms,
-            std::env::var_os("HOME").map(Into::into).unwrap_or_default(),
+            novacode_base::platform::home().unwrap_or_default(),
             Some(self.paths.settings()),
         );
         if let Some(m) = self.cli.mode {
@@ -1509,9 +1509,7 @@ impl Ctx {
             &ext_dirs,
             &procs,
             &self.cwd,
-            &std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_default(),
+            &novacode_base::platform::home().unwrap_or_default(),
             &self.paths.home().join("cache").join("extensions"),
             store.id(),
             &self.paths.home().join("logs"),
@@ -2220,7 +2218,7 @@ fn resource_dirs(
     claude: &str,
 ) -> Vec<std::path::PathBuf> {
     let compat = settings.get::<bool>("compat.claude").unwrap_or(true);
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let home = novacode_base::platform::home();
     let mut d = Vec::new();
     if trusted || kind == "prompts" {
         d.push(Paths::project_dir(cwd).join(kind));

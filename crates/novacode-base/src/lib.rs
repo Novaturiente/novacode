@@ -3,6 +3,7 @@
 pub mod git;
 pub mod logging;
 pub mod paths;
+pub mod platform;
 pub mod redact;
 pub mod settings;
 pub mod settings_doc;

@@ -155,7 +155,7 @@ impl ToolCtx {
     pub fn path(&self, p: &str) -> PathBuf {
         let p = p.trim();
         if let Some(rest) = p.strip_prefix("~/")
-            && let Some(home) = std::env::var_os("HOME")
+            && let Some(home) = novacode_base::platform::home()
         {
             return Path::new(&home).join(rest);
         }

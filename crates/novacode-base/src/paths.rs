@@ -24,8 +24,9 @@ impl Paths {
         if let Some(h) = non_empty("NOVACODE_HOME") {
             return Ok(Self::new(h));
         }
-        non_empty("HOME")
-            .map(|h| Self::new(PathBuf::from(h).join(".novacode")))
+        crate::platform::home()
+            .filter(|h| !h.as_os_str().is_empty())
+            .map(|h| Self::new(h.join(".novacode")))
             .ok_or(NoHome)
     }
 

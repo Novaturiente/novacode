@@ -188,7 +188,7 @@ pub fn normalize(bytes: &[u8]) -> Result<Image, String> {
 
 /// `@path` mentions in a prompt that name image files: (path as written, file).
 pub fn mentions(text: &str, cwd: &Path) -> Vec<(String, PathBuf)> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = novacode_base::platform::home();
     text.split_whitespace()
         .filter_map(|w| w.strip_prefix('@'))
         .map(|w| w.trim_end_matches([',', '.', ';', ':', ')', '!', '?']))

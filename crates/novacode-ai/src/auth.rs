@@ -354,7 +354,10 @@ pub fn resolve_key(value: &str) -> Result<String, AuthError> {
         return std::env::var(var).map_err(|_| AuthError::Key(format!("env var {var} is not set")));
     }
     if let Some(cmd) = v.strip_prefix('!') {
-        let out = std::process::Command::new("sh").arg("-c").arg(cmd).output()?;
+        let out = std::process::Command::new(novacode_base::platform::sh())
+            .arg("-c")
+            .arg(cmd)
+            .output()?;
         if !out.status.success() {
             return Err(AuthError::Key(format!(
                 "`{cmd}` failed: {}",

@@ -457,17 +457,15 @@ fn read_json(f: &Path) -> Value {
 
 fn write_private(f: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     if let Some(d) = f.parent() {
         std::fs::create_dir_all(d)?;
     }
     let tmp = f.with_extension("json.tmp");
-    let mut o = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
+    let mut o = novacode_base::platform::set_create_mode(
+        std::fs::OpenOptions::new().write(true).create(true).truncate(true),
+        0o600,
+    )
+    .open(&tmp)?;
     o.write_all(text.as_bytes())?;
     std::fs::rename(tmp, f)
 }

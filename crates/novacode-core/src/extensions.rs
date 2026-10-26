@@ -197,7 +197,7 @@ impl ExtHost for Host {
                         return Err(format!("refused: {}", risk.reason));
                     }
                     let secs = args["timeout"].as_u64().unwrap_or(60).clamp(1, 600);
-                    let run = tokio::process::Command::new("bash")
+                    let run = tokio::process::Command::new(novacode_base::platform::bash())
                         .arg("-c")
                         .arg(&cmd)
                         .current_dir(&cwd)

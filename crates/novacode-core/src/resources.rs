@@ -325,7 +325,7 @@ pub fn render_skills(skills: &[Skill]) -> String {
     if listed.is_empty() {
         return String::new();
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = novacode_base::platform::home();
     let show = |p: &Path| match home.as_deref().and_then(|h| p.strip_prefix(h).ok()) {
         Some(r) => format!("~/{}", r.display()),
         None => p.display().to_string(),

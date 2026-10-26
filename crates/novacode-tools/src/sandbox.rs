@@ -580,7 +580,7 @@ pub fn command(sandbox: Option<&Sandbox>, cmd: &str, cwd: &Path) -> io::Result<t
             let mut c = tokio::process::Command::new(&l[0]);
             c.args(&l[1..]).args(s.args(cwd)).args(["--", "bash"]);
             c.env_clear().envs(std::env::vars_os().filter(|(k, _)| s.keeps_env(k)));
-            c.process_group(0);
+            novacode_base::platform::own_group(c.as_std_mut());
             c
         }
         Some(s) if s.mode == Mode::On && s.symlink.is_some() => {
@@ -605,8 +605,8 @@ pub fn command(sandbox: Option<&Sandbox>, cmd: &str, cwd: &Path) -> io::Result<t
         // shortcut: outside Linux an unsandboxed command can still take the terminal; fix when macOS users hit it.
         #[cfg(not(target_os = "linux"))]
         _ => {
-            let mut c = tokio::process::Command::new("bash");
-            c.process_group(0);
+            let mut c = tokio::process::Command::new(novacode_base::platform::bash());
+            novacode_base::platform::own_group(c.as_std_mut());
             c
         }
     };

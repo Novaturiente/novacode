@@ -90,8 +90,8 @@ impl ProcessExt {
             .current_dir(cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .process_group(0)
             .kill_on_drop(true);
+        novacode_base::platform::own_group(p.as_std_mut());
         if let Some(d) = log.parent() {
             let _ = std::fs::create_dir_all(d);
         }

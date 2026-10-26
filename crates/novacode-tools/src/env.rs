@@ -174,7 +174,7 @@ async fn run(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
-    let pgid = child.id().map(|p| p as i32);
+    let pgid = child.id();
     let pump = |mut r: Box<dyn tokio::io::AsyncRead + Unpin + Send>, tx: mpsc::Sender<Vec<u8>>| async move {
         let mut buf = vec![0u8; 16 * 1024];
         while let Ok(n) = r.read(&mut buf).await {
@@ -213,9 +213,9 @@ async fn run(
     })
 }
 
-fn kill_group(pgid: Option<i32>) {
+fn kill_group(pgid: Option<u32>) {
     if let Some(p) = pgid {
-        let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(p), nix::sys::signal::Signal::SIGKILL);
+        crate::process::kill_group_now(p);
     }
 }
 

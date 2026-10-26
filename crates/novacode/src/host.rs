@@ -800,7 +800,7 @@ impl Host {
             return;
         }
         let cwd = PathBuf::from(self.hub.state().cwd);
-        let run = tokio::process::Command::new("bash")
+        let run = tokio::process::Command::new(novacode_base::platform::bash())
             .arg("-c")
             .arg(&cmd)
             .current_dir(&cwd)

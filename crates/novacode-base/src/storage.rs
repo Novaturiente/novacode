@@ -4,7 +4,6 @@
 use serde::{Serialize, de::DeserializeOwned};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +54,7 @@ fn write_impl(
         .unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
     if mode.is_some() {
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        crate::platform::set_mode(dir, 0o700)?;
     }
     let name = path
         .file_name()
@@ -69,7 +68,7 @@ fn write_impl(
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     if let Some(m) = mode {
-        opts.mode(m);
+        crate::platform::set_create_mode(&mut opts, m);
     }
     let result = (|| {
         let mut f = opts.open(&tmp)?;
@@ -280,8 +279,10 @@ mod tests {
         assert_eq!(fs::read(&fresh).unwrap(), b"2");
     }
 
+    #[cfg(unix)]
     #[test]
     fn secret_is_0600_in_0700_dir() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("sub/auth.json");
         write_secret(&p, b"{}").unwrap();

@@ -146,7 +146,7 @@ impl Store {
         let lock = if local.is_dir() { None } else { Some(self.read_lock()?) };
         if local.is_dir() {
             let abs = std::fs::canonicalize(local).map_err(|e| e.to_string())?;
-            std::os::unix::fs::symlink(&abs, &dest).map_err(|e| e.to_string())?;
+            novacode_base::platform::link_dir(&abs, &dest).map_err(|e| e.to_string())?;
             return Ok(name);
         }
         git(&["clone", "-q", src, &dest.display().to_string()], None)?;

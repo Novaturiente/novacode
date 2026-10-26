@@ -361,7 +361,7 @@ impl Agent {
         }
         let defs: Vec<ToolDef> = tools.iter().map(|t| pipeline::def(t.as_ref())).collect();
         let (events, _) = broadcast::channel(EVENT_BUFFER);
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let home = novacode_base::platform::home().unwrap_or_default();
         // Compacted after the last reply (e.g. at the end of a `-p` run): the next miss is expected.
         let compacted = {
             let b = store.branch();

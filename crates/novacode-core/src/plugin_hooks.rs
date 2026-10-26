@@ -264,7 +264,11 @@ impl PluginHooks {
                 c
             }
             None => {
-                let mut c = tokio::process::Command::new(if b.hook.bash { "bash" } else { "sh" });
+                let mut c = tokio::process::Command::new(if b.hook.bash {
+                    novacode_base::platform::bash()
+                } else {
+                    novacode_base::platform::sh()
+                });
                 c.arg("-c").arg(fill(&b.hook.command));
                 c
             }
@@ -451,8 +455,8 @@ async fn run(mut c: tokio::process::Command, cwd: &Path, input: &Value, timeout:
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .process_group(0)
         .kill_on_drop(true);
+    novacode_base::platform::own_group(c.as_std_mut());
     let mut child = c
         .spawn()
         .map_err(|e| tracing::warn!("plugin hook did not start: {e}"))

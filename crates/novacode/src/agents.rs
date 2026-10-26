@@ -1574,10 +1574,7 @@ fn dur(ms: u64) -> String {
 
 fn at(cwd: &Path, p: &str) -> PathBuf {
     match p.strip_prefix("~/") {
-        Some(rest) => std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default()
-            .join(rest),
+        Some(rest) => novacode_base::platform::home().unwrap_or_default().join(rest),
         None => cwd.join(p),
     }
 }

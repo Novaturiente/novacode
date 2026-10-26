@@ -326,7 +326,7 @@ async fn run(
     input: &Value,
     timeout: Duration,
 ) -> Option<(Option<i32>, String, String)> {
-    let mut c = tokio::process::Command::new("sh");
+    let mut c = tokio::process::Command::new(novacode_base::platform::sh());
     c.arg("-c")
         .arg(cmd)
         .current_dir(cwd)
@@ -337,8 +337,8 @@ async fn run(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .process_group(0)
         .kill_on_drop(true);
+    novacode_base::platform::own_group(c.as_std_mut());
     if let Some(t) = input["tool"].as_str() {
         c.env("NOVACODE_TOOL", t);
     }

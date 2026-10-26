@@ -192,7 +192,7 @@ fn read_json(path: &Path) -> Value {
 
 /// `novacode import claude [--yes]`.
 pub fn run(paths: &Paths, providers: &novacode_ai::connect::Providers, yes: bool) -> anyhow::Result<ExitCode> {
-    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let home = novacode_base::platform::home().unwrap_or_default();
     let settings = paths.settings();
     let mcp = paths.home().join("mcp.json");
     let plan = plan(
@@ -290,7 +290,7 @@ pub fn hook(event: &str, matcher: &str, command: &str) -> ExitCode {
     if event == "PostToolUse" {
         payload["tool_response"] = json!({"output": v["output"], "is_error": v["is_error"]});
     }
-    let child = std::process::Command::new("sh")
+    let child = std::process::Command::new(novacode_base::platform::sh())
         .arg("-c")
         .arg(command)
         .env("CLAUDE_PROJECT_DIR", v["cwd"].as_str().unwrap_or("."))
