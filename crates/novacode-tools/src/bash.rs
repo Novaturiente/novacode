@@ -9,6 +9,13 @@ use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// Windows runs commands in Git Bash (L11.14).
+const BASH_HINT: &str = if cfg!(windows) {
+    ". novacode needs Git Bash: install Git for Windows (https://git-scm.com/download/win), or set NOVACODE_BASH to a bash.exe"
+} else {
+    ""
+};
+
 pub struct Bash;
 
 pub const DEFAULT_TIMEOUT: u64 = 120;
@@ -91,7 +98,7 @@ impl Tool for Bash {
             out.push_str(&String::from_utf8_lossy(&buf));
             let res = match res {
                 Ok(r) => r,
-                Err(e) => return ToolOutput::error(format!("could not start bash: {e}")),
+                Err(e) => return ToolOutput::error(format!("could not start bash: {e}{BASH_HINT}")),
             };
             if !out.is_empty() && !out.ends_with('\n') {
                 out.push('\n');
@@ -168,7 +175,7 @@ async fn run_managed(
     let sb = if spec.unsandboxed { None } else { ctx.env.sandbox() };
     let id = match pm.start(&name, &spec.command, &spec.cwd, &spec.env, false, sb) {
         Ok(id) => id,
-        Err(e) => return ToolOutput::error(format!("could not start bash: {e}")),
+        Err(e) => return ToolOutput::error(format!("could not start bash: {e}{BASH_HINT}")),
     };
     // bash calls get no input: a prompt sees EOF at once instead of hanging (the `process` tool keeps stdin).
     let _ = pm.write(&id, "", true).await;

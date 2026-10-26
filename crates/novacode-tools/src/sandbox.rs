@@ -469,6 +469,13 @@ impl Sandbox {
     /// check logs the one warning; a protected symlink logs it in both modes.
     pub fn available(&self) -> bool {
         *self.works.get_or_init(|| {
+            // L11.14: no sandbox on Windows (bubblewrap is Linux-only).
+            if cfg!(windows) {
+                if self.mode == Mode::Auto {
+                    tracing::warn!("sandbox: there is no sandbox on Windows; commands run unsandboxed, the approval policy still applies");
+                }
+                return false;
+            }
             if let Some(p) = &self.symlink {
                 let then = if self.mode == Mode::On {
                     "commands are refused"
@@ -601,6 +608,11 @@ pub fn command(sandbox: Option<&Sandbox>, cmd: &str, cwd: &Path) -> io::Result<t
                 "the sandbox is on (`sandbox.mode`), but {} is a symlink in a writable place, which the sandbox can't protect, so the command was not run. Replace the symlink with the real file or folder and restart, set `sandbox.mode` to `auto`, or pass `unsandboxed: true` for this one command",
                 s.symlink.as_deref().unwrap_or(Path::new("")).display()
             )));
+        }
+        Some(s) if s.mode == Mode::On && cfg!(windows) => {
+            return Err(io::Error::other(
+                "the sandbox is on (`sandbox.mode`), but there is no sandbox on Windows, so the command was not run. Set `sandbox.mode` to `auto` or `off`, or pass `unsandboxed: true` for this one command",
+            ));
         }
         Some(s) if s.mode == Mode::On => {
             return Err(io::Error::other(

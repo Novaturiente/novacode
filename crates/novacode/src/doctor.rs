@@ -162,6 +162,8 @@ pub async fn doctor(
 fn sandbox_line(mode: Mode, works: bool, symlink: Option<&Path>) -> (bool, String) {
     let why = match symlink {
         Some(p) => format!("{} is a symlink", p.display()),
+        None if cfg!(windows) => "no sandbox on Windows".into(),
+        None if cfg!(windows) => "no sandbox on Windows".into(),
         None => "bwrap not found".into(),
     };
     match (mode, works) {

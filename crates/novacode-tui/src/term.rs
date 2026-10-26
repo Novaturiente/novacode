@@ -285,6 +285,32 @@ pub enum Pasted {
 
 /// Read the clipboard (Ctrl+V, L2.22): an image if it has one, else text.
 /// Wayland via wl-paste, X11 via xclip; every call is capped at 2s.
+/// Windows: one PowerShell call saves a clipboard image as PNG, else prints the text.
+/// Windows PowerShell runs in STA, which the clipboard API needs.
+#[cfg(windows)]
+pub fn paste() -> Option<Pasted> {
+    const IMAGE: &str = "::novacode-image::";
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let path = std::env::temp_dir().join(format!("novacode-clip-{}-{stamp}.png", std::process::id()));
+    let quoted = path.display().to_string().replace('\'', "''");
+    let script = format!(
+        "[Console]::OutputEncoding = [Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; \
+         $i = [Windows.Forms.Clipboard]::GetImage(); \
+         if ($i) {{ $i.Save('{quoted}', [Drawing.Imaging.ImageFormat]::Png); '{IMAGE}' }} else {{ Get-Clipboard -Raw }}"
+    );
+    let out = run("powershell", &["-NoProfile", "-NonInteractive", "-Command", &script])?;
+    let out = String::from_utf8_lossy(&out);
+    if out.trim() == IMAGE {
+        return path.exists().then_some(Pasted::Image(path));
+    }
+    // `Get-Clipboard -Raw` keeps the text's own line ends; PowerShell adds one more.
+    Some(Pasted::Text(out.strip_suffix("\r\n").unwrap_or(&out).to_string()))
+}
+
+#[cfg(unix)]
 pub fn paste() -> Option<Pasted> {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
     let types = if wayland {
@@ -317,6 +343,7 @@ pub fn paste() -> Option<Pasted> {
 }
 
 /// The best image type on offer: formats providers take, before ones to convert.
+#[cfg(unix)]
 fn image_type(types: &str) -> Option<&str> {
     let types: Vec<&str> = types.lines().map(str::trim).collect();
     ["image/png", "image/jpeg", "image/webp", "image/gif"]
@@ -361,6 +388,7 @@ mod paste_tests {
         assert!(super::restores_on_panic(None, other));
     }
 
+    #[cfg(unix)]
     #[test]
     fn picks_the_best_image_type() {
         assert_eq!(
