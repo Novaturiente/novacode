@@ -324,16 +324,19 @@ fn address(dir: &Path, id: &str) -> PathBuf {
     }
 }
 
-/// Accept clients on `sock` (owner only), each served by [`serve`].
+type Reader = Box<dyn AsyncRead + Unpin + Send>;
+type Writer = Box<dyn AsyncWrite + Unpin + Send>;
+
+/// Accept clients on `sock` (owner only), each handed to `on`.
 #[cfg(unix)]
-fn listen(sock: &Path, h: Arc<Host>) -> std::io::Result<tokio::task::JoinHandle<()>> {
+fn listen(sock: &Path, on: impl Fn(Reader, Writer) + Send + 'static) -> std::io::Result<tokio::task::JoinHandle<()>> {
     let _ = std::fs::remove_file(sock);
     let listener = tokio::net::UnixListener::bind(sock)?;
     novacode_base::platform::set_mode(sock, 0o600)?;
     Ok(tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let (r, w) = stream.into_split();
-            tokio::spawn(serve(r, w, h.clone(), false));
+            on(Box::new(r), Box::new(w));
         }
     }))
 }
@@ -342,7 +345,7 @@ fn listen(sock: &Path, h: Arc<Host>) -> std::io::Result<tokio::task::JoinHandle<
 /// `first_pipe_instance`: fails if another process already owns the name.
 // shortcut: the pipe's default DACL lets other local users open it read-only; set an owner-only DACL for shared machines.
 #[cfg(windows)]
-fn listen(sock: &Path, h: Arc<Host>) -> std::io::Result<tokio::task::JoinHandle<()>> {
+fn listen(sock: &Path, on: impl Fn(Reader, Writer) + Send + 'static) -> std::io::Result<tokio::task::JoinHandle<()>> {
     use tokio::net::windows::named_pipe::ServerOptions;
     let name = sock.as_os_str().to_owned();
     let mut server = ServerOptions::new().first_pipe_instance(true).create(&name)?;
@@ -352,7 +355,7 @@ fn listen(sock: &Path, h: Arc<Host>) -> std::io::Result<tokio::task::JoinHandle<
                 break;
             };
             let (r, w) = tokio::io::split(std::mem::replace(&mut server, next));
-            tokio::spawn(serve(r, w, h.clone(), false));
+            on(Box::new(r), Box::new(w));
         }
     }))
 }
@@ -386,7 +389,10 @@ pub fn go_live(host: &Arc<Host>, bg: bool) -> std::io::Result<Live> {
     novacode_base::platform::set_mode(&dir, 0o700)?;
     let sock = address(&dir, &host.id);
     let run = dir.join(format!("{}.json", host.id));
-    let accept = listen(&sock, host.clone())?;
+    let h = host.clone();
+    let accept = listen(&sock, move |r, w| {
+        tokio::spawn(serve(r, w, h.clone(), false));
+    })?;
     let mut file = RunFile {
         pid: std::process::id(),
         socket: sock.clone(),
@@ -776,5 +782,39 @@ pub async fn attach_loop(
             eprintln!("the session is over: it didn't come back after a reload");
             return Ok(std::process::ExitCode::SUCCESS);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// L11.14: the session address round-trips on every OS, for several clients in a row
+    /// (Windows hands each its own pipe instance).
+    #[tokio::test]
+    async fn live_address_serves_each_client() {
+        let dir = std::env::temp_dir().join(format!("nc-addr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = address(&dir, &format!("t{}", std::process::id()));
+        let accept = listen(&sock, |r, mut w| {
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(r).lines();
+                while let Ok(Some(l)) = lines.next_line().await {
+                    let _ = w.write_all(format!("{l}!\n").as_bytes()).await;
+                }
+            });
+        })
+        .unwrap();
+        for n in 0..3 {
+            let (r, mut w) = tokio::io::split(connect(&sock).await.unwrap());
+            w.write_all(format!("hi{n}\n").as_bytes()).await.unwrap();
+            let got = BufReader::new(r).lines().next_line().await.unwrap();
+            assert_eq!(got, Some(format!("hi{n}!")));
+        }
+        // Another process can't take over a live session's pipe name.
+        #[cfg(windows)]
+        assert!(listen(&sock, |_, _| {}).is_err());
+        accept.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
