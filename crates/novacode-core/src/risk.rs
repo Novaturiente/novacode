@@ -2267,6 +2267,8 @@ fn extra_protected(p: &Path, ctx: &Ctx) -> Option<String> {
 
 fn is_device(p: &Path) -> bool {
     let s = p.to_string_lossy();
+    // Windows keeps `/dev/sda` as `\dev\sda`; Git Bash maps it to the raw disk.
+    let s = if cfg!(windows) { s.replace('\\', "/").into() } else { s };
     [
         "/dev/sd",
         "/dev/nvme",

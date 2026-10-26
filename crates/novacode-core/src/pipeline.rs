@@ -336,7 +336,8 @@ mod tests {
                 .await
                 .unwrap();
             assert!(text(&out).contains("Refused by the command judge: no."));
-            let sent = format!("{:?}", faux.requests.lock().unwrap()[0].messages);
+            // Debug doubles a Windows `\`.
+            let sent = format!("{:?}", faux.requests.lock().unwrap()[0].messages).replace("\\\\", "/");
             assert!(sent.contains("writes /h/.local/bin/x, outside the project"), "{sent}");
             assert!(sent.contains("The `write` tool writes this path"), "{sent}");
             assert!(

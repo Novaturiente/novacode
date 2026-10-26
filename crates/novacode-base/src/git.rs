@@ -255,12 +255,14 @@ mod tests {
         let mark = root.join("PWN");
         let hook_mark = root.join("HOOK");
         let mut config = std::fs::read_to_string(evil.join("config")).unwrap();
-        config.push_str(&format!("[filter \"x\"]\n\tclean = touch {}\n", mark.display()));
+        // `/` paths: git config and sh read `\` as an escape.
+        let sl = |p: &Path| crate::platform::slash_path(p);
+        config.push_str(&format!("[filter \"x\"]\n\tclean = touch {}\n", sl(&mark)));
         std::fs::write(evil.join("config"), config).unwrap();
         let hook = evil.join("hooks/post-checkout");
-        std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", hook_mark.display())).unwrap();
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", sl(&hook_mark))).unwrap();
         assert!(Command::new("chmod").arg("+x").arg(&hook).status().unwrap().success());
-        std::fs::write(p.join(".git/commondir"), format!("{}\n", evil.display())).unwrap();
+        std::fs::write(p.join(".git/commondir"), format!("{}\n", sl(&evil))).unwrap();
         std::fs::write(p.join(".gitattributes"), "* filter=x\n").unwrap();
         std::fs::write(p.join("f.txt"), "b\n").unwrap();
         std::fs::write(p.join("new.txt"), "n\n").unwrap();
@@ -271,10 +273,7 @@ mod tests {
             .args(["rev-parse", "--path-format=absolute", "--git-path", "hooks"])
             .output()
             .unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&o.stdout).trim(),
-            evil.join("hooks").display().to_string()
-        );
+        assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), sl(&evil.join("hooks")));
         // The checkpoint's commands, through a temporary index.
         let idx = root.join("tmp-index");
         let run = |a: &[&str]| {

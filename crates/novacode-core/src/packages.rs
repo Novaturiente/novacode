@@ -191,7 +191,7 @@ impl Store {
             .ok_or(format!("`{what}` is not installed (see `novacode packages`)"))?;
         let name = p.name.clone();
         if p.link.is_some() {
-            std::fs::remove_file(&p.dir).map_err(|e| e.to_string())?;
+            novacode_base::platform::unlink_dir(&p.dir).map_err(|e| e.to_string())?;
         } else {
             std::fs::remove_dir_all(&p.dir).map_err(|e| e.to_string())?;
         }

@@ -133,6 +133,16 @@ pub fn slash_path(p: &Path) -> String {
     if cfg!(windows) { s.replace('\\', "/") } else { s }
 }
 
+/// Remove the dir link made by [`link_dir`], not what it points at.
+pub fn unlink_dir(link: &Path) -> io::Result<()> {
+    // Windows removes a dir symlink or junction as a folder.
+    if cfg!(windows) {
+        std::fs::remove_dir(link)
+    } else {
+        std::fs::remove_file(link)
+    }
+}
+
 /// Make `link` point at the dir `target`.
 #[cfg(unix)]
 pub fn link_dir(target: &Path, link: &Path) -> io::Result<()> {

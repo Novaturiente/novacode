@@ -479,7 +479,11 @@ mod tests {
         // From inside: exit with nobody to ask keeps it.
         let o = ExitWorktree(None).execute(json!({}), &ctx(&wt)).await;
         assert!(text(&o).contains("Worktree kept"), "{}", text(&o));
-        assert_eq!(o.details.as_ref().unwrap()["set_cwd"], json!(root));
+        let back = o.details.as_ref().unwrap()["set_cwd"].as_str().unwrap().to_string();
+        assert_eq!(
+            std::fs::canonicalize(back).unwrap(),
+            std::fs::canonicalize(&root).unwrap()
+        );
         assert!(wt.exists());
         // Entering again reuses it.
         assert!(text(&EnterWorktree.execute(json!({"name": "fix-x"}), &c).await).contains("existing"));
