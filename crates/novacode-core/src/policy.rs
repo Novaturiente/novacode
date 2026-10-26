@@ -118,37 +118,21 @@ impl Rule {
 
     fn matches_path(&self, raw: Option<&str>, abs: Option<&Path>) -> bool {
         let Some(p) = self.pattern.as_deref() else { return true };
-        // Windows: globset compares paths with `/`, and NTFS ignores case; a `\` that
-        // doesn't escape a glob character is a separator.
-        let p = if cfg!(windows) { windows_glob(p) } else { p.to_string() };
-        let Ok(glob) = globset::GlobBuilder::new(&p)
-            .case_insensitive(cfg!(windows))
-            .backslash_escape(true)
-            .build()
-        else {
+        // Windows: globset compares paths with `/`, so `\` is a separator (a literal `[` is
+        // `[[]`); NTFS ignores case.
+        let p = if cfg!(windows) {
+            p.replace('\\', "/")
+        } else {
+            p.to_string()
+        };
+        let Ok(glob) = globset::GlobBuilder::new(&p).case_insensitive(cfg!(windows)).build() else {
             return false;
         };
         let m = glob.compile_matcher();
-        raw.is_some_and(|r| m.is_match(r)) || abs.is_some_and(|a| m.is_match(a))
+        // Windows: `.env.`, `.env::$DATA` and `\\?\C:\…` write the same file as `.env`, `C:\…`.
+        let fold = crate::risk::fold;
+        raw.is_some_and(|r| m.is_match(fold(Path::new(r)))) || abs.is_some_and(|a| m.is_match(fold(a)))
     }
-}
-
-/// A Windows rule pattern with `\` separators in globset's `/` form. `\[`, `\]`, `\{`, `\}`
-/// stay escapes (names can hold them); `*` and `?` can't be in a name, so `\*` is a separator.
-fn windows_glob(p: &str) -> String {
-    let mut out = String::with_capacity(p.len());
-    let mut it = p.chars().peekable();
-    while let Some(c) = it.next() {
-        match (c, it.peek()) {
-            ('\\', Some(n)) if "[]{}".contains(*n) => {
-                out.push(c);
-                out.push(it.next().unwrap_or_default());
-            }
-            ('\\', _) => out.push('/'),
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 impl std::fmt::Display for Rule {
@@ -529,7 +513,8 @@ impl Policy {
         if let (Some(command), Some(segs)) = (command, &segments) {
             for s in segs {
                 let name = s.split_whitespace().next().unwrap_or("");
-                let name = name.rsplit('/').next().unwrap_or(name);
+                let name = crate::risk::cmd_name(name);
+                let name = name.as_ref();
                 if self.perms.protected.commands.iter().any(|c| c == name)
                     || s.split_whitespace()
                         .any(|w| self.perms.protected.commands.iter().any(|c| c == w))
@@ -1556,7 +1541,20 @@ mod tests {
         // Rules: case-insensitive, `\` as a separator, `\[` still an escape.
         let rule = |r: &str| Rule::parse(r).unwrap();
         assert!(rule(r"Write(C:\Proj\**)").matches_path(None, Some(Path::new(r"c:\proj\a.txt"))));
-        assert!(rule(r"Edit(config\[prod\].json)").matches_path(Some("config[prod].json"), None));
+        assert!(rule(r"Edit(config[[]prod].json)").matches_path(Some("config[prod].json"), None));
+        // Review a2 F6, F7: `\{` is a separator then a group; leaf aliases still match.
+        assert!(rule(r"Write(C:\Users\u\{.ssh,.aws}\**)").matches_path(None, Some(Path::new(r"C:\Users\u\.aws\k"))));
+        for leaf in [
+            r"C:\proj\.env.",
+            r"C:\proj\.env ",
+            r"C:\proj\.env::$DATA",
+            r"\\?\C:\proj\.ENV",
+        ] {
+            assert!(
+                rule(r"Write(C:\proj\.env)").matches_path(None, Some(Path::new(leaf))),
+                "{leaf}"
+            );
+        }
     }
 
     /// `$ZDOTDIR` is read at check time: each case runs [`zdotdir_case`] in a

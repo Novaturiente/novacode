@@ -267,8 +267,8 @@ fn computed(words: &[String]) -> Option<String> {
     risk::computed(words).then(|| "the command name is computed".into())
 }
 
-fn base(w: &str) -> &str {
-    w.rsplit('/').next().unwrap_or(w)
+fn base(w: &str) -> std::borrow::Cow<'_, str> {
+    risk::cmd_name(w)
 }
 
 /// The first word that isn't an option; `value` options take the next word.
@@ -286,6 +286,7 @@ fn sub<'a>(args: &'a [String], value: &[&str]) -> Option<&'a str> {
 /// Network tools, pushes and publishes.
 fn network(words: &[String]) -> Option<String> {
     let name = base(words.first()?);
+    let name = name.as_ref();
     let args = &words[1..];
     let s = sub(args, &[]);
     match name {
@@ -344,7 +345,7 @@ fn git_runs(words: &[String], env: &[String]) -> bool {
     if env.iter().any(|a| GIT_RUN_VARS.contains(&var(a).as_str())) {
         return true;
     }
-    if words.first().map(|w| base(w)) != Some("git") {
+    if words.first().is_none_or(|w| base(w) != "git") {
         return false;
     }
     // `--config-env=k=ENV` takes the value from a variable: any alias counts.
@@ -470,7 +471,7 @@ fn forge_writes(args: &[String]) -> bool {
 /// (except `cd`) are not looked at.
 fn outside(words: &[String], ctx: &risk::Ctx, root: &Path) -> Option<String> {
     let name = base(words.first()?);
-    if name != "cd" && risk::SAFE.contains(&name) {
+    if name != "cd" && risk::SAFE.contains(&name.as_ref()) {
         return None;
     }
     words[1..].iter().find_map(|a| {
@@ -498,9 +499,9 @@ fn away(p: &str, ctx: &risk::Ctx, root: &Path) -> Option<String> {
                 || p.starts_with('\\')
                 || p.starts_with("..\\")
                 || p.contains("\\..\\")
-                || ["$USERPROFILE", "${USERPROFILE}", "$APPDATA", "${APPDATA}", "$LOCALAPPDATA", "${LOCALAPPDATA}"]
-                    .iter()
-                    .any(|v| p.starts_with(v))));
+                // Drive-relative `C:..\x`, and any variable: `resolve` expands the env ones.
+                || p.as_bytes().get(1) == Some(&b':')
+                || p.starts_with('$')));
     if !pathy || p.contains("://") {
         return None;
     }

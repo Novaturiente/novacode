@@ -403,11 +403,11 @@ pub fn programs(src: &str) -> Option<Vec<String>> {
             .into_iter()
             .filter_map(|s| {
                 let (first, rest) = s.words.split_first()?;
-                let base = first.rsplit('/').next().unwrap_or(first);
+                let base = cmd_name(first);
                 // git's global options don't change the subcommand: `git -C . push` is a `git push`.
                 let rest = if base == "git" { git_globals(rest) } else { rest };
                 Some(
-                    std::iter::once(base)
+                    std::iter::once(base.as_ref())
                         .chain(rest.iter().map(String::as_str))
                         .collect::<Vec<_>>()
                         .join(" "),
@@ -563,7 +563,8 @@ fn simple_into(words: &[String], at: &Here, targets: Vec<String>, out: &mut Vec<
         push(out, &[], targets, at.nested);
         return Some(());
     };
-    let name = first.rsplit('/').next().unwrap_or(first);
+    let name = cmd_name(first);
+    let name = name.as_ref();
     let args = &w[1..];
     let deeper = at.depth + 1;
     if SHELLS.contains(&name) {
@@ -643,9 +644,9 @@ fn unwrap(words: &[String]) -> Inner<'_> {
             w = &w[1..];
         }
         let Some(first) = w.first() else { return Inner::Words(w) };
-        let name = first.rsplit('/').next().unwrap_or(first);
+        let name = cmd_name(first);
         let args = &w[1..];
-        w = match name {
+        w = match name.as_ref() {
             "sudo" | "doas" | "pkexec" => skip_opts(args, SUDO_VALUE_FLAGS),
             "env" => match env_split(args) {
                 Ok(line) => return Inner::Script(line),
@@ -922,7 +923,8 @@ fn runner<'a>(name: &str, args: &'a [String]) -> Vec<Inner<'a>> {
 /// (`-c`, `-e`, `deno eval`, …), or on stdin with no script file or module.
 pub(crate) fn runs_inline(words: &[String], stdin: bool) -> bool {
     let Some(first) = words.first() else { return false };
-    let name = first.rsplit('/').next().unwrap_or(first);
+    let name = cmd_name(first);
+    let name = name.as_ref();
     if !is_interpreter(name) {
         return false;
     }
@@ -1239,9 +1241,9 @@ fn simple(w: &[String], input: &[String], piped: bool, ctx: &Ctx, depth: u32) ->
     let Some(first) = w.first() else {
         return Risk::safe();
     };
-    let name = first.rsplit('/').next().unwrap_or(first);
+    let name = cmd_name(first);
     let mut r = simple_base(w, input, piped, ctx, depth);
-    for inner in runner(name, &w[1..]) {
+    for inner in runner(&name, &w[1..]) {
         let ran = match inner {
             Inner::Words(iw) => command(iw, input, piped, ctx, depth + 1),
             Inner::Script(s) => classify_depth(&s, ctx, depth + 1),
@@ -1258,7 +1260,7 @@ fn simple_base(w: &[String], input: &[String], piped: bool, ctx: &Ctx, depth: u3
     if computed(w) {
         return Risk::new(Level::Confirm, "the command name is computed");
     }
-    let name = first.rsplit('/').next().unwrap_or(first).to_string();
+    let name = cmd_name(first).into_owned();
     let args = &w[1..];
     let rest = || args.join(" ");
     match name.as_str() {
@@ -1348,7 +1350,7 @@ fn simple_base(w: &[String], input: &[String], piped: bool, ctx: &Ctx, depth: u3
             let deletes = args.iter().any(|a| a == "-delete")
                 || args.windows(2).any(|p| {
                     (p[0] == "-exec" || p[0] == "-execdir" || p[0] == "-ok")
-                        && ["rm", "shred", "unlink"].contains(&p[1].rsplit('/').next().unwrap_or(&p[1]))
+                        && ["rm", "shred", "unlink"].contains(&cmd_name(&p[1]).as_ref())
                 });
             if deletes {
                 targets(&roots, ctx, "deletes everything found under")
@@ -1426,6 +1428,9 @@ fn simple_base(w: &[String], input: &[String], piped: bool, ctx: &Ctx, depth: u3
         "tee" => tee(args, ctx),
         "awk" | "gawk" => awk(&name, args, ctx),
         n if is_interpreter(n) => interpreter(n, args, input, ctx),
+        // Windows shells: novacode can't parse their commands, so they ask at least.
+        #[cfg(windows)]
+        "cmd" | "powershell" | "pwsh" => windows_shell(&name, args, ctx),
         n if SAFE.contains(&n) => {
             if writes_or_runs(n, args) {
                 Risk::low()
@@ -1805,7 +1810,57 @@ fn awk(name: &str, args: &[String], ctx: &Ctx) -> Risk {
 fn is_interpreter(name: &str) -> bool {
     name.strip_prefix("python")
         .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
-        || ["node", "nodejs", "deno", "bun", "perl", "ruby", "php"].contains(&name)
+        || ["py", "node", "nodejs", "deno", "bun", "perl", "ruby", "php"].contains(&name)
+}
+
+/// A command's name as the shell finds it: its last path part. Windows also splits on
+/// `\`, ignores case and drops `.exe`/`.cmd`/`.bat`/`.com` (`C:\Bin\RM.EXE` is `rm`).
+pub(crate) fn cmd_name(w: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(unix)]
+    return w.rsplit('/').next().unwrap_or(w).into();
+    #[cfg(windows)]
+    {
+        let n = w.rsplit(['/', '\\']).next().unwrap_or(w).to_lowercase();
+        let bare = [".exe", ".cmd", ".bat", ".com"].iter().find_map(|x| n.strip_suffix(x));
+        bare.map(str::to_string).unwrap_or(n).into()
+    }
+}
+
+/// `cmd`, `powershell`, `pwsh`: their commands aren't parsed. Shared when they name a
+/// credential folder, home or a system folder; else Confirm.
+#[cfg(windows)]
+fn windows_shell(name: &str, args: &[String], ctx: &Ctx) -> Risk {
+    let code = args.join(" ");
+    let lower = code.to_lowercase().replace('\\', "/");
+    let home = ctx.home.to_string_lossy().to_lowercase().replace('\\', "/");
+    let names_home = [
+        "userprofile",
+        "homepath",
+        "homedrive",
+        "appdata",
+        "systemroot",
+        "windir",
+        "~",
+        home.as_str(),
+    ]
+    .iter()
+    .any(|w| lower.contains(w));
+    if let Some(what) = mentions(&code, ctx) {
+        Risk::new(
+            Level::Shared,
+            format!("{name} code mentions {what}; novacode can't see what it does"),
+        )
+    } else if names_home {
+        Risk::new(
+            Level::Shared,
+            format!("{name} code names home or a system folder; novacode can't see what it does"),
+        )
+    } else {
+        Risk::new(
+            Level::Confirm,
+            format!("runs {name}, whose commands novacode can't read"),
+        )
+    }
 }
 
 /// Short options of an interpreter, up to the first plain word: the values of
@@ -1926,14 +1981,23 @@ fn mentions(code: &str, ctx: &Ctx) -> Option<String> {
     // Windows: compared lower-cased with `/`, so `C:\Users\u\.SSH` is `c:/users/u/.ssh`.
     let norm = |s: &str| {
         if cfg!(windows) {
-            s.replace('\\', "/").to_lowercase()
+            // Collapsed: escaped strings in inline code (`'C:\\Users\\u\\.ssh'`) double the `\`.
+            let mut s = s.replace('\\', "/").to_lowercase();
+            while s.contains("//") {
+                s = s.replace("//", "/");
+            }
+            s
         } else {
             s.to_string()
         }
     };
     let code = &norm(code);
     let home = norm(&ctx.home.to_string_lossy());
-    let home_word = if cfg!(windows) { "home" } else { "HOME" };
+    let home_words: &[&str] = if cfg!(windows) {
+        &["home", "userprofile"]
+    } else {
+        &["HOME"]
+    };
     // (path under home, how to name it); protected paths outside home are matched whole.
     let mut under: Vec<(String, String)> = CREDENTIAL_DIRS
         .iter()
@@ -1960,9 +2024,11 @@ fn mentions(code: &str, ctx: &Ctx) -> Option<String> {
         // `$HOME/.ssh`, `${HOME}/.ssh`, `process.env.HOME+'/.aws'`, `os.environ['HOME'] + "/.ssh"`.
         // A path built any other way (a variable, `join`) is not seen; that is the sandbox's job.
         let tail = format!("/{rel}");
-        let after_home = code.match_indices(home_word).any(|(i, _)| {
-            let rest = code[i + 4..].trim_start_matches(|c: char| !c.is_alphanumeric() && c != '/');
-            rest.strip_prefix(&tail).is_some_and(ends)
+        let after_home = home_words.iter().any(|w| {
+            code.match_indices(w).any(|(i, _)| {
+                let rest = code[i + w.len()..].trim_start_matches(|c: char| !c.is_alphanumeric() && c != '/');
+                rest.strip_prefix(&tail).is_some_and(ends)
+            })
         });
         if after_home {
             return Some(what.clone());
@@ -2074,28 +2140,21 @@ fn git_sub(args: &[String], i: usize) -> Risk {
 /// strip a trailing `/*` or `/` (deleting `dir/*` is as bad as deleting `dir`).
 pub(crate) fn resolve(arg: &str, ctx: &Ctx) -> PathBuf {
     let home = ctx.home.to_string_lossy();
-    let mut s = arg.to_string();
-    #[cfg(windows)]
-    let vars = [
-        ("${HOME}", ""),
-        ("$HOME", ""),
-        ("${USERPROFILE}", ""),
-        ("$USERPROFILE", ""),
-        ("${APPDATA}", "/AppData/Roaming"),
-        ("$APPDATA", "/AppData/Roaming"),
-        ("${LOCALAPPDATA}", "/AppData/Local"),
-        ("$LOCALAPPDATA", "/AppData/Local"),
-    ];
     #[cfg(unix)]
-    let vars = [("${HOME}", ""), ("$HOME", "")];
-    for (var, sub) in vars {
+    let mut s = arg.to_string();
+    #[cfg(unix)]
+    for var in ["${HOME}", "$HOME"] {
         if let Some(rest) = s.strip_prefix(var) {
-            s = format!("{home}{sub}{rest}");
+            s = format!("{home}{rest}");
         }
     }
+    #[cfg(windows)]
+    let mut s = windows_vars(arg, &home);
     if s == "~" || s.starts_with("~/") {
         s = format!("{home}{}", &s[1..]);
     }
+    #[cfg(windows)]
+    let before = s.len();
     while s.len() > 1 && (s.ends_with("/*") || s.ends_with("/.*") || s.ends_with('/')) {
         s = s
             .trim_end_matches("/*")
@@ -2105,6 +2164,11 @@ pub(crate) fn resolve(arg: &str, ctx: &Ctx) -> PathBuf {
         if s.is_empty() {
             s = "/".into();
         }
+    }
+    // `C:/` trimmed to `C:` would read as drive C's cwd.
+    #[cfg(windows)]
+    if s.len() == 2 && s.as_bytes()[1] == b':' && before > 2 {
+        s.push('/');
     }
     if s == "*" || s == ".*" {
         s = ".".into();
@@ -2121,6 +2185,19 @@ pub(crate) fn resolve(arg: &str, ctx: &Ctx) -> PathBuf {
         && (rest.is_empty() || rest[0] == b'/')
     {
         s = format!("{}:/{}", *d as char, s[2..].trim_start_matches('/'));
+    }
+    // `C:rest` is relative to drive C's cwd: ours when we're on C, else (unknown) its root.
+    #[cfg(windows)]
+    if s.as_bytes().get(1) == Some(&b':') && s.as_bytes()[0].is_ascii_alphabetic() && !s[2..].starts_with(['/', '\\']) {
+        let on_cwd = fold(ctx.cwd)
+            .to_string_lossy()
+            .get(..2)
+            .is_some_and(|c| c.eq_ignore_ascii_case(&s[..2]));
+        s = if on_cwd {
+            ctx.cwd.join(&s[2..]).to_string_lossy().into_owned()
+        } else {
+            format!("{}\\{}", &s[..2], &s[2..])
+        };
     }
     let p = Path::new(&s);
     // A `/`-led path without a drive is Git Bash's own (`/`, `/dev/sda`); a `\`-led one
@@ -2143,9 +2220,11 @@ pub(crate) fn resolve(arg: &str, ctx: &Ctx) -> PathBuf {
     if out.as_os_str().is_empty() {
         out.push("/");
     }
-    // 8.3 short names (`PROGRA~1`) only resolve on disk.
+    // 8.3 short names (`PROGRA~1`) and drive-less device paths (`\\?\Volume{…}`) only resolve on disk.
     #[cfg(windows)]
-    if out.to_string_lossy().contains('~') {
+    if let o = out.to_string_lossy().into_owned()
+        && (o.contains('~') || o.starts_with(r"\\") || o.starts_with("//"))
+    {
         out = crate::policy::real(&out);
     }
     out
@@ -2210,10 +2289,19 @@ pub(crate) fn fold(p: &Path) -> std::borrow::Cow<'_, Path> {
             let (share, rest) = r.split_once('\\').unwrap_or((r, ""));
             match share.as_bytes() {
                 [d, b'$'] if d.is_ascii_alphabetic() => Some(format!("{}:\\{rest}", *d as char)),
+                _ if share.eq_ignore_ascii_case("admin$") => {
+                    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+                    Some(format!(r"{root}\{rest}"))
+                }
                 _ => None,
             }
         });
     let s = share.unwrap_or(s);
+    // `C:rest` (drive-relative) is the drive, then `rest`; not a stream named `rest`.
+    let s = match s.as_bytes() {
+        [d, b':', x, ..] if d.is_ascii_alphabetic() && *x != b'\\' => format!(r"{}\{}", &s[..2], &s[2..]),
+        _ => s,
+    };
     // A drive inside the path (`C:\proj\C:\Users\u` after joining `\??\C:\…` or `C:\…` to a
     // cwd) is where the path really starts.
     let is_drive = |c: &str| matches!(c.as_bytes(), [d, b':'] if d.is_ascii_alphabetic());
@@ -2306,6 +2394,41 @@ pub fn protected_path(path: &Path, ctx: &Ctx) -> Option<String> {
         }
     }
     protected(&p, ctx)
+}
+
+/// Windows: every `$NAME`/`${NAME}` in `s`: the home folders from `home`, the rest from the
+/// environment (`$SYSTEMDRIVE/`, `$HOMEDRIVE$HOMEPATH`). Unknown names stay as written.
+#[cfg(windows)]
+fn windows_vars(s: &str, home: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        let r = &rest[i + 1..];
+        let (name, after) = match r.strip_prefix('{').and_then(|b| b.split_once('}')) {
+            Some(x) => x,
+            None => {
+                let end = r
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(r.len());
+                (&r[..end], &r[end..])
+            }
+        };
+        let value = match name.to_ascii_uppercase().as_str() {
+            "" => None,
+            "HOME" | "USERPROFILE" => Some(home.to_string()),
+            "APPDATA" => Some(format!("{home}/AppData/Roaming")),
+            "LOCALAPPDATA" => Some(format!("{home}/AppData/Local")),
+            n => std::env::var(n).ok(),
+        };
+        match value {
+            Some(v) => out.push_str(&v),
+            None => out.push_str(&rest[i..rest.len() - after.len()]),
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The home folders to protect: `ctx.home`, and on Windows `%USERPROFILE%` too,
@@ -2410,6 +2533,10 @@ mod tests {
             r"\\localhost\C$\Users\u\.ssh\k",
             r"\\127.0.0.1\c$\users\u\.ssh\k",
             r"\\?\UNC\localhost\C$\Users\u\.ssh\k",
+            // Review a2: drive-relative, ADMIN$.
+            r"C:..\.ssh\k",
+            r"C:..\.ssh",
+            r"\\localhost\ADMIN$",
             r"C:\Users\u",
             r"C:\",
             r"C:\Windows",
@@ -2435,12 +2562,40 @@ mod tests {
             r"rm -rf '\Windows'",
             "rm -rf $APPDATA/Microsoft/Protect",
             "rm -rf ${LOCALAPPDATA}/Microsoft/Credentials",
+            // Review a2 F1: Windows spellings of the command name.
+            "rm.exe -rf ~",
+            "RM -rf ~",
+            "/usr/bin/rm.exe -rf ~",
+            r"'C:\Git\usr\bin\rm.exe' -rf ~",
+            // F2: drive-relative paths.
+            "rm -rf C:../.ssh",
+            r"rm -rf 'C:..\.ssh'",
+            "rm -rf C:/",
+            // F3: Windows variables.
+            "rm -rf $SYSTEMDRIVE/",
+            "rm -rf $WINDIR",
+            // F4: admin share.
+            r"rm -rf '\\localhost\ADMIN$'",
         ] {
             assert_eq!(lvl(c), Catastrophic, "{c}");
         }
         assert_ne!(lvl("rm -rf /c/Users/u/proj/target"), Catastrophic);
         // Inline code naming a credential folder in Windows form asks, as on Unix.
         assert_eq!(lvl(r#"python3 -c "open(r'C:\Users\u\.SSH\id_rsa','a')""#), Shared);
+        for c in [
+            // F1: interpreters and Windows shells by any name; F5: escaped strings, USERPROFILE.
+            r#"python.exe -c 'open("C:\\Users\\u\\.ssh\\id_rsa")'"#,
+            r#"py -c "open(r'C:\Users\u\.ssh\k')""#,
+            r#"node.exe -e "require('fs').rmSync(process.env.USERPROFILE+'/.ssh')""#,
+            r#"cmd //c "rd /s /q %USERPROFILE%""#,
+            r#"powershell -c "Remove-Item -Recurse ~\.ssh""#,
+        ] {
+            assert_eq!(lvl(c), Shared, "{c}");
+        }
+        assert_eq!(lvl("cmd /c dir"), Confirm);
+        if std::env::var_os("HOMEDRIVE").is_some() && std::env::var_os("HOMEPATH").is_some() {
+            assert_eq!(lvl(r#"rm -rf "$HOMEDRIVE$HOMEPATH""#), Catastrophic);
+        }
         // A home given by its short name (CI's `%TEMP%` is `RUNNER~1`) is still home:
         // `rm -rf ~` once got through and ran on the runner.
         let short = std::env::temp_dir();
