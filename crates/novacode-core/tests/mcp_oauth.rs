@@ -58,7 +58,6 @@ async fn call(home: &std::path::Path, url: &str) -> (bool, String) {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn login_call_and_refresh() {
     let mut child = std::process::Command::new("python3")
@@ -94,11 +93,14 @@ async fn login_call_and_refresh() {
         reqwest::Url::parse(&loc).unwrap().query_pairs().into_owned().collect();
     assert_eq!(q["state"], p.state);
     mcp_oauth::finish(home.path(), "fake", p, &q["code"]).await.unwrap();
-    let mode = std::fs::metadata(mcp_oauth::store_path(home.path())).unwrap();
-    assert_eq!(
-        std::os::unix::fs::PermissionsExt::mode(&mode.permissions()) & 0o777,
-        0o600
-    );
+    #[cfg(unix)]
+    {
+        let mode = std::fs::metadata(mcp_oauth::store_path(home.path())).unwrap();
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&mode.permissions()) & 0o777,
+            0o600
+        );
+    }
 
     let (ok, msg) = call(home.path(), &url).await;
     assert!(ok && msg.contains("token at1"), "{msg}");

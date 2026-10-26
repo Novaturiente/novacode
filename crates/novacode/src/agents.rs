@@ -2036,6 +2036,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[cfg(unix)]
     fn test_setup(tmp: &Path, exe: PathBuf) -> Setup {
         Setup {
             slot: HubSlot::default(),

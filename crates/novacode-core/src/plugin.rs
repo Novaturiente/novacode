@@ -489,7 +489,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn claude_plugin_parts() {
         let t = tempfile::tempdir().unwrap();
@@ -553,12 +552,15 @@ mod tests {
         o.insert("tok".to_string(), json!("saved"));
         parts.save_options(&o).unwrap();
         assert_eq!(parts.options()["tok"], "saved");
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(base.join("package-options.json"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(base.join("package-options.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         let owned = Parts::owning(&r.join("skills/a/SKILL.md")).unwrap();
         assert_eq!(owned.name, "pony");
         assert!(owner_name(&t.path().join("elsewhere/SKILL.md")).is_none());
