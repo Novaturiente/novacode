@@ -2400,7 +2400,12 @@ async fn serve_headless(ctx: &Ctx, store: Store, model: String) -> anyhow::Resul
             }
         };
         let term = async {
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            #[cfg(unix)]
+            let s = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+            // The console window closing is Windows' nearest to SIGTERM.
+            #[cfg(windows)]
+            let s = tokio::signal::windows::ctrl_close();
+            match s {
                 Ok(mut s) => {
                     s.recv().await;
                 }
@@ -2442,7 +2447,6 @@ fn live_path(exe: std::path::PathBuf) -> std::path::PathBuf {
 }
 
 fn restart(id: &str) -> anyhow::Error {
-    use std::os::unix::process::CommandExt;
     let mut args = Vec::new();
     let mut skip = false;
     // `-w` takes an optional name: drop the next arg only if it isn't a flag.
@@ -2466,7 +2470,18 @@ fn restart(id: &str) -> anyhow::Error {
         Ok(e) => live_path(e),
         Err(e) => return e.into(),
     };
-    anyhow::anyhow!("restart failed: {}", std::process::Command::new(exe).args(args).exec())
+    #[cfg(unix)]
+    let err = {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new(exe).args(args).exec()
+    };
+    // shortcut: no exec on Windows, so this process waits for the new one and exits with its code; fine until the waiting parent's memory matters.
+    #[cfg(windows)]
+    let err = match std::process::Command::new(exe).args(args).status() {
+        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+        Err(e) => e,
+    };
+    anyhow::anyhow!("restart failed: {err}")
 }
 
 /// `--bg`: re-run this command detached, wait for its session id, print it.
@@ -2511,16 +2526,23 @@ const SHELL_SH: &str = r#"novacode() {
 
 fn spawn_bg() -> anyhow::Result<ExitCode> {
     use std::io::BufRead;
-    use std::os::unix::process::CommandExt;
-    let mut child = std::process::Command::new(std::env::current_exe()?)
-        .args(std::env::args_os().skip(1))
+    let mut c = std::process::Command::new(std::env::current_exe()?);
+    c.args(std::env::args_os().skip(1))
         .env("NOVACODE_BG_CHILD", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        // Its own process group: closing this terminal doesn't hang it up.
-        .process_group(0)
-        .spawn()?;
+        .stderr(std::process::Stdio::null());
+    // Its own process group: closing this terminal doesn't hang it up.
+    novacode_base::platform::own_group(&mut c);
+    // Windows: also no console, which would end it when the window closes.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        c.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    let mut child = c.spawn()?;
     let mut id = String::new();
     std::io::BufReader::new(child.stdout.take().context("no pipe")?).read_line(&mut id)?;
     let id = id.trim();

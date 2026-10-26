@@ -219,7 +219,8 @@ fn kill_group(pgid: Option<u32>) {
     }
 }
 
-#[cfg(test)]
+// Symlinks and Unix modes.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

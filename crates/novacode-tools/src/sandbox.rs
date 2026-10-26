@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -230,10 +229,25 @@ fn submodule_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 /// close-on-exec: setting the flag on a bare number needs `unsafe`, which the
 /// workspace forbids, and novacode never uses an inherited descriptor.
 pub fn close_inherited_fds() {
+    #[cfg(unix)]
     close_fds(&open_fds());
 }
 
+/// Where a child opens this process's descriptor `f`.
+#[cfg(unix)]
+fn fd_path(f: &File) -> String {
+    use std::os::fd::AsRawFd;
+    format!("/proc/{}/fd/{}", std::process::id(), f.as_raw_fd())
+}
+
+// Never reached: `memfd` fails outside Linux.
+#[cfg(windows)]
+fn fd_path(_: &File) -> String {
+    String::new()
+}
+
 /// The descriptors above 2 open in this process.
+#[cfg(unix)]
 fn open_fds() -> Vec<i32> {
     let Ok(rd) = std::fs::read_dir("/proc/self/fd") else {
         return vec![];
@@ -245,6 +259,7 @@ fn open_fds() -> Vec<i32> {
         .collect()
 }
 
+#[cfg(unix)]
 fn close_fds(fds: &[i32]) {
     for &fd in fds {
         // EBADF for the listing's own descriptor, already closed.
@@ -427,9 +442,7 @@ impl Sandbox {
                 }
             }
         });
-        memfd
-            .as_ref()
-            .map(|m| format!("/proc/{}/fd/{}", std::process::id(), m.as_raw_fd()))
+        memfd.as_ref().map(fd_path)
     }
 
     /// The variable is passed into sandboxed commands (not a secret).
@@ -762,10 +775,19 @@ fn seccomp_program() -> Option<Vec<u8>> {
 /// it; ctime also catches a rewrite in place with the mtime put back.
 type IndexStat = (u64, u64, i64, i64, i64, i64);
 
+#[cfg(unix)]
 fn index_stat(p: &Path) -> Option<IndexStat> {
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::metadata(p).ok()?;
     Some((m.ino(), m.size(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec()))
+}
+
+// No sandbox on Windows, so no git change check reads this; size and mtime keep it honest.
+#[cfg(windows)]
+fn index_stat(p: &Path) -> Option<IndexStat> {
+    let m = std::fs::metadata(p).ok()?;
+    let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some((0, m.len(), t.as_secs() as i64, i64::from(t.subsec_nanos()), 0, 0))
 }
 
 /// What the git change check reads (L6.5): `.git` stays writable inside the
@@ -1013,7 +1035,8 @@ pub fn project_dirs(cwd: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-#[cfg(test)]
+// bubblewrap, symlinks and Unix modes: nothing here runs on Windows.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -1461,6 +1484,7 @@ mod tests {
     }
 
     /// Inherited descriptors are closed, so commands don't get them.
+    #[cfg(unix)]
     #[test]
     fn inherited_fds_are_closed() {
         use std::os::fd::IntoRawFd;

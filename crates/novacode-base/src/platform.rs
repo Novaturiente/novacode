@@ -7,41 +7,136 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The user's home dir: `$HOME`.
+/// The user's home dir: `$HOME` (on Windows, else `%USERPROFILE%`).
 pub fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    let home = std::env::var_os("HOME");
+    #[cfg(windows)]
+    let home = home
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE"));
+    home.map(PathBuf::from)
 }
 
 /// The program for `bash -c CMD`.
+#[cfg(unix)]
 pub fn bash() -> PathBuf {
     "bash".into()
 }
 
+/// The program for `bash -c CMD`: `%NOVACODE_BASH%`, else Git for Windows' `bash.exe`.
+/// Never `bash` from PATH: `C:\Windows\System32\bash.exe` is WSL's launcher.
+#[cfg(windows)]
+pub fn bash() -> PathBuf {
+    static BASH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BASH.get_or_init(|| {
+        if let Some(b) = std::env::var_os("NOVACODE_BASH").filter(|b| !b.is_empty()) {
+            return b.into();
+        }
+        // `<Git>\cmd\git.exe` on PATH, then the default install folders.
+        let from_path = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+            .filter(|d| d.join("git.exe").is_file())
+            .filter_map(|d| d.parent().map(Path::to_path_buf));
+        let defaults = ["ProgramFiles", "ProgramW6432", "LOCALAPPDATA"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .map(|d| {
+                let d = PathBuf::from(d);
+                if d.ends_with("Local") {
+                    d.join("Programs").join("Git")
+                } else {
+                    d.join("Git")
+                }
+            });
+        from_path
+            .chain(defaults)
+            .map(|g| g.join("bin").join("bash.exe"))
+            .find(|b| b.is_file())
+            // Not found: spawning fails with "program not found"; callers explain.
+            .unwrap_or_else(|| "bash.exe".into())
+    })
+    .clone()
+}
+
 /// The program for `sh -c CMD`.
+#[cfg(unix)]
 pub fn sh() -> PathBuf {
     "sh".into()
 }
 
+/// Git Bash runs `sh -c` scripts too.
+#[cfg(windows)]
+pub fn sh() -> PathBuf {
+    bash()
+}
+
 /// Start `c` in its own process group (pgid = pid), so a group kill reaches its children.
 /// For a tokio command: `own_group(c.as_std_mut())`.
+#[cfg(unix)]
 pub fn own_group(c: &mut Command) -> &mut Command {
     use std::os::unix::process::CommandExt;
     c.process_group(0)
 }
 
+/// A new process group: the terminal's Ctrl+C doesn't reach it; novacode stops it itself.
+#[cfg(windows)]
+pub fn own_group(c: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    c.creation_flags(CREATE_NEW_PROCESS_GROUP)
+}
+
 /// Create the file `opts` opens with `mode` (`0o600` for secrets).
+#[cfg(unix)]
 pub fn set_create_mode(opts: &mut OpenOptions, mode: u32) -> &mut OpenOptions {
     use std::os::unix::fs::OpenOptionsExt;
     opts.mode(mode)
 }
 
+// shortcut: no owner-only ACL, files rely on the profile folder's default ACL; set one if shared machines matter.
+#[cfg(windows)]
+pub fn set_create_mode(opts: &mut OpenOptions, _mode: u32) -> &mut OpenOptions {
+    opts
+}
+
 /// Set `path`'s permission bits (`0o700` for a private dir).
+#[cfg(unix)]
 pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
+/// No Unix modes on Windows (see `set_create_mode`).
+#[cfg(windows)]
+pub fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
 /// Make `link` point at the dir `target`.
+#[cfg(unix)]
 pub fn link_dir(target: &Path, link: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(target, link)
+}
+
+/// A dir symlink needs Developer Mode or admin; a junction works for every user.
+#[cfg(windows)]
+pub fn link_dir(target: &Path, link: &Path) -> io::Result<()> {
+    if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+        return Ok(());
+    }
+    let ok = Command::new("cmd")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(link)
+        .arg(target)
+        .stdout(std::process::Stdio::null())
+        .status()?
+        .success();
+    if ok {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("could not link {}", link.display())))
+    }
 }

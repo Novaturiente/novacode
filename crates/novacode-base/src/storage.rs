@@ -239,6 +239,8 @@ mod tests {
         );
     }
 
+    // File symlinks on Windows need Developer Mode or admin.
+    #[cfg(unix)]
     #[test]
     fn write_goes_through_a_symlink() {
         use std::os::unix::fs::symlink;
@@ -265,6 +267,7 @@ mod tests {
         assert_eq!(fs::read(real.join("settings.json")).unwrap(), b"{}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn dangling_symlink_and_missing_path_still_get_written() {
         use std::os::unix::fs::symlink;

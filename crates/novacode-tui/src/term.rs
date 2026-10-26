@@ -31,17 +31,27 @@ fn restores_on_panic(ui: Option<ThreadId>, cur: ThreadId) -> bool {
     ui.is_none_or(|u| u == cur)
 }
 
+/// The background from `COLORFGBG`; `None` = unknown.
+fn background_from_env() -> Option<bool> {
+    let v = std::env::var("COLORFGBG").ok()?;
+    let bg: u8 = v.rsplit(';').next()?.parse().ok()?;
+    Some(!matches!(bg, 7 | 15))
+}
+
+/// Windows' console input has no raw byte stream to read an OSC 11 reply from: `COLORFGBG` only.
+#[cfg(windows)]
+pub fn query_background() -> Option<bool> {
+    background_from_env()
+}
+
 /// Is the terminal background dark? Asks with OSC 11 (150 ms timeout), then
 /// falls back to `COLORFGBG`. Call before [`enter`]; `None` = unknown.
+#[cfg(unix)]
 pub fn query_background() -> Option<bool> {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use std::io::Read;
     use std::os::fd::AsFd;
-    let from_env = || {
-        let v = std::env::var("COLORFGBG").ok()?;
-        let bg: u8 = v.rsplit(';').next()?.parse().ok()?;
-        Some(!matches!(bg, 7 | 15))
-    };
+    let from_env = background_from_env;
     // On reload the TUI's terminal is still up (raw): leave it that way afterwards.
     let was_raw = terminal::is_raw_mode_enabled().unwrap_or(false);
     if terminal::enable_raw_mode().is_err() {
@@ -137,6 +147,7 @@ pub fn install_panic_hook() {
 }
 
 /// Ctrl+Z: give the terminal back, stop, and take it again on `fg`.
+#[cfg(unix)]
 pub fn suspend(t: &mut Term) -> std::io::Result<()> {
     restore();
     let _ = nix::sys::signal::raise(nix::sys::signal::Signal::SIGTSTP);
@@ -144,16 +155,47 @@ pub fn suspend(t: &mut Term) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Windows has no job control: Ctrl+Z does nothing.
+#[cfg(windows)]
+pub fn suspend(_t: &mut Term) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// `editor` on `files` through a shell, so `EDITOR="code --wait"` works; paths are
+/// passed as `$1`, `$2`, never spliced.
+#[cfg(unix)]
+fn editor_process(editor: &str, files: &[&std::path::Path]) -> std::process::Command {
+    let args: Vec<String> = (1..=files.len()).map(|i| format!("\"${i}\"")).collect();
+    let mut c = std::process::Command::new("sh");
+    c.arg("-c")
+        .arg(format!("{editor} {}", args.join(" ")))
+        .arg("sh")
+        .args(files);
+    c
+}
+
+/// Through `cmd /C`, so `EDITOR="code --wait"` works. Paths are quoted; a `"` can't occur in a Windows path.
+#[cfg(windows)]
+fn editor_process(editor: &str, files: &[&std::path::Path]) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let args: Vec<String> = files.iter().map(|f| format!("\"{}\"", f.display())).collect();
+    let mut c = std::process::Command::new("cmd");
+    c.arg("/C").raw_arg(format!("\"{editor} {}\"", args.join(" ")));
+    c
+}
+
 /// The editor to run: `$VISUAL`, `$EDITOR`, else the first of nvim, nano, emacs, vim, vi on PATH.
 pub fn editor_command() -> String {
     let set = |k| std::env::var(k).ok().filter(|v: &String| !v.trim().is_empty());
     set("VISUAL").or_else(|| set("EDITOR")).unwrap_or_else(|| {
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let found = |b: &&&str| std::env::split_paths(&path).any(|d| d.join(b).is_file());
+        let exe = if cfg!(windows) { ".exe" } else { "" };
+        let found = |b: &&&str| std::env::split_paths(&path).any(|d| d.join(format!("{b}{exe}")).is_file());
         match ["nvim", "nano", "emacs", "vim"].iter().find(found) {
             // In the terminal, not a GUI window.
             Some(&"emacs") => "emacs -nw".into(),
             Some(b) => b.to_string(),
+            None if cfg!(windows) => "notepad".into(),
             None => "vi".into(),
         }
     })
@@ -165,13 +207,7 @@ pub fn external_editor(t: &mut Term, text: &str) -> std::io::Result<Option<Strin
     let path = std::env::temp_dir().join(format!("novacode-prompt-{}.md", std::process::id()));
     std::fs::write(&path, text)?;
     restore();
-    // Through sh, so `EDITOR="code --wait"` works; the path is passed as $1, never spliced.
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("{editor} \"$1\""))
-        .arg("sh")
-        .arg(&path)
-        .status();
+    let status = editor_process(&editor, &[&path]).status();
     *t = enter()?;
     let out = std::fs::read_to_string(&path);
     let _ = std::fs::remove_file(&path);
@@ -190,26 +226,27 @@ pub fn open_in_editor(t: &mut Term, path: &std::path::Path, base: Option<&std::p
     let bin = bin.rsplit('/').next().unwrap_or(bin);
     let diff = base.filter(|_| matches!(bin, "nvim" | "vim" | "vi" | "gvim"));
     restore();
-    // Through sh, so `EDITOR="code --wait"` works; paths are passed as $1/$2, never spliced.
-    let mut c = std::process::Command::new("sh");
-    match diff {
-        Some(b) => c
-            .arg("-c")
-            .arg(format!("{editor} -d \"$1\" \"$2\""))
-            .arg("sh")
-            .arg(b)
-            .arg(path),
-        None => c.arg("-c").arg(format!("{editor} \"$1\"")).arg("sh").arg(path),
-    };
-    let status = c.status();
+    let status = match diff {
+        Some(b) => editor_process(&format!("{editor} -d"), &[b, path]),
+        None => editor_process(&editor, &[path]),
+    }
+    .status();
     *t = enter()?;
     status.map(|_| ())
 }
 
 /// Open a URL in the default browser (xdg-open, or `open` on macOS); output goes nowhere.
 pub fn open(url: &str) {
-    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    // Windows: the URL handler directly; `cmd /C start` would split a URL at `&`.
+    let (opener, pre): (&str, &[&str]) = if cfg!(windows) {
+        ("rundll32", &["url.dll,FileProtocolHandler"])
+    } else if cfg!(target_os = "macos") {
+        ("open", &[])
+    } else {
+        ("xdg-open", &[])
+    };
     let _ = std::process::Command::new(opener)
+        .args(pre)
         .arg(url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

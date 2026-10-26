@@ -138,6 +138,7 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+#[cfg(unix)]
 fn kill_group(pid: u32) {
     let _ = nix::sys::signal::killpg(
         nix::unistd::Pid::from_raw(pid as i32),
@@ -145,11 +146,18 @@ fn kill_group(pid: u32) {
     );
 }
 
+// Windows has no SIGTERM for console programs: stop is a hard kill.
+#[cfg(windows)]
+fn kill_group(pid: u32) {
+    kill_group_hard(pid);
+}
+
 /// SIGKILL a process group at once (MCP servers on shutdown).
 pub fn kill_group_now(pid: u32) {
     kill_group_hard(pid);
 }
 
+#[cfg(unix)]
 fn kill_group_hard(pid: u32) {
     let _ = nix::sys::signal::killpg(
         nix::unistd::Pid::from_raw(pid as i32),
@@ -157,9 +165,49 @@ fn kill_group_hard(pid: u32) {
     );
 }
 
+/// `taskkill /T` kills `pid` and the children it can still see.
+// shortcut: misses children whose parent already exited (`cmd &`), use a Job Object when that leaks processes.
+#[cfg(windows)]
+fn kill_group_hard(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
 /// The process group `pid` leads is still alive.
+#[cfg(unix)]
 fn group_alive(pid: u32) -> bool {
     nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+}
+
+#[cfg(windows)]
+fn group_alive(pid: u32) -> bool {
+    pid_alive(pid)
+}
+
+/// A process with this pid exists.
+#[cfg(target_os = "linux")]
+fn pid_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+// No `/proc` on macOS: signal 0 probes; EPERM means it exists under another user.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn pid_alive(pid: u32) -> bool {
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None) {
+        Ok(()) => true,
+        Err(e) => e == nix::errno::Errno::EPERM,
+    }
+}
+
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/NH", "/FO", "CSV", "/FI", &format!("PID eq {pid}")])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
 }
 
 impl ProcessManager {
@@ -700,7 +748,7 @@ fn tail_text(p: &Proc, n: usize, filter: Option<&str>) -> String {
 
 /// After a crash: kill groups whose novacode owner is gone, and mark them ended.
 fn reap_orphans(root: &Path) {
-    let owner_alive = |pid: u32| Path::new(&format!("/proc/{pid}")).exists();
+    let owner_alive = pid_alive;
     for dir in std::fs::read_dir(root).into_iter().flatten().flatten() {
         for f in std::fs::read_dir(dir.path()).into_iter().flatten().flatten() {
             let path = f.path();
