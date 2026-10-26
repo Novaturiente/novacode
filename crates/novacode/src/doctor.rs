@@ -207,7 +207,11 @@ mod tests {
         assert_eq!(line(Mode::Off, true, None), (false, "off (setting)".into()));
         assert_eq!(
             line(Mode::Auto, false, None).1,
-            "unavailable (bwrap not found), commands run unsandboxed"
+            if cfg!(windows) {
+                "unavailable (no sandbox on Windows), commands run unsandboxed"
+            } else {
+                "unavailable (bwrap not found), commands run unsandboxed"
+            }
         );
         assert!(line(Mode::On, false, None).1.contains("refused"));
         assert_eq!(

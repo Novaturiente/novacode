@@ -2103,6 +2103,11 @@ pub(crate) fn resolve(arg: &str, ctx: &Ctx) -> PathBuf {
     if s == "*" || s == ".*" {
         s = ".".into();
     }
+    // `\??\` is the NT form of `\\?\`.
+    #[cfg(windows)]
+    if let Some(r) = s.strip_prefix(r"\??\") {
+        s = format!(r"\\?\{r}");
+    }
     // Git Bash names drives `/c/...`.
     #[cfg(windows)]
     if let [b'/', d, rest @ ..] = s.as_bytes()
@@ -2203,6 +2208,13 @@ pub(crate) fn fold(p: &Path) -> std::borrow::Cow<'_, Path> {
             }
         });
     let s = share.unwrap_or(s);
+    // A drive inside the path (`C:\proj\C:\Users\u` after joining `\??\C:\…` or `C:\…` to a
+    // cwd) is where the path really starts.
+    let is_drive = |c: &str| matches!(c.as_bytes(), [d, b':'] if d.is_ascii_alphabetic());
+    let s = match s.split('\\').skip(1).position(is_drive) {
+        Some(i) => s.split('\\').skip(i + 1).collect::<Vec<_>>().join("\\"),
+        None => s,
+    };
     let parts: Vec<String> = s
         .split('\\')
         .enumerate()
@@ -2263,9 +2275,14 @@ fn is_system(p: &Path) -> bool {
 /// still edit AGENTS.md, skills and settings there.
 pub fn protected_path(path: &Path, ctx: &Ctx) -> Option<String> {
     let p = resolve(&path.to_string_lossy(), ctx);
-    let nova = ctx.home.join(".novacode");
-    let (folded, nova) = (fold(&p), fold(&nova));
-    if let Ok(rest) = folded.strip_prefix(&nova)
+    let folded = fold(&p);
+    // Every form of home: `resolve` may have turned a short name into its long one.
+    let homes = homes(ctx);
+    let rest = homes.iter().find_map(|h| {
+        let nova = fold(&h.join(".novacode")).into_owned();
+        folded.strip_prefix(&nova).ok().map(Path::to_path_buf)
+    });
+    if let Some(rest) = rest
         && !rest.as_os_str().is_empty()
     {
         let mut parts = rest.components();
@@ -2290,11 +2307,18 @@ pub fn protected_path(path: &Path, ctx: &Ctx) -> Option<String> {
 fn homes(ctx: &Ctx) -> Vec<PathBuf> {
     #[allow(unused_mut)]
     let mut v = vec![ctx.home.to_path_buf()];
+    // Also the long form of a short-named home (`RUNNER~1`): `resolve` expands short names.
     #[cfg(windows)]
-    if let Some(u) = std::env::var_os("USERPROFILE").map(PathBuf::from)
-        && !same(&u, ctx.home)
+    for h in [
+        Some(crate::policy::real(ctx.home)),
+        std::env::var_os("USERPROFILE").map(PathBuf::from),
+    ]
+    .into_iter()
+    .flatten()
     {
-        v.push(u);
+        if !v.iter().any(|x| same(x, &h)) {
+            v.push(h);
+        }
     }
     v
 }
@@ -2411,6 +2435,22 @@ mod tests {
         assert_ne!(lvl("rm -rf /c/Users/u/proj/target"), Catastrophic);
         // Inline code naming a credential folder in Windows form asks, as on Unix.
         assert_eq!(lvl(r#"python3 -c "open(r'C:\Users\u\.SSH\id_rsa','a')""#), Shared);
+        // A home given by its short name (CI's `%TEMP%` is `RUNNER~1`) is still home:
+        // `rm -rf ~` once got through and ran on the runner.
+        let short = std::env::temp_dir();
+        let sctx = Ctx {
+            cwd: &short,
+            home: &short,
+            protected: &protected,
+        };
+        for c in ["rm -rf ~", "rm -rf ~/.ssh", "rm -rf $HOME"] {
+            assert_eq!(
+                classify(c, &sctx).level,
+                Catastrophic,
+                "{c} with home {}",
+                short.display()
+            );
+        }
         // 8.3 short names resolve on disk (when the drive has them).
         if Path::new(r"C:\PROGRA~1").exists() {
             assert_eq!(lvl("rm -rf C:/PROGRA~1"), Catastrophic);

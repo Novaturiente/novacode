@@ -121,7 +121,11 @@ impl Rule {
         // Windows: globset compares paths with `/`, and NTFS ignores case; a `\` that
         // doesn't escape a glob character is a separator.
         let p = if cfg!(windows) { windows_glob(p) } else { p.to_string() };
-        let Ok(glob) = globset::GlobBuilder::new(&p).case_insensitive(cfg!(windows)).build() else {
+        let Ok(glob) = globset::GlobBuilder::new(&p)
+            .case_insensitive(cfg!(windows))
+            .backslash_escape(true)
+            .build()
+        else {
             return false;
         };
         let m = glob.compile_matcher();
