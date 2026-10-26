@@ -141,7 +141,14 @@ fn route_changed(last: Option<&State>, s: &State) -> bool {
 
 static HERDR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// herdr is a Unix terminal multiplexer: never there on Windows.
+#[cfg(windows)]
+async fn herdr_send(_sock: &str, _req: &serde_json::Value) -> bool {
+    false
+}
+
 /// One request line to herdr; true once it answers anything.
+#[cfg(unix)]
 async fn herdr_send(sock: &str, req: &serde_json::Value) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     for wait in [500, 1500] {

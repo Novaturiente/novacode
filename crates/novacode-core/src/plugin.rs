@@ -489,6 +489,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn claude_plugin_parts() {
         let t = tempfile::tempdir().unwrap();

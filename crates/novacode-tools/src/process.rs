@@ -189,13 +189,13 @@ fn group_alive(pid: u32) -> bool {
 
 /// A process with this pid exists.
 #[cfg(target_os = "linux")]
-fn pid_alive(pid: u32) -> bool {
+pub fn pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
 // No `/proc` on macOS: signal 0 probes; EPERM means it exists under another user.
 #[cfg(all(unix, not(target_os = "linux")))]
-fn pid_alive(pid: u32) -> bool {
+pub fn pid_alive(pid: u32) -> bool {
     match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None) {
         Ok(()) => true,
         Err(e) => e == nix::errno::Errno::EPERM,
@@ -203,7 +203,7 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn pid_alive(pid: u32) -> bool {
+pub fn pid_alive(pid: u32) -> bool {
     std::process::Command::new("tasklist")
         .args(["/NH", "/FO", "CSV", "/FI", &format!("PID eq {pid}")])
         .output()

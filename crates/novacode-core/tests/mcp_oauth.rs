@@ -58,6 +58,7 @@ async fn call(home: &std::path::Path, url: &str) -> (bool, String) {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn login_call_and_refresh() {
     let mut child = std::process::Command::new("python3")

@@ -397,6 +397,7 @@ async fn policy_gates_every_call_in_the_loop() {
 
 /// L4.16: while the session file can't be written, no tool runs and no model is
 /// called; once it can, the missing entries are written and the session goes on.
+#[cfg(unix)]
 #[tokio::test]
 async fn unsaved_session_stops_work_until_it_saves() {
     use std::os::unix::fs::PermissionsExt;

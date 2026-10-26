@@ -315,24 +315,78 @@ impl Live {
     }
 }
 
-/// Listen on `<home>/run/<id>.sock` (owner only) and keep the run file current.
-pub fn go_live(host: &Arc<Host>, bg: bool) -> std::io::Result<Live> {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = run_dir(&host.paths);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    let sock = dir.join(format!("{}.sock", host.id));
-    let run = dir.join(format!("{}.json", host.id));
-    let _ = std::fs::remove_file(&sock);
-    let listener = tokio::net::UnixListener::bind(&sock)?;
-    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
-    let h = host.clone();
-    let accept = tokio::spawn(async move {
+/// A live session's address: `<run>/<id>.sock`, or a named pipe on Windows.
+fn address(dir: &Path, id: &str) -> PathBuf {
+    if cfg!(windows) {
+        format!(r"\\.\pipe\novacode-{id}").into()
+    } else {
+        dir.join(format!("{id}.sock"))
+    }
+}
+
+/// Accept clients on `sock` (owner only), each served by [`serve`].
+#[cfg(unix)]
+fn listen(sock: &Path, h: Arc<Host>) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    let _ = std::fs::remove_file(sock);
+    let listener = tokio::net::UnixListener::bind(sock)?;
+    novacode_base::platform::set_mode(sock, 0o600)?;
+    Ok(tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let (r, w) = stream.into_split();
             tokio::spawn(serve(r, w, h.clone(), false));
         }
-    });
+    }))
+}
+
+/// One pipe instance per client; a new one waits before the last is handed off.
+/// `first_pipe_instance`: fails if another process already owns the name.
+// shortcut: the pipe's default DACL lets other local users open it read-only; set an owner-only DACL for shared machines.
+#[cfg(windows)]
+fn listen(sock: &Path, h: Arc<Host>) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let name = sock.as_os_str().to_owned();
+    let mut server = ServerOptions::new().first_pipe_instance(true).create(&name)?;
+    Ok(tokio::spawn(async move {
+        while server.connect().await.is_ok() {
+            let Ok(next) = ServerOptions::new().create(&name) else {
+                break;
+            };
+            let (r, w) = tokio::io::split(std::mem::replace(&mut server, next));
+            tokio::spawn(serve(r, w, h.clone(), false));
+        }
+    }))
+}
+
+/// Connect to a live session's address.
+#[cfg(unix)]
+async fn connect(sock: &Path) -> std::io::Result<tokio::net::UnixStream> {
+    tokio::net::UnixStream::connect(sock).await
+}
+
+/// Busy = every instance taken for a moment; the server makes the next one at once.
+#[cfg(windows)]
+async fn connect(sock: &Path) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    const ERROR_PIPE_BUSY: i32 = 231;
+    let mut tries = 0;
+    loop {
+        match tokio::net::windows::named_pipe::ClientOptions::new().open(sock) {
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && tries < 40 => {
+                tries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            r => return r,
+        }
+    }
+}
+
+/// Listen on `<home>/run/<id>.sock` (owner only) and keep the run file current.
+pub fn go_live(host: &Arc<Host>, bg: bool) -> std::io::Result<Live> {
+    let dir = run_dir(&host.paths);
+    std::fs::create_dir_all(&dir)?;
+    novacode_base::platform::set_mode(&dir, 0o700)?;
+    let sock = address(&dir, &host.id);
+    let run = dir.join(format!("{}.json", host.id));
+    let accept = listen(&sock, host.clone())?;
     let mut file = RunFile {
         pid: std::process::id(),
         socket: sock.clone(),
@@ -369,8 +423,7 @@ pub fn live_sessions(paths: &Paths) -> Vec<RunFile> {
         .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
         .filter_map(|e| {
             let f: RunFile = novacode_base::storage::read_json(&e.path()).ok().flatten()?;
-            // shortcut: liveness via /proc (Linux); add kill(pid, 0) for macOS.
-            if Path::new(&format!("/proc/{}", f.pid)).exists() {
+            if novacode_tools::process::pid_alive(f.pid) {
                 Some(f)
             } else {
                 let _ = std::fs::remove_file(e.path());
@@ -426,7 +479,7 @@ pub fn agents(paths: &Paths) -> std::process::ExitCode {
 /// `novacode stop <id>`: end a live session (a `--bg` one included).
 pub async fn stop(paths: &Paths, prefix: &str) -> anyhow::Result<std::process::ExitCode> {
     let f = find_live(paths, prefix)?;
-    let mut s = tokio::net::UnixStream::connect(&f.socket).await?;
+    let mut s = connect(&f.socket).await?;
     s.write_all(
         line(&Request {
             id: None,
@@ -449,10 +502,10 @@ pub async fn attach(
 ) -> anyhow::Result<Option<std::process::ExitCode>> {
     use anyhow::Context;
     let f = find_live(paths, prefix)?;
-    let stream = tokio::net::UnixStream::connect(&f.socket)
+    let stream = connect(&f.socket)
         .await
         .with_context(|| format!("connecting to {}", f.socket.display()))?;
-    let (r, mut w) = stream.into_split();
+    let (r, mut w) = tokio::io::split(stream);
     let mut lines = BufReader::new(r).lines();
     let mut next = async || -> anyhow::Result<ServerMsg> {
         let l = lines.next_line().await?.context("the session closed the connection")?;

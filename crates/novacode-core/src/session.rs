@@ -904,6 +904,7 @@ mod tests {
 
     /// L4.16: a failed write keeps entries in memory and the next one writes them in
     /// order, past a cut-off line; reopening gives the whole branch, each entry once.
+    #[cfg(unix)]
     #[test]
     fn failed_writes_are_written_later_in_order() {
         use std::os::unix::fs::PermissionsExt;

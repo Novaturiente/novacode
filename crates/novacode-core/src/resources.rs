@@ -615,6 +615,7 @@ mod tests {
         assert_eq!(field(&fm, "description").unwrap(), "Use when: the user asks");
     }
 
+    #[cfg(unix)]
     #[test]
     fn skills_discovery_order_and_render() {
         let d = tempfile::tempdir().unwrap();

@@ -504,7 +504,7 @@ impl Claims {
 }
 
 fn alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+    novacode_tools::process::pid_alive(pid)
 }
 
 impl Handler for Claims {
@@ -1826,6 +1826,7 @@ mod tests {
     use super::*;
 
     /// A fake `novacode --rpc`: hello, then per prompt a reply that echoes it and settles.
+    #[cfg(unix)]
     fn fake_child(dir: &Path) -> PathBuf {
         let hello = serde_json::to_string(&ServerMsg::Hello {
             protocol: 1,
@@ -1873,6 +1874,7 @@ mod tests {
         script
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn spawn_after_wait_and_send() {
         let tmp = std::env::temp_dir().join(format!("nc-sup-{}", std::process::id()));
@@ -1964,6 +1966,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn at_most_max_running_children_and_slots_free_on_exit() {
         let tmp = std::env::temp_dir().join(format!("nc-cap-{}", std::process::id()));
@@ -2060,6 +2063,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn tool_progress_agent_wait_and_relays_count_as_activity() {
         let tmp = std::env::temp_dir().join(format!("nc-act-{}", std::process::id()));
@@ -2132,6 +2136,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn worktree_names_never_repeat_across_sessions() {
         let tmp = std::env::temp_dir().join(format!("nc-wt-{}", std::process::id()));
@@ -2302,6 +2307,7 @@ mod tests {
         assert!(notes[0].contains("parentPicksTools"), "{notes:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn defs_and_claims() {
         let tmp = std::env::temp_dir().join(format!("nc-agents-{}", std::process::id()));

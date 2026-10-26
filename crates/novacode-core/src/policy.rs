@@ -1391,6 +1391,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn file_tools_refuse_protected_paths() {
         let d = tempfile::tempdir().unwrap();
@@ -1543,6 +1544,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn allow_rules_need_the_resolved_path_too() {
         let d = tempfile::tempdir().unwrap();

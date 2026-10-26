@@ -385,6 +385,7 @@ mod tests {
             assert!(faux.requests.lock().unwrap().is_empty());
         }
 
+        #[cfg(unix)]
         #[tokio::test]
         async fn file_writes_through_a_link_out_of_the_project_are_judged() {
             let proj = tempfile::tempdir().unwrap();

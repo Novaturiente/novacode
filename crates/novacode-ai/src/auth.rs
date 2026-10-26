@@ -974,6 +974,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn writes_go_through_a_symlinked_auth_file() {
         let real = tempfile::tempdir().unwrap();
@@ -1040,6 +1041,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn store_round_trip_is_0600_and_fresh_token_skips_refresh() {
         use std::os::unix::fs::PermissionsExt;
