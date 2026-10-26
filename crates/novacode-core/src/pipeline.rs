@@ -349,7 +349,8 @@ mod tests {
             let (j, faux) = judge("BLOCK: no");
             let edit = json!({ "path": "../other/f.rs", "edits": [{ "old_text": "a", "new_text": "b" }] });
             assert!(auth_tool(&p, None, &j, "edit", edit, w).await.is_some());
-            assert!(format!("{:?}", faux.requests.lock().unwrap()[0].messages).contains("/other/f.rs"));
+            let sent = format!("{:?}", faux.requests.lock().unwrap()[0].messages).replace("\\\\", "/");
+            assert!(sent.contains("/other/f.rs"), "{sent}");
             let (j, faux) = judge("BLOCK: no");
             let patch = "*** Begin Patch\n*** Add File: /srv/x\n+a\n*** End Patch";
             assert!(

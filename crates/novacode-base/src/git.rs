@@ -289,10 +289,7 @@ mod tests {
             .args(["rev-parse", "--path-format=absolute", "--git-path", "hooks"])
             .output()
             .unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&o.stdout).trim(),
-            p.join(".git/hooks").display().to_string()
-        );
+        assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), sl(&p.join(".git/hooks")));
         // `worktree add` (enter_worktree): no planted hook. (Refs still follow a
         // planted `commondir`, git reads it for them directly; no program runs from refs.)
         let o = command_in(&p)

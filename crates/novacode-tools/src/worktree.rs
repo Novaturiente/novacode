@@ -438,7 +438,7 @@ mod tests {
     #[tokio::test]
     async fn enter_and_exit() {
         let d = tempfile::tempdir().unwrap();
-        let root = d.path().canonicalize().unwrap();
+        let root = novacode_base::platform::canonicalize(d.path()).unwrap();
         let sh = |a: &[&str]| {
             assert!(
                 std::process::Command::new("git")
@@ -495,7 +495,11 @@ mod tests {
         assert!(here(&root).is_err());
         let l = list(&wt).unwrap();
         assert!(
-            l.contains(&format!("* {}  [worktree-fix-x]  0 uncommitted", wt.display())),
+            // git prints `C:/…` on Windows.
+            l.replace('\\', "/").contains(&format!(
+                "* {}  [worktree-fix-x]  0 uncommitted",
+                novacode_base::platform::slash_path(&wt)
+            )),
             "{l}"
         );
         // Removal: the unchanged .env copy doesn't count as work and doesn't block it.
