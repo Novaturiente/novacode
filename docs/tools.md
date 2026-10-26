@@ -134,7 +134,7 @@ Asks you one or more questions in one form. Params: `questions`, each with `ques
 
 `web_fetch` takes `url` and an optional `format` (`markdown` by default, `text`, or `html`). Only `http://` and `https://` URLs work. Downloads stop at 5 MB and time out after 30 seconds. Content that isn't text (a PDF, an image) is refused; download it with `bash` (`curl -o`).
 
-`web_search` takes `query` and optional `urls` to read closely (only the Antigravity and Gemini engines read `urls`; Brave and SearXNG ignore them). It tries these engines in order and uses the first that works: an Antigravity login, a Gemini API key (`GEMINI_API_KEY`), Brave (`BRAVE_API_KEY`), then your SearXNG instance (`web.searxngUrl`). With none set up, it says so. Setting `web.native` lets models that have their own web search use it. See [Config](config.md).
+`web_search` takes `query` and optional `urls` to read closely (only the Antigravity and Gemini engines read `urls`; Brave and SearXNG ignore them). It tries these engines in order and uses the first that works: an Antigravity login (the account picked last with `/account`, else `default`), a Gemini API key (`GEMINI_API_KEY`), Brave (`BRAVE_API_KEY`), then your SearXNG instance (`web.searxngUrl`). `/websearch` (setting `web.search`) puts one engine first; when it fails, the answer from a fallback says so. With none set up, it says so. Setting `web.native` lets models that have their own web search use it. See [Config](config.md).
 
 ### enter_worktree and exit_worktree
 

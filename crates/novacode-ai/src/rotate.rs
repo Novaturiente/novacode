@@ -277,6 +277,7 @@ impl Adapter for Live {
             )
         })?;
         self.inner.set_current(i);
+        self.inner.providers.auth.select(&self.inner.provider, name);
         Ok(())
     }
 

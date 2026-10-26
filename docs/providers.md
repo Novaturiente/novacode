@@ -43,13 +43,13 @@ novacode login claude --account work
 novacode login claude --account second
 ```
 
-When an account runs out (quota used up, or a rate limit longer than novacode is willing to wait) before a reply starts, novacode switches to the next account of that provider and tells you in the transcript. It remembers the account, so a new session doesn't start on it: a rate limit until the reset time the server gave, a used-up quota for one hour. These are saved in `~/.novacode/exhausted.json`; delete it to clear them. Order is `default` first, then by name. Accounts known to be used up go last.
+When an account runs out (quota used up, or a rate limit longer than novacode is willing to wait) before a reply starts, novacode switches to the next account of that provider and tells you in the transcript. It remembers the account, so a new session doesn't start on it: a rate limit until the reset time the server gave, a used-up quota for one hour. These are saved in `~/.novacode/exhausted.json`; delete it to clear them. Order is the account you picked last with `/account` first, then `default`, then by name. Accounts known to be used up go last.
 
 novacode never falls back to a metered API key. If every account is used up, the error says when a rate limit resets (for a used-up quota it says only `quota used up`) and suggests adding an account or switching model with `/model`.
 
 `--account` only works for subscriptions. API keys have one key per provider.
 
-To switch by hand, type `/account` in a session to list the provider's accounts and see the active one, then `/account work` to move to `work`. The switch applies from the next request on and lasts for this session only. Automatic rotation still applies: if `work` runs out, novacode moves on to the next account. `/account` only knows accounts that were logged in when the session started (or last changed model); after a new `novacode login --account`, use `/reload`.
+To switch by hand, type `/account` in a session to pick one of the provider's accounts (the active one is marked), or `/account work` to move to `work`. The switch applies from the next request on and is saved per provider in `~/.novacode/selected.json`: new sessions, Antigravity web search and `/usage` start from it. Automatic rotation still applies, without changing the saved pick: if `work` runs out, novacode moves on to the next account. `/account` only knows accounts that were logged in when the session started (or last changed model); after a new `novacode login --account`, use `/reload`.
 
 Usage windows are kept per account in `~/.novacode/cache/usage/<provider>-<account>.json`, each fetched with that account's own token. Only the account a session uses is fetched. `novacode status` (`{account}`, and `account` in `--json`) and the tmux option `@agent_account` show the account in use. See [automation](automation.md).
 

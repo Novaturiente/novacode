@@ -172,7 +172,7 @@ A line that isn't a valid command gets `{"type":"response","command":"parse","ok
 
 ### Slash commands over RPC
 
-`prompt` text starting with `/` runs the command in the session instead of going to the model. These work: `/compact`, `/context`, `/mcp`, `/name <text>`, `/worktree [name|exit|remove]`, `/btw <q>`, `/docs`, `/export [html]`, `/model <id>`, `/thinking <level>`, `/plan`, `/mode`, `/goal`, `/usage`, `/account [name]`, `/debug`, plus skills, prompt templates and extension commands. `get_commands` lists them.
+`prompt` text starting with `/` runs the command in the session instead of going to the model. These work: `/compact`, `/context`, `/mcp`, `/name <text>`, `/worktree [name|exit|remove]`, `/btw <q>`, `/docs`, `/export [html]`, `/model <id>`, `/thinking <level>`, `/plan`, `/mode`, `/goal`, `/usage`, `/account [name]`, `/websearch [engine]`, `/debug`, plus skills, prompt templates and extension commands. `get_commands` lists them.
 
 These need the session's own window and answer with an error such as `/resume works only in the session's own window`: `/resume`, `/new`, `/tree`, `/rewind`, `/fork`, `/clone`, `/reload`, `/restart`, `/login`, `/keys`, `/copy`, `/ps`, `/quit`. `/model` and `/thinking` without an argument (the pickers) fail the same way. The session-changing ones also don't work in a window opened with `novacode attach`.
 

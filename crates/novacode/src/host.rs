@@ -61,7 +61,11 @@ pub const MODE_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/account",
-        "subscription account: /account lists them, /account <name> switches",
+        "subscription account: /account picks one (saved for new sessions), /account <name> switches",
+    ),
+    (
+        "/websearch",
+        "web search engine tried first: /websearch picks one (saved), /websearch <engine> sets it",
     ),
     (
         "/debug",
@@ -229,12 +233,19 @@ impl Host {
             Cmd::Prompt(t) | Cmd::Steer(t) if t.split_whitespace().next() == Some("/account") => {
                 let arg = t.trim().strip_prefix("/account").unwrap_or("").trim();
                 let a = self.adapter.lock().unwrap().as_ref().map(|(a, _)| a.clone());
-                let (text, error) = match a.map(|a| account_command(a.as_ref(), arg)) {
-                    Some(Ok(t)) => (t, false),
-                    Some(Err(e)) => (e, true),
-                    None => ("no model is connected".into(), true),
+                let ev = match a.map(|a| account_command(a.as_ref(), arg)) {
+                    Some(Ok(ev)) => ev,
+                    Some(Err(text)) => UiEvent::Notice { text, error: true },
+                    None => UiEvent::Notice {
+                        text: "no model is connected".into(),
+                        error: true,
+                    },
                 };
-                let _ = ui.send(UiEvent::Notice { text, error });
+                let _ = ui.send(ev);
+            }
+            Cmd::Prompt(t) | Cmd::Steer(t) if t.split_whitespace().next() == Some("/websearch") => {
+                let arg = t.trim().strip_prefix("/websearch").unwrap_or("").trim();
+                let _ = ui.send(websearch_command(&self.paths.settings(), arg));
             }
             Cmd::Prompt(t) | Cmd::Steer(t) if t.trim() == "/debug" => {
                 let _ = ui.send(UiEvent::Page {
@@ -930,19 +941,70 @@ impl Host {
     }
 }
 
-/// `/account` lists the provider's accounts; `/account <name>` switches to one.
-fn account_command(a: &dyn Adapter, arg: &str) -> Result<String, String> {
+/// `/account` offers the provider's accounts to pick; `/account <name>` switches to one.
+fn account_command(a: &dyn Adapter, arg: &str) -> Result<UiEvent, String> {
     let cur = a
         .follow_account()
         .map(|r| r.borrow().clone())
         .ok_or("this model is not on a subscription login, so it has no accounts")?;
     if arg.is_empty() {
-        return Ok(format!("accounts: {} (active: {cur})", a.accounts().join(", ")));
+        let items = a
+            .accounts()
+            .into_iter()
+            .map(|n| PickItem {
+                detail: if n == cur { "active".into() } else { String::new() },
+                label: n.clone(),
+                value: n,
+            })
+            .collect();
+        return Ok(UiEvent::Pick {
+            title: "Account (saved for new sessions)".into(),
+            command: "/account".into(),
+            items,
+        });
     }
     a.switch_account(arg)?;
-    Ok(format!(
-        "switched to account `{arg}` from the next request; rotation still moves on when it runs out"
-    ))
+    Ok(UiEvent::Notice {
+        text: format!("switched to account `{arg}` from the next request; rotation still moves on when it runs out"),
+        error: false,
+    })
+}
+
+/// `/websearch` offers the engines to pick; `/websearch <engine>` saves setting `web.search`.
+fn websearch_command(settings: &std::path::Path, arg: &str) -> UiEvent {
+    let engines = std::iter::once("auto").chain(novacode_core::web::ENGINES);
+    if arg.is_empty() {
+        let cur = novacode_base::settings::Settings::load(settings, None, false)
+            .get::<String>("web.search")
+            .unwrap_or_else(|| "auto".into());
+        let items = engines
+            .map(|e| PickItem {
+                label: e.into(),
+                detail: if e == cur { "active".into() } else { String::new() },
+                value: e.into(),
+            })
+            .collect();
+        return UiEvent::Pick {
+            title: "Web search engine (tried first; others are fallbacks)".into(),
+            command: "/websearch".into(),
+            items,
+        };
+    }
+    let (text, error) = if !engines.clone().any(|e| e == arg) {
+        (
+            format!(
+                "unknown engine `{arg}` (auto, {})",
+                novacode_core::web::ENGINES.join(", ")
+            ),
+            true,
+        )
+    } else {
+        match novacode_base::settings::set(settings, "web.search", &serde_json::Value::from(arg)) {
+            Ok(()) => (format!("web search now tries `{arg}` first (saved in settings)"), false),
+            Err(e) => (format!("could not save web.search: {e}"), true),
+        }
+    };
+    UiEvent::Notice { text, error }
 }
 
 fn is_mode_command(t: &str) -> bool {

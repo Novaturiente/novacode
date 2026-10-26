@@ -141,7 +141,8 @@ impl AuthStore {
             .map(|c| c.access.clone())
     }
 
-    /// Logged-in accounts of a provider: `default` first, then by name.
+    /// Logged-in accounts of a provider: the selected one (`/account`) first, then
+    /// `default`, then by name; accounts inside a saved rate-limit window go last.
     pub fn accounts(&self, provider: &str) -> Vec<String> {
         let mut a: Vec<String> = self
             .read()
@@ -156,11 +157,34 @@ impl AuthStore {
         // doesn't spend its first request on an account known to be exhausted.
         let until = self.exhausted();
         let now = now_ms();
+        let picked = self.selected().remove(provider);
         a.sort_by_key(|x| {
             let out = until.get(&format!("{provider}/{x}")).is_some_and(|&t| t > now);
-            (out, x != DEFAULT_ACCOUNT, x.clone())
+            (out, picked.as_ref() != Some(x), x != DEFAULT_ACCOUNT, x.clone())
         });
         a
+    }
+
+    fn selected_path(&self) -> PathBuf {
+        self.path.with_file_name("selected.json")
+    }
+
+    /// provider → the account picked last with `/account`.
+    fn selected(&self) -> BTreeMap<String, String> {
+        std::fs::read_to_string(self.selected_path())
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    /// Save `account` as `provider`'s pick: new sessions and web search start on it.
+    // shortcut: read-modify-write without the auth lock; two processes picking at once can lose one pick.
+    pub fn select(&self, provider: &str, account: &str) {
+        let mut m = self.selected();
+        m.insert(provider.into(), account.into());
+        if let Ok(t) = serde_json::to_string_pretty(&m) {
+            let _ = storage::write_atomic(&self.selected_path(), t.as_bytes(), storage::Durability::Durable);
+        }
     }
 
     fn exhausted_path(&self) -> PathBuf {
@@ -1037,6 +1061,26 @@ mod tests {
             & 0o777;
         assert_eq!(mode, 0o600);
         assert!(s.has("claude") && s.remove("claude", None).await.unwrap() && !s.has("claude"));
+    }
+
+    #[tokio::test]
+    async fn selected_account_goes_first_unless_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = AuthStore::new(dir.path().join("auth.json"));
+        let cred = || OAuthCredential {
+            access: "a".into(),
+            refresh: "r".into(),
+            expires_ms: now_ms() + 3_600_000,
+            project: None,
+        };
+        for a in [DEFAULT_ACCOUNT, "home", "work"] {
+            s.put("claude", a, cred()).await.unwrap();
+        }
+        assert_eq!(s.accounts("claude"), ["default", "home", "work"]);
+        s.select("claude", "work");
+        assert_eq!(s.accounts("claude"), ["work", "default", "home"]);
+        s.mark_exhausted("claude", "work", now_ms() + 60_000);
+        assert_eq!(s.accounts("claude"), ["default", "home", "work"]);
     }
 
     #[test]

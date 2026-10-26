@@ -1341,6 +1341,7 @@ impl Ctx {
             auth: Arc::new(AuthStore::new(self.paths.home().join("auth.json"))),
             providers: self.providers.clone(),
             searxng: s.get::<String>("web.searxngUrl"),
+            settings: self.paths.settings(),
         }));
         all.push(Arc::new(novacode_tools::worktree::EnterWorktree));
         all.push(Arc::new(novacode_tools::worktree::ExitWorktree(asker.clone())));

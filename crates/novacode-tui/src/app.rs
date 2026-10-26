@@ -254,6 +254,12 @@ pub enum UiEvent {
     LoginList {
         items: Vec<PickItem>,
     },
+    /// A host command's choices (`/account`, `/websearch`); picking one sends `<command> <value>`.
+    Pick {
+        title: String,
+        command: String,
+        items: Vec<PickItem>,
+    },
     LoginMethods {
         provider: String,
         items: Vec<PickItem>,
@@ -371,6 +377,8 @@ enum Overlay {
     Pager(Pager),
     /// `/login` with no provider: every provider you can log in to.
     LoginPick(Picker),
+    /// [`UiEvent::Pick`]: the command the picked value goes to.
+    CommandPick(String, Picker),
     /// How to log in to this provider (browser or a code).
     LoginMethod(String, Picker),
     Login(crate::login::LoginView),
@@ -633,7 +641,13 @@ impl App {
                 };
                 self.overlay = Some(Overlay::Branch(a, Picker::new(title, items)));
             }
-            UiEvent::Notice { text, error } => self.tr.notice(text, error),
+            UiEvent::Notice { text, error } => {
+                // Idle: the host answered a command itself (`/account`, `/mode`); no user message will replace the echo.
+                if !self.busy {
+                    self.tr.echo = None;
+                }
+                self.tr.notice(text, error)
+            }
             UiEvent::Draft { text } => {
                 // Not `take()`: that would put the half-typed draft in history and drop its pastes.
                 let draft = self.editor.text().to_string();
@@ -669,6 +683,12 @@ impl App {
             UiEvent::FollowUpsBack { .. } => {}
             UiEvent::History { prompts } => self.editor.prepend_history(prompts),
             UiEvent::LoginList { items } => self.overlay = Some(Overlay::LoginPick(Picker::new("Log in to", items))),
+            UiEvent::Pick { title, command, items } => {
+                if !self.busy {
+                    self.tr.echo = None;
+                }
+                self.overlay = Some(Overlay::CommandPick(command, Picker::new(title, items)));
+            }
             UiEvent::LoginMethods { provider, items } => {
                 let title = format!("Log in to {provider}");
                 self.overlay = Some(Overlay::LoginMethod(provider, Picker::new(title, items)));
@@ -695,7 +715,12 @@ impl App {
             UiEvent::Procs { items } => self.panel.set_procs(items),
             UiEvent::FileStats(v) => self.panel.set_diffstat(v),
             UiEvent::OpenFile { path, base } => self.open_file = Some((path, base)),
-            UiEvent::Page { title, text } => self.overlay = Some(Overlay::Pager(Pager::new(title, &text, &self.theme))),
+            UiEvent::Page { title, text } => {
+                if !self.busy {
+                    self.tr.echo = None;
+                }
+                self.overlay = Some(Overlay::Pager(Pager::new(title, &text, &self.theme)))
+            }
             UiEvent::Btw { result } => {
                 let left = match &mut self.overlay {
                     Some(Overlay::Btw(c)) => c.answer(result),
@@ -1184,6 +1209,7 @@ impl App {
                 | Overlay::Branch(_, p)
                 | Overlay::RewindMode(_, p)
                 | Overlay::LoginPick(p)
+                | Overlay::CommandPick(_, p)
                 | Overlay::LoginMethod(_, p) => match p.handle(k, &self.keymap) {
                     Picked::Pending => {}
                     Picked::Cancel => self.overlay = None,
@@ -1196,6 +1222,7 @@ impl App {
                                 provider: v,
                                 method: None,
                             }),
+                            Some(Overlay::CommandPick(command, _)) => self.send(Cmd::Prompt(format!("{command} {v}"))),
                             Some(Overlay::LoginMethod(provider, _)) => self.send(Cmd::Login {
                                 provider,
                                 method: Some(v),
@@ -2074,6 +2101,7 @@ impl App {
                 | Overlay::Branch(_, p)
                 | Overlay::RewindMode(_, p)
                 | Overlay::LoginPick(p)
+                | Overlay::CommandPick(_, p)
                 | Overlay::LoginMethod(_, p),
             ) => p.render(f, dialog::centered(main, 70, 70, 20), t),
             Some(Overlay::Login(v)) => {

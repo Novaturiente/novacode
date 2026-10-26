@@ -138,12 +138,18 @@ pub async fn quotas(home: &Path, p: &Providers, current: &str, account: Option<&
         .filter(|pr| novacode_ai::quota::supported(&pr.id) && p.connected(pr))
         .map(|pr| pr.id.clone())
     {
-        let (model, acct) = if provider == cur_provider {
-            (cur_model, account.unwrap_or(novacode_ai::auth::DEFAULT_ACCOUNT))
-        } else {
-            ("", novacode_ai::auth::DEFAULT_ACCOUNT)
+        let (model, acct) = match account {
+            Some(a) if provider == cur_provider => (cur_model, a.to_string()),
+            // Another provider: its selected account (`/account`), else `default`.
+            _ => (
+                if provider == cur_provider { cur_model } else { "" },
+                auth.accounts(&provider)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| novacode_ai::auth::DEFAULT_ACCOUNT.into()),
+            ),
         };
-        let Some(q) = novacode_ai::quota::cached(home, &auth, &provider, acct, model).await else {
+        let Some(q) = novacode_ai::quota::cached(home, &auth, &provider, &acct, model).await else {
             continue;
         };
         any = true;

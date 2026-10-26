@@ -270,6 +270,12 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "Use the model's own web search when it has one.",
     ),
     (
+        "web.search",
+        "string",
+        "auto",
+        "`web_search` engine tried first: `auto`, `antigravity`, `gemini`, `brave` or `searxng`; the others stay as fallbacks. Set with `/websearch`.",
+    ),
+    (
         "web.searxngUrl",
         "string",
         "unset",

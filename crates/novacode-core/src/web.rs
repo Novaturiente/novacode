@@ -1,7 +1,7 @@
 //! `web_fetch` and `web_search` (L5.13). Fetch returns markdown (5 MB download
-//! cap; the L5.3 output guards cut it to size). Search tries, in order: Google
-//! grounding through the Antigravity login, a Gemini API key, Brave, SearXNG.
-//! No HTML scraping of search pages.
+//! cap; the L5.3 output guards cut it to size). Search tries the engine in setting
+//! `web.search` first, then the rest in order: Google grounding through the
+//! Antigravity login, a Gemini API key, Brave, SearXNG. No HTML scraping of search pages.
 
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
@@ -12,6 +12,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -182,6 +183,21 @@ pub struct WebSearch {
     pub providers: Arc<Providers>,
     /// Setting `web.searxngUrl`.
     pub searxng: Option<String>,
+    /// The global settings file, read on every search for `web.search` (`/websearch` changes it live).
+    pub settings: PathBuf,
+}
+
+/// `web.search` values after `auto`, in fallback order.
+pub const ENGINES: [&str; 4] = ["antigravity", "gemini", "brave", "searxng"];
+
+/// `chosen` first, then the other engines in their usual order.
+fn order(chosen: &str) -> Vec<&'static str> {
+    let mut v = ENGINES.to_vec();
+    if let Some(i) = v.iter().position(|e| *e == chosen) {
+        let e = v.remove(i);
+        v.insert(0, e);
+    }
+    v
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -286,9 +302,11 @@ async fn unredirect(text: String) -> String {
 
 impl WebSearch {
     async fn antigravity(&self, a: &SearchArgs) -> Option<Result<String, String>> {
+        // The selected account (`/account`), else `default`.
+        let account = self.auth.accounts(antigravity::PROVIDER).into_iter().next();
         let cred = self
             .auth
-            .credential(antigravity::PROVIDER, DEFAULT_ACCOUNT)
+            .credential(antigravity::PROVIDER, account.as_deref().unwrap_or(DEFAULT_ACCOUNT))
             .await
             .ok()?;
         let project = cred.project.clone()?;
@@ -444,19 +462,29 @@ impl Tool for WebSearch {
                 Ok(a) => a,
                 Err(e) => return e,
             };
+            let chosen = novacode_base::settings::Settings::load(&self.settings, None, false)
+                .get::<String>("web.search")
+                .unwrap_or_default();
             let mut errors = Vec::new();
-            for r in [
-                self.antigravity(&a).await,
-                self.gemini_key(&a).await,
-                self.brave(&a).await,
-                self.searxng(&a).await,
-            ]
-            .into_iter()
-            .flatten()
-            {
+            for engine in order(&chosen) {
+                let r = match engine {
+                    "antigravity" => self.antigravity(&a).await,
+                    "gemini" => self.gemini_key(&a).await,
+                    "brave" => self.brave(&a).await,
+                    _ => self.searxng(&a).await,
+                };
                 match r {
-                    Ok(t) => return ToolOutput::text(t),
-                    Err(e) => errors.push(e),
+                    Some(Ok(t)) if errors.is_empty() => return ToolOutput::text(t),
+                    Some(Ok(t)) => {
+                        return ToolOutput::text(format!(
+                            "(answered by {engine}; failed first: {})\n\n{t}",
+                            errors.join("; ")
+                        ));
+                    }
+                    Some(Err(e)) => errors.push(e),
+                    // Not set up: a chosen engine without a login or key still says so.
+                    None if engine == chosen => errors.push(format!("{engine}: not set up")),
+                    None => {}
                 }
             }
             if errors.is_empty() {
@@ -472,6 +500,13 @@ impl Tool for WebSearch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chosen_engine_goes_first() {
+        assert_eq!(order("brave"), ["brave", "antigravity", "gemini", "searxng"]);
+        assert_eq!(order("auto"), ENGINES);
+        assert_eq!(order(""), ENGINES);
+    }
 
     #[test]
     fn markdown_and_grounding() {

@@ -51,6 +51,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `goal.maxTokens` | number | none | Tokens (prompt + output) a goal may spend; then the agent summarises its progress and the goal pauses. |
 | `goal.judge` | string | the observer's model | Checks after each turn whether the goal is met: a `provider/model`, a classifier model (e.g. `typesafe/jev-latest`: calibrated probabilities, met needs 0.8), or `off` (only the agent's `complete` ends it). |
 | `web.native` | bool | false | Use the model's own web search when it has one. |
+| `web.search` | string | auto | `web_search` engine tried first: `auto`, `antigravity`, `gemini`, `brave` or `searxng`; the others stay as fallbacks. Set with `/websearch`. |
 | `web.searxngUrl` | string | unset | SearXNG instance for `web_search`, the last fallback. |
 | `debug.metrics` | bool | false | Per-session timing JSONL in `~/.novacode/metrics/` for `novacode stats`. |
 | `notifications.enabled` | bool | true | OSC 777 notification when a turn ends unwatched or needs you. |
