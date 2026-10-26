@@ -122,10 +122,16 @@ fn lex(src: &str) -> Option<(Vec<Tok>, Vec<String>)> {
                 loop {
                     match *c.get(i)? {
                         '"' => break,
-                        '\\' => {
-                            i += 1;
-                            word.push(*c.get(i)?);
-                        }
+                        // As bash: inside "…" a `\` escapes only `$`, `` ` ``, `"`, `\` and a newline;
+                        // before anything else it stays (`"C:\Users"` keeps its `\`).
+                        '\\' => match *c.get(i + 1)? {
+                            '\n' => i += 1,
+                            n @ ('$' | '`' | '"' | '\\') => {
+                                i += 1;
+                                word.push(n);
+                            }
+                            _ => word.push('\\'),
+                        },
                         '$' if c.get(i + 1) == Some(&'(') => {
                             let (body, end) = paren_body(&c, i + 2)?;
                             subs.push(body.clone());

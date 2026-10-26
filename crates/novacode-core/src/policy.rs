@@ -133,13 +133,14 @@ impl Rule {
     }
 }
 
-/// A Windows rule pattern with `\` separators in globset's `/` form; `\[` and the like stay escapes.
+/// A Windows rule pattern with `\` separators in globset's `/` form. `\[`, `\]`, `\{`, `\}`
+/// stay escapes (names can hold them); `*` and `?` can't be in a name, so `\*` is a separator.
 fn windows_glob(p: &str) -> String {
     let mut out = String::with_capacity(p.len());
     let mut it = p.chars().peekable();
     while let Some(c) = it.next() {
         match (c, it.peek()) {
-            ('\\', Some(n)) if "[]{}*?\\".contains(*n) => {
+            ('\\', Some(n)) if "[]{}".contains(*n) => {
                 out.push(c);
                 out.push(it.next().unwrap_or_default());
             }
