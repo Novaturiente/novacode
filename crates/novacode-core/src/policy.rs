@@ -39,11 +39,33 @@ impl Mode {
     }
 }
 
+/// How much novacode guards on its own (L6.9).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Security {
+    /// Like pi: in auto mode nothing asks; only Catastrophic commands, writes into
+    /// credentials and the user's own rules stop a call. No judge, no sandbox.
+    #[default]
+    Lenient,
+    /// The command judge, the sandbox, and asks for Shared commands and config files.
+    Hardened,
+}
+
+impl Security {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Security::Lenient => "lenient",
+            Security::Hardened => "hardened",
+        }
+    }
+}
+
 /// `permissions` in global settings (never project settings, L0.6).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Permissions {
     pub mode: Mode,
+    pub security: Security,
     pub allow: Vec<String>,
     pub ask: Vec<String>,
     pub deny: Vec<String>,
@@ -257,6 +279,10 @@ pub struct Policy {
     overlay: Mutex<Option<Overlay>>,
     /// Risk-gated commands the user approved for this session, verbatim.
     session_commands: Mutex<HashSet<String>>,
+    /// Programs the user let past the command judge this session (`git push`, L6.9).
+    judged: Mutex<HashSet<String>>,
+    /// Targets of links in the project's top folder at session start: project for the judge (L6.9).
+    links: Vec<PathBuf>,
     /// An activated skill's `allowed-tools` rules and `disallowed-tools` names,
     /// until the next user message (L5.25).
     turn: Mutex<(Vec<Rule>, Vec<String>)>,
@@ -287,6 +313,8 @@ impl Policy {
             session_allow: Mutex::default(),
             overlay: Mutex::default(),
             session_commands: Mutex::default(),
+            judged: Mutex::default(),
+            links: Vec::new(),
             turn: Mutex::default(),
         }
     }
@@ -342,6 +370,15 @@ impl Policy {
         self.perms.mode
     }
 
+    pub fn security(&self) -> Security {
+        self.perms.security
+    }
+
+    /// Auto mode at the lenient level: risky but not catastrophic calls run without asking.
+    fn lenient_auto(&self) -> bool {
+        self.perms.security == Security::Lenient && self.perms.mode == Mode::Auto
+    }
+
     /// The home folder the risk gate resolves `~` against.
     pub fn home(&self) -> &Path {
         &self.home
@@ -387,6 +424,24 @@ impl Policy {
     /// for the session.
     pub fn approved(&self, key: &str) -> bool {
         self.session_commands.lock().unwrap().contains(key)
+    }
+
+    /// The user let `key` (a program and its first word) past the judge this session.
+    pub fn judged_ok(&self, key: &str) -> bool {
+        self.judged.lock().unwrap().contains(key)
+    }
+
+    pub fn approve_judged(&self, keys: Vec<String>) {
+        self.judged.lock().unwrap().extend(keys);
+    }
+
+    pub fn with_links(mut self, links: Vec<PathBuf>) -> Self {
+        self.links = links;
+        self
+    }
+
+    pub fn links(&self) -> &[PathBuf] {
+        &self.links
     }
 
     /// The mode a child agent starts with: read-only while a read-only preset
@@ -550,6 +605,10 @@ impl Policy {
                 Level::Confirm if self.perms.mode == Mode::Auto => {
                     tracing::info!(command, reason = %r.reason, "risky command run in auto mode");
                 }
+                // Lenient (L6.9): Shared runs too, logged.
+                Level::Shared if self.lenient_auto() => {
+                    tracing::info!(command, reason = %r.reason, "shared-risk command run at the lenient level");
+                }
                 Level::Confirm | Level::Shared => {
                     if interactive {
                         // The user already approved this exact command; don't ask twice.
@@ -686,8 +745,8 @@ impl Policy {
         }
 
         // novacode's settings hold the permission rules: a file tool changes them only with the user's yes,
-        // ahead of any allow rule (the agent mustn't widen its own permissions).
-        if MUTATING.contains(&lower.as_str()) {
+        // ahead of any allow rule (the agent mustn't widen its own permissions). Hardened only (L6.9).
+        if MUTATING.contains(&lower.as_str()) && !self.lenient_auto() {
             use crate::risk::{fold, same, under};
             let name = |s: &str| fold(Path::new(s)).into_owned();
             let is_settings = |q: &Path| {
@@ -1004,7 +1063,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn policy(v: Value) -> Policy {
+    /// Hardened unless `v` names a level: most tests cover what hardened adds.
+    fn policy(mut v: Value) -> Policy {
+        if v.get("security").is_none() {
+            v["security"] = json!("hardened");
+        }
         Policy::new(serde_json::from_value(v).unwrap(), "/home/u".into(), None)
     }
     fn bash(c: &str) -> Value {
@@ -1016,6 +1079,75 @@ mod tests {
     }
     fn denied(v: &Verdict) -> bool {
         matches!(v, Verdict::Deny(_))
+    }
+
+    #[test]
+    fn lenient_asks_nothing_but_keeps_the_floor() {
+        let p = policy(json!({ "security": "lenient" }));
+        assert_eq!(p.security(), Security::Lenient);
+        // Shared and config writes run, attended or not.
+        for interactive in [true, false] {
+            assert_eq!(
+                check(&p, "bash", bash("git push --force origin main"), interactive),
+                Verdict::Allow
+            );
+            assert_eq!(
+                check(&p, "bash", bash("python3 -c 'open(\"~/.ssh/id_rsa\")'"), interactive),
+                Verdict::Allow
+            );
+            for path in [
+                "/home/u/.novacode/settings.json",
+                "/home/u/.bashrc",
+                "/home/u/.novacode/skills/x/SKILL.md",
+            ] {
+                assert_eq!(
+                    check(&p, "write", json!({ "path": path }), interactive),
+                    Verdict::Allow,
+                    "{path}"
+                );
+            }
+        }
+        // The floor: Catastrophic commands, writes into credentials and novacode's logins, the user's rules.
+        assert!(denied(&check(&p, "bash", bash("rm -rf ~"), true)));
+        assert!(denied(&check(
+            &p,
+            "bash",
+            bash("echo k >> ~/.ssh/authorized_keys"),
+            true
+        )));
+        assert!(denied(&check(
+            &p,
+            "write",
+            json!({ "path": "/home/u/.ssh/config" }),
+            true
+        )));
+        assert!(denied(&check(
+            &p,
+            "write",
+            json!({ "path": "/home/u/.novacode/auth.json" }),
+            true
+        )));
+        let rules = policy(json!({ "security": "lenient", "ask": ["Bash(git push:*)"], "deny": ["Bash(curl:*)"] }));
+        assert!(matches!(
+            check(&rules, "bash", bash("git push"), true),
+            Verdict::Ask { .. }
+        ));
+        assert!(denied(&check(&rules, "bash", bash("curl x"), true)));
+        // Ask mode still asks at the lenient level.
+        let ask = policy(json!({ "security": "lenient" })).with_mode(Mode::Ask);
+        assert!(matches!(
+            check(&ask, "bash", bash("git push --force"), true),
+            Verdict::Ask { risky: true, .. }
+        ));
+        assert!(matches!(
+            check(
+                &ask,
+                "write",
+                json!({ "path": "/home/u/.novacode/settings.json" }),
+                true
+            ),
+            Verdict::Ask { risky: true, .. }
+        ));
     }
 
     #[test]
@@ -1420,7 +1552,7 @@ mod tests {
         std::fs::create_dir_all(&proj).unwrap();
         std::os::unix::fs::symlink(home.join(".ssh"), proj.join("keys")).unwrap();
         let p = Policy::new(
-            serde_json::from_value(json!({ "allow": ["Write", "Edit"] })).unwrap(),
+            serde_json::from_value(json!({ "allow": ["Write", "Edit"], "security": "hardened" })).unwrap(),
             home.clone(),
             None,
         );
@@ -1584,7 +1716,7 @@ mod tests {
         let home = PathBuf::from(std::env::var_os("NOVACODE_TEST_HOME").unwrap());
         let zdot = std::env::var_os("ZDOTDIR").map(PathBuf::from);
         let p = Policy::new(
-            serde_json::from_value(json!({ "allow": ["Write"] })).unwrap(),
+            serde_json::from_value(json!({ "allow": ["Write"], "security": "hardened" })).unwrap(),
             home.clone(),
             None,
         );

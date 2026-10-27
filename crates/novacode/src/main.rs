@@ -9,7 +9,7 @@ use novacode_ai::trace::Trace;
 use novacode_base::redact::Redactor;
 use novacode_base::{logging, new_id, paths::Paths, settings, settings::Settings};
 use novacode_core::agent::{self, Agent, Config};
-use novacode_core::policy::{Approver, Mode, Permissions, Policy};
+use novacode_core::policy::{Approver, Mode, Permissions, Policy, Security};
 use novacode_core::resources;
 use novacode_core::session::{self, Store};
 use novacode_core::trust::{self, TrustStore};
@@ -335,23 +335,35 @@ fn parse_mode(s: &str) -> Result<Mode, String> {
     serde_json::from_value(serde_json::Value::from(s)).map_err(|_| format!("`{s}`: use auto, ask or read-only"))
 }
 
-/// `sandbox.mode` (L6.5); a bad value is reported by `doctor` and means the default.
-fn sandbox_mode(s: &Settings) -> sbx::Mode {
+/// `sandbox.mode` (L6.5); a bad value is reported by `doctor` and means the default:
+/// `off` at the lenient level, `auto` when hardened (L6.9).
+fn sandbox_mode(s: &Settings, security: Security) -> sbx::Mode {
     s.get::<String>("sandbox.mode")
         .and_then(|m| sbx::Mode::parse(&m))
-        .unwrap_or_default()
+        .unwrap_or(match security {
+            Security::Lenient => sbx::Mode::Off,
+            Security::Hardened => sbx::Mode::Auto,
+        })
 }
 
 /// The sandbox of a session in `cwd` (L6.5): its project folders, the settings'
-/// extra places and the user's protected paths.
-fn session_sandbox(s: &Settings, cwd: &Path, novacode_home: &Path, protected: &[String]) -> Arc<Sandbox> {
+/// extra places, the folders linked into the project at start (L6.9) and the
+/// user's protected paths.
+fn session_sandbox(
+    s: &Settings,
+    cwd: &Path,
+    novacode_home: &Path,
+    perms: &Permissions,
+    links: &[std::path::PathBuf],
+) -> Arc<Sandbox> {
     // Host git pin (L6.5): the project's common git dir, resolved before any model command runs.
     novacode_base::git::pin_repo(cwd);
-    let mode = sandbox_mode(s);
-    let mut deny_read = protected.to_vec();
+    let mode = sandbox_mode(s, perms.security);
+    let mut deny_read = perms.protected.paths.clone();
     deny_read.extend(s.get::<Vec<String>>("sandbox.denyRead").unwrap_or_default());
     // Download caches of a relocated CARGO_HOME / GOPATH; their binaries and config stay read-only.
     let mut allow_write: Vec<String> = s.get("sandbox.allowWrite").unwrap_or_default();
+    allow_write.extend(links.iter().map(|l| l.to_string_lossy().into_owned()));
     allow_write.extend(relocated_caches(
         std::env::var_os("CARGO_HOME").as_deref(),
         std::env::var_os("GOPATH").as_deref(),
@@ -646,8 +658,8 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
                     }
                 }
                 let perms: Permissions = settings.get("permissions").unwrap_or_default();
-                let sb = session_sandbox(&settings, &cwd, paths.home(), &perms.protected.paths);
-                return Ok(doctor::doctor(&p, &settings, &sb, problems, shadowed).await);
+                let sb = session_sandbox(&settings, &cwd, paths.home(), &perms, &[]);
+                return Ok(doctor::doctor(&p, &settings, &sb, perms.security, problems, shadowed).await);
             }
             return Ok(doctor::auth_status(&p));
         }
@@ -1242,13 +1254,15 @@ impl Ctx {
         diag::mark("connect provider");
         let s = &self.settings;
         let perms: Permissions = s.get("permissions").unwrap_or_default();
-        let judge_spec = perms.judge.clone();
-        let sandbox = session_sandbox(s, &self.cwd, self.paths.home(), &perms.protected.paths);
-        let mut policy = Policy::new(
-            perms,
-            novacode_base::platform::home().unwrap_or_default(),
-            Some(self.paths.settings()),
-        );
+        // Lenient (L6.9): no judge.
+        let judge_spec = match perms.security {
+            Security::Lenient => Some("off".to_string()),
+            Security::Hardened => perms.judge.clone(),
+        };
+        let home = novacode_base::platform::home().unwrap_or_default();
+        let links = novacode_core::judge::start_links(&self.cwd, &home, &perms.protected.paths);
+        let sandbox = session_sandbox(s, &self.cwd, self.paths.home(), &perms, &links);
+        let mut policy = Policy::new(perms, home, Some(self.paths.settings())).with_links(links);
         if let Some(m) = self.cli.mode {
             policy = policy.with_mode(m);
         }

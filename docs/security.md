@@ -1,10 +1,38 @@
 # Security
 
-This page explains what novacode does and does not protect you from: permission modes, the command risk gate, the sandbox, permission rules, project trust, and how secrets are handled.
+This page explains what novacode does and does not protect you from: security levels, permission modes, the command risk gate, the sandbox, permission rules, project trust, and how secrets are handled.
+
+## Security levels
+
+novacode has two levels. Set the level in `~/.novacode/settings.json` (global only, so a project can't change it):
+
+```json
+{
+  "permissions": { "security": "hardened" }
+}
+```
+
+| | `lenient` (default) | `hardened` |
+|---|---|---|
+| Catastrophic commands | refused | refused |
+| File writes into credentials | refused | refused |
+| Your `deny`/`ask` rules, protected paths | apply | apply |
+| Shared commands (auto mode) | run, logged | ask you |
+| Config file writes (auto mode) | run | ask you |
+| [Command judge](#command-judge) | off | on |
+| [Sandbox](#sandbox) | off | on where available |
+
+- **`lenient`** works like pi: in `auto` mode nothing asks. It still refuses what can't be undone: the Catastrophic commands of the [risk gate](#the-command-risk-gate) (`rm -rf ~`, writes into `~/.ssh`, disk wipes), and file-tool writes into credential folders and novacode's logins. **It does not stop a command from reading your secrets and sending them out.** Text in a file or web page can steer the model into doing that (prompt injection). Use `hardened`, or a container or VM, when the agent reads content you don't trust.
+- **`hardened`** adds the command judge, the sandbox (bubblewrap on Linux; none on macOS and Windows yet), and asks for Shared commands and for changes to novacode settings, global extensions, skills and shell startup files.
+- An explicit `sandbox.mode` always wins, at either level.
+- `ask`, `read-only` and plan mode work the same at both levels.
+- `novacode doctor` shows the level under `security`.
+
+The rest of this page describes `hardened` where the two differ.
 
 ## The threat model
 
-Commands the agent runs with `bash` run as you. On Linux with bubblewrap installed, they run in a [sandbox](#sandbox): they can read your files but write only in the project and a few other places, they can't reach desktop services or Docker, and your credentials and secret environment variables are hidden. Without bubblewrap (and on macOS and Windows) they run with your files, your network and your credentials. The protections below are guard rails that catch mistakes. They are not a wall against a determined attacker or a hostile model.
+Commands the agent runs with `bash` run as you. At the `hardened` level on Linux with bubblewrap installed, they run in a [sandbox](#sandbox): they can read your files but write only in the project and a few other places, they can't reach desktop services or Docker, and your credentials and secret environment variables are hidden. Without bubblewrap (and on macOS and Windows) they run with your files, your network and your credentials. The protections below are guard rails that catch mistakes. They are not a wall against a determined attacker or a hostile model.
 
 If you need real isolation, run novacode inside a container or VM.
 
@@ -12,8 +40,8 @@ What the guard rails do:
 
 - A permission policy checks every tool call before it runs (including calls made from `codemode` scripts).
 - A command risk gate looks at each `bash` command and holds or refuses destructive ones.
-- In `auto` mode, a [command judge](#command-judge) (a small model) checks risky commands, and file writes outside the project, against what you asked for. When it blocks one, you get an approval card.
-- On Linux with bubblewrap, commands run in a [sandbox](#sandbox).
+- In `auto` mode at the `hardened` level, a [command judge](#command-judge) (a small model) checks risky commands, and file writes outside the project, against what you asked for. When it blocks one, you get an approval card.
+- At the `hardened` level on Linux with bubblewrap, commands run in a [sandbox](#sandbox).
 - Project config that can run code only loads from folders you trust.
 - Your own logins are masked in tool output before the model sees it.
 
@@ -81,7 +109,7 @@ How the gate reads a command:
 What each level does depends on the mode:
 
 - **Catastrophic**: refused in every mode. The model is told to do it another way or ask you to run it yourself.
-- **Shared**: asks you, even in `auto` mode; refused in `read-only` mode. Without anyone to ask, it needs a `justification`.
+- **Shared**: `hardened`: asks you, even in `auto` mode; without anyone to ask, it needs a `justification`. `lenient`: runs in `auto` mode (logged) and asks in `ask` mode. Refused in `read-only` mode at both levels.
 - **Confirm**: asks you in `ask` mode. In `auto` mode it runs without asking (it is logged). In `read-only` mode (and plan mode) it is refused without asking: read-only means no changes.
 - **Safe / Low**: no gate action.
 
@@ -100,7 +128,7 @@ You can add folders to the protected set and ban commands outright:
 
 A protected command never runs. It matches the command name (so `/usr/bin/sudo` too) and any other word of the command (so `env sudo ls`). Protected paths are treated like credentials: destroying or overwriting them is Catastrophic.
 
-The file tools follow the same list. `write`, `edit` and `apply_patch` are refused, in every mode and past any `allow` rule, when the file is in a credential folder, a protected path, or is your home or a system folder itself. `~/.novacode` is the exception: there the file tools refuse only your logins and trust decisions (`auth.json`, `auth-*.json`, `mcp-auth.json`, `trust.json`), so the agent can still edit `~/.novacode/AGENTS.md`. A change to `settings.json` (in `~/.novacode` or a project's `.novacode`) always asks you first, past any `allow` rule, because it holds the permission rules; with nobody to ask it is refused. The same goes for config that can run commands: anything under `~/.novacode/extensions`, `skills`, `agents`, `prompts` or `packages`, and `~/.novacode/mcp.json` (a skill can carry hooks and `allowed-tools`); the Claude-compatible `~/.claude/skills`, `~/.claude/agents`, `~/.claude/commands`, `~/.claude/settings.json` and `~/.agents/skills`; and the shell startup files `~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.zshrc`, `~/.zprofile`, `~/.zshenv`, `~/.zlogin`, `~/.zlogout`, `~/.bash_login`, `~/.bash_logout`, `~/.config/fish/config.fish`, and anything under `~/.config/fish/conf.d`, `~/.config/zsh` or `$ZDOTDIR`. `$ZDOTDIR` is read when the file tool runs; when it is your home folder, only the startup files listed above ask. You can still let the agent edit them; it asks first each time. This ask covers the file tools only. Shell commands treat the whole `~/.novacode` folder as credentials, so a redirect or `cp` onto `~/.novacode/settings.json` is refused, but `sed -i`, `tee` or an interpreter editing it runs with no ask in `auto` mode. A project's `.novacode/settings.json` is not protected from shell commands at all. The path is checked as given and with symlinks resolved, so a project link into `~/.ssh` is refused too. Reads are not affected. Path rules such as `Read(...)` also match the resolved path. A `deny` or `ask` rule matches when either path does. An `allow` rule needs both: a link inside an allowed folder that points outside it is not auto-allowed, and the approval card says where the link resolves to.
+The file tools follow the same list. `write`, `edit` and `apply_patch` are refused, in every mode and past any `allow` rule, when the file is in a credential folder, a protected path, or is your home or a system folder itself. `~/.novacode` is the exception: there the file tools refuse only your logins and trust decisions (`auth.json`, `auth-*.json`, `mcp-auth.json`, `trust.json`), so the agent can still edit `~/.novacode/AGENTS.md`. At the `hardened` level (and in `ask` mode), a change to `settings.json` (in `~/.novacode` or a project's `.novacode`) always asks you first, past any `allow` rule, because it holds the permission rules; with nobody to ask it is refused. The same goes for config that can run commands: anything under `~/.novacode/extensions`, `skills`, `agents`, `prompts` or `packages`, and `~/.novacode/mcp.json` (a skill can carry hooks and `allowed-tools`); the Claude-compatible `~/.claude/skills`, `~/.claude/agents`, `~/.claude/commands`, `~/.claude/settings.json` and `~/.agents/skills`; and the shell startup files `~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.zshrc`, `~/.zprofile`, `~/.zshenv`, `~/.zlogin`, `~/.zlogout`, `~/.bash_login`, `~/.bash_logout`, `~/.config/fish/config.fish`, and anything under `~/.config/fish/conf.d`, `~/.config/zsh` or `$ZDOTDIR`. `$ZDOTDIR` is read when the file tool runs; when it is your home folder, only the startup files listed above ask. You can still let the agent edit them; it asks first each time. This ask covers the file tools only. Shell commands treat the whole `~/.novacode` folder as credentials, so a redirect or `cp` onto `~/.novacode/settings.json` is refused, but `sed -i`, `tee` or an interpreter editing it runs with no ask in `auto` mode. A project's `.novacode/settings.json` is not protected from shell commands at all. The path is checked as given and with symlinks resolved, so a project link into `~/.ssh` is refused too. Reads are not affected. Path rules such as `Read(...)` also match the resolved path. A `deny` or `ask` rule matches when either path does. An `allow` rule needs both: a link inside an allowed folder that points outside it is not auto-allowed, and the approval card says where the link resolves to.
 
 When a tool writes a file, it writes through a symlink to its target (the link stays a link), keeps the file's mode, and never creates or deletes a `<file>.bak` next to it: a `.bak` file of your own is left alone.
 
@@ -110,7 +138,7 @@ In print mode (`-p`) and other runs with no one to answer a question, a held com
 
 ## Command judge
 
-The risk gate reads command text. It can't tell whether a `curl` or a `git push` is what you asked for. In `auto` mode a small model, the **command judge**, checks the risky commands the gate lets through.
+The risk gate reads command text. It can't tell whether a `curl` or a `git push` is what you asked for. In `auto` mode at the `hardened` level, a small model, the **command judge**, checks the risky commands the gate lets through. At the `lenient` level it is off.
 
 It looks at `bash` commands, `process` starts, and file changes outside the project. Commands are judged when they:
 
@@ -122,13 +150,13 @@ It looks at `bash` commands, `process` starts, and file changes outside the proj
 - are a `process` start whose `cwd` is outside the project and `/tmp`;
 - run with `unsandboxed: true`.
 
-A `write`, `edit` or `apply_patch` call is judged when the file it writes, as given or with symlinks resolved, is outside the project and `/tmp`. The judge sees the tool, the path and the first 1000 characters of what it writes. A block works as for commands; `a` on its card allows that tool on that path for the session. An `allow` rule that covers the path (such as `Write(/srv/**)`) skips the judge.
+A `write`, `edit` or `apply_patch` call is judged when the file it writes, as given or with symlinks resolved, is outside the project and `/tmp`. A folder linked from the project's top folder counts as project when the link existed at session start, git doesn't track it (so a cloned repository can't ship one), and it points into your home but not into a dot folder there (`~/.config`, `~/.ssh`, …) or a protected path. Such folders are writable in the sandbox too. The judge sees the tool, the path and the first 1000 characters of what it writes. A block works as for commands; `a` on its card allows that tool on that path for the session. An `allow` rule that covers the path (such as `Write(/srv/**)`) skips the judge.
 
 It sees through wrappers, runners, `sh -c`, `$(...)`, `trap` scripts and shell keywords (`coproc` too) the same way the gate does. A runner's options are read only before the command it runs, so `flock /tmp/l curl -c jar` runs `curl`. Builds, tests and read-only commands never go to it. Nor does a command your own `allow` rules or this session's approvals cover. An `allow` rule must cover every command inside the line too: `Bash(git push:*)` does not cover `git push $(curl x)`. In `ask` and `read-only` mode it is off: you already decide there. An `unsandboxed: true` call asks you in `ask` mode, even for a read-only command, and is refused in `read-only` and plan mode, because outside the sandbox even `cat` can read what the sandbox hides.
 
-The judge sees your messages of this session and the agent's recent tool calls (name and arguments, without the agent's `intent` and `justification`). The command (or the file path and content) is given as a quoted JSON string. It never sees the agent's replies or any tool output, so neither the agent nor text in a file can talk it round. In a subagent, the "user" messages it sees are the task the parent agent wrote, not your own words. It answers `ALLOW` or `BLOCK` with a reason, in any case and with or without markdown around it.
+The judge sees your messages of this session, your answers to the agent's `ask_user` questions, and the agent's recent tool calls (name and arguments, without the agent's `intent` and `justification`). The command (or the file path and content) is given as a quoted JSON string. It never sees the agent's replies or any tool output, so neither the agent nor text in a file can talk it round. In a subagent, the "user" messages it sees are the task the parent agent wrote, not your own words. It answers `ALLOW` or `BLOCK` with a reason, in any case and with or without markdown around it.
 
-- **Block, with you there:** an approval card shows the judge's reason. `y` runs it; `a` allows that exact command for the session.
+- **Block, with you there:** an approval card shows the judge's reason. `y` runs it; `a` allows that exact command for the session. When only network parts made it judged, `a` also lets each such program and its first word past the judge for the session: after `a` on `git add -A && git push origin main`, every `git push` (and a `cd x && git push`) runs without the judge; after `a` on `ssh novahome ls`, so does every `ssh novahome …`. The risk gate still checks them first.
 - **Block, nobody there** (print mode): the command is refused, and the model is told why.
 - **An answer that is neither ALLOW nor BLOCK, or empty:** counts as a block ("the judge gave no clear answer").
 - **A command over 4000 characters:** blocked without asking the model ("too long to judge").
@@ -138,7 +166,7 @@ Esc while it thinks cancels the call. Pick its model with `permissions.judge`: u
 
 ## Sandbox
 
-On Linux, the commands the model runs (the `bash` tool and `process` starts) run inside [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`). Install it with your package manager (`bubblewrap`). It adds about 10 ms per command.
+At the `hardened` level on Linux, the commands the model runs (the `bash` tool and `process` starts) run inside [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`). Install it with your package manager (`bubblewrap`). It adds about 10 ms per command.
 
 Inside the sandbox:
 
@@ -178,11 +206,11 @@ When a sandboxed command fails with `Read-only file system`, the result adds one
 
 | Key | Meaning |
 |---|---|
-| `sandbox.mode` | `auto` (default), `on` or `off`. |
+| `sandbox.mode` | `auto`, `on` or `off`. Default: `auto` at the `hardened` level, `off` at `lenient`. |
 | `sandbox.allowWrite` | More writable folders. |
 | `sandbox.denyRead` | More hidden files and folders. |
 
-With `auto`, novacode checks once whether bubblewrap works. If it doesn't, it logs one warning and commands run unsandboxed. With `on`, commands are refused instead (except `unsandboxed: true` ones). `novacode doctor` shows the state under `sandbox`: `on (bubblewrap)`, `off (setting)`, `unavailable (bwrap not found), commands run unsandboxed`, or `unavailable (<path> is a symlink), …` for the symlink case above. With `on` and the sandbox unavailable, `novacode doctor` exits with code 1.
+With `auto`, novacode checks once whether bubblewrap works. If it doesn't, it logs one warning and commands run unsandboxed. With `on`, commands are refused instead (except `unsandboxed: true` ones). `novacode doctor` shows the state under `sandbox`: `on (bubblewrap)`, ``off (`sandbox.mode`, or the lenient level)``, `unavailable (bwrap not found), commands run unsandboxed`, or `unavailable (<path> is a symlink), …` for the symlink case above. With `on` and the sandbox unavailable, `novacode doctor` exits with code 1.
 
 ## Approval dialogs
 

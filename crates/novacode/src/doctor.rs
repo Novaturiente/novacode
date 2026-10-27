@@ -78,6 +78,7 @@ pub async fn doctor(
     p: &Arc<Providers>,
     settings: &Settings,
     sandbox: &Sandbox,
+    security: novacode_core::policy::Security,
     key_problems: Vec<String>,
     shadowed: Vec<String>,
 ) -> ExitCode {
@@ -145,6 +146,8 @@ pub async fn doctor(
     for s in shadowed {
         println!("  · {s}");
     }
+    println!("security");
+    println!("  {}", security_line(security));
     println!("sandbox");
     let mode = sandbox.mode();
     match sandbox_line(mode, mode != Mode::Off && sandbox.available(), sandbox.symlink()) {
@@ -157,17 +160,28 @@ pub async fn doctor(
     if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }
 
+/// The doctor's line under `security` (L6.9). Not a failure either way.
+fn security_line(s: novacode_core::policy::Security) -> &'static str {
+    match s {
+        novacode_core::policy::Security::Lenient => {
+            "- lenient (default): no command judge, no sandbox, nothing asks in auto mode; only catastrophic commands, writes into credentials and your rules are stopped. Commands can read your secrets and send them out. Set \"permissions\": {\"security\": \"hardened\"} for the judge and the sandbox."
+        }
+        novacode_core::policy::Security::Hardened => {
+            "✓ hardened: command judge, sandbox (where available), asks for shared and config changes"
+        }
+    }
+}
+
 /// The doctor's sandbox line (L6.5), under the `sandbox` heading: (fine, text).
 /// `symlink`: a protected path that is a symlink, which makes it unavailable.
 fn sandbox_line(mode: Mode, works: bool, symlink: Option<&Path>) -> (bool, String) {
     let why = match symlink {
         Some(p) => format!("{} is a symlink", p.display()),
         None if cfg!(windows) => "no sandbox on Windows".into(),
-        None if cfg!(windows) => "no sandbox on Windows".into(),
         None => "bwrap not found".into(),
     };
     match (mode, works) {
-        (Mode::Off, _) => (false, "off (setting)".into()),
+        (Mode::Off, _) => (false, "off (`sandbox.mode`, or the lenient level)".into()),
         (_, true) => (true, "on (bubblewrap)".into()),
         (Mode::Auto, false) => (false, format!("unavailable ({why}), commands run unsandboxed")),
         (Mode::On, false) => (
@@ -204,7 +218,10 @@ mod tests {
         use std::path::Path;
         let line = |m, w, s: Option<&str>| super::sandbox_line(m, w, s.map(Path::new));
         assert_eq!(line(Mode::Auto, true, None), (true, "on (bubblewrap)".into()));
-        assert_eq!(line(Mode::Off, true, None), (false, "off (setting)".into()));
+        assert_eq!(
+            line(Mode::Off, true, None),
+            (false, "off (`sandbox.mode`, or the lenient level)".into())
+        );
         assert_eq!(
             line(Mode::Auto, false, None).1,
             if cfg!(windows) {

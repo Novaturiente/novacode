@@ -44,7 +44,7 @@ The full walk-through and a list of every flag and subcommand are in [docs/quick
 |---|---|
 | **Models** | Subscription logins and API keys, several accounts per provider that rotate when one runs out, custom OpenAI-compatible endpoints and local models, custom providers as a program you write. |
 | **Tools** | Read, write, edit (a patch tool for some models), bash, grep, find, a background process manager, web search and fetch, todos, questions to you, and a JavaScript tool (codemode) that chains many tool calls in one step. |
-| **Safety** | Permission modes (auto, ask, read-only), a command risk check that asks before force pushes and refuses catastrophic commands, allow/ask/deny rules, project trust, optional secret masking. |
+| **Safety** | Lenient by default, like pi: nothing asks, but catastrophic commands (`rm -rf ~`, writes into `~/.ssh`) are refused. A `hardened` level adds a command judge, a sandbox on Linux and asks before force pushes. Permission modes (auto, ask, read-only), allow/ask/deny rules, project trust, optional secret masking. |
 | **Sessions** | Every session is a tree: resume, branch, fork, rewind the conversation and your files, export to JSONL or HTML. Sessions can run in the background and be attached from another terminal. |
 | **Context** | `AGENTS.md`/`CLAUDE.md` files, Agent Skills, prompt templates, notes-based compaction, and memory that carries across sessions. |
 | **Subagents** | Background helper sessions (scout, worker, reviewer, or your own) that see only the tools they're given, plus plan mode and `/goal` (keep working until an auditor agrees it's done). |

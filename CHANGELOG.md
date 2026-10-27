@@ -2,6 +2,13 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [Unreleased]
+
+### Changed
+
+- **Lenient by default.** New setting `permissions.security`: `lenient` (the new default) or `hardened` (how 0.6.0 behaved). At `lenient`, `auto` mode asks nothing: no command judge, no sandbox (unless `sandbox.mode` is set), and Shared commands and config-file writes run, logged. Catastrophic commands, file writes into credentials, and your own rules still stop. To keep the old behaviour, set `"permissions": {"security": "hardened"}`. `novacode doctor` shows the level. See [security levels](docs/security.md#security-levels).
+- **Hardened is less noisy.** The command judge sees your `ask_user` answers. An `a` on a judge card for a network command (`git push`, `ssh host …`) also lets that program and its first word past the judge for the rest of the session. A folder linked from the project's top folder at session start (untracked by git, inside your home, not a dot folder) counts as project for the judge and is writable in the sandbox.
+
 ## [0.6.0] - 2026-10-27
 
 ### Added

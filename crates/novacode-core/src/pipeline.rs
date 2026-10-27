@@ -153,6 +153,7 @@ pub async fn authorize_cancellable(
 ) -> Option<ToolOutput> {
     use crate::judge::Decision;
     use crate::policy::{Approval, ApprovalRequest, Verdict};
+    let mut sticky = Vec::new();
     let (reason, rule, risky) = match policy.check_tool(tool, read_only, args, cwd, approver.is_some(), hook) {
         Verdict::Allow => {
             let judge = judge?;
@@ -166,7 +167,11 @@ pub async fn authorize_cancellable(
                     )));
                 }
                 // Risky: no "always"; a yes is remembered for this exact command (or file and tool).
-                Decision::Block(reason) => (format!("the command judge: {reason}"), subject.key(), true),
+                // A session yes also lets the same programs past the judge (`git push`, L6.9).
+                Decision::Block(reason) => {
+                    sticky = crate::judge::approves(policy, tool, args, cwd);
+                    (format!("the command judge: {reason}"), subject.key(), true)
+                }
             }
         }
         Verdict::Deny(why) => return Some(ToolOutput::error(why)),
@@ -190,6 +195,9 @@ pub async fn authorize_cancellable(
         a = approver.approve(req.clone()) => a,
     };
     policy.record(&req, &answer);
+    if matches!(answer, Approval::Session | Approval::Always) {
+        policy.approve_judged(sticky);
+    }
     match answer {
         Approval::Deny(why) => Some(ToolOutput::error(match why {
             Some(w) if !w.trim().is_empty() => format!("The user declined this call: {w}"),
@@ -283,6 +291,8 @@ mod tests {
         }
 
         fn policy(v: Value) -> Policy {
+            let mut v = v;
+            v["security"] = json!("hardened");
             Policy::new(serde_json::from_value(v).unwrap(), "/h".into(), None)
         }
 
@@ -453,10 +463,14 @@ mod tests {
             assert_eq!(req.reason, "the command judge: pushes to a remote");
             // The yes is remembered for this exact command: no second judge call.
             assert!(p.user_allowed("git push"));
+            // And it covers other pushes this session (L6.9): no judge, no card.
+            let (j, faux) = judge("BLOCK: never asked");
+            assert!(auth(&p, None, &j, "git push other").await.is_none());
+            assert!(faux.requests.lock().unwrap().is_empty());
 
-            let (j, _) = judge("BLOCK: deletes a remote");
+            let (j, _) = judge("BLOCK: publishes");
             let no = Arc::new(Cards(Approval::Deny(None), Mutex::default()));
-            let out = auth(&p, Some(&no), &j, "git push other").await.unwrap();
+            let out = auth(&p, Some(&no), &j, "cargo publish").await.unwrap();
             assert!(text(&out).contains("The user declined this call."));
         }
 

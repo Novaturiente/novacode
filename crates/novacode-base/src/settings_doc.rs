@@ -61,8 +61,8 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
     (
         "permissions",
         "object",
-        "auto mode",
-        "Global only. `mode` auto|ask|read-only; `allow`/`ask`/`deny` lists of rules like `Bash(git push:*)`; `protected: {commands, paths}`; `profiles.<name>.{tools, deny}`, named tool sets; `judge`: the command judge's model in auto mode, `off` or a `provider/model[:level]` (default the observer's model). See docs/security.md.",
+        "auto mode, lenient",
+        "Global only. `security` lenient|hardened: hardened adds the command judge, the sandbox and asks for shared commands and config changes (docs/security.md#security-levels); `mode` auto|ask|read-only; `allow`/`ask`/`deny` lists of rules like `Bash(git push:*)`; `protected: {commands, paths}`; `profiles.<name>.{tools, deny}`, named tool sets; `judge`: the command judge's model in auto mode at the hardened level, `off` or a `provider/model[:level]` (default the observer's model). See docs/security.md.",
     ),
     (
         "tools.<name>.exposure",
@@ -115,7 +115,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
     (
         "sandbox.mode",
         "string",
-        "`auto`",
+        "`auto` if hardened, else `off`",
         "Global only. Run the model's `bash` commands and `process` starts in a bubblewrap sandbox: `auto` (when bwrap works; otherwise one warning, then unsandboxed), `on` (refuse commands when it can't sandbox) or `off`. See docs/security.md.",
     ),
     (
