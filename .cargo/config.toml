@@ -1,0 +1,4 @@
+# L11.14: link the C runtime statically on Windows. Without it novacode.exe needs
+# VCRUNTIME140.dll, which a stock Windows lacks (exit 0xC0000135 at start).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
