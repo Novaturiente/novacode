@@ -269,6 +269,13 @@ novacode --bg "run the full test suite and fix what breaks"
 
 The id is printed to stdout; the other lines go to stderr. The session runs in its own process group, so closing your terminal doesn't stop it. `--bg` with no prompt starts an idle session you can attach to. Other flags such as `-m` and `--mode` apply to it too.
 
+On Windows, PowerShell can't take the id directly: `$id = novacode --bg …` and `novacode --bg … > id.txt` both wait until the background session ends. Let cmd write the file instead:
+
+```powershell
+cmd /c 'novacode --bg "run the tests" > id.txt'
+$id = Get-Content id.txt
+```
+
 | Command | What it does |
 |---|---|
 | `novacode agents` | List live sessions: id, state (`working`, `blocked` when it waits for an answer, or `idle`), whether it's `bg`, model and folder |
