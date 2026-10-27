@@ -367,6 +367,9 @@ pub(crate) struct Simple {
     pub nested: bool,
     /// Its `VAR=value` words, also those after `env` or `sudo`.
     pub env: Vec<String>,
+    /// Assignments or wrappers (`xargs`, `env`, `timeout`, `sudo`, …) were stripped:
+    /// `words` may not be all it runs with (`xargs` adds stdin's words).
+    pub wrapped: bool,
 }
 
 /// The simple commands of a line for the command judge (L6.8): wrappers (`sudo`,
@@ -545,6 +548,7 @@ fn simple_into(words: &[String], at: &Here, targets: Vec<String>, out: &mut Vec<
                 targets,
                 nested,
                 env: Vec::new(),
+                wrapped: false,
             });
         }
     };
@@ -603,6 +607,7 @@ fn simple_into(words: &[String], at: &Here, targets: Vec<String>, out: &mut Vec<
             targets,
             nested: at.nested,
             env,
+            wrapped: kw.len() != w.len(),
         });
     }
     Some(())

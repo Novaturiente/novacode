@@ -116,7 +116,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "sandbox.mode",
         "string",
         "`auto` if hardened, else credentials only",
-        "Global only. Run the model's `bash` commands and `process` starts in a bubblewrap sandbox: `auto` (when bwrap works; otherwise one warning, then unsandboxed), `on` (refuse commands when it can't sandbox) or `off`. Unset at the lenient level: a credentials-only layer (only credentials and novacode's settings read-only). See docs/security.md.",
+        "Global only. Run the model's `bash` commands and `process` starts in a bubblewrap sandbox: `auto` (when bwrap works; otherwise one warning, then unsandboxed), `on` (refuse commands when it can't sandbox) or `off`. Unset at the lenient level: a credentials-only layer (only credential folders, token files and `~/.novacode` read-only). See docs/security.md.",
     ),
     (
         "sandbox.allowWrite",

@@ -345,18 +345,28 @@ fn sandbox_mode(s: &Settings, security: Security) -> (sbx::Mode, bool) {
     }
 }
 
-/// Global `permissions`. One that doesn't parse fails closed (review a1, finding 7):
-/// hardened, with no rules, rather than the lenient default.
+/// Global `permissions`. One that doesn't parse, or a settings file that was ignored
+/// (a syntax error, unreadable), fails closed: hardened with no rules, rather than the
+/// lenient default (review a1 finding 7, a2 M4).
 fn permissions(s: &Settings) -> Permissions {
+    let hardened = |why: &str| {
+        tracing::warn!("{why}: using the hardened level and no permission rules");
+        Permissions {
+            security: Security::Hardened,
+            ..Default::default()
+        }
+    };
+    if s.diagnostics()
+        .iter()
+        .any(|d| d.message.contains("file ignored") || d.message.starts_with("cannot read"))
+    {
+        return hardened("a settings file was ignored");
+    }
     match s.get::<serde_json::Value>("permissions") {
         None => Permissions::default(),
-        Some(v) => serde_json::from_value(v).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "`permissions` doesn't parse: using the hardened level and no rules");
-            Permissions {
-                security: Security::Hardened,
-                ..Default::default()
-            }
-        }),
+        Some(v) => {
+            serde_json::from_value(v).unwrap_or_else(|e| hardened(&format!("`permissions` doesn't parse ({e})")))
+        }
     }
 }
 
@@ -3331,6 +3341,8 @@ mod tests {
         for bad in [
             r#"{"permissions": {"security": "strict"}}"#,
             r#"{"permissions": {"mode": "yolo"}}"#,
+            r#"{"permissions": {"deny": ["Bash"]},,}"#,
+            "[1]",
         ] {
             assert_eq!(permissions(&load(bad)).security, Security::Hardened, "{bad}");
         }

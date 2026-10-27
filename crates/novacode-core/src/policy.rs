@@ -899,11 +899,11 @@ fn suggest_rule(tool: &str, command: Option<&str>, path: Option<&str>) -> String
     }
 }
 
+/// The [`GLOBAL_CONFIG`] entries that still ask at the lenient level: code that runs with no checks.
+const LENIENT_ASKS: &[&str] = &[".novacode/extensions", ".novacode/packages", ".novacode/mcp.json"];
+
 /// Global config that runs commands: (path under home, a folder, what it is).
 /// File tools ask before writing there (L6.1).
-/// The [`GLOBAL_CONFIG`] entries that still ask at the lenient level: trusted code with no checks.
-const LENIENT_ASKS: &[&str] = &[".novacode/extensions", ".novacode/packages"];
-
 const GLOBAL_CONFIG: &[(&str, bool, &str)] = &[
     (".novacode/extensions", true, "novacode's own extensions"),
     (".novacode/skills", true, "novacode's own skills"),
@@ -1102,6 +1102,7 @@ mod tests {
             "/home/u/.novacode/settings.json",
             "/home/u/.novacode/extensions/x.ts",
             "/home/u/.novacode/packages/p/extensions/x.ts",
+            "/home/u/.novacode/mcp.json",
         ] {
             assert!(
                 matches!(

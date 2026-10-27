@@ -67,9 +67,6 @@ pub struct Config {
     pub light: bool,
 }
 
-/// Under novacode's folder, read-only in the light sandbox: the rules and unchecked code.
-const NOVACODE_LOCKED: &[&str] = &["settings.json", "extensions", "packages"];
-
 /// Download caches under home, writable when they exist (none is created).
 /// Only these: shells and editors source files they keep elsewhere in
 /// `~/.cache`, `~/.bun` and `~/.npm` at start. The rest of `~/.cargo`
@@ -418,24 +415,22 @@ impl Sandbox {
     }
 
     /// The credentials-only layout (L6.9): the existing locked paths, resolved.
-    /// shortcut: a locked path that is a symlink (`~/.ssh -> dotfiles/ssh`) is locked at
-    /// its target, but the link itself can be swapped; refuse such links if that matters.
+    /// The whole novacode folder is locked, a mount point that can't be moved aside, with
+    /// the targets of links in it (`settings.json -> ~/.dotfiles/…`), so files created later
+    /// (`auth-work.json`, `extensions/`) are covered too (review a2, H3, H4, M1, M2, L3).
+    /// shortcut: a credential folder that doesn't exist at start isn't locked, a nested
+    /// token file's parent (`~/.config`) can be renamed, and a credential folder that is a
+    /// symlink can be swapped; this layer catches accidents, not a hostile agent (which also
+    /// has `unsandboxed: true` and D-Bus). The full sandbox (`hardened`) covers those.
     fn credentials_only(c: Config) -> Self {
         let mut cands: Vec<PathBuf> = c.credential_dirs.iter().map(|d| c.home.join(d)).collect();
-        // The whole ~/.novacode stays writable (sessions, memory), except these.
-        cands.retain(|p| *p != c.home.join(".novacode"));
-        cands.extend(
-            NOVACODE_FILES
-                .iter()
-                .chain(NOVACODE_LOCKED)
-                .map(|f| c.novacode_home.join(f)),
-        );
+        cands.push(c.novacode_home.clone());
         if let Ok(rd) = std::fs::read_dir(&c.novacode_home) {
-            cands.extend(rd.flatten().map(|e| e.path()).filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("auth-") && n.ends_with(".json"))
-            }));
+            cands.extend(
+                rd.flatten()
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_symlink()))
+                    .map(|e| e.path()),
+            );
         }
         cands.extend(TOKEN_FILES.iter().map(|f| c.home.join(f)));
         cands.extend(c.deny_read.iter().map(|p| expand(p, &c.home, &c.home)));
@@ -1613,17 +1608,20 @@ mod tests {
         let root = std::fs::canonicalize(d.path()).unwrap();
         let (home, proj) = (root.join("home"), root.join("proj"));
         let nc = home.join(".novacode");
-        for dir in [home.join(".ssh"), nc.join("extensions"), proj.clone()] {
+        for dir in [home.join(".ssh"), home.join("dots"), nc.clone(), proj.clone()] {
             std::fs::create_dir_all(dir).unwrap();
         }
         for f in [
             ".ssh/authorized_keys",
-            ".novacode/settings.json",
+            "dots/settings.json",
             ".novacode/auth.json",
             ".npmrc",
         ] {
             std::fs::write(home.join(f), "keep").unwrap();
         }
+        // A dotfiles setup: the settings file is a link out of ~/.novacode.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(home.join("dots/settings.json"), nc.join("settings.json")).unwrap();
         let sb = Arc::new(Sandbox::new(Config {
             mode: Mode::Auto,
             light: true,
@@ -1634,8 +1632,8 @@ mod tests {
         }));
         let a = sb.args(&proj);
         assert_eq!(a[..3], ["--bind", "/", "/"].map(OsString::from));
-        // ~/.novacode itself stays writable (sessions); only its listed files are locked.
-        assert!(!a.contains(&nc.clone().into_os_string()));
+        // The whole ~/.novacode is locked (it is a credential folder here too).
+        assert!(a.contains(&nc.clone().into_os_string()));
         if !sb.available() {
             eprintln!("note: light_locks_only_credentials skipped, bwrap is not available here");
             return;
@@ -1646,7 +1644,7 @@ mod tests {
         let h = home.display();
         // Writes anywhere else work and locked files can be read.
         let o = sh(format!(
-            "echo x > {h}/free.txt && echo y > {h}/.novacode/session.txt && cat {h}/.ssh/authorized_keys"
+            "echo x > {h}/free.txt && echo y > {h}/dots/other && cat {h}/.ssh/authorized_keys"
         ))
         .await;
         assert!(!o.is_error, "{}", text(&o));
@@ -1655,24 +1653,27 @@ mod tests {
             sb.keeps_env(OsStr::new("GITHUB_TOKEN")),
             "the light layer keeps secrets in the env"
         );
-        assert!(home.join("free.txt").exists() && nc.join("session.txt").exists());
+        assert!(home.join("free.txt").exists() && home.join("dots/other").exists());
         for f in [
             ".ssh/authorized_keys",
             ".ssh/new",
             ".novacode/settings.json",
             ".novacode/auth.json",
+            ".novacode/auth-new.json",
             ".novacode/extensions/x.ts",
             ".npmrc",
         ] {
-            let o = sh(format!("echo bad >> {h}/{f}")).await;
+            let o = sh(format!("mkdir -p \"$(dirname {h}/{f})\" && echo bad >> {h}/{f}")).await;
             let t = text(&o);
             assert!(o.is_error && t.contains("Read-only file system"), "{f}: {t}");
             assert!(t.contains("unsandboxed: true"), "{t}");
         }
         // A locked folder can't be moved aside and replaced.
-        let o = sh(format!("mv {h}/.ssh {h}/.ssh.old")).await;
-        assert!(o.is_error, "{}", text(&o));
-        for f in [".ssh/authorized_keys", ".novacode/settings.json", ".npmrc"] {
+        for dir in [".ssh", ".novacode"] {
+            let o = sh(format!("mv {h}/{dir} {h}/{dir}.old")).await;
+            assert!(o.is_error, "{dir}: {}", text(&o));
+        }
+        for f in [".ssh/authorized_keys", "dots/settings.json", ".npmrc"] {
             assert_eq!(std::fs::read_to_string(home.join(f)).unwrap(), "keep", "{f}");
         }
     }
