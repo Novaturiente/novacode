@@ -9,7 +9,7 @@ This page shows how to install novacode, update it, remove it, and where it keep
 | Linux x86_64 | yes (static, musl) | supported |
 | Linux arm64 | yes (static, musl) | supported |
 | macOS arm64 (Apple silicon) | yes | untested, experimental |
-| Windows x86_64 | yes (.zip) | experimental: tested in CI, not yet by hand |
+| Windows x86_64 | yes (.zip) | experimental: tested in CI and on Windows 11 |
 
 On Windows, novacode runs the model's commands in Git Bash, so [Git for Windows](https://git-scm.com/download/win) must be installed. It finds `bash.exe` through `git` on your `PATH` or the default install folders; set `NOVACODE_BASH` to use another one. There is no command sandbox on Windows: `sandbox.mode` `auto` warns once and runs commands unsandboxed, and the approval policy still applies. WSL also works: novacode runs there as a normal Linux program. Other platforms (for example macOS on Intel) have no prebuilt binary; build from source.
 
@@ -40,7 +40,13 @@ In PowerShell:
 irm https://raw.githubusercontent.com/Novaturiente/novacode/main/scripts/install.ps1 | iex
 ```
 
-The script downloads the `.zip` for `x86_64-pc-windows-msvc`, checks its SHA-256 checksum, puts `novacode.exe` in `%LOCALAPPDATA%\novacode\bin` and adds that folder to your user `PATH` (open a new terminal afterwards). `NOVACODE_BIN_DIR` and `NOVACODE_REPO` work as above.
+The script downloads the `.zip` for `x86_64-pc-windows-msvc`, checks its SHA-256 checksum, puts `novacode.exe` in `%LOCALAPPDATA%\novacode\bin` and adds that folder to your user `PATH` (open a new terminal afterwards). `NOVACODE_BIN_DIR` and `NOVACODE_REPO` work as above; `NOVACODE_VERSION` installs a given tag (for example `v0.6.0`) instead of the latest release. The binary needs nothing else installed except Git for Windows.
+
+What differs on Windows:
+
+- `~` means `%USERPROFILE%` (unless `HOME` is set), so novacode's folder is `%USERPROFILE%\.novacode`.
+- Commands run in Git Bash with no sandbox; the risk gate and permission rules still apply, and they treat `C:\Users\you\.SSH`, `/c/users/you/.ssh` and `\\?\C:\…` spellings of a path alike.
+- `$id = novacode --bg …` in PowerShell waits until the background session ends; see [automation](automation.md#background-sessions---bg) for the way around it.
 
 Check the result:
 
@@ -112,7 +118,7 @@ What happens depends on how you installed:
 
 | Installed with | `novacode update` does |
 |---|---|
-| Install script (release binary) | Downloads the newest release, checks the checksum, and replaces the binary in place. Running sessions keep the old version until you `/restart`. |
+| Install script (release binary) | Downloads the newest release, checks the checksum, and replaces the binary in place (on Windows too, while it runs). Running sessions keep the old version until you `/restart`. |
 | `novacode-bin` or any release binary in a folder under `/usr` (even `/usr/local/bin`) | Does nothing. It says the file belongs to your package manager. |
 | `novacode` (AUR, source build) | Does nothing. It tells you to update with your AUR helper, for example `paru -Syu`. |
 | `cargo install` or a source build | Does nothing. It tells you to run `git pull && cargo install --locked --path crates/novacode` in your checkout, or to rerun `cargo install --git` with `--force`. |
@@ -146,6 +152,8 @@ rm ~/.local/bin/novacode          # install script
 cargo uninstall novacode          # cargo install
 sudo pacman -R novacode           # Arch package (or novacode-bin)
 ```
+
+On Windows, delete `%LOCALAPPDATA%\novacode\bin\novacode.exe` and remove that folder from your user `PATH` (Settings, "Edit environment variables for your account").
 
 Your data stays in `~/.novacode` (settings, logins, sessions). Delete that folder too if you want a clean removal. Projects may also hold a `.novacode/` folder with project settings.
 

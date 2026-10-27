@@ -4,7 +4,7 @@
 
 novacode reads and edits your code, runs commands, and works through tasks with you, like Claude Code, pi or Codex. It uses the subscriptions you already pay for (Claude Pro/Max, ChatGPT/Codex, Antigravity, GitHub Copilot) or an API key for about 55 providers, including local models. Your existing Claude Code skills, agents and commands load without moving any files (a documented subset of their fields; `novacode doctor` lists what doesn't apply), and Claude Code plugins (ponytail, caveman, mattpocock/skills, …) install with `novacode install <repo>`, hooks included.
 
-> **Status:** early release (0.3). Linux is the main platform. macOS builds exist but are not tested yet. Windows x86_64 builds are experimental: tested in CI, not yet by hand. They need Git for Windows and have no command sandbox.
+> **Status:** early release (0.6). Linux is the main platform. macOS builds exist but are not tested yet. Windows x86_64 is new in 0.6 and experimental: tested in CI and by hand on Windows 11. It needs Git for Windows and has no command sandbox (see [docs/install.md](docs/install.md#windows)).
 
 ## Install
 
@@ -63,7 +63,7 @@ The full walk-through and a list of every flag and subcommand are in [docs/quick
 | Subagents, plan mode, MCP | Built in | Extensions | Built in |
 | Command risk check and approvals | Built in | Extension | Built in |
 | Extensions | TS/JS (no npm) or any language | TS with npm | Plugins and hooks |
-| Windows | Experimental (needs Git Bash, no sandbox) | Yes | Yes |
+| Windows | Yes, experimental (needs Git Bash, no sandbox) | Yes | Yes |
 
 ## Documentation
 

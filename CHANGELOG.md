@@ -2,6 +2,23 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.6.0] - 2026-10-27
+
+### Added
+
+- **Windows x86_64 (experimental).** A release `.zip` for `x86_64-pc-windows-msvc` and `scripts/install.ps1` (`irm …/install.ps1 | iex`). Commands run in Git Bash, which must be installed (Git for Windows; `NOVACODE_BASH` picks another `bash.exe`). There is no command sandbox on Windows: `sandbox.mode` `auto` warns once and runs commands unsandboxed, `on` refuses them; the approval policy still applies. Process trees are stopped with Job Objects, live sessions talk over named pipes, `novacode update` replaces the running `.exe`, and the clipboard paste reads Windows' clipboard. Tested in CI and by hand on Windows 11. See [install](docs/install.md#windows).
+- **`NOVACODE_VERSION`** for `install.ps1` installs a given tag.
+
+### Changed
+
+- **The risk gate reads `\` inside `"…"` as bash does:** it is kept unless it escapes `$`, `` ` ``, `"`, `\` or a newline. Before, every backslash there was dropped, so `"C:\Users"` was read as `C:Users`.
+- **On Windows, protected paths match whatever the spelling:** case, `/` or `\`, trailing dots and spaces, `name:stream`, `\\?\` and `\\.\` prefixes, admin shares (`\\host\C$`), Git Bash `/c/…`, drive-relative `C:…`, 8.3 short names and `$USERPROFILE`/`$APPDATA`-style variables. `rm.exe`, `RM` and `C:\…\rm.exe` count as `rm`; `cmd`, `powershell` and `pwsh` ask before running. Permission rules match without regard to case on Windows, and `\` in a rule is a folder separator there.
+- **Release tags with a `-` (`v0.6.1-rc.1`) publish as pre-releases**, so `novacode update` and the install scripts never pick one up.
+
+### Known issues
+
+- On Windows, capturing `novacode --bg`'s output in PowerShell (`$id = novacode --bg …`) waits until the background session ends. Use `cmd /c 'novacode --bg "…" > id.txt'` (see [automation](docs/automation.md#background-sessions---bg)).
+
 ## [0.5.0] - 2026-10-26
 
 ### Added
@@ -101,6 +118,7 @@ All notable changes to novacode. Versions follow [semantic versioning](https://s
 - **`novacode auth status`** exits with code 1 when only keyless local servers (`ollama`, `lmstudio`) are listed.
 - **Print mode** notes on stderr when the reply was cut at the output token limit or had no text.
 
+[0.6.0]: https://github.com/Novaturiente/novacode/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Novaturiente/novacode/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Novaturiente/novacode/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/Novaturiente/novacode/compare/v0.3.2...v0.3.3

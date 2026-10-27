@@ -3,7 +3,7 @@
 name: ci
 on:
   push:
-    branches: [master, main, windows-port]
+    branches: [master, main]
   pull_request:
 jobs:
   check:

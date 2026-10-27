@@ -4,7 +4,7 @@ This page explains what novacode does and does not protect you from: permission 
 
 ## The threat model
 
-Commands the agent runs with `bash` run as you. On Linux with bubblewrap installed, they run in a [sandbox](#sandbox): they can read your files but write only in the project and a few other places, they can't reach desktop services or Docker, and your credentials and secret environment variables are hidden. Without bubblewrap (and on macOS) they run with your files, your network and your credentials. The protections below are guard rails that catch mistakes. They are not a wall against a determined attacker or a hostile model.
+Commands the agent runs with `bash` run as you. On Linux with bubblewrap installed, they run in a [sandbox](#sandbox): they can read your files but write only in the project and a few other places, they can't reach desktop services or Docker, and your credentials and secret environment variables are hidden. Without bubblewrap (and on macOS and Windows) they run with your files, your network and your credentials. The protections below are guard rails that catch mistakes. They are not a wall against a determined attacker or a hostile model.
 
 If you need real isolation, run novacode inside a container or VM.
 
