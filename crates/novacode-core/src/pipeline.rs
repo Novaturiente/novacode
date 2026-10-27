@@ -170,7 +170,12 @@ pub async fn authorize_cancellable(
                 // A session yes also lets the same programs past the judge (`git push`, L6.9).
                 Decision::Block(reason) => {
                     sticky = crate::judge::approves(policy, tool, args, cwd);
-                    (format!("the command judge: {reason}"), subject.key(), true)
+                    // The card says what `a` grants beyond this exact command (review a1, finding 13).
+                    let also = match sticky.as_slice() {
+                        [] => String::new(),
+                        k => format!("; `a` also lets {} past the judge this session", k.join(", ")),
+                    };
+                    (format!("the command judge: {reason}{also}"), subject.key(), true)
                 }
             }
         }
@@ -433,6 +438,7 @@ mod tests {
                 session: "s".into(),
                 user: vec!["push my branch".into()],
                 calls: vec![],
+                answers: vec![],
             });
             assert!(
                 auth(&policy(json!({})), None, &j, "git push origin main")
@@ -460,12 +466,15 @@ mod tests {
             assert!(auth(&p, Some(&yes), &j, "git push").await.is_none());
             let req = yes.1.lock().unwrap()[0].clone();
             assert!(req.risky);
-            assert_eq!(req.reason, "the command judge: pushes to a remote");
+            assert_eq!(
+                req.reason,
+                "the command judge: pushes to a remote; `a` also lets git push past the judge this session"
+            );
             // The yes is remembered for this exact command: no second judge call.
             assert!(p.user_allowed("git push"));
             // And it covers other pushes this session (L6.9): no judge, no card.
             let (j, faux) = judge("BLOCK: never asked");
-            assert!(auth(&p, None, &j, "git push other").await.is_none());
+            assert!(auth(&p, None, &j, "git push --tags").await.is_none());
             assert!(faux.requests.lock().unwrap().is_empty());
 
             let (j, _) = judge("BLOCK: publishes");

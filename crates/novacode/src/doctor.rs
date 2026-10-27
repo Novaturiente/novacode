@@ -151,6 +151,7 @@ pub async fn doctor(
     println!("sandbox");
     let mode = sandbox.mode();
     match sandbox_line(mode, mode != Mode::Off && sandbox.available(), sandbox.symlink()) {
+        (true, line) if sandbox.light() => println!("  ✓ {line}, credentials only (the lenient level)"),
         (true, line) => println!("  ✓ {line}"),
         (false, line) => {
             failed |= mode == Mode::On;
@@ -164,7 +165,7 @@ pub async fn doctor(
 fn security_line(s: novacode_core::policy::Security) -> &'static str {
     match s {
         novacode_core::policy::Security::Lenient => {
-            "- lenient (default): no command judge, no sandbox, nothing asks in auto mode; only catastrophic commands, writes into credentials and your rules are stopped. Commands can read your secrets and send them out. Set \"permissions\": {\"security\": \"hardened\"} for the judge and the sandbox."
+            "- lenient (default): no command judge, and in auto mode only catastrophic commands, writes into credentials and novacode's settings, extensions and packages, and your rules are stopped. Commands can read your secrets and send them out. Set \"permissions\": {\"security\": \"hardened\"} for the judge and the full sandbox."
         }
         novacode_core::policy::Security::Hardened => {
             "✓ hardened: command judge, sandbox (where available), asks for shared and config changes"

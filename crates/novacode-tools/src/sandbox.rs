@@ -60,7 +60,15 @@ pub struct Config {
     pub secret_env: Vec<String>,
     /// `$HISTFILE`, hidden when it exists (`~/` and relative paths from home).
     pub histfile: Option<PathBuf>,
+    /// Credentials only (the lenient level, L6.9): everything stays writable and
+    /// reachable except credential folders, token files, novacode's logins,
+    /// settings, extensions and packages, and the user's protected paths, which
+    /// are read-only. No seccomp filter, no env stripping, no git pins.
+    pub light: bool,
 }
+
+/// Under novacode's folder, read-only in the light sandbox: the rules and unchecked code.
+const NOVACODE_LOCKED: &[&str] = &["settings.json", "extensions", "packages"];
 
 /// Download caches under home, writable when they exist (none is created).
 /// Only these: shells and editors source files they keep elsewhere in
@@ -162,6 +170,8 @@ const NOVACODE_FILES: &[&str] = &["auth.json", "mcp-auth.json", "trust.json"];
 
 pub struct Sandbox {
     mode: Mode,
+    /// Credentials only ([`Config::light`]).
+    light: bool,
     /// Writable binds, parents first.
     write: Vec<PathBuf>,
     /// Git folders bound onto themselves, parents first, so they are mount
@@ -280,6 +290,9 @@ fn expand(p: &str, home: &Path, base: &Path) -> PathBuf {
 impl Sandbox {
     /// Resolves the layout once: paths that don't exist are skipped.
     pub fn new(c: Config) -> Self {
+        if c.light {
+            return Self::credentials_only(c);
+        }
         let base = c.project.first().cloned().unwrap_or_else(|| PathBuf::from("/"));
         let mut write: Vec<PathBuf> = c
             .project
@@ -390,6 +403,7 @@ impl Sandbox {
         });
         Sandbox {
             mode: c.mode,
+            light: false,
             write,
             pin,
             git,
@@ -403,11 +417,55 @@ impl Sandbox {
         }
     }
 
+    /// The credentials-only layout (L6.9): the existing locked paths, resolved.
+    /// shortcut: a locked path that is a symlink (`~/.ssh -> dotfiles/ssh`) is locked at
+    /// its target, but the link itself can be swapped; refuse such links if that matters.
+    fn credentials_only(c: Config) -> Self {
+        let mut cands: Vec<PathBuf> = c.credential_dirs.iter().map(|d| c.home.join(d)).collect();
+        // The whole ~/.novacode stays writable (sessions, memory), except these.
+        cands.retain(|p| *p != c.home.join(".novacode"));
+        cands.extend(
+            NOVACODE_FILES
+                .iter()
+                .chain(NOVACODE_LOCKED)
+                .map(|f| c.novacode_home.join(f)),
+        );
+        if let Ok(rd) = std::fs::read_dir(&c.novacode_home) {
+            cands.extend(rd.flatten().map(|e| e.path()).filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("auth-") && n.ends_with(".json"))
+            }));
+        }
+        cands.extend(TOKEN_FILES.iter().map(|f| c.home.join(f)));
+        cands.extend(c.deny_read.iter().map(|p| expand(p, &c.home, &c.home)));
+        let mut ro: Vec<PathBuf> = cands.iter().filter_map(|p| std::fs::canonicalize(p).ok()).collect();
+        ro.sort();
+        ro.dedup();
+        Sandbox {
+            mode: c.mode,
+            light: true,
+            write: Vec::new(),
+            pin: Vec::new(),
+            git: None,
+            symlink: None,
+            ro,
+            hide: Vec::new(),
+            secret_env: Vec::new(),
+            program: PathBuf::from("bwrap"),
+            works: OnceLock::new(),
+            filter: OnceLock::new(),
+        }
+    }
+
     /// The start of every bwrap command line. With the seccomp filter it goes
     /// through `sh`, which opens the program on fd 3 for `bwrap --seccomp 3`
     /// (passing an fd to a child directly needs `unsafe`, which the workspace forbids).
     /// Each command opens it afresh: bwrap reads the fd to its end.
     fn launcher(&self) -> Vec<OsString> {
+        if self.light {
+            return vec![self.program.clone().into()];
+        }
         match self.filter_path() {
             Some(path) => vec![
                 "sh".into(),
@@ -447,6 +505,9 @@ impl Sandbox {
 
     /// The variable is passed into sandboxed commands (not a secret).
     fn keeps_env(&self, name: &OsStr) -> bool {
+        if self.light {
+            return true;
+        }
         let n = name.to_string_lossy().to_ascii_uppercase();
         !(SECRET_NAMES.contains(&n.as_str())
             || SECRET_PARTS.iter().any(|p| n.contains(p))
@@ -457,6 +518,11 @@ impl Sandbox {
 
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// Credentials only ([`Config::light`]).
+    pub fn light(&self) -> bool {
+        self.light
     }
 
     /// The protected path that is a symlink in a writable place, which makes
@@ -515,24 +581,27 @@ impl Sandbox {
 
     /// The bwrap arguments before `--`, for a command run in `cwd`.
     pub fn args(&self, cwd: &Path) -> Vec<OsString> {
-        let mut a: Vec<OsString> = [
-            "--ro-bind",
-            "/",
-            "/",
-            "--dev",
-            "/dev",
-            "--proc",
-            "/proc",
-            // Kill semantics: killing bwrap (timeout, Esc, `process stop`, novacode dying)
-            // ends the pid namespace, so nothing started inside survives, even a `setsid` child.
-            "--unshare-pid",
-            "--die-with-parent",
-            // A new session without a terminal: commands can't open `/dev/tty`
-            // (clipboard and reply-injection escapes reach the user's terminal).
-            "--new-session",
-        ]
-        .map(OsString::from)
-        .into();
+        // Light: the whole system writable and the host's devices; only `ro` below is locked.
+        let start: &[&str] = if self.light {
+            &["--bind", "/", "/", "--dev-bind", "/dev", "/dev"]
+        } else {
+            &["--ro-bind", "/", "/", "--dev", "/dev"]
+        };
+        let mut a: Vec<OsString> = start.iter().map(OsString::from).collect();
+        a.extend(
+            [
+                "--proc",
+                "/proc",
+                // Kill semantics: killing bwrap (timeout, Esc, `process stop`, novacode dying)
+                // ends the pid namespace, so nothing started inside survives, even a `setsid` child.
+                "--unshare-pid",
+                "--die-with-parent",
+                // A new session without a terminal: commands can't open `/dev/tty`
+                // (clipboard and reply-injection escapes reach the user's terminal).
+                "--new-session",
+            ]
+            .map(OsString::from),
+        );
         // A path deleted since the start is skipped: bwrap would fail on it, or
         // create it on the host as an empty file.
         let live = |p: &Path| p.symlink_metadata().is_ok();
@@ -572,6 +641,9 @@ impl Sandbox {
 
     /// The line added when a sandboxed command failed on a blocked write.
     pub fn hint(&self) -> String {
+        if self.light {
+            return "[sandbox: credential folders, token files and novacode's logins, settings, extensions and packages are read-only; pass `unsandboxed: true` to run this one outside it]".into();
+        }
         let places: Vec<String> = self.write.iter().map(|p| p.display().to_string()).collect();
         format!(
             "[sandbox: commands may write only in {}; pass `unsandboxed: true` to run this one outside it (the command judge checks such calls)]",
@@ -1129,6 +1201,7 @@ mod tests {
             git_dirs: vec![proj.join(".git")],
             secret_env: vec!["My_Provider_Key".into()],
             histfile: Some(d.path().join("hist/zsh")),
+            light: false,
         };
         (d, c)
     }
@@ -1523,6 +1596,85 @@ mod tests {
             .flatten()
             .filter(|e| std::fs::read(e.path().join("cmdline")).is_ok_and(|c| c == want.as_bytes()))
             .count()
+    }
+
+    /// L6.9 credentials only: home writable, credentials, logins and settings read-only
+    /// but readable, env kept. Real bwrap; skipped with a note where it doesn't work.
+    #[tokio::test]
+    async fn light_locks_only_credentials() {
+        use crate::Tool;
+        use crate::testutil::{ctx, text};
+        use serde_json::json;
+        let base = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let d = tempfile::Builder::new()
+            .prefix(".novacode-light-test")
+            .tempdir_in(&base)
+            .unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (home, proj) = (root.join("home"), root.join("proj"));
+        let nc = home.join(".novacode");
+        for dir in [home.join(".ssh"), nc.join("extensions"), proj.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for f in [
+            ".ssh/authorized_keys",
+            ".novacode/settings.json",
+            ".novacode/auth.json",
+            ".npmrc",
+        ] {
+            std::fs::write(home.join(f), "keep").unwrap();
+        }
+        let sb = Arc::new(Sandbox::new(Config {
+            mode: Mode::Auto,
+            light: true,
+            home: home.clone(),
+            novacode_home: nc.clone(),
+            credential_dirs: vec![".ssh".into(), ".novacode".into()],
+            ..Config::default()
+        }));
+        let a = sb.args(&proj);
+        assert_eq!(a[..3], ["--bind", "/", "/"].map(OsString::from));
+        // ~/.novacode itself stays writable (sessions); only its listed files are locked.
+        assert!(!a.contains(&nc.clone().into_os_string()));
+        if !sb.available() {
+            eprintln!("note: light_locks_only_credentials skipped, bwrap is not available here");
+            return;
+        }
+        let mut c = ctx(&proj);
+        c.env = Arc::new(crate::SandboxedEnv(sb.clone()));
+        let sh = |cmd: String| crate::bash::Bash.execute(json!({ "command": cmd }), &c);
+        let h = home.display();
+        // Writes anywhere else work and locked files can be read.
+        let o = sh(format!(
+            "echo x > {h}/free.txt && echo y > {h}/.novacode/session.txt && cat {h}/.ssh/authorized_keys"
+        ))
+        .await;
+        assert!(!o.is_error, "{}", text(&o));
+        assert_eq!(text(&o), "keep");
+        assert!(
+            sb.keeps_env(OsStr::new("GITHUB_TOKEN")),
+            "the light layer keeps secrets in the env"
+        );
+        assert!(home.join("free.txt").exists() && nc.join("session.txt").exists());
+        for f in [
+            ".ssh/authorized_keys",
+            ".ssh/new",
+            ".novacode/settings.json",
+            ".novacode/auth.json",
+            ".novacode/extensions/x.ts",
+            ".npmrc",
+        ] {
+            let o = sh(format!("echo bad >> {h}/{f}")).await;
+            let t = text(&o);
+            assert!(o.is_error && t.contains("Read-only file system"), "{f}: {t}");
+            assert!(t.contains("unsandboxed: true"), "{t}");
+        }
+        // A locked folder can't be moved aside and replaced.
+        let o = sh(format!("mv {h}/.ssh {h}/.ssh.old")).await;
+        assert!(o.is_error, "{}", text(&o));
+        for f in [".ssh/authorized_keys", ".novacode/settings.json", ".npmrc"] {
+            assert_eq!(std::fs::read_to_string(home.join(f)).unwrap(), "keep", "{f}");
+        }
     }
 
     /// Real runs through bwrap; skipped with a note where it doesn't work.

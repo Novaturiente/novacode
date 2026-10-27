@@ -279,10 +279,8 @@ pub struct Policy {
     overlay: Mutex<Option<Overlay>>,
     /// Risk-gated commands the user approved for this session, verbatim.
     session_commands: Mutex<HashSet<String>>,
-    /// Programs the user let past the command judge this session (`git push`, L6.9).
+    /// Programs the user let past the command judge this session (`git push origin`, L6.9).
     judged: Mutex<HashSet<String>>,
-    /// Targets of links in the project's top folder at session start: project for the judge (L6.9).
-    links: Vec<PathBuf>,
     /// An activated skill's `allowed-tools` rules and `disallowed-tools` names,
     /// until the next user message (L5.25).
     turn: Mutex<(Vec<Rule>, Vec<String>)>,
@@ -314,7 +312,6 @@ impl Policy {
             overlay: Mutex::default(),
             session_commands: Mutex::default(),
             judged: Mutex::default(),
-            links: Vec::new(),
             turn: Mutex::default(),
         }
     }
@@ -433,15 +430,6 @@ impl Policy {
 
     pub fn approve_judged(&self, keys: Vec<String>) {
         self.judged.lock().unwrap().extend(keys);
-    }
-
-    pub fn with_links(mut self, links: Vec<PathBuf>) -> Self {
-        self.links = links;
-        self
-    }
-
-    pub fn links(&self) -> &[PathBuf] {
-        &self.links
     }
 
     /// The mode a child agent starts with: read-only while a read-only preset
@@ -745,8 +733,10 @@ impl Policy {
         }
 
         // novacode's settings hold the permission rules: a file tool changes them only with the user's yes,
-        // ahead of any allow rule (the agent mustn't widen its own permissions). Hardened only (L6.9).
-        if MUTATING.contains(&lower.as_str()) && !self.lenient_auto() {
+        // ahead of any allow rule (the agent mustn't widen its own permissions). At the lenient
+        // level only settings and novacode's extensions and packages ask (L6.9, review a1 finding 5).
+        if MUTATING.contains(&lower.as_str()) {
+            let lenient = self.lenient_auto();
             use crate::risk::{fold, same, under};
             let name = |s: &str| fold(Path::new(s)).into_owned();
             let is_settings = |q: &Path| {
@@ -779,6 +769,7 @@ impl Policy {
                     let rest = q.strip_prefix(&h).ok()?;
                     GLOBAL_CONFIG
                         .iter()
+                        .filter(|(p, ..)| !lenient || LENIENT_ASKS.contains(p))
                         .find(|(p, folder, _)| {
                             if *folder {
                                 rest.starts_with(name(p))
@@ -910,6 +901,9 @@ fn suggest_rule(tool: &str, command: Option<&str>, path: Option<&str>) -> String
 
 /// Global config that runs commands: (path under home, a folder, what it is).
 /// File tools ask before writing there (L6.1).
+/// The [`GLOBAL_CONFIG`] entries that still ask at the lenient level: trusted code with no checks.
+const LENIENT_ASKS: &[&str] = &[".novacode/extensions", ".novacode/packages"];
+
 const GLOBAL_CONFIG: &[(&str, bool, &str)] = &[
     (".novacode/extensions", true, "novacode's own extensions"),
     (".novacode/skills", true, "novacode's own skills"),
@@ -1085,7 +1079,7 @@ mod tests {
     fn lenient_asks_nothing_but_keeps_the_floor() {
         let p = policy(json!({ "security": "lenient" }));
         assert_eq!(p.security(), Security::Lenient);
-        // Shared and config writes run, attended or not.
+        // Shared and most config writes run, attended or not.
         for interactive in [true, false] {
             assert_eq!(
                 check(&p, "bash", bash("git push --force origin main"), interactive),
@@ -1095,17 +1089,28 @@ mod tests {
                 check(&p, "bash", bash("python3 -c 'open(\"~/.ssh/id_rsa\")'"), interactive),
                 Verdict::Allow
             );
-            for path in [
-                "/home/u/.novacode/settings.json",
-                "/home/u/.bashrc",
-                "/home/u/.novacode/skills/x/SKILL.md",
-            ] {
+            for path in ["/home/u/.bashrc", "/home/u/.novacode/skills/x/SKILL.md"] {
                 assert_eq!(
                     check(&p, "write", json!({ "path": path }), interactive),
                     Verdict::Allow,
                     "{path}"
                 );
             }
+        }
+        // Settings, extensions and packages still ask: they hold the rules or run unchecked code.
+        for path in [
+            "/home/u/.novacode/settings.json",
+            "/home/u/.novacode/extensions/x.ts",
+            "/home/u/.novacode/packages/p/extensions/x.ts",
+        ] {
+            assert!(
+                matches!(
+                    check(&p, "write", json!({ "path": path }), true),
+                    Verdict::Ask { risky: true, .. }
+                ),
+                "{path}"
+            );
+            assert!(denied(&check(&p, "write", json!({ "path": path }), false)), "{path}");
         }
         // The floor: Catastrophic commands, writes into credentials and novacode's logins, the user's rules.
         assert!(denied(&check(&p, "bash", bash("rm -rf ~"), true)));
@@ -1657,7 +1662,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_settings_spellings_ask() {
-        let p = Policy::new(Default::default(), r"C:\Users\u".into(), None);
+        let hardened = serde_json::from_value(json!({ "security": "hardened" })).unwrap();
+        let p = Policy::new(hardened, r"C:\Users\u".into(), None);
         let cwd = Path::new(r"C:\Users\u\proj");
         for path in [
             r"C:\Users\u\.NOVACODE\Settings.json",

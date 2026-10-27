@@ -18,13 +18,17 @@ novacode has two levels. Set the level in `~/.novacode/settings.json` (global on
 | File writes into credentials | refused | refused |
 | Your `deny`/`ask` rules, protected paths | apply | apply |
 | Shared commands (auto mode) | run, logged | ask you |
-| Config file writes (auto mode) | run | ask you |
+| novacode settings, extensions, packages | ask you | ask you |
+| Other config files (auto mode) | run | ask you |
 | [Command judge](#command-judge) | off | on |
-| [Sandbox](#sandbox) | off | on where available |
+| [Sandbox](#sandbox) (Linux) | credentials only | full |
 
-- **`lenient`** works like pi: in `auto` mode nothing asks. It still refuses what can't be undone: the Catastrophic commands of the [risk gate](#the-command-risk-gate) (`rm -rf ~`, writes into `~/.ssh`, disk wipes), and file-tool writes into credential folders and novacode's logins. **It does not stop a command from reading your secrets and sending them out.** Text in a file or web page can steer the model into doing that (prompt injection). Use `hardened`, or a container or VM, when the agent reads content you don't trust.
-- **`hardened`** adds the command judge, the sandbox (bubblewrap on Linux; none on macOS and Windows yet), and asks for Shared commands and for changes to novacode settings, global extensions, skills and shell startup files.
-- An explicit `sandbox.mode` always wins, at either level.
+- **`lenient`** works like pi: in `auto` mode almost nothing asks. It still refuses what can't be undone: the Catastrophic commands of the [risk gate](#the-command-risk-gate) (`rm -rf ~`, disk wipes), and file-tool writes into credential folders and novacode's logins. A file-tool change to novacode's `settings.json`, `extensions` or `packages` asks you, because those hold your rules or run code no check sees.
+- **The credentials-only sandbox (lenient, Linux with bubblewrap):** commands can write everywhere except the credential folders (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.config/gcloud`, `~/.password-store`), the token files listed under [Sandbox](#sandbox), novacode's logins, `settings.json`, `extensions` and `packages`, and your protected paths. Those are read-only, but readable, so `ssh` and `git push` keep working. There is no seccomp filter and the environment is kept, so Docker, ssh-agent and desktop services work. A command that has to write there (`ssh` adding to `known_hosts`, `gh auth login`) can run with `unsandboxed: true`, which runs without asking at this level. On macOS and Windows there is no such layer: other programs can write there.
+- **What lenient does not stop: a command reading your secrets and sending them out.** Text in a file or web page can steer the model into doing that (prompt injection). Use `hardened`, or a container or VM, when the agent reads content you don't trust.
+- **`hardened`** adds the command judge, the full sandbox (bubblewrap on Linux; none on macOS and Windows yet), and asks for Shared commands and for changes to Claude-compatible config and shell startup files.
+- If `permissions` in your settings doesn't parse (for example `"security": "strict"`), novacode uses `hardened` with no rules, and logs a warning.
+- An explicit `sandbox.mode` always wins, at either level, and means the full sandbox.
 - `ask`, `read-only` and plan mode work the same at both levels.
 - `novacode doctor` shows the level under `security`.
 
@@ -150,13 +154,13 @@ It looks at `bash` commands, `process` starts, and file changes outside the proj
 - are a `process` start whose `cwd` is outside the project and `/tmp`;
 - run with `unsandboxed: true`.
 
-A `write`, `edit` or `apply_patch` call is judged when the file it writes, as given or with symlinks resolved, is outside the project and `/tmp`. A folder linked from the project's top folder counts as project when the link existed at session start, git doesn't track it (so a cloned repository can't ship one), and it points into your home but not into a dot folder there (`~/.config`, `~/.ssh`, …) or a protected path. Such folders are writable in the sandbox too. The judge sees the tool, the path and the first 1000 characters of what it writes. A block works as for commands; `a` on its card allows that tool on that path for the session. An `allow` rule that covers the path (such as `Write(/srv/**)`) skips the judge.
+A `write`, `edit` or `apply_patch` call is judged when the file it writes, as given or with symlinks resolved, is outside the project and `/tmp`. The judge sees the tool, the path and the first 1000 characters of what it writes. A block works as for commands; `a` on its card allows that tool on that path for the session. An `allow` rule that covers the path (such as `Write(/srv/**)`) skips the judge.
 
 It sees through wrappers, runners, `sh -c`, `$(...)`, `trap` scripts and shell keywords (`coproc` too) the same way the gate does. A runner's options are read only before the command it runs, so `flock /tmp/l curl -c jar` runs `curl`. Builds, tests and read-only commands never go to it. Nor does a command your own `allow` rules or this session's approvals cover. An `allow` rule must cover every command inside the line too: `Bash(git push:*)` does not cover `git push $(curl x)`. In `ask` and `read-only` mode it is off: you already decide there. An `unsandboxed: true` call asks you in `ask` mode, even for a read-only command, and is refused in `read-only` and plan mode, because outside the sandbox even `cat` can read what the sandbox hides.
 
-The judge sees your messages of this session, your answers to the agent's `ask_user` questions, and the agent's recent tool calls (name and arguments, without the agent's `intent` and `justification`). The command (or the file path and content) is given as a quoted JSON string. It never sees the agent's replies or any tool output, so neither the agent nor text in a file can talk it round. In a subagent, the "user" messages it sees are the task the parent agent wrote, not your own words. It answers `ALLOW` or `BLOCK` with a reason, in any case and with or without markdown around it.
+The judge sees your messages of this session, your answers to the agent's `ask_user` questions (in their own section, with the agent's question and label text cut to 200 characters), and the agent's recent tool calls (name and arguments, without the agent's `intent` and `justification`). The command (or the file path and content) is given as a quoted JSON string. It never sees the agent's replies or any tool output, so neither the agent nor text in a file can talk it round. In a subagent, the "user" messages it sees are the task the parent agent wrote, not your own words. It answers `ALLOW` or `BLOCK` with a reason, in any case and with or without markdown around it.
 
-- **Block, with you there:** an approval card shows the judge's reason. `y` runs it; `a` allows that exact command for the session. When only network parts made it judged, `a` also lets each such program and its first word past the judge for the session: after `a` on `git add -A && git push origin main`, every `git push` (and a `cd x && git push`) runs without the judge; after `a` on `ssh novahome ls`, so does every `ssh novahome …`. The risk gate still checks them first.
+- **Block, with you there:** an approval card shows the judge's reason. `y` runs it; `a` allows that exact command for the session. When only network parts made it judged, `a` also lets the same push or host past the judge for the session, and the card says so: after `a` on `git add -A && git push -u origin main`, every `git push origin …` runs without the judge; after `a` on `ssh novahome ls`, so does every `ssh novahome …`. This covers only `git push` to a named remote and `ssh` to a host with plain flags (`-u`, `--tags`, `-t`, `-q`, …). An option that takes a value or runs a program (`--receive-pack`, `--repo`, `-o ProxyCommand=…`, `-l`, `-J`), a URL or path as the remote, `git -C`, and every other program such as `curl` or `scp` approve only the exact command. The risk gate still checks them first.
 - **Block, nobody there** (print mode): the command is refused, and the model is told why.
 - **An answer that is neither ALLOW nor BLOCK, or empty:** counts as a block ("the judge gave no clear answer").
 - **A command over 4000 characters:** blocked without asking the model ("too long to judge").
@@ -206,11 +210,11 @@ When a sandboxed command fails with `Read-only file system`, the result adds one
 
 | Key | Meaning |
 |---|---|
-| `sandbox.mode` | `auto`, `on` or `off`. Default: `auto` at the `hardened` level, `off` at `lenient`. |
+| `sandbox.mode` | `auto`, `on` or `off`: the full sandbox. Unset: `auto` at the `hardened` level, the credentials-only layer at `lenient`. |
 | `sandbox.allowWrite` | More writable folders. |
 | `sandbox.denyRead` | More hidden files and folders. |
 
-With `auto`, novacode checks once whether bubblewrap works. If it doesn't, it logs one warning and commands run unsandboxed. With `on`, commands are refused instead (except `unsandboxed: true` ones). `novacode doctor` shows the state under `sandbox`: `on (bubblewrap)`, ``off (`sandbox.mode`, or the lenient level)``, `unavailable (bwrap not found), commands run unsandboxed`, or `unavailable (<path> is a symlink), …` for the symlink case above. With `on` and the sandbox unavailable, `novacode doctor` exits with code 1.
+With `auto`, novacode checks once whether bubblewrap works. If it doesn't, it logs one warning and commands run unsandboxed. With `on`, commands are refused instead (except `unsandboxed: true` ones). `novacode doctor` shows the state under `sandbox`: `on (bubblewrap)`, `on (bubblewrap), credentials only (the lenient level)`, ``off (`sandbox.mode`, or the lenient level)``, `unavailable (bwrap not found), commands run unsandboxed`, or `unavailable (<path> is a symlink), …` for the symlink case above. With `on` and the sandbox unavailable, `novacode doctor` exits with code 1.
 
 ## Approval dialogs
 

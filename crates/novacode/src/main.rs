@@ -335,41 +335,49 @@ fn parse_mode(s: &str) -> Result<Mode, String> {
     serde_json::from_value(serde_json::Value::from(s)).map_err(|_| format!("`{s}`: use auto, ask or read-only"))
 }
 
-/// `sandbox.mode` (L6.5); a bad value is reported by `doctor` and means the default:
-/// `off` at the lenient level, `auto` when hardened (L6.9).
-fn sandbox_mode(s: &Settings, security: Security) -> sbx::Mode {
-    s.get::<String>("sandbox.mode")
-        .and_then(|m| sbx::Mode::parse(&m))
-        .unwrap_or(match security {
-            Security::Lenient => sbx::Mode::Off,
-            Security::Hardened => sbx::Mode::Auto,
-        })
+/// `sandbox.mode` (L6.5) and whether it is the credentials-only layer: an explicit
+/// mode is the full sandbox; unset (or bad, which `doctor` reports) is `auto`, full
+/// when hardened and credentials only at the lenient level (L6.9).
+fn sandbox_mode(s: &Settings, security: Security) -> (sbx::Mode, bool) {
+    match s.get::<String>("sandbox.mode").and_then(|m| sbx::Mode::parse(&m)) {
+        Some(m) => (m, false),
+        None => (sbx::Mode::Auto, security == Security::Lenient),
+    }
+}
+
+/// Global `permissions`. One that doesn't parse fails closed (review a1, finding 7):
+/// hardened, with no rules, rather than the lenient default.
+fn permissions(s: &Settings) -> Permissions {
+    match s.get::<serde_json::Value>("permissions") {
+        None => Permissions::default(),
+        Some(v) => serde_json::from_value(v).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "`permissions` doesn't parse: using the hardened level and no rules");
+            Permissions {
+                security: Security::Hardened,
+                ..Default::default()
+            }
+        }),
+    }
 }
 
 /// The sandbox of a session in `cwd` (L6.5): its project folders, the settings'
-/// extra places, the folders linked into the project at start (L6.9) and the
-/// user's protected paths.
-fn session_sandbox(
-    s: &Settings,
-    cwd: &Path,
-    novacode_home: &Path,
-    perms: &Permissions,
-    links: &[std::path::PathBuf],
-) -> Arc<Sandbox> {
+/// extra places and the user's protected paths. At the lenient level without a
+/// `sandbox.mode` it only locks credentials (L6.9).
+fn session_sandbox(s: &Settings, cwd: &Path, novacode_home: &Path, perms: &Permissions) -> Arc<Sandbox> {
     // Host git pin (L6.5): the project's common git dir, resolved before any model command runs.
     novacode_base::git::pin_repo(cwd);
-    let mode = sandbox_mode(s, perms.security);
+    let (mode, light) = sandbox_mode(s, perms.security);
     let mut deny_read = perms.protected.paths.clone();
     deny_read.extend(s.get::<Vec<String>>("sandbox.denyRead").unwrap_or_default());
     // Download caches of a relocated CARGO_HOME / GOPATH; their binaries and config stay read-only.
     let mut allow_write: Vec<String> = s.get("sandbox.allowWrite").unwrap_or_default();
-    allow_write.extend(links.iter().map(|l| l.to_string_lossy().into_owned()));
     allow_write.extend(relocated_caches(
         std::env::var_os("CARGO_HOME").as_deref(),
         std::env::var_os("GOPATH").as_deref(),
     ));
     let sb = Arc::new(Sandbox::new(sbx::Config {
         mode,
+        light,
         project: if mode == sbx::Mode::Off {
             vec![]
         } else {
@@ -657,8 +665,8 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
                         shadowed.push(format!("package `{}`: {s} is skipped", pkg.name));
                     }
                 }
-                let perms: Permissions = settings.get("permissions").unwrap_or_default();
-                let sb = session_sandbox(&settings, &cwd, paths.home(), &perms, &[]);
+                let perms = permissions(&settings);
+                let sb = session_sandbox(&settings, &cwd, paths.home(), &perms);
                 return Ok(doctor::doctor(&p, &settings, &sb, perms.security, problems, shadowed).await);
             }
             return Ok(doctor::auth_status(&p));
@@ -1253,16 +1261,18 @@ impl Ctx {
         let (adapter, api_key) = self.providers.adapter(&route.provider, trace).await?;
         diag::mark("connect provider");
         let s = &self.settings;
-        let perms: Permissions = s.get("permissions").unwrap_or_default();
+        let perms = permissions(s);
         // Lenient (L6.9): no judge.
         let judge_spec = match perms.security {
             Security::Lenient => Some("off".to_string()),
             Security::Hardened => perms.judge.clone(),
         };
-        let home = novacode_base::platform::home().unwrap_or_default();
-        let links = novacode_core::judge::start_links(&self.cwd, &home, &perms.protected.paths);
-        let sandbox = session_sandbox(s, &self.cwd, self.paths.home(), &perms, &links);
-        let mut policy = Policy::new(perms, home, Some(self.paths.settings())).with_links(links);
+        let sandbox = session_sandbox(s, &self.cwd, self.paths.home(), &perms);
+        let mut policy = Policy::new(
+            perms,
+            novacode_base::platform::home().unwrap_or_default(),
+            Some(self.paths.settings()),
+        );
         if let Some(m) = self.cli.mode {
             policy = policy.with_mode(m);
         }
@@ -3302,6 +3312,35 @@ async fn login(store: &AuthStore, provider: &str, account: &str, method: Option<
 
 #[cfg(test)]
 mod tests {
+    /// L6.9: unset is lenient with a credentials-only sandbox; a bad `permissions` is
+    /// hardened (fails closed); an explicit `sandbox.mode` is the full sandbox.
+    #[test]
+    fn security_level_and_sandbox_defaults() {
+        use super::{Security, permissions, sandbox_mode, sbx};
+        let dir = std::env::temp_dir().join(format!("nc-levels-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("settings.json");
+        let load = |json: &str| {
+            std::fs::write(&file, json).unwrap();
+            novacode_base::settings::Settings::load(&file, None, false)
+        };
+        let s = load("{}");
+        assert_eq!(permissions(&s).security, Security::Lenient);
+        assert_eq!(sandbox_mode(&s, Security::Lenient), (sbx::Mode::Auto, true));
+        assert_eq!(sandbox_mode(&s, Security::Hardened), (sbx::Mode::Auto, false));
+        for bad in [
+            r#"{"permissions": {"security": "strict"}}"#,
+            r#"{"permissions": {"mode": "yolo"}}"#,
+        ] {
+            assert_eq!(permissions(&load(bad)).security, Security::Hardened, "{bad}");
+        }
+        let s = load(r#"{"sandbox": {"mode": "off"}}"#);
+        assert_eq!(sandbox_mode(&s, Security::Lenient), (sbx::Mode::Off, false));
+        let s = load(r#"{"sandbox": {"mode": "on"}}"#);
+        assert_eq!(sandbox_mode(&s, Security::Lenient), (sbx::Mode::On, false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // GOPATH splits on `;` on Windows.
     #[cfg(unix)]
     #[test]
