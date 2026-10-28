@@ -2614,6 +2614,7 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
         .flatten();
     // Kept across reload, rewind and session swaps: the old frame stays up meanwhile.
     let mut screen: Option<Screen> = None;
+    let mut first = true;
     loop {
         let (ui_tx, ui_rx) = mpsc::unbounded_channel();
         let (live, task) = start_session(
@@ -2627,6 +2628,23 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
         )
         .await?;
         let host = live.host.clone();
+        // L8.16: after go_live, so this session is no longer in the list.
+        if std::mem::take(&mut first) {
+            for f in serve::interrupted_sessions(&ctx.paths) {
+                let s = &f.state.session;
+                notices.push(format!(
+                    "a session in {} was cut off mid-run: novacode -r {}",
+                    f.state.cwd,
+                    &s[..s.len().min(13)]
+                ));
+            }
+        }
+        if live.interrupted {
+            notices.push(
+                "this session was cut off mid-run (crash, kill or power loss); a tool may have partly run. Send a message such as \"continue\" to pick it up."
+                    .into(),
+            );
+        }
         let (handle, id) = (host.hub.handle.clone(), host.id.clone());
         let tmux_pane = tmux_panel(&ctx.settings, &id, ctx.paths.home());
         let (etx, erx) = mpsc::unbounded_channel();

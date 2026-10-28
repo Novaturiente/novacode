@@ -291,6 +291,8 @@ pub struct Live {
     run: PathBuf,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     pub host: Arc<Host>,
+    /// The last process on this session died mid-run (L8.16).
+    pub interrupted: bool,
 }
 
 impl Live {
@@ -389,6 +391,15 @@ pub fn go_live(host: &Arc<Host>, bg: bool) -> std::io::Result<Live> {
     novacode_base::platform::set_mode(&dir, 0o700)?;
     let sock = address(&dir, &host.id);
     let run = dir.join(format!("{}.json", host.id));
+    // We hold the session lock, so a run file of this id left here is from a dead process.
+    let kept = interrupted_dir(&host.paths).join(format!("{}.json", host.id));
+    let interrupted = [&run, &kept].iter().any(|p| {
+        novacode_base::storage::read_json::<RunFile>(p)
+            .ok()
+            .flatten()
+            .is_some_and(|f| f.state.busy)
+    });
+    let _ = std::fs::remove_file(&kept);
     let h = host.clone();
     let accept = listen(&sock, move |r, w| {
         tokio::spawn(serve(r, w, h.clone(), false));
@@ -417,10 +428,61 @@ pub fn go_live(host: &Arc<Host>, bg: bool) -> std::io::Result<Live> {
         run,
         tasks: vec![accept, writer],
         host: host.clone(),
+        interrupted,
     })
 }
 
-/// Live sessions, newest first. Files of dead processes are removed.
+fn interrupted_dir(paths: &Paths) -> PathBuf {
+    run_dir(paths).join("interrupted")
+}
+
+fn alive(f: &RunFile) -> bool {
+    // Pids restart at boot: a run started before this boot is dead whatever holds its pid now.
+    // A minute of slack for clock steps after boot.
+    // shortcut: boot time only from /proc/stat (Linux); elsewhere the pid alone decides.
+    let booted = boot_ms().is_none_or(|b| f.started_ms + 60_000 >= b);
+    booted && novacode_tools::process::pid_alive(f.pid)
+}
+
+fn boot_ms() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let secs: u64 = stat
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(secs * 1000)
+}
+
+/// Sessions whose process died mid-run (crash, kill, power loss), newest first (L8.16).
+/// Kept until resumed, or 7 days after the last state write.
+pub fn interrupted_sessions(paths: &Paths) -> Vec<RunFile> {
+    live_sessions(paths); // moves newly dead ones in
+    let week = std::time::Duration::from_secs(7 * 24 * 3600);
+    let mut v: Vec<RunFile> = std::fs::read_dir(interrupted_dir(paths))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| {
+            let old = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t.elapsed().is_ok_and(|d| d > week));
+            let f = novacode_base::storage::read_json::<RunFile>(&e.path()).ok().flatten();
+            if old || f.is_none() {
+                let _ = std::fs::remove_file(e.path());
+            }
+            f.filter(|_| !old)
+        })
+        .collect();
+    v.sort_by_key(|f| std::cmp::Reverse(f.started_ms));
+    v
+}
+
+/// Live sessions, newest first. Files of dead processes are removed, except a
+/// busy one with a session file: that moves to `run/interrupted/` (L8.16).
 pub fn live_sessions(paths: &Paths) -> Vec<RunFile> {
     let mut v: Vec<RunFile> = std::fs::read_dir(run_dir(paths))
         .into_iter()
@@ -429,10 +491,17 @@ pub fn live_sessions(paths: &Paths) -> Vec<RunFile> {
         .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
         .filter_map(|e| {
             let f: RunFile = novacode_base::storage::read_json(&e.path()).ok().flatten()?;
-            if novacode_tools::process::pid_alive(f.pid) {
+            if alive(&f) {
                 Some(f)
             } else {
-                let _ = std::fs::remove_file(e.path());
+                let keep = f.state.busy && f.state.file.is_some();
+                let dir = interrupted_dir(paths);
+                let moved = keep
+                    && std::fs::create_dir_all(&dir).is_ok()
+                    && std::fs::rename(e.path(), dir.join(e.file_name())).is_ok();
+                if !moved {
+                    let _ = std::fs::remove_file(e.path());
+                }
                 let _ = std::fs::remove_file(novacode_base::storage::backup_path(&e.path()));
                 let _ = std::fs::remove_file(&f.socket);
                 None
@@ -459,24 +528,35 @@ pub fn find_live(paths: &Paths, prefix: &str) -> anyhow::Result<RunFile> {
 /// `novacode agents`: live sessions on this machine.
 pub fn agents(paths: &Paths) -> std::process::ExitCode {
     let all = live_sessions(paths);
+    let cut = interrupted_sessions(paths);
     if all.is_empty() {
         eprintln!("no live sessions");
-        return std::process::ExitCode::SUCCESS;
+    } else {
+        println!("{:<15} {:<8} {:<4} {:<34} cwd", "session", "state", "bg", "model");
+        for f in all {
+            let s = &f.state;
+            println!(
+                "{:<15} {:<8} {:<4} {:<34} {}",
+                &s.session[..s.session.len().min(13)],
+                match s.activity.state {
+                    crate::wire::ActState::Blocked => "blocked",
+                    _ if s.busy => "working",
+                    _ => "idle",
+                },
+                if f.bg { "yes" } else { "" },
+                format!("{}:{}", s.model, s.level.as_str()),
+                s.cwd
+            );
+        }
     }
-    println!("{:<15} {:<8} {:<4} {:<34} cwd", "session", "state", "bg", "model");
-    for f in all {
-        let s = &f.state;
+    if !cut.is_empty() {
+        println!("\ninterrupted mid-run (resume with the command):");
+    }
+    for f in cut {
         println!(
-            "{:<15} {:<8} {:<4} {:<34} {}",
-            &s.session[..s.session.len().min(13)],
-            match s.activity.state {
-                crate::wire::ActState::Blocked => "blocked",
-                _ if s.busy => "working",
-                _ => "idle",
-            },
-            if f.bg { "yes" } else { "" },
-            format!("{}:{}", s.model, s.level.as_str()),
-            s.cwd
+            "novacode -r {}  {}",
+            &f.state.session[..f.state.session.len().min(13)],
+            f.state.cwd
         );
     }
     std::process::ExitCode::SUCCESS
@@ -816,5 +896,47 @@ mod tests {
         assert!(listen(&sock, |_, _| {}).is_err());
         accept.abort();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The boot time comes from /proc/stat, so only Linux can call our own pid's old run dead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dead_busy_run_files_become_interrupted() {
+        let tmp = std::env::temp_dir().join(format!("nc-interrupted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let paths = Paths::new(&tmp);
+        std::fs::create_dir_all(run_dir(&paths)).unwrap();
+        // Our own pid, so only the boot check can call a run dead: started_ms 0 is before this boot.
+        let put = |id: &str, started_ms: u64, busy: bool| {
+            let f = RunFile {
+                pid: std::process::id(),
+                socket: tmp.join(format!("{id}.sock")),
+                bg: false,
+                pane: None,
+                started_ms,
+                state: State {
+                    session: id.into(),
+                    busy,
+                    file: Some(format!("{id}.jsonl")),
+                    ..Default::default()
+                },
+            };
+            let p = run_dir(&paths).join(format!("{id}.json"));
+            novacode_base::storage::write_json(&p, &f, novacode_base::storage::Durability::Fast).unwrap();
+        };
+        put("crashed", 0, true);
+        put("idle-dead", 0, false);
+        put("live", novacode_core::session::now_ms(), true);
+
+        let cut: Vec<String> = interrupted_sessions(&paths)
+            .into_iter()
+            .map(|f| f.state.session)
+            .collect();
+        assert_eq!(cut, ["crashed"]);
+        let live: Vec<String> = live_sessions(&paths).into_iter().map(|f| f.state.session).collect();
+        assert_eq!(live, ["live"]);
+        assert!(!run_dir(&paths).join("idle-dead.json").exists());
+        assert!(!run_dir(&paths).join("crashed.json").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

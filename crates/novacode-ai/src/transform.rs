@@ -21,7 +21,8 @@ pub struct Target<'a> {
     pub normalize_id: Option<fn(&str) -> String>,
 }
 
-pub const NO_RESULT: &str = "No result provided";
+/// Only a call novacode stopped during (crash, kill, power loss) has no stored result (L4.17).
+pub const NO_RESULT: &str = "No result: novacode stopped while this tool ran, so it may have partly run. Check its effects before running it again.";
 pub const IMAGE_OMITTED: &str = "(image omitted: model does not support images)";
 
 pub fn for_target(messages: &[Message], t: &Target) -> Vec<Message> {

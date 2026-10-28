@@ -341,9 +341,14 @@ impl Store {
         if self.failed {
             end_line(path)?;
         }
+        let wrote = self.saved < self.entries.len();
         while self.saved < self.entries.len() {
             storage::append_jsonl(path, &self.entries[self.saved])?;
             self.saved += 1;
+        }
+        // L4.17: on disk before the run goes on, so a power loss keeps it.
+        if wrote {
+            std::fs::File::open(path)?.sync_data()?;
         }
         Ok(())
     }
@@ -367,6 +372,10 @@ impl Store {
             .truncate(true)
             .open(path)?;
         f.write_all(buf.as_bytes())?;
+        f.sync_data()?;
+        if let Some(dir) = path.parent() {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
         self.on_disk = true;
         self.saved = self.entries.len();
         self._lock = Some(lock);
