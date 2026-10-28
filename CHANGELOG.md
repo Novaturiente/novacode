@@ -2,6 +2,19 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.6.2] - 2026-10-29
+
+### Added
+
+- **Skills as `/name`.** Type `/release-notes` instead of `/skill:release-notes`; `/skill:name` still works. Built-in, mode and extension commands and templates of the same name win; such a skill is completed as `/skill:name`. See [skills](docs/skills.md#using-a-skill-yourself).
+- **Interrupted sessions.** When novacode dies mid-run (crash, kill, power loss), the session is listed at the next start and in `novacode agents` with its `novacode -r <id>` command, for 7 days or until resumed. A resumed one says it was cut off.
+
+### Changed
+
+- **Folded turns keep every message.** A finished turn shows all of the agent's messages, not only the last; each run of tool calls and notes between them folds to its own line.
+- **Session saves are fsynced**, so a power loss keeps every saved entry.
+- **A tool call cut off by a crash** tells the model it may have partly run (was: `No result provided`).
+
 ## [0.6.1] - 2026-10-27
 
 ### Changed
@@ -125,6 +138,7 @@ All notable changes to novacode. Versions follow [semantic versioning](https://s
 - **`novacode auth status`** exits with code 1 when only keyless local servers (`ollama`, `lmstudio`) are listed.
 - **Print mode** notes on stderr when the reply was cut at the output token limit or had no text.
 
+[0.6.2]: https://github.com/Novaturiente/novacode/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/Novaturiente/novacode/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Novaturiente/novacode/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Novaturiente/novacode/compare/v0.4.0...v0.5.0
