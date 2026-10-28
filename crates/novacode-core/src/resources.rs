@@ -432,17 +432,20 @@ pub fn templates(dirs: &[PathBuf]) -> (Vec<Template>, Vec<String>) {
     (found.into_values().collect(), seen.shadowed)
 }
 
-/// Expand `/skill:name args` and `/template args`; anything else is returned as is.
+/// Expand `/skill:name args`, `/template args` and `/name args` (a skill no template
+/// shadows); anything else is returned as is.
 pub fn expand(text: &str, skills: &[Skill], templates: &[Template]) -> String {
     let Some(rest) = text.strip_prefix('/') else {
         return text.to_string();
     };
     let (cmd, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     let args = args.trim();
-    if let Some(name) = cmd.strip_prefix("skill:") {
-        let Some(k) = skills.iter().find(|k| k.name == name && !k.model_only) else {
-            return text.to_string();
-        };
+    let name = match cmd.strip_prefix("skill:") {
+        Some(n) => Some(n),
+        None if !templates.iter().any(|t| t.name == cmd) => Some(cmd),
+        None => None,
+    };
+    if let Some(k) = name.and_then(|n| skills.iter().find(|k| k.name == n && !k.model_only)) {
         let Ok(raw) = std::fs::read_to_string(&k.path) else {
             return text.to_string();
         };
@@ -669,6 +672,15 @@ mod tests {
             "{x}"
         );
         assert_eq!(expand("/skill:nope", &s, &[]), "/skill:nope");
+        // `/name` works too, unless a template of that name shadows it.
+        assert_eq!(expand("/secret do it", &s, &[]), x);
+        let t = [Template {
+            name: "secret".into(),
+            description: String::new(),
+            body: "T".into(),
+        }];
+        assert_eq!(expand("/secret", &s, &t), "T");
+        assert_eq!(expand("/skill:secret do it", &s, &t), x);
     }
 
     #[test]

@@ -1742,6 +1742,7 @@ impl Inputs {
         let out = resources::expand(text, &skills, &resources::templates(&self.templates).0);
         let name = text
             .strip_prefix("/skill:")
+            .or_else(|| text.strip_prefix('/'))
             .and_then(|r| r.split_whitespace().next())
             .filter(|_| out != text);
         let skill = name.and_then(|n| skills.into_iter().find(|s| s.name == n));
@@ -1756,18 +1757,37 @@ impl Inputs {
             .into_iter()
             .map(|t| (format!("/{}", t.name), t.description))
             .collect();
+        // A skill shows as `/name`, or `/skill:name` when a command or template owns `/name`.
+        let taken = |n: &str| {
+            let n = format!("/{n}");
+            novacode_tui::app::COMMANDS
+                .iter()
+                .chain(host::MODE_COMMANDS)
+                .any(|(x, _)| *x == n)
+                || c.iter().any(|(x, _)| *x == n)
+        };
         // `user-invocable: false` skills are the model's only.
-        c.extend(skills.into_iter().filter(|k| !k.model_only).map(|k| {
-            let d: String = k
-                .description
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .chars()
-                .take(80)
-                .collect();
-            (format!("/skill:{}", k.name), d)
-        }));
+        let s: Vec<_> = skills
+            .into_iter()
+            .filter(|k| !k.model_only)
+            .map(|k| {
+                let d: String = k
+                    .description
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(80)
+                    .collect();
+                let cmd = if taken(&k.name) {
+                    format!("/skill:{}", k.name)
+                } else {
+                    format!("/{}", k.name)
+                };
+                (cmd, d)
+            })
+            .collect();
+        c.extend(s);
         (c, warn)
     }
 }
