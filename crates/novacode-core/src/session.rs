@@ -347,8 +347,9 @@ impl Store {
             self.saved += 1;
         }
         // L4.17: on disk before the run goes on, so a power loss keeps it.
+        // Windows flushes only through a handle with write access.
         if wrote {
-            std::fs::File::open(path)?.sync_data()?;
+            std::fs::OpenOptions::new().append(true).open(path)?.sync_data()?;
         }
         Ok(())
     }
@@ -373,6 +374,8 @@ impl Store {
             .open(path)?;
         f.write_all(buf.as_bytes())?;
         f.sync_data()?;
+        // Windows can't open a folder as a file; NTFS journals the creation itself.
+        #[cfg(unix)]
         if let Some(dir) = path.parent() {
             std::fs::File::open(dir)?.sync_all()?;
         }
