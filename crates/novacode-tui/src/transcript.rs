@@ -117,26 +117,14 @@ struct Layout {
 }
 
 impl Turn {
-    fn tool_count(&self) -> (usize, usize) {
-        let tools = self.items.iter().filter_map(|i| match i {
-            Item::Tool(t) => Some(t),
-            _ => None,
-        });
-        tools.fold((0, 0), |(n, e), t| (n + 1, e + t.is_error as usize))
-    }
-
-    /// Notices that fold with the steps.
-    fn notice_count(&self) -> usize {
-        self.items
-            .iter()
-            .filter(|i| matches!(i, Item::Notice { folds: true, .. }))
-            .count()
-    }
-
-    /// Only a prompt's turn folds: everything but the prompt and the final reply
-    /// (tool calls, notes, process lines, in-between text) goes behind one line.
+    /// Only a prompt's turn with tool calls or notes folds: its steps (tool calls,
+    /// notes, process lines, thinking) go behind fold lines; its text stays in view.
     fn foldable(&self) -> bool {
-        matches!(self.items.first(), Some(Item::User(_))) && (self.tool_count().0 > 0 || self.notice_count() > 0)
+        matches!(self.items.first(), Some(Item::User(_)))
+            && self
+                .items
+                .iter()
+                .any(|i| matches!(i, Item::Tool(_) | Item::Notice { folds: true, .. }))
     }
 
     fn collapsed(&self) -> bool {
@@ -703,42 +691,64 @@ fn lay_turn(
     let mut imgs = Vec::new();
     let mut image_toggles = Vec::new();
     let collapsed = turn.collapsed();
-    let (n, errors) = turn.tool_count();
-    let notes = turn.notice_count();
-    // In a collapsed turn only the prompt, the fold line and the final reply show.
-    let final_reply = turn
-        .items
-        .iter()
-        .rposition(|i| matches!(i, Item::Assistant(b) if b.iter().any(|(k, _)| *k == BlockKind::Text)));
-    let mut folded = false;
-    for (idx, item) in turn.items.iter().enumerate() {
+    // A collapsed turn shows the prompt, every message with text, and one fold line
+    // per run of steps (tool calls, notes, thinking) between them. Open, it has one
+    // fold line, at its first step.
+    let is_step = |idx: usize| {
+        let item = &turn.items[idx];
         // Images right after the prompt are part of it and never fold.
         let prompt_image = matches!(item, Item::Image(_))
             && turn.items[..idx]
                 .iter()
                 .all(|i| matches!(i, Item::User(_) | Item::Image(_)));
-        let is_step = !matches!(
+        let text = matches!(item, Item::Assistant(b) if b.iter().any(|(k, _)| *k == BlockKind::Text));
+        !matches!(
             item,
             Item::User(_) | Item::Notice { folds: false, .. } | Item::Divider { .. }
-        ) && Some(idx) != final_reply
-            && !prompt_image;
-        if turn.done && turn.foldable() && !folded && is_step {
+        ) && !text
+            && !prompt_image
+    };
+    let mut folded = false;
+    for (idx, item) in turn.items.iter().enumerate() {
+        let step = is_step(idx);
+        let run_start = step && (idx == 0 || !is_step(idx - 1));
+        if turn.done && turn.foldable() && step && (if collapsed { run_start } else { !folded }) {
             folded = true;
-            toggles.push(lines.len());
-            let arrow = if collapsed { "▸" } else { "▾" };
-            let plural = |k: usize, w: &str| format!("{k} {w}{}", if k == 1 { "" } else { "s" });
-            let what: Vec<String> = [(n, "tool call"), (notes, "note")]
-                .into_iter()
-                .filter(|(k, _)| *k > 0)
-                .map(|(k, w)| plural(k, w))
-                .collect();
-            let mut s = vec![Span::styled(format!("{arrow} {}", what.join(" · ")), t.toggle)];
-            if errors > 0 {
-                s.push(Span::styled(format!(" · {errors} failed"), t.error));
+            // What the fold line hides: this run when collapsed, the whole turn when open.
+            let end = if collapsed {
+                (idx..turn.items.len())
+                    .find(|&i| !is_step(i))
+                    .unwrap_or(turn.items.len())
+            } else {
+                turn.items.len()
+            };
+            let hidden = &turn.items[idx..end];
+            let (mut n, mut errors, mut notes) = (0, 0, 0);
+            for i in hidden {
+                match i {
+                    Item::Tool(tool) => (n, errors) = (n + 1, errors + tool.is_error as usize),
+                    Item::Notice { folds: true, .. } => notes += 1,
+                    _ => {}
+                }
             }
-            lines.push(Line::from(s));
+            // A run of thinking alone gets no fold line.
+            if n + notes > 0 {
+                toggles.push(lines.len());
+                let arrow = if collapsed { "▸" } else { "▾" };
+                let plural = |k: usize, w: &str| format!("{k} {w}{}", if k == 1 { "" } else { "s" });
+                let what: Vec<String> = [(n, "tool call"), (notes, "note")]
+                    .into_iter()
+                    .filter(|(k, _)| *k > 0)
+                    .map(|(k, w)| plural(k, w))
+                    .collect();
+                let mut s = vec![Span::styled(format!("{arrow} {}", what.join(" · ")), t.toggle)];
+                if errors > 0 {
+                    s.push(Span::styled(format!(" · {errors} failed"), t.error));
+                }
+                lines.push(Line::from(s));
+            }
         }
-        if collapsed && is_step {
+        if collapsed && step {
             continue;
         }
         match item {
@@ -749,10 +759,10 @@ fn lay_turn(
                 lines.extend(user_box(text, width, t));
             }
             Item::Assistant(blocks) => {
-                let only_reply = collapsed && Some(idx) == final_reply;
+                // Collapsed, a message shows its text, not its thinking.
                 let blocks: Vec<_> = blocks
                     .iter()
-                    .filter(|(k, _)| !only_reply || *k == BlockKind::Text)
+                    .filter(|(k, _)| !collapsed || *k == BlockKind::Text)
                     .cloned()
                     .collect();
                 lines.extend(lay_assistant(&blocks, width, t, None, thinking, hint));
@@ -1352,6 +1362,42 @@ mod reminder_tests {
             s.contains("retry failed hard") && s.contains("done it") && s.contains("model → x"),
             "{s}"
         );
+    }
+
+    #[test]
+    fn a_collapsed_turn_keeps_every_text_and_folds_each_run_of_steps() {
+        use novacode_types::{AssistantMessage, Block, Message, StopReason};
+        let mut tr = super::Transcript::default();
+        let reply = |b: Vec<Block>| {
+            Message::Assistant(AssistantMessage {
+                content: b,
+                stop: StopReason::Stop,
+                usage: Default::default(),
+                provider: "p".into(),
+                model: "m".into(),
+                response_id: None,
+                error_message: None,
+                thinking_level: None,
+            })
+        };
+        tr.on_message(&Message::user("go"));
+        tr.on_message(&reply(vec![Block::text("first update")]));
+        tr.notice("⚙ proc_1 dev: exited", false);
+        tr.notice("⚙ proc_2 dev: exited", false);
+        tr.on_message(&reply(vec![Block::text("second update")]));
+        tr.notice("⚙ proc_3 dev: exited", false);
+        tr.on_message(&reply(vec![Block::text("done")]));
+        tr.settle();
+        let v = tr.layout(60, &crate::theme::Theme::default());
+        let s = v.lines.iter().map(crate::wrap::plain).collect::<Vec<_>>().join("\n");
+        let at = |x: &str| s.find(x).unwrap_or_else(|| panic!("{x} missing: {s}"));
+        assert!(at("first update") < at("▸ 2 notes"), "{s}");
+        assert!(
+            at("▸ 2 notes") < at("second update") && at("second update") < at("▸ 1 note"),
+            "{s}"
+        );
+        assert!(at("▸ 1 note") < at("done") && !s.contains("proc_1"), "{s}");
+        assert_eq!(v.toggles.len(), 2, "each fold line toggles the turn");
     }
 
     #[test]

@@ -1,15 +1,15 @@
  ╭────────────────────────────────────────────────────────╮
  │ fix the failing test                                   │
  ╰────────╭ Model ───────────────────────────────╮────────╯
- ▸ 2 tool │ › type to filter                     │
-          │ ▸ opus                               │
- Fixed: th│   sonnet                             │h 2.
+          │ › type to filter                     │
+ Running t│ ▸ opus                               │
+ ▸ 2 tool │   sonnet                             │
           │                                      │
- • tests p│                                      │
- · model →│                                      │sage
-   (the ca╰──────────────────────────────────────╯
-
-
+ Fixed: th│                                      │h 2.
+          │                                      │
+ • tests p╰──────────────────────────────────────╯
+ · model → claude/haiku · medium from the next message
+   (the cache starts over: ~31k tokens re-sent)
 ╭──────────────────────────────────────────────────────────╮
 │                                                          │
 ╰──────────────────────────────────────────────────────────╯

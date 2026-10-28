@@ -8,7 +8,7 @@ novacode runs full screen in your terminal's alternate screen. The mouse is on: 
 
 From top to bottom:
 
-- **Transcript.** Your messages (in a box), the model's replies, tool calls and their output. Finished turns fold their steps (tool calls, notes) to one line by default; the prompt and final reply stay (`Alt+O` toggles, `ui.turnCollapse`). `Ctrl+O` shows every tool's output in full or short again. `Ctrl+T` shows or folds thinking (`ui.thinking`: `collapsed`, `full` or `hidden`). When the context is compacted, a coloured line runs across the transcript: `━━ context compacted · 182k → 41k tokens · 37 notes ━━`. It never folds away. If no notes were available, it says `no notes, earlier messages were dropped` and shows in the error colour.
+- **Transcript.** Your messages (in a box), the model's replies, tool calls and their output. Finished turns fold their steps (tool calls, notes, thinking) by default: each run of steps between two messages becomes one line, and the prompt and every message with text stay (`Alt+O` toggles, `ui.turnCollapse`). `Ctrl+O` shows every tool's output in full or short again. `Ctrl+T` shows or folds thinking (`ui.thinking`: `collapsed`, `full` or `hidden`). When the context is compacted, a coloured line runs across the transcript: `━━ context compacted · 182k → 41k tokens · 37 notes ━━`. It never folds away. If no notes were available, it says `no notes, earlier messages were dropped` and shows in the error colour.
 - **Editor.** The input box. It grows up to 10 rows.
 - **Status line.** One row under the editor with the activity (`ready`, a spinner, or what novacode waits for) on the left and details on the right. While a compaction runs, the activity says `compacting context`. See [Status line](#status-line).
 - **Side panel.** An optional column on the right. See [Side panel](#side-panel).
@@ -183,7 +183,7 @@ An active mode shows in the status line (`⏸ <name> mode`).
 
 ### Skills, templates and extensions
 
-- `/skill:<name> [args]` inlines a skill into your message. See [skills](skills.md).
+- `/<name> [args]` (or `/skill:<name> [args]`) inlines a skill into your message. See [skills](skills.md).
 - `/<name> [args]` runs a prompt template with that name.
 - Script extensions can add their own commands. See [extensions](extensions.md).
 

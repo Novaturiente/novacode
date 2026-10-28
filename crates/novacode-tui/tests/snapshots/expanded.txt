@@ -1,11 +1,11 @@
  ╭────────────────────────────────────────────────────────╮
  │ fix the failing test                                   │
  ╰────────────────────────────────────────────────────────╯
- ▾ 2 tool calls · 1 failed
 
  ∴ thought · 6 words · ctrl+t to show
 
  Running the tests.
+ ▾ 2 tool calls · 1 failed
 
  ● bash $ cargo test  2.3s
    see what fails

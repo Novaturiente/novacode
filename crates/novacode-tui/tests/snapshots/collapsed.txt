@@ -1,13 +1,13 @@
  ╭────────────────────────────────────────────────────────╮
  │ fix the failing test                                   │
  ╰────────────────────────────────────────────────────────╯
+
+ Running the tests.
  ▸ 2 tool calls · 1 failed
 
  Fixed: the assertion in src/lib.rs compared 1 with 2.
 
  • tests pass now
-
-
 
 
 ╭──────────────────────────────────────────────────────────╮
