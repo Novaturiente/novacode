@@ -94,7 +94,7 @@ Type `/` and the skill's name (or `/skill:` and the name), then anything you wan
 /release-notes for v2.3
 ```
 
-novacode inlines the skill's text (without the frontmatter) into your message, in a `<skill name=… location=…>` block that says references are relative to the skill's folder, then your extra text after it. This also works for skills with `disable-model-invocation: true`. The editor completes skill names for you. A built-in command, mode command, extension command or template with the same name owns `/name`; reach that skill with `/skill:name` (the editor completes it that way, except for an extension clash).
+novacode inlines the skill's text (without the frontmatter) into your message, in a `<skill name=… location=…>` block that says references are relative to the skill's folder, then your extra text after it. Only the model sees that block: the transcript, prompt history, session list and `/tree` show your message as `/name` plus your own text. This also works for skills with `disable-model-invocation: true`. The editor completes skill names for you. A built-in command, mode command, extension command or template with the same name owns `/name`; reach that skill with `/skill:name` (the editor completes it that way, except for an extension clash).
 
 ### Shadowed skills
 

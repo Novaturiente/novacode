@@ -5,7 +5,7 @@
 
 use novacode_base::storage::{self, FileLock};
 use novacode_base::{new_id, paths::Paths};
-use novacode_types::{Block, Message};
+use novacode_types::{Block, Message, typed_prompt};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -628,7 +628,7 @@ impl Store {
                 content
                     .iter()
                     .find_map(|b| match b {
-                        Block::Text { text, .. } => Some(text.lines().next().unwrap_or("").to_string()),
+                        Block::Text { text, .. } => Some(typed_prompt(text).lines().next().unwrap_or("").to_string()),
                         _ => None,
                     })
                     .unwrap_or_else(|| "[image]".into()),
@@ -725,6 +725,7 @@ pub fn recent_prompts(paths: &Paths, cwd: &Path, exclude: Option<&str>, max: usi
                 ),
                 _ => None,
             })
+            .map(|t| typed_prompt(&t).into_owned())
             .filter(|t| !t.trim().is_empty())
             .collect();
         // Skipped before counting, so subagent sessions can't crowd out the user's.
@@ -766,7 +767,7 @@ pub fn summary(path: &Path) -> Option<Summary> {
                 prompts += 1;
                 if first.is_none() {
                     first = content.iter().find_map(|b| match b {
-                        Block::Text { text, .. } => Some(text.lines().next().unwrap_or("").to_string()),
+                        Block::Text { text, .. } => Some(typed_prompt(text).lines().next().unwrap_or("").to_string()),
                         _ => None,
                     });
                 }

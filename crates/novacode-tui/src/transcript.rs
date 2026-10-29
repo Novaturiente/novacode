@@ -425,7 +425,7 @@ impl Transcript {
                         t.touch();
                     }
                 }
-                let mut items = vec![Item::User(text)];
+                let mut items = vec![Item::User(novacode_types::typed_prompt(&text).into_owned())];
                 items.extend(images_of(content));
                 self.turns.push(Turn {
                     items,

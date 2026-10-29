@@ -456,14 +456,16 @@ pub struct App {
     images: Option<crate::images::Images>,
 }
 
+/// The prompt as typed (an inlined skill back to `/name`).
 fn text_of(content: &[novacode_types::Block]) -> String {
-    content
+    let text: String = content
         .iter()
         .filter_map(|b| match b {
             novacode_types::Block::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
-        .collect()
+        .collect();
+    novacode_types::typed_prompt(&text).into_owned()
 }
 
 impl App {

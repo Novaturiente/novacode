@@ -672,6 +672,10 @@ mod tests {
             "{x}"
         );
         assert_eq!(expand("/skill:nope", &s, &[]), "/skill:nope");
+        // The UI shows an inlined skill as typed, not its whole text.
+        assert_eq!(novacode_types::typed_prompt(&x), "/secret do it");
+        assert_eq!(novacode_types::typed_prompt(&expand("/secret", &s, &[])), "/secret");
+        assert_eq!(novacode_types::typed_prompt("plain\n</skill>"), "plain\n</skill>");
         // `/name` works too, unless a template of that name shadows it.
         assert_eq!(expand("/secret do it", &s, &[]), x);
         let t = [Template {

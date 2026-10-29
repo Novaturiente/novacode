@@ -268,6 +268,22 @@ impl Message {
     }
 }
 
+/// A prompt as the user typed it: an inlined skill (`<skill name="x" …>…</skill>`,
+/// written by `novacode_core::resources::expand`) shows as `/x` plus the user's own text.
+pub fn typed_prompt(text: &str) -> std::borrow::Cow<'_, str> {
+    let parsed = text.strip_prefix("<skill name=\"").and_then(|r| {
+        let (name, _) = r.split_once('"')?;
+        let (_, rest) = r.rsplit_once("\n</skill>")?;
+        Some((name, rest.trim()))
+    });
+    // shortcut: a skill whose `/name` a command owns shows as `/name` too; fine for display and history.
+    match parsed {
+        Some((name, "")) => format!("/{name}").into(),
+        Some((name, rest)) => format!("/{name} {rest}").into(),
+        None => text.into(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockKind {
