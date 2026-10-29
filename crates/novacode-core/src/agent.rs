@@ -1590,6 +1590,22 @@ impl Agent {
                 break StopReason::Stop;
             }
             self.flush_ext_state();
+            // An open todo list the model stopped updating (L5.12): show it again.
+            if let Some((items, ago)) = self.store.todo()
+                && ago >= novacode_tools::todo::STALE_AFTER
+                && items.iter().any(|i| {
+                    matches!(
+                        i.status,
+                        novacode_tools::todo::Status::Pending | novacode_tools::todo::Status::Active
+                    )
+                })
+            {
+                self.add(EntryKind::CustomMessage {
+                    kind: "todo".into(),
+                    text: novacode_tools::todo::stale_note(&items, ago),
+                    display: false,
+                });
+            }
             let notes: Vec<(String, String)> = {
                 let mut q = self.shared.queues.lock().unwrap();
                 q.wake = false;

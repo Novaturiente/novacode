@@ -437,6 +437,42 @@ impl Store {
         project(&self.path_to_leaf(), |_| true)
     }
 
+    /// The branch's todo list (L5.12), also from before a compaction, and how many
+    /// replies ago the model last saw it (a `todo` result or a `todo` note);
+    /// `usize::MAX` when that was compacted away. `None`: no list yet.
+    pub fn todo(&self) -> Option<(Vec<novacode_tools::todo::Item>, usize)> {
+        let path = self.path_to_leaf();
+        let is_result = |e: &Entry| matches!(&e.kind, EntryKind::Message { message: Message::ToolResult { tool_name, .. } } if tool_name == "todo");
+        let items = path.iter().rev().find_map(|e| match &e.kind {
+            EntryKind::Message {
+                message: Message::ToolResult { details: Some(d), .. },
+            } if is_result(e) => serde_json::from_value(d["todo"].clone()).ok(),
+            _ => None,
+        })?;
+        let seen = path.iter().rposition(|e| {
+            is_result(e) || matches!(&e.kind, EntryKind::CustomMessage { kind, .. } if kind == "todo")
+        })?;
+        let first_kept = path.iter().rev().find_map(|e| match &e.kind {
+            EntryKind::Compaction { first_kept, .. } => path.iter().position(|p| &p.id == first_kept),
+            _ => None,
+        });
+        if first_kept.is_some_and(|k| seen < k) {
+            return Some((items, usize::MAX));
+        }
+        let ago = path[seen..]
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EntryKind::Message {
+                        message: Message::Assistant(_)
+                    }
+                )
+            })
+            .count();
+        Some((items, ago))
+    }
+
     /// What a window replays: the projection without the hidden notes that never
     /// showed live (hooks, env changes, docs briefs, nudges); process, schedule and
     /// subagent notes stay, as one line each.
@@ -842,6 +878,49 @@ mod tests {
                 thinking_level: None,
             }),
         }
+    }
+
+    #[test]
+    fn todo_staleness_counts_replies_and_survives_compaction() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::new(home.path());
+        let mut s = Store::create(&paths, home.path(), false);
+        assert!(s.todo().is_none());
+        s.append(msg("go")).unwrap();
+        let item = serde_json::json!([{"id": 1, "text": "build", "status": "active"}]);
+        s.append(EntryKind::Message {
+            message: Message::ToolResult {
+                call_id: "c".into(),
+                tool_name: "todo".into(),
+                content: vec![],
+                is_error: false,
+                details: Some(serde_json::json!({ "todo": item })),
+            },
+        })
+        .unwrap();
+        s.append(reply("a")).unwrap();
+        s.append(reply("b")).unwrap();
+        let (items, ago) = s.todo().unwrap();
+        assert_eq!((items[0].text.as_str(), ago), ("build", 2));
+        // A note showing the list counts as a look at it.
+        s.append(EntryKind::CustomMessage {
+            kind: "todo".into(),
+            text: "list".into(),
+            display: false,
+        })
+        .unwrap();
+        assert_eq!(s.todo().unwrap().1, 0);
+        // Compacted away: still known, but the model can't see it.
+        let kept = s.append(msg("later")).unwrap();
+        s.append(EntryKind::Compaction {
+            system: "sys".into(),
+            summary: "sum".into(),
+            first_kept: kept,
+            tokens_before: 0,
+            notes: 0,
+        })
+        .unwrap();
+        assert_eq!(s.todo().unwrap(), (vec![items[0].clone()], usize::MAX));
     }
 
     #[test]

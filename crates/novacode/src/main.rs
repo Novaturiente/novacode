@@ -1382,7 +1382,9 @@ impl Ctx {
         if let Some(a) = asker.clone() {
             all.push(Arc::new(novacode_tools::ask::AskUser(a)));
         }
-        all.push(Arc::new(novacode_tools::todo::Todo::from_history(&store.projection())));
+        all.push(Arc::new(novacode_tools::todo::Todo::new(
+            store.todo().map(|t| t.0).unwrap_or_default(),
+        )));
         if store.path().is_some() {
             all.push(Arc::new(novacode_core::export::SessionSearch {
                 sessions_root: self.paths.home().join("sessions"),

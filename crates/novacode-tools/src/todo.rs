@@ -84,7 +84,30 @@ pub fn render(items: &[Item]) -> String {
     s.trim_end().into()
 }
 
+/// After this many replies without a look at an open list, the model is shown it
+/// again and asked to bring it up to date (Claude Code does the same).
+pub const STALE_AFTER: usize = 10;
+
+/// The hidden note that shows the model its open list again.
+pub fn stale_note(items: &[Item], ago: usize) -> String {
+    let when = if ago == usize::MAX {
+        "before the conversation was compacted".to_string()
+    } else {
+        format!("{ago} replies ago")
+    };
+    format!(
+        "Your todo list was last updated {when}:\n{}\nIf the work has moved on, update it now in one `todo` call with your next tool call: mark finished items done, drop items no longer needed, add new steps, and start the current one. If it is still right, carry on. Don't mention this note to the user.",
+        render(items)
+    )
+}
+
 impl Todo {
+    pub fn new(items: Vec<Item>) -> Self {
+        Todo {
+            items: Mutex::new(items),
+        }
+    }
+
     /// The list as the last `todo` result in `history` left it.
     pub fn from_history(history: &[Message]) -> Self {
         let items = history
