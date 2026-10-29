@@ -49,6 +49,9 @@ pub enum EntryKind {
     },
     SessionInfo {
         name: String,
+        /// Given by the namer model (L4.18); a `/name` (false) pins the name.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        auto: bool,
     },
     /// Usage of a cache-warming replay (L2.17): billed, but not part of the conversation.
     WarmUsage {
@@ -437,6 +440,14 @@ impl Store {
         project(&self.path_to_leaf(), |_| true)
     }
 
+    /// The branch's name and whether the namer gave it (L4.18).
+    pub fn name(&self) -> Option<(String, bool)> {
+        self.path_to_leaf().iter().rev().find_map(|e| match &e.kind {
+            EntryKind::SessionInfo { name, auto } => Some((name.clone(), *auto)),
+            _ => None,
+        })
+    }
+
     /// The branch's todo list (L5.12), also from before a compaction, and how many
     /// replies ago the model last saw it (a `todo` result or a `todo` note);
     /// `usize::MAX` when that was compacted away. `None`: no list yet.
@@ -796,7 +807,7 @@ pub fn summary(path: &Path) -> Option<Summary> {
     let (mut name, mut first, mut prompts) = (None, None, 0);
     for l in lines {
         match serde_json::from_str::<Entry>(l).map(|e| e.kind) {
-            Ok(EntryKind::SessionInfo { name: n }) => name = Some(n),
+            Ok(EntryKind::SessionInfo { name: n, .. }) => name = Some(n),
             Ok(EntryKind::Message {
                 message: Message::User { content },
             }) => {

@@ -37,7 +37,9 @@ Inside the UI:
 |---|---|
 | `/resume` | Pick another session from this folder. Sessions with no prompts, and the current one, are not listed. |
 | `/new` | Start a new session. The model stays the same. |
-| `/name <text>` | Name this session. The name shows in the `/resume` list; without one, the first prompt does. |
+| `/name <text>` | Name this session. The name shows in the `/resume` list. Your name is kept: automatic naming stops for this session. |
+
+**Sessions name themselves.** After the first reply, the observer's small model gives the session a name of a few words, and the `/resume` list shows it instead of the first prompt. After each compaction it looks again and renames the session if the work has moved on. This is a separate small request, so the session model's prompt and cache are not touched. Print mode (`-p`), `--rpc` and subagents are not named, and neither is a session with `memory.enabled: false`.
 
 `--no-session` also applies to `/new`. With it, no file is written, and file rewind is not available (see below).
 

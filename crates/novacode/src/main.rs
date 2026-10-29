@@ -1712,6 +1712,10 @@ impl Ctx {
                 }
                 None => agent = agent.with_memory(session_worker, m).without_observer(),
             }
+            // Named for the session list (L4.18); not scripts, pipelines or subagents.
+            if self.cli.print.is_none() && !self.cli.rpc {
+                agent = agent.with_auto_name();
+            }
         }
         if let Some(a) = approver {
             agent = agent.with_approver(a);

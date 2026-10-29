@@ -546,6 +546,42 @@ fn reflect_tool() -> ToolDef {
     }
 }
 
+const NAMER_PROMPT: &str = "You name coding-agent sessions so the user can tell them apart in a list. Give a name of 2 to 5 words for the specific task (not the project or repo name), like `todo staleness reminder` or `release 0.6.3`. No quotes, no trailing period. When a current name is given and still fits the work, return it unchanged.";
+
+fn name_tool() -> ToolDef {
+    ToolDef {
+        name: "name_session".into(),
+        description: "Set the session's name.".into(),
+        schema: json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"]
+        }),
+    }
+}
+
+/// A short session name (L4.18) from what the session is about; `current` is kept
+/// when it still fits. `None`: the model gave no usable name.
+pub async fn name_session(
+    w: &Worker,
+    current: Option<&str>,
+    about: &str,
+    session: &str,
+) -> Result<Option<String>, String> {
+    let user = match current {
+        Some(c) => format!("Current name: {c}\n\n{about}"),
+        None => about.to_string(),
+    };
+    let (calls, _) = ask(w, NAMER_PROMPT, user, name_tool(), session).await?;
+    Ok(calls.iter().find_map(|a| clean_name(a["name"].as_str()?)))
+}
+
+fn clean_name(raw: &str) -> Option<String> {
+    let n = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let n = n.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '.' | ' '));
+    (!n.is_empty() && n.chars().count() <= 48).then(|| n.to_string())
+}
+
 fn drop_tool() -> ToolDef {
     ToolDef {
         name: "drop_notes".into(),

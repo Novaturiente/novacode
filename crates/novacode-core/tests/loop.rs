@@ -860,6 +860,57 @@ fn notes_reply(n: usize) -> FauxReply {
     }
 }
 
+/// L4.18: after the first reply the small model names the session; a `/name` pins it.
+#[tokio::test]
+async fn session_is_named_by_the_small_model_unless_pinned() {
+    use novacode_core::memory::{Settings, Worker};
+    let named = |pin: Option<&'static str>| async move {
+        let work = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let namer = Faux::new([FauxReply::Message {
+            blocks: vec![call("n", "name_session", json!({"name": " \"login bug fix.\" "}))],
+            stop: StopReason::ToolUse,
+            usage: Usage::default(),
+        }]);
+        let asked = namer.requests.clone();
+        let store = Store::create(&Paths::new(home.path()), work.path(), false);
+        let agent = Agent::new(
+            Arc::new(Faux::new([FauxReply::text("fixed it")])),
+            vec![],
+            store,
+            cfg(work.path(), home.path()),
+            Arc::new(LocalEnv),
+        )
+        .with_memory(
+            Worker {
+                adapter: Arc::new(namer),
+                provider: "faux".into(),
+                model: "small".into(),
+            },
+            Settings::for_window(200_000),
+        )
+        .with_auto_name();
+        let (h, task) = agent::spawn(agent);
+        if let Some(n) = pin {
+            h.rename(n);
+        }
+        let mut rx = h.subscribe();
+        h.prompt("the login page rejects valid passwords");
+        while !matches!(rx.recv().await.unwrap(), AgentEvent::AgentEnd { .. }) {}
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        h.shutdown();
+        let agent = task.await.unwrap();
+        let asked = asked.lock().unwrap().len();
+        (agent.store.name(), asked)
+    };
+    let (name, asked) = named(None).await;
+    assert_eq!(name, Some(("login bug fix".into(), true)));
+    assert_eq!(asked, 1);
+    let (name, asked) = named(Some("mine")).await;
+    assert_eq!(name, Some(("mine".into(), false)));
+    assert_eq!(asked, 0);
+}
+
 /// M7 check: a long session compacts with no LLM call for the summary. The
 /// observer runs in the background as the session grows, catches up to the cut,
 /// and the next request carries the rendered notes plus the kept tail.

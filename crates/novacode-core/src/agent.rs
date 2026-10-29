@@ -162,6 +162,10 @@ struct Memory {
     task: Option<tokio::task::JoinHandle<ObserverRun>>,
     /// `memory.enabled: false`: no observer; compaction summarises with the session model.
     observe: bool,
+    /// Name the session with the observer's model (L4.18).
+    auto_name: bool,
+    /// What the last naming was based on: `start`, or a compaction's id.
+    named_for: Option<String>,
 }
 
 /// What a background observer run produced.
@@ -208,6 +212,8 @@ struct Shared {
     compact: Mutex<bool>,
     /// `/name`: written between runs (L4.4).
     rename: Mutex<Option<String>>,
+    /// The namer's pick (L4.18), written between runs unless `/name` pinned one.
+    auto_name: Mutex<Option<String>>,
     /// `/worktree`: the folder to move the session to, between runs.
     move_to: Mutex<Option<PathBuf>>,
     /// The session's prompts as a tree, refreshed with the report (for `/tree`).
@@ -759,8 +765,82 @@ impl Agent {
             settings,
             task: None,
             observe: true,
+            auto_name: false,
+            named_for: None,
         });
         self
+    }
+
+    /// Name the session automatically (L4.18); needs the observer's small model.
+    pub fn with_auto_name(mut self) -> Self {
+        if let Some(m) = self.memory.as_mut() {
+            m.auto_name = m.observe;
+        }
+        self
+    }
+
+    /// Ask the small model for a session name: once at the start, then once after
+    /// each compaction. A separate request, so the session model's cache is never
+    /// touched; the name lands when the owner is idle. A `/name` pins the name.
+    fn start_naming(&mut self) {
+        let Some(m) = self.memory.as_mut() else { return };
+        if !m.auto_name {
+            return;
+        }
+        let path = self.store.branch();
+        let compaction = path.iter().rev().find_map(|e| match &e.kind {
+            EntryKind::Compaction { summary, .. } => Some((e.id.clone(), summary.clone())),
+            _ => None,
+        });
+        let key = compaction.as_ref().map_or("start", |c| c.0.as_str()).to_string();
+        if m.named_for.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        let current = self.store.name();
+        let about = match (&current, compaction) {
+            (Some((_, false)), _) | (Some(_), None) => {
+                m.named_for = Some(key);
+                return;
+            }
+            (_, Some((_, summary))) => format!("What the session has done so far:\n{}", cut(&summary, 6000)),
+            (None, None) => {
+                let text = |m: &Message| match m {
+                    Message::User { content } => content.iter().find_map(|b| match b {
+                        Block::Text { text, .. } => Some(novacode_types::typed_prompt(text).to_string()),
+                        _ => None,
+                    }),
+                    Message::Assistant(a) => Some(a.text()).filter(|t| !t.trim().is_empty()),
+                    _ => None,
+                };
+                let msgs = path.iter().filter_map(|e| match &e.kind {
+                    EntryKind::Message { message } => Some(message),
+                    _ => None,
+                });
+                let first = msgs.clone().find(|m| matches!(m, Message::User { .. })).and_then(text);
+                let reply = msgs.rev().find(|m| matches!(m, Message::Assistant(_))).and_then(text);
+                let (Some(first), Some(reply)) = (first, reply) else {
+                    return;
+                };
+                format!(
+                    "The user's first message:\n{}\n\nThe agent's reply:\n{}",
+                    cut(&first, 2000),
+                    cut(&reply, 1500)
+                )
+            }
+        };
+        m.named_for = Some(key);
+        let current = current.map(|c| c.0);
+        let (w, session, shared) = (m.worker.clone(), self.store.id().to_string(), self.shared.clone());
+        tokio::spawn(async move {
+            match crate::memory::name_session(&w, current.as_deref(), &about, &session).await {
+                Ok(Some(n)) if current.as_ref() != Some(&n) => {
+                    *shared.auto_name.lock().unwrap() = Some(n);
+                    shared.notify.notify_one();
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "session namer"),
+            }
+        });
     }
 
     /// Compaction without the observer (`memory.enabled: false`, L4.5 revision).
@@ -2576,14 +2656,23 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
             agent.flush_ext_state();
             agent.collect_notes(false).await;
             if let Some(name) = agent.shared.rename.lock().unwrap().take() {
-                log_err(
-                    agent
-                        .store
-                        .append(crate::session::EntryKind::SessionInfo { name: name.clone() }),
-                );
+                log_err(agent.store.append(crate::session::EntryKind::SessionInfo {
+                    name: name.clone(),
+                    auto: false,
+                }));
                 agent.emit(AgentEvent::Stream(StreamEvent::Notice {
                     text: format!("session named \"{name}\""),
                 }));
+            }
+            let auto = agent.shared.auto_name.lock().unwrap().take();
+            if let Some(name) = auto
+                && agent.store.name().is_none_or(|(_, auto)| auto)
+            {
+                log_err(
+                    agent
+                        .store
+                        .append(crate::session::EntryKind::SessionInfo { name, auto: true }),
+                );
             }
             let dir = agent.shared.move_to.lock().unwrap().take();
             if let Some(dir) = dir {
@@ -2598,6 +2687,8 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
                     agent.emit(AgentEvent::Stream(StreamEvent::Notice {
                         text: "nothing to compact: the conversation fits in the part kept verbatim".into(),
                     }));
+                } else {
+                    agent.start_naming();
                 }
                 continue;
             }
@@ -2609,6 +2700,7 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
                 };
                 if idle {
                     agent.after_settle().await;
+                    agent.start_naming();
                 }
             } else if *agent.shared.closed.lock().unwrap() {
                 agent.shared.warm_wake.notify_one();
@@ -2621,6 +2713,11 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
         }
     });
     (handle, task)
+}
+
+/// The first `n` characters of `s`.
+fn cut(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
 }
 
 /// Bring the model's prompt up to date by appending only (L4.7, L1.7): the full
