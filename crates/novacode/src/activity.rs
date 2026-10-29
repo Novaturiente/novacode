@@ -113,6 +113,7 @@ fn pane_args(p: &str, st: &str, s: &State, proj: Option<&str>) -> Vec<String> {
         ("@agent_model", Some(s.model.as_str())),
         // Unset on API-key routes, so a switch away from a subscription clears it.
         ("@agent_account", s.account.as_deref()),
+        ("@agent_name", s.name.as_deref()),
     ];
     if let Some(f) = s.file.as_deref().filter(|f| !f.is_empty()) {
         opts.push(("@agent_session", Some(f)));
@@ -134,9 +135,9 @@ fn pane_args(p: &str, st: &str, s: &State, proj: Option<&str>) -> Vec<String> {
     args
 }
 
-/// The model or account moved: publish the pane options again.
+/// The model, account or name moved: publish the pane options again.
 fn route_changed(last: Option<&State>, s: &State) -> bool {
-    last.is_none_or(|l| l.model != s.model || l.account != s.account)
+    last.is_none_or(|l| l.model != s.model || l.account != s.account || l.name != s.name)
 }
 
 static HERDR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -334,6 +335,7 @@ pub fn spawn(hub: &Arc<Hub>, sinks: Sinks) -> tokio::task::JoinHandle<()> {
                 "@agent_project",
                 "@agent_model",
                 "@agent_account",
+                "@agent_name",
                 "@agent_bg",
             ] {
                 if !args.is_empty() {
@@ -377,6 +379,15 @@ mod tests {
             pane_args("%1", "idle", &s, None)
                 .join(" ")
                 .contains("set -p -t %1 -u @agent_account")
+        );
+        // A new name (L4.18) republishes too.
+        let before = s.clone();
+        s.name = Some("login bug fix".into());
+        assert!(route_changed(Some(&before), &s));
+        assert!(
+            pane_args("%1", "idle", &s, None)
+                .join(" ")
+                .contains("@agent_name login bug fix")
         );
     }
 }

@@ -58,6 +58,9 @@ pub struct CacheStats {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct State {
     pub session: String,
+    /// The session's name (`/name` or automatic, L4.18).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub cwd: String,
     /// `provider/model`.
     pub model: String,

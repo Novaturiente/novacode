@@ -2663,16 +2663,17 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
                 agent.emit(AgentEvent::Stream(StreamEvent::Notice {
                     text: format!("session named \"{name}\""),
                 }));
+                agent.emit(AgentEvent::SessionNamed { name });
             }
             let auto = agent.shared.auto_name.lock().unwrap().take();
             if let Some(name) = auto
                 && agent.store.name().is_none_or(|(_, auto)| auto)
             {
-                log_err(
-                    agent
-                        .store
-                        .append(crate::session::EntryKind::SessionInfo { name, auto: true }),
-                );
+                log_err(agent.store.append(crate::session::EntryKind::SessionInfo {
+                    name: name.clone(),
+                    auto: true,
+                }));
+                agent.emit(AgentEvent::SessionNamed { name });
             }
             let dir = agent.shared.move_to.lock().unwrap().take();
             if let Some(dir) = dir {

@@ -166,6 +166,7 @@ impl Hub {
                 g.state.cache.last_miss = Some(text.trim_start_matches("cache miss:").trim().to_string());
             }
             AgentEvent::Message(m) => g.state.add(m),
+            AgentEvent::SessionNamed { name } => g.state.name = Some(name.clone()),
             AgentEvent::CwdChanged { cwd, branch } => {
                 g.state.cwd = cwd.clone();
                 g.state.branch = branch.clone();
@@ -206,6 +207,7 @@ impl Hub {
             AgentEvent::Message(_)
                 | AgentEvent::Compacted { .. }
                 | AgentEvent::CwdChanged { .. }
+                | AgentEvent::SessionNamed { .. }
                 | AgentEvent::ProcessStarted { .. }
                 | AgentEvent::ProcessEnded { .. }
         );

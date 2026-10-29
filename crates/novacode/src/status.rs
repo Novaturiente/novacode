@@ -32,7 +32,7 @@ fn pct(w: &Option<novacode_ai::quota::Window>) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
-/// `{name}` placeholders: session state detail model account level ctx ctx_tokens window
+/// `{name}` placeholders: session name state detail model account level ctx ctx_tokens window
 /// hit read write miss cost 5h week branch project cwd bg.
 pub fn render(fmt: &str, f: &RunFile) -> String {
     let s = &f.state;
@@ -64,6 +64,7 @@ pub fn render(fmt: &str, f: &RunFile) -> String {
             "branch" => s.branch.clone().unwrap_or_default(),
             "project" => s.project.clone().unwrap_or_default(),
             "cwd" => s.cwd.clone(),
+            "name" => s.name.clone().unwrap_or_default(),
             "bg" => {
                 if f.bg {
                     "bg".into()
@@ -147,6 +148,7 @@ mod tests {
                 session: "01abcdef-1234-5678".into(),
                 model: "claude/claude-opus-5-5".into(),
                 account: Some("mili".into()),
+                name: Some("login bug fix".into()),
                 window_tokens: 200_000,
                 context_tokens: 50_000,
                 ..Default::default()
@@ -155,6 +157,7 @@ mod tests {
         assert_eq!(render("{ctx}% {session} {nope} {", &f), "25% 01abcdef-1234 {nope} {");
         assert_eq!(render("{5h}|{cost}", &f), "|");
         assert_eq!(render("{account}", &f), "mili");
+        assert_eq!(render("{name}", &f), "login bug fix");
         assert!(serde_json::to_string(&f).unwrap().contains(r#""account":"mili""#));
     }
 }

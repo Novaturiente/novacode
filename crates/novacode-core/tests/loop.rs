@@ -898,15 +898,21 @@ async fn session_is_named_by_the_small_model_unless_pinned() {
         h.prompt("the login page rejects valid passwords");
         while !matches!(rx.recv().await.unwrap(), AgentEvent::AgentEnd { .. }) {}
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut named_ev = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::SessionNamed { name } = ev {
+                named_ev = Some(name);
+            }
+        }
         h.shutdown();
         let agent = task.await.unwrap();
         let asked = asked.lock().unwrap().len();
-        (agent.store.name(), asked)
+        (agent.store.name(), asked, named_ev)
     };
-    let (name, asked) = named(None).await;
+    let (name, asked, ev) = named(None).await;
     assert_eq!(name, Some(("login bug fix".into(), true)));
-    assert_eq!(asked, 1);
-    let (name, asked) = named(Some("mine")).await;
+    assert_eq!((asked, ev.as_deref()), (1, Some("login bug fix")));
+    let (name, asked, _) = named(Some("mine")).await;
     assert_eq!(name, Some(("mine".into(), false)));
     assert_eq!(asked, 0);
 }

@@ -368,6 +368,10 @@ pub enum AgentEvent {
     PromptTakenBack {
         text: String,
     },
+    /// The session got a name: `/name` or the namer (L4.18).
+    SessionNamed {
+        name: String,
+    },
     /// The session moved to another folder (a worktree, L5.22).
     CwdChanged {
         cwd: String,

@@ -872,6 +872,8 @@ impl App {
                 self.init.cwd = cwd;
                 self.init.branch = branch;
             }
+            // Shown by `/resume`, `novacode status` and tmux `@agent_name`, not in the chat.
+            AgentEvent::SessionNamed { .. } => {}
             AgentEvent::ProcessStarted { id, name } => {
                 self.tr
                     .notice(format!("⚙ {id} {name}: running in the process manager (/ps)"), false);

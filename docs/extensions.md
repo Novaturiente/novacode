@@ -98,7 +98,7 @@ Styles are theme token names (`accent`, `dim`, `error`, …) or `#rrggbb`. A lin
 | `input` | `{text, source}`. `source` is `prompt` for a new prompt, `steer` for a message typed while a run is going | `{text}` rewrites the prompt before it is saved, `{handled: true}` swallows it. Handlers run in load order and see earlier rewrites. |
 | `before_request` | `{provider, model, cwd, contextTokens, lastUser}` | A string, a list of strings or `{append: string or list}`: unsaved text sent after the cached prefix, for current state such as the time or git status. |
 | `ui_key` | `{tab, node, key, width, height}`. `tab` is `null` for a key from `registerShortcut` | Ignored. |
-| Session events: `agent_start`, `turn_start`, `message`, `tool_start`, `tool_update`, `tool_end`, `retry`, `agent_end`, `settled`, `cwd_changed`, `process_started`, `process_ended`, `compacted`, `prompt_taken_back`, `ui` | The event as on the [wire](automation.md), with snake_case fields (`call_id`, `is_error`, `duration_ms`) | Ignored: observe only. |
+| Session events: `agent_start`, `turn_start`, `message`, `tool_start`, `tool_update`, `tool_end`, `retry`, `agent_end`, `settled`, `cwd_changed`, `session_named`, `process_started`, `process_ended`, `compacted`, `prompt_taken_back`, `ui` | The event as on the [wire](automation.md), with snake_case fields (`call_id`, `is_error`, `duration_ms`) | Ignored: observe only. |
 
 With several `after_tool` handlers, each sees the original result; the last `replace` or `isError` wins. Handlers fail open: an error leaves things as they were. Running past the 10 s limit also disables the extension.
 

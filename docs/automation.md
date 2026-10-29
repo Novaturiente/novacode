@@ -288,7 +288,7 @@ $id = Get-Content id.txt
 | `novacode status --format TEMPLATE` | A template, e.g. `'{state} {ctx}% {5h}'` |
 | `novacode stop ID` | End a live session, a background one included. It sends the stop request and returns without waiting. An unknown id exits `1`. |
 
-`status` fields are: `session state detail model account level ctx ctx_tokens window hit read write miss cost 5h week branch project cwd bg`. It exits with `1` when there is no live session, which makes it easy to use in scripts and in a tmux status line (`#(novacode status --format '{state}')`).
+`status` fields are: `session name state detail model account level ctx ctx_tokens window hit read write miss cost 5h week branch project cwd bg`. It exits with `1` when there is no live session, which makes it easy to use in scripts and in a tmux status line (`#(novacode status --format '{state}')`).
 
 A background session that needs an approval waits in the `blocked` state until you attach and answer. Give it allow rules or `--mode read-only` if you want it to run on its own.
 
@@ -327,6 +327,7 @@ Inside tmux, a session in its own window sets these options on its pane, so your
 | `@agent_cwd`, `@agent_model` | Folder and model |
 | `@agent_account` | The subscription account in use, e.g. `default`. Updated when novacode rotates accounts or you use `/account`. Unset on API-key routes. |
 | `@agent_session` | Session file |
+| `@agent_name` | The session's name (`/name` or the automatic one); unset until it has one |
 | `@agent_project` | The repo name |
 | `@agent_bg` | How many background processes are running (unset when none) |
 

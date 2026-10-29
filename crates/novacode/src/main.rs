@@ -2121,6 +2121,7 @@ async fn start_session(
     let history = agent.store.transcript();
     let mut state = wire::State {
         session: agent.store.id().to_string(),
+        name: agent.store.name().map(|n| n.0),
         cwd: ctx.cwd.display().to_string(),
         model: spec.clone(),
         level: agent.config().thinking,
