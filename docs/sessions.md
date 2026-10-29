@@ -149,6 +149,7 @@ It prints the session id and returns. Other flags such as `-m` work as usual. `-
 | `novacode status` | One-line status of a live session. Shows this tmux pane's session, else the newest in this folder, else the newest live session anywhere. Exits `1` when no live session matches. |
 | `novacode status --all` | Every live session. |
 | `novacode stop <id>` | End a live session, including a background one. |
+| `novacode restore` | Pick a session whose process died mid-run (crash, kill, power loss) and resume it. Startup shows one line when there are any; they are kept 7 days. |
 
 `status` also takes `--session <id>`, `--json`, and `--format '<template>'` for scripts and tmux, for example `--format '{state} {ctx}%'`. Fields: `session state detail model level ctx ctx_tokens window hit read write miss cost 5h week branch project cwd bg`.
 

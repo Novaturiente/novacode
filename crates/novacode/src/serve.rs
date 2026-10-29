@@ -556,7 +556,7 @@ pub fn agents(paths: &Paths) -> std::process::ExitCode {
         }
     }
     if !cut.is_empty() {
-        println!("\ninterrupted mid-run (resume with the command):");
+        println!("\ninterrupted mid-run (resume with the command, or pick with `novacode restore`):");
     }
     for f in cut {
         println!(

@@ -199,6 +199,8 @@ enum Command {
     },
     /// List live sessions on this machine
     Agents,
+    /// Pick a session that was cut off mid-run (crash, kill, power loss) and resume it
+    Restore,
     /// End a live session, a background one included
     Stop { session: String },
     /// Status of a live session: this pane's, else this folder's newest
@@ -619,7 +621,7 @@ fn fail(e: anyhow::Error) -> ExitCode {
     ExitCode::from(1)
 }
 
-async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
+async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     let auth_store = AuthStore::new(paths.home().join("auth.json"));
     match cli.command {
         Some(Command::Login {
@@ -695,6 +697,44 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Some(Command::Agents) => return Ok(serve::agents(&paths)),
+        Some(Command::Restore) => {
+            let cut = serve::interrupted_sessions(&paths);
+            if cut.is_empty() {
+                eprintln!("no sessions were cut off mid-run");
+                return Ok(ExitCode::SUCCESS);
+            }
+            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                bail!("restore needs a terminal; see `novacode agents` for the list");
+            }
+            let items = cut
+                .iter()
+                .map(|f| {
+                    let s = &f.state;
+                    let sum = s.file.as_deref().and_then(|p| session::summary(Path::new(p)));
+                    let short = &s.session[..s.session.len().min(13)];
+                    let title = s.name.clone().or_else(|| {
+                        let t = &sum.as_ref()?.title;
+                        // A subagent's first prompt is its task: show the title its parent gave it.
+                        Some(match t.strip_prefix(session::SUBAGENT_TASK_PREFIX) {
+                            Some(rest) => format!("subagent {}", rest.split_inclusive('"').take(2).collect::<String>()),
+                            None => t.clone(),
+                        })
+                    });
+                    PickItem {
+                        label: title.filter(|t| !t.is_empty()).unwrap_or_else(|| short.into()),
+                        detail: format!(
+                            "{short} · {} · {}",
+                            sum.map_or_else(String::new, |x| ago(x.modified)),
+                            s.cwd
+                        ),
+                        value: s.session.clone(),
+                    }
+                })
+                .collect();
+            let id = novacode_tui::prompt::select("Restore a session cut off mid-run", &[], items)?
+                .context("restore cancelled")?;
+            cli.resume = Some(id);
+        }
         Some(Command::Status {
             session,
             all,
@@ -2659,13 +2699,10 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
         let host = live.host.clone();
         // L8.16: after go_live, so this session is no longer in the list.
         if std::mem::take(&mut first) {
-            for f in serve::interrupted_sessions(&ctx.paths) {
-                let s = &f.state.session;
-                notices.push(format!(
-                    "a session in {} was cut off mid-run: novacode -r {}",
-                    f.state.cwd,
-                    &s[..s.len().min(13)]
-                ));
+            match serve::interrupted_sessions(&ctx.paths).len() {
+                0 => {}
+                1 => notices.push("a session was cut off mid-run: novacode restore".into()),
+                n => notices.push(format!("{n} sessions were cut off mid-run: novacode restore")),
             }
         }
         if live.interrupted {
