@@ -788,6 +788,7 @@ impl App {
             AgentEvent::AgentStart => {
                 self.busy = true;
                 self.activity = "working".into();
+                self.tr.reopen();
             }
             AgentEvent::TurnStart => self.activity = "waiting for the model".into(),
             AgentEvent::Stream(e) => {
@@ -799,7 +800,7 @@ impl App {
                     };
                 }
                 if let StreamEvent::Notice { text } = &e {
-                    self.tr.notice(text.clone(), false);
+                    self.tr.agent_notice(text.clone());
                 }
                 self.tr.on_stream(&e);
             }

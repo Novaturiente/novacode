@@ -236,6 +236,27 @@ impl Transcript {
         });
     }
 
+    /// The agent's own note (a schedule firing, a subagent report, a cache miss): it
+    /// folds with the steps even when it arrives after the turn ended.
+    pub fn agent_notice(&mut self, text: impl Into<String>) {
+        self.turn().items.push(Item::Notice {
+            text: text.into(),
+            error: false,
+            folds: true,
+        });
+    }
+
+    /// A run with no new prompt (a schedule or subagent woke the agent) goes on in the
+    /// last turn: open it again until it settles, so its steps show live and its notes fold.
+    pub fn reopen(&mut self) {
+        if let Some(t) = self.turns.last_mut()
+            && t.done
+        {
+            t.done = false;
+            t.touch();
+        }
+    }
+
     /// A full-width divider that stays in view when its turn folds (a compaction, L9.19).
     pub fn divider(&mut self, text: impl Into<String>, error: bool) {
         self.turn().items.push(Item::Divider {
@@ -1398,6 +1419,17 @@ mod reminder_tests {
         );
         assert!(at("▸ 1 note") < at("done") && !s.contains("proc_1"), "{s}");
         assert_eq!(v.toggles.len(), 2, "each fold line toggles the turn");
+
+        // Idle notes from the agent, and a woken run's notes, fold too.
+        tr.agent_notice("⏰ schedule s6: long report");
+        tr.reopen();
+        tr.notice("allowed for this session: bash kill", false);
+        tr.on_message(&reply(vec![Block::text("report")]));
+        tr.settle();
+        let v = tr.layout(60, &crate::theme::Theme::default());
+        let s = v.lines.iter().map(crate::wrap::plain).collect::<Vec<_>>().join("\n");
+        assert!(!s.contains("schedule s6") && !s.contains("allowed for"), "{s}");
+        assert!(s.contains("▸ 2 notes\n") && s.contains("report"), "{s}");
     }
 
     #[test]
