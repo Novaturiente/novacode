@@ -240,6 +240,10 @@ pub enum ClientCmd {
     /// Response data: `{"disposition": "started" | "queued" | "handled"}`.
     Prompt {
         text: String,
+        /// Sent to the model as written: no `!cmd`, slash command, skill, template,
+        /// extension input or image attachment (for pipelines whose text may start so).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        raw: bool,
     },
     /// Delivered before the next model call of the running turn (L3.7).
     Steer {
@@ -461,7 +465,17 @@ mod tests {
         let client = vec![
             Request {
                 id: Some("1".into()),
-                cmd: ClientCmd::Prompt { text: "fix it".into() },
+                cmd: ClientCmd::Prompt {
+                    text: "fix it".into(),
+                    raw: false,
+                },
+            },
+            Request {
+                id: Some("1b".into()),
+                cmd: ClientCmd::Prompt {
+                    text: "/home/x is a path, !not a command".into(),
+                    raw: true,
+                },
             },
             Request {
                 id: None,

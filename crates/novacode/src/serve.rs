@@ -216,11 +216,17 @@ async fn dispatch(host: &Arc<Host>, cmd: ClientCmd, ui: &mpsc::UnboundedSender<U
         Ok(Value::Null)
     };
     match cmd {
-        ClientCmd::Prompt { text } if text.starts_with('!') => {
+        ClientCmd::Prompt { text, raw: true } => {
+            let disposition = if hub.state().busy { "queued" } else { "started" };
+            hub.update(false, |s| s.busy = true);
+            hub.handle.prompt_content(vec![novacode_types::Block::text(text)]);
+            Ok(json!({ "disposition": disposition }))
+        }
+        ClientCmd::Prompt { text, .. } if text.starts_with('!') => {
             host.user_shell(&text, ui).await;
             Ok(json!({ "disposition": "handled" }))
         }
-        ClientCmd::Prompt { text } if text.starts_with('/') && host.slash(&text).is_some() => {
+        ClientCmd::Prompt { text, .. } if text.starts_with('/') && host.slash(&text).is_some() => {
             let cmd = host.slash(&text).unwrap()?;
             host.handle(cmd, ui, false).await;
             Ok(json!({ "disposition": "handled" }))
@@ -228,7 +234,7 @@ async fn dispatch(host: &Arc<Host>, cmd: ClientCmd, ui: &mpsc::UnboundedSender<U
         ClientCmd::GetCommands => Ok(json!({
             "commands": host.commands().into_iter().map(|(name, description)| json!({"name": name, "description": description})).collect::<Vec<_>>()
         })),
-        ClientCmd::Prompt { text } => {
+        ClientCmd::Prompt { text, .. } => {
             let disposition = if hub.state().busy { "queued" } else { "started" };
             // Busy from hand-in, not from agent_start: a second prompt right after is queued.
             hub.update(false, |s| s.busy = true);
@@ -737,7 +743,7 @@ pub async fn attach(
     tokio::spawn(async move {
         while let Some(c) = cmd_rx.recv().await {
             let cmd = match c {
-                Cmd::Prompt(text) => ClientCmd::Prompt { text },
+                Cmd::Prompt(text) => ClientCmd::Prompt { text, raw: false },
                 Cmd::Steer(text) => ClientCmd::Steer { text },
                 Cmd::Abort => ClientCmd::Abort,
                 Cmd::SetModel(model) => ClientCmd::SetModel { model },
@@ -746,16 +752,25 @@ pub async fn attach(
                 Cmd::Context => ClientCmd::GetContext,
                 Cmd::Compact => ClientCmd::Compact,
                 Cmd::Export(html) => ClientCmd::Export { html },
-                Cmd::Mcp => ClientCmd::Prompt { text: "/mcp".into() },
-                Cmd::Docs => ClientCmd::Prompt { text: "/docs".into() },
+                Cmd::Mcp => ClientCmd::Prompt {
+                    text: "/mcp".into(),
+                    raw: false,
+                },
+                Cmd::Docs => ClientCmd::Prompt {
+                    text: "/docs".into(),
+                    raw: false,
+                },
                 Cmd::Btw(q) => ClientCmd::Prompt {
                     text: format!("/btw {q}"),
+                    raw: false,
                 },
                 Cmd::Rename(name) => ClientCmd::Prompt {
                     text: format!("/name {name}"),
+                    raw: false,
                 },
                 Cmd::Worktree(arg) => ClientCmd::Prompt {
                     text: format!("/worktree {arg}"),
+                    raw: false,
                 },
                 Cmd::ExtKey {
                     ext,

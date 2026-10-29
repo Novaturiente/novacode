@@ -1775,11 +1775,13 @@ impl Agent {
         loop {
             let route = format!("{}/{}", self.cfg.provider, self.cfg.model);
             let messages = self.store.projection();
-            // Never ask for more output than the window has room for (L2.21).
+            // Never ask for more output than the window has room for (L2.21), with 4096
+            // spare for the estimate's error (pi's margin).
             let room = self
                 .cfg
                 .window_tokens
-                .saturating_sub(novacode_types::estimate::context(&messages));
+                .saturating_sub(novacode_types::estimate::context(&messages))
+                .saturating_sub(4096);
             let req = Request {
                 tail: tail.clone(),
                 model: self.cfg.model.clone(),
@@ -1909,8 +1911,10 @@ impl Agent {
         }
     }
 
-    /// Keep a failed attempt on record, hidden from the model.
+    /// Keep a failed attempt on record, hidden from the model. It is asked for again,
+    /// so clients drop the text it streamed.
     fn hide_failed(&mut self, m: AssistantMessage) {
+        self.emit(AgentEvent::Stream(StreamEvent::RetryRollback));
         let id = self.add(EntryKind::Message {
             message: Message::Assistant(m),
         });

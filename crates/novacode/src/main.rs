@@ -1914,7 +1914,7 @@ async fn print_mode(
     tracing::info!(stop = ?stop, usage = ?msg.usage, "print mode done");
     let text = msg.text();
     if matches!(stop, StopReason::Length) {
-        eprintln!("novacode: reply cut at the output token limit");
+        eprintln!("novacode: reply still cut at the output token limit after asking to continue");
     }
     if text.trim().is_empty() && !matches!(stop, StopReason::Error { .. } | StopReason::Aborted) {
         eprintln!("novacode: the final reply had no text");
@@ -1936,7 +1936,9 @@ async fn print_mode(
         }
     }
     Ok(match stop {
-        StopReason::Stop | StopReason::ToolUse | StopReason::Length => ExitCode::SUCCESS,
+        StopReason::Stop | StopReason::ToolUse => ExitCode::SUCCESS,
+        // The output on stdout is incomplete: scripts must be able to tell.
+        StopReason::Length => ExitCode::from(3),
         StopReason::Aborted => ExitCode::from(130),
         StopReason::Error { .. } => {
             eprintln!(

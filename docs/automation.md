@@ -22,15 +22,16 @@ Only the answer goes to stdout, so you can pipe it. novacode exits only after su
 
 An empty prompt with nothing piped fails with `-p needs a prompt`. Print mode needs a model: pass `-m provider/model` or set `model` in settings. Without one it stops with `no model: pass -m provider/model or set "model" in settings`. `--bg` and `--rpc` do the same. Only interactive runs pick one for you.
 
-Two notes go to stderr without changing the exit code: `novacode: reply cut at the output token limit` when the reply hit the length limit, and `novacode: the final reply had no text` when the last reply was empty (not after an error or abort).
+When a reply hits the output limit, novacode asks the model to continue (twice at most). If it is still cut off, `novacode: reply still cut at the output token limit after asking to continue` goes to stderr and the exit code is `3`. `novacode: the final reply had no text` goes to stderr when the last reply was empty (not after an error or abort); it doesn't change the exit code.
 
 ### Exit codes
 
 | Code | Meaning |
 |---|---|
-| `0` | The run finished (stopped normally, hit the length limit, or stopped to use tools) |
+| `0` | The run finished (stopped normally or stopped to use tools) |
 | `1` | The model request failed, or novacode could not start (no model, no login) |
 | `2` | A bad flag or argument (the usage message goes to stderr) |
+| `3` | The reply is incomplete: still cut off at the output limit after asking the model to continue |
 | `130` | The run was aborted (for example Ctrl+C) |
 
 ```sh
@@ -149,7 +150,7 @@ Send one JSON object per line. Add an `id` (any string) to a command to get a `r
 
 | Command | Fields | What it does |
 |---|---|---|
-| `prompt` | `text` | Start a run, or queue it as a follow-up if one is running. A `!cmd` line runs a shell command. A built-in `/command` runs that command instead (see [Slash commands](#slash-commands-over-rpc)). Response data: `{"disposition": "started" \| "queued" \| "handled"}` |
+| `prompt` | `text`, `raw?` | Start a run, or queue it as a follow-up if one is running. A `!cmd` line runs a shell command. A built-in `/command` runs that command instead (see [Slash commands](#slash-commands-over-rpc)). With `"raw": true` the text goes to the model exactly as written: no `!cmd`, slash command, skill, template, extension input or `@image`; use it for generated prompts. Response data: `{"disposition": "started" \| "queued" \| "handled"}` |
 | `steer` | `text` | Send a message to the running turn before its next model call |
 | `abort` | | Stop the running turn |
 | `set_model` | `model` | `provider/model[:level]` |

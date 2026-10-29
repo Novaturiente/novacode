@@ -857,7 +857,16 @@ impl App {
                 );
             }
             // The turn may have added files: the `@` list is read again on next use.
-            AgentEvent::AgentEnd { .. } => self.files = None,
+            AgentEvent::AgentEnd { stop } => {
+                self.files = None;
+                // The agent already asked the model to continue; it was still cut off.
+                if stop == StopReason::Length {
+                    self.tr.notice(
+                        "the reply is still cut off at the output limit after the agent asked to continue: raise `maxTokens` or ask for smaller pieces",
+                        true,
+                    );
+                }
+            }
             AgentEvent::CwdChanged { cwd, branch } => {
                 self.files = None;
                 self.init.cwd = cwd;

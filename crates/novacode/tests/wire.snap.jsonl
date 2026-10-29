@@ -12,6 +12,7 @@
 {"type":"state","state":{"session":"01abc","cwd":"/w","model":"claude/claude-opus-5-5","level":"medium","window_tokens":200000,"busy":false,"spent":0.0,"activity":{"state":"working","detail":"tool:bash"},"file":"/s/01abc.jsonl","context_tokens":0,"compactions":0,"cache":{"last_read":0,"last_write":0,"hit_pct":0.0},"tokens":{"input":0,"output":0,"cache_read":0,"cache_write":0},"started_ms":0}}
 {"type":"bye","reason":"session ended"}
 {"id":"1","type":"prompt","text":"fix it"}
+{"id":"1b","type":"prompt","text":"/home/x is a path, !not a command","raw":true}
 {"type":"steer","text":"also tests"}
 {"type":"abort"}
 {"id":"2","type":"set_model","model":"codex/gpt-5.5:high"}
