@@ -2,6 +2,29 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.6.3] - 2026-10-29
+
+0.6.2 was tagged but never published (a release build failed); its changes ship in this release too.
+
+### Added
+
+- **`"raw": true` for RPC `prompt`** sends the text to the model as written: no `!cmd`, slash command, skill, template, extension input or `@image`. Use it for generated prompts. See [automation](docs/automation.md).
+- **Model loops are stopped.** A reply whose text or thinking keeps repeating the same block is cancelled and asked for again.
+
+### Changed
+
+- **`maxTokens` is the room for the answer.** Reasoning models get 16384 more for thinking on top (every provider counts thinking against the cap), clamped to the model's limit. Before, thinking could use up the whole 16384 and cut long answers off.
+- **A cut-off reply is continued, not restarted:** the nudge quotes where the reply stopped and asks for the next character on.
+- **Print mode exits `3`** when the reply is still cut off after asking the model to continue (was `0`). The TUI shows an error in that case.
+- **Every agent-level retry sends `retry_rollback`**, so clients drop the text the failed attempt streamed.
+- **Output cap keeps 4096 tokens spare** below the room left in the context window.
+- **Folded turns keep every message** and fold each run of tool calls and notes on its own line. Notes from schedules, subagents and cache misses fold too, also when they arrive after the turn ended.
+- **An inlined skill shows as `/name` plus your text** in the transcript, prompt history, session list and `/tree`, not as the whole skill.
+
+### Fixed
+
+- **Windows:** saving a session failed with `Access is denied.` (since the fsync change in 0.6.2).
+
 ## [0.6.2] - 2026-10-29
 
 ### Added
@@ -138,6 +161,7 @@ All notable changes to novacode. Versions follow [semantic versioning](https://s
 - **`novacode auth status`** exits with code 1 when only keyless local servers (`ollama`, `lmstudio`) are listed.
 - **Print mode** notes on stderr when the reply was cut at the output token limit or had no text.
 
+[0.6.3]: https://github.com/Novaturiente/novacode/compare/v0.6.1...v0.6.3
 [0.6.2]: https://github.com/Novaturiente/novacode/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/Novaturiente/novacode/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Novaturiente/novacode/compare/v0.5.0...v0.6.0
