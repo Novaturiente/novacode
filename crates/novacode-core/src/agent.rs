@@ -1674,7 +1674,12 @@ impl Agent {
             if let Some(n) = nudge
                 && rec.allow(n)
             {
-                self.nudge(n.text());
+                let say = if n == Nudge::CutOff {
+                    Nudge::cut_off(&text)
+                } else {
+                    n.text().into()
+                };
+                self.nudge(&say);
                 continue;
             }
             if !self.shared.queues.lock().unwrap().follow_up.is_empty() {

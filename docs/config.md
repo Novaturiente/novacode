@@ -9,7 +9,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `compat.claude` | bool | true | Also load skills, agents and commands from `~/.claude` and a trusted project's `.claude`. novacode's own folders win a name. `~/.agents/skills` loads either way. |
 | `model` | string | picked at first run | Default `provider/model[:level]`, e.g. `claude/claude-opus-5-5:medium`. |
 | `thinking` | string | `medium` | Default thinking level: off, minimal, low, medium, high, xhigh, max. |
-| `maxTokens` | number | 16384 | Output cap per reply, clamped to the model's limit. |
+| `maxTokens` | number | 16384, or 32768 for reasoning models | Output cap per reply, thinking included, clamped to the model's limit. |
 | `contextWindow` | number | from the catalog | Override the model's context window (normally a smaller one). |
 | `cacheRetention` | string | `short` | `long` asks Anthropic (Claude) for 1h prompt caching instead of 5 min. Other providers ignore it. |
 | `cache.warm` | bool | false | Keep the prompt cache alive with 1-token replays while it pays off. |

@@ -30,7 +30,10 @@ impl Limits {
     /// (context window, max output tokens) for a route.
     pub fn of(&self, r: &Route) -> (u64, u32) {
         let window = self.window.unwrap_or(r.info.context);
-        let max = self.max_tokens.unwrap_or(16_384).min(r.info.output.max(1024) as u32);
+        // Every provider counts thinking against this cap: a reasoning model gets 16k
+        // more by default, so its thinking can't eat the answer's 16k.
+        let default = if r.info.reasoning { 32_768 } else { 16_384 };
+        let max = self.max_tokens.unwrap_or(default).min(r.info.output.max(1024) as u32);
         (window, max)
     }
 }

@@ -597,8 +597,11 @@ pub fn build_body(req: &Request, oauth: Option<&OAuthProfile>, ns: &str) -> Valu
                 ThinkingLevel::Medium => 8192,
                 _ => 16_384,
             };
-            // The budget is part of max_tokens; keep the answer's room (pi's rule).
-            max_tokens += budget;
+            // The budget is part of max_tokens, which must be larger: add it only when the
+            // cap can't hold it (the default for reasoning models already has thinking room).
+            if max_tokens <= budget {
+                max_tokens += budget;
+            }
             body.insert("thinking".into(), json!({ "type": "enabled", "budget_tokens": budget }));
         }
         (ThinkingStyle::Adaptive, Some(l)) => {
@@ -964,6 +967,10 @@ mod tests {
         let b = build_body(&r, None, PROVIDER);
         assert_eq!(b["thinking"], json!({ "type": "enabled", "budget_tokens": 8192 }));
         assert_eq!(b["max_tokens"], json!(100 + 8192));
+        // A cap that already holds the budget is kept as is.
+        r.max_tokens = 32_768;
+        assert_eq!(build_body(&r, None, PROVIDER)["max_tokens"], json!(32_768));
+        r.max_tokens = 100;
         r.model = "claude-opus-4-8".into();
         let b = build_body(&r, None, PROVIDER);
         assert_eq!(b["output_config"], json!({ "effort": "medium" }));

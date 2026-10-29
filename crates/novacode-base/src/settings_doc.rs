@@ -25,8 +25,8 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
     (
         "maxTokens",
         "number",
-        "16384",
-        "Output cap per reply, clamped to the model's limit.",
+        "16384, or 32768 for reasoning models",
+        "Output cap per reply, thinking included, clamped to the model's limit.",
     ),
     (
         "contextWindow",

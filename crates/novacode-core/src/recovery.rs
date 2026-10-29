@@ -32,6 +32,23 @@ impl Nudge {
             Nudge::Malformed => "",
         }
     }
+
+    /// The cut-off nudge, quoting where `reply` stopped: without the spot, models
+    /// often start the whole reply (a long JSON document) over.
+    pub fn cut_off(reply: &str) -> String {
+        let tail: String = {
+            let rev: Vec<char> = reply.chars().rev().take(80).collect();
+            rev.into_iter().rev().collect()
+        };
+        if tail.trim().is_empty() {
+            return Nudge::CutOff.text().into();
+        }
+        format!(
+            "Your reply was cut off by the output limit. It ended with:\n<tail>{tail}</tail>\n\
+             Continue from the very next character. Do not repeat anything already written, \
+             do not start over, and add no preamble: your text is joined directly to the end above."
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -94,6 +111,16 @@ mod tests {
         assert!(r.allow(Nudge::CutOff) && r.allow(Nudge::CutOff) && !r.allow(Nudge::CutOff));
         assert!((0..3).all(|_| r.allow(Nudge::Malformed)) && !r.allow(Nudge::Malformed));
         assert!(Recovery::looks_like_text_tool_call("ok\n<invoke name=\"read\">"));
+    }
+
+    #[test]
+    fn cut_off_quotes_the_last_80_chars() {
+        let reply = format!("{{\"a\": \"{}énd", "x".repeat(200));
+        let n = Nudge::cut_off(&reply);
+        let tail = n.split("<tail>").nth(1).unwrap().split("</tail>").next().unwrap();
+        assert_eq!(tail.chars().count(), 80);
+        assert!(reply.ends_with(tail) && n.contains("do not start over"));
+        assert_eq!(Nudge::cut_off("  "), Nudge::CutOff.text());
     }
 
     #[test]
