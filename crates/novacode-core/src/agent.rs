@@ -1791,16 +1791,53 @@ impl Agent {
                 images: self.cfg.images,
                 session: Some(self.store.id().to_string()),
             };
-            let mut rx = self.adapter.stream(req.clone(), cancel.child_token());
-            let mut fin = None;
+            let req_cancel = cancel.child_token();
+            let mut rx = self.adapter.stream(req.clone(), req_cancel.clone());
+            let (mut fin, mut looped) = (None, false);
+            // Text and thinking per block, checked for a model loop every 1000 new bytes.
+            let mut seen = std::collections::HashMap::<usize, (String, usize)>::new();
             while let Some(ev) = rx.recv().await {
                 match ev {
                     StreamEvent::Done(m) | StreamEvent::Error(m) => fin = Some(m),
-                    other => self.emit(AgentEvent::Stream(other)),
+                    other => {
+                        match &other {
+                            StreamEvent::BlockStart {
+                                index,
+                                kind: novacode_types::BlockKind::Text | novacode_types::BlockKind::Thinking,
+                                ..
+                            } => {
+                                seen.insert(*index, (String::new(), 0));
+                            }
+                            StreamEvent::Delta { index, text } if !looped => {
+                                if let Some((buf, checked)) = seen.get_mut(index) {
+                                    buf.push_str(text);
+                                    if buf.len() >= *checked + 1000 {
+                                        *checked = buf.len();
+                                        looped = Recovery::looping(buf);
+                                        if looped {
+                                            req_cancel.cancel();
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        self.emit(AgentEvent::Stream(other))
+                    }
                 }
             }
             let m =
                 fin.unwrap_or_else(|| failed(&self.cfg, ErrorKind::Other, "provider stream ended without a result"));
+            // A looping reply is dropped and asked for again, like a dropped stream.
+            let m = if looped && !cancel.is_cancelled() {
+                failed(
+                    &self.cfg,
+                    ErrorKind::Transient,
+                    "the reply kept repeating the same text (a model loop), so it was stopped",
+                )
+            } else {
+                m
+            };
             if !matches!(m.stop, StopReason::Error { .. } | StopReason::Aborted) {
                 self.after_request(req, &m.usage);
                 let mut side = self.shared.side.lock().unwrap();

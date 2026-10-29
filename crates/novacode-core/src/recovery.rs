@@ -98,6 +98,18 @@ impl Recovery {
         }
         false
     }
+
+    /// A model loop: the last 4000 bytes of `text` are one block of at most 1000
+    /// bytes repeated (4 copies or more). Cheap enough to call every 1000 new bytes.
+    pub fn looping(text: &str) -> bool {
+        const WINDOW: usize = 4000;
+        let b = text.as_bytes();
+        if b.len() < WINDOW {
+            return false;
+        }
+        let w = &b[b.len() - WINDOW..];
+        (1..=WINDOW / 4).any(|p| w[p..] == w[..WINDOW - p])
+    }
 }
 
 #[cfg(test)]
@@ -111,6 +123,16 @@ mod tests {
         assert!(r.allow(Nudge::CutOff) && r.allow(Nudge::CutOff) && !r.allow(Nudge::CutOff));
         assert!((0..3).all(|_| r.allow(Nudge::Malformed)) && !r.allow(Nudge::Malformed));
         assert!(Recovery::looks_like_text_tool_call("ok\n<invoke name=\"read\">"));
+    }
+
+    #[test]
+    fn loops_are_four_exact_repeats_in_the_last_4000_bytes() {
+        let block = "I will now write the JSON for lesson 12 again.\n";
+        assert!(Recovery::looping(&format!("intro {}", block.repeat(100))));
+        // Varied text, and fewer than 4000 repeated bytes, are not loops.
+        let varied: String = (0..400).map(|i| format!("{{\"id\": {i}, \"ok\": true}},")).collect();
+        assert!(!Recovery::looping(&varied));
+        assert!(!Recovery::looping(&format!("{varied}{}", block.repeat(50))));
     }
 
     #[test]
