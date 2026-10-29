@@ -2,6 +2,16 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.6.5] - 2026-10-29
+
+### Added
+
+- **`novacode restore`** lists sessions whose process died mid-run (crash, kill, power loss) by name, id, age and folder, and resumes the one you pick. A subagent shows the title its parent gave it. See [sessions](docs/sessions.md).
+
+### Changed
+
+- **Startup shows one line** for interrupted sessions (`2 sessions were cut off mid-run: novacode restore`) instead of one line per session.
+
 ## [0.6.4] - 2026-10-29
 
 ### Added
@@ -172,6 +182,7 @@ All notable changes to novacode. Versions follow [semantic versioning](https://s
 - **`novacode auth status`** exits with code 1 when only keyless local servers (`ollama`, `lmstudio`) are listed.
 - **Print mode** notes on stderr when the reply was cut at the output token limit or had no text.
 
+[0.6.5]: https://github.com/Novaturiente/novacode/compare/v0.6.4...v0.6.5
 [0.6.4]: https://github.com/Novaturiente/novacode/compare/v0.6.3...v0.6.4
 [0.6.3]: https://github.com/Novaturiente/novacode/compare/v0.6.1...v0.6.3
 [0.6.2]: https://github.com/Novaturiente/novacode/compare/v0.6.1...v0.6.2
