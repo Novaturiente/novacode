@@ -2,6 +2,17 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.6.4] - 2026-10-29
+
+### Added
+
+- **Sessions name themselves.** After the first reply, the observer's small model gives an interactive session a short name, and `/resume` shows it instead of the first prompt. After each compaction it renames the session if the work moved on. It is a separate request, so the session model's cache is untouched. `/name` pins your own name. Not for `-p`, `--rpc` or `memory.enabled: false`. See [sessions](docs/sessions.md).
+- **The name is visible outside:** tmux pane option `@agent_name`, `name` in `get_state` and the run file, `novacode status --format '{name}'`, and a `session_named` event.
+
+### Fixed
+
+- **Todo lists no longer freeze** when the work changes track: an open list the model hasn't touched for 10 replies, or that was compacted away, is shown to it again with a request to update it. A resumed session keeps its list past a compaction.
+
 ## [0.6.3] - 2026-10-29
 
 0.6.2 was tagged but never published (a release build failed); its changes ship in this release too.
@@ -161,6 +172,7 @@ All notable changes to novacode. Versions follow [semantic versioning](https://s
 - **`novacode auth status`** exits with code 1 when only keyless local servers (`ollama`, `lmstudio`) are listed.
 - **Print mode** notes on stderr when the reply was cut at the output token limit or had no text.
 
+[0.6.4]: https://github.com/Novaturiente/novacode/compare/v0.6.3...v0.6.4
 [0.6.3]: https://github.com/Novaturiente/novacode/compare/v0.6.1...v0.6.3
 [0.6.2]: https://github.com/Novaturiente/novacode/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/Novaturiente/novacode/compare/v0.6.0...v0.6.1
