@@ -43,7 +43,7 @@ In each folder it loads **one** file, the first that exists:
 2. `AGENTS.md`
 3. `CLAUDE.md`
 
-(`AGENTS.MD` and `CLAUDE.MD` are also accepted.) An empty file still counts as that folder's file: it loads nothing, and the next name is not tried. So an empty `AGENTS.override.md` hides the `AGENTS.md` next to it. The same real file is never loaded twice, even if it is reachable through a symlink or a worktree. Folders closer to your working directory come later in the prompt, so they are read last.
+(`AGENTS.MD` and `CLAUDE.MD` are also accepted.) An empty file still counts as that folder's file: it loads nothing, and the next name is not tried. So an empty `AGENTS.override.md` hides the `AGENTS.md` next to it. The same real file is never loaded twice, even if it is reachable through a symlink or a worktree. Inside a git worktree nested in its main checkout (for example `repo/.worktrees/feat`), the main checkout's folders are skipped, because the worktree has its own copy of those files. Folders above the main checkout still load. Folders closer to your working directory come later in the prompt, so they are read last.
 
 Each file is wrapped like this in the prompt, so the model knows where it came from:
 

@@ -172,13 +172,21 @@ pub fn build(src: &Sources, environment: &str) -> Sections {
 
 /// Context files: global first, then every folder from `/` down to `cwd`; one per
 /// folder (`AGENTS.override.md` > `AGENTS.md` > `CLAUDE.md`), deduplicated by real
-/// path so worktrees don't load the same file twice (L4.9).
+/// path so worktrees don't load the same file twice (L4.9). Inside a linked git worktree
+/// nested in its main checkout, the main checkout's folders are skipped: the worktree
+/// has its own copy of those files, and loading both doubles and can contradict them.
 pub fn context_files(cwd: &Path, home: &Path) -> Vec<(PathBuf, String)> {
     const NAMES: [&str; 5] = ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
     let mut dirs = vec![home.to_path_buf()];
     let mut chain: Vec<&Path> = cwd.ancestors().collect();
     chain.reverse();
-    dirs.extend(chain.into_iter().map(Path::to_path_buf));
+    let shadowed = nested_worktree(cwd);
+    let skip = |d: &Path| {
+        shadowed
+            .as_ref()
+            .is_some_and(|(wt, main)| d.starts_with(main) && wt.starts_with(d) && d != wt)
+    };
+    dirs.extend(chain.into_iter().filter(|d| !skip(d)).map(Path::to_path_buf));
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for d in dirs {
@@ -196,6 +204,25 @@ pub fn context_files(cwd: &Path, home: &Path) -> Vec<(PathBuf, String)> {
         }
     }
     out
+}
+
+/// `(worktree root, main checkout root)` when `cwd` is in a linked git worktree
+/// (`.git` file pointing at `<main>/.git/worktrees/<name>`). Submodules don't match.
+fn nested_worktree(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+    let dot = cwd.ancestors().map(|d| d.join(".git")).find(|p| p.exists())?;
+    let s = std::fs::read_to_string(&dot).ok()?;
+    let wt = dot.parent()?;
+    let g = PathBuf::from(s.trim().strip_prefix("gitdir: ")?);
+    let g = if g.is_absolute() { g } else { wt.join(g) };
+    let worktrees = g.parent()?;
+    let git = worktrees.parent()?;
+    if worktrees.file_name()? != "worktrees" || git.file_name()? != ".git" {
+        return None;
+    }
+    // Relative gitdirs keep `..` parts; normalise so `starts_with` compares real folders.
+    let main = novacode_base::platform::canonicalize(git.parent()?).ok()?;
+    let wt = novacode_base::platform::canonicalize(wt).ok()?;
+    Some((wt, main))
 }
 
 pub fn render(sections: &Sections) -> String {
@@ -277,6 +304,32 @@ mod tests {
         assert_eq!(got, ["global", "proj", "override"]);
         // A cwd that is the home folder doesn't load the same file twice.
         assert_eq!(context_files(&home, &home).len(), 1);
+    }
+
+    #[test]
+    fn nested_worktree_skips_main_checkout_files() {
+        let d = tempfile::tempdir().unwrap();
+        let root = novacode_base::platform::canonicalize(d.path()).unwrap();
+        let home = root.join("home");
+        let main = root.join("repo");
+        let wt = main.join(".worktrees/feat");
+        let sub = wt.join("src");
+        let sm = main.join("sm");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(main.join(".git/worktrees/feat")).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&sm).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "above").unwrap();
+        std::fs::write(main.join("CLAUDE.md"), "main copy").unwrap();
+        std::fs::write(main.join(".worktrees/AGENTS.md"), "between").unwrap();
+        std::fs::write(wt.join("CLAUDE.md"), "worktree copy").unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: ../../.git/worktrees/feat\n").unwrap();
+        let got: Vec<String> = context_files(&sub, &home).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(got, ["above", "worktree copy"]);
+        // A submodule's `.git` file points into `.git/modules`, so its parents still load.
+        std::fs::write(sm.join(".git"), "gitdir: ../.git/modules/sm\n").unwrap();
+        let got: Vec<String> = context_files(&sm, &home).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(got, ["above", "main copy"]);
     }
 
     #[test]

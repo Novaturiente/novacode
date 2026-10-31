@@ -56,7 +56,7 @@ fn child_model(
 }
 
 /// Reports longer than this reach the model cut, with an `agent read` pointer.
-/// Reports are written terse (see the task preamble), so most arrive whole; only
+/// Reports are written short (see the task preamble), so most arrive whole; only
 /// a runaway one is cut, saving the parent an `agent read` call per child.
 const REPORT_CUT: usize = 6000;
 
@@ -1052,8 +1052,8 @@ impl Supervisor {
                     let first = format!(
                         "{}\"{}\" (agent {}, depth {}), started by another novacode agent. \
                          Do the task below. Your final message is your report to it: what you did, what you \
-                         found with file paths, and anything left open. Write the report terse, for an agent, \
-                         not a person: fragments, no preamble or pleasantries, no restating the task. Keep every \
+                         found with file paths, and anything left open. Keep the report short: plain, complete \
+                         sentences with normal spacing, no preamble or pleasantries, no restating the task. Keep every \
                          fact the parent needs (paths, line numbers, names, numbers, commands, errors quoted \
                          exactly); drop only filler.\n\n{}",
                         novacode_core::session::SUBAGENT_TASK_PREFIX,
