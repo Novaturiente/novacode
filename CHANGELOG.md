@@ -2,6 +2,13 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.6.6] - 2026-10-31
+
+### Fixed
+
+- **Worktrees no longer load the main checkout's `AGENTS.md`/`CLAUDE.md` too.** Inside a git worktree nested in its main checkout (such as `repo/.worktrees/feat`), only the worktree's own copy loads. Before, both copies went into the system prompt, doubling it and mixing two versions of the rules. Folders above the repo still load. See [context](docs/context.md).
+- **Subagent reports are written in plain, complete sentences.** The old "terse fragments" style spread into the parent's own messages in long sessions, until words ran together without spaces.
+
 ## [0.6.5] - 2026-10-29
 
 ### Added
