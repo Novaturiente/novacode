@@ -2,6 +2,25 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.6.7] - 2026-11-03
+
+### Fixed
+
+- **Switching model mid-session no longer breaks the next request.** A tool result without its tool call (or a second result for one call) is left out, and notes that land between a call and its result are sent after the result. Before, Claude could reject every request with `unexpected tool_use_id found in tool_result blocks`.
+- **Rewind checkpoints survive a bad path.** A file git can't add (deleted while the snapshot ran, or behind a symlink) is skipped and listed, instead of failing the whole checkpoint. If the session's folder itself was deleted, novacode says so once instead of on every prompt. See [sessions](docs/sessions.md).
+- **Accounts known to be rate-limited are skipped when rotating.** With every account out, a request fails at once with the reset time instead of bouncing between accounts. See [providers](docs/providers.md).
+- **A request too large for the provider (HTTP 413) compacts and retries**, like other too-long errors. Z.AI's usage cap (code `1308`) counts as used up instead of being retried.
+- **Long silent thinking no longer times out:** a streamed reply may pause up to 300 s between chunks (was 120 s).
+- **`apply_patch` keeps CRLF line endings, a BOM and a missing final newline**, and refuses files that are not UTF-8.
+- **Live bash output** no longer shows `�` where a character was split across chunks.
+- **Codemode `searchTools`** ranks the tool whose name matches above tools that only mention it.
+
+### Changed
+
+- **Collapsed tool lines are dim** (`▸ 13 tool calls · 1 failed`), so the answer text stands out. See [TUI](docs/tui.md).
+- **MCP servers keep running** across `/new`, `/resume`, `/tree`, rewind and `/reload` while their config is unchanged.
+- **The stale todo reminder stops after 3 notes** for a list the model hasn't changed. See [tools](docs/tools.md).
+
 ## [0.6.6] - 2026-10-31
 
 ### Fixed
