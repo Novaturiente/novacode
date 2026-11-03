@@ -199,6 +199,15 @@ impl AuthStore {
             .unwrap_or_default()
     }
 
+    /// When a saved rate-limit window of the account ends; `None` once it has passed.
+    pub fn exhausted_until(&self, provider: &str, account: &str) -> Option<u64> {
+        let now = now_ms();
+        self.exhausted()
+            .get(&format!("{provider}/{account}"))
+            .copied()
+            .filter(|&t| t > now)
+    }
+
     /// Remember that an account is out until `until_ms` (L2.14), for other processes.
     // shortcut: read-modify-write without the auth lock; two processes marking at once can lose one entry, which only costs one extra 429.
     pub fn mark_exhausted(&self, provider: &str, account: &str, until_ms: u64) {

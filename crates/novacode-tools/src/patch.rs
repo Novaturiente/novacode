@@ -133,8 +133,14 @@ fn seek(lines: &[String], old: &[String], from: usize) -> Option<usize> {
         .or_else(|| fits(&|s| s.trim().to_string()))
 }
 
-fn apply_hunks(text: &str, hunks: &[Hunk]) -> Result<String, String> {
-    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+/// Keeps the file's BOM, CRLF endings and missing final newline, as `edit` does.
+fn apply_hunks(raw: &str, hunks: &[Hunk]) -> Result<String, String> {
+    let (bom, body) = raw
+        .strip_prefix(crate::edit::BOM)
+        .map_or(("", raw), |b| (crate::edit::BOM, b));
+    let crlf = body.contains("\r\n");
+    let final_newline = body.is_empty() || body.ends_with('\n');
+    let mut lines: Vec<String> = body.lines().map(String::from).collect();
     let mut cursor = 0;
     for (n, h) in hunks.iter().enumerate() {
         if !h.header.is_empty() {
@@ -158,10 +164,11 @@ fn apply_hunks(text: &str, hunks: &[Hunk]) -> Result<String, String> {
         cursor = at + h.new.len();
     }
     let mut out = lines.join("\n");
-    if !out.is_empty() {
+    if final_newline && !out.is_empty() {
         out.push('\n');
     }
-    Ok(out)
+    let out = if crlf { out.replace('\n', "\r\n") } else { out };
+    Ok(format!("{bom}{out}"))
 }
 
 impl Tool for ApplyPatch {
@@ -212,7 +219,12 @@ impl Tool for ApplyPatch {
                     Op::Delete { path } => writes.push((path.clone(), None)),
                     Op::Update { path, move_to, hunks } => {
                         let text = match ctx.env.read(&ctx.path(path)).await {
-                            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                            Ok(b) => match String::from_utf8(b) {
+                                Ok(t) => t,
+                                Err(_) => {
+                                    return ToolOutput::error(format!("{path} is not UTF-8 text. No changes applied."));
+                                }
+                            },
                             Err(e) => {
                                 return ToolOutput::error(format!("cannot read {path}: {e}. No changes applied."));
                             }
@@ -285,5 +297,35 @@ mod tests {
         assert!(o.is_error && text(&o).contains("No changes applied"));
         assert!(!d.path().join("b").exists());
         assert!(parse_patch("nope").is_err());
+    }
+
+    #[tokio::test]
+    async fn keeps_line_endings_bom_and_missing_final_newline() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(d.path());
+        let cases = [
+            ("a", "one\r\ntwo\r\n", "one\r\nTWO\r\n"),
+            ("b", "one\ntwo", "one\nTWO"),
+            ("c", "\u{feff}one\r\ntwo", "\u{feff}one\r\nTWO"),
+        ];
+        for (name, before, after) in cases {
+            std::fs::write(d.path().join(name), before).unwrap();
+            let patch = format!("*** Begin Patch\n*** Update File: {name}\n one\n-two\n+TWO\n*** End Patch");
+            let o = ApplyPatch.execute(json!({"input": patch}), &c).await;
+            assert!(!o.is_error, "{name}: {}", text(&o));
+            assert_eq!(std::fs::read_to_string(d.path().join(name)).unwrap(), after, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_non_utf8_files() {
+        let d = tempfile::tempdir().unwrap();
+        let bytes = b"one\n\xff\xfe\n";
+        std::fs::write(d.path().join("bin"), bytes).unwrap();
+        let c = ctx(d.path());
+        let patch = "*** Begin Patch\n*** Update File: bin\n-one\n+ONE\n*** End Patch";
+        let o = ApplyPatch.execute(json!({"input": patch}), &c).await;
+        assert!(o.is_error && text(&o).contains("not UTF-8"), "{}", text(&o));
+        assert_eq!(std::fs::read(d.path().join("bin")).unwrap(), bytes);
     }
 }

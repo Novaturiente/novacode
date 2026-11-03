@@ -198,7 +198,7 @@ novacode couldn't write the session file (disk full, permissions, a read-only mo
 
 Press Esc to abort the turn. Open another terminal and run `novacode agents` to see live sessions (ids and prefixes work) and `novacode status` to see what the session is doing (without a session id it picks this tmux pane's session, else the newest in this folder, else the newest live one anywhere; it exits 1 with "no live session" only when none is running; `--all` lists every one). `novacode stop <id>` ends one. `/debug` shows running processes and queued prompts.
 
-A provider that sends nothing for 120 s (no response headers, or a reply that stalls mid-stream) fails with a transient error and is retried ([providers](providers.md#errors-and-retries)), so a silent server can't hang a turn forever. A subagent with no activity for `agents.stallMinutes` (default 10) is stopped ([subagents](subagents.md#limits-and-safety)).
+A provider that sends nothing for too long (no response headers within 120 s, or a reply that stalls for 300 s mid-stream) fails with a transient error and is retried ([providers](providers.md#errors-and-retries)), so a silent server can't hang a turn forever. A subagent with no activity for `agents.stallMinutes` (default 10) is stopped ([subagents](subagents.md#limits-and-safety)).
 
 ## Report a bug
 

@@ -99,7 +99,7 @@ A command that passes its timeout is not killed: it moves to the process manager
 
 ### todo
 
-A small task list. A call with no fields shows the list. The list is saved with the session and comes back on resume.
+A small task list. A call with no fields shows the list. The list is saved with the session and comes back on resume. When an open list goes 10 replies without a look, a hidden note shows it to the model again; after 3 notes for an unchanged list, the notes stop until the model updates it.
 
 | Param | Meaning |
 |---|---|

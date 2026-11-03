@@ -120,6 +120,8 @@ pub struct Agent {
     checkpoints: Option<crate::checkpoint::Repo>,
     /// The run's snapshot, taken while the model thinks; awaited before any tool runs.
     pending_cp: Option<tokio::task::JoinHandle<crate::checkpoint::Snapshot>>,
+    /// The session's folder was deleted and the user was told (once).
+    cwd_gone: bool,
     /// Long-running commands (L5.11); dropping the agent kills them.
     processes: Option<Arc<novacode_tools::process::ProcessManager>>,
     /// Found through `tool_search`, never in the request (L5.17).
@@ -432,6 +434,7 @@ impl Agent {
             extensions: None,
             plugins: None,
             pending_cp: None,
+            cwd_gone: false,
         };
         agent.update_report();
         agent
@@ -702,6 +705,20 @@ impl Agent {
     }
 
     fn start_checkpoint(&mut self) {
+        // A folder removed under the session (a deleted worktree): say so once, not a
+        // failed checkpoint per prompt.
+        if !self.cfg.cwd.is_dir() {
+            if !std::mem::replace(&mut self.cwd_gone, true) {
+                self.emit(AgentEvent::Stream(StreamEvent::Notice {
+                    text: format!(
+                        "the session's folder {} no longer exists: tools that use it fail and files can't be checkpointed. Restart novacode in an existing folder.",
+                        self.cfg.cwd.display()
+                    ),
+                }));
+            }
+            return;
+        }
+        self.cwd_gone = false;
         if let Some(repo) = self.checkpoints.clone() {
             let tracked = self.tracked_paths();
             self.pending_cp = Some(tokio::task::spawn_blocking(move || {
@@ -1673,6 +1690,7 @@ impl Agent {
             // An open todo list the model stopped updating (L5.12): show it again.
             if let Some((items, ago)) = self.store.todo()
                 && ago >= novacode_tools::todo::STALE_AFTER
+                && self.store.todo_notes() < novacode_tools::todo::MAX_STALE_NOTES
                 && items.iter().any(|i| {
                     matches!(
                         i.status,

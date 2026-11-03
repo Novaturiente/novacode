@@ -79,12 +79,16 @@ impl Tool for Bash {
             let run = ctx.env.exec(spec, ctx.cancel.clone(), tx);
             let mut buf: Vec<u8> = Vec::new();
             let mut dropped = 0usize;
+            let mut partial: Vec<u8> = Vec::new();
             let collect = async {
                 while let Some(chunk) = rx.recv().await {
-                    ctx.update(String::from_utf8_lossy(&chunk).into_owned());
+                    ctx.update(live_text(&mut partial, &chunk));
                     buf.extend_from_slice(&chunk);
                     if buf.len() > BUFFER_CAP {
-                        let cut = buf.len() - BUFFER_CAP;
+                        let mut cut = buf.len() - BUFFER_CAP;
+                        while buf.get(cut).is_some_and(|b| b & 0xC0 == 0x80) {
+                            cut += 1; // don't start the kept output inside a character
+                        }
                         buf.drain(..cut);
                         dropped += cut;
                     }
@@ -150,6 +154,20 @@ pub(crate) fn sandbox_note(ctx: &ToolCtx, unsandboxed: bool, failed: bool, out: 
             .map(|_| "[ran outside the sandbox]".to_string());
     }
     crate::sandbox::hint_for(sb, failed, out)
+}
+
+/// The text of a live chunk; a character cut at the chunk's end waits in `partial`
+/// for the next one instead of showing as U+FFFD.
+fn live_text(partial: &mut Vec<u8>, chunk: &[u8]) -> String {
+    partial.extend_from_slice(chunk);
+    let keep = match std::str::from_utf8(partial) {
+        Err(e) if e.error_len().is_none() => partial.len() - e.valid_up_to(),
+        _ => 0,
+    };
+    let tail = partial.split_off(partial.len() - keep);
+    let text = String::from_utf8_lossy(partial).into_owned();
+    *partial = tail;
+    text
 }
 
 fn push_note(out: &mut String, note: Option<String>) {
@@ -247,6 +265,16 @@ mod tests {
     use super::*;
     use crate::testutil::{ctx, text};
     use serde_json::json;
+
+    #[test]
+    fn live_text_keeps_split_characters() {
+        let mut p = Vec::new();
+        let s = "aé".as_bytes(); // é is two bytes
+        assert_eq!(live_text(&mut p, &s[..2]), "a");
+        assert_eq!(live_text(&mut p, &s[2..]), "é");
+        assert_eq!(live_text(&mut p, b"\xffx"), "\u{fffd}x", "bad bytes still show");
+        assert!(p.is_empty());
+    }
 
     #[tokio::test]
     async fn runs_merges_and_reports() {

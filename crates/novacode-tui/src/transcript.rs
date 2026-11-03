@@ -762,9 +762,12 @@ fn lay_turn(
                     .filter(|(k, _)| *k > 0)
                     .map(|(k, w)| plural(k, w))
                     .collect();
-                let mut s = vec![Span::styled(format!("{arrow} {}", what.join(" · ")), t.toggle)];
+                // Collapsed, the line is all dim so the answer text stands out; open, it
+                // marks where the expanded steps start.
+                let (style, failed) = if collapsed { (t.dim, t.dim) } else { (t.toggle, t.error) };
+                let mut s = vec![Span::styled(format!("{arrow} {}", what.join(" · ")), style)];
                 if errors > 0 {
-                    s.push(Span::styled(format!(" · {errors} failed"), t.error));
+                    s.push(Span::styled(format!(" · {errors} failed"), failed));
                 }
                 lines.push(Line::from(s));
             }

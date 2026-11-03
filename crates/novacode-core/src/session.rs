@@ -484,6 +484,18 @@ impl Store {
         Some((items, ago))
     }
 
+    /// How many `todo` notes showed the list since the model last changed it.
+    pub fn todo_notes(&self) -> usize {
+        self.path_to_leaf()
+            .iter()
+            .rev()
+            .take_while(|e| {
+                !matches!(&e.kind, EntryKind::Message { message: Message::ToolResult { tool_name, .. } } if tool_name == "todo")
+            })
+            .filter(|e| matches!(&e.kind, EntryKind::CustomMessage { kind, .. } if kind == "todo"))
+            .count()
+    }
+
     /// What a window replays: the projection without the hidden notes that never
     /// showed live (hooks, env changes, docs briefs, nudges); process, schedule and
     /// subagent notes stay, as one line each.
@@ -921,6 +933,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(s.todo().unwrap().1, 0);
+        assert_eq!(s.todo_notes(), 1);
         // Compacted away: still known, but the model can't see it.
         let kept = s.append(msg("later")).unwrap();
         s.append(EntryKind::Compaction {

@@ -274,23 +274,38 @@ pub fn declaration(t: &ToolInfo) -> String {
     )
 }
 
-/// Word-overlap search over names and descriptions (codemode's `searchTools`).
-fn search(tools: &[ToolInfo], q: &str, limit: usize) -> Value {
-    let words: Vec<String> = q
-        .to_lowercase()
+fn split_words(s: &str) -> Vec<String> {
+    s.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
         .map(String::from)
-        .collect();
+        .collect()
+}
+
+/// Word-overlap search over names and descriptions (codemode's `searchTools`).
+/// A tool whose name holds every query word ranks above ones that only mention them.
+fn search(tools: &[ToolInfo], q: &str, limit: usize) -> Value {
+    let words = split_words(q);
     let mut hits: Vec<(usize, &ToolInfo)> = tools
         .iter()
+        // `tool_search` lists other tools' names and `call` takes any: neither is an answer.
+        .filter(|t| !matches!(t.name.as_str(), "tool_search" | "call"))
         .map(|t| {
-            let name = t.name.to_lowercase();
-            let desc = t.description.to_lowercase();
+            let lname = t.name.to_lowercase();
+            let name = split_words(&t.name);
+            let desc = split_words(&t.description);
             let s = words
                 .iter()
-                .map(|w| 3 * name.contains(w.as_str()) as usize + desc.contains(w.as_str()) as usize)
-                .sum();
+                .map(|w| {
+                    let in_name = if name.contains(w) {
+                        3
+                    } else {
+                        lname.contains(w.as_str()) as usize
+                    };
+                    in_name + desc.contains(w) as usize
+                })
+                .sum::<usize>()
+                + 5 * (!words.is_empty() && words.iter().all(|w| name.contains(w))) as usize;
             (s, t)
         })
         .filter(|(s, _)| *s > 0 || words.is_empty())
@@ -647,6 +662,37 @@ async fn call(s: &Arc<Shared>, name: String, raw: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_prefers_the_named_tool() {
+        let t = |name: &str, description: &str| ToolInfo {
+            name: name.into(),
+            description: description.into(),
+            schema: json!({}),
+            namespace: None,
+            output_schema: None,
+        };
+        let tools = [
+            t(
+                "peekaboo__click",
+                "Click in an app. Use peekaboo app first; app names come from peekaboo app.",
+            ),
+            t("peekaboo__app", "Launch or list applications."),
+            t(
+                "tool_search",
+                "Find more tools. Not listed up front: peekaboo__app, peekaboo__click.",
+            ),
+        ];
+        let r = search(&tools, "peekaboo app", 10);
+        let names: Vec<&str> = r
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names[0].contains("peekaboo__app"), "{names:?}");
+    }
 
     struct Echo;
     impl Host for Echo {

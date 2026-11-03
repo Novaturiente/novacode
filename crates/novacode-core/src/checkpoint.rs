@@ -131,9 +131,7 @@ pub fn snapshot(repo: &Repo, paths: &[String]) -> Snapshot {
             .map(String::as_str)
             .collect();
         for batch in have.chunks(200) {
-            let mut args = vec!["add", "-A", "--"];
-            args.extend(batch);
-            git(repo, &args, i)?;
+            add(repo, &["add", "-A", "--"], batch, i, &mut skipped)?;
         }
     } else {
         git(repo, &["add", "-u"], i)?;
@@ -147,12 +145,32 @@ pub fn snapshot(repo: &Repo, paths: &[String]) -> Snapshot {
             }
         }
         for batch in small.chunks(200) {
-            let mut args = vec!["add", "--"];
-            args.extend(batch);
-            git(repo, &args, i)?;
+            add(repo, &["add", "--"], batch, i, &mut skipped)?;
         }
     }
     Ok((git(repo, &["write-tree"], i)?.trim().to_string(), skipped))
+}
+
+/// `git add` a batch; when one path fails it (gone since the listing, or behind
+/// a symlink), add the rest one by one and list the failures as skipped.
+fn add(repo: &Repo, base: &[&str], batch: &[&str], i: Option<&Path>, skipped: &mut Vec<String>) -> Result<(), String> {
+    let mut args = base.to_vec();
+    args.extend(batch);
+    let Err(first) = git(repo, &args, i) else { return Ok(()) };
+    let mut failed = Vec::new();
+    for p in batch {
+        let mut args = base.to_vec();
+        args.push(p);
+        if git(repo, &args, i).is_err() {
+            failed.push(p.to_string());
+        }
+    }
+    if failed.len() == batch.len() {
+        return Err(first); // not one path's fault (a missing folder, a broken repo)
+    }
+    tracing::warn!(?failed, "checkpoint: paths git could not add");
+    skipped.extend(failed);
+    Ok(())
 }
 
 /// Store a file's current content (shadow stores, before novacode first edits it).
@@ -396,6 +414,44 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "two\n");
         assert!(root.join("new.txt").exists() && !root.join("notes.txt").exists());
         assert!(exists(&repo, &tree) && !exists(&repo, "0000000000000000000000000000000000000000"));
+    }
+
+    #[test]
+    fn one_bad_path_does_not_fail_the_batch() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        let repo = resolve(root, root).unwrap();
+        let idx = TempIndex::new(&repo);
+        let mut skipped = Vec::new();
+        add(
+            &repo,
+            &["add", "--"],
+            &["a.txt", "gone.txt"],
+            Some(idx.0.as_path()),
+            &mut skipped,
+        )
+        .unwrap();
+        assert_eq!(skipped, ["gone.txt"]);
+        assert!(
+            add(
+                &repo,
+                &["add", "--"],
+                &["gone.txt"],
+                Some(idx.0.as_path()),
+                &mut skipped
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -31,7 +31,12 @@ pub fn for_target(messages: &[Message], t: &Target) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     let mut pending: Vec<ToolCall> = Vec::new();
     let mut answered: BTreeSet<String> = BTreeSet::new();
-    let close = |out: &mut Vec<Message>, pending: &mut Vec<ToolCall>, answered: &mut BTreeSet<String>| {
+    // System and custom messages between a call and its results, put after the results.
+    let mut held: Vec<Message> = Vec::new();
+    let close = |out: &mut Vec<Message>,
+                 pending: &mut Vec<ToolCall>,
+                 answered: &mut BTreeSet<String>,
+                 held: &mut Vec<Message>| {
         for c in pending.drain(..) {
             if !answered.contains(&c.id) {
                 out.push(Message::ToolResult {
@@ -44,11 +49,12 @@ pub fn for_target(messages: &[Message], t: &Target) -> Vec<Message> {
             }
         }
         answered.clear();
+        out.append(held);
     };
     for m in messages {
         match m {
             Message::Assistant(a) => {
-                close(&mut out, &mut pending, &mut answered);
+                close(&mut out, &mut pending, &mut answered, &mut held);
                 if matches!(a.stop, StopReason::Error { .. } | StopReason::Aborted) {
                     dropped.extend(a.tool_calls().map(|c| c.id.clone()));
                     continue;
@@ -95,7 +101,11 @@ pub fn for_target(messages: &[Message], t: &Target) -> Vec<Message> {
                     continue;
                 }
                 let call_id = ids.get(call_id).cloned().unwrap_or_else(|| call_id.clone());
-                answered.insert(call_id.clone());
+                // A result whose call isn't in the reply just before it (or a second
+                // result for one call) makes providers reject the whole request.
+                if !pending.iter().any(|c| c.id == call_id) || !answered.insert(call_id.clone()) {
+                    continue;
+                }
                 out.push(Message::ToolResult {
                     call_id,
                     tool_name: tool_name.clone(),
@@ -105,7 +115,7 @@ pub fn for_target(messages: &[Message], t: &Target) -> Vec<Message> {
                 });
             }
             Message::User { content } => {
-                close(&mut out, &mut pending, &mut answered);
+                close(&mut out, &mut pending, &mut answered, &mut held);
                 out.push(Message::User {
                     content: images(content, t.images),
                 });
@@ -115,13 +125,12 @@ pub fn for_target(messages: &[Message], t: &Target) -> Vec<Message> {
                 if pending.is_empty() {
                     out.push(other.clone());
                 } else {
-                    close(&mut out, &mut pending, &mut answered);
-                    out.push(other.clone());
+                    held.push(other.clone());
                 }
             }
         }
     }
-    close(&mut out, &mut pending, &mut answered);
+    close(&mut out, &mut pending, &mut answered, &mut held);
     out
 }
 
@@ -278,6 +287,28 @@ mod tests {
         assert_eq!(content[0], Block::text(NO_RESULT));
         assert_eq!(out.len(), 5, "errored reply and its result left out: {out:#?}");
         assert_eq!(for_target(&msgs, &t), out, "deterministic");
+    }
+
+    #[test]
+    fn results_stay_next_to_their_calls() {
+        let msgs = vec![
+            Message::user("hi"),
+            asst("openai", "gpt-5", StopReason::ToolUse, vec![call("c1")]),
+            Message::System { text: "note".into() },
+            result("c1"),
+            result("c1"),     // duplicate
+            result("orphan"), // its call was never stored
+        ];
+        let t = Target {
+            provider: "openai",
+            model: "gpt-5",
+            images: true,
+            normalize_id: None,
+        };
+        let out = for_target(&msgs, &t);
+        assert_eq!(out.len(), 4, "{out:#?}");
+        assert!(matches!(&out[2], Message::ToolResult { call_id, is_error: false, .. } if call_id == "c1"));
+        assert!(matches!(&out[3], Message::System { .. }), "note after the result");
     }
 
     #[test]

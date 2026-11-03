@@ -131,6 +131,17 @@ impl Inner {
         self.named.send_replace(self.accounts[i].clone());
     }
 
+    /// The first account after `i` not inside a saved rate-limit window.
+    fn next_free(&self, i: usize) -> Option<usize> {
+        let n = self.accounts.len();
+        (1..n).map(|k| (i + k) % n).find(|&j| {
+            self.providers
+                .auth
+                .exhausted_until(&self.provider, &self.accounts[j])
+                .is_none()
+        })
+    }
+
     async fn adapter(&self, i: usize) -> Result<Arc<dyn Adapter>, AuthFailure> {
         let account = &self.accounts[i];
         #[cfg(test)]
@@ -160,6 +171,18 @@ impl Inner {
 
     async fn run(&self, req: Request, cancel: CancellationToken, tx: mpsc::Sender<StreamEvent>) {
         let n = self.accounts.len();
+        // The current account is known to be out (another process or the observer hit
+        // it): start on a free one instead of spending a request on a 429.
+        let i = self.current.load(Ordering::Relaxed);
+        if self
+            .providers
+            .auth
+            .exhausted_until(&self.provider, &self.accounts[i])
+            .is_some()
+            && let Some(j) = self.next_free(i)
+        {
+            self.set_current(j);
+        }
         'accounts: for tried in 0..n {
             let i = self.current.load(Ordering::Relaxed);
             let a = match self.adapter(i).await {
@@ -184,10 +207,29 @@ impl Inner {
             while let Some(mut ev) = rx.recv().await {
                 if let StreamEvent::Error(m) = &ev
                     && !forwarded
-                    && tried + 1 < n
                     && exhausted(&m.stop)
                 {
-                    let next = (i + 1) % n;
+                    let wait = match &m.stop {
+                        StopReason::Error {
+                            kind:
+                                ErrorKind::RateLimit {
+                                    retry_after_ms: Some(ms),
+                                },
+                        } => *ms,
+                        _ => 3_600_000, // quota without a reset time: try again in an hour
+                    };
+                    self.providers
+                        .auth
+                        .mark_exhausted(&self.provider, &self.accounts[i], now_ms() + wait);
+                }
+                // Rotate only to an account not known to be out: when all are, one
+                // request fails fast instead of one per account.
+                if let StreamEvent::Error(m) = &ev
+                    && !forwarded
+                    && tried + 1 < n
+                    && exhausted(&m.stop)
+                    && let Some(next) = self.next_free(i)
+                {
                     let why = m.error_message.as_deref().unwrap_or("used up");
                     let note = format!(
                         "{} account `{}` is exhausted ({why}); switched to account `{}`",
@@ -202,18 +244,6 @@ impl Inner {
                         to = %self.accounts[next],
                         "account exhausted, rotating"
                     );
-                    let wait = match &m.stop {
-                        StopReason::Error {
-                            kind:
-                                ErrorKind::RateLimit {
-                                    retry_after_ms: Some(ms),
-                                },
-                        } => *ms,
-                        _ => 3_600_000, // quota without a reset time: try again in an hour
-                    };
-                    self.providers
-                        .auth
-                        .mark_exhausted(&self.provider, &self.accounts[i], now_ms() + wait);
                     self.set_current(next);
                     continue 'accounts;
                 }
@@ -380,6 +410,63 @@ mod tests {
             (StopReason::Stop, "work".to_string()),
             "{:?}",
             m.error_message
+        );
+    }
+
+    #[tokio::test]
+    async fn accounts_known_to_be_out_are_skipped() {
+        let quota = http(
+            "429 Too Many Requests",
+            "application/json",
+            r#"{"error":{"code":"insufficient_quota","message":"quota"}}"#,
+        );
+        // One reply only: a second request (rotating into `work`) would hang.
+        let url = server(vec![quota]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let sub = format!(
+            r#"{{ "providers": {{ "sub": {{ "name": "Sub", "api": "openai-chat", "auth": "oauth", "baseUrl": "{url}" }} }} }}"#
+        );
+        std::fs::write(&path, sub).unwrap();
+        let p = Arc::new(Providers::load(dir.path(), &Settings::load(&path, None, false)));
+        let cred = |t: &str| OAuthCredential {
+            access: t.into(),
+            refresh: "r".into(),
+            expires_ms: u64::MAX / 2,
+            project: None,
+        };
+        p.auth.put("sub", "default", cred("a")).await.unwrap();
+        p.auth.put("sub", "work", cred("b")).await.unwrap();
+        p.auth.mark_exhausted("sub", "work", now_ms() + 60_000);
+        let (first, _) = p.adapter_for("sub", "default", None).await.unwrap();
+        let a = Live::new(p.clone(), "sub", vec!["default".into(), "work".into()], None, first);
+        let req = Request {
+            tail: Vec::new(),
+            model: "m".into(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 10,
+            cache: CacheRetention::Short,
+            thinking: None,
+            images: false,
+            session: None,
+        };
+        let m = tokio::time::timeout(
+            Duration::from_secs(10),
+            collect(a.stream(req, CancellationToken::new())),
+        )
+        .await
+        .expect("no second request");
+        assert_eq!(
+            m.stop,
+            StopReason::Error {
+                kind: ErrorKind::QuotaExhausted
+            }
+        );
+        assert!(m.error_message.unwrap().contains("account `default`"));
+        assert!(
+            p.auth.exhausted_until("sub", "default").is_some(),
+            "the last account is marked too"
         );
     }
 

@@ -355,6 +355,7 @@ fn classify(status: u16, headers: &reqwest::header::HeaderMap, body: &str) -> Fa
             retry_after_ms: retry::retry_after(headers).map(|d| d.as_millis() as u64),
         },
         408 | 409 | 500.. => ErrorKind::Transient,
+        413 => ErrorKind::Overflow, // also a proxy's non-JSON 413
         _ => error_kind(etype, &msg),
     };
     (kind, msg)
@@ -370,7 +371,9 @@ fn error_kind(etype: &str, msg: &str) -> ErrorKind {
             ErrorKind::Overflow
         }
         "invalid_request_error" if lower.contains("credit balance") => ErrorKind::QuotaExhausted,
-        "invalid_request_error" | "not_found_error" | "request_too_large" => ErrorKind::InvalidRequest,
+        // HTTP 413, body over the size limit: compacting shrinks it (L4.6).
+        "request_too_large" => ErrorKind::Overflow,
+        "invalid_request_error" | "not_found_error" => ErrorKind::InvalidRequest,
         _ => ErrorKind::Other,
     }
 }
@@ -1206,6 +1209,10 @@ mod tests {
             ErrorKind::Transient
         );
         assert_eq!(classify(429, &h, "").0, ErrorKind::RateLimit { retry_after_ms: None });
+        assert_eq!(
+            classify(413, &h, &body("request_too_large", "Request exceeds the maximum size")).0,
+            ErrorKind::Overflow
+        );
     }
 
     /// One-shot HTTP server replaying canned responses, one per connection.

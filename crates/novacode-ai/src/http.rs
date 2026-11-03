@@ -16,8 +16,11 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Time allowed for the response headers, and between any two body chunks.
+/// Time allowed for the response headers.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Time allowed between two body chunks: longer, since a model can think silently
+/// for minutes at high effort (Codex CLI waits 300 s too).
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub type Failure = (ErrorKind, String);
 
@@ -139,7 +142,7 @@ async fn stream_body<W: Wire>(
     let mut body = resp.bytes_stream();
     let mut sse = SseParser::default();
     loop {
-        let chunk = match tokio::time::timeout(IDLE_TIMEOUT, body.next()).await {
+        let chunk = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, body.next()).await {
             Err(_) => return Err((ErrorKind::Transient, "stream idle timeout".into())),
             Ok(None) => break,
             Ok(Some(Err(e))) => return Err((ErrorKind::Transient, format!("stream error: {e}"))),
@@ -179,10 +182,12 @@ pub fn classify_openai(status: u16, headers: &HeaderMap, body: &str) -> Failure 
         .or_else(|| e.as_str())
         .map(String::from)
         .unwrap_or_else(|| format!("HTTP {status}: {}", body.chars().take(500).collect::<String>()));
+    let num = e["code"].as_u64().map(|n| n.to_string());
     let code = e["code"]
         .as_str()
         .or(e["type"].as_str())
         .or(e["status"].as_str())
+        .or(num.as_deref())
         .unwrap_or_default();
     (openai_kind(status, code, &msg, headers), msg)
 }
@@ -203,7 +208,9 @@ fn openai_kind(status: u16, code: &str, msg: &str, headers: &HeaderMap) -> Error
     // statuses or daily wording mean the quota is used up. "billing" alone does not:
     // Google's free-tier per-minute 429 says "check your plan and billing details".
     let used_up = matches!(status, 402 | 403) || ["per day", "daily"].iter().any(|w| lower.contains(w));
+    // Z.AI (Zhipu) code 1308: the plan's usage cap, sent as 429; it resets after hours.
     if code == "insufficient_quota"
+        || (status == 429 && code == "1308")
         || lower.contains("insufficient credits")
         || (lower.contains("quota exceeded") && used_up)
     {
@@ -216,7 +223,9 @@ fn openai_kind(status: u16, code: &str, msg: &str, headers: &HeaderMap) -> Error
             retry_after_ms: retry::retry_after(headers).map(|d| d.as_millis() as u64),
         },
         408 | 409 | 500.. => ErrorKind::Transient,
-        400 | 404 | 413 | 422 => ErrorKind::InvalidRequest,
+        // A body too large to accept: compacting shrinks it (L4.6).
+        413 => ErrorKind::Overflow,
+        400 | 404 | 422 => ErrorKind::InvalidRequest,
         _ => ErrorKind::Other,
     }
 }
@@ -280,6 +289,17 @@ mod tests {
             ),
             ErrorKind::RateLimit { retry_after_ms: None },
             "billing wording alone is a rate limit"
+        );
+        assert_eq!(k(413, "failed to parse request"), ErrorKind::Overflow);
+        for body in [
+            r#"{"error":{"code":"1308","message":"Usage limit reached for 5 hour"}}"#,
+            r#"{"error":{"code":1308,"message":"Usage limit reached for 5 hour"}}"#,
+        ] {
+            assert_eq!(k(429, body), ErrorKind::QuotaExhausted, "{body}");
+        }
+        assert_eq!(
+            k(429, r#"{"error":{"code":"1302","message":"slow down"}}"#),
+            ErrorKind::RateLimit { retry_after_ms: None }
         );
     }
 

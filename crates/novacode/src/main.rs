@@ -1048,6 +1048,7 @@ async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         goals: Default::default(),
         sup: Default::default(),
         carry: Default::default(),
+        mcp: Default::default(),
     };
     let store = match resumed {
         Some(s) => s,
@@ -1104,6 +1105,9 @@ struct Ctx {
     sup: std::sync::Mutex<Option<Arc<agents::Supervisor>>>,
     /// `/reload`: the old session's live state, for the next `agent()` (then taken).
     carry: std::sync::Mutex<Option<novacode_core::agent::Carry>>,
+    /// MCP servers of the last agent built, keyed by their config: `/new`, `/resume`,
+    /// `/tree`, rewind and `/reload` reuse running servers instead of cold-starting them.
+    mcp: std::sync::Mutex<Option<(String, Arc<novacode_core::mcp::Hub>)>>,
 }
 
 impl Ctx {
@@ -1625,7 +1629,22 @@ impl Ctx {
         for w in &mcp_warnings {
             tracing::warn!("mcp config: {w}");
         }
-        let mcp = (!servers.is_empty()).then(|| novacode_core::mcp::Hub::start(servers, self.paths.home(), &self.cwd));
+        let mcp = (!servers.is_empty()).then(|| {
+            let key = format!(
+                "{}\0{:?}",
+                self.cwd.display(),
+                servers.iter().map(|s| (&s.name, &s.config)).collect::<Vec<_>>()
+            );
+            let mut last = self.mcp.lock().unwrap();
+            match last.as_ref().filter(|(k, _)| *k == key) {
+                Some((_, hub)) => hub.clone(),
+                None => {
+                    let hub = novacode_core::mcp::Hub::start(servers, self.paths.home(), &self.cwd);
+                    *last = Some((key, hub.clone()));
+                    hub
+                }
+            }
+        });
         if let Some(h) = &mcp {
             all.extend(h.tools());
         }

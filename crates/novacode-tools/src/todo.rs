@@ -88,6 +88,10 @@ pub fn render(items: &[Item]) -> String {
 /// again and asked to bring it up to date (Claude Code does the same).
 pub const STALE_AFTER: usize = 10;
 
+/// Notes for one unchanged list stop after this many: a model that ignored three
+/// has reasons (the list is right, or it's stuck), and more only cost context.
+pub const MAX_STALE_NOTES: usize = 3;
+
 /// The hidden note that shows the model its open list again.
 pub fn stale_note(items: &[Item], ago: usize) -> String {
     let when = if ago == usize::MAX {

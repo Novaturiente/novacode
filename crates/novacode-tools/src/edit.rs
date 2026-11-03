@@ -27,7 +27,7 @@ struct OneEdit {
     new_text: String,
 }
 
-const BOM: &str = "\u{feff}";
+pub(crate) const BOM: &str = "\u{feff}";
 
 impl Tool for Edit {
     fn name(&self) -> &str {
