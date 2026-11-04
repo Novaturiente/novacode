@@ -47,7 +47,8 @@ fn task_of(name: &str) -> Option<&str> {
 /// The reports waiting in `<super_dir>/inbox`, ordered by `seq` per task.
 /// Reports already applied (by id) are deleted; files for an unknown or
 /// archived task, with a wrong token, or that don't parse move to
-/// `inbox/rejected/`.
+/// `inbox/rejected/`. A file that can't be read, moved or deleted is logged and
+/// skipped; only an unreadable inbox folder is an error.
 pub fn read(super_dir: &Path, board: &Board) -> io::Result<Vec<Pending>> {
     let inbox = super_dir.join("inbox");
     let entries = match std::fs::read_dir(&inbox) {
@@ -57,10 +58,16 @@ pub fn read(super_dir: &Path, board: &Board) -> io::Result<Vec<Pending>> {
     };
     let mut pending = Vec::new();
     for entry in entries {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(%e, "inbox: entry skipped");
+                continue;
+            }
+        };
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(id) = task_of(&name) else { continue };
-        if !entry.file_type()?.is_file() {
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
             continue;
         }
         let path = entry.path();
@@ -82,8 +89,11 @@ pub fn read(super_dir: &Path, board: &Board) -> io::Result<Vec<Pending>> {
                 let why = why.unwrap_or("not a report");
                 tracing::warn!(file = %name, why, "inbox: report rejected");
                 let rejected = inbox.join("rejected");
-                std::fs::create_dir_all(&rejected)?;
-                std::fs::rename(&path, rejected.join(&name))?;
+                if let Err(e) =
+                    std::fs::create_dir_all(&rejected).and_then(|_| std::fs::rename(&path, rejected.join(&name)))
+                {
+                    tracing::warn!(file = %name, %e, "inbox: rejected report not moved");
+                }
             }
         }
     }
@@ -99,7 +109,10 @@ pub fn read(super_dir: &Path, board: &Board) -> io::Result<Vec<Pending>> {
             .is_some_and(|t| t.applied.contains(&p.report.id));
         if applied || !seen.insert(p.report.id.clone()) {
             tracing::debug!(id = %p.report.id, "inbox: duplicate report dropped");
-            p.done()?;
+            let name = p.path.display().to_string();
+            if let Err(e) = p.done() {
+                tracing::warn!(file = %name, %e, "inbox: duplicate report not deleted");
+            }
         } else {
             out.push(p);
         }
@@ -214,5 +227,17 @@ mod tests {
             rejected(&d.0),
             ["T1-1.json", "T1-2.json", "T1-3.json", "T2-1.json", "T9-1.json"]
         );
+    }
+
+    /// C6: a file that can't be moved aside is skipped, not an error for the whole inbox.
+    #[test]
+    fn one_bad_file_does_not_stop_the_others() {
+        let (d, board) = setup("badfile");
+        // `rejected` can't be made: a file holds its name.
+        fs::write(d.0.join("inbox/rejected"), "").unwrap();
+        fs::write(d.0.join("inbox/T1-1.json"), "{not json").unwrap();
+        drop_file(&d.0, "T1-2.json", "ok", "T1", 2, "tok-T1");
+        let got = read(&d.0, &board).unwrap();
+        assert_eq!(ids(&got), ["ok"]);
     }
 }

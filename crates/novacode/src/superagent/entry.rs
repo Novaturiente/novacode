@@ -24,12 +24,27 @@ fn held(dir: &Path) -> bool {
     matches!(try_lock(&lock_path(dir)), Ok(None))
 }
 
+/// `root` is written as the path's bytes, so a path that isn't UTF-8 reads back too.
 fn read_root(dir: &Path) -> Option<PathBuf> {
-    std::fs::read_to_string(dir.join("root")).ok().map(PathBuf::from)
+    let bytes = std::fs::read(dir.join("root")).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes).ok().map(PathBuf::from)
+    }
 }
 
 /// Refuses a root inside or containing the root of a live super, and a hash collision.
 pub fn check_root(home: &Path, root: &Path) -> anyhow::Result<()> {
+    check_collision(home, root)?;
+    check_nested(home, root)
+}
+
+fn check_collision(home: &Path, root: &Path) -> anyhow::Result<()> {
     let own = dir(home, root);
     if let Some(r) = read_root(&own)
         && r != root
@@ -41,6 +56,10 @@ pub fn check_root(home: &Path, root: &Path) -> anyhow::Result<()> {
             own.display()
         );
     }
+    Ok(())
+}
+
+fn check_nested(home: &Path, root: &Path) -> anyhow::Result<()> {
     for e in std::fs::read_dir(home.join("super")).into_iter().flatten().flatten() {
         let d = e.path();
         let Some(other) = read_root(&d) else { continue };
@@ -57,15 +76,17 @@ pub fn check_root(home: &Path, root: &Path) -> anyhow::Result<()> {
 }
 
 /// The detached super takes the root's lock. `None`: another super holds it.
-/// On success the root is checked again (a nested launch may have raced it), `root`
-/// is written and a `session` left by an earlier super is removed.
+/// `root` is written before the root is checked again (a nested launch may have raced
+/// it): of two nested claims at once, the later check sees the other. A `session` left
+/// by an earlier super is removed.
 pub fn claim(home: &Path, root: &Path) -> anyhow::Result<Option<FileLock>> {
     let d = dir(home, root);
     let Some(lock) = try_lock(&lock_path(&d))? else {
         return Ok(None);
     };
-    check_root(home, root)?;
+    check_collision(home, root)?;
     std::fs::write(d.join("root"), root.as_os_str().as_encoded_bytes())?;
+    check_nested(home, root)?;
     match std::fs::remove_file(d.join("session")) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
         _ => {}
@@ -179,6 +200,33 @@ mod tests {
         let e = check_root(&home, &root).unwrap_err().to_string();
         assert!(e.contains("hash collision"), "{e}");
         assert!(claim(&home, &root).is_err());
+    }
+
+    /// C7: a claimant publishes its root before it looks for nested ones, so of two supers
+    /// claiming nested roots at once the later check always sees the other.
+    #[test]
+    fn a_claim_publishes_its_root_before_checking_for_nested_ones() {
+        let (t, home) = setup();
+        let root = t.path().join("projects");
+        let _held = claim(&home, &root).unwrap().unwrap();
+        let inner = root.join("app");
+        assert!(claim(&home, &inner).unwrap_err().to_string().contains("inside"));
+        assert_eq!(
+            std::fs::read(dir(&home, &inner).join("root")).unwrap(),
+            inner.as_os_str().as_encoded_bytes()
+        );
+    }
+
+    /// C7: a root that isn't UTF-8 is still found.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_root_is_checked() {
+        use std::os::unix::ffi::OsStrExt;
+        let (t, home) = setup();
+        let root = t.path().join(std::ffi::OsStr::from_bytes(b"proj\xff"));
+        let _held = claim(&home, &root).unwrap().unwrap();
+        let inside = check_root(&home, &root.join("app")).unwrap_err().to_string();
+        assert!(inside.contains("inside"), "{inside}");
     }
 
     #[test]

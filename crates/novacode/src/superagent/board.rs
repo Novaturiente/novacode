@@ -740,11 +740,8 @@ impl Board {
 
     /// `<dir>/board.json`; a missing file is an empty board.
     pub fn load(dir: &Path) -> io::Result<Board> {
-        match std::fs::read(dir.join("board.json")) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Board::default()),
-            Err(e) => Err(e),
-        }
+        // A corrupt board.json is restored from its `.bak` when that parses.
+        Ok(novacode_base::storage::read_json(&dir.join("board.json"))?.unwrap_or_default())
     }
 
     /// Write `board.json` atomically, then the readable `board.md`.
@@ -1401,6 +1398,17 @@ mod tests {
         let json = std::fs::read_to_string(dir.join("board.json")).unwrap();
         assert!(json.contains("\"waiting-you\"") || json.contains("\"running\""));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// C8: a corrupt board.json is restored from its backup instead of stopping super.
+    #[test]
+    fn a_corrupt_board_loads_from_its_backup() {
+        let d = tempfile::tempdir().unwrap();
+        let first = board(&[("T1", Ready)]);
+        first.save(d.path()).unwrap();
+        board(&[("T1", Ready), ("T2", Running)]).save(d.path()).unwrap();
+        std::fs::write(d.path().join("board.json"), "{\"tasks\": [").unwrap();
+        assert_eq!(Board::load(d.path()).unwrap(), first);
     }
 
     #[test]
