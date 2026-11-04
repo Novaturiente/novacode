@@ -360,7 +360,8 @@ also not with bash. Report with `report`: `verdict` approved | needs-proof | rej
 (for needs-proof, concrete proof requests such as a test for a named case or a browser check with a screenshot; \
 you may name skills for the fix, such as tdd or diagnosing-bugs). `approved` is refused unless the findings name \
 every acceptance criterion by number, one short line each, such as \"Criterion 1: met, `cargo test` passes\"; \
-several lines may share a finding (1000 characters in all).\n",
+several lines may share a finding (1000 characters in all). A criterion that is not met, for any reason, \
+means `rejected` or `needs-proof`, never `approved`; super asks the user when a criterion can't be met.\n",
         i.scratch.display()
     );
     s
@@ -507,11 +508,16 @@ impl Super {
         }
         // Scratch before the row: a crash in between leaves a live row, retired again at restart.
         let dir = scratch(&self.dir, &rv);
+        let live = rv.session.clone().filter(|s| self.launcher.alive(s));
+        if live.is_none() {
+            // What its process started may outlive it (codegraph's daemon) and keep writing there.
+            novacode_tools::process::stop_inside(&dir);
+        }
         remove_scratch(rv.repo.as_deref(), &dir);
         if let Err(e) = self.edit(|b| b.apply(review, Event::Retire)) {
             tracing::warn!(review, %e, "super: review row");
         }
-        if let Some(s) = rv.session.clone().filter(|s| self.launcher.alive(s)) {
+        if let Some(s) = live {
             let l = self.launcher.clone();
             let repo = rv.repo.clone();
             tokio::spawn(async move {
@@ -523,6 +529,8 @@ impl Super {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
                 if dir.exists() {
+                    let d = dir.clone();
+                    let _ = tokio::task::spawn_blocking(move || novacode_tools::process::stop_inside(&d)).await;
                     remove_scratch(repo.as_deref(), &dir);
                 }
             });

@@ -1056,6 +1056,14 @@ impl Super {
         }
         if let Some(s) = t.session.as_deref().filter(|s| self.launcher.alive(s)) {
             let _ = self.launcher.send(s, ClientCmd::Shutdown).await;
+            if remove {
+                for _ in 0..100 {
+                    if !self.launcher.alive(s) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
         }
         if let Some(why) = self.merge_exit(&t.id, &n) {
             return Ok(format!(
@@ -1066,7 +1074,12 @@ impl Super {
         let mut out = format!("Closed {}.", t.label);
         if let Some(w) = &t.worktree {
             match (remove, novacode_tools::worktree::here(w)) {
-                (true, Ok(h)) => out += &novacode_tools::worktree::remove(&h),
+                (true, Ok(h)) => {
+                    // A daemon the task started (codegraph's) outlives it and keeps writing there.
+                    let dir = w.clone();
+                    let _ = tokio::task::spawn_blocking(move || novacode_tools::process::stop_inside(&dir)).await;
+                    out += &novacode_tools::worktree::remove(&h)
+                }
                 (true, Err(e)) => out += &format!(" Worktree not removed: {e}."),
                 _ => out += &format!(" Worktree {} kept (not merged).", w.display()),
             }
@@ -1631,7 +1644,7 @@ mod tests {
         let cfg = Config {
             max_running,
             tiers,
-            worktree_copy: vec!["AGENTS.md".into()],
+            worktree_copy: vec!["AGENTS.md".into(), ".codegraph".into()],
             home: home.clone(),
             allow: Arc::new(|m: &str| match m.starts_with("denied/") {
                 true => Err(format!("{m} is denied by models.deny")),
@@ -2087,6 +2100,35 @@ mod tests {
             git(&app, &["rev-parse", "--verify", &branch]).is_ok(),
             "the branch stays: {out}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn close_stops_a_daemon_left_in_the_worktree_and_removes_it() {
+        // Nothing committed: the branch is merged, so a plain close removes the worktree.
+        let fx = fixture(5, &[Some("Close")]);
+        let app = repo(&fx.root, "app");
+        std::fs::create_dir_all(app.join(".codegraph")).unwrap();
+        std::fs::write(app.join(".codegraph/codegraph.db"), "db").unwrap();
+        run(&fx, spawn_args("app", "cg", true)).await.unwrap();
+        let wt = app.join(".worktrees/T1-cg");
+        assert!(wt.join(".codegraph/codegraph.db").exists(), "copied");
+        // A detached daemon that keeps writing in the copied folder, like codegraph's.
+        let mut daemon = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "while :; do echo x > writer.pid; echo x > codegraph.db-wal; sleep 0.01; done",
+            ])
+            .current_dir(wt.join(".codegraph"))
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let out = run(&fx, json!({"action": "close", "task": "T1-cg"})).await;
+        let gone = daemon.try_wait().unwrap().is_some();
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        assert!(gone, "the daemon is stopped: {out:?}");
+        assert!(!wt.exists(), "{out:?}");
     }
 
     #[tokio::test]
