@@ -1517,6 +1517,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_missing_task_folder_is_named_not_reported_as_a_missing_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let procs = Procs {
+            exe: PathBuf::from("/bin/true"),
+            paths: Paths::new(tmp.path()),
+        };
+        let gone = tmp.path().join("gone");
+        let e = procs
+            .start(Start {
+                cwd: gone.clone(),
+                model: "m".into(),
+                trust: false,
+                resume: None,
+                env: vec![],
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e, format!("the task folder {} no longer exists", gone.display()));
+    }
+
+    #[tokio::test]
     async fn bad_slugs_and_type_write_mismatches_are_refused() {
         let fx = fixture(5, &[]);
         std::fs::create_dir(fx.root.join("p")).unwrap();
