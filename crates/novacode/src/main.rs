@@ -109,6 +109,12 @@ struct Cli {
     /// Run in the background with no window; prints the session id. Attach with `novacode attach`.
     #[arg(long, value_name = "PROMPT", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["print", "rpc"])]
     bg: Option<String>,
+    /// Start (or reattach to) the super agent for this folder: one session that runs your tasks.
+    #[arg(long = "super", conflicts_with_all = ["print", "rpc", "bg", "resume", "continue", "worktree", "mode", "profile", "trust", "no_session", "agent", "tools", "mcp", "initial", "profile_startup"])]
+    super_: bool,
+    /// The detached super process itself (set by the `--super` launcher).
+    #[arg(long, hide = true, requires = "super_")]
+    super_serve: bool,
     /// API key for the model's provider, for this run only (ahead of saved and env keys).
     #[arg(long, value_name = "KEY")]
     api_key: Option<String>,
@@ -946,8 +952,24 @@ async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         }
         None => {}
     }
+    // --super (L10.9): the launcher starts or finds the root's super and attaches; the
+    // detached super itself holds the root's lock for its whole life.
+    let _super_lock = if cli.super_ {
+        if !cli.super_serve {
+            return super_launch(&paths).await;
+        }
+        let root = novacode_base::platform::canonicalize(std::env::current_dir()?)?;
+        let Some(lock) = superagent::entry::claim(paths.home(), &root)? else {
+            // Another super won the race; its launchers attach to it.
+            return Ok(ExitCode::SUCCESS);
+        };
+        cli.bg = Some(String::new());
+        Some(lock)
+    } else {
+        None
+    };
     // --bg: start a detached copy of this command and report its session id.
-    if cli.bg.is_some() && std::env::var_os("NOVACODE_BG_CHILD").is_none() {
+    if cli.bg.is_some() && !cli.super_serve && std::env::var_os("NOVACODE_BG_CHILD").is_none() {
         return spawn_bg();
     }
     let headless = cli.bg.is_some() || cli.rpc || cli.profile_startup;
@@ -2565,6 +2587,11 @@ async fn serve_headless(ctx: &Ctx, store: Store, model: String) -> anyhow::Resul
     } else {
         // The parent waits for this line; nothing else goes to stdout.
         println!("{}", host.id);
+        if ctx.cli.super_serve {
+            // The socket is up: launchers may attach now.
+            let root = novacode_base::platform::canonicalize(std::env::current_dir()?)?;
+            superagent::entry::write_session(ctx.paths.home(), &root, &host.id)?;
+        }
         let (sink, _) = mpsc::unbounded_channel();
         if let Some(p) = ctx.cli.bg.clone().filter(|p| !p.trim().is_empty()) {
             host.handle(Cmd::Prompt(p), &sink, false).await;
@@ -2713,6 +2740,62 @@ const SHELL_SH: &str = r#"novacode() {
 }
 "#;
 
+/// Detach `c` from this terminal: its own process group, so closing the terminal doesn't
+/// hang it up; on Windows also no console, which would end it when the window closes.
+fn detach(c: &mut std::process::Command) {
+    novacode_base::platform::own_group(c);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        c.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+}
+
+/// `novacode --super` (L10.9): start this folder's super unless one runs, wait up to 10 s
+/// for its session, then attach (without a terminal: print its session id).
+async fn super_launch(paths: &Paths) -> anyhow::Result<ExitCode> {
+    use superagent::entry;
+    let root = novacode_base::platform::canonicalize(std::env::current_dir()?)?;
+    let home = paths.home().to_path_buf();
+    entry::check_root(&home, &root)?;
+    let id = match entry::running(&home, &root, |id| serve::find_live(paths, id).is_ok()) {
+        Some(id) => id,
+        None => {
+            // Not through spawn_bg: its NOVACODE_BG_CHILD would reach every task super starts,
+            // and it reports a super that lost the lock race as a failed start.
+            let mut c = std::process::Command::new(live_path(std::env::current_exe()?));
+            c.args(std::env::args_os().skip(1))
+                .arg("--super-serve")
+                .current_dir(&root)
+                .env_remove("NOVACODE_BG_CHILD")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            detach(&mut c);
+            let mut child = c.spawn()?;
+            std::thread::spawn(move || child.wait());
+            let (p, r) = (paths.clone(), root.clone());
+            tokio::task::spawn_blocking(move || {
+                entry::wait(p.home(), &r, std::time::Duration::from_secs(10), |id| {
+                    serve::find_live(&p, id).is_ok()
+                })
+            })
+            .await??
+        }
+    };
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        eprintln!("super agent {id} runs for {}", root.display());
+        eprintln!("attach with: novacode --super (in {})", root.display());
+        println!("{id}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let trusted = trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &root, false);
+    let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&root)), trusted);
+    serve::attach_loop(paths, &id, || tui_base(paths, &settings), false).await
+}
+
 fn spawn_bg() -> anyhow::Result<ExitCode> {
     use std::io::BufRead;
     let mut c = std::process::Command::new(std::env::current_exe()?);
@@ -2721,16 +2804,7 @@ fn spawn_bg() -> anyhow::Result<ExitCode> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    // Its own process group: closing this terminal doesn't hang it up.
-    novacode_base::platform::own_group(&mut c);
-    // Windows: also no console, which would end it when the window closes.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        c.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
+    detach(&mut c);
     let mut child = c.spawn()?;
     let mut id = String::new();
     std::io::BufReader::new(child.stdout.take().context("no pipe")?).read_line(&mut id)?;
@@ -3493,6 +3567,30 @@ async fn login(store: &AuthStore, provider: &str, account: &str, method: Option<
 
 #[cfg(test)]
 mod tests {
+    /// L10.9: `--super` takes `-m`; every other session flag is refused with it.
+    #[test]
+    fn super_allows_model_and_refuses_other_session_flags() {
+        use clap::Parser;
+        let parse = |args: &[&str]| super::Cli::try_parse_from(["novacode"].iter().chain(args));
+        let ok = parse(&["--super", "-m", "faux/faux"]).unwrap();
+        assert!(ok.super_ && ok.model.as_deref() == Some("faux/faux"));
+        for bad in [
+            &["--super", "--bg"][..],
+            &["--super", "-r", "abc"],
+            &["--super", "-c"],
+            &["--super", "-w"],
+            &["--super", "--mode", "auto"],
+            &["--super", "--profile", "scout"],
+            &["--super", "--trust"],
+            &["--super", "-p", "hi"],
+            &["--super", "--rpc"],
+            &["--super", "--no-session"],
+            &["--super", "fix the build"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
+
     /// L6.9: unset is lenient with a credentials-only sandbox; a bad `permissions` is
     /// hardened (fails closed); an explicit `sandbox.mode` is the full sandbox.
     #[test]
