@@ -22,3 +22,4 @@
 {"type":"approval","approval":3,"answer":{"deny":"not now"}}
 {"id":"9","type":"get_state"}
 {"type":"answer","ask":4,"replies":[{"question":"Which db?","chosen":["SQLite"]}]}
+{"id":"10","type":"set_goal","objective":"make the parser faster","criteria":["p95 under 120 ms"]}

@@ -168,6 +168,7 @@ Send one JSON object per line. Add an `id` (any string) to a command to get a `r
 | `register_tools` | `tools` | Tools your client runs (see below). Response data: `{"registered": n}` |
 | `tool_result` | `call`, `content`, `is_error` | The result of a `tool_call`. A call that isn't waiting gets the error `no tool call <n> is waiting` |
 | `shutdown` | | End the session |
+| `set_goal` | `objective`, `criteria` | Start a [goal](subagents.md#goals) whose criteria are already approved: no approval question, and no run starts (the next prompt works on it). Fails when the session has no goals |
 
 A line that isn't a valid command gets `{"type":"response","command":"parse","ok":false,"error":"bad command: …"}`.
 

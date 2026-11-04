@@ -292,6 +292,15 @@ async fn dispatch(host: &Arc<Host>, cmd: ClientCmd, ui: &mpsc::UnboundedSender<U
             }
             Ok(Value::Null)
         }
+        ClientCmd::SetGoal { objective, criteria } => {
+            let g = host.goals.as_ref().ok_or("goals are off in this session")?;
+            if objective.trim().is_empty() {
+                return Err("the goal needs an objective".into());
+            }
+            let note = g.start_approved(objective, criteria);
+            hub.handle.remind_as("goal", note, false);
+            Ok(Value::Null)
+        }
         // Handled in `serve`, which owns the client link.
         ClientCmd::RegisterTools { .. } | ClientCmd::ToolResult { .. } => Err("not available here".into()),
     }
@@ -917,6 +926,146 @@ mod tests {
         assert!(listen(&sock, |_, _| {}).is_err());
         accept.abort();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ST11 (L10.9): `set_goal` over the socket starts an active goal with the given
+    /// criteria, already approved: the model is told so, and no ask card opens.
+    #[tokio::test]
+    async fn set_goal_starts_an_approved_goal_without_asking() {
+        use novacode_ai::faux::{Faux, FauxReply};
+        let home = std::env::temp_dir().join(format!("nc-setgoal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let paths = Paths::new(&home);
+        let faux = Faux::new([FauxReply::text("on it")]);
+        let cfg = novacode_core::agent::Config {
+            cwd: home.clone(),
+            provider: "faux".into(),
+            model: "m".into(),
+            max_tokens: 1000,
+            cache: novacode_ai::adapter::CacheRetention::Short,
+            window_tokens: 200_000,
+            images: true,
+            reasoning: true,
+            thinking: Default::default(),
+            spill_dir: home.join("spill"),
+            redactor: Default::default(),
+            prompt: novacode_core::prompt::Sources {
+                cwd: home.clone(),
+                home: home.clone(),
+                context_files: false,
+                skill_dirs: vec![],
+                tool_guidelines: vec![],
+                agent: None,
+                memory_index: None,
+                mode: None,
+            },
+            warm: false,
+            metrics: false,
+        };
+        let store = novacode_core::session::Store::create(&paths, &home, true);
+        let agent = novacode_core::agent::Agent::new(
+            Arc::new(faux.clone()),
+            vec![],
+            store,
+            cfg,
+            Arc::new(novacode_tools::LocalEnv),
+        );
+        let goals = crate::goals::Goals::new(
+            home.join("goal.json"),
+            None,
+            crate::goals::Config {
+                max_runs: 3,
+                max_tokens: None,
+                audit: true,
+                audit_model: None,
+                judge: None,
+            },
+        );
+        let (handle, task) = novacode_core::agent::spawn(agent);
+        let hub = crate::hub::Hub::start(handle, vec![], State::default(), None);
+        let settings = novacode_base::settings::Settings::load(&home, None, false);
+        let host = Arc::new(Host {
+            hub,
+            cur: Arc::new(std::sync::Mutex::new(("faux/m".into(), Default::default()))),
+            paths: paths.clone(),
+            cwd: home.clone(),
+            id: "setgoal".into(),
+            inputs: crate::Inputs {
+                skills: vec![],
+                templates: vec![],
+            },
+            undo: Default::default(),
+            providers: Arc::new(novacode_ai::connect::Providers::load(&home, &settings)),
+            limits: crate::models::Limits::new(&settings),
+            memory_model: None,
+            trace: None,
+            processes: None,
+            mcp: None,
+            extensions: None,
+            modes: None,
+            goals: Some(goals.clone()),
+            login: Default::default(),
+            adapter: Default::default(),
+            worktree_copy: vec![],
+        });
+        let live = go_live(&host, true).unwrap();
+        let (r, mut w) = tokio::io::split(connect(&live.sock).await.unwrap());
+        w.write_all(
+            concat!(
+                r#"{"id":"g","type":"set_goal","objective":"make the parser faster","criteria":["p95 under 120 ms","cargo test passes"]}"#,
+                "\n",
+                r#"{"id":"p","type":"prompt","text":"go"}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut lines = BufReader::new(r).lines();
+        let mut seen = Vec::new();
+        let read = async {
+            while let Some(l) = lines.next_line().await.unwrap() {
+                let m: ServerMsg = serde_json::from_str(&l).unwrap();
+                let end = matches!(
+                    m,
+                    ServerMsg::Event {
+                        event: novacode_types::AgentEvent::AgentEnd { .. }
+                    }
+                );
+                seen.push(m);
+                if end {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), read)
+            .await
+            .expect("the run ends");
+        let goal_ok = seen.iter().any(|m| {
+            matches!(m, ServerMsg::Response { id: Some(id), ok: true, command, .. } if id == "g" && command == "set_goal")
+        });
+        assert!(goal_ok, "set_goal answered ok: {seen:?}");
+        assert!(
+            !seen.iter().any(|m| matches!(m, ServerMsg::Ask { .. })),
+            "no ask card: {seen:?}"
+        );
+        let g = goals.current().expect("a goal");
+        assert_eq!(g.state, crate::goals::State::Active);
+        assert_eq!(g.objective, "make the parser faster");
+        assert_eq!(g.criteria, ["p95 under 120 ms", "cargo test passes"]);
+        // The model learns the goal and that its criteria are already approved, not
+        // /goal's note that makes it draft criteria and ask for approval.
+        let sent = format!("{:?}", faux.requests.lock().unwrap()[0].messages);
+        assert!(
+            sent.contains("p95 under 120 ms") && sent.contains("already approved"),
+            "{sent}"
+        );
+        assert!(!sent.contains("ask the user to approve"), "{sent}");
+        live.end("done").await;
+        host.hub.handle.shutdown();
+        let _ = task.await;
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // The boot time comes from /proc/stat, so only Linux can call our own pid's old run dead.
