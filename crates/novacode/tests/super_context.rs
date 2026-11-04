@@ -64,13 +64,16 @@ fn super_context_stays_under_50k_tokens_after_20_reports() {
     std::fs::write(home.join("settings.json"), r#"{"memory": {"enabled": false}}"#).unwrap();
     // Super's model has no script lines: every wake gets an empty reply.
     std::fs::write(scripts.join("super.jsonl"), "").unwrap();
-    // The board a restarted super finds: 20 read tasks at work.
+    // The board a restarted super finds: 20 read tasks a code-made report blocked (no
+    // process: a `running` row without a session is started again, audit r5 A13); their
+    // own `done` still applies (R18).
     let sup_dir = home.join("super").join(novacode_core::trust::path_key(&root));
     std::fs::create_dir_all(sup_dir.join("inbox")).unwrap();
     let tasks: Vec<Value> = (1..=20)
         .map(|n| {
             json!({"id": format!("T{n}-q"), "label": format!("T{n}-q"), "kind": "work", "type": "question",
-                   "state": "running", "token": format!("tok{n}"), "model": "faux/script",
+                   "state": "blocked", "block": {"reason": "ended its turn without a report", "code_made": true},
+                   "token": format!("tok{n}"), "model": "faux/script",
                    "request": "answer it", "criteria": ["an answer"], "started": 1, "updated": 1})
         })
         .collect();

@@ -43,6 +43,11 @@ pub const LIMIT_CLEARED: &str = "continue: the provider limit has cleared";
 const RESUMED: &str = "continue: super restarted while your process was gone. First check your folder and git (what \
 is committed, what already ran) and don't repeat anything outside it that already happened (a commit, a push, a \
 message); your proof log is empty, so re-run your checks before you cite them.";
+/// What a task interrupted while merging is sent when resumed: its merge lock is gone.
+const RESUMED_MERGING: &str = "continue: super restarted while you were merging; the merge stopped and its lock is \
+released. Do not merge, rebase or push now. Check your folder and git (and the main checkout for a half-done merge), \
+then report: `done` when your branch still holds the approved work (super merges again with `task merge`), else \
+`blocked` with what you found.";
 /// The request id super's prompts carry (`Launcher::send`): a run that consumed
 /// only these is a turn on super's prompt.
 pub(super) const SUPER_ID: &str = "super";
@@ -192,6 +197,8 @@ pub struct Watcher {
     retry_after_ms: Option<u64>,
     /// A question run ended: its reply for super.
     reply: Option<String>,
+    /// A question run ended on a provider limit: the hold to set.
+    hold: Option<Limit>,
     goal: Option<Goal>,
     /// A run is going: a goal that ends meanwhile is judged at its end (R18).
     running: bool,
@@ -225,6 +232,11 @@ impl Watcher {
     /// The reply of the question run that just ended, once.
     pub fn take_reply(&mut self) -> Option<String> {
         self.reply.take()
+    }
+
+    /// The provider limit the question run that just ended hit, once.
+    pub fn take_hold(&mut self) -> Option<Limit> {
+        self.hold.take()
     }
 
     /// The session state (hello, state updates): its running processes.
@@ -312,13 +324,24 @@ impl Watcher {
                 }
                 self.turn_end(stop, goal)
             }
-            // Errors and limits block as on super's prompt; otherwise the reply wakes super.
+            // Super waits for the reply: every end wakes it, and none blocks the task; a
+            // provider limit holds the provider.
             Run::Question => {
-                let failed = self.failure(stop);
-                if failed.is_none() && !matches!(stop, StopReason::Aborted) {
-                    self.reply = Some(self.last_text().unwrap_or_else(|| "(no text)".into()));
-                }
-                failed
+                self.reply = Some(match self.failure(stop) {
+                    Some(Event::TurnLimit(l)) => {
+                        let r = format!(
+                            "(no answer: its turn hit the {} of provider {}; ask again once it clears)",
+                            l.kind.label(),
+                            l.provider
+                        );
+                        self.hold = Some(l);
+                        r
+                    }
+                    Some(Event::TurnError(e)) => format!("(no answer: its turn ended on: {e})"),
+                    _ if matches!(stop, StopReason::Aborted) => "(no answer: its turn was stopped)".into(),
+                    _ => self.last_text().unwrap_or_else(|| "(no text)".into()),
+                });
+                None
             }
         }
     }
@@ -384,7 +407,9 @@ impl Watcher {
             Goal::Done => "goal done without a report",
             Goal::Blocked => "goal blocked",
             Goal::Failed => "goal can't be met",
-            Goal::None | Goal::Active | Goal::Paused => return None,
+            // It paused itself (or super's stop paused it: the board then refuses this, the task is `stopped`).
+            Goal::Paused => "goal paused (it stalled or used up its runs)",
+            Goal::None | Goal::Active => return None,
         };
         Some(Event::GoalEnded(how.into()))
     }
@@ -524,6 +549,15 @@ impl Links {
     /// `waiting-you` become `interrupted`, a dead merge follows the merge exits; the user
     /// is asked once which interrupted tasks to resume. Live tasks are linked by `tick`.
     fn recover(&self, sup: &Arc<Super>) {
+        // Saved `running` but super went down before its session was recorded: start it again
+        // (its saved folder, worktree or review scratch is reused). Else it holds a slot forever.
+        let _ = sup.edit(|b| {
+            for t in &mut b.tasks {
+                if t.state.is_live() && t.session.is_none() {
+                    t.state = State::Queued;
+                }
+            }
+        });
         let dead: Vec<board::Task> = {
             let b = sup.board.lock().unwrap();
             b.tasks
@@ -551,7 +585,7 @@ impl Links {
                         ));
                     }
                     if sup.row(&t.id).is_ok_and(|r| r.state == State::Interrupted) && n.from != n.to {
-                        interrupted.push(t.label.clone());
+                        interrupted.push((t.label.clone(), n.from == State::Merging));
                     }
                 }
             }
@@ -568,7 +602,7 @@ impl Links {
                 header: Some("Resume tasks".into()),
                 options: interrupted
                     .iter()
-                    .map(|l| novacode_types::Choice {
+                    .map(|(l, _)| novacode_types::Choice {
                         label: l.clone(),
                         description: None,
                         preview: None,
@@ -584,11 +618,12 @@ impl Links {
                 .map(|r| r.chosen)
                 .unwrap_or_default();
             let mut lines = Vec::new();
-            for label in &interrupted {
+            for (label, merging) in &interrupted {
                 if !picked.contains(label) {
                     continue;
                 }
-                let send = serde_json::json!({"action": "send", "task": label, "message": RESUMED});
+                let message = if *merging { RESUMED_MERGING } else { RESUMED };
+                let send = serde_json::json!({"action": "send", "task": label, "message": message});
                 match sup.run(send).await {
                     Ok(_) => lines.push(format!("{label} resumed")),
                     Err(e) => lines.push(format!("{label} didn't resume: {e}")),
@@ -596,8 +631,8 @@ impl Links {
             }
             let rest: Vec<&str> = interrupted
                 .iter()
-                .filter(|l| !picked.contains(l))
-                .map(String::as_str)
+                .map(|(l, _)| l.as_str())
+                .filter(|l| !picked.iter().any(|p| p == l))
                 .collect();
             if !rest.is_empty() {
                 lines.push(format!("{} stay interrupted", rest.join(", ")));
@@ -703,18 +738,23 @@ impl Links {
     /// (no row for this pair in the spec's table) are logged and ignored. Returns
     /// whether a running slot may have freed.
     fn apply(&self, sup: &Super, id: &str, ev: Event) -> bool {
-        self.apply_with(sup, id, ev, "")
+        self.apply_with(sup, id, ev, "") == Some(true)
     }
 
     /// [`apply`](Self::apply), with `extra` lines for the wake (a report's checks).
-    fn apply_with(&self, sup: &Super, id: &str, ev: Event, extra: &str) -> bool {
-        let Ok(before) = sup.row(id) else { return false };
+    /// `None` when the event was refused (or the row is gone), else whether a slot may have freed.
+    fn apply_with(&self, sup: &Super, id: &str, ev: Event, extra: &str) -> Option<bool> {
+        let before = sup.row(id).ok()?;
         if before.kind == board::Kind::Review {
+            if let Event::TurnLimit(l) = &ev {
+                self.review_held(sup, &before, l);
+                return Some(false);
+            }
             // A review row only runs or waits; its turn ends and exits are crashes of the review.
-            return match crash_reason(&ev) {
+            return Some(match crash_reason(&ev) {
                 Some(why) => self.review_crashed(sup, &before, why),
                 None => self.apply_row(sup, id, ev),
-            };
+            });
         }
         let had_hold = match &ev {
             Event::TurnLimit(l) => sup.board.lock().unwrap().holds.contains_key(&l.provider),
@@ -724,11 +764,11 @@ impl Links {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => {
                 tracing::debug!(task = id, %e, "super: event ignored");
-                return false;
+                return None;
             }
             Err(e) => {
                 tracing::warn!(task = id, %e, "super: board");
-                return false;
+                return None;
             }
         };
         let mut extra = extra.to_string();
@@ -738,24 +778,9 @@ impl Links {
                 None => "\nThe merge lock is released; the main checkout shows no half-done merge.".into(),
             };
         }
-        let Ok(t) = sup.row(id) else { return false };
+        let t = sup.row(id).ok()?;
         if let Event::TurnLimit(limit) = &ev {
-            // No reset time known: the hold ends after a fixed wait.
-            let _ = sup.edit(|b| {
-                if let Some(h) = b.holds.get_mut(&limit.provider)
-                    && h.reset_at.is_none()
-                {
-                    h.reset_at = Some(board::now() + HOLD_WITHOUT_RESET);
-                }
-            });
-            if !had_hold {
-                self.inform.notice(format!(
-                    "Provider {} is on hold ({}){}: its queued tasks wait; blocked tasks are resent when it clears.",
-                    limit.provider,
-                    limit.kind.label(),
-                    until(sup, &limit.provider)
-                ));
-            }
+            self.held(sup, limit, had_hold);
         }
         if let Some(old) = before.reviewer.as_deref().filter(|_| t.reviewer != before.reviewer) {
             sup.retire_review(old);
@@ -767,10 +792,7 @@ impl Links {
                 }
                 Err(e) => extra += &format!("\nIt is blocked now: {e}"),
             }
-            match sup.row(id) {
-                Ok(t) => t,
-                Err(_) => return false,
-            }
+            sup.row(id).ok()?
         } else {
             t
         };
@@ -783,7 +805,9 @@ impl Links {
         let wakes = match &ev {
             // Over a code-made block the task's own report always counts (R18).
             Event::Report { state, .. } => {
-                *state != ReportState::Progress && (changed || before.block.as_ref().is_some_and(|b| b.code_made))
+                let restarted = n.effects.iter().any(|e| matches!(e, board::Effect::StartReview { .. }));
+                *state != ReportState::Progress
+                    && (changed || restarted || before.block.as_ref().is_some_and(|b| b.code_made))
             }
             Event::MergeReport(_) | Event::Verdict(_) | Event::BranchMoved | Event::ReviewCantStart(_) => true,
             Event::ReviewCrashed(_) => t.state == State::Blocked,
@@ -800,12 +824,66 @@ impl Links {
             self.inform
                 .note(format!("{}'s review task crashed ({why}); one retry.{extra}", t.label));
         }
-        changed && n.from == State::Running
+        Some(changed && n.from == State::Running)
     }
 
-    /// A question run of task `id` ended: its reply wakes super.
+    /// `limit` holds its provider (the board already has it when a task was blocked by it):
+    /// set a reset time when it has none, and tell the user when the hold is new.
+    fn held(&self, sup: &Super, limit: &Limit, had_hold: bool) {
+        // No reset time known: the hold ends after a fixed wait.
+        let _ = sup.edit(|b| {
+            let h = b.holds.entry(limit.provider.clone()).or_insert_with(|| limit.clone());
+            if h.reset_at.is_none() {
+                h.reset_at = Some(board::now() + HOLD_WITHOUT_RESET);
+            }
+        });
+        if !had_hold {
+            self.inform.notice(format!(
+                "Provider {} is on hold ({}){}: its queued tasks wait; blocked tasks are resent when it clears.",
+                limit.provider,
+                limit.kind.label(),
+                until(sup, &limit.provider)
+            ));
+        }
+    }
+
+    /// A review task's turn hit a provider limit: no crash. The provider is held; the review
+    /// keeps its row (marked with the limit) and is resent to when the limit clears.
+    fn review_held(&self, sup: &Super, rv: &board::Task, limit: &Limit) {
+        let had = sup.board.lock().unwrap().holds.contains_key(&limit.provider);
+        let _ = sup.edit(|b| {
+            if let Some(t) = b.tasks.iter_mut().find(|t| t.id == rv.id) {
+                t.block = Some(board::Block {
+                    reason: limit.kind.label().into(),
+                    limit: Some(limit.clone()),
+                    code_made: true,
+                    merge: false,
+                });
+            }
+        });
+        self.held(sup, limit, had);
+        self.inform.note(format!(
+            "{}'s review task {} hit the {} of provider {}; code resends to it when the limit clears.",
+            rv.reviewer_of.as_deref().unwrap_or("?"),
+            rv.label,
+            limit.kind.label(),
+            limit.provider
+        ));
+    }
+
+    /// A question run of task `id` ended: its reply wakes super, once (the catch-up after a
+    /// reconnect or restart finds no prompt to reply to again); a limit it hit holds the provider.
     fn replied(&self, sup: &Super, id: &str, w: &mut Watcher) {
+        if let Some(l) = w.take_hold() {
+            let had = sup.board.lock().unwrap().holds.contains_key(&l.provider);
+            self.held(sup, &l, had);
+        }
         if let Some(r) = w.take_reply() {
+            let _ = sup.edit(|b| {
+                if let Some(t) = b.tasks.iter_mut().find(|t| t.id == id) {
+                    t.last_prompt = None;
+                }
+            });
             let label = sup.row(id).map(|t| t.label).unwrap_or_else(|_| id.to_string());
             self.inform.wake(format!("{label} replied: {r}"));
         }
@@ -972,6 +1050,17 @@ Address every finding, commit, re-run your checks and report `done` again.",
             } = &ev
             {
                 let done = done_facts(f);
+                // The commit its running review already judges: nothing new to review.
+                let same = sup.row(&r.task).is_ok_and(|t| {
+                    t.state == State::Reviewing
+                        && t.reviewer.is_some()
+                        && t.done.as_ref().map(|d| &d.commit) == Some(&done.commit)
+                });
+                if same {
+                    tracing::debug!(task = r.task, "super: done on the commit under review ignored");
+                    self.applied(sup, p);
+                    continue;
+                }
                 let _ = sup.edit(|b| {
                     if let Some(t) = b.tasks.iter_mut().find(|t| t.id == r.task) {
                         prior_done = Some(t.done.replace(done));
@@ -985,7 +1074,7 @@ Address every finding, commit, re-run your checks and report `done` again.",
                     }
                 });
             }
-            if !self.apply_with(sup, &r.task, ev, &checks_text(f))
+            if self.apply_with(sup, &r.task, ev, &checks_text(f)).is_none()
                 && let Some(old) = prior_done
             {
                 let _ = sup.edit(|b| {
@@ -1036,9 +1125,35 @@ Address every finding, commit, re-run your checks and report `done` again.",
                 })
                 .unwrap_or_default();
             for id in blocked {
-                if sup.edit(|b| b.apply(&id, Event::LimitCleared)).is_ok_and(|r| r.is_ok())
-                    && let Err(e) = sup.deliver(&id, LIMIT_CLEARED.into()).await
-                {
+                let Ok(t) = sup.row(&id) else { continue };
+                let merge = t.block.as_ref().is_some_and(|b| b.merge);
+                if merge || t.kind == board::Kind::Review {
+                    // The limit is spent: a later clear of the provider doesn't concern it.
+                    let _ = sup.edit(|b| {
+                        if let Some(row) = b.tasks.iter_mut().find(|r| r.id == id) {
+                            match row.kind {
+                                board::Kind::Review => row.block = None,
+                                board::Kind::Work => {
+                                    if let Some(bl) = row.block.as_mut() {
+                                        bl.limit = None;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+                if merge {
+                    // Its merge lock is gone: resending would finish the merge without it.
+                    self.inform.wake(format!(
+                        "{}'s provider limit cleared; it stays blocked, as its merge stopped and the merge lock is \
+                         released. Call `task merge` again to retry the merge.",
+                        t.label
+                    ));
+                    continue;
+                }
+                let resend = t.kind == board::Kind::Review
+                    || sup.edit(|b| b.apply(&id, Event::LimitCleared)).is_ok_and(|r| r.is_ok());
+                if resend && let Err(e) = sup.deliver(&id, LIMIT_CLEARED.into()).await {
                     self.inform
                         .note(format!("{id}: the resend after the provider limit failed: {e}"));
                 }
@@ -1202,9 +1317,13 @@ fn done_facts(f: &serde_json::Map<String, Value>) -> board::Done {
     }
 }
 
-/// A task blocked by `provider`'s limit.
+/// A task blocked by `provider`'s limit, or a review task whose turn hit it.
 fn blocked_on(t: &board::Task, provider: &str) -> bool {
-    t.state == State::Blocked
+    let waits = match t.kind {
+        board::Kind::Work => t.state == State::Blocked,
+        board::Kind::Review => t.state.is_live(),
+    };
+    waits
         && t.block
             .as_ref()
             .and_then(|b| b.limit.as_ref())
@@ -1458,7 +1577,7 @@ async fn run_link(
                     match watcher.catch_up(&history, last.as_deref(), busy, goal) {
                         CatchUp::Nothing => {}
                         CatchUp::Report(ev) => {
-                            if links.apply_with(&sup, &id, ev.clone(), &said(&watcher, &ev)) {
+                            if links.apply_with(&sup, &id, ev.clone(), &said(&watcher, &ev)) == Some(true) {
                                 links.kick();
                             }
                         }
@@ -1480,7 +1599,7 @@ async fn run_link(
                     let home = sup.home().to_path_buf();
                     let ev = watcher.event(&event, || Goal::read(&home, &session));
                     if let Some(ev) = ev
-                        && links.apply_with(&sup, &id, ev.clone(), &said(&watcher, &ev))
+                        && links.apply_with(&sup, &id, ev.clone(), &said(&watcher, &ev)) == Some(true)
                     {
                         links.kick();
                     }
@@ -1651,7 +1770,8 @@ mod tests {
         assert_eq!(ev, None);
         assert_eq!(w.take_reply().as_deref(), Some("check 9: exit 0"));
         assert_eq!(w.take_reply(), None, "taken once");
-        // Errors still block, with no reply.
+        // A10 (audit r5): an error, the length limit, a provider limit or a stop still
+        // replies (super is waiting for it) and blocks nothing; a limit holds the provider.
         let ev = run(
             &mut w,
             &[
@@ -1660,8 +1780,22 @@ mod tests {
             ],
             Goal::None,
         );
-        assert!(matches!(ev, Some(Event::TurnError(_))), "{ev:?}");
-        assert_eq!(w.take_reply(), None);
+        assert_eq!(ev, None);
+        let r = w.take_reply().unwrap();
+        assert!(r.contains("no answer") && r.contains("length limit"), "{r}");
+        let quota = StopReason::Error {
+            kind: ErrorKind::QuotaExhausted,
+        };
+        assert_eq!(run(&mut w, &[end(QUESTION, quota)], Goal::None), None);
+        let r = w.take_reply().unwrap();
+        assert!(r.contains("quota of provider faux"), "{r}");
+        assert_eq!(w.take_hold().map(|l| l.kind), Some(LimitKind::Quota));
+        assert_eq!(w.take_hold(), None, "taken once");
+        assert_eq!(
+            run(&mut w, &[says("half"), end(QUESTION, StopReason::Aborted)], Goal::None),
+            None
+        );
+        assert!(w.take_reply().unwrap().contains("stopped"));
         // Super's plain prompt is unchanged.
         assert_eq!(
             run(&mut w, &[end(SUPER, StopReason::Stop)], Goal::None),
@@ -1857,7 +1991,7 @@ mod tests {
     }
 
     #[test]
-    fn a_goal_that_ends_unreported_is_blocked_and_a_paused_one_is_not() {
+    fn a_goal_that_ends_or_pauses_unreported_is_blocked() {
         let mut w = Watcher::new("faux");
         assert_eq!(w.goal(Goal::None), None);
         assert_eq!(w.goal(Goal::Active), None);
@@ -1867,8 +2001,13 @@ mod tests {
             Some(Event::GoalEnded("goal done without a report".into()))
         );
         assert_eq!(w.goal(Goal::Done), None, "once");
+        // A4 (audit r5): a goal that pauses itself (stalls, `goal.maxRuns`) leaves the task
+        // idle; a pause by super's stop is refused by the board (the task is `stopped`).
         w.goal(Goal::Active);
-        assert_eq!(w.goal(Goal::Paused), None);
+        assert_eq!(
+            w.goal(Goal::Paused),
+            Some(Event::GoalEnded("goal paused (it stalled or used up its runs)".into()))
+        );
         w.goal(Goal::Active);
         assert_eq!(w.goal(Goal::Blocked), Some(Event::GoalEnded("goal blocked".into())));
         // Reported during the goal's own runs: no code-made report.
@@ -2724,12 +2863,14 @@ mod tests {
         let tx = fx.asker.waiting.lock().unwrap().remove(0);
         let reply = Reply {
             question: q.question.clone(),
-            chosen: vec!["T2-dead".into()],
+            chosen: vec!["T2-dead".into(), "T5-merge".into()],
             text: None,
             preview: None,
         };
         tx.send(Some(vec![reply])).unwrap();
         fx.until("T2 resumed", |fx| fx.state("T2-dead") == State::Running).await;
+        fx.until("T5 resumed", |fx| fx.state("T5-merge") == State::Running)
+            .await;
         assert_eq!(fx.state("T3-wait"), State::Interrupted);
         let starts = fx.launcher.starts.lock().unwrap().clone();
         assert!(
@@ -2742,6 +2883,12 @@ mod tests {
                 .any(|(_, c)| matches!(c, ClientCmd::Prompt { text, raw: true } if text.contains("check your folder and git"))),
             "{sent:?}"
         );
+        // A3 (audit r5): a task interrupted while merging no longer holds the merge lock.
+        let merge_resumes: Vec<_> = sent
+            .iter()
+            .filter(|(_, c)| matches!(c, ClientCmd::Prompt { text, .. } if text.contains("Do not merge")))
+            .collect();
+        assert_eq!(merge_resumes.len(), 1, "{sent:?}");
         assert!(fx.asker.asked.lock().unwrap().len() == 1, "asked once");
     }
 
@@ -2827,11 +2974,20 @@ mod tests {
             .edit(|b| b.apply("T1-x", Event::GoalEnded("goal done without a report".into())))
             .unwrap()
             .unwrap();
-        write_report(&fx, "T1-x", 1, "tok", json!({"state": "done", "summary": "all good"}));
+        write_report(
+            &fx,
+            "T1-x",
+            1,
+            "tok",
+            json!({"state": "done", "summary": "all good", "commit": "c1"}),
+        );
         fx.links.kick();
         fx.until("reviewing", |fx| fx.state("T1-x") == State::Reviewing).await;
         let row = fx.sup.row("T1-x").unwrap();
         assert_eq!((row.block, row.summary.as_deref()), (None, Some("all good")));
+        // A2 (audit r5): the new done facts stay (they are what the review judges).
+        let commit = row.done.and_then(|d| d.commit);
+        assert_eq!(commit.as_deref(), Some("c1"));
         let wakes: Vec<_> = fx.said().into_iter().filter(|l| l.starts_with("wake:")).collect();
         assert!(
             wakes
@@ -2839,5 +2995,186 @@ mod tests {
                 .any(|w| w.contains("T1-x reported done (now reviewing): all good")),
             "{wakes:?}"
         );
+    }
+
+    fn wakes(fx: &Fx) -> Vec<String> {
+        fx.said().into_iter().filter(|l| l.starts_with("wake:")).collect()
+    }
+
+    fn sent_cleared(fx: &Fx, session: &str) -> bool {
+        fx.launcher
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(s, c)| s == session && matches!(c, ClientCmd::Prompt { text, .. } if text == LIMIT_CLEARED))
+    }
+
+    fn clear_hold(fx: &Fx, provider: &str) {
+        fx.sup
+            .edit(|b| b.holds.get_mut(provider).unwrap().reset_at = Some(board::now() - 1))
+            .unwrap();
+        fx.links.kick();
+    }
+
+    const QUOTA: StopReason = StopReason::Error {
+        kind: ErrorKind::QuotaExhausted,
+    };
+
+    #[tokio::test]
+    async fn a_merging_task_blocked_by_a_limit_stays_blocked_when_it_clears_and_super_is_woken() {
+        // A3 (audit r5): its merge lock is gone, so code must not resend "continue".
+        let fx = fixture(5);
+        let repo = fx.sup.root.join("a");
+        git_repo(&repo);
+        let s = fx.merging("T1-x", &repo);
+        let mut t = fx.end(&s).await;
+        t.catch_up(true, vec![], vec![]).await;
+        t.event(AgentEvent::AgentStart).await;
+        t.event(end(SUPER, QUOTA)).await;
+        fx.until("blocked", |fx| fx.state("T1-x") == State::Blocked).await;
+        assert_eq!(fx.locks(), 0);
+        clear_hold(&fx, "faux");
+        fx.until("woken", |fx| wakes(fx).iter().any(|w| w.contains("limit cleared")))
+            .await;
+        let w = wakes(&fx).into_iter().find(|w| w.contains("limit cleared")).unwrap();
+        assert!(w.contains("`task merge`"), "{w}");
+        let row = fx.sup.row("T1-x").unwrap();
+        assert_eq!(row.state, State::Blocked);
+        assert!(row.block.unwrap().limit.is_none(), "not woken again by a later clear");
+        assert!(!sent_cleared(&fx, &s));
+    }
+
+    #[tokio::test]
+    async fn a_done_on_a_new_commit_during_review_restarts_the_review_and_wakes_super() {
+        // A5 (audit r5).
+        let fx = fixture(5);
+        fx.task("T1-x", "faux/a", State::Reviewing);
+        fx.task("T2-review-T1-x", "faux/s", State::Running);
+        fx.sup
+            .edit(|b| {
+                let t = &mut b.tasks[0];
+                (t.write, t.tier) = (true, Some("quick".into()));
+                t.reviewer = Some("T2-review-T1-x".into());
+                t.done = Some(board::Done {
+                    commit: Some("c1".into()),
+                    ..board::Done::default()
+                });
+                let r = &mut b.tasks[1];
+                (r.kind, r.reviewer_of) = (Kind::Review, Some("T1-x".into()));
+            })
+            .unwrap();
+        // The commit under review again: nothing changes.
+        let same = json!({"state": "done", "summary": "again", "commit": "c1"});
+        write_report(&fx, "T1-x", 1, "tok", same);
+        let new = json!({"state": "done", "summary": "fixed more", "commit": "c2"});
+        write_report(&fx, "T1-x", 2, "tok", new);
+        fx.links.kick();
+        fx.until("a new review", |fx| {
+            let r = fx.sup.row("T1-x").unwrap().reviewer;
+            r.is_some_and(|r| r != "T2-review-T1-x")
+        })
+        .await;
+        assert_eq!(fx.state("T2-review-T1-x"), State::Archived);
+        let row = fx.sup.row("T1-x").unwrap();
+        assert_eq!(row.done.and_then(|d| d.commit).as_deref(), Some("c2"));
+        let w = wakes(&fx);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("T1-x reported done (now reviewing): fixed more") && w[0].contains("Its review task"),
+            "{w:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_question_reply_wakes_super_once_across_reconnects() {
+        // A8 (audit r5).
+        let fx = fixture(5);
+        let s = fx.task("T1-x", "faux/a", State::Ready);
+        let q = question_prompt("which check?");
+        fx.sup
+            .edit(|b| b.tasks[0].last_prompt = Some(board::prompt_hash(&q)))
+            .unwrap();
+        let mut t = fx.end(&s).await;
+        t.catch_up(true, vec![], vec![]).await;
+        t.event(AgentEvent::AgentStart).await;
+        t.event(says("check 9")).await;
+        t.event(end(QUESTION, StopReason::Stop)).await;
+        fx.until("woken", |fx| !wakes(fx).is_empty()).await;
+        let history = vec![Message::user(&q), assistant(StopReason::Stop, None)];
+        for _ in 0..2 {
+            drop(t);
+            t = fx.end(&s).await;
+            t.catch_up(false, history.clone(), vec![]).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(wakes(&fx), ["wake: T1-x replied: check 9"]);
+    }
+
+    #[tokio::test]
+    async fn a_review_task_s_limit_holds_its_provider_and_resends_to_it_when_it_clears() {
+        // A9 (audit r5): a limit is no crash of the review.
+        let fx = fixture(5);
+        fx.task("T1-x", "faux/a", State::Reviewing);
+        let s = fx.task("T2-rev", "claude/a", State::Running);
+        fx.sup
+            .edit(|b| {
+                (b.tasks[0].write, b.tasks[0].reviewer) = (true, Some("T2-rev".into()));
+                (b.tasks[1].kind, b.tasks[1].reviewer_of) = (Kind::Review, Some("T1-x".into()));
+            })
+            .unwrap();
+        let mut t = fx.end(&s).await;
+        t.catch_up(true, vec![], vec![]).await;
+        t.event(AgentEvent::AgentStart).await;
+        t.event(end(SUPER, QUOTA)).await;
+        fx.until("held", |fx| fx.sup.board.lock().unwrap().holds.contains_key("claude"))
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let t1 = fx.sup.row("T1-x").unwrap();
+        assert_eq!(
+            (t1.state, t1.reviewer.as_deref(), t1.review_crashes),
+            (State::Reviewing, Some("T2-rev"), 0)
+        );
+        assert_eq!(fx.state("T2-rev"), State::Running);
+        clear_hold(&fx, "claude");
+        fx.until("resent", |fx| sent_cleared(fx, &s)).await;
+        assert!(fx.sup.row("T2-rev").unwrap().block.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_question_turn_that_hits_a_limit_still_wakes_super_and_holds_the_provider() {
+        // A10 (audit r5).
+        let fx = fixture(5);
+        let s = fx.task("T1-x", "claude/a", State::Ready);
+        let mut t = fx.end(&s).await;
+        t.catch_up(true, vec![], vec![]).await;
+        t.event(AgentEvent::AgentStart).await;
+        t.event(end(QUESTION, QUOTA)).await;
+        fx.until("woken", |fx| !wakes(fx).is_empty()).await;
+        let w = wakes(&fx);
+        assert!(w[0].starts_with("wake: T1-x replied: (no answer"), "{w:?}");
+        assert!(fx.sup.board.lock().unwrap().holds.contains_key("claude"));
+        assert_eq!(fx.state("T1-x"), State::Ready);
+    }
+
+    #[tokio::test]
+    async fn a_row_saved_running_before_its_session_is_queued_again_after_a_crash() {
+        // A13 (audit r5): it would hold a slot forever.
+        let fx = fixture_with(5, |sup, _| {
+            let t = Task {
+                id: "T1-x".into(),
+                label: "T1-x".into(),
+                model: "faux/a".into(),
+                token: "tok".into(),
+                state: State::Running,
+                request: "r".into(),
+                ..Task::default()
+            };
+            sup.edit(|b| b.tasks.push(t)).unwrap();
+        });
+        fx.until("started", |fx| fx.sup.row("T1-x").unwrap().session.is_some())
+            .await;
+        assert_eq!(fx.state("T1-x"), State::Running);
+        assert_eq!(fx.launcher.starts.lock().unwrap().len(), 1);
     }
 }

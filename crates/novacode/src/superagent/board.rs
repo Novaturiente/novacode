@@ -457,7 +457,6 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
             Event::TurnUnreported | Event::TurnError(_) | Event::TurnLimit(_) => Some(Blocked),
             Event::ProcessExit => Some(Failed),
             Event::Restart => Some(Interrupted),
-            Event::Close => Some(Archived),
             _ => None,
         };
         if let Some(to) = to {
@@ -492,18 +491,28 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
             (ReportState::Done, Running) if t.write && t.approval_covers_done() => go(Ready),
             (ReportState::Done, Running) if t.write => with(Reviewing, Effect::StartReview { uses_round: true }),
             (ReportState::Done, Running) => go(Reviewing),
+            // A new commit while its review runs: that review judged old work (the caller
+            // refuses a `done` on the commit under review).
+            (ReportState::Done, Reviewing) if t.write && reviewing && t.approval_covers_done() => stop_review(Ready),
+            (ReportState::Done, Reviewing) if t.write && reviewing => Ok(Next {
+                from,
+                to: Reviewing,
+                block: None,
+                effects: vec![Effect::StopReview, Effect::StartReview { uses_round: true }],
+            }),
             _ => refused(),
         },
 
         (Event::TurnUnreported | Event::TurnError(_) | Event::TurnLimit(_), Running) => blocked(turn_block(ev)),
-        (Event::LimitCleared, Blocked) if t.block.as_ref().is_some_and(|b| b.limit.is_some()) => go(Running),
+        // A merge block is never resent: its merge lock is gone (`task merge` retries it, R19).
+        (Event::LimitCleared, Blocked) if block_is(|b| b.limit.is_some() && !b.merge) => go(Running),
         (Event::GoalEnded(how), Running) => blocked(Block::new(how.clone()).code_made()),
 
         (Event::ProcessExit, Running | WaitingYou) => go(Failed),
         (Event::ProcessExit | Event::Restart, s) if !s.is_live() => go(s),
         (Event::Restart, Running | WaitingYou) => go(Interrupted),
 
-        (Event::Accept, Reviewing) if !t.write => go(Ready),
+        (Event::Accept, Reviewing) if !t.write => stop_review(Ready),
         // A read task that answered in text without `report` (R20).
         (Event::Accept, Blocked) if !t.write && block_is(|b| b.code_made) => go(Ready),
         (Event::Accept, Reviewing) => Err(format!(
@@ -536,7 +545,12 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
         (Event::BranchMoved, Reviewing) if reviewing => go(Running),
         (Event::ReviewCrashed(why), Reviewing) if reviewing => {
             if t.review_crashes == 0 {
-                with(Reviewing, Effect::StartReview { uses_round: true })
+                with(
+                    Reviewing,
+                    Effect::StartReview {
+                        uses_round: !t.review_free,
+                    },
+                )
             } else {
                 blocked(Block::new(format!("review task crashed twice: {why}")))
             }
@@ -549,6 +563,11 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
             if t.repo.is_none() {
                 Err(format!(
                     "{} is not in a git repo; nothing to merge: ask the user whether to close it (`task close`)",
+                    t.label
+                ))
+            } else if !t.write || t.branch.is_none() {
+                Err(format!(
+                    "{} has no branch of its own (a read task): nothing to merge",
                     t.label
                 ))
             } else if t.landed == Some(Landed::Merged) {
@@ -569,7 +588,7 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
         (Event::Send, Running | WaitingYou | Merging | Queued) => go(from),
         (Event::Stop, Running | WaitingYou | Queued) => go(Stopped),
         (Event::Stop, Reviewing) => stop_review(Stopped),
-        (Event::Close, s) if s != Archived => stop_review(Archived),
+        (Event::Close, s) if !matches!(s, Archived | Merging) => stop_review(Archived),
 
         _ => refused(),
     }
@@ -851,6 +870,7 @@ mod tests {
             state,
             write: true,
             repo: Some("/r".into()),
+            branch: Some("worktree-T1-fix".into()),
             ..Task::default()
         }
     }
@@ -1255,6 +1275,93 @@ mod tests {
     }
 
     #[test]
+    fn a_limit_block_made_while_merging_is_not_resent_when_the_limit_clears() {
+        // A3 (audit r5): the merge lock is gone; a resend would finish the merge without it.
+        let mut b = board(&[("T1", Merging)]);
+        b.apply("T1", Event::TurnLimit(limit())).unwrap();
+        let block = b.task("T1").unwrap().block.clone().unwrap();
+        assert!(block.merge && block.limit.is_some(), "{block:?}");
+        assert!(b.apply("T1", Event::LimitCleared).is_err());
+        assert_eq!(b.task("T1").unwrap().state, Blocked);
+    }
+
+    #[test]
+    fn a_done_on_a_new_commit_while_reviewing_restarts_the_review() {
+        // A5 (audit r5): the review judged the old commit.
+        let mut b = Board {
+            tasks: vec![Task {
+                id: "T1".into(),
+                ..under_review(0)
+            }],
+            ..Board::default()
+        };
+        let n = b.apply("T1", report(ReportState::Done)).unwrap();
+        assert_eq!(
+            (n.to, n.effects),
+            (
+                Reviewing,
+                vec![Effect::StopReview, Effect::StartReview { uses_round: true }]
+            )
+        );
+        assert_eq!(b.task("T1").unwrap().reviewer, None, "the old review is retired");
+        // A read task super judges itself still refuses a second `done`.
+        let read = Task {
+            write: false,
+            ..row(Reviewing)
+        };
+        assert!(next(&read, &report(ReportState::Done), None).is_err());
+    }
+
+    #[test]
+    fn accepting_a_read_task_under_review_stops_the_review() {
+        // A6 (audit r5).
+        let read = Task {
+            write: false,
+            ..under_review(0)
+        };
+        let n = next(&read, &Event::Accept, None).unwrap();
+        assert_eq!((n.to, n.effects), (Ready, vec![Effect::StopReview]));
+    }
+
+    #[test]
+    fn a_crashed_free_review_is_retried_free() {
+        // A7 (audit r5): `task review` on a ready task uses no round, nor does its retry.
+        let mut b = Board {
+            tasks: vec![Task {
+                id: "T1".into(),
+                review_free: true,
+                ..under_review(1)
+            }],
+            ..Board::default()
+        };
+        let n = b.apply("T1", Event::ReviewCrashed("oom".into())).unwrap();
+        assert_eq!(n.effects, vec![Effect::StartReview { uses_round: false }]);
+        assert!(b.task("T1").unwrap().review_free);
+    }
+
+    #[test]
+    fn close_is_refused_while_merging() {
+        // A11 (audit r5): the table itself refuses it, not only `task close`.
+        assert!(next(&row(Merging), &Event::Close, None).is_err());
+    }
+
+    #[test]
+    fn merge_needs_a_write_task_with_a_branch() {
+        // A12 (audit r5): a ready read task in a git repo has nothing to merge.
+        let read = Task {
+            write: false,
+            ..row(Ready)
+        };
+        let e = next(&read, &Event::Merge, None).unwrap_err();
+        assert!(e.contains("nothing to merge"), "{e}");
+        let no_branch = Task {
+            branch: None,
+            ..row(Ready)
+        };
+        assert!(next(&no_branch, &Event::Merge, None).is_err());
+    }
+
+    #[test]
     fn merge_exit_rows() {
         let cases = [
             (Event::Stop, Stopped),
@@ -1262,7 +1369,6 @@ mod tests {
             (Event::TurnError("e".into()), Blocked),
             (Event::ProcessExit, Failed),
             (Event::Restart, Interrupted),
-            (Event::Close, Archived),
         ];
         for (ev, want) in cases {
             let n = next(&row(Merging), &ev, None).unwrap();
@@ -1283,7 +1389,7 @@ mod tests {
             assert_eq!(to(&row(s), Event::Stop), Stopped, "{s:?}");
         }
         assert_eq!(effects(&under_review(0), Event::Stop), vec![Effect::StopReview]);
-        for s in ALL.into_iter().filter(|s| *s != Archived) {
+        for s in ALL.into_iter().filter(|s| !matches!(s, Archived | Merging)) {
             assert_eq!(to(&row(s), Event::Close), Archived, "{s:?}");
         }
     }

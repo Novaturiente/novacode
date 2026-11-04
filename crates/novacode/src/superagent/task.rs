@@ -767,7 +767,10 @@ impl Super {
                 return Ok(format!("The user declined: {} stays blocked.", t.label));
             }
         }
-        self.edit(|b| b.apply(&t.id, Event::Accept))??;
+        let n = self.edit(|b| b.apply(&t.id, Event::Accept))??;
+        if n.effects.contains(&super::board::Effect::StopReview) {
+            self.stop_review(t.reviewer.clone()).await;
+        }
         Ok(format!("{} is ready.", t.label))
     }
 

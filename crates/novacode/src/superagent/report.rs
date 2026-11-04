@@ -587,6 +587,16 @@ impl ReportTool {
         if !review && a.verdict.is_some() {
             return Err("`verdict` is for review tasks; report with `state`".into());
         }
+        // The board refuses the other form; a refused report must not count as reported.
+        let merging = row.state == super::board::State::Merging;
+        if merging && a.state.is_some_and(|s| s != WorkState::Progress) {
+            return Err(
+                "you are merging: report with `merge` (merged | pr-opened | failed) and a one-line `summary`".into(),
+            );
+        }
+        if !merging && a.merge.is_some() {
+            return Err("`merge` is only for a merging task; report with `state`".into());
+        }
         let summary = a.summary.clone().unwrap_or_default();
         if a.verdict.is_none() && summary.trim().is_empty() {
             return Err("`summary` is required".into());
@@ -1442,7 +1452,13 @@ mod tests {
         );
 
         // A merging write task with uncommitted changes and no checks.
-        let work = Fixture::new(true, write_row());
+        let work = Fixture::new(
+            true,
+            Task {
+                state: crate::superagent::board::State::Merging,
+                ..write_row()
+            },
+        );
         std::fs::write(work.work.join("dirty.txt"), "x").unwrap();
         for m in ["merged", "pr-opened", "failed"] {
             let r = report(&work.report(json!({"merge": m, "summary": "rebased and merged"})).await);
@@ -1458,6 +1474,42 @@ mod tests {
                 .report(json!({"state": "done", "merge": "merged", "summary": "s"}))
                 .await,
             "exactly one",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_report_form_must_match_the_merging_state() {
+        // A1 (audit r5): a terminal `state` while merging, or `merge` while not merging, is
+        // refused by the board; the tool refuses it so the turn isn't counted as reported.
+        use crate::superagent::board::State;
+        let merging = Fixture::new(
+            false,
+            Task {
+                state: State::Merging,
+                ..write_row()
+            },
+        );
+        for s in ["done", "blocked", "failed"] {
+            refused(
+                &merging.report(json!({"state": s, "summary": "s"})).await,
+                "you are merging: report with `merge`",
+            );
+        }
+        report(
+            &merging
+                .report(json!({"state": "progress", "summary": "rebasing"}))
+                .await,
+        );
+        let running = Fixture::new(
+            false,
+            Task {
+                state: State::Running,
+                ..write_row()
+            },
+        );
+        refused(
+            &running.report(json!({"merge": "merged", "summary": "s"})).await,
+            "`merge` is only for a merging task",
         );
     }
 
