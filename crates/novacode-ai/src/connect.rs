@@ -76,6 +76,8 @@ pub struct Providers {
     pub cli_key: Option<(String, String)>,
     /// `web.native`: use the provider's own web search where it has one (L2.23).
     pub native_search: bool,
+    /// `models.deny` (L2.28): globs of models never used.
+    pub deny: Vec<String>,
 }
 
 impl Providers {
@@ -86,6 +88,30 @@ impl Providers {
             auth: AuthStore::new(home.join("auth.json")),
             cli_key: None,
             native_search: settings.get::<bool>("web.native").unwrap_or(false),
+            deny: settings.get("models.deny").unwrap_or_default(),
+        }
+    }
+
+    /// Refuse a model `models.deny` blocks (L2.28). Separate from [`Self::resolve`],
+    /// which price and usage lookups use too, so old sessions keep their price.
+    pub fn allow(&self, r: &Route) -> Result<(), ConnectError> {
+        self.allow_id(&r.provider, &r.model)
+    }
+
+    /// [`Self::allow`] for a `provider` and model id (classifier models have no route).
+    /// A glob matches `provider/model`, the bare id, or its last `/` segment.
+    pub fn allow_id(&self, provider: &str, model: &str) -> Result<(), ConnectError> {
+        let spec = format!("{provider}/{model}");
+        let last = model.rsplit('/').next().unwrap_or(model);
+        match self
+            .deny
+            .iter()
+            .find(|g| [spec.as_str(), model, last].iter().any(|s| glob(g, s)))
+        {
+            Some(g) => Err(setup(format!(
+                "model `{spec}` is blocked by the setting `models.deny` (`{g}`)"
+            ))),
+            None => Ok(()),
         }
     }
 
@@ -329,6 +355,35 @@ impl Providers {
     }
 }
 
+/// `*` matches any run of characters (`/` too), `?` one character.
+fn glob(pattern: &str, s: &str) -> bool {
+    let (p, s): (Vec<char>, Vec<char>) = (pattern.chars().collect(), s.chars().collect());
+    let (mut i, mut j) = (0, 0);
+    // The last `*` seen and where in `s` its match ends, to backtrack to.
+    let mut star: Option<(usize, usize)> = None;
+    while j < s.len() {
+        match p.get(i) {
+            Some('*') => {
+                star = Some((i, j));
+                i += 1;
+            }
+            Some(c) if *c == '?' || *c == s[j] => {
+                i += 1;
+                j += 1;
+            }
+            _ => match star {
+                Some((si, sj)) => {
+                    star = Some((si, sj + 1));
+                    i = si + 1;
+                    j = sj + 1;
+                }
+                None => return false,
+            },
+        }
+    }
+    p[i..].iter().all(|c| *c == '*')
+}
+
 /// A pasted key can carry invisible characters (zero-width spaces, a BOM, a
 /// newline) that make the vendor reject it (jcode #376): drop them.
 fn clean_key(k: &str) -> String {
@@ -378,6 +433,39 @@ mod tests {
         assert!(p.resolve("claude-opus").is_err());
         let r = p.resolve("deepseek/brand-new-model").unwrap();
         assert!(!r.info.known, "unknown models still route, with defaults");
+    }
+
+    #[test]
+    fn deny_globs_match_spec_bare_and_last_segment() {
+        let (_d, p) = providers(r#"{ "models": { "deny": ["claude-fable*", "groq/llama-?-8b"] } }"#);
+        let denied = |spec: &str| p.allow(&p.resolve(spec).unwrap()).is_err();
+        assert!(denied("claude/claude-fable-5"), "bare id");
+        assert!(denied("openrouter/anthropic/claude-fable-5"), "last `/` segment");
+        assert!(denied("groq/llama-3-8b"), "provider/model");
+        assert!(!denied("groq/llama-3-70b") && !denied("claude/claude-opus-4-5"));
+        let err = p
+            .allow(&p.resolve("claude/claude-fable-5:high").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("claude/claude-fable-5") && err.contains("models.deny"),
+            "names model and setting: {err}"
+        );
+        let (_d, open) = providers("{}");
+        assert!(
+            open.allow(&open.resolve("claude/claude-fable-5").unwrap()).is_ok(),
+            "empty by default"
+        );
+    }
+
+    #[test]
+    fn an_alias_to_a_denied_model_is_refused_but_still_priced() {
+        let (_d, p) = providers(r#"{ "models": { "deny": ["claude-opus-*"] } }"#);
+        let r = p.resolve("claude/claude-opus").unwrap();
+        assert!(r.model.starts_with("claude-opus-"), "alias resolved: {}", r.model);
+        assert!(p.allow(&r).is_err(), "the alias's model is denied");
+        // resolve stays parse-only: old sessions on a denied model keep their price.
+        assert!(p.resolve("anthropic/claude-opus-4-5").unwrap().info.cost.is_some());
     }
 
     #[test]

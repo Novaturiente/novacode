@@ -1049,6 +1049,7 @@ async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         sup: Default::default(),
         carry: Default::default(),
         mcp: Default::default(),
+        notes: Default::default(),
     };
     let store = match resumed {
         Some(s) => s,
@@ -1057,6 +1058,9 @@ async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     diag::mark("open session");
     if ctx.cli.profile_startup {
         let (agent, _) = ctx.agent(store, &model, None, None, None).await?;
+        for n in ctx.take_notes() {
+            eprintln!("{n}");
+        }
         diag::mark("agent ready");
         drop(agent);
         eprint!("{}", diag::profile());
@@ -1073,6 +1077,9 @@ async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             // A hub with no windows still carries subagents (L10.1): they report back by waking the run.
             let slot = hub::HubSlot::default();
             let (agent, _) = ctx.agent(store, &model, None, None, Some(slot.clone())).await?;
+            for n in ctx.take_notes() {
+                eprintln!("{n}");
+            }
             let sup = ctx.sup.lock().unwrap().take();
             print_mode(
                 agent,
@@ -1108,9 +1115,23 @@ struct Ctx {
     /// MCP servers of the last agent built, keyed by their config: `/new`, `/resume`,
     /// `/tree`, rewind and `/reload` reuse running servers instead of cold-starting them.
     mcp: std::sync::Mutex<Option<(String, Arc<novacode_core::mcp::Hub>)>>,
+    /// Model fallbacks made while building the agent (`models.deny`, L2.28), for the user.
+    notes: std::sync::Mutex<Vec<String>>,
 }
 
 impl Ctx {
+    /// A notice for the user about the agent being built (once per text).
+    fn note(&self, text: String) {
+        let mut g = self.notes.lock().unwrap();
+        if !g.contains(&text) {
+            g.push(text);
+        }
+    }
+
+    fn take_notes(&self) -> Vec<String> {
+        std::mem::take(&mut *self.notes.lock().unwrap())
+    }
+
     /// `/reload`: read trust, settings and provider config again. CLI flags stay.
     /// `checked` = the trust check the caller already made (None with `--trust`).
     fn reload(&mut self, checked: Option<(trust::State, trust::Fingerprint)>) -> Vec<String> {
@@ -1207,25 +1228,30 @@ impl Ctx {
         main: Arc<dyn novacode_ai::adapter::Adapter>,
     ) -> Option<goals::Judge> {
         let spec = self.settings.get::<String>("goal.judge");
-        match spec.as_deref() {
-            Some("off") => None,
-            Some(s) if novacode_ai::classify::find(s).is_some() => Some(goals::Judge::Classifier(
-                Arc::new(novacode_core::classifier::Classify::new(self.providers.clone())),
-                novacode_ai::classify::find(s)?,
-            )),
-            Some(s) => match self.providers.resolve(s) {
-                Ok(_) => Some(goals::Judge::Model {
-                    worker: std::sync::Mutex::new(
-                        models::helper(&self.providers, Some(s.to_string()), route, main).await,
-                    ),
-                    fixed: true,
-                }),
+        let classifier = spec.as_deref().and_then(novacode_ai::classify::find);
+        match (spec.as_deref(), classifier) {
+            (Some("off"), _) => None,
+            (Some(_), Some(m)) => match self.providers.allow_id(m.provider, m.id) {
+                Ok(()) => Some(goals::Judge::Classifier(
+                    Arc::new(novacode_core::classifier::Classify::new(self.providers.clone())),
+                    m,
+                )),
                 Err(e) => {
-                    tracing::warn!(%e, "goal.judge: using the observer's model");
+                    self.note(format!("goal.judge: {e}; using the observer's model"));
                     self.default_judge(route, main).await
                 }
             },
-            None => self.default_judge(route, main).await,
+            (Some(s), None) => match models::usable(&self.providers, s) {
+                Ok(_) => Some(goals::Judge::Model {
+                    worker: std::sync::Mutex::new(self.helper(Some(s.to_string()), route, main).await),
+                    fixed: true,
+                }),
+                Err(e) => {
+                    self.note(format!("goal.judge: {e}; using the observer's model"));
+                    self.default_judge(route, main).await
+                }
+            },
+            (None, _) => self.default_judge(route, main).await,
         }
     }
 
@@ -1252,13 +1278,10 @@ impl Ctx {
         use novacode_core::judge::Judge;
         let (worker, fixed) = match spec.as_deref() {
             Some("off") => return None,
-            Some(s) => match self.providers.resolve(s) {
-                Ok(_) => (
-                    models::helper(&self.providers, Some(s.to_string()), route, main).await,
-                    true,
-                ),
+            Some(s) => match models::usable(&self.providers, s) {
+                Ok(_) => (self.helper(Some(s.to_string()), route, main).await, true),
                 Err(e) => {
-                    tracing::warn!(%e, "permissions.judge: using the observer's model");
+                    self.note(format!("permissions.judge: {e}; using the observer's model"));
                     (self.memory_worker(route, main).await, false)
                 }
             },
@@ -1273,7 +1296,21 @@ impl Ctx {
         route: &novacode_ai::connect::Route,
         main: Arc<dyn novacode_ai::adapter::Adapter>,
     ) -> novacode_core::memory::Worker {
-        models::helper(&self.providers, self.settings.get("memory.model"), route, main).await
+        self.helper(self.settings.get("memory.model"), route, main).await
+    }
+
+    /// `models::helper`, its fallback notice kept for the user.
+    async fn helper(
+        &self,
+        explicit: Option<String>,
+        route: &novacode_ai::connect::Route,
+        main: Arc<dyn novacode_ai::adapter::Adapter>,
+    ) -> novacode_core::memory::Worker {
+        let (w, note) = models::helper(&self.providers, explicit, route, main).await;
+        if let Some(n) = note {
+            self.note(n);
+        }
+        w
     }
 
     /// Build the agent for `model` (`provider/model[:level]`). Returns the resolved `provider/model`.
@@ -1291,11 +1328,11 @@ impl Ctx {
             (None, Some((p, m))) => Some(format!("{p}/{m}")),
             _ => None,
         };
-        // …and falls back to the given one if that model can't be resolved any more.
-        let route = match resumed.as_deref().map(|r| self.providers.resolve(r)) {
-            Some(Ok(r)) => r,
-            _ => self.providers.resolve(model)?,
-        };
+        // …and falls back to the given one, with a notice, if that model can't be used any more.
+        let (route, note) = models::session_route(&self.providers, resumed.as_deref(), model)?;
+        if let Some(n) = note {
+            self.note(n);
+        }
         // `model:level` wins, then the session's own level (resume), then settings.
         let level = route
             .level
@@ -1486,6 +1523,7 @@ impl Ctx {
                 stall_min: s.get("agents.stallMinutes").unwrap_or(10),
                 timeout_min: s.get("agents.timeoutMinutes").unwrap_or(45),
                 models,
+                allow: models::spawn_check(self.providers.clone()),
                 skill_dirs: self.skill_dirs(),
                 max_running: if place.depth == 0 {
                     s.get("agents.maxConcurrent").unwrap_or(4)
@@ -2497,6 +2535,10 @@ async fn serve_headless(ctx: &Ctx, store: Store, model: String) -> anyhow::Resul
         activity::Sinks::headless(&ctx.settings),
     )
     .await?;
+    // No window yet: model fallbacks go to stderr (the log of a detached session).
+    for n in ctx.take_notes() {
+        eprintln!("{n}");
+    }
     let host = live.host.clone();
     if ctx.cli.rpc {
         tokio::spawn(serve::serve(
@@ -2716,6 +2758,7 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
         )
         .await?;
         let host = live.host.clone();
+        notices.extend(ctx.take_notes());
         // L8.16: after go_live, so this session is no longer in the list.
         if std::mem::take(&mut first) {
             match serve::interrupted_sessions(&ctx.paths).len() {

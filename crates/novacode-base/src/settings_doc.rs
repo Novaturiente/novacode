@@ -59,6 +59,12 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "Per-model catalog overrides, keyed `\"<provider>/<id>\"`: `contextWindow`, `maxTokens`, `images`, `reasoning` (bools), `name`, `cost`. See docs/providers.md.",
     ),
     (
+        "models.deny",
+        "list",
+        "[]",
+        "Models never used, as globs (`*` any run, `?` one character), e.g. `[\"claude-fable*\"]`. Each glob is matched against `provider/model`, the bare model id and its last `/` segment, after aliases resolve. A denied session model, `/model` or subagent model is an error; a denied helper, judge or resumed model falls back with a notice. Denied models leave the model list. Prices of past replies still count.",
+    ),
+    (
         "permissions",
         "object",
         "auto mode, lenient",

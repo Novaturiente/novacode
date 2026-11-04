@@ -71,6 +71,35 @@ pub fn spent(p: &Providers, entries: &[novacode_core::session::Entry]) -> f64 {
     sum
 }
 
+/// Resolve `spec` and refuse it when `models.deny` blocks it (L2.28).
+pub fn usable(p: &Providers, spec: &str) -> Result<Route, novacode_ai::connect::ConnectError> {
+    let r = p.resolve(spec)?;
+    p.allow(&r)?;
+    Ok(r)
+}
+
+/// The session's route at start: a resumed session's own model, else `model`. A resumed
+/// model that no longer resolves or is denied falls back to `model`, with a notice.
+pub fn session_route(p: &Providers, resumed: Option<&str>, model: &str) -> anyhow::Result<(Route, Option<String>)> {
+    let note = match resumed.map(|r| (r, usable(p, r))) {
+        Some((_, Ok(r))) => return Ok((r, None)),
+        Some((r, Err(e))) => Some(format!("this session's model `{r}` can't be used ({e})")),
+        None => None,
+    };
+    let route = usable(p, model)?;
+    let note = note.map(|n| format!("{n}; using {}", route.spec()));
+    Ok((route, note))
+}
+
+/// The subagent model check (L2.28): a `provider/model[:level]` that `models.deny` blocks
+/// is refused at spawn. Other resolve errors are left to the child's own start.
+pub fn spawn_check(p: Arc<Providers>) -> crate::agents::ModelCheck {
+    Arc::new(move |spec: &str| match p.resolve(spec) {
+        Ok(r) => p.allow(&r).map_err(|e| e.to_string()),
+        Err(_) => Ok(()),
+    })
+}
+
 /// Everything the agent needs to move to `spec` (another provider is fine).
 pub async fn switch(
     p: &Arc<Providers>,
@@ -79,7 +108,7 @@ pub async fn switch(
     limits: Limits,
     trace: Option<Trace>,
 ) -> anyhow::Result<(Switch, Route)> {
-    let route = p.resolve(spec)?;
+    let route = usable(p, spec)?;
     let (adapter, _) = p.adapter(&route.provider, trace).await?;
     let (window_tokens, max_tokens) = limits.of(&route);
     let switch = Switch {
@@ -98,50 +127,51 @@ pub async fn switch(
 
 /// The background model (observer, goal judge) for a session on `route`: `explicit`
 /// (`memory.model`), else the provider's small model, else the session's own.
-/// One that can't connect falls back to the session's.
+/// One that can't resolve, is denied (`models.deny`) or can't connect falls back to the
+/// session's; the second value is then a notice for the user.
 pub async fn helper(
     p: &Arc<Providers>,
     explicit: Option<String>,
     route: &Route,
     main: Arc<dyn Adapter>,
-) -> novacode_core::memory::Worker {
+) -> (novacode_core::memory::Worker, Option<String>) {
     let small = p.profile(&route.provider).ok().and_then(|pr| {
         pr.extra
             .get("smallModel")?
             .as_str()
             .map(|m| format!("{}/{m}", route.provider))
     });
-    let fallback = || novacode_core::memory::Worker {
+    let session = novacode_core::memory::Worker {
         adapter: main.clone(),
         provider: route.provider.clone(),
         model: route.model.clone(),
     };
     let Some(spec) = explicit.or(small) else {
-        return fallback();
+        return (session, None);
     };
-    let r = match p.resolve(&spec) {
+    let fallback = |e: &dyn std::fmt::Display| {
+        let note = format!("helper model `{spec}`: {e}; using {}", route.spec());
+        tracing::warn!("{note}");
+        (session, Some(note))
+    };
+    let r = match usable(p, &spec) {
         Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(%e, "memory.model");
-            return fallback();
-        }
+        Err(e) => return fallback(&e),
     };
     let adapter = if r.provider == route.provider {
         main.clone()
     } else {
         match p.adapter(&r.provider, None).await {
             Ok((a, _)) => a,
-            Err(e) => {
-                tracing::warn!(%e, "memory.model connect");
-                return fallback();
-            }
+            Err(e) => return fallback(&e),
         }
     };
-    novacode_core::memory::Worker {
+    let w = novacode_core::memory::Worker {
         adapter,
         provider: r.provider,
         model: r.model,
-    }
+    };
+    (w, None)
 }
 
 /// Live model lists of every connected provider, plus errors worth showing.
@@ -167,7 +197,8 @@ pub async fn list(p: &Arc<Providers>, current: &str) -> (Vec<PickItem>, Vec<Stri
                 continue;
             }
         };
-        for id in ids {
+        // `models.deny` (L2.28): denied models aren't offered.
+        for id in ids.into_iter().filter(|id| p.allow_id(&pr.id, id).is_ok()) {
             let value = format!("{}/{id}", pr.id);
             let info = p.catalog.get(pr.catalog_id(), &id);
             let mut detail = info.map(|i| format!("{}k", i.context / 1000)).unwrap_or_default();
@@ -239,4 +270,83 @@ pub async fn command(p: &Arc<Providers>, filter: Option<String>, all: bool) -> a
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn denying(globs: &[&str]) -> Arc<Providers> {
+        let mut p = Providers::load(std::path::Path::new("/nonexistent"), &Settings::default());
+        p.deny = globs.iter().map(|g| g.to_string()).collect();
+        Arc::new(p)
+    }
+
+    #[tokio::test]
+    async fn switch_refuses_a_denied_model() {
+        let p = denying(&["claude-fable*"]);
+        let limits = Limits::new(&Settings::default());
+        let err = switch(&p, "claude/claude-fable-5", ThinkingLevel::Medium, limits, None)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("claude/claude-fable-5") && err.contains("models.deny"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn start_refuses_and_resume_falls_back_with_a_notice() {
+        let p = denying(&["claude-fable*"]);
+        let err = session_route(&p, None, "claude/claude-fable-5")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("models.deny"), "{err}");
+        let (r, note) = session_route(&p, Some("claude/claude-fable-5"), "claude/claude-opus-4-5").unwrap();
+        assert_eq!(r.spec(), "claude/claude-opus-4-5");
+        let note = note.expect("the fallback is shown");
+        assert!(
+            note.contains("claude/claude-fable-5") && note.contains("models.deny") && note.contains("claude-opus-4-5"),
+            "{note}"
+        );
+        let (r, note) = session_route(&p, Some("claude/claude-opus-4-5"), "claude/claude-sonnet-4-5").unwrap();
+        assert_eq!((r.spec().as_str(), note), ("claude/claude-opus-4-5", None));
+        // A resumed model that no longer resolves falls back visibly too.
+        let (_, note) = session_route(&p, Some("gone/x"), "claude/claude-opus-4-5").unwrap();
+        assert!(note.is_some_and(|n| n.contains("gone/x")));
+    }
+
+    #[test]
+    fn subagent_models_are_checked_after_alias_resolution() {
+        let p = denying(&["claude-opus-*"]);
+        let check = spawn_check(p);
+        let err = check("claude/claude-opus:high").unwrap_err();
+        assert!(err.contains("models.deny"), "{err}");
+        assert!(check("claude/claude-haiku-4-5").is_ok());
+        assert!(
+            check("nope/x").is_ok(),
+            "an unknown provider fails at the child's start"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_helper_falls_back_with_a_notice() {
+        let p = denying(&["claude-haiku*"]);
+        let route = p.resolve("claude/claude-opus-4-5").unwrap();
+        let main: Arc<dyn Adapter> = Arc::new(novacode_ai::faux::Faux::new([]));
+        let (w, note) = helper(&p, Some("claude/claude-haiku-4-5".into()), &route, main).await;
+        assert_eq!((w.provider.as_str(), w.model.as_str()), ("claude", "claude-opus-4-5"));
+        let note = note.expect("the fallback is shown");
+        assert!(
+            note.contains("models.deny") && note.contains("claude-opus-4-5"),
+            "{note}"
+        );
+        // The provider's small model (`claude-haiku`, an alias) is denied too.
+        let (w, note) = helper(&p, None, &route, Arc::new(novacode_ai::faux::Faux::new([]))).await;
+        assert_eq!(w.model, "claude-opus-4-5");
+        assert!(note.is_some_and(|n| n.contains("models.deny")));
+    }
 }

@@ -32,6 +32,7 @@ impl Classify {
 
     /// One classification with `m` (the tool and the goal judge use it).
     pub async fn run(&self, m: &classify::Model, ctx: &Context) -> Result<classify::Outcome, String> {
+        self.providers.allow_id(m.provider, m.id).map_err(|e| e.to_string())?;
         let Some(key) = self.key(m.provider) else {
             return Err(format!(
                 "no key for {}: run `novacode login {}` or set its env var",
@@ -43,11 +44,12 @@ impl Classify {
         Ok(classify::classify(&novacode_ai::http::client(), m, &key, account.as_deref(), ctx).await)
     }
 
-    /// Classifier models whose provider has a key.
+    /// Classifier models whose provider has a key, minus `models.deny` (L2.28).
     pub fn available(&self) -> Vec<&'static classify::Model> {
         let cf = std::env::var("CLOUDFLARE_ACCOUNT_ID").is_ok();
         classify::MODELS
             .iter()
+            .filter(|m| self.providers.allow_id(m.provider, m.id).is_ok())
             .filter(|m| self.key(m.provider).is_some() && (m.wire != classify::Wire::Cloudflare || cf))
             .collect()
     }
@@ -109,5 +111,25 @@ impl Tool for Classify {
                 Err(e) => ToolOutput::error(e),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn denied_classifiers_are_refused_and_not_listed() {
+        let mut p = Providers::load(std::path::Path::new("/nonexistent"), &Default::default());
+        p.deny = vec!["*".into()];
+        let c = Classify::new(Arc::new(p));
+        assert!(c.available().is_empty());
+        let m = classify::find("openrouter/typesafe/jev-1.13").unwrap();
+        let ctx: Context = serde_json::from_value(json!({"state": {}, "questions": {}})).unwrap();
+        let err = c.run(m, &ctx).await.unwrap_err();
+        assert!(
+            err.contains("openrouter/typesafe/jev-1.13") && err.contains("models.deny"),
+            "{err}"
+        );
     }
 }

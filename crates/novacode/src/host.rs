@@ -357,7 +357,10 @@ impl Host {
                         Ok((mut sw, route)) => {
                             // Observer and goal judge move to the new provider's small model.
                             if me.memory_model.is_none() {
-                                let w = models::helper(&me.providers, None, &route, sw.adapter.clone()).await;
+                                let (w, note) = models::helper(&me.providers, None, &route, sw.adapter.clone()).await;
+                                if let Some(text) = note {
+                                    let _ = tx.send(UiEvent::Notice { text, error: false });
+                                }
                                 if let Some(g) = &me.goals {
                                     g.set_judge_model(w.clone());
                                 }
@@ -392,8 +395,15 @@ impl Host {
             }
             Cmd::SetThinking(l) => {
                 let spec = self.cur.lock().unwrap().0.clone();
-                let Ok(route) = self.providers.resolve(&spec) else {
-                    return;
+                let route = match models::usable(&self.providers, &spec) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = ui.send(UiEvent::Notice {
+                            text: format!("thinking not changed: {e}"),
+                            error: true,
+                        });
+                        return;
+                    }
                 };
                 let level = route.clamp(l);
                 self.cur.lock().unwrap().1 = level;

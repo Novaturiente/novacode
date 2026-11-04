@@ -41,6 +41,9 @@ fn own_exe() -> PathBuf {
 /// a family (`sonnet`) or a bare model id is looked up on that provider. None: not there.
 pub type ModelLookup = Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
 
+/// `provider/model[:level]` → Err(why) when `models.deny` blocks it (L2.28).
+pub type ModelCheck = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
 /// A child's model: the spawn's or its type's (`provider/model` as is; anything
 /// else on the parent's current provider), else the parent's own.
 fn child_model(
@@ -634,6 +637,7 @@ struct Cfg {
     /// This session's own tool names (MCP ones aside): a child never gets more.
     own: Option<Vec<String>>,
     models: ModelLookup,
+    allow: ModelCheck,
     skill_dirs: Vec<PathBuf>,
     /// Children running at once; more wait as `queued` (`agents.maxConcurrent`; 1 below the top).
     max_running: usize,
@@ -660,6 +664,7 @@ impl Cfg {
             stall: Duration::from_secs(s.stall_min * 60),
             timeout: Duration::from_secs(s.timeout_min * 60),
             models: s.models,
+            allow: s.allow,
             skill_dirs: s.skill_dirs,
             max_running: s.max_running.max(1),
             nerd: s.nerd,
@@ -684,6 +689,8 @@ pub struct Setup {
     pub timeout_min: u64,
     /// A provider's small model as `provider/model`, asked at spawn time (the parent may switch provider).
     pub models: ModelLookup,
+    /// Refuses a model `models.deny` blocks (L2.28).
+    pub allow: ModelCheck,
     /// Skill folders, for agents that preload skills (Claude `skills`).
     pub skill_dirs: Vec<PathBuf>,
     pub max_running: usize,
@@ -918,7 +925,12 @@ impl Supervisor {
             format!("no agent `{agent}`; known: {}", names.join(", "))
         })?;
         let parent = self.parent_model().unwrap_or_default();
-        let mut model = child_model(a.model.or(def.model.clone()).as_deref(), parent, cfg.models.as_ref());
+        let asked = a.model.is_some();
+        let mut model = child_model(
+            a.model.or(def.model.clone()).as_deref(),
+            parent.clone(),
+            cfg.models.as_ref(),
+        );
         if let Some(t) = &def.thinking
             && !model.contains(':')
         {
@@ -926,6 +938,14 @@ impl Supervisor {
         }
         let (mut tools, mcp, mut notes) =
             grant(def, a.tools, a.mcp, cfg.parent_picks, cfg.own.as_deref(), &cfg.servers);
+        // `models.deny` (L2.28): a model asked for is refused; a type's own falls back, visibly.
+        if let Err(e) = (cfg.allow)(&model) {
+            if asked {
+                return Err(e);
+            }
+            notes.push(format!("{e}; using the parent's model `{parent}`"));
+            model = parent;
+        }
         // Claude Code refuses an agent none of whose listed tools exists.
         if let (Some(wanted), Some(got)) = (&def.tools, &tools)
             && !wanted.is_empty()
@@ -1876,6 +1896,59 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn denied_models_are_refused_or_fall_back_with_a_note() {
+        let tmp = std::env::temp_dir().join(format!("nc-sup-deny-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let sup = Supervisor::new(Setup {
+            slot: HubSlot::default(),
+            unattended: false,
+            me: "ROOT".into(),
+            home: tmp.clone(),
+            cwd: tmp.clone(),
+            trusted: false,
+            defs: defs(&[]).0,
+            parent_picks: true,
+            servers: vec![],
+            stall_min: 10,
+            timeout_min: 45,
+            models: Arc::new(|p: &str, w: &str| Some(format!("{p}/{w}-denied"))),
+            allow: Arc::new(|m: &str| match m.contains("denied") {
+                true => Err(format!("model `{m}` is blocked by the setting `models.deny`")),
+                false => Ok(()),
+            }),
+            skill_dirs: vec![],
+            max_running: 4,
+            exe: Some(fake_child(&tmp)),
+            nerd: false,
+            env: Default::default(),
+            policy: Arc::new(novacode_core::policy::Policy::new(
+                Default::default(),
+                tmp.clone(),
+                None,
+            )),
+        });
+        let args = |v: serde_json::Value| serde_json::from_value(v).unwrap();
+        // Asked for: an error naming the model and the setting, by full id or by family.
+        for m in ["p/denied", "sonnet"] {
+            let err = sup.spawn(args(json!({"task": "t", "model": m}))).unwrap_err();
+            assert!(err.contains("models.deny") && err.contains("denied"), "{err}");
+        }
+        let err = sup
+            .audit("t".into(), "audit".into(), Some("p/denied".into()))
+            .await
+            .unwrap_err();
+        assert!(err.contains("models.deny"), "the auditor too: {err}");
+        // A type's own model (scout: `small`) falls back to the parent's, with a note.
+        let (id, notes) = sup.spawn(args(json!({"task": "t", "agent": "scout"}))).unwrap();
+        assert!(notes.iter().any(|n| n.contains("models.deny")), "{notes:?}");
+        assert_eq!(sup.with(&id, |c| c.model.clone()).as_deref(), Some(""));
+        sup.wait(vec![], false, Duration::from_secs(20)).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn spawn_after_wait_and_send() {
         let tmp = std::env::temp_dir().join(format!("nc-sup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1893,6 +1966,7 @@ mod tests {
             stall_min: 10,
             timeout_min: 45,
             models: Arc::new(|_: &str, _: &str| None),
+            allow: Arc::new(|_: &str| Ok(())),
             skill_dirs: vec![],
             max_running: 4,
             exe: Some(fake_child(&tmp)),
@@ -1985,6 +2059,7 @@ mod tests {
             stall_min: 10,
             timeout_min: 45,
             models: Arc::new(|_: &str, _: &str| None),
+            allow: Arc::new(|_: &str| Ok(())),
             skill_dirs: vec![],
             max_running: 2,
             exe: Some(exe),
@@ -2051,6 +2126,7 @@ mod tests {
             stall_min: 10,
             timeout_min: 45,
             models: Arc::new(|_: &str, _: &str| None),
+            allow: Arc::new(|_: &str| Ok(())),
             skill_dirs: vec![],
             max_running: 4,
             exe: Some(exe),

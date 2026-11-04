@@ -208,6 +208,7 @@ pub async fn check_key(
         auth: AuthStore::new(home.join("auth.json")),
         cli_key: Some((provider.into(), key.into())),
         native_search: false,
+        deny: Vec::new(),
     });
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         match p.adapter(provider, None).await {
