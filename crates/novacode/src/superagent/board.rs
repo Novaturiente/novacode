@@ -457,7 +457,8 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
     if from == Merging {
         let to = match ev {
             Event::Stop => Some(Stopped),
-            Event::TurnUnreported | Event::TurnError(_) | Event::TurnLimit(_) => Some(Blocked),
+            // A goal that ended unreported is a turn end too (R24: it used to be refused, leaving the row stuck).
+            Event::TurnUnreported | Event::TurnError(_) | Event::TurnLimit(_) | Event::GoalEnded(_) => Some(Blocked),
             Event::ProcessExit => Some(Failed),
             Event::Restart => Some(Interrupted),
             _ => None,
@@ -608,7 +609,7 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
 /// The block reason of a turn that ended without a terminal report.
 fn turn_block(ev: &Event) -> Block {
     match ev {
-        Event::TurnError(text) => Block::new(text.clone()),
+        Event::TurnError(text) | Event::GoalEnded(text) => Block::new(text.clone()),
         Event::TurnLimit(limit) => Block {
             reason: limit.kind.label().into(),
             limit: Some(limit.clone()),
@@ -1375,6 +1376,7 @@ mod tests {
             (Event::Stop, Stopped),
             (Event::TurnUnreported, Blocked),
             (Event::TurnError("e".into()), Blocked),
+            (Event::GoalEnded("goal done without a report".into()), Blocked),
             (Event::ProcessExit, Failed),
             (Event::Restart, Interrupted),
         ];

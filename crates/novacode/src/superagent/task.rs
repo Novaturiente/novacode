@@ -71,6 +71,30 @@ pub struct Super {
     pub(super) launcher: Arc<dyn Launcher>,
     /// The task links (ST13); set once after construction.
     pub links: std::sync::OnceLock<Arc<super::link::Links>>,
+    /// Super's prompts per session not yet consumed by a run's end (R24).
+    flights: Mutex<std::collections::HashMap<String, Flight>>,
+}
+
+/// Super's prompts to one session: questions and work never share a run (R24), so the
+/// other kind waits here until the run that took the sent ones ends.
+#[derive(Default)]
+struct Flight {
+    /// The kind of the sent ones: questions.
+    question: bool,
+    /// Sent and not yet seen consumed.
+    sent: usize,
+    /// Waiting, in order: (question, text).
+    held: Vec<(bool, String)>,
+}
+
+/// What a tool result adds when its prompt was held.
+fn held_note(held: bool) -> &'static str {
+    match held {
+        true => {
+            "\nIt is held: the task's run on your other prompt (a question, or work) is still going; code sends it when that run ends."
+        }
+        false => "",
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -282,6 +306,7 @@ impl Super {
             asker,
             launcher,
             links: std::sync::OnceLock::new(),
+            flights: Mutex::default(),
         })
     }
 
@@ -830,16 +855,40 @@ impl Super {
     }
 
     /// A raw prompt: a brief or message starting with `!` or `/` is not a command.
-    async fn prompt(&self, session: &str, text: String) -> Result<(), String> {
+    /// `true` when it waits for the task's run on a question to end.
+    async fn prompt(&self, session: &str, text: String) -> Result<bool, String> {
         self.prompt_as(session, super::link::SUPER_ID, text).await
     }
 
-    /// [`prompt`](Self::prompt) with request id `id`.
-    async fn prompt_as(&self, session: &str, id: &str, text: String) -> Result<(), String> {
+    /// [`prompt`](Self::prompt) with request id `id`; held (`true`) while a prompt of the
+    /// other kind (question or work) is sent and its run has not ended.
+    async fn prompt_as(&self, session: &str, id: &str, text: String) -> Result<bool, String> {
+        let question = id == super::link::SUPER_QUESTION_ID;
+        {
+            let mut flights = self.flights.lock().unwrap();
+            let f = flights.entry(session.to_string()).or_default();
+            if !f.held.is_empty() || (f.sent > 0 && f.question != question) {
+                f.held.push((question, text));
+                return Ok(true);
+            }
+            f.question = question;
+            f.sent += 1;
+        }
+        self.send_prompt(session, id, text).await.map(|_| false)
+    }
+
+    async fn send_prompt(&self, session: &str, id: &str, text: String) -> Result<(), String> {
         let hash = super::board::prompt_hash(&text);
-        self.launcher
+        if let Err(e) = self
+            .launcher
             .send_as(session, id, ClientCmd::Prompt { text, raw: true })
-            .await?;
+            .await
+        {
+            if let Some(f) = self.flights.lock().unwrap().get_mut(session) {
+                f.sent = f.sent.saturating_sub(1);
+            }
+            return Err(e);
+        }
         self.edit(|b| {
             if let Some(row) = b.tasks.iter_mut().find(|r| r.session.as_deref() == Some(session)) {
                 row.last_prompt = Some(hash);
@@ -847,8 +896,41 @@ impl Super {
         })
     }
 
+    /// A run of `session` ended having consumed `consumed` of super's prompts: once none is
+    /// left, the held ones of the next kind are sent.
+    pub(super) async fn ran(&self, session: &str, consumed: usize) {
+        let (question, next) = {
+            let mut flights = self.flights.lock().unwrap();
+            let Some(f) = flights.get_mut(session) else { return };
+            f.sent = f.sent.saturating_sub(consumed);
+            let Some(&(question, _)) = f.held.first().filter(|_| f.sent == 0) else {
+                return;
+            };
+            let n = f.held.iter().take_while(|h| h.0 == question).count();
+            f.question = question;
+            f.sent = n;
+            (question, f.held.drain(..n).map(|h| h.1).collect::<Vec<_>>())
+        };
+        let id = match question {
+            true => super::link::SUPER_QUESTION_ID,
+            false => super::link::SUPER_ID,
+        };
+        for text in next {
+            if let Err(e) = self.send_prompt(session, id, text).await {
+                tracing::warn!(session, %e, "super: a held prompt couldn't be sent");
+            }
+        }
+    }
+
+    /// The session's run was stopped or its process is gone: nothing is in flight and
+    /// nothing held is sent.
+    pub(super) fn grounded(&self, session: &str) {
+        self.flights.lock().unwrap().remove(session);
+    }
+
     /// Send `text` to the task, resuming its session first when its process is gone.
-    pub(super) async fn deliver(&self, id: &str, text: String) -> Result<(), String> {
+    /// `true` when it waits for the task's run on a question to end.
+    pub(super) async fn deliver(&self, id: &str, text: String) -> Result<bool, String> {
         let t = self.row(id)?;
         match &t.session {
             Some(s) if self.launcher.alive(s) => {
@@ -867,7 +949,7 @@ impl Super {
                         row.pending.push(text);
                     }
                 })?;
-                self.start(id).await
+                self.start(id).await.map(|_| false)
             }
         }
     }
@@ -930,8 +1012,8 @@ impl Super {
         if n.effects.contains(&super::board::Effect::StopReview) {
             self.stop_review(reviewer).await;
         }
-        self.deliver(&t.id, message.to_string()).await?;
-        Ok(format!("Sent to {} ({}).", t.label, n.to.name()))
+        let held = self.deliver(&t.id, message.to_string()).await?;
+        Ok(format!("Sent to {} ({}).{}", t.label, n.to.name(), held_note(held)))
     }
 
     /// `send` with `question: true`: the task answers in text; its board state and any
@@ -950,11 +1032,12 @@ impl Super {
             }
             None => return Err(format!("{} has no session to answer", t.label)),
         };
-        self.prompt_as(&s, super::link::SUPER_QUESTION_ID, text).await?;
+        let held = self.prompt_as(&s, super::link::SUPER_QUESTION_ID, text).await?;
         Ok(format!(
-            "Asked {} (still {}); its reply wakes you when its turn ends.",
+            "Asked {} (still {}); its reply wakes you when its turn ends.{}",
             t.label,
-            t.state.name()
+            t.state.name(),
+            held_note(held)
         ))
     }
 
@@ -968,6 +1051,9 @@ impl Super {
         }
         if n.effects.contains(&super::board::Effect::StopReview) {
             self.stop_review(reviewer).await;
+        }
+        if let Some(s) = t.session.as_deref() {
+            self.grounded(s);
         }
         if let Some(s) = t.session.as_deref().filter(|s| self.launcher.alive(s)) {
             self.launcher.send(s, ClientCmd::Abort { drop_queued: true }).await?;
@@ -1173,8 +1259,8 @@ If anything fails (a conflict, uncommitted changes to tracked files in the main 
 `merge: failed` with the reason. Untracked files (build output, caches) are not a reason to stop: git refuses by \
 itself if the merge would overwrite one."
         );
-        self.deliver(&t.id, text).await?;
-        Ok(format!("{} is merging.", t.label))
+        let held = self.deliver(&t.id, text).await?;
+        Ok(format!("{} is merging.{}", t.label, held_note(held)))
     }
 
     fn list(&self, all: bool) -> String {
@@ -2052,6 +2138,8 @@ mod tests {
         let fx = fixture(5, &[]);
         std::fs::create_dir(fx.root.join("p")).unwrap();
         run(&fx, spawn_args("p", "t", false)).await.unwrap();
+        // The brief's run ended (questions and work never share a run).
+        fx.sup.ran("s1", 1).await;
         use State::*;
         for s in [Ready, Running, Blocked] {
             set_state(&fx, "T1-t", s);
@@ -2073,7 +2161,8 @@ mod tests {
             fx.sup.row("T1-t").unwrap().follow_ups.is_empty(),
             "a question is no follow-up"
         );
-        // A plain send is unchanged.
+        // A plain send is unchanged once the questions' runs ended.
+        fx.sup.ran("s1", 3).await;
         set_state(&fx, "T1-t", Ready);
         run(&fx, json!({"action": "send", "task": "T1-t", "message": "work"}))
             .await
@@ -2088,6 +2177,43 @@ mod tests {
         set_state(&fx, "T1-t", Queued);
         let ask = json!({"action": "send", "task": "T1-t", "message": "q", "question": true});
         assert!(run(&fx, ask).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_question_and_a_work_prompt_are_never_queued_into_one_run() {
+        // L10.9 R24: the second kind waits in code until the run that took the first one ends.
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "t", false)).await.unwrap();
+        let sent = || fx.launcher.prompts("s1");
+        let ask = |m: &str| json!({"action": "send", "task": "T1-t", "message": m, "question": true});
+        // The brief's run is going: a question waits for its end.
+        let out = run(&fx, ask("which check?")).await.unwrap();
+        assert!(out.contains("held"), "{out}");
+        assert_eq!(sent().len(), 1);
+        fx.sup.ran("s1", 1).await;
+        assert!(sent().last().unwrap().ends_with("which check?"));
+        assert_eq!(
+            fx.launcher.ids.lock().unwrap().last().unwrap(),
+            super::super::link::SUPER_QUESTION_ID
+        );
+        // The question's run is going: work waits for its end.
+        let out = run(&fx, json!({"action": "send", "task": "T1-t", "message": "work"}))
+            .await
+            .unwrap();
+        assert!(out.contains("held"), "{out}");
+        assert_eq!(sent().len(), 2);
+        fx.sup.ran("s1", 1).await;
+        assert_eq!(sent().last().unwrap(), "work");
+        assert_eq!(
+            fx.launcher.ids.lock().unwrap().last().unwrap(),
+            super::super::link::SUPER_ID
+        );
+        // A stop drops what waits.
+        run(&fx, ask("later?")).await.unwrap();
+        run(&fx, json!({"action": "stop", "task": "T1-t"})).await.unwrap();
+        fx.sup.ran("s1", 1).await;
+        assert_eq!(sent().len(), 3, "{:?}", sent());
     }
 
     #[tokio::test]

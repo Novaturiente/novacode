@@ -1171,6 +1171,7 @@ Address every finding, commit, re-run your checks and report `done` again.",
             }
         }
         drop(g);
+        sup.grounded(session);
         // A resumed task runs a new session; only its current one counts.
         if sup.row(id).ok().and_then(|t| t.session).as_deref() != Some(session) {
             return;
@@ -1587,6 +1588,10 @@ async fn run_link(
                         }
                     }
                     links.replied(&sup, &id, &mut watcher);
+                    if !busy {
+                        // Any run end missed while disconnected: nothing of super's is in flight.
+                        sup.ran(&session, usize::MAX).await;
+                    }
                     history = Vec::new();
                 }
                 ServerMsg::Event { event } => {
@@ -1601,6 +1606,14 @@ async fn run_link(
                         links.kick();
                     }
                     links.replied(&sup, &id, &mut watcher);
+                    // Held prompts of the other kind go once this run took all of super's (R24).
+                    if let AgentEvent::AgentEnd { prompts, .. } = &event {
+                        let ours = prompts
+                            .iter()
+                            .filter(|p| matches!(p.as_deref(), Some(SUPER_ID | SUPER_QUESTION_ID)))
+                            .count();
+                        sup.ran(&session, ours).await;
+                    }
                 }
                 ServerMsg::Ask { .. } | ServerMsg::Approve { .. } => {
                     if let Some(card) = Card::from_msg(&msg) {
@@ -3040,6 +3053,69 @@ mod tests {
         assert_eq!(row.state, State::Blocked);
         assert!(row.block.unwrap().limit.is_none(), "not woken again by a later clear");
         assert!(!sent_cleared(&fx, &s));
+    }
+
+    #[tokio::test]
+    async fn a_held_question_is_sent_when_the_run_on_super_s_work_prompt_ends() {
+        // L10.9 R24.
+        let fx = fixture(5);
+        let s = fx.task("T1-x", "faux/a", State::Running);
+        let mut t = fx.end(&s).await;
+        t.catch_up(true, vec![], vec![]).await;
+        let questions = |fx: &Fx| {
+            fx.launcher
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, c)| matches!(c, ClientCmd::Prompt { text, .. } if text.starts_with(QUESTION_PREFIX)))
+                .count()
+        };
+        fx.sup
+            .run(json!({"action": "send", "task": "T1-x", "message": "work"}))
+            .await
+            .unwrap();
+        let ask = json!({"action": "send", "task": "T1-x", "message": "which?", "question": true});
+        assert!(fx.sup.run(ask).await.unwrap().contains("held"));
+        assert_eq!(questions(&fx), 0);
+        t.event(AgentEvent::AgentStart).await;
+        t.event(says("working")).await;
+        t.event(report("done")).await;
+        t.event(end(SUPER, StopReason::Stop)).await;
+        fx.until("question sent", |fx| questions(fx) == 1).await;
+    }
+
+    #[tokio::test]
+    async fn a_merging_run_that_also_took_a_question_and_ended_its_goal_unreported_is_a_merge_exit() {
+        // L10.9 R24: a question and the merge prompt consumed in one run, the goal done, no report.
+        let fx = fixture(5);
+        let repo = fx.sup.root.join("a");
+        git_repo(&repo);
+        let goals = fx.sup.home().join("goals");
+        std::fs::create_dir_all(&goals).unwrap();
+        let goal =
+            |state: &str| std::fs::write(goals.join("s-T1-x.json"), json!({ "state": state }).to_string()).unwrap();
+        goal("auditing");
+        let s = fx.merging("T1-x", &repo);
+        let mut t = fx.end(&s).await;
+        t.catch_up(true, vec![], vec![]).await;
+        t.event(AgentEvent::AgentStart).await;
+        t.event(says("I changed nothing.")).await;
+        goal("done");
+        t.event(end(&[Some(SUPER_QUESTION_ID), Some(SUPER_ID)], StopReason::Stop))
+            .await;
+        fx.until("out of merging", |fx| fx.state("T1-x") != State::Merging)
+            .await;
+        let row = fx.sup.row("T1-x").unwrap();
+        assert_eq!(row.state, State::Blocked);
+        assert!(row.block.unwrap().merge);
+        assert_eq!(fx.locks(), 0);
+        fx.until("woken", |fx| {
+            wakes(fx)
+                .iter()
+                .any(|w| w.contains("T1-x is blocked") && w.contains("merge lock is released"))
+        })
+        .await;
     }
 
     #[tokio::test]
