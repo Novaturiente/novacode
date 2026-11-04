@@ -1015,7 +1015,9 @@ impl Super {
         };
         let text = format!(
             "The user approved merging. Rebase {branch} on {base}. {recheck} Then {how}. \
-If anything fails (a conflict, a dirty main checkout, a failed check), report `merge: failed` with the reason."
+If anything fails (a conflict, uncommitted changes to tracked files in the main checkout, a failed check), report \
+`merge: failed` with the reason. Untracked files (build output, caches) are not a reason to stop: git refuses by \
+itself if the merge would overwrite one."
         );
         self.deliver(&t.id, text).await?;
         Ok(format!("{} is merging.", t.label))
@@ -2098,6 +2100,10 @@ mod tests {
         run(&fx, json!({"action": "merge", "task": "T1-a"})).await.unwrap();
         let text = fx.launcher.prompts("s1").last().unwrap().clone();
         assert!(!text.contains("moved since"), "{text}");
+        assert!(
+            text.contains("Untracked files (build output, caches) are not a reason to stop"),
+            "{text}"
+        );
         // The base gets a new commit after T2 started.
         run(&fx, spawn_args("app", "b", true)).await.unwrap();
         std::fs::write(app.join("sub/g"), "new").unwrap();
