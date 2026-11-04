@@ -2328,3 +2328,44 @@ async fn take_follow_ups_drops_queued_prompts() {
     h.shutdown();
     task.await.unwrap();
 }
+
+/// Prompt, prompt, abort: how many runs start before the session settles (L10.9 Stop).
+async fn runs_after_abort(drop_queued: bool) -> usize {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (agent, asked) = waiting_on_approval(work.path(), home.path());
+    let (h, task) = agent::spawn(agent);
+    let mut rx = h.subscribe();
+    h.prompt("make a file");
+    asked.notified().await;
+    h.prompt("then this");
+    if drop_queued {
+        h.drop_follow_ups();
+    }
+    h.abort();
+    let runs = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut runs = 0;
+        loop {
+            match rx.recv().await.unwrap() {
+                AgentEvent::AgentStart => runs += 1,
+                AgentEvent::Settled => return runs,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the session settles");
+    h.shutdown();
+    task.await.unwrap();
+    runs
+}
+
+#[tokio::test]
+async fn abort_dropping_queued_starts_no_second_run() {
+    assert_eq!(runs_after_abort(true).await, 1);
+}
+
+#[tokio::test]
+async fn plain_abort_keeps_the_queued_prompt() {
+    assert_eq!(runs_after_abort(false).await, 2);
+}
