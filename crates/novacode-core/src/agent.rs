@@ -2581,6 +2581,11 @@ impl SessionHandle {
             .collect()
     }
 
+    /// Drop every queued follow-up, images too, so an abort right after starts no run (super's Stop, L10.9).
+    pub fn drop_follow_ups(&self) {
+        self.shared.queues.lock().unwrap().follow_up.clear();
+    }
+
     /// Compact now, or as soon as the running turn ends (`/compact`, L4.5).
     pub fn compact(&self) {
         *self.shared.compact.lock().unwrap() = true;

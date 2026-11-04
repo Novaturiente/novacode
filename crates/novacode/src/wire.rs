@@ -252,7 +252,12 @@ pub enum ClientCmd {
     Steer {
         text: String,
     },
-    Abort,
+    /// Stops the running turn; queued prompts then start, unless `drop_queued`
+    /// drops them first (super's Stop, L10.9).
+    Abort {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        drop_queued: bool,
+    },
     /// `provider/model[:level]`.
     SetModel {
         model: String,
@@ -330,7 +335,7 @@ impl ClientCmd {
         match self {
             ClientCmd::Prompt { .. } => "prompt",
             ClientCmd::Steer { .. } => "steer",
-            ClientCmd::Abort => "abort",
+            ClientCmd::Abort { .. } => "abort",
             ClientCmd::SetModel { .. } => "set_model",
             ClientCmd::SetThinking { .. } => "set_thinking",
             ClientCmd::Compact => "compact",
@@ -488,7 +493,11 @@ mod tests {
             },
             Request {
                 id: None,
-                cmd: ClientCmd::Abort,
+                cmd: ClientCmd::Abort { drop_queued: false },
+            },
+            Request {
+                id: None,
+                cmd: ClientCmd::Abort { drop_queued: true },
             },
             Request {
                 id: Some("2".into()),
@@ -566,5 +575,10 @@ mod tests {
         // Minimal hand-written commands parse too.
         let r: Request = serde_json::from_str(r#"{"type":"abort"}"#).unwrap();
         assert_eq!(r.cmd.name(), "abort");
+        assert!(matches!(r.cmd, ClientCmd::Abort { drop_queued: false }));
+        assert!(
+            want.contains("{\"type\":\"abort\"}\n"),
+            "plain abort stays byte-identical"
+        );
     }
 }
