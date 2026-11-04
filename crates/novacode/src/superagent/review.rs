@@ -235,6 +235,12 @@ recorded, never the task's own summary.\n\nThe user's request:\n{}\n",
         if t.write { "write" } else { "read" },
         t.request.trim()
     );
+    if !t.follow_ups.is_empty() {
+        s += "\nFollow-up requests the user added later (part of the request):\n";
+        for f in &t.follow_ups {
+            s += &format!("- {}\n", f.trim());
+        }
+    }
     if !t.criteria.is_empty() {
         s += "\nAcceptance criteria: check each one and name it in your findings as met or not met, with its proof.\n";
         for (n, c) in t.criteria.iter().enumerate() {
@@ -537,6 +543,28 @@ mod tests {
         }
     }
 
+    /// Super's cards: records each question and picks `pick` (none: dismissed).
+    #[derive(Default)]
+    struct Pick {
+        pick: Mutex<Option<String>>,
+        asked: Mutex<Vec<String>>,
+    }
+    impl Asker for Pick {
+        fn ask(&self, questions: Vec<Question>) -> BoxFuture<'_, Option<Vec<Reply>>> {
+            let q = questions[0].question.clone();
+            self.asked.lock().unwrap().push(q.clone());
+            let pick = self.pick.lock().unwrap().clone();
+            Box::pin(async move {
+                Some(vec![Reply {
+                    question: q,
+                    chosen: pick.into_iter().collect(),
+                    text: None,
+                    preview: None,
+                }])
+            })
+        }
+    }
+
     struct NoAsk;
     impl Asker for NoAsk {
         fn ask(&self, _: Vec<Question>) -> BoxFuture<'_, Option<Vec<Reply>>> {
@@ -569,6 +597,7 @@ mod tests {
         links: Arc<Links>,
         launcher: Arc<FakeLauncher>,
         said: Arc<Said>,
+        cards: Arc<Pick>,
     }
 
     fn sh(dir: &Path, args: &[&str]) -> String {
@@ -633,7 +662,9 @@ mod tests {
             }),
         };
         let launcher = Arc::new(FakeLauncher::default());
-        let sup = Arc::new(Super::new(&root, home.join("super/x"), cfg, None, launcher.clone()).unwrap());
+        let cards = Arc::new(Pick::default());
+        let sup =
+            Arc::new(Super::new(&root, home.join("super/x"), cfg, Some(cards.clone()), launcher.clone()).unwrap());
         let said = Arc::new(Said::default());
         let links = Links::start(&sup, Arc::new(NoAsk), Arc::new(Allow), said.clone());
         Fx {
@@ -643,6 +674,7 @@ mod tests {
             links,
             launcher,
             said,
+            cards,
         }
     }
 
@@ -901,6 +933,77 @@ mod tests {
                 .any(|l| l.contains("rounds are used up") && l.contains("show the test failing"))
         );
         assert_eq!(fx.prompts("s1").len(), sent.len(), "nothing more sent to the task");
+    }
+
+    #[tokio::test]
+    async fn a_task_out_of_review_rounds_is_ready_only_after_the_user_accepts_on_a_card() {
+        let fx = fixture("faux/review");
+        let wt = fx.spawn("fix", "standard", "change").await;
+        for (round, file) in ["src/a.rs", "src/b.rs"].into_iter().enumerate() {
+            let c = fx.commit(&wt, file);
+            fx.done("T1-fix", &c, &[file]);
+            let rv = fx.review_of("T1-fix").await;
+            fx.report(&rv.id, json!({"verdict": "rejected", "findings": ["no"]}));
+            let want = if round == 0 { State::Running } else { State::Blocked };
+            fx.until("the verdict applied", |fx| fx.row("T1-fix").state == want)
+                .await;
+        }
+        let accept = json!({"action": "accept", "task": "T1-fix"});
+        // Dismissed or cancelled: it stays blocked.
+        let out = fx.run(accept.clone()).await.unwrap();
+        assert!(out.contains("declined"), "{out}");
+        assert_eq!(fx.row("T1-fix").state, State::Blocked);
+        assert!(
+            fx.cards
+                .asked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|q| q.starts_with("Accept T1-fix without an approved review?")),
+            "{:?}",
+            fx.cards.asked.lock().unwrap()
+        );
+        *fx.cards.pick.lock().unwrap() = Some("Accept".into());
+        let out = fx.run(accept).await.unwrap();
+        assert!(out.contains("T1-fix is ready"), "{out}");
+        let t = fx.row("T1-fix");
+        assert_eq!((t.state, t.accepted), (State::Ready, true));
+        let list = fx.run(json!({"action": "list"})).await.unwrap();
+        assert!(list.contains("| ready (accepted without review) |"), "{list}");
+        assert_eq!(fx.row("T1-fix").reviewer, None, "no new review");
+    }
+
+    #[tokio::test]
+    async fn the_review_brief_carries_super_s_follow_ups_but_not_code_s_resends() {
+        let fx = fixture("faux/review");
+        let wt = fx.spawn("fix", "standard", "change").await;
+        let send = json!({"action": "send", "task": "T1-fix", "message": "also add a README line"});
+        fx.run(send).await.unwrap();
+        let c1 = fx.commit(&wt, "README.md");
+        fx.done("T1-fix", &c1, &["README.md"]);
+        let rv = fx.review_of("T1-fix").await;
+        let brief = fx.prompts(&rv.session.clone().unwrap()).remove(0);
+        let request = brief.find("please fix").unwrap();
+        let follow = brief
+            .find("also add a README line")
+            .unwrap_or_else(|| panic!("{brief}"));
+        assert!(request < follow && brief.contains("Follow-up requests"), "{brief}");
+        // The findings code forwards are not follow-ups.
+        fx.report(&rv.id, json!({"verdict": "rejected", "findings": ["F1 tabs"]}));
+        fx.until("running", |fx| fx.row("T1-fix").state == State::Running).await;
+        let c2 = fx.commit(&wt, "src/a.rs");
+        fx.done("T1-fix", &c2, &["README.md", "src/a.rs"]);
+        fx.until("second review", |fx| {
+            fx.row("T1-fix").reviewer.is_some_and(|r| r != rv.id)
+        })
+        .await;
+        let rv2 = fx.review_of("T1-fix").await;
+        let brief = fx.prompts(&rv2.session.clone().unwrap()).remove(0);
+        assert!(
+            brief.contains("also add a README line") && !brief.contains("F1 tabs"),
+            "{brief}"
+        );
+        assert_eq!(fx.row("T1-fix").follow_ups, ["also add a README line"]);
     }
 
     #[tokio::test]

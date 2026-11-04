@@ -57,7 +57,14 @@ pub trait Inform: Send + Sync {
     fn notice(&self, text: String);
     /// A desktop notification.
     fn desktop(&self, title: String, body: String);
+    /// Super's session is ending: a card copy that closes now got no answer from the user.
+    fn closing(&self) -> bool {
+        false
+    }
 }
+
+/// How much of a task's last message a code-made report carries.
+const LAST_TEXT_CHARS: usize = 600;
 
 /// Who started a run, from `agent_end`'s consumed prompts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +169,8 @@ pub struct Watcher {
     /// Subagent id → still running.
     subagents: HashMap<String, bool>,
     last_error: Option<String>,
+    /// The current run's last assistant text: a code-made report carries it.
+    last_text: Option<String>,
     retry_after_ms: Option<u64>,
     goal: Option<Goal>,
     /// The catch-up note already given: (super's prompt hash, messages after it).
@@ -182,6 +191,15 @@ impl Watcher {
         !self.processes.is_empty() || self.subagents.values().any(|r| *r)
     }
 
+    /// The current run's last assistant text, cut to about [`LAST_TEXT_CHARS`].
+    pub fn last_text(&self) -> Option<String> {
+        let t = self.last_text.as_deref()?.trim();
+        Some(match t.char_indices().nth(LAST_TEXT_CHARS) {
+            Some((i, _)) => format!("{}…", &t[..i]),
+            None => t.to_string(),
+        })
+    }
+
     /// The session state (hello, state updates): its running processes.
     pub fn state(&mut self, s: &crate::wire::State) {
         self.processes = s.processes.iter().cloned().collect();
@@ -193,6 +211,7 @@ impl Watcher {
             AgentEvent::AgentStart => {
                 self.run_reported = false;
                 self.last_error = None;
+                self.last_text = None;
                 self.retry_after_ms = None;
             }
             AgentEvent::Message(m) => {
@@ -201,10 +220,14 @@ impl Watcher {
                     self.reported_since_super = true;
                     self.armed = false;
                 }
-                if let Message::Assistant(a) = m
-                    && let Some(e) = &a.error_message
-                {
-                    self.last_error = Some(e.clone());
+                if let Message::Assistant(a) = m {
+                    if let Some(e) = &a.error_message {
+                        self.last_error = Some(e.clone());
+                    }
+                    let text = a.text();
+                    if !text.trim().is_empty() {
+                        self.last_text = Some(text);
+                    }
                 }
             }
             AgentEvent::Retry {
@@ -344,6 +367,7 @@ impl Watcher {
         };
         self.run_reported = false;
         self.last_error = last.error_message.clone();
+        self.last_text = Some(last.text()).filter(|t| !t.trim().is_empty());
         match self.end(Run::Super, &last.stop, goal) {
             Some(ev) => CatchUp::Report(ev),
             None => CatchUp::Nothing,
@@ -980,6 +1004,10 @@ Address every finding, commit, re-run your checks and report `done` again.",
             let l = format!("[{label}] ");
             let (cmd, said) =
                 crate::relay::relay(asker.as_ref(), approver.as_ref(), card, Label { ask: &l, approval: &l }).await;
+            // Super shutting down closed its copy: that is no answer; the card stays open in the task.
+            if me.upgrade().is_none_or(|me| me.inform.closing()) {
+                return;
+            }
             if let Some(w) = writer.lock().await.as_mut() {
                 let req = Request { id: None, cmd };
                 let _ = w.write_all(line(&req).as_bytes()).await;
@@ -1113,11 +1141,17 @@ fn wake_text(t: &board::Task, ev: &Event) -> String {
                 ReportState::Failed => "failed",
                 ReportState::Progress => "progress",
             };
-            format!("{} reported {st} (now {}): {summary}", t.label, t.state.name())
+            let mut s = format!("{} reported {st} (now {}): {summary}", t.label, t.state.name());
+            if t.state == State::Reviewing && t.reviewer.is_none() {
+                s += "\nNo review runs for a read task: judge its answer now, with `task accept` or `task review`; \
+nothing else will wake you about it.";
+            }
+            s
         }
         Event::MergeReport(m) => match m {
             MergeResult::Merged => format!(
-                "{} merged (now {}). Ask the user now whether to close it (`task close`).",
+                "{} merged (now {}). If the user already said to close it after the merge, call `task close` now (its \
+card is the confirmation); otherwise offer to close it.",
                 t.label,
                 t.state.name()
             ),
@@ -1155,7 +1189,8 @@ second review with `task review`.",
             s
         }
         Event::Verdict(v) if t.state == State::Blocked => format!(
-            "{}'s review says {} and its review rounds are used up (now blocked). Ask the user how to go on.",
+            "{}'s review says {} and its review rounds are used up (now blocked). Ask the user how to go on; \
+if they want it as it is, `task accept` asks them on a card to accept it without an approved review.",
             t.label,
             v.name()
         ),
@@ -1219,6 +1254,15 @@ fn checks_text(f: &serde_json::Map<String, Value>) -> String {
         String::new()
     } else {
         format!("\nChecks:\n{}", out.join("\n"))
+    }
+}
+
+/// The wake lines for a code-made report of a turn that ended without one: the
+/// task's last message, so an answer given in text isn't lost.
+fn said(w: &Watcher, ev: &Event) -> String {
+    match (ev, w.last_text()) {
+        (Event::TurnUnreported | Event::GoalEnded(_), Some(t)) => format!("\nIts last message:\n{t}"),
+        _ => String::new(),
     }
 }
 
@@ -1298,7 +1342,7 @@ async fn run_link(
                     match watcher.catch_up(&history, last.as_deref(), busy, goal) {
                         CatchUp::Nothing => {}
                         CatchUp::Report(ev) => {
-                            if links.apply(&sup, &id, ev) {
+                            if links.apply_with(&sup, &id, ev.clone(), &said(&watcher, &ev)) {
                                 links.kick();
                             }
                         }
@@ -1319,7 +1363,7 @@ async fn run_link(
                     let home = sup.home().to_path_buf();
                     let ev = watcher.event(&event, || Goal::read(&home, &session));
                     if let Some(ev) = ev
-                        && links.apply(&sup, &id, ev)
+                        && links.apply_with(&sup, &id, ev.clone(), &said(&watcher, &ev))
                     {
                         links.kick();
                     }
@@ -1373,6 +1417,13 @@ impl Inform for HubInform {
         if self.desktop {
             tokio::spawn(crate::activity::desktop(title, body));
         }
+    }
+    fn closing(&self) -> bool {
+        self.slot
+            .0
+            .get()
+            .and_then(|w| w.upgrade())
+            .is_none_or(|h| h.is_closed())
     }
 }
 
@@ -1429,6 +1480,34 @@ mod tests {
             out = w.event(e, || goal);
         }
         out
+    }
+
+    fn says(text: &str) -> AgentEvent {
+        AgentEvent::Message(Message::Assistant(AssistantMessage {
+            content: vec![Block::text(text)],
+            ..match assistant(StopReason::Stop, None) {
+                Message::Assistant(a) => a,
+                _ => unreachable!(),
+            }
+        }))
+    }
+
+    #[test]
+    fn a_code_made_report_carries_the_task_s_last_text_cut() {
+        let mut w = Watcher::new("faux");
+        let ev = run(
+            &mut w,
+            &[says("checking"), says("merged: abc123"), end(SUPER, StopReason::Stop)],
+            Goal::None,
+        );
+        assert_eq!(ev, Some(Event::TurnUnreported));
+        assert_eq!(w.last_text().as_deref(), Some("merged: abc123"));
+        // A new run starts empty; a long answer is cut.
+        run(&mut w, &[says(&"é".repeat(700))], Goal::None);
+        let cut = w.last_text().unwrap();
+        assert!(cut.chars().count() <= 601 && cut.ends_with('…'), "{cut}");
+        run(&mut w, &[], Goal::None);
+        assert_eq!(w.last_text(), None);
     }
 
     #[test]
@@ -1831,8 +1910,11 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct Said(Log);
+    struct Said(Log, Arc<std::sync::atomic::AtomicBool>);
     impl Inform for Said {
+        fn closing(&self) -> bool {
+            self.1.load(std::sync::atomic::Ordering::Relaxed)
+        }
         fn wake(&self, t: String) {
             self.0.lock().unwrap().push(format!("wake: {t}"));
         }
@@ -1854,6 +1936,7 @@ mod tests {
         launcher: Arc<FakeLauncher>,
         asker: Arc<FakeAsker>,
         log: Log,
+        closing: Arc<std::sync::atomic::AtomicBool>,
     }
 
     fn fixture(max_running: usize) -> Fx {
@@ -1886,7 +1969,9 @@ mod tests {
             Arc::new(Super::new(&root, home.join("super/x"), cfg, Some(asker.clone()), launcher.clone()).unwrap());
         before(&sup, &launcher);
         let log = Log::default();
-        let links = Links::start(&sup, asker.clone(), Arc::new(Allow), Arc::new(Said(log.clone())));
+        let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let said = Said(log.clone(), closing.clone());
+        let links = Links::start(&sup, asker.clone(), Arc::new(Allow), Arc::new(said));
         Fx {
             _tmp: tmp,
             sup,
@@ -1894,6 +1979,7 @@ mod tests {
             launcher,
             asker,
             log,
+            closing,
         }
     }
 
@@ -2071,6 +2157,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn super_shutting_down_never_answers_a_task_s_card() {
+        let fx = fixture(5);
+        let s = fx.task("T1-x", "faux/a", State::Running);
+        let mut t = fx.end(&s).await;
+        t.catch_up(false, vec![], vec![ask(3)]).await;
+        fx.until("asked", |fx| fx.asker.waiting.lock().unwrap().len() == 1)
+            .await;
+        // Super's hub closes: its copy of the card ends without an answer.
+        fx.closing.store(true, std::sync::atomic::Ordering::Relaxed);
+        let tx = fx.asker.waiting.lock().unwrap().remove(0);
+        tx.send(None).unwrap();
+        let sent = tokio::time::timeout(Duration::from_millis(300), t.lines.next_line()).await;
+        assert!(sent.is_err(), "nothing sent to the task: {sent:?}");
+        assert_eq!(fx.state("T1-x"), State::WaitingYou, "the card stays open in the task");
+        assert!(!fx.said().iter().any(|l| l.contains("you answered")), "{:?}", fx.said());
+    }
+
+    #[tokio::test]
     async fn a_card_while_merging_keeps_merging() {
         let fx = fixture(5);
         let s = fx.task("T1-x", "faux/a", State::Merging);
@@ -2093,12 +2197,18 @@ mod tests {
         // A progress report, then the turn on super's prompt ends.
         t.event(AgentEvent::AgentStart).await;
         t.event(report("progress")).await;
+        t.event(says("the merge landed: abc123")).await;
         t.event(end(SUPER, StopReason::Stop)).await;
         fx.until("blocked", |fx| fx.state("T1-x") == State::Blocked).await;
         let said = fx.said();
         let wakes: Vec<_> = said.iter().filter(|l| l.starts_with("wake:")).collect();
         assert_eq!(wakes.len(), 1, "{said:?}");
         assert!(wakes[0].contains("T1-x is blocked (code-made report): ended its turn without a report"));
+        assert!(
+            wakes[0].contains("Its last message:\nthe merge landed: abc123"),
+            "{}",
+            wakes[0]
+        );
         assert!(said.contains(&"desktop: T1-x blocked".to_string()));
     }
 
@@ -2436,5 +2546,13 @@ mod tests {
         assert_eq!(wakes.len(), 1, "progress doesn't wake: {wakes:?}");
         assert!(wakes[0].contains("T1-x reported done (now reviewing): the answer is 42"));
         assert!(wakes[0].contains("#1 `cargo test` → exit 0: ok"), "{}", wakes[0]);
+        // A read task: no review runs; super must judge it now.
+        assert!(
+            wakes[0].contains("No review runs for a read task") && wakes[0].contains("`task accept` or `task review`"),
+            "{}",
+            wakes[0]
+        );
+        let list = fx.sup.run(json!({"action": "list"})).await.unwrap();
+        assert!(list.contains("| reviewing (your call) |"), "{list}");
     }
 }

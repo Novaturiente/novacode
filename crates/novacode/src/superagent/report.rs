@@ -339,7 +339,7 @@ struct Args {
     summary: Option<String>,
     /// Only with `state: blocked`: what you need answered.
     question: Option<String>,
-    /// Proof numbers from the `[proof #N]` marks on your bash and process results (e.g. "#4"), plus screenshot or file paths and URLs.
+    /// Proof numbers from the `[proof #N]` marks (e.g. "#4"), plus files a check produced and URLs.
     #[serde(default)]
     checks: Vec<String>,
     /// Review task: at most 5 findings or proof requests (with the verdict, 1000 characters at most).
@@ -348,6 +348,11 @@ struct Args {
     /// Review task: base-commit check results, outside the 1000-character cap.
     baseline: Option<Value>,
 }
+
+/// What `checks` holds besides proof numbers, for the field and its errors.
+const ARTIFACTS_ONLY: &str = "Besides `#N` proof numbers, `checks` holds only files a check produced \
+(screenshots, logs) and URLs, never source files, commands or results: cite the `#N` of the check that ran \
+them, and put text in `summary`.";
 
 /// One `checks` entry.
 enum Cited {
@@ -358,7 +363,9 @@ enum Cited {
 
 fn cite(s: &str) -> Cited {
     let t = s.trim();
-    let num = t.strip_prefix("proof").map(str::trim_start).unwrap_or(t);
+    // `[proof #N]`, as the mark shows on the tool result.
+    let num = t.strip_prefix('[').and_then(|r| r.strip_suffix(']')).unwrap_or(t);
+    let num = num.strip_prefix("proof").map(str::trim_start).unwrap_or(num);
     let num = num.strip_prefix('#').unwrap_or(num);
     if let Ok(n) = num.parse() {
         return Cited::Proof(n);
@@ -526,13 +533,16 @@ impl ReportTool {
                     if done {
                         let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
                         let Some(mtime) = mtime else {
-                            return Err(format!("{p} doesn't exist; cite files that exist"));
+                            return Err(format!("{p} doesn't exist. {ARTIFACTS_ONLY}"));
                         };
                         let ms = mtime
                             .duration_since(std::time::UNIX_EPOCH)
                             .map_or(0, |d| d.as_millis() as u64);
                         if last_edit.is_some_and(|e| ms < e) {
-                            return Err(format!("{p} is older than your last edit; make it again"));
+                            return Err(format!(
+                                "{p} is older than your last edit: a file a check produced must be made after it. \
+                                 {ARTIFACTS_ONLY}"
+                            ));
                         }
                     }
                     artifacts.push(path.display().to_string());
@@ -594,7 +604,7 @@ impl Tool for ReportTool {
         "report"
     }
     fn description(&self) -> &str {
-        "Report to super, the session that started this task. Work task: `state` (progress | done | blocked | failed), `summary` (at most 80 words), `question` (only with blocked), `checks` (the `[proof #N]` numbers of the bash and process calls that prove it, plus screenshot paths or URLs). Review task: `verdict` and `findings`. Merging: `merge` and a one-line `summary`."
+        "Report to super, the session that started this task. Work task: `state` (progress | done | blocked | failed), `summary` (at most 80 words), `question` (only with blocked), `checks` (the `[proof #N]` numbers of the bash and process calls that prove it, plus files a check produced, such as screenshots or logs, and URLs). Review task: `verdict` and `findings`. Merging: `merge` and a one-line `summary`."
     }
     fn schema(&self) -> Value {
         json!({
@@ -605,7 +615,7 @@ impl Tool for ReportTool {
                 "merge": { "type": "string", "enum": ["merged", "pr-opened", "failed"], "description": "Merging task, instead of `state`." },
                 "summary": { "type": "string", "description": "At most 80 words; for `merge`, the one-line reason." },
                 "question": { "type": "string", "description": "Only with `state: blocked`: what you need answered." },
-                "checks": { "type": "array", "items": { "type": "string" }, "description": "Proof numbers from the `[proof #N]` marks on your bash and process results (e.g. \"#4\"), plus screenshot or file paths and URLs." },
+                "checks": { "type": "array", "items": { "type": "string" }, "description": "Proof numbers from the `[proof #N]` marks on your bash and process results (e.g. \"#4\"), plus files a check produced (screenshots, logs) and URLs; never source files, commands or results: those go in `summary`." },
                 "findings": { "type": "array", "items": { "type": "string" }, "description": "Review task: at most 5 findings or proof requests (with the verdict, 1000 characters at most)." },
                 "baseline": { "type": "object", "description": "Review task: base-commit check results, outside the 1000-character cap: {\"checks\": [{\"folder\", \"command\", \"exit_codes\": [first run, re-run], \"failing\": [test names]}]}." }
             }
@@ -1029,7 +1039,17 @@ mod tests {
         f.bash("echo test").await;
         let done = |a: &str| json!({"state": "done", "summary": "s", "checks": ["#1", a]});
         refused(&f.report(done("old.png")).await, "older than your last edit");
+        refused(&f.report(done("old.png")).await, "never source files");
         refused(&f.report(done("none.png")).await, "doesn't exist");
+        // Text and commands in `checks`: the error says where they go.
+        let o = f.report(done("python3 -m unittest: OK (2 tests)")).await;
+        refused(&o, "only files a check produced");
+        refused(&o, "`summary`");
+        // The mark as the tool result shows it is a proof number.
+        let r = report(&f.report(done("[proof #1]")).await);
+        assert_eq!(r["checks"].as_array().unwrap().len(), 2);
+        let schema = f.tool.schema().to_string();
+        assert!(schema.contains("never source files, commands or results"), "{schema}");
         std::fs::write(f.work.join("new.png"), "png").unwrap();
         let r = report(&f.report(done("new.png")).await);
         assert_eq!(r["artifacts"], json!([f.work.join("new.png")]));

@@ -7,7 +7,7 @@
 //! [`Launcher`]; [`Procs`] is the real one. They outlive super.
 
 use super::Tier;
-use super::board::{Board, Event, Kind, Landed, MergeResult, State, Task, TaskType};
+use super::board::{Board, Event, Kind, MergeResult, State, Task, TaskType};
 use crate::wire::{ClientCmd, Request, ServerMsg, line};
 use futures_util::future::BoxFuture;
 use novacode_base::paths::Paths;
@@ -331,10 +331,7 @@ impl Super {
             "stop" => self.stop(&t).await,
             "close" => self.close(&t).await,
             "merge" => self.merge(&t, a.pr).await,
-            "accept" => {
-                self.edit(|b| b.apply(&t.id, Event::Accept))??;
-                Ok(format!("{} is ready.", t.label))
-            }
+            "accept" => self.accept(&t).await,
             "review" => {
                 self.edit(|b| b.apply(&t.id, Event::Review))??;
                 let review = self.open_review(&t.id, a.note.as_deref())?;
@@ -745,10 +742,34 @@ impl Super {
         self.retire_review(&r.id);
     }
 
+    /// `task accept`: a read task in `reviewing`, or a write task whose review rounds are
+    /// used up, after the user's OK on a card made by code.
+    async fn accept(&self, t: &Task) -> Result<String, String> {
+        self.check(&t.id, Event::Accept)?;
+        if t.state == State::Blocked {
+            let q = format!(
+                "Accept {} without an approved review? Its review rounds are used up; it becomes ready, \
+                 marked accepted without review, and can be merged.",
+                t.label
+            );
+            if !self.confirm(format!("{}: accept", t.label), q, "Accept").await? {
+                return Ok(format!("The user declined: {} stays blocked.", t.label));
+            }
+        }
+        self.edit(|b| b.apply(&t.id, Event::Accept))??;
+        Ok(format!("{} is ready.", t.label))
+    }
+
     async fn send(&self, t: &Task, message: &str) -> Result<String, String> {
+        let follow_up = |b: &mut Board| {
+            if let Some(row) = b.tasks.iter_mut().find(|r| r.id == t.id) {
+                row.follow_ups.push(message.to_string());
+            }
+        };
         if t.state == State::Queued {
             self.edit(|b| {
                 b.apply(&t.id, Event::Send)?;
+                follow_up(b);
                 if let Some(row) = b.tasks.iter_mut().find(|r| r.id == t.id) {
                     row.pending.push(message.to_string());
                 }
@@ -756,7 +777,11 @@ impl Super {
             })??;
             return Ok(format!("Added to {}'s brief; it is still queued.", t.label));
         }
-        let n = self.edit(|b| b.apply(&t.id, Event::Send))??;
+        let n = self.edit(|b| {
+            let n = b.apply(&t.id, Event::Send)?;
+            follow_up(b);
+            Ok::<_, String>(n)
+        })??;
         if n.effects.contains(&super::board::Effect::StopReview) {
             self.stop_review(t.reviewer.clone()).await;
         }
@@ -969,13 +994,7 @@ If anything fails (a conflict, a dirty main checkout, a failed check), report `m
             .iter()
             .filter(|t| all || t.state != State::Archived)
             .map(|t| {
-                let mut state = t.state.name().to_string();
-                match (&t.block, t.landed) {
-                    (Some(bl), _) => state += &format!(": {}", bl.reason),
-                    (None, Some(Landed::Merged)) => state += " (merged)",
-                    (None, Some(Landed::PrOpened)) => state += " (PR opened)",
-                    _ => {}
-                }
+                let state = t.state_text();
                 let repo = t
                     .repo
                     .as_ref()
@@ -1107,7 +1126,7 @@ impl Tool for TaskTool {
         "task"
     }
     fn description(&self) -> &str {
-        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], scope?, skills?[], goal?}; send {task, message}; stop {task}; close {task} and merge {task, pr?} (each asks the user on a card); accept {task} (read tasks); review {task, note?}; list {all?}; read {task, offset?, limit?} (pages the task's final message)."
+        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], scope?, skills?[], goal?}; send {task, message}; stop {task}; close {task} and merge {task, pr?} (each asks the user on a card); accept {task} (a read task in reviewing; a write task blocked by used-up review rounds, after the user's OK on a card); review {task, note?}; list {all?}; read {task, offset?, limit?} (pages the task's final message)."
     }
     fn schema(&self) -> Value {
         let s = |d: &str| json!({ "type": "string", "description": d });

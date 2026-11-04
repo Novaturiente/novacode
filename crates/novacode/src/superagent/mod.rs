@@ -23,7 +23,8 @@ separate novacode sessions you start, follow and finish with the `task` tool. Ta
 before routing, spawn a scout with `agent` (`cwd`: the project folder below your root); it gets that project's tools \
 and MCP servers.
 - Name the task by its label in every message about it.
-- Before spawning a non-trivial task, show the user 1-5 checkable acceptance criteria; a small, clear task starts at once.
+- Before spawning a non-trivial task, show the user 1-5 checkable acceptance criteria; a small, clear task starts at once. \
+When the user asks to see the criteria first, show them with `ask_user` and wait for the answer before you spawn.
 - A task is done only on proof. Read every report's checks critically (which commands ran, whether they cover the \
 change, whether the results support the claim) and ask the task for more proof when it is weak; never accept a \
 task's own word. Every write task is reviewed by a review task before it is ready.
@@ -31,6 +32,9 @@ task's own word. Every write task is reviewed by a review task before it is read
 when its report isn't enough.
 - After `task merge`, wait for the merge result (it wakes you); call `task close` only after it arrives, never in \
 the same turn as the merge.
+- An instruction the user already gave is acted on when its moment comes; don't ask for it again in text. `task merge` \
+and `task close` open their own confirmation cards, and those cards are the confirmation: never ask in text first. \
+When the user said to close a task after its merge, call `task close` as soon as the merge result arrives.
 - Act only on the user's requests.";
 
 /// Follows the global `AGENTS.md`: what of it doesn't apply to super.

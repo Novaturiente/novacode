@@ -195,6 +195,8 @@ pub struct Task {
     /// The facts of its last `done` report, for its review (never the task's summary).
     pub done: Option<Done>,
     pub landed: Option<Landed>,
+    /// A write task the user accepted on a card after its review rounds ran out.
+    pub accepted: bool,
     /// The user's words, sent in the brief (kept so a queued task can start later).
     pub request: String,
     /// Skills the brief names.
@@ -203,6 +205,8 @@ pub struct Task {
     pub goal: bool,
     /// Messages sent while `queued`: added to the brief.
     pub pending: Vec<String>,
+    /// Follow-ups super sent with `task send` (not code's resends): the review brief carries them.
+    pub follow_ups: Vec<String>,
     /// The task's session id, once its process started.
     pub session: Option<String>,
     /// The folder its process runs in (absolute; in its worktree for a write task).
@@ -218,14 +222,28 @@ pub struct Task {
 }
 
 impl Task {
-    /// The state with its block reason or landing mark: `blocked: quota`, `ready (merged)`.
+    /// The state with its block reason or marks: `blocked: quota`, `ready (merged)`,
+    /// `reviewing (your call)` for a read task no review task judges.
     pub fn state_text(&self) -> String {
         let state = self.state.name();
-        match (&self.block, self.landed) {
-            (Some(b), _) => format!("{state}: {}", b.reason),
-            (None, Some(Landed::Merged)) => format!("{state} (merged)"),
-            (None, Some(Landed::PrOpened)) => format!("{state} (PR opened)"),
-            _ => state.to_string(),
+        if let Some(b) = &self.block {
+            return format!("{state}: {}", b.reason);
+        }
+        let mut marks = Vec::new();
+        if self.state == State::Reviewing && !self.write && self.reviewer.is_none() {
+            marks.push("your call");
+        }
+        if self.accepted {
+            marks.push("accepted without review");
+        }
+        match self.landed {
+            Some(Landed::Merged) => marks.push("merged"),
+            Some(Landed::PrOpened) => marks.push("PR opened"),
+            None => {}
+        }
+        match marks.is_empty() {
+            true => state.to_string(),
+            false => format!("{state} ({})", marks.join(", ")),
         }
     }
 
@@ -342,6 +360,9 @@ pub struct Next {
     pub effects: Vec<Effect>,
 }
 
+/// The block reason once a write task's review rounds are used up.
+pub const ROUNDS_USED_UP: &str = "review rounds used up";
+
 /// The transition table. `lock_holder` is the task holding the merge lock of
 /// this task's repo, if another one does. `Err` is the refusal message.
 pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, String> {
@@ -449,6 +470,10 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
             "{}: a write task becomes ready only through an approved review",
             t.label
         )),
+        // The user's call once the rounds are used up (the caller asks on a card first).
+        (Event::Accept, Blocked) if t.write && t.block.as_ref().is_some_and(|b| b.reason == ROUNDS_USED_UP) => {
+            go(Ready)
+        }
         (Event::Review, Reviewing) if !t.write && !reviewing => {
             with(Reviewing, Effect::StartReview { uses_round: true })
         }
@@ -464,7 +489,7 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
                 if rounds < 2 {
                     go(Running)
                 } else {
-                    blocked(Block::new("review rounds used up"))
+                    blocked(Block::new(ROUNDS_USED_UP))
                 }
             }
         },
@@ -586,6 +611,10 @@ impl Board {
         }
         if n.to == State::Running {
             t.landed = None;
+            t.accepted = false;
+        }
+        if ev == Event::Accept && n.from == State::Blocked {
+            t.accepted = true;
         }
         let ends_review = matches!(
             ev,
@@ -906,6 +935,46 @@ mod tests {
         );
         // A write task becomes ready only through an approved verdict.
         assert!(next(&row(Reviewing), &Event::Accept, None).is_err());
+    }
+
+    #[test]
+    fn a_write_task_out_of_review_rounds_can_be_accepted_and_is_marked() {
+        let used_up = Task {
+            block: Some(Block::new(ROUNDS_USED_UP)),
+            ..row(Blocked)
+        };
+        assert_eq!(to(&used_up, Event::Accept), Ready);
+        assert!(next(&row(Blocked), &Event::Accept, None).is_err(), "other blocks");
+        let mut b = Board {
+            tasks: vec![Task {
+                id: "T1".into(),
+                label: "T1-x".into(),
+                ..used_up
+            }],
+            ..Board::default()
+        };
+        b.apply("T1", Event::Accept).unwrap();
+        let t = b.task("T1").unwrap();
+        assert!(t.accepted);
+        assert_eq!(t.state_text(), "ready (accepted without review)");
+        assert!(b.render().contains("ready (accepted without review)"));
+        b.apply("T1", Event::Send).unwrap();
+        assert!(!b.task("T1").unwrap().accepted, "cleared when it works again");
+    }
+
+    #[test]
+    fn a_read_task_in_reviewing_without_a_review_is_super_s_call() {
+        let read = Task {
+            write: false,
+            ..row(Reviewing)
+        };
+        assert_eq!(read.state_text(), "reviewing (your call)");
+        let reviewed = Task {
+            reviewer: Some("T2".into()),
+            ..read
+        };
+        assert_eq!(reviewed.state_text(), "reviewing");
+        assert_eq!(under_review(0).state_text(), "reviewing");
     }
 
     fn under_review(rounds: u8) -> Task {
