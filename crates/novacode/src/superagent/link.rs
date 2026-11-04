@@ -1392,26 +1392,35 @@ pub struct HubInform {
 }
 
 impl HubInform {
-    fn handle(&self) -> Option<novacode_core::agent::SessionHandle> {
-        self.slot.0.get().and_then(|w| w.upgrade()).map(|h| h.handle.clone())
+    /// `f` on super's session now, or once its hub starts (restart recovery runs before it).
+    fn handle(&self, f: impl FnOnce(novacode_core::agent::SessionHandle) + Send + 'static) {
+        match self.slot.0.get() {
+            Some(w) => {
+                if let Some(h) = w.upgrade() {
+                    f(h.handle.clone())
+                }
+            }
+            None => {
+                let slot = self.slot.clone();
+                tokio::spawn(async move {
+                    if let Some(h) = slot.hub().await {
+                        f(h.handle.clone())
+                    }
+                });
+            }
+        }
     }
 }
 
 impl Inform for HubInform {
     fn wake(&self, text: String) {
-        if let Some(h) = self.handle() {
-            h.remind_as("super", text, true);
-        }
+        self.handle(|h| h.remind_as("super", text, true));
     }
     fn note(&self, text: String) {
-        if let Some(h) = self.handle() {
-            h.remind_as("super", text, false);
-        }
+        self.handle(|h| h.remind_as("super", text, false));
     }
     fn notice(&self, text: String) {
-        if let Some(h) = self.handle() {
-            h.emit(AgentEvent::Stream(novacode_types::StreamEvent::Notice { text }));
-        }
+        self.handle(|h| h.emit(AgentEvent::Stream(novacode_types::StreamEvent::Notice { text })));
     }
     fn desktop(&self, title: String, body: String) {
         if self.desktop {
@@ -1419,11 +1428,11 @@ impl Inform for HubInform {
         }
     }
     fn closing(&self) -> bool {
+        // Not started yet is not closing.
         self.slot
             .0
             .get()
-            .and_then(|w| w.upgrade())
-            .is_none_or(|h| h.is_closed())
+            .is_some_and(|w| w.upgrade().is_none_or(|h| h.is_closed()))
     }
 }
 

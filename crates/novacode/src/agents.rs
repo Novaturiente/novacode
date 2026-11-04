@@ -2304,7 +2304,8 @@ mod tests {
         assert!(fresh(), "ToolEnd is activity");
         idle();
         assert!(stalled(), "the exemption ends with the wait");
-        // No window: the approval is refused at once, and the child is back to work, active.
+        // The hub is gone: the approval is refused at once, and the child is back to work, active.
+        let _ = sup.c().slot.0.set(std::sync::Weak::new());
         sup.relay_card(
             &n,
             "t",

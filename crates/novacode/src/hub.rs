@@ -547,13 +547,37 @@ impl Drop for Open {
 
 /// The session's approver: every window of the hub (L6.1, L8.13). The hub is
 /// created after the agent (it needs the handle), so it is found through this slot.
+/// Cards opened before the hub starts (super's restart recovery, L10.9 R10) wait for it.
 #[derive(Clone, Default)]
-pub struct HubSlot(pub Arc<std::sync::OnceLock<std::sync::Weak<Hub>>>);
+pub struct HubSlot(
+    pub Arc<std::sync::OnceLock<std::sync::Weak<Hub>>>,
+    Arc<tokio::sync::Notify>,
+);
+
+impl HubSlot {
+    pub fn set(&self, hub: &Arc<Hub>) {
+        let _ = self.0.set(Arc::downgrade(hub));
+        self.1.notify_waiters();
+    }
+
+    /// The hub, once it has started; `None` when it is gone.
+    pub async fn hub(&self) -> Option<Arc<Hub>> {
+        loop {
+            let set = self.1.notified();
+            tokio::pin!(set);
+            set.as_mut().enable();
+            if let Some(w) = self.0.get() {
+                return w.upgrade();
+            }
+            set.await;
+        }
+    }
+}
 
 impl Approver for HubSlot {
     fn approve(&self, req: ApprovalRequest) -> BoxFuture<'_, Approval> {
         Box::pin(async move {
-            let Some(hub) = self.0.get().and_then(|w| w.upgrade()) else {
+            let Some(hub) = self.hub().await else {
                 return Approval::Deny(None);
             };
             match hub.ask(req).await {
@@ -568,10 +592,7 @@ impl Approver for HubSlot {
 
 impl novacode_tools::ask::Asker for HubSlot {
     fn ask(&self, questions: Vec<Question>) -> BoxFuture<'_, Option<Vec<Reply>>> {
-        Box::pin(async move {
-            let hub = self.0.get().and_then(|w| w.upgrade())?;
-            hub.ask_user(questions).await
-        })
+        Box::pin(async move { self.hub().await?.ask_user(questions).await })
     }
 }
 

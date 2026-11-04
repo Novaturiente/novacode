@@ -2068,7 +2068,7 @@ async fn print_mode(
     let mut events = handle.subscribe();
     let hub = hub::Hub::start(handle.clone(), Vec::new(), state.clone(), None);
     hub.unattended.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = slot.0.set(Arc::downgrade(&hub));
+    slot.set(&hub);
     let mut out_json = json.then(std::io::stdout);
     if let Some(o) = &mut out_json {
         o.write_all(
@@ -2381,7 +2381,7 @@ async fn start_session(
     if let Some(e) = &extensions {
         hub.seed_ui(e.setup_ui());
     }
-    let _ = slot.0.set(Arc::downgrade(&hub));
+    slot.set(&hub);
     let host = Arc::new(host::Host {
         hub,
         cur: Arc::new(std::sync::Mutex::new((spec, level))),

@@ -100,6 +100,127 @@ fn say(text: &str) -> Value {
     json!({"text": text})
 }
 
+/// Waits (at most 30 s) until `ok` holds.
+fn until(what: &str, ok: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !ok() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Starts super in the background; its session id.
+fn start_super(home: &Path, root: &Path, scripts: &Path) -> String {
+    let out = novacode(home)
+        .current_dir(root)
+        .args(["--super", "-m", "faux/script"])
+        .env("NOVACODE_FAUX_SCRIPT_DIR", scripts)
+        .output()
+        .unwrap();
+    let sup = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(out.status.success() && !sup.is_empty(), "{out:?}");
+    sup
+}
+
+fn run_file(home: &Path, session: &str) -> PathBuf {
+    home.join("run").join(format!("{session}.json"))
+}
+
+/// L10.9 R10: super restarted without a window finds its task's process gone; the
+/// "Resume tasks" card waits until a window connects later, and answering it resumes the task.
+#[test]
+fn restart_recovery_card_waits_for_a_late_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let (home, root, scripts) = (base.join("home"), base.join("projects"), base.join("scripts"));
+    let app = root.join("app");
+    for d in [&home, &app, &scripts] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let faux = json!({"model": "faux/script"});
+    let settings = json!({
+        "memory": {"enabled": false},
+        "notifications": {"enabled": false},
+        "super": {"tiers": {"quick": faux, "standard": faux, "deep": faux, "review": faux}}
+    });
+    std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
+    std::fs::write(app.join("README"), "x").unwrap();
+    git(&app, "init -q -b main");
+    git(&app, "add .");
+    git(&app, "commit -qm init");
+    let label = "T1-note";
+    script(
+        &scripts,
+        "super",
+        &[
+            tool(
+                "task",
+                json!({"action": "spawn", "request": "add note.txt", "folder": "app", "slug": "note",
+                       "write": true, "tier": "quick", "criteria": ["note.txt exists"]}),
+            ),
+            say("spawned"),
+        ],
+    );
+    // The task works until it is stopped.
+    let never = base.join("never");
+    script(&scripts, label, &[tool("bash", json!({"command": wait_for(&never)}))]);
+
+    let sup = start_super(&home, &root, &scripts);
+    let mut cleanup = Cleanup(home.clone(), sup.clone());
+    let run: Value = serde_json::from_str(&std::fs::read_to_string(run_file(&home, &sup)).unwrap()).unwrap();
+    let mut sock = UnixStream::connect(run["socket"].as_str().unwrap()).unwrap();
+    sock.write_all(format!("{}\n", json!({"id": "p1", "type": "prompt", "text": "add a note"})).as_bytes())
+        .unwrap();
+    until("the task runs", || {
+        let t = task(&home, label);
+        t["state"] == "running" && t["session"].as_str().is_some_and(|s| run_file(&home, s).exists())
+    });
+    let session = task(&home, label)["session"].as_str().unwrap().to_string();
+    drop(sock);
+
+    // Super stops, then its task's process goes.
+    novacode(&home).args(["stop", &sup]).output().unwrap();
+    until("super gone", || !run_file(&home, &sup).exists());
+    novacode(&home).args(["stop", &session]).output().unwrap();
+    until("task gone", || !run_file(&home, &session).exists());
+
+    // Resumed, the task proves it ran again.
+    let resumed = base.join("resumed");
+    script(
+        &scripts,
+        label,
+        &[
+            tool("bash", json!({"command": format!("touch {}", resumed.display())})),
+            say("resumed"),
+        ],
+    );
+    let sup = start_super(&home, &root, &scripts);
+    cleanup.1 = sup.clone();
+    until("marked interrupted", || task(&home, label)["state"] == "interrupted");
+    // The window connects after recovery ran.
+    std::thread::sleep(Duration::from_secs(1));
+    let run: Value = serde_json::from_str(&std::fs::read_to_string(run_file(&home, &sup)).unwrap()).unwrap();
+    let sock = UnixStream::connect(run["socket"].as_str().unwrap()).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut conn = BufReader::new(sock);
+    let card = loop {
+        let mut l = String::new();
+        conn.read_line(&mut l)
+            .unwrap_or_else(|e| panic!("{e}: no Resume tasks card; board {}", board(&home)));
+        assert!(!l.is_empty(), "super closed the connection");
+        let m: Value = serde_json::from_str(&l).unwrap();
+        if m["type"] == "ask" && m["questions"][0]["header"] == "Resume tasks" {
+            break m;
+        }
+    };
+    let q = &card["questions"][0];
+    assert_eq!(q["options"][0]["label"], label, "{card}");
+    let reply =
+        json!({"type": "answer", "ask": card["id"], "replies": [{"question": q["question"], "chosen": [label]}]});
+    conn.get_mut().write_all(format!("{reply}\n").as_bytes()).unwrap();
+    until("the task resumed", || resumed.exists());
+}
+
 #[test]
 fn super_runs_a_write_task_through_review_merge_and_close() {
     let dir = tempfile::tempdir().unwrap();
