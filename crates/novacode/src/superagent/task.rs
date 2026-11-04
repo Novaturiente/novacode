@@ -351,7 +351,17 @@ impl Super {
             "merge" => self.merge(&t, a.pr).await,
             "accept" => self.accept(&t).await,
             "review" => {
-                self.edit(|b| b.apply(&t.id, Event::Review))??;
+                self.check(&t.id, Event::Review)?;
+                // A code-made block (R23): no report, so code takes the facts from its commits.
+                let unreported = (t.state == State::Blocked).then(|| commits_done(&t)).transpose()?;
+                self.edit(|b| {
+                    let n = b.apply(&t.id, Event::Review)?;
+                    if let (Some(done), Some(row)) = (unreported, b.tasks.iter_mut().find(|r| r.id == t.id)) {
+                        row.done = Some(done);
+                        row.summary = Some("no report; reviewed from its commits".into());
+                    }
+                    Ok::<_, String>(n)
+                })??;
                 let review = self.open_review(&t.id, a.note.as_deref())?;
                 let mut out = format!("{} is reviewing; its review task is {review}.", t.label);
                 for n in self.pump().await {
@@ -1288,6 +1298,36 @@ pub(super) fn half_done(t: &Task) -> Option<String> {
     in_progress(wt).map(|what| format!("its worktree {} has {what}", wt.display()))
 }
 
+/// The `done` facts of a write task that never reported, from git: its branch head and the
+/// files changed since its base; no checks. Refused when nothing is committed beyond the base.
+fn commits_done(t: &Task) -> Result<super::board::Done, String> {
+    let nothing = || format!("{}: nothing committed to review; send it on or close it", t.label);
+    let (Some(main), Some(branch), Some(base)) = (&t.repo, &t.branch, &t.base_commit) else {
+        return Err(nothing());
+    };
+    let ahead = git(main, &["rev-list", "--count", &format!("{base}..{branch}")])?;
+    if ahead.trim() == "0" {
+        return Err(nothing());
+    }
+    let head = git(main, &["rev-parse", branch])?;
+    let copies = t
+        .worktree
+        .as_deref()
+        .map(novacode_tools::worktree::copies)
+        .unwrap_or_default();
+    let files = git(main, &["diff", "--name-only", &format!("{base}...{head}")])?
+        .lines()
+        .filter(|f| !f.is_empty() && !copies.iter().any(|c| f.starts_with(c.as_str())))
+        .map(String::from)
+        .collect();
+    Ok(super::board::Done {
+        commit: Some(head),
+        files,
+        from_commits: true,
+        ..Default::default()
+    })
+}
+
 /// The non-git write task already holding `t`'s folder.
 fn folder_holder<'a>(b: &'a Board, t: &Task) -> Option<&'a Task> {
     if !t.write || t.repo.is_some() || t.kind != Kind::Work {
@@ -1325,7 +1365,7 @@ impl Tool for TaskTool {
         "task"
     }
     fn description(&self) -> &str {
-        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], scope?, skills?[], goal?}; info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task}; close {task} and merge {task, pr?} (each asks the user on a card; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task blocked by used-up review rounds, after the user's OK on a card); review {task, note?}; list {all?}; read {task, offset?, limit?} (pages the task's final message)."
+        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], scope?, skills?[], goal?}; info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task, pr?} (each asks the user on a card; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task blocked by used-up review rounds, after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked by code because it kept ending without a report: code takes its commit and changed files from its branch, refused when nothing is committed, and the review uses a round); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
     }
     fn schema(&self) -> Value {
         let s = |d: &str| json!({ "type": "string", "description": d });

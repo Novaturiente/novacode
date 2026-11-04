@@ -1310,6 +1310,7 @@ fn done_facts(f: &serde_json::Map<String, Value>) -> board::Done {
         files: strings("files_changed"),
         checks,
         artifacts: strings("artifacts"),
+        from_commits: false,
     }
 }
 

@@ -167,6 +167,9 @@ pub struct Done {
     pub checks: Vec<String>,
     /// Screenshot paths and URLs.
     pub artifacts: Vec<String>,
+    /// Built by code from the branch's commits: the task sent no report and no proof (R23).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub from_commits: bool,
 }
 
 /// One board row: only what super owns. Live data (busy, current model,
@@ -526,6 +529,10 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
         (Event::Review, Reviewing) if !t.write && !reviewing => {
             with(Reviewing, Effect::StartReview { uses_round: true })
         }
+        // A write task that keeps ending without a report: the caller records its commits first (R23).
+        (Event::Review, Blocked) if t.write && block_is(|b| b.code_made) => {
+            with(Reviewing, Effect::StartReview { uses_round: true })
+        }
         (Event::Review, Ready) if t.landed != Some(Landed::Merged) => {
             with(Reviewing, Effect::StartReview { uses_round: false })
         }
@@ -588,6 +595,10 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
         (Event::Send, Running | WaitingYou | Merging | Queued) => go(from),
         (Event::Stop, Running | WaitingYou | Queued) => go(Stopped),
         (Event::Stop, Reviewing) => stop_review(Stopped),
+        (Event::Stop, Blocked) => Err(format!(
+            "{} is not running (blocked): `task close` ends it, `task send` gives it more work",
+            t.label
+        )),
         (Event::Close, s) if !matches!(s, Archived | Merging) => stop_review(Archived),
 
         _ => refused(),
@@ -1389,6 +1400,38 @@ mod tests {
         for s in ALL.into_iter().filter(|s| !matches!(s, Archived | Merging)) {
             assert_eq!(to(&row(s), Event::Close), Archived, "{s:?}");
         }
+    }
+
+    #[test]
+    fn stop_on_a_blocked_task_hints_at_close_and_send() {
+        // R23: a blocked task is not running; stop points at what ends it or moves it on.
+        let e = next(&row(Blocked), &Event::Stop, None).unwrap_err();
+        assert_eq!(
+            e,
+            "T1-fix is not running (blocked): `task close` ends it, `task send` gives it more work"
+        );
+    }
+
+    #[test]
+    fn review_from_a_code_made_block_uses_a_round_but_not_from_a_reported_one() {
+        // R23: a write task that keeps ending without a report can be reviewed from its commits.
+        let mut b = Board {
+            tasks: vec![row(Running)],
+            ..Board::default()
+        };
+        b.apply("T1", Event::TurnUnreported).unwrap();
+        let n = b.apply("T1", Event::Review).unwrap();
+        assert_eq!(
+            (n.from, n.to, n.effects),
+            (Blocked, Reviewing, vec![Effect::StartReview { uses_round: true }])
+        );
+        assert_eq!(b.task("T1").unwrap().block, None);
+        let reported = Task {
+            block: Some(Block::new("reported blocked")),
+            ..row(Blocked)
+        };
+        let e = next(&reported, &Event::Review, None).unwrap_err();
+        assert!(e.contains("review is not possible while it is blocked"), "{e}");
     }
 
     #[test]

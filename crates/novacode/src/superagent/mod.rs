@@ -29,6 +29,7 @@ When the user asks to see the criteria first, show them with `ask_user` and wait
 - A task is done only on proof. Read every report's checks critically (which commands ran, whether they cover the \
 change, whether the results support the claim) and ask the task for more proof when it is weak; never accept a \
 task's own word. Every write task is reviewed by a review task before it is ready.
+- A write task that keeps ending its turn without a report but has committed work can be reviewed with `task review`.
 - Your context must stay small: read reports, not transcripts; page a task's final message with `task read` only \
 when its report isn't enough.
 - To only ask a task for information (raw output of a check, proof a merge landed), use `task send` with \

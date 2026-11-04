@@ -290,6 +290,14 @@ the task's own worktree is not yours.\n",
             i.cwd.display()
         );
     }
+    if done.from_commits {
+        s += &format!(
+            "\n{} sent no report and no proof: it ended its turns without one, so code took the commit and the \
+changed files from its branch. No check was recorded: run the checks yourself (the tests and builds the criteria \
+need) before any verdict.\n",
+            t.label
+        );
+    }
     if !done.files.is_empty() {
         s += "\nChanged files: justify or reject each one against the request; an unexplained file is a finding.\n";
         for f in &done.files {
@@ -1135,6 +1143,69 @@ mod tests {
         fx.report(&rv2.id, json!({"verdict": "rejected", "findings": ["x"]}));
         fx.until("running", |fx| fx.row("T1-fix").state == State::Running).await;
         assert_eq!(fx.row("T1-fix").review_rounds, rounds);
+    }
+
+    /// Block `id` as code does when its turn ends without a report.
+    fn block_unreported(fx: &Fx, id: &str) {
+        fx.sup.edit(|b| b.apply(id, Event::TurnUnreported)).unwrap().unwrap();
+        assert!(fx.row(id).block.unwrap().code_made);
+    }
+
+    #[tokio::test]
+    async fn task_review_on_a_task_that_never_reported_reviews_its_commits() {
+        // R23: committed work, turn after turn without `report`.
+        let fx = fixture("faux/review");
+        let wt = fx.spawn("fix", "quick", "change").await;
+        fx.commit(&wt, "src/a.rs");
+        let head = fx.commit(&wt, "tests/a.rs");
+        block_unreported(&fx, "T1-fix");
+        let out = fx.run(json!({"action": "review", "task": "T1-fix"})).await.unwrap();
+        assert!(out.contains("T2-review-T1-fix"), "{out}");
+        let t = fx.row("T1-fix");
+        assert_eq!((t.state, t.block.clone()), (State::Reviewing, None));
+        assert_eq!(t.summary.as_deref(), Some("no report; reviewed from its commits"));
+        let done = t.done.unwrap();
+        assert_eq!(done.commit.as_deref(), Some(head.as_str()));
+        assert_eq!(done.files, ["src/a.rs", "tests/a.rs"]);
+        assert!(done.checks.is_empty() && done.artifacts.is_empty());
+        let rv = fx.review_of("T1-fix").await;
+        assert_eq!(
+            sh(&fx.launcher.starts.lock().unwrap()[1].cwd, &["rev-parse", "HEAD"]),
+            head
+        );
+        let brief = fx.prompts(rv.session.as_deref().unwrap()).remove(0);
+        assert!(
+            brief.contains("T1-fix sent no report and no proof") && brief.contains("run the checks yourself"),
+            "{brief}"
+        );
+        // It uses a round.
+        fx.report(&rv.id, json!({"verdict": "rejected", "findings": ["no test"]}));
+        fx.until("running", |fx| fx.row("T1-fix").state == State::Running).await;
+        assert_eq!(fx.row("T1-fix").review_rounds, 1);
+    }
+
+    #[tokio::test]
+    async fn task_review_on_a_task_that_never_reported_nor_committed_is_refused() {
+        let fx = fixture("faux/review");
+        fx.spawn("fix", "quick", "change").await;
+        block_unreported(&fx, "T1-fix");
+        let e = fx.run(json!({"action": "review", "task": "T1-fix"})).await.unwrap_err();
+        assert_eq!(e, "T1-fix: nothing committed to review; send it on or close it");
+        let t = fx.row("T1-fix");
+        assert_eq!((t.state, t.done, t.reviewer), (State::Blocked, None, None));
+    }
+
+    #[tokio::test]
+    async fn task_review_on_a_task_that_reported_blocked_is_refused() {
+        let fx = fixture("faux/review");
+        let wt = fx.spawn("fix", "quick", "change").await;
+        fx.commit(&wt, "src/a.rs");
+        fx.report("T1-fix", json!({"state": "blocked", "summary": "need a key"}));
+        fx.until("blocked", |fx| fx.row("T1-fix").state == State::Blocked).await;
+        let e = fx.run(json!({"action": "review", "task": "T1-fix"})).await.unwrap_err();
+        assert!(e.contains("review is not possible while it is blocked"), "{e}");
+        let t = fx.row("T1-fix");
+        assert_eq!((t.done, t.reviewer), (None, None));
     }
 
     #[tokio::test]
