@@ -500,6 +500,23 @@ fn uncovered(n: usize, findings: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The first criterion (1 to `n`) a finding calls not met: "Criterion N: not met",
+/// "criterion N not met" or "Criterion N: unmet" (any case; "metered" doesn't count).
+fn not_met(n: usize, findings: &[String]) -> Option<usize> {
+    let text = findings.join("\n").to_lowercase();
+    (1..=n).find(|i| {
+        let name = format!("criterion {i}");
+        text.match_indices(&name).any(|(at, _)| {
+            let rest = &text[at + name.len()..];
+            let rest = rest.strip_prefix(':').unwrap_or(rest).trim_start();
+            ["not met", "unmet"].iter().any(|w| {
+                rest.strip_prefix(w)
+                    .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric()))
+            })
+        })
+    })
+}
+
 /// What git says about the task's folder.
 #[derive(Default)]
 struct Git {
@@ -639,6 +656,12 @@ impl ReportTool {
                     missing.join(", ")
                 ));
             }
+            if let Some(i) = not_met(row.criteria.len(), &a.findings).filter(|_| approved) {
+                return Err(format!(
+                    "approved with criterion {i} not met: report `rejected` or `needs-proof`, \
+                     or say why it is met; super asks the user when a criterion can't be met"
+                ));
+            }
         }
         if let Some(pm) = &ctx.processes {
             self.proof.sync(pm);
@@ -769,7 +792,7 @@ impl Tool for ReportTool {
                 "summary": { "type": "string", "description": "At most 80 words; for `merge`, the one-line reason." },
                 "question": { "type": "string", "description": "Only with `state: blocked`: what you need answered." },
                 "checks": { "type": "array", "items": { "type": "string" }, "description": "Proof numbers from the `[proof #N]` marks on your bash and process results (e.g. \"#4\"); `done` on a write task needs at least one check that ran after your last edit and has exited, and a check from before it (such as the failing run of red-then-green) is allowed but marked `before the last edit`. Plus files a check produced (screenshots, logs) and URLs; never source files, commands or results: those go in `summary`." },
-                "findings": { "type": "array", "items": { "type": "string" }, "description": "Review task: at most 5 findings or proof requests (with the verdict, 1000 characters at most). `approved` must name every acceptance criterion by number, one short line each, like \"Criterion 1: met, #3 passes\"." },
+                "findings": { "type": "array", "items": { "type": "string" }, "description": "Review task: at most 5 findings or proof requests (with the verdict, 1000 characters at most). `approved` must name every acceptance criterion by number, one short line each, like \"Criterion 1: met, #3 passes\"; a criterion that is not met means `rejected` or `needs-proof`, never `approved`." },
                 "baseline": { "type": "object", "description": "Review task: base-commit check results, outside the 1000-character cap: {\"checks\": [{\"folder\", \"command\", \"exit_codes\": [first run, re-run], \"failing\": [test names]}]}." }
             }
         })
@@ -1553,6 +1576,49 @@ mod tests {
             &f.report(json!({"verdict": "needs-proof", "findings": ["run it"]}))
                 .await,
         );
+    }
+
+    #[tokio::test]
+    async fn approved_is_refused_when_a_criterion_is_not_met() {
+        let f = Fixture::new(
+            false,
+            Task {
+                kind: Kind::Review,
+                criteria: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+                ..Task::default()
+            },
+        );
+        let met = ["Criterion 1: met", "Criterion 2: met", "Criterion 3: met"];
+        for bad in [
+            "Criterion 4: not met, by the user's explicit instruction",
+            "criterion 4 NOT MET",
+            "Criterion 4: unmet",
+        ] {
+            let mut findings = met.to_vec();
+            findings.push(bad);
+            refused(
+                &f.report(json!({"verdict": "approved", "findings": findings})).await,
+                "Report not sent: approved with criterion 4 not met: report `rejected` or `needs-proof`, \
+                 or say why it is met; super asks the user when a criterion can't be met.",
+            );
+        }
+        // "met" findings that mention "not" elsewhere, and "met" inside other words, pass.
+        report(
+            &f.report(json!({"verdict": "approved", "findings": [
+                "Criterion 1: met, not flaky",
+                "Criterion 2: met; criterion 20 not met is unrelated",
+                "Criterion 3: not metered but met",
+                "Criterion 4: met (not a regression)",
+            ]}))
+            .await,
+        );
+        // Only approval is gated.
+        for v in ["rejected", "needs-proof"] {
+            report(
+                &f.report(json!({"verdict": v, "findings": ["Criterion 4: not met"]}))
+                    .await,
+            );
+        }
     }
 
     fn entry(kind: EntryKind) -> Entry {

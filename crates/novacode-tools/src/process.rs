@@ -187,6 +187,55 @@ fn kill_group(pid: u32) {
     kill_group_hard(pid);
 }
 
+/// Stop this user's processes whose working folder is inside `dir` (a detached daemon a
+/// task left in its worktree): SIGTERM, up to 3 s to exit, then SIGKILL. Never this
+/// process or its ancestors. Returns how many it signalled.
+#[cfg(target_os = "linux")]
+pub fn stop_inside(dir: &Path) -> usize {
+    use nix::sys::signal::{Signal, kill};
+    use std::os::unix::fs::MetadataExt;
+    let Ok(dir) = std::fs::canonicalize(dir) else { return 0 };
+    let uid = std::fs::metadata("/proc/self").map(|m| m.uid()).ok();
+    let ppid = |pid: u32| -> Option<u32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+    };
+    let mut spared = vec![std::process::id()];
+    while let Some(p) = ppid(*spared.last().unwrap()).filter(|p| *p > 0 && !spared.contains(p)) {
+        spared.push(p);
+    }
+    // A process that exited (or is a zombie) has no readable cwd.
+    let inside = |pid: u32| std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|c| c.starts_with(&dir));
+    let found: Vec<u32> = std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse().ok())
+        .filter(|pid| !spared.contains(pid))
+        .filter(|pid| std::fs::metadata(format!("/proc/{pid}")).ok().map(|m| m.uid()) == uid)
+        .filter(|pid| inside(*pid))
+        .collect();
+    let signal = |pid: u32, s| kill(nix::unistd::Pid::from_raw(pid as i32), s);
+    for pid in &found {
+        let _ = signal(*pid, Signal::SIGTERM);
+    }
+    let until = std::time::Instant::now() + Duration::from_secs(3);
+    while found.iter().any(|p| inside(*p)) && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for pid in found.iter().filter(|p| inside(**p)) {
+        let _ = signal(*pid, Signal::SIGKILL);
+    }
+    found.len()
+}
+
+// shortcut: needs /proc to find a process's working folder; elsewhere a daemon left in a
+// worktree keeps running and can block its removal.
+#[cfg(not(target_os = "linux"))]
+pub fn stop_inside(_dir: &Path) -> usize {
+    0
+}
+
 /// SIGKILL a process group at once (MCP servers on shutdown).
 pub fn kill_group_now(pid: u32) {
     kill_group_hard(pid);
@@ -1036,6 +1085,33 @@ impl crate::Tool for ProcessTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_inside_ends_a_process_whose_cwd_is_in_the_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let inner = d.path().join("wt/.codegraph");
+        std::fs::create_dir_all(&inner).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .current_dir(&inner)
+            .spawn()
+            .unwrap();
+        let mut outside = std::process::Command::new("sleep")
+            .arg("300")
+            .current_dir(d.path())
+            .spawn()
+            .unwrap();
+        assert_eq!(stop_inside(&d.path().join("wt")), 1);
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "ended by a signal: {status:?}");
+        assert!(
+            outside.try_wait().unwrap().is_none(),
+            "a process outside the folder runs on"
+        );
+        let _ = outside.kill();
+        let _ = outside.wait();
+    }
 
     #[tokio::test]
     async fn bad_watch_regex_is_refused() {
