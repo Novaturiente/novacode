@@ -1041,16 +1041,18 @@ impl App {
                     return;
                 }
                 let exe = std::env::current_exe().map_or("novacode".into(), |p| p.display().to_string());
-                let ok = std::process::Command::new("tmux")
-                    .args(["new-window", "-n", &label, &exe, "attach", &session])
+                let home = std::env::var("NOVACODE_HOME").ok().filter(|h| !h.is_empty());
+                let out = std::process::Command::new("tmux")
+                    .args(tmux_attach_args(&label, &session, &exe, home.as_deref()))
                     .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .is_ok_and(|s| s.success());
-                if !ok {
-                    self.tr.notice(format!("{label}: tmux failed; run `{cmd}`"), true);
-                }
+                    .output();
+                let err = match out {
+                    Ok(o) if o.status.success() => return,
+                    Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                    Err(e) => e.to_string(),
+                };
+                self.tr
+                    .notice(format!("{label}: tmux failed ({err}); run `{cmd}`"), true);
             }
             PanelAction::Ext { ext, tab, node, action } => {
                 let (width, height) = self.panel.size;
@@ -2552,6 +2554,17 @@ fn screen_text(buf: &ratatui::buffer::Buffer, a: (u16, u16), b: (u16, u16)) -> S
     rows.join("\n").trim().to_string()
 }
 
+/// `tmux new-window` running `exe attach session`. A new window gets tmux's
+/// environment, not ours: the home goes along so the session is found.
+fn tmux_attach_args(label: &str, session: &str, exe: &str, home: Option<&str>) -> Vec<String> {
+    let mut a: Vec<String> = vec!["new-window".into(), "-n".into(), label.into()];
+    if let Some(h) = home {
+        a.extend(["-e".into(), format!("NOVACODE_HOME={h}")]);
+    }
+    a.extend([exe.into(), "attach".into(), session.into()]);
+    a
+}
+
 #[cfg(test)]
 mod screen_tests {
     #[test]
@@ -2564,5 +2577,15 @@ mod screen_tests {
         buf.set_string(0, 2, "╰─────────────────╯", ratatui::style::Style::default());
         assert_eq!(super::screen_text(&buf, (0, 1), (19, 1)), "Pick 数据 one");
         assert_eq!(super::screen_text(&buf, (9, 1), (2, 0)), "Question\nPick 数据");
+    }
+
+    /// R9 (L10.9): a tmux window gets tmux's environment, not ours, so the attach
+    /// window is told this window's home; else it finds no live session and closes at once.
+    #[test]
+    fn tmux_attach_passes_the_home_along() {
+        let args = super::tmux_attach_args("T1", "01a1", "/bin/nc", Some("/h/home")).join(" ");
+        assert_eq!(args, "new-window -n T1 -e NOVACODE_HOME=/h/home /bin/nc attach 01a1");
+        let args = super::tmux_attach_args("T1", "01a1", "/bin/nc", None);
+        assert_eq!(args, ["new-window", "-n", "T1", "/bin/nc", "attach", "01a1"]);
     }
 }
