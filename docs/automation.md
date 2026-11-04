@@ -103,7 +103,7 @@ The first line is `hello`, then one `event` line for each thing the session does
 {"type":"hello","protocol":1,"version":"0.1.0","capabilities":["events"],"state":{"session":"01abc…","cwd":"/work","model":"claude/claude-opus-5-5","level":"medium","window_tokens":200000,"busy":false,…}}
 {"type":"event","event":{"type":"agent_start"}}
 {"type":"event","event":{"type":"stream","stream":"delta","index":0,"text":"4"}}
-{"type":"event","event":{"type":"agent_end","stop":{"type":"stop"}}}
+{"type":"event","event":{"type":"agent_end","stop":{"type":"stop"},"prompts":[]}}
 {"type":"event","event":{"type":"settled"}}
 ```
 
@@ -133,7 +133,7 @@ Every message has a `type`.
 |---|---|
 | `hello` | Always first: `protocol`, `version`, `capabilities`, and the session `state` |
 | `history` | The session's messages so far (sent right after `hello`) |
-| `event` | A loop event in `event`: `agent_start`, `turn_start`, `stream`, `message`, `tool_start`, `tool_update`, `tool_end`, `retry`, `agent_end`, `settled`, `compacting` (a compaction started, with `tokens_before`), `compacted`, `prompt_taken_back` (Esc before the first reply took the prompt off the branch; `text` holds it), … Streamed text arrives as `stream` events with `"stream":"delta"` |
+| `event` | A loop event in `event`: `agent_start`, `turn_start`, `stream`, `message`, `tool_start`, `tool_update`, `tool_end`, `retry`, `agent_end` (its `prompts` lists the request ids of the `prompt` and `steer` commands the run took, queued ones included; `null` for one sent without an `id`; empty for a run the session started itself), `settled`, `compacting` (a compaction started, with `tokens_before`), `compacted`, `prompt_taken_back` (Esc before the first reply took the prompt off the branch; `text` holds it), … Streamed text arrives as `stream` events with `"stream":"delta"` |
 | `response` | The answer to a command that had an `id`: `command`, `ok`, `data`, `error` |
 | `ui` | A notice, page or list for the user, tagged by `ui.kind` |
 | `approve` | A permission question (see below) |
@@ -216,7 +216,7 @@ You type the lines marked `>`. The rest comes back. Lines are shortened with `�
 < {"type":"event","event":{"type":"stream","stream":"delta","index":0,"text":"I'll create"}}
 < {"type":"event","event":{"type":"tool_start","call":{"id":"…","name":"write","arguments":{"path":"hello.txt","content":"hi"}}}}
 < {"type":"event","event":{"type":"tool_end","call_id":"…","is_error":false,"duration_ms":3}}
-< {"type":"event","event":{"type":"agent_end","stop":{"type":"stop"}}}
+< {"type":"event","event":{"type":"agent_end","stop":{"type":"stop"},"prompts":["1"]}}
 < {"type":"event","event":{"type":"settled"}}
 > {"id":"2","type":"get_state"}
 < {"type":"response","id":"2","command":"get_state","ok":true,"data":{…}}

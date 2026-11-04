@@ -133,6 +133,7 @@ impl Tool for Bash {
             push_note(&mut out, git.and_then(|g| g.changes()));
             ToolOutput {
                 is_error,
+                details: Some(exit_details(res.code)),
                 ..ToolOutput::text(out.trim_end().to_string())
             }
         })
@@ -168,6 +169,12 @@ fn live_text(partial: &mut Vec<u8>, chunk: &[u8]) -> String {
     let text = String::from_utf8_lossy(partial).into_owned();
     *partial = tail;
     text
+}
+
+/// ST06 (L10.9): the structured exit code for after-tool hooks; `null` = killed
+/// (signal, timeout, cancel).
+fn exit_details(code: Option<i32>) -> Value {
+    serde_json::json!({ "exit_code": code })
 }
 
 fn push_note(out: &mut String, note: Option<String>) {
@@ -212,7 +219,11 @@ async fn run_managed(
         _ = ctx.cancel.cancelled() => {
             pm.stop(&id).await;
             pm.clear_one(&id);
-            return ToolOutput { is_error: true, ..ToolOutput::text("[cancelled]".to_string()) };
+            return ToolOutput {
+                is_error: true,
+                details: Some(exit_details(None)),
+                ..ToolOutput::text("[cancelled]".to_string())
+            };
         }
     };
     let mut out = String::new();
@@ -231,7 +242,11 @@ async fn run_managed(
         ));
         let note = sandbox_note(ctx, spec.unsandboxed, false, &out);
         push_note(&mut out, note);
-        return ToolOutput::text(out.trim_end().to_string());
+        // No exit code yet: it comes with the process manager's exit event for `id`.
+        return ToolOutput {
+            details: Some(serde_json::json!({ "process_id": id })),
+            ..ToolOutput::text(out.trim_end().to_string())
+        };
     };
     // The process manager ran the git change check when it exited.
     let git = pm.git_note(&id);
@@ -250,6 +265,7 @@ async fn run_managed(
     push_note(&mut out, git);
     ToolOutput {
         is_error,
+        details: Some(exit_details(end.code)),
         ..ToolOutput::text(out.trim_end().to_string())
     }
 }
@@ -295,6 +311,22 @@ mod tests {
         assert!(o.is_error && text(&o).contains("exit code 3"));
     }
 
+    /// ST06: the exit code is structured, 0 included, with and without the process manager.
+    #[tokio::test]
+    async fn exit_code_is_in_details() {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = ctx(d.path());
+        for managed in [false, true] {
+            if managed {
+                c.processes = Some(crate::process::ProcessManager::new(&d.path().join("procs"), "s"));
+            }
+            let o = Bash.execute(json!({"command": "echo ok"}), &c).await;
+            assert_eq!(o.details, Some(json!({"exit_code": 0})), "managed={managed}");
+            let o = Bash.execute(json!({"command": "exit 3"}), &c).await;
+            assert_eq!(o.details, Some(json!({"exit_code": 3})), "managed={managed}");
+        }
+    }
+
     #[tokio::test]
     async fn timeout_kills_the_group() {
         let d = tempfile::tempdir().unwrap();
@@ -326,6 +358,8 @@ mod tests {
             !o.is_error && t.contains("up") && t.contains("moved to the process manager as proc_1"),
             "{t}"
         );
+        // No exit code yet: the process manager's exit event for proc_1 brings it.
+        assert_eq!(o.details, Some(json!({"process_id": "proc_1"})));
         assert_eq!(pm.running(), 1);
         tokio::time::sleep(Duration::from_millis(1800)).await;
         assert!(pm.output("proc_1", 10, None).unwrap().contains("later"));

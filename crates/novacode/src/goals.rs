@@ -314,7 +314,7 @@ impl Goals {
                     AgentEvent::AgentStart => tools = 0,
                     AgentEvent::ToolStart { .. } => tools += 1,
                     AgentEvent::Message(m) => self.observe(&m),
-                    AgentEvent::AgentEnd { stop: s } => {
+                    AgentEvent::AgentEnd { stop: s, .. } => {
                         if s == StopReason::Aborted && self.pause_if_active("you interrupted it") {
                             self.notice("goal paused: you interrupted it (/goal resume continues)".into());
                         }

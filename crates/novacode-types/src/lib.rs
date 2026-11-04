@@ -361,6 +361,10 @@ pub enum AgentEvent {
     /// The loop stopped. `stop` is the last assistant message's stop reason.
     AgentEnd {
         stop: StopReason,
+        /// Request ids of the wire prompts this run consumed, drained ones included;
+        /// `None` = sent without an id. Empty for a run started inside the session (L10.9).
+        #[serde(default)]
+        prompts: Vec<Option<String>>,
     },
     /// Stopped and nothing is queued (L3.10).
     Settled,
