@@ -202,7 +202,7 @@ thing super reads; a turn that ends without one is reported as blocked.
 Don't write elsewhere with `bash` either. A read task that has to write calls `enter_worktree` first.
 - Commit your work before you report `done`.
 - A review task (its brief says so) reports a `verdict` instead of a `state` and edits only under its \
-/tmp/novacode-review-… scratch folder; the commit rule doesn't apply to it.
+scratch folder (its brief names it); the commit rule doesn't apply to it.
 - After a restart or resume: your proof log is empty, so re-run your checks before you cite them, and check \
 your folder and git before repeating anything outside it (a commit, a push, a message)."
     )
@@ -261,6 +261,7 @@ impl Super {
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
         let board = Board::load(&dir)?;
+        super::review::sweep_scratch(&dir, &board);
         // A restarted super pins its tasks' repos again (nested repos included).
         for main in board.tasks.iter().filter_map(|t| t.repo.as_deref()) {
             novacode_base::git::pin_repo(main);
@@ -617,7 +618,7 @@ impl Super {
         // Its own worktree (other worktrees of the repo stay refused), else its folder;
         // a review task only its scratch folder.
         let rule = match t.kind {
-            Kind::Review => format!("review:{}", super::review::scratch_id(&t)),
+            Kind::Review => format!("review:{}", super::review::scratch(&self.dir, &t).display()),
             Kind::Work => format!(
                 "worktree:{}",
                 t.worktree

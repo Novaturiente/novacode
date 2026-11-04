@@ -4,7 +4,7 @@
 //! - **Input:** reasoning-free. The review brief holds the user's request, the criteria,
 //!   the scope, the base, the pinned commit, the changed files and the recorded checks;
 //!   never the task's summary or transcript.
-//! - **Where:** `/tmp/novacode-review-<id>/work`, a detached checkout with the
+//! - **Where:** `<super dir>/review/<id>/work` (on disk: builds there can be large), a detached checkout with the
 //!   `worktree.copy` files, so the reviewed task's worktree stays clean. Every
 //!   worktree under the scratch folder is removed (and `git worktree prune` run) when
 //!   the review ends.
@@ -32,16 +32,43 @@ pub fn reviewer_tier(tier: Option<&str>) -> &'static str {
 }
 
 /// The review's scratch folder key: its label plus a piece of its token, so two supers
-/// (or two test runs) with the same labels never share `/tmp/novacode-review-<id>`.
+/// (or two test runs) with the same labels never share a scratch folder.
 pub fn scratch_id(rv: &Task) -> String {
     // The token's tail: its head is a time-ordered id, alike for reviews started together.
     let tail = rv.token.len().saturating_sub(8);
     format!("{}-{}", rv.id, rv.token.get(tail..).unwrap_or_default())
 }
 
-/// `/tmp/novacode-review-<id>`: the only place a review task may edit.
-pub fn scratch(rv: &Task) -> PathBuf {
-    EditRule::review_scratch(&scratch_id(rv))
+/// `<super dir>/review/<id>`: the only place a review task may edit.
+pub fn scratch(dir: &Path, rv: &Task) -> PathBuf {
+    dir.join("review").join(scratch_id(rv))
+}
+
+/// At start: remove the scratch folders no live review row owns (a super that went
+/// down while retiring a review leaves its scratch worktree behind).
+pub(super) fn sweep_scratch(dir: &Path, board: &board::Board) {
+    let Ok(entries) = std::fs::read_dir(dir.join("review")) else {
+        return;
+    };
+    let live: Vec<PathBuf> = board
+        .tasks
+        .iter()
+        .filter(|t| t.kind == Kind::Review && t.state != State::Archived)
+        .map(|t| scratch(dir, t))
+        .collect();
+    for e in entries.flatten() {
+        let path = e.path();
+        if live.contains(&path) {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().into_owned();
+        let repo = board
+            .tasks
+            .iter()
+            .find(|t| t.kind == Kind::Review && scratch_id(t) == name)
+            .and_then(|t| t.repo.clone());
+        remove_scratch(repo.as_deref(), &path);
+    }
 }
 
 /// How a base-commit check came out.
@@ -406,7 +433,7 @@ impl Super {
             updated: now,
             ..Task::default()
         };
-        let scratch = scratch(&rv);
+        let scratch = scratch(&self.dir, &rv);
         let cwd = self.review_cwd_plan(&t, &scratch);
         let baseline = match (&t.repo, &t.base_commit, t.done.as_ref().and_then(|d| d.commit.as_ref())) {
             (Some(repo), Some(base), Some(_)) => {
@@ -455,7 +482,7 @@ impl Super {
     /// Make the review's folder before its process starts: the scratch folder, and for a
     /// pinned commit its detached worktree with the `worktree.copy` files.
     pub(super) fn review_cwd(&self, rv: &Task) -> Result<PathBuf, String> {
-        let scratch = scratch(rv);
+        let scratch = scratch(&self.dir, rv);
         let Ok(t) = self.row(rv.reviewer_of.as_deref().unwrap_or_default()) else {
             return Ok(self.root.join(&rv.folder));
         };
@@ -471,23 +498,36 @@ impl Super {
         Ok(cwd)
     }
 
-    /// End a review task: its process stops, its row is archived (no card), its scratch
-    /// worktrees go. Nothing when it is already archived.
+    /// End a review task: its scratch worktrees go, its row is archived (no card), its
+    /// process stops (and whatever it wrote meanwhile goes once it has). Nothing when it
+    /// is already archived.
     pub(super) fn retire_review(&self, review: &str) {
         let Ok(rv) = self.row(review) else { return };
         if rv.kind != Kind::Review || rv.state == State::Archived {
             return;
         }
-        if let Some(s) = rv.session.clone().filter(|s| self.launcher.alive(s)) {
-            let l = self.launcher.clone();
-            tokio::spawn(async move {
-                let _ = l.send(&s, ClientCmd::Shutdown).await;
-            });
-        }
+        // Scratch before the row: a crash in between leaves a live row, retired again at restart.
+        let dir = scratch(&self.dir, &rv);
+        remove_scratch(rv.repo.as_deref(), &dir);
         if let Err(e) = self.edit(|b| b.apply(review, Event::Retire)) {
             tracing::warn!(review, %e, "super: review row");
         }
-        remove_scratch(rv.repo.as_deref(), &scratch(&rv));
+        if let Some(s) = rv.session.clone().filter(|s| self.launcher.alive(s)) {
+            let l = self.launcher.clone();
+            let repo = rv.repo.clone();
+            tokio::spawn(async move {
+                let _ = l.send(&s, ClientCmd::Shutdown).await;
+                for _ in 0..100 {
+                    if !l.alive(&s) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                if dir.exists() {
+                    remove_scratch(repo.as_deref(), &dir);
+                }
+            });
+        }
     }
 
     /// The reviewed task's branch no longer points at the commit under review.
@@ -830,14 +870,20 @@ mod tests {
         assert!(e.contains("only through an approved review"), "{e}");
 
         // Its own scratch worktree of the pinned commit, with the copy list; only it is editable.
-        let scratch = scratch(&rv);
-        assert!(scratch.starts_with("/tmp") && scratch.to_string_lossy().contains("novacode-review-T2-review-T1-fix-"));
+        // C4: on disk under super's folder, never /tmp (tmpfs).
+        let scratch = scratch(&fx.sup.dir, &rv);
+        assert!(
+            scratch.starts_with(fx.sup.dir.join("review"))
+                && scratch.file_name().unwrap().to_string_lossy().starts_with("T2-review-T1-fix-"),
+            "{}",
+            scratch.display()
+        );
         let start = fx.launcher.starts.lock().unwrap()[1].clone();
         assert_eq!(start.cwd, scratch.join("work"));
         assert_eq!(sh(&start.cwd, &["rev-parse", "HEAD"]), commit);
         assert!(start.cwd.join("AGENTS.md").exists() && start.cwd.join("src/parse.rs").exists());
         let rule = start.env.iter().find(|(k, _)| k == EditRule::ENV).unwrap();
-        assert_eq!(rule.1, format!("review:{}", scratch_id(&rv)));
+        assert_eq!(rule.1, format!("review:{}", scratch.display()));
         assert!(start.env.contains(&("NOVACODE_TASK".into(), rv.id.clone())));
 
         // Reasoning-free brief: facts, never the task's summary; the checks as code recorded them.
@@ -877,7 +923,7 @@ mod tests {
         assert_eq!(fx.row("T1-fix").reviewer, None);
         assert!(!scratch.exists(), "scratch removed");
         assert!(
-            !worktrees(&fx.app).contains("novacode-review"),
+            !worktrees(&fx.app).contains(&scratch_id(&rv)),
             "{}",
             worktrees(&fx.app)
         );
@@ -908,7 +954,7 @@ mod tests {
         assert_eq!(rv.model, "faux/deep");
         let brief = fx.prompts("s2").remove(0);
         assert!(
-            brief.contains("red then green") && brief.contains(&format!("{}/base", scratch(&rv).display())),
+            brief.contains("red then green") && brief.contains(&format!("{}/base", scratch(&fx.sup.dir, &rv).display())),
             "{brief}"
         );
 
@@ -1114,7 +1160,7 @@ mod tests {
         })
         .await;
         assert_eq!(fx.row(&rv.id).state, State::Archived);
-        assert!(!scratch(&rv).exists());
+        assert!(!scratch(&fx.sup.dir, &rv).exists());
         assert_eq!(fx.row("T1-fix").state, State::Reviewing);
         let rv2 = fx.review_of("T1-fix").await;
         fx.launcher
@@ -1133,7 +1179,35 @@ mod tests {
                 .iter()
                 .any(|l| l.starts_with("wake: T1-fix is blocked") && l.contains("Ask the user"))
         );
-        assert!(!worktrees(&fx.app).contains("novacode-review"));
+        assert!(!worktrees(&fx.app).contains(&fx.sup.dir.join("review").to_string_lossy().to_string()));
+    }
+
+    /// C5: a super that went down between archiving a review and removing its scratch
+    /// worktree removes it at the next start.
+    #[tokio::test]
+    async fn an_archived_review_s_scratch_left_by_a_crash_is_removed_at_start() {
+        let fx = fixture("faux/review");
+        let wt = fx.spawn("fix", "quick", "change").await;
+        let c = fx.commit(&wt, "src/a.rs");
+        fx.done("T1-fix", &c, &["src/a.rs"]);
+        let rv = fx.review_of("T1-fix").await;
+        let s = scratch(&fx.sup.dir, &rv);
+        assert!(s.join("work").exists());
+        // The crash: the row is archived, its scratch worktree is still there.
+        fx.sup
+            .edit(|b| b.tasks.iter_mut().find(|t| t.id == rv.id).unwrap().state = State::Archived)
+            .unwrap();
+        let cfg = Config {
+            max_running: 1,
+            tiers: vec![],
+            worktree_copy: vec![],
+            home: fx.sup.home().to_path_buf(),
+            allow: Arc::new(|_: &str| Ok(())),
+        };
+        let again = Super::new(&fx.sup.root, fx.sup.dir.clone(), cfg, None, fx.launcher.clone()).unwrap();
+        drop(again);
+        assert!(!s.exists(), "scratch removed");
+        assert!(!worktrees(&fx.app).contains(&scratch_id(&rv)), "{}", worktrees(&fx.app));
     }
 
     #[tokio::test]
@@ -1186,7 +1260,7 @@ mod tests {
         fx.links.kick();
         fx.until("running", |fx| fx.row("T1-fix").state == State::Running).await;
         assert_eq!(fx.row(&rv.id).state, State::Archived);
-        assert!(!scratch(&rv).exists());
+        assert!(!scratch(&fx.sup.dir, &rv).exists());
         assert_eq!(fx.row("T1-fix").review_rounds, 0);
         assert!(fx.said().iter().any(|l| l.contains("branch moved during its review")));
     }
