@@ -991,8 +991,17 @@ async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     }
     if let Some(name) = &cli.worktree {
         let name = if name.is_empty() { chrono_name() } else { name.clone() };
-        let (path, msg) =
-            novacode_tools::worktree::create(&std::env::current_dir()?, &name).map_err(anyhow::Error::msg)?;
+        // The main checkout's settings: the worktree has no project settings yet. Trusted only when
+        // already trusted, no prompt (the worktree's own trust check comes next).
+        let here = std::env::current_dir()?;
+        let trusted =
+            cli.trust || TrustStore::new(paths.home().join("trust.json")).state(&here) == trust::State::Trusted;
+        let copy = worktree_copy(&Settings::load(
+            &paths.settings(),
+            Some(&Paths::project_settings(&here)),
+            trusted,
+        ));
+        let (path, msg) = novacode_tools::worktree::create(&here, &name, &copy).map_err(anyhow::Error::msg)?;
         std::env::set_current_dir(&path)?;
         eprintln!("{msg}");
     }
@@ -1370,6 +1379,8 @@ impl Ctx {
         if let Some(p) = &self.cli.profile {
             policy = policy.with_profile(p).map_err(anyhow::Error::msg)?;
         }
+        // A super mode task's fence for the edit tools (L10.9); its subagents inherit the variable.
+        policy = policy.with_edit_rule(novacode_core::policy::EditRule::from_env().map_err(anyhow::Error::msg)?);
         // Shared: mode presets change it at run time, and subagents read its mode.
         let policy = Arc::new(policy);
         // A subagent: its role prompt, and only its tools and MCP servers (L10.1).
@@ -1458,7 +1469,7 @@ impl Ctx {
             searxng: s.get::<String>("web.searxngUrl"),
             settings: self.paths.settings(),
         }));
-        all.push(Arc::new(novacode_tools::worktree::EnterWorktree));
+        all.push(Arc::new(novacode_tools::worktree::EnterWorktree(worktree_copy(s))));
         all.push(Arc::new(novacode_tools::worktree::ExitWorktree(asker.clone())));
         if let Some(a) = asker.clone() {
             all.push(Arc::new(novacode_tools::ask::AskUser(a)));
@@ -1535,6 +1546,7 @@ impl Ctx {
                 nerd: s.get::<String>("ui.icons").as_deref() != Some("unicode"),
                 unattended: approver.is_none(),
                 policy: policy.clone(),
+                worktree_copy: worktree_copy(s),
             };
             // `/reload` keeps the supervisor, so running subagents carry on and report back.
             let kept = carry.as_ref().and_then(|_| self.sup.lock().unwrap().clone());
@@ -1997,7 +2009,7 @@ async fn print_mode(
             }) => {
                 eprintln!("retry {attempt} in {delay_ms}ms: {message}")
             }
-            Ok(AgentEvent::AgentEnd { stop }) => end = Some(stop),
+            Ok(AgentEvent::AgentEnd { stop, .. }) => end = Some(stop),
             // Done when nothing is queued and no subagent is still out: its report would start another run.
             Ok(AgentEvent::Settled) if end.is_some() && sup.as_ref().is_none_or(|s| s.pending() == 0) => {
                 break end.take().unwrap_or(StopReason::Stop);
@@ -2273,6 +2285,7 @@ async fn start_session(
         extensions,
         modes,
         goals: goals.clone(),
+        worktree_copy: worktree_copy(&ctx.settings),
     });
     host.follow_account(adapter);
     let mut live = serve::go_live(&host, bg)?;
@@ -2655,6 +2668,16 @@ fn ask_remove(h: &novacode_tools::worktree::Here) -> bool {
     let mut line = String::new();
     let _ = std::io::stdin().read_line(&mut line);
     matches!(line.trim(), "n" | "N" | "no")
+}
+
+/// `worktree.copy`: untracked project files copied into a new worktree.
+fn worktree_copy(s: &Settings) -> Vec<String> {
+    s.get("worktree.copy").unwrap_or_else(|| {
+        novacode_tools::worktree::COPY_DEFAULT
+            .iter()
+            .map(|p| p.to_string())
+            .collect()
+    })
 }
 
 /// `-w` without a name: `wt-MMDD-HHMM` (UTC).

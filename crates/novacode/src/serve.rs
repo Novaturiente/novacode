@@ -124,7 +124,7 @@ where
                 }
                 None => Err(format!("no tool call {call} is waiting")),
             },
-            cmd => dispatch(&host, cmd, &ui_tx).await,
+            cmd => dispatch(&host, cmd, req.id.clone(), &ui_tx).await,
         };
         if req.id.is_some() || res.is_err() {
             let (ok, data, error) = match res {
@@ -209,7 +209,13 @@ impl novacode_tools::Tool for ClientTool {
     }
 }
 
-async fn dispatch(host: &Arc<Host>, cmd: ClientCmd, ui: &mpsc::UnboundedSender<UiEvent>) -> Result<Value, String> {
+/// `id` = the request's id, echoed on the `agent_end` of the run that takes a prompt or steer (L10.9).
+async fn dispatch(
+    host: &Arc<Host>,
+    cmd: ClientCmd,
+    id: Option<String>,
+    ui: &mpsc::UnboundedSender<UiEvent>,
+) -> Result<Value, String> {
     let hub = &host.hub;
     let via = |c: Cmd| async move {
         host.handle(c, ui, false).await;
@@ -219,7 +225,7 @@ async fn dispatch(host: &Arc<Host>, cmd: ClientCmd, ui: &mpsc::UnboundedSender<U
         ClientCmd::Prompt { text, raw: true } => {
             let disposition = if hub.state().busy { "queued" } else { "started" };
             hub.update(false, |s| s.busy = true);
-            hub.handle.prompt_content(vec![novacode_types::Block::text(text)]);
+            hub.handle.prompt_wire(vec![novacode_types::Block::text(text)], id);
             Ok(json!({ "disposition": disposition }))
         }
         ClientCmd::Prompt { text, .. } if text.starts_with('!') => {
@@ -238,11 +244,20 @@ async fn dispatch(host: &Arc<Host>, cmd: ClientCmd, ui: &mpsc::UnboundedSender<U
             let disposition = if hub.state().busy { "queued" } else { "started" };
             // Busy from hand-in, not from agent_start: a second prompt right after is queued.
             hub.update(false, |s| s.busy = true);
-            host.handle(Cmd::Prompt(text), ui, false).await;
+            host.handle_as(Cmd::Prompt(text), ui, false, Some(id)).await;
             Ok(json!({ "disposition": disposition }))
         }
-        ClientCmd::Steer { text } => via(Cmd::Steer(text)).await,
-        ClientCmd::Abort => via(Cmd::Abort).await,
+        ClientCmd::Steer { text } => {
+            host.handle_as(Cmd::Steer(text), ui, false, Some(id)).await;
+            Ok(Value::Null)
+        }
+        ClientCmd::Abort { drop_queued } => {
+            // Dropped before the abort, so the cancelled run finds nothing to start next.
+            if drop_queued {
+                hub.handle.drop_follow_ups();
+            }
+            via(Cmd::Abort).await
+        }
         ClientCmd::SetModel { model } => via(Cmd::SetModel(model)).await,
         ClientCmd::SetThinking { level } => via(Cmd::SetThinking(level)).await,
         ClientCmd::Compact => via(Cmd::Compact).await,
@@ -745,7 +760,7 @@ pub async fn attach(
             let cmd = match c {
                 Cmd::Prompt(text) => ClientCmd::Prompt { text, raw: false },
                 Cmd::Steer(text) => ClientCmd::Steer { text },
-                Cmd::Abort => ClientCmd::Abort,
+                Cmd::Abort => ClientCmd::Abort { drop_queued: false },
                 Cmd::SetModel(model) => ClientCmd::SetModel { model },
                 Cmd::SetThinking(level) => ClientCmd::SetThinking { level },
                 Cmd::ListModels => ClientCmd::ListModels,

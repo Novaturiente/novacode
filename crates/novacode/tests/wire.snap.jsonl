@@ -1,7 +1,7 @@
 {"type":"hello","protocol":1,"version":"x","capabilities":["events","history","approvals","ask_user","prompt","steer","models","thinking","compact","export"],"state":{"session":"01abc","cwd":"/w","model":"claude/claude-opus-5-5","level":"medium","window_tokens":200000,"busy":false,"spent":0.0,"activity":{"state":"working","detail":"tool:bash"},"file":"/s/01abc.jsonl","context_tokens":0,"compactions":0,"cache":{"last_read":0,"last_write":0,"hit_pct":0.0},"tokens":{"input":0,"output":0,"cache_read":0,"cache_write":0},"started_ms":0}}
 {"type":"history","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}
 {"type":"event","event":{"type":"stream","stream":"delta","index":0,"text":"he"}}
-{"type":"event","event":{"type":"agent_end","stop":{"type":"stop"}}}
+{"type":"event","event":{"type":"agent_end","stop":{"type":"stop"},"prompts":["1",null]}}
 {"type":"response","id":"1","command":"prompt","ok":true,"data":{"disposition":"started"}}
 {"type":"response","command":"set_model","ok":false,"error":"unknown model"}
 {"type":"ui","ui":{"kind":"notice","text":"n","error":false}}
@@ -15,6 +15,7 @@
 {"id":"1b","type":"prompt","text":"/home/x is a path, !not a command","raw":true}
 {"type":"steer","text":"also tests"}
 {"type":"abort"}
+{"type":"abort","drop_queued":true}
 {"id":"2","type":"set_model","model":"codex/gpt-5.5:high"}
 {"type":"set_thinking","level":"low"}
 {"type":"export","html":true}

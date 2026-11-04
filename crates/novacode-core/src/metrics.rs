@@ -490,7 +490,7 @@ pub async fn record(mut rx: broadcast::Receiver<AgentEvent>, file: PathBuf, head
                     t.tools_ms += ms(s);
                 }
             }
-            AgentEvent::AgentEnd { stop } => {
+            AgentEvent::AgentEnd { stop, .. } => {
                 if let Some(r) = t.close_turn(now) {
                     write(&r);
                 }

@@ -157,7 +157,16 @@ async fn tools_session_and_cache_prefix() {
         .iter()
         .filter(|e| matches!(e, AgentEvent::AgentEnd { .. }))
         .collect();
-    assert_eq!(ends, vec![&AgentEvent::AgentEnd { stop: StopReason::Stop }; 2]);
+    assert_eq!(
+        ends,
+        vec![
+            &AgentEvent::AgentEnd {
+                stop: StopReason::Stop,
+                prompts: vec![]
+            };
+            2
+        ]
+    );
 
     let reqs = faux.requests.lock().unwrap().clone();
     assert_eq!(reqs.len(), 6);
@@ -233,7 +242,8 @@ async fn retry_is_hidden_and_errors_end_the_run() {
         "the failed attempt is hidden from the retry"
     );
     assert!(events.contains(&AgentEvent::AgentEnd {
-        stop: StopReason::Error { kind: ErrorKind::Auth }
+        stop: StopReason::Error { kind: ErrorKind::Auth },
+        prompts: vec![]
     }));
     // The run after the error sees "hi", "ok", "again" and not the hidden failure.
     assert_eq!(
@@ -315,7 +325,8 @@ async fn cut_off_and_empty_replies_are_nudged_within_caps() {
     let (_a, events) = drive(agent, &["write a lot"]).await;
     assert_eq!(faux.requests.lock().unwrap().len(), 3, "two continues, then stop");
     assert!(events.contains(&AgentEvent::AgentEnd {
-        stop: StopReason::Length
+        stop: StopReason::Length,
+        prompts: vec![]
     }));
     let last = faux.requests.lock().unwrap()[2].messages.last().cloned().unwrap();
     assert!(format!("{last:?}").contains("<system-reminder>"));
@@ -2216,7 +2227,10 @@ async fn loop_retries_four_times_then_succeeds() {
         .collect();
     assert_eq!(delays.len(), 4);
     assert_eq!(faux.requests.lock().unwrap().len(), 5);
-    assert!(events.contains(&AgentEvent::AgentEnd { stop: StopReason::Stop }));
+    assert!(events.contains(&AgentEvent::AgentEnd {
+        stop: StopReason::Stop,
+        prompts: vec![]
+    }));
 }
 
 #[tokio::test]
@@ -2228,7 +2242,8 @@ async fn loop_gives_up_after_five_failures() {
     assert!(events.contains(&AgentEvent::AgentEnd {
         stop: StopReason::Error {
             kind: ErrorKind::Transient
-        }
+        },
+        prompts: vec![]
     }));
 }
 
@@ -2249,7 +2264,10 @@ async fn quoted_tool_markup_is_not_nudged() {
     );
     let (_a, events) = drive(agent, &["explain the check"]).await;
     assert_eq!(faux.requests.lock().unwrap().len(), 1, "no nudge, no second call");
-    assert!(events.contains(&AgentEvent::AgentEnd { stop: StopReason::Stop }));
+    assert!(events.contains(&AgentEvent::AgentEnd {
+        stop: StopReason::Stop,
+        prompts: vec![]
+    }));
 }
 
 /// Never answers; signals when a card arrives.
@@ -2296,7 +2314,7 @@ async fn abort_ends_a_pending_approval() {
     h.abort();
     let end = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if let AgentEvent::AgentEnd { stop } = rx.recv().await.unwrap() {
+            if let AgentEvent::AgentEnd { stop, .. } = rx.recv().await.unwrap() {
                 return stop;
             }
         }
@@ -2327,4 +2345,112 @@ async fn take_follow_ups_drops_queued_prompts() {
     while !matches!(rx.recv().await.unwrap(), AgentEvent::AgentEnd { .. }) {}
     h.shutdown();
     task.await.unwrap();
+}
+
+/// The prompt ids each `agent_end` carries, in order (L10.9 "No false blocks").
+async fn ends(rx: &mut tokio::sync::broadcast::Receiver<AgentEvent>) -> Vec<Option<String>> {
+    loop {
+        if let AgentEvent::AgentEnd { prompts, .. } = rx.recv().await.unwrap() {
+            return prompts;
+        }
+    }
+}
+
+/// ST04: a wire prompt queued during a run is drained into it; both ids end up on its one `agent_end`.
+#[tokio::test]
+async fn agent_end_lists_every_wire_prompt_the_run_consumed() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let faux = Faux::new([
+        tools_reply(vec![call("s1", "bash", json!({"command": "sleep 0.3"}))]),
+        FauxReply::text("first done"),
+        FauxReply::text("second done"),
+    ]);
+    let store = Store::create(&Paths::new(home.path()), work.path(), true);
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        novacode_tools::builtins(false),
+        store,
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    );
+    let (h, task) = agent::spawn(agent);
+    let mut rx = h.subscribe();
+    h.prompt_wire(vec![Block::text("one")], Some("p1".into()));
+    loop {
+        if let AgentEvent::ToolStart { .. } = rx.recv().await.unwrap() {
+            break;
+        }
+    }
+    h.prompt_wire(vec![Block::text("two")], Some("p2".into()));
+    assert_eq!(ends(&mut rx).await, [Some("p1".to_string()), Some("p2".to_string())]);
+    assert_eq!(faux.requests.lock().unwrap().len(), 3, "one run took both prompts");
+    h.shutdown();
+    task.await.unwrap();
+}
+
+/// ST04: an id-less wire prompt is a `null` entry; a run woken from inside the session lists none.
+#[tokio::test]
+async fn agent_end_marks_idless_prompts_and_lists_none_for_wakes() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let faux = Faux::new([FauxReply::text("hi"), FauxReply::text("noted")]);
+    let store = Store::create(&Paths::new(home.path()), work.path(), true);
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        vec![],
+        store,
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    );
+    let (h, task) = agent::spawn(agent);
+    let mut rx = h.subscribe();
+    h.prompt_wire(vec![Block::text("typed in a window")], None);
+    assert_eq!(ends(&mut rx).await, [None]);
+    // A subagent's report wakes the session (agents.rs), with no wire prompt.
+    h.remind_as("agent", "subagent a1 finished", true);
+    assert_eq!(ends(&mut rx).await, Vec::<Option<String>>::new());
+    h.shutdown();
+    task.await.unwrap();
+}
+
+/// Prompt, prompt, abort: how many runs start before the session settles (L10.9 Stop).
+async fn runs_after_abort(drop_queued: bool) -> usize {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (agent, asked) = waiting_on_approval(work.path(), home.path());
+    let (h, task) = agent::spawn(agent);
+    let mut rx = h.subscribe();
+    h.prompt("make a file");
+    asked.notified().await;
+    h.prompt("then this");
+    if drop_queued {
+        h.drop_follow_ups();
+    }
+    h.abort();
+    let runs = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut runs = 0;
+        loop {
+            match rx.recv().await.unwrap() {
+                AgentEvent::AgentStart => runs += 1,
+                AgentEvent::Settled => return runs,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the session settles");
+    h.shutdown();
+    task.await.unwrap();
+    runs
+}
+
+#[tokio::test]
+async fn abort_dropping_queued_starts_no_second_run() {
+    assert_eq!(runs_after_abort(true).await, 1);
+}
+
+#[tokio::test]
+async fn plain_abort_keeps_the_queued_prompt() {
+    assert_eq!(runs_after_abort(false).await, 2);
 }
