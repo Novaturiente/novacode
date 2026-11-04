@@ -572,6 +572,8 @@ struct Child {
     model: String,
     task: String,
     cwd: PathBuf,
+    /// Started with `--trust`: its folder's project config loads.
+    trusted: bool,
     /// Its tools and MCP servers (kept for resumes); None: all of its process's.
     tools: Option<Vec<String>>,
     mcp: Vec<String>,
@@ -651,6 +653,8 @@ struct Cfg {
     policy: Arc<novacode_core::policy::Policy>,
     /// `worktree.copy`: untracked files copied into a child's worktree.
     worktree_copy: Vec<String>,
+    /// Super mode's root (see [`Setup::root`]).
+    root: Option<PathBuf>,
 }
 
 impl Cfg {
@@ -674,6 +678,7 @@ impl Cfg {
             env: s.env,
             policy: s.policy,
             worktree_copy: s.worktree_copy,
+            root: s.root,
         }
     }
 }
@@ -705,6 +710,10 @@ pub struct Setup {
     pub policy: Arc<novacode_core::policy::Policy>,
     /// `worktree.copy`, passed to `worktree::create_new`.
     pub worktree_copy: Vec<String>,
+    /// Super mode (L10.9): children run only in this folder or below it (symlinks
+    /// resolved), each with its own folder's trust and MCP servers, and the regular tool
+    /// set as ceiling instead of this session's own tools.
+    pub root: Option<PathBuf>,
 }
 
 impl Supervisor {
@@ -941,8 +950,33 @@ impl Supervisor {
         {
             model = format!("{model}:{t}");
         }
-        let (mut tools, mcp, mut notes) =
-            grant(def, a.tools, a.mcp, cfg.parent_picks, cfg.own.as_deref(), &cfg.servers);
+        let mut cwd = match &a.cwd {
+            Some(c) => at(&cfg.cwd, c),
+            None => cfg.cwd.clone(),
+        };
+        // Super's scouts: its target folder's trust and servers, no cap from super's tools.
+        let (trusted, own, servers, def) = match &cfg.root {
+            Some(root) => {
+                cwd = in_root(root, &cwd)?;
+                let store = novacode_core::trust::TrustStore::new(self.home.join("trust.json"));
+                let trusted = novacode_core::trust::resolve(&store, &cwd, false);
+                let servers: Vec<String> = novacode_core::mcp::load(&self.home, &cwd, trusted)
+                    .0
+                    .into_iter()
+                    .map(|c| c.name)
+                    .collect();
+                let mut def = def.clone();
+                def.mcp = servers.clone();
+                (trusted, None, servers, std::borrow::Cow::Owned(def))
+            }
+            None => (
+                cfg.trusted,
+                cfg.own.clone(),
+                cfg.servers.clone(),
+                std::borrow::Cow::Borrowed(def),
+            ),
+        };
+        let (mut tools, mcp, mut notes) = grant(&def, a.tools, a.mcp, cfg.parent_picks, own.as_deref(), &servers);
         // `models.deny` (L2.28): a model asked for is refused; a type's own falls back, visibly.
         if let Err(e) = (cfg.allow)(&model) {
             if asked {
@@ -981,17 +1015,13 @@ impl Supervisor {
         }
         // An active mode preset's tool list caps the child too.
         if let Some(only) = cfg.policy.overlay_tools() {
-            let pool = tools.take().or_else(|| cfg.own.clone()).unwrap_or_default();
+            let pool = tools.take().or(own).unwrap_or_default();
             tools = Some(
                 pool.into_iter()
                     .filter(|t| only.iter().any(|o| o.eq_ignore_ascii_case(t)))
                     .collect(),
             );
         }
-        let mut cwd = match &a.cwd {
-            Some(c) => at(&cfg.cwd, c),
-            None => cfg.cwd.clone(),
-        };
         {
             let g = self.children.lock().unwrap();
             for d in &a.after {
@@ -1019,6 +1049,7 @@ impl Supervisor {
             model,
             task,
             cwd,
+            trusted,
             read_only: def.read_only,
             no_context: def.no_context,
             max_turns: def.max_turns,
@@ -1112,7 +1143,7 @@ impl Supervisor {
 
     /// Run child `n` until it settles: start it (or resume `session`), send `prompt`.
     async fn run(self: Arc<Self>, n: String, prompt: Option<String>, session: Option<String>) {
-        let Some((model, agent, cwd, title, tools, mcp, (read_only, no_context))) = self.with(&n, |c| {
+        let Some((model, agent, cwd, title, tools, mcp, (read_only, no_context, trusted))) = self.with(&n, |c| {
             c.status = Status::Starting;
             c.turns = 0;
             c.started = Some(Instant::now());
@@ -1129,7 +1160,7 @@ impl Supervisor {
                 c.title.clone(),
                 c.tools.clone(),
                 c.mcp.clone(),
-                (c.read_only, c.no_context),
+                (c.read_only, c.no_context, c.trusted),
             )
         }) else {
             return;
@@ -1150,7 +1181,7 @@ impl Supervisor {
             cmd.arg(format!("--tools={}", t.join(",")));
         }
         cmd.arg(format!("--mcp={}", mcp.join(",")));
-        if self.c().trusted {
+        if trusted {
             cmd.arg("--trust");
         }
         if let Some(s) = &session {
@@ -1597,6 +1628,20 @@ fn dur(ms: u64) -> String {
     }
 }
 
+/// Super mode: `cwd` resolved (symlinks followed), refused outside `root`.
+fn in_root(root: &Path, cwd: &Path) -> Result<PathBuf, String> {
+    let real = novacode_base::platform::canonicalize(cwd).map_err(|e| format!("`{}`: {e}", cwd.display()))?;
+    let root = novacode_base::platform::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if !real.starts_with(&root) {
+        return Err(format!(
+            "`{}` is outside the super root {}: subagents run only there",
+            real.display(),
+            root.display()
+        ));
+    }
+    Ok(real)
+}
+
 fn at(cwd: &Path, p: &str) -> PathBuf {
     match p.strip_prefix("~/") {
         Some(rest) => novacode_base::platform::home().unwrap_or_default().join(rest),
@@ -1924,6 +1969,7 @@ mod tests {
             }),
             skill_dirs: vec![],
             worktree_copy: vec![],
+            root: None,
             max_running: 4,
             exe: Some(fake_child(&tmp)),
             nerd: false,
@@ -1953,6 +1999,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// L10.9 scouts: super's subagents run only inside its root, and each gets its target
+    /// folder's trust and MCP servers (global plus project), not super's (none).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn super_scouts_get_their_folders_mcp_and_trust_inside_the_root_only() {
+        let tmp = std::env::temp_dir().join(format!("nc-sup-scout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (home, root, outside) = (tmp.join("home"), tmp.join("root"), tmp.join("outside"));
+        let (proj, plain) = (root.join("proj"), root.join("plain"));
+        for d in [&home, &proj, &plain, &outside] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let server = |name: &str| json!({"mcpServers": {name: {"command": "true"}}}).to_string();
+        std::fs::write(home.join("mcp.json"), server("globsrv")).unwrap();
+        std::fs::write(proj.join(".mcp.json"), server("projsrv")).unwrap();
+        std::fs::write(plain.join(".mcp.json"), server("untrusted")).unwrap();
+        novacode_core::trust::TrustStore::new(home.join("trust.json"))
+            .set(&proj, true)
+            .unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let sup = Supervisor::new(Setup {
+            slot: HubSlot::default(),
+            unattended: false,
+            me: "ROOT".into(),
+            home: home.clone(),
+            cwd: root.clone(),
+            trusted: false,
+            defs: defs(&[]).0,
+            parent_picks: true,
+            servers: vec![],
+            stall_min: 10,
+            timeout_min: 45,
+            models: Arc::new(|_: &str, _: &str| None),
+            allow: Arc::new(|_: &str| Ok(())),
+            skill_dirs: vec![],
+            worktree_copy: vec![],
+            max_running: 4,
+            exe: Some(fake_child(&tmp)),
+            nerd: false,
+            env: Default::default(),
+            policy: Arc::new(novacode_core::policy::Policy::new(
+                Default::default(),
+                tmp.clone(),
+                None,
+            )),
+            root: Some(root.clone()),
+        });
+        // Super's own tool list (its 5) is not the children's ceiling.
+        sup.set_own_tools(vec!["task".into(), "agent".into()]);
+        let spawn = |cwd: &str| {
+            sup.spawn(
+                serde_json::from_value(json!({"task": "t", "agent": "scout", "cwd": cwd, "model": "p/m"})).unwrap(),
+            )
+        };
+        for bad in [outside.to_str().unwrap(), "link", "../outside", "missing"] {
+            let err = spawn(bad).unwrap_err();
+            assert!(err.contains("root") || err.contains("missing"), "{bad}: {err}");
+        }
+        let (p, _) = spawn("proj").unwrap();
+        let (q, _) = spawn("plain").unwrap();
+        let out = sup.wait(vec![p.clone()], false, Duration::from_secs(20)).await;
+        assert!(
+            out.contains("--mcp=globsrv,projsrv ") && out.contains(" --trust"),
+            "the trusted project's servers and trust: {out}"
+        );
+        assert!(out.contains("--tools=read,"), "the scout's own tools, uncapped: {out}");
+        let out = sup.wait(vec![q], false, Duration::from_secs(20)).await;
+        assert!(
+            out.contains("--mcp=globsrv") && !out.contains("untrusted") && !out.contains("--trust"),
+            "an untrusted folder: global servers only: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn spawn_after_wait_and_send() {
@@ -1979,6 +2099,7 @@ mod tests {
             exe: Some(fake_child(&tmp)),
             nerd: false,
             env: [("NC_ENV".to_string(), " env-set".to_string())].into(),
+            root: None,
             policy: Arc::new(novacode_core::policy::Policy::new(
                 Default::default(),
                 tmp.clone(),
@@ -2070,6 +2191,7 @@ mod tests {
             skill_dirs: vec![],
             max_running: 2,
             worktree_copy: vec![],
+            root: None,
             exe: Some(exe),
             nerd: false,
             env: Default::default(),
@@ -2138,6 +2260,7 @@ mod tests {
             skill_dirs: vec![],
             max_running: 4,
             worktree_copy: vec![],
+            root: None,
             exe: Some(exe),
             nerd: false,
             env: Default::default(),

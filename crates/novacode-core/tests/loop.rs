@@ -1197,6 +1197,53 @@ async fn compaction_without_the_observer() {
     assert!(p.contains("Summary of the earlier conversation"), "{p}");
 }
 
+/// L10.9: a session's own compaction instructions (super's) reach the summary model and
+/// are repeated after the summary, so the model acts on them once the chat is gone.
+#[tokio::test]
+async fn compaction_guide_reaches_the_summary_and_follows_it() {
+    use novacode_core::memory::{Settings, Worker};
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let big = "lorem ipsum ".repeat(300);
+    let main = Faux::new((0..8).map(|i| FauxReply::text(&format!("answer {i} {big}"))));
+    let agent = Agent::new(
+        Arc::new(main.clone()),
+        vec![],
+        Store::create(&Paths::new(home.path()), work.path(), false),
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_memory(
+        Worker {
+            adapter: Arc::new(Faux::new([])),
+            provider: "faux".into(),
+            model: "small".into(),
+        },
+        Settings {
+            observe_after: 1000,
+            keep_recent: 2500,
+            compact_at: 6000,
+            chunk_tokens: 3000,
+            reflect_after: u64::MAX,
+            pool_target: u64::MAX,
+        },
+    )
+    .without_observer()
+    .with_compaction_guide("GUIDE: keep the board; call task list after".into());
+    let prompts: Vec<String> = (0..5).map(|i| format!("task {i} {big}")).collect();
+    let refs: Vec<&str> = prompts.iter().map(String::as_str).collect();
+    let (agent, events) = drive(agent, &refs).await;
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::Compacted { .. })));
+    let asked = format!("{:?}", main.requests.lock().unwrap());
+    assert!(
+        asked.contains("Summarise this part") && asked.contains("GUIDE: keep the board"),
+        "the summary request carries the guide"
+    );
+    let p = format!("{:?}", agent.store.projection());
+    let summary = p.find("Summary of the earlier conversation").expect("compacted");
+    assert!(p[summary..].contains("GUIDE: keep the board"), "{p}");
+}
+
 /// A model switch moves background calls too: the observer to the switch's helper,
 /// and (observer off) compaction summaries to the new session model.
 #[tokio::test]

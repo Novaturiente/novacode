@@ -115,6 +115,9 @@ struct Cli {
     /// The detached super process itself (set by the `--super` launcher).
     #[arg(long, hide = true, requires = "super_")]
     super_serve: bool,
+    /// `/restart` of the detached super: resume this session (`-r` is refused with `--super`).
+    #[arg(long, hide = true, requires = "super_serve")]
+    super_resume: Option<String>,
     /// API key for the model's provider, for this run only (ahead of saved and env keys).
     #[arg(long, value_name = "KEY")]
     api_key: Option<String>,
@@ -964,6 +967,7 @@ async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         };
         cli.bg = Some(String::new());
+        cli.resume = cli.super_resume.take();
         Some(lock)
     } else {
         None
@@ -1385,6 +1389,8 @@ impl Ctx {
         let (adapter, api_key) = self.providers.adapter(&route.provider, trace).await?;
         diag::mark("connect provider");
         let s = &self.settings;
+        // Super mode (L10.9): its own prompt and tools, no project files, skills or MCP.
+        let is_super = self.cli.super_serve;
         let perms = permissions(s);
         // Lenient (L6.9): no judge.
         let judge_spec = match perms.security {
@@ -1425,7 +1431,10 @@ impl Ctx {
                 .map(String::from)
                 .collect()
         };
-        let allowed: Option<Vec<String>> = self.cli.tools.as_ref().map(csv).or_else(|| def.as_ref()?.tools.clone());
+        let allowed: Option<Vec<String>> = match is_super {
+            true => Some(superagent::tools(s)),
+            false => self.cli.tools.as_ref().map(csv).or_else(|| def.as_ref()?.tools.clone()),
+        };
         let granted: Option<Vec<String>> = def
             .as_ref()
             .map(|d| self.cli.mcp.as_ref().map_or_else(|| d.mcp.clone(), csv));
@@ -1454,13 +1463,16 @@ impl Ctx {
             prompt: novacode_core::prompt::Sources {
                 cwd: self.cwd.clone(),
                 home: self.paths.home().to_path_buf(),
-                context_files: !self.cli.no_context_files,
-                skill_dirs: self.skill_dirs(),
+                context_files: !self.cli.no_context_files && !is_super,
+                skill_dirs: if is_super { vec![] } else { self.skill_dirs() },
                 tool_guidelines: vec![],
-                agent: def
-                    .as_ref()
-                    .filter(|d| !d.prompt.is_empty())
-                    .map(|d| (d.prompt.clone(), d.replace)),
+                agent: if is_super {
+                    Some((superagent::prompt(self.paths.home()), true))
+                } else {
+                    def.as_ref()
+                        .filter(|d| !d.prompt.is_empty())
+                        .map(|d| (d.prompt.clone(), d.replace))
+                },
                 mode: None,
                 memory_index: memories.as_ref().map(|m| {
                     m.index(
@@ -1521,6 +1533,9 @@ impl Ctx {
         if let Some(g) = &granted {
             servers.retain(|c| g.contains(&c.name));
         }
+        if is_super {
+            servers.clear();
+        }
         let server_names: Vec<String> = servers.iter().map(|c| c.name.clone()).collect();
         let mut supervisor = None;
         if let Some(slot) = slot
@@ -1571,6 +1586,8 @@ impl Ctx {
                 unattended: approver.is_none(),
                 policy: policy.clone(),
                 worktree_copy: worktree_copy(s),
+                // Super's scouts: inside its root, with their folder's trust and MCP (L10.9).
+                root: is_super.then(|| self.cwd.clone()),
             };
             // `/reload` keeps the supervisor, so running subagents carry on and report back.
             let kept = carry.as_ref().and_then(|_| self.sup.lock().unwrap().clone());
@@ -1844,6 +1861,9 @@ impl Ctx {
                     }
                 }
                 None => agent = agent.with_memory(session_worker, m).without_observer(),
+            }
+            if is_super {
+                agent = agent.with_compaction_guide(superagent::COMPACTION.into());
             }
             // Named for the session list (L4.18); not scripts, pipelines or subagents.
             if self.cli.print.is_none() && !self.cli.rpc {
@@ -2653,25 +2673,7 @@ fn live_path(exe: std::path::PathBuf) -> std::path::PathBuf {
 }
 
 fn restart(id: &str) -> anyhow::Error {
-    let mut args = Vec::new();
-    let mut skip = false;
-    // `-w` takes an optional name: drop the next arg only if it isn't a flag.
-    let mut skip_name = false;
-    for a in std::env::args().skip(1) {
-        if std::mem::take(&mut skip) || std::mem::take(&mut skip_name) && !a.starts_with('-') {
-            continue;
-        }
-        match a.as_str() {
-            "-c" | "--continue" => {}
-            "-r" | "--resume" => skip = true,
-            // The resumed session's folder decides where it runs (worktree included).
-            "-w" | "--worktree" => skip_name = true,
-            s if s.starts_with("--worktree=") || s.starts_with("-w") && s.len() > 2 => {}
-            s if s.starts_with("--resume=") => {}
-            _ => args.push(a),
-        }
-    }
-    args.extend(["-r".into(), id.to_string()]);
+    let args = restart_args(std::env::args().skip(1), id);
     let exe = match std::env::current_exe() {
         Ok(e) => live_path(e),
         Err(e) => return e.into(),
@@ -2688,6 +2690,38 @@ fn restart(id: &str) -> anyhow::Error {
         Err(e) => e,
     };
     anyhow::anyhow!("restart failed: {err}")
+}
+
+/// This process's arguments for resuming session `id`: its own resume and worktree
+/// flags dropped (the session's folder decides), then `-r id`, or `--super-resume id`
+/// for the detached super.
+fn restart_args(own: impl Iterator<Item = String>, id: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut skip = false;
+    // `-w` takes an optional name: drop the next arg only if it isn't a flag.
+    let mut skip_name = false;
+    for a in own {
+        if std::mem::take(&mut skip) || std::mem::take(&mut skip_name) && !a.starts_with('-') {
+            continue;
+        }
+        match a.as_str() {
+            "-c" | "--continue" => {}
+            "-r" | "--resume" => skip = true,
+            // The resumed session's folder decides where it runs (worktree included).
+            "-w" | "--worktree" => skip_name = true,
+            s if s.starts_with("--worktree=") || s.starts_with("-w") && s.len() > 2 => {}
+            s if s.starts_with("--resume=") || s.starts_with("--super-resume=") => {}
+            "--super-resume" => skip = true,
+            _ => args.push(a),
+        }
+    }
+    let flag = if args.iter().any(|a| a == "--super-serve") {
+        "--super-resume"
+    } else {
+        "-r"
+    };
+    args.extend([flag.into(), id.to_string()]);
+    args
 }
 
 /// `--bg`: re-run this command detached, wait for its session id, print it.
@@ -3589,6 +3623,24 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad:?} should be refused");
         }
+    }
+
+    /// ST09 open point: `/restart` re-runs the session's own arguments plus its id. For the
+    /// detached super that must parse (`-r` is refused with `--super`) and resume it.
+    #[test]
+    fn restart_args_resume_a_super_and_any_other_session() {
+        use clap::Parser;
+        fn args(a: &[&str]) -> std::vec::IntoIter<String> {
+            a.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+        }
+        let parse = |a: Vec<String>| super::Cli::try_parse_from(std::iter::once("novacode".to_string()).chain(a));
+        let sup = super::restart_args(args(&["--super", "-m", "faux/script", "--super-serve"]), "abc");
+        let cli = parse(sup).expect("a super's restart parses");
+        assert!(cli.super_serve && cli.super_resume.as_deref() == Some("abc") && cli.resume.is_none());
+        let plain = super::restart_args(args(&["-m", "faux/script", "-r", "old", "-w", "x"]), "abc");
+        assert_eq!(plain, ["-m", "faux/script", "-r", "abc"]);
+        // Only the detached super may resume: a launcher can't.
+        assert!(parse(args(&["--super", "--super-resume", "abc"]).collect()).is_err());
     }
 
     /// L6.9: unset is lenient with a credentials-only sandbox; a bad `permissions` is

@@ -246,6 +246,24 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "Untracked files and folders (relative to the repo root) copied into a new worktree (`-w`, `/worktree`, `enter_worktree`, subagent worktrees), besides root `.env*` files. Folders are copied whole except files git tracks; `daemon.*` files and sockets are never copied. Copies don't count as changes and are deleted when the worktree is removed.",
     ),
     (
+        "super.maxRunning",
+        "number",
+        "5",
+        "Super mode (docs/super.md): tasks running at once, review tasks included; a new `task spawn` over the limit waits as `queued`. Messages to existing tasks never wait.",
+    ),
+    (
+        "super.tiers",
+        "object",
+        "`quick` `claude/claude-haiku-5-5`, `standard` `claude/claude-sonnet-5-5`, `deep` `claude/claude-opus-5-5:high`, `review` `codex/gpt-6.1-sol:high`",
+        "Super mode task models, weakest to strongest: `<tier>: {model, note}`, `note` saying when super should use it. An entry replaces that tier's default; a review runs one tier above its task.",
+    ),
+    (
+        "super.tools",
+        "list",
+        "[]",
+        "Extra tools super's model sees besides `task`, `ask_user`, `memory`, `todo` and `agent`. Scouts and tasks it starts get the regular tool set either way.",
+    ),
+    (
         "goal.audit",
         "bool",
         "true",

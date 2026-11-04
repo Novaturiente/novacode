@@ -766,18 +766,23 @@ pub async fn drop_notes(
 pub const SUMMARY_PROMPT: &str = "Summarise this part of a coding agent's conversation so the agent can continue the work without it. Keep: the user's goals, preferences and corrections; decisions and their reasons; what was completed (so it isn't redone); open problems and next steps; exact file paths, identifiers, commands and error messages. Plain text with short sections, no preamble.";
 
 /// Fallback summary by the session's main model, when there are no notes.
+/// `guide`: the session's own compaction instructions, added to the prompt.
 pub async fn summarize(
     adapter: &Arc<dyn Adapter>,
     model: &str,
     c: &Chunk,
     session: &str,
+    guide: Option<&str>,
 ) -> Result<(String, Usage), String> {
     let req = Request {
         tail: Vec::new(),
         model: model.into(),
         messages: vec![
             Message::System {
-                text: SUMMARY_PROMPT.into(),
+                text: match guide {
+                    Some(g) => format!("{SUMMARY_PROMPT}\n\n{g}"),
+                    None => SUMMARY_PROMPT.into(),
+                },
             },
             Message::User {
                 content: vec![Block::text(c.text.clone())],

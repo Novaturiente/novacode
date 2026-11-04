@@ -168,6 +168,9 @@ struct Memory {
     auto_name: bool,
     /// What the last naming was based on: `start`, or a compaction's id.
     named_for: Option<String>,
+    /// This session's own compaction instructions (super's, L10.9): given to the
+    /// summary model and repeated after the summary.
+    guide: Option<String>,
 }
 
 /// What a background observer run produced.
@@ -790,7 +793,16 @@ impl Agent {
             observe: true,
             auto_name: false,
             named_for: None,
+            guide: None,
         });
+        self
+    }
+
+    /// Compaction instructions of this session (after `with_memory`).
+    pub fn with_compaction_guide(mut self, text: String) -> Self {
+        if let Some(m) = self.memory.as_mut() {
+            m.guide = Some(text);
+        }
         self
     }
 
@@ -1069,7 +1081,7 @@ impl Agent {
         self.collect_notes(true).await;
         let tokens_before = self.context_tokens();
         let Some(m) = self.memory.as_ref() else { return false };
-        let (settings, worker, observe) = (m.settings.clone(), m.worker.clone(), m.observe);
+        let (settings, worker, observe, guide) = (m.settings.clone(), m.worker.clone(), m.observe, m.guide.clone());
         let (from, cut) = {
             let path = self.store.branch();
             let from = path
@@ -1131,7 +1143,7 @@ impl Agent {
                     ),
                 }));
             }
-            match memory::summarize(&self.adapter, &self.cfg.model, &gap, self.store.id()).await {
+            match memory::summarize(&self.adapter, &self.cfg.model, &gap, self.store.id(), guide.as_deref()).await {
                 Ok((t, _)) => summary_text = Some(t),
                 Err(e) => self.emit(AgentEvent::Stream(StreamEvent::Notice {
                     text: format!("summary failed too ({e}); dropping the older messages"),
@@ -1156,6 +1168,9 @@ impl Agent {
             summary.push_str(&format!(
                 "\n\n## Request in progress\nThe conversation below continues the turn started by this user message:\n{p}"
             ));
+        }
+        if let Some(g) = &guide {
+            summary.push_str(&format!("\n\n## After this compaction\n{g}"));
         }
         let fallback = notes.is_empty() && refl.is_empty() && summary_text.is_none();
         let system = crate::prompt::render(&self.store.sections());

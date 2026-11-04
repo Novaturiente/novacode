@@ -83,6 +83,82 @@ fn two_concurrent_launches_give_one_super_and_both_attach() {
     );
 }
 
+/// The `/context` report of a live session, over its socket.
+#[cfg(unix)]
+fn context_of(home: &Path, id: &str) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let run: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join("run").join(format!("{id}.json"))).unwrap()).unwrap();
+    let sock = std::os::unix::net::UnixStream::connect(run["socket"].as_str().unwrap()).unwrap();
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+    (&sock)
+        .write_all(b"{\"id\": \"ctx\", \"type\": \"get_context\"}\n")
+        .unwrap();
+    for line in BufReader::new(&sock).lines() {
+        let m: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if m["type"] == "response" && m["id"] == "ctx" {
+            return m["data"]["text"].as_str().unwrap().to_string();
+        }
+    }
+    panic!("no context reply");
+}
+
+/// The rows under `title` in a `/context` report: (name) per indented row.
+#[cfg(unix)]
+fn rows(report: &str, title: &str) -> Vec<String> {
+    report
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with(title))
+        .skip(1)
+        .take_while(|l| l.starts_with("    "))
+        .map(|l| l.split_whitespace().next().unwrap().to_string())
+        .collect()
+}
+
+/// L10.9 "The super agent": its model sees only its own tools (`task` joins with ST12),
+/// and its prompt has no project `AGENTS.md` and no skills, though the root has both and
+/// a global MCP server is configured.
+#[cfg(unix)]
+#[test]
+fn super_session_sees_exactly_its_tools_and_no_project_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let (home, root) = (dir.path().join("home"), dir.path().join("projects"));
+    let skill = home.join("skills").join("demo");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(home.join("AGENTS.md"), "GLOBAL-RULE").unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: demo\ndescription: a demo skill\n---\nbody",
+    )
+    .unwrap();
+    std::fs::write(
+        home.join("mcp.json"),
+        r#"{"mcpServers": {"globsrv": {"command": "true"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("AGENTS.md"), "PROJECT-RULE").unwrap();
+    let script = dir.path().join("super.jsonl");
+    std::fs::write(&script, "").unwrap();
+    let out = launch(&root, &home, &["-m", "faux/script"])
+        .env("NOVACODE_FAUX_SCRIPT", &script)
+        .output()
+        .unwrap();
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(out.status.success() && !id.is_empty(), "{}", text(&out));
+    let report = std::panic::catch_unwind(|| context_of(&home, &id));
+    stop(&home, &id);
+    let report = report.unwrap();
+    let mut tools = rows(&report, "tools");
+    tools.sort();
+    assert_eq!(tools, ["agent", "ask_user", "memory", "todo"], "{report}");
+    let sections = rows(&report, "system prompt");
+    assert!(sections.contains(&"preamble".to_string()), "{report}");
+    for absent in ["project_context", "skills"] {
+        assert!(!sections.contains(&absent.to_string()), "{absent}: {report}");
+    }
+}
+
 #[test]
 fn refused_flag_combinations_start_nothing() {
     let dir = tempfile::tempdir().unwrap();
