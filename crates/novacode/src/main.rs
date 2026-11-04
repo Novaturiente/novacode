@@ -42,7 +42,6 @@ mod schedule;
 mod serve;
 mod stats;
 mod status;
-#[allow(dead_code)] // shortcut: wired up by the super process (ST12, ST13)
 mod superagent;
 mod update;
 mod updates;

@@ -22,6 +22,7 @@ The panel has tabs. Switch tabs with `Tab` and `Shift+Tab` or the number keys `1
 | Tab | Shows |
 |---|---|
 | Agent | The goal, the todo list and subagents. Subagents show from the oldest prompt that still has one running up to the newest prompt that started any; older finished ones are hidden (the title counts them). |
+| Tasks | Super mode only ([super mode](super.md)), shown while the board has tasks: one row per task on the super agent's board, not archived ones: label, repo, state, model, tokens, age and last summary, refreshed every 2 seconds. `Enter` opens the task in a new tmux window (`novacode attach <session>`), or prints that command outside tmux. |
 | Processes | A list of processes, running ones first: status, run time, command and the last output line. `Enter` or a click opens the process popup. |
 | Usage stats | Bars for context use (and a split into system prompt, tools and messages), cache hits (last request and session) and subscription windows; sparklines of cache hit and cost (or output tokens) per request; token totals and cost; MCP servers with connected or failed state and tool counts; how many skills, prompts, agents, extensions, packages and context files loaded, and running processes and subagents. `Ctrl+Alt+U` opens it. |
 | Timing | Where the time of each task went, with a sparkline of task times. |
@@ -35,7 +36,7 @@ Extensions can add tabs too (see [extensions](extensions.md)).
 | `Ctrl+Alt+U` | Open the panel on Usage stats with focus. Again closes it. |
 | `Ctrl+Alt+F` | Give the panel the keys. `Esc` or `q` gives them back. |
 | `Up`/`Down` (or `k`/`j`) | Move in the focused panel. |
-| `Enter` | Run the action of the selected row (Files: open it; Processes: show its output; extension tabs: their action). |
+| `Enter` | Run the action of the selected row (Files: open it; Processes: show its output; Tasks: open the task; extension tabs: their action). |
 | Mouse | Wheel scrolls the panel, a click picks a tab or a row, a drag copies text. |
 
 The panel needs a terminal at least 100 columns wide. On a narrower screen it stays hidden and open todos show as a short block above the editor instead. Its width is a quarter of the screen, at least 40 columns and at most half.

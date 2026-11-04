@@ -53,11 +53,6 @@ impl State {
     }
 }
 
-/// The state a new task starts in (the two spawn rows).
-pub fn spawn_state(can_start: bool) -> State {
-    if can_start { State::Running } else { State::Queued }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
@@ -782,8 +777,6 @@ mod tests {
 
     #[test]
     fn spawn_rows() {
-        assert_eq!(spawn_state(true), Running);
-        assert_eq!(spawn_state(false), Queued);
         assert_eq!(to(&row(Queued), Event::SlotFree), Running);
     }
 
