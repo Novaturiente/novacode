@@ -164,6 +164,8 @@ pub struct Watcher {
     last_error: Option<String>,
     retry_after_ms: Option<u64>,
     goal: Option<Goal>,
+    /// The catch-up note already given: (super's prompt hash, messages after it).
+    noted: Option<(String, usize)>,
     /// The provider of the task's model (`provider/model`), for holds.
     pub provider: String,
 }
@@ -324,6 +326,11 @@ impl Watcher {
         };
         let after = &history[i + 1..];
         if after.iter().any(|m| user_text(m).is_some()) {
+            let key = (hash.to_string(), after.len());
+            if self.noted.as_ref() == Some(&key) {
+                return CatchUp::Nothing;
+            }
+            self.noted = Some(key);
             return CatchUp::Note;
         }
         if after.iter().any(terminal_report) {
@@ -1663,6 +1670,42 @@ mod tests {
         assert_eq!(
             w.catch_up(&failed, Some(&hash), false, Goal::None),
             CatchUp::Report(Event::TurnError("401".into()))
+        );
+    }
+
+    #[test]
+    fn catch_up_note_is_given_once_per_state() {
+        let brief = "Task T1: do it";
+        let hash = board::prompt_hash(brief);
+        let mut typed = vec![
+            Message::user(brief),
+            assistant(StopReason::Stop, None),
+            Message::user("also do this"),
+            assistant(StopReason::Stop, None),
+        ];
+        let mut w = Watcher::new("faux");
+        assert_eq!(w.catch_up(&typed, Some(&hash), false, Goal::None), CatchUp::Note);
+        assert_eq!(
+            w.catch_up(&typed, Some(&hash), false, Goal::None),
+            CatchUp::Nothing,
+            "same state on the next reconnect"
+        );
+        typed.push(Message::user("and this"));
+        typed.push(assistant(StopReason::Stop, None));
+        assert_eq!(
+            w.catch_up(&typed, Some(&hash), false, Goal::None),
+            CatchUp::Note,
+            "new activity"
+        );
+        let brief2 = "Task T1: next";
+        let hash2 = board::prompt_hash(brief2);
+        typed.push(Message::user(brief2));
+        typed.push(Message::user("typed again"));
+        typed.push(assistant(StopReason::Stop, None));
+        assert_eq!(
+            w.catch_up(&typed, Some(&hash2), false, Goal::None),
+            CatchUp::Note,
+            "new prompt"
         );
     }
 

@@ -204,6 +204,13 @@ impl ProofLog {
                     (None, None) if check.process.is_some() => check.running = true,
                     (None, None) => check.ended_at = Some(now),
                 }
+                // Files a `bash` call changed are edits stamped with its own
+                // start: stale for every earlier check, not for this one.
+                if tool == "bash" {
+                    let at = check.started_at;
+                    let edits = run.touched.iter().map(|p| Edit { path: p.clone(), at });
+                    log.edits.extend(edits);
+                }
                 let n = check.n;
                 log.checks.push(check);
                 Some(n)
@@ -284,6 +291,10 @@ impl Handler for ProofLog {
     ) -> BoxFuture<'a, Option<After>> {
         let n = self.record(tool, args, out, run);
         Box::pin(async move { n.map(|n| After::append(format!("[proof #{n}]"))) })
+    }
+    /// Files a `bash` call changed count as edits.
+    fn wants_touched(&self) -> bool {
+        true
     }
 }
 
@@ -980,6 +991,31 @@ mod tests {
         f.bash("echo test").await;
         report(
             &f.report(json!({"state": "done", "summary": "s", "checks": ["#2"]}))
+                .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_edit_after_a_check_makes_it_stale() {
+        let f = Fixture::new(true, write_row());
+        f.bash("echo test").await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        f.bash("echo more >> a.txt").await;
+        refused(
+            &f.report(json!({"state": "done", "summary": "s", "checks": ["#1"]}))
+                .await,
+            "ran before your last edit",
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_check_that_writes_a_file_can_be_cited() {
+        // A read row: no commit needed, so only staleness can refuse.
+        let f = Fixture::new(true, Task::default());
+        f.bash("echo more >> a.txt").await;
+        assert_eq!(f.tool.proof.edited(), vec![f.work.join("a.txt")]);
+        report(
+            &f.report(json!({"state": "done", "summary": "s", "checks": ["#1"]}))
                 .await,
         );
     }
