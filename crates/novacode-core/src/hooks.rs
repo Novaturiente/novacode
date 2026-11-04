@@ -25,6 +25,8 @@ pub struct Run {
     pub touched: Vec<PathBuf>,
     /// The folder the call ran in.
     pub cwd: PathBuf,
+    /// Why `touched` misses a `bash` call's changes (a folder too big to walk).
+    pub note: Option<String>,
 }
 
 impl Run {
@@ -67,13 +69,18 @@ impl After {
 /// Taken before a call runs; finished by [`Hooks::after_tool`].
 pub struct Started {
     t0: Instant,
-    snap: Option<Snap>,
+    /// The snapshot, and whether it came from the walk (not git).
+    snap: Option<(Snap, bool)>,
+    note: Option<String>,
 }
+
+/// The most files the walk outside git looks at; a bigger folder isn't tracked.
+pub const WALK_CAP: usize = 20_000;
 
 /// Changed files under a folder (modified, untracked, deleted) → (mtime, len).
 type Snap = HashMap<PathBuf, Option<(SystemTime, u64)>>;
 
-/// shortcut: git-only (`ls-files -m -o -d`); a bash call outside a repo reports no touched files. Upgrade to an mtime walk if non-git projects need it.
+/// In a git repo: the files `git ls-files -m -o -d` lists; `None` outside one.
 async fn snapshot(cwd: &Path) -> Option<Snap> {
     let o = tokio::process::Command::from(novacode_base::git::command_in(cwd))
         .args(["ls-files", "-z", "-m", "-o", "-d", "--exclude-standard"])
@@ -96,6 +103,48 @@ async fn snapshot(cwd: &Path) -> Option<Snap> {
             })
             .collect(),
     )
+}
+
+/// Outside git: every file under `cwd` (no `.git`, `node_modules`, `target` or
+/// dot-folders), or `None` past [`WALK_CAP`] files. shortcut: a full walk before
+/// and after each `bash` call; only a super task's proof log asks for it.
+fn walk(cwd: &Path) -> Option<Snap> {
+    let mut snap = Snap::new();
+    let mut dirs = vec![cwd.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let Ok(t) = e.file_type() else { continue };
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if t.is_dir() {
+                if !name.starts_with('.') && name != "node_modules" && name != "target" {
+                    dirs.push(e.path());
+                }
+                continue;
+            }
+            if snap.len() == WALK_CAP {
+                return None;
+            }
+            let meta = e.metadata().ok().and_then(|m| Some((m.modified().ok()?, m.len())));
+            snap.insert(e.path(), meta);
+        }
+    }
+    Some(snap)
+}
+
+/// What a walk over the cap leaves untracked.
+fn over_cap() -> String {
+    format!("bash edits not tracked in this folder (over {WALK_CAP} files)")
+}
+
+/// The walk, off the async threads; `Err` = over the cap.
+async fn walked(cwd: &Path) -> Result<Snap, String> {
+    let dir = cwd.to_path_buf();
+    match tokio::task::spawn_blocking(move || walk(&dir)).await {
+        Ok(Some(s)) => Ok(s),
+        _ => Err(over_cap()),
+    }
 }
 
 /// Files whose state differs between two snapshots.
@@ -167,6 +216,11 @@ pub trait Handler: Send + Sync {
     fn wants_touched(&self) -> bool {
         false
     }
+    /// With [`Handler::wants_touched`]: outside git, find a `bash` call's changes
+    /// by walking the folder (costly; capped at [`WALK_CAP`] files).
+    fn walks_folders(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Default, Clone)]
@@ -203,14 +257,23 @@ impl Hooks {
     /// Before a call runs: start its clock, and snapshot the tree around `bash`
     /// when a handler reads touched files.
     pub async fn start(&self, tool: &str, cwd: &Path) -> Started {
-        let snap = if tool == "bash" && self.handlers.iter().any(|h| h.wants_touched()) {
-            snapshot(cwd).await
+        let (snap, note) = if tool == "bash" && self.handlers.iter().any(|h| h.wants_touched()) {
+            let walk_ok = self.handlers.iter().any(|h| h.wants_touched() && h.walks_folders());
+            match snapshot(cwd).await {
+                Some(s) => (Some((s, false)), None),
+                None if walk_ok => match walked(cwd).await {
+                    Ok(s) => (Some((s, true)), None),
+                    Err(note) => (None, Some(note)),
+                },
+                None => (None, None),
+            }
         } else {
-            None
+            (None, None)
         };
         Started {
             t0: Instant::now(),
             snap,
+            note,
         }
     }
 
@@ -228,14 +291,25 @@ impl Hooks {
             return;
         }
         let mut touched = named(tool, args, cwd);
-        if let (Some(before), Some(after)) = (&started.snap, snapshot_if(&started, cwd).await) {
-            touched.extend(diff(before, &after));
+        let mut note = started.note.clone();
+        if let Some((before, walk)) = &started.snap {
+            // The same kind of snapshot as before the call (git, or the walk).
+            let after = match walk {
+                true => walked(cwd).await.map(Some),
+                false => Ok(snapshot(cwd).await),
+            };
+            match after {
+                Ok(Some(after)) => touched.extend(diff(before, &after)),
+                Ok(None) => {}
+                Err(n) => note = Some(n),
+            }
         }
         let run = Run {
             call_id: call_id.into(),
             duration_ms: started.t0.elapsed().as_millis() as u64,
             touched,
             cwd: cwd.to_path_buf(),
+            note,
         };
         for h in &self.handlers {
             let Some(a) = h.after_tool(tool, args, out, &run).await else {
@@ -257,14 +331,6 @@ impl Hooks {
                 out.content.push(novacode_types::Block::text(text));
             }
         }
-    }
-}
-
-async fn snapshot_if(started: &Started, cwd: &Path) -> Option<Snap> {
-    if started.snap.is_some() {
-        snapshot(cwd).await
-    } else {
-        None
     }
 }
 

@@ -190,6 +190,7 @@ async fn api_v1_surface() {
         duration_ms: 5,
         touched: vec![d.path().join("a")],
         cwd: d.path().to_path_buf(),
+        note: None,
     };
     exts.after_tool("read", &json!({"path": "a"}), &ToolOutput::text("out"), &run)
         .await;

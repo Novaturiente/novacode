@@ -1558,7 +1558,7 @@ impl Ctx {
         // A super task's own session (L10.9): the `report` tool and its proof log; never in a subagent.
         let task = {
             task_id.map(|id| {
-                let proof = Arc::new(superagent::report::ProofLog::default());
+                let proof = Arc::new(superagent::report::ProofLog::restore(store.branch()));
                 let seq = superagent::report::last_seq(store.branch());
                 all.push(Arc::new(superagent::report::ReportTool::new(
                     id.clone(),
@@ -1945,6 +1945,7 @@ impl Ctx {
                 // A failed write stays in memory and goes out with the next flush.
                 tracing::warn!("super task identity not saved yet: {e}");
             }
+            proof.save_to(agent.state_saver());
             if let Some(pm) = agent.processes() {
                 proof.watch(pm);
             }

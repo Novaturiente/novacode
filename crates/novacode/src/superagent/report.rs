@@ -1,11 +1,13 @@
 //! A super task's side of the inbox (L10.9 "Reports and the inbox"): the
-//! in-memory proof log, the `report` tool and the inbox writer.
+//! proof log, the `report` tool and the inbox writer.
 //!
 //! - [`ProofLog`] is an `after_tool` handler: it records every `bash` and
 //!   `process` call (command, folder, exit code, last line) and every edit, and
 //!   appends `[proof #N]` to each `bash` and `process` result so the model can
-//!   cite `N` in `checks`. It lives only in this process's memory, so the
-//!   task's own commands can't rewrite it; a restart starts it empty.
+//!   cite `N` in `checks`. Each change is saved as a session entry (`ext`
+//!   "superagent", `kind` "proof") and replayed on `/reload` or resume, so
+//!   numbers continue. shortcut: the session file is the task's own, so a
+//!   command that edits it could forge proof; sign the entries if that matters.
 //! - [`ReportTool`] checks a report against the log and git, adds the fields
 //!   code owns, and returns it in its result's details. It exists only in a
 //!   task's own session (depth 0), never in its subagents.
@@ -93,7 +95,7 @@ impl Identity {
 // Proof log
 
 /// One `bash` or `process` call.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Check {
     pub n: u64,
     pub tool: String,
@@ -115,6 +117,21 @@ pub struct Check {
     pub before_last_edit: bool,
     #[serde(skip)]
     process: Option<String>,
+    /// Why the call's file changes weren't tracked (a folder too big to walk).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// The `kind` of the session entries that save the proof log, one per change.
+const PROOF_KIND: &str = "proof";
+
+/// One saved change to the log; replayed in order to rebuild it.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Saved {
+    Check { check: Check, process: Option<String> },
+    Edits { paths: Vec<PathBuf>, at: u64 },
+    Ended { id: String, code: Option<i32>, at: u64 },
 }
 
 /// One edit tool call.
@@ -133,10 +150,11 @@ struct Log {
     ended: HashMap<String, (Option<i32>, u64)>,
 }
 
-/// The task's in-memory record of what it ran and edited.
+/// The task's record of what it ran and edited, saved as session entries.
 #[derive(Default)]
 pub struct ProofLog {
     log: Mutex<Log>,
+    save: std::sync::OnceLock<Saver>,
 }
 
 /// The last line worth showing: not empty, not one of the tools' `[…]` status lines.
@@ -159,19 +177,82 @@ fn last_line(out: &ToolOutput) -> String {
     line.chars().take(200).collect()
 }
 
+pub use novacode_core::agent::StateSaver as Saver;
+
+impl Log {
+    fn apply(&mut self, s: Saved) {
+        match s {
+            Saved::Check { mut check, process } => {
+                check.process = process;
+                self.checks.push(check);
+            }
+            Saved::Edits { paths, at } => self.edits.extend(paths.into_iter().map(|path| Edit { path, at })),
+            Saved::Ended { id, code, at } => {
+                self.ended(&id, code, at);
+            }
+        }
+    }
+
+    /// Complete every check still waiting on process `id`; whether any was.
+    fn ended(&mut self, id: &str, code: Option<i32>, at: u64) -> bool {
+        self.ended.insert(id.to_string(), (code, at));
+        let mut any = false;
+        for c in self
+            .checks
+            .iter_mut()
+            .filter(|c| c.running && c.process.as_deref() == Some(id))
+        {
+            c.running = false;
+            c.exit_code = code;
+            c.ended_at = Some(at);
+            any = true;
+        }
+        any
+    }
+}
+
 impl ProofLog {
+    /// Save every later change through `save` (the session's state entries).
+    pub fn save_to(&self, save: Saver) {
+        let _ = self.save.set(save);
+    }
+
+    /// The log the branch's saved entries describe (`/reload`, a resumed task).
+    pub fn restore<'a>(branch: impl IntoIterator<Item = &'a Entry>) -> ProofLog {
+        let mut log = Log::default();
+        for e in branch {
+            if let EntryKind::ExtState { ext, kind, data } = &e.kind
+                && ext == EXT
+                && kind == PROOF_KIND
+                && let Ok(s) = serde_json::from_value(data.clone())
+            {
+                log.apply(s);
+            }
+        }
+        ProofLog {
+            log: Mutex::new(log),
+            save: Default::default(),
+        }
+    }
+
+    fn saved(&self, s: &Saved) {
+        if let Some(save) = self.save.get() {
+            save(EXT, PROOF_KIND, serde_json::to_value(s).unwrap_or_default());
+        }
+    }
     /// Record a finished tool call; returns the proof number of a `bash` or `process` call.
     pub fn record(&self, tool: &str, args: &Value, out: &ToolOutput, run: &Run) -> Option<u64> {
         let now = now_ms();
+        // Saved under the lock, so the entries replay in the order applied.
         let mut log = self.log.lock().unwrap();
+        let keep = |log: &mut Log, s: Saved| {
+            self.saved(&s);
+            log.apply(s);
+        };
         match tool {
             "edit" | "write" | "apply_patch" if !out.is_error => {
-                for p in &run.touched {
-                    log.edits.push(Edit {
-                        path: p.clone(),
-                        at: now,
-                    });
-                }
+                let paths = run.touched.clone();
+                keep(&mut log, Saved::Edits { paths, at: now });
                 None
             }
             "bash" | "process" => {
@@ -191,7 +272,7 @@ impl ProofLog {
                 let process = d["process_id"].as_str().map(String::from);
                 let exited = d.get("exit_code").map(|c| c.as_i64().map(|c| c as i32));
                 let mut check = Check {
-                    n: log.checks.len() as u64 + 1,
+                    n: log.checks.iter().map(|c| c.n).max().unwrap_or(0) + 1,
                     tool: tool.into(),
                     command,
                     folder,
@@ -202,6 +283,7 @@ impl ProofLog {
                     running: false,
                     before_last_edit: false,
                     process: process.clone(),
+                    note: run.note.clone(),
                 };
                 match (exited, process.and_then(|p| log.ended.get(&p).copied())) {
                     (Some(code), _) => (check.exit_code, check.ended_at) = (code, Some(now)),
@@ -211,13 +293,13 @@ impl ProofLog {
                 }
                 // Files a `bash` call changed are edits stamped with its own
                 // start: stale for every earlier check, not for this one.
-                if tool == "bash" {
-                    let at = check.started_at;
-                    let edits = run.touched.iter().map(|p| Edit { path: p.clone(), at });
-                    log.edits.extend(edits);
+                let (n, at) = (check.n, check.started_at);
+                let process = check.process.clone();
+                keep(&mut log, Saved::Check { check, process });
+                if tool == "bash" && !run.touched.is_empty() {
+                    let paths = run.touched.clone();
+                    keep(&mut log, Saved::Edits { paths, at });
                 }
-                let n = check.n;
-                log.checks.push(check);
                 Some(n)
             }
             _ => None,
@@ -227,15 +309,12 @@ impl ProofLog {
     /// A process exited: complete every check still waiting on it.
     pub fn ended(&self, id: &str, code: Option<i32>, at: u64) {
         let mut log = self.log.lock().unwrap();
-        log.ended.insert(id.to_string(), (code, at));
-        for c in log
-            .checks
-            .iter_mut()
-            .filter(|c| c.running && c.process.as_deref() == Some(id))
-        {
-            c.running = false;
-            c.exit_code = code;
-            c.ended_at = Some(at);
+        if log.ended(id, code, at) {
+            self.saved(&Saved::Ended {
+                id: id.into(),
+                code,
+                at,
+            });
         }
     }
 
@@ -295,10 +374,15 @@ impl Handler for ProofLog {
         run: &'a Run,
     ) -> BoxFuture<'a, Option<After>> {
         let n = self.record(tool, args, out, run);
-        Box::pin(async move { n.map(|n| After::append(format!("[proof #{n}]"))) })
+        let note = run.note.as_ref().map(|n| format!(" {n}")).unwrap_or_default();
+        Box::pin(async move { n.map(|n| After::append(format!("[proof #{n}]{note}"))) })
     }
     /// Files a `bash` call changed count as edits.
     fn wants_touched(&self) -> bool {
+        true
+    }
+    /// Outside git too: a task's checks go stale on any change.
+    fn walks_folders(&self) -> bool {
         true
     }
 }
@@ -634,7 +718,7 @@ impl Tool for ReportTool {
     fn guidelines(&self) -> &[&str] {
         &[
             "Call `report` when you are done, blocked or failed. `done` needs `checks`: the `[proof #N]` numbers of finished checks, at least one run after your last edit (earlier ones, like a red test run, are allowed and marked), and committed work in a git worktree.",
-            "The proof log lives in memory: after a restart or resume it is empty, so run your checks again before citing them.",
+            "The proof log is kept with the session: after `/reload` or a resume its `[proof #N]` numbers still count and new ones continue from them.",
         ]
     }
     fn large_output(&self) -> bool {
@@ -810,6 +894,8 @@ mod tests {
         tool: ReportTool,
         hooks: novacode_core::hooks::Hooks,
         ctx: ToolCtx,
+        /// The session entries the proof log saved.
+        saved: Arc<Mutex<Vec<Entry>>>,
     }
 
     impl Fixture {
@@ -834,7 +920,6 @@ mod tests {
                 ..Board::default()
             };
             board.save(&dir).unwrap();
-            let proof = Arc::new(ProofLog::default());
             let id = Identity {
                 task: "T1".into(),
                 token: "tok".into(),
@@ -842,15 +927,37 @@ mod tests {
             };
             let mut ctx = ctx(&work);
             ctx.processes = Some(ProcessManager::new(&tmp.path().join("procs"), "s"));
-            Fixture {
-                hooks: novacode_core::hooks::Hooks {
-                    handlers: vec![proof.clone()],
-                },
-                tool: ReportTool::new(id, proof, 0),
+            let saved = Arc::new(Mutex::new(Vec::new()));
+            let mut f = Fixture {
+                hooks: Default::default(),
+                tool: ReportTool::new(id, Default::default(), 0),
                 ctx,
                 work,
                 _tmp: tmp,
-            }
+                saved,
+            };
+            f.use_proof(ProofLog::default());
+            f
+        }
+
+        fn use_proof(&mut self, proof: ProofLog) {
+            let saved = self.saved.clone();
+            proof.save_to(Arc::new(move |ext: &str, kind: &str, data: Value| {
+                saved.lock().unwrap().push(entry(EntryKind::ExtState {
+                    ext: ext.into(),
+                    kind: kind.into(),
+                    data,
+                }))
+            }));
+            let proof = Arc::new(proof);
+            self.hooks.handlers = vec![proof.clone()];
+            self.tool = ReportTool::new(self.tool.id.clone(), proof, 0);
+        }
+
+        /// `/reload` or a resumed task: a new proof log from the saved entries.
+        fn reload(&mut self) {
+            let saved = self.saved.lock().unwrap().clone();
+            self.use_proof(ProofLog::restore(&saved));
         }
 
         /// Run a tool through the hooks, as the agent does.
@@ -1060,6 +1167,68 @@ mod tests {
                 .await,
             "every cited check ran before your last edit",
         );
+    }
+
+    #[tokio::test]
+    async fn proof_log_survives_a_rebuild_from_session_entries() {
+        let mut f = Fixture::new(false, write_row());
+        f.bash("echo test").await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        f.edit("b.txt").await;
+        f.bash("exit 2").await;
+        let before = (f.tool.proof.check(1), f.tool.proof.check(2), f.tool.proof.last_edit());
+        f.reload();
+        assert_eq!(
+            (f.tool.proof.check(1), f.tool.proof.check(2), f.tool.proof.last_edit()),
+            before
+        );
+        assert_eq!(f.tool.proof.edited(), vec![f.work.join("b.txt")]);
+        let o = f.bash("echo again").await;
+        assert!(text(&o).ends_with("[proof #3]"), "numbering continues: {}", text(&o));
+        refused(
+            &f.report(json!({"state": "done", "summary": "s", "checks": ["#1"]}))
+                .await,
+            "every cited check ran before your last edit",
+        );
+        // A second reload keeps everything, the new check too.
+        f.reload();
+        report(
+            &f.report(json!({"state": "done", "summary": "s", "checks": ["#1", "#3"]}))
+                .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_edit_after_a_check_makes_it_stale_outside_git() {
+        let f = Fixture::new(false, write_row());
+        std::fs::create_dir_all(f.work.join("node_modules")).unwrap();
+        f.bash("echo test").await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        f.bash("echo x > node_modules/skip.js; mkdir -p .cache; echo x > .cache/skip")
+            .await;
+        assert_eq!(f.tool.proof.edited(), Vec::<PathBuf>::new(), "skipped folders");
+        f.bash("mkdir -p src && echo more > src/a.txt").await;
+        assert_eq!(f.tool.proof.edited(), vec![f.work.join("src/a.txt")]);
+        refused(
+            &f.report(json!({"state": "done", "summary": "s", "checks": ["#1"]}))
+                .await,
+            "every cited check ran before your last edit",
+        );
+        f.bash("rm src/a.txt").await;
+        assert_eq!(f.tool.proof.last_edit(), f.tool.proof.check(4).map(|c| c.started_at));
+    }
+
+    #[tokio::test]
+    async fn folder_over_the_cap_is_not_tracked_and_says_so() {
+        let f = Fixture::new(false, write_row());
+        for i in 0..=novacode_core::hooks::WALK_CAP {
+            std::fs::write(f.work.join(format!("f{i}")), "").unwrap();
+        }
+        let o = f.bash("echo x > f0").await;
+        let note = "bash edits not tracked in this folder (over 20000 files)";
+        assert!(text(&o).ends_with(&format!("[proof #1] {note}")), "{}", text(&o));
+        assert_eq!(f.tool.proof.edited(), Vec::<PathBuf>::new());
+        assert_eq!(f.tool.proof.check(1).unwrap().note.as_deref(), Some(note));
     }
 
     #[tokio::test]

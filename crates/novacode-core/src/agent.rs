@@ -238,6 +238,21 @@ struct Shared {
     plugin_hooks: std::sync::OnceLock<Arc<crate::plugin_hooks::PluginHooks>>,
 }
 
+/// Saves `(ext, kind, data)` in the session file.
+pub type StateSaver = Arc<dyn Fn(&str, &str, serde_json::Value) + Send + Sync>;
+
+/// Kept as live state now; written to the session by the owner task's next flush.
+fn state_append(d: Arc<Shared>) -> StateSaver {
+    Arc::new(move |ext: &str, kind: &str, data: serde_json::Value| {
+        let mut st = d.ext_state.lock().unwrap();
+        let item = (ext.to_string(), kind.to_string(), data);
+        st.live.push(item.clone());
+        st.pending.push(item);
+        drop(st);
+        d.notify.notify_one();
+    })
+}
+
 #[derive(Default)]
 struct ExtState {
     /// (extension, kind, data) on the current branch, oldest first.
@@ -1404,14 +1419,7 @@ impl Agent {
                     }
                 })
             }),
-            state_append: Arc::new(move |ext: &str, kind: &str, data: serde_json::Value| {
-                let mut st = d.ext_state.lock().unwrap();
-                let item = (ext.to_string(), kind.to_string(), data);
-                st.live.push(item.clone());
-                st.pending.push(item);
-                drop(st);
-                d.notify.notify_one();
-            }),
+            state_append: state_append(d),
             state_entries: Arc::new(move |ext: &str, kind: &str| {
                 e.ext_state
                     .lock()
@@ -1439,6 +1447,11 @@ impl Agent {
         });
         self.extensions = Some(exts);
         self
+    }
+
+    /// Saves `(ext, kind, data)` state entries in the session file, as extensions do.
+    pub fn state_saver(&self) -> StateSaver {
+        state_append(self.shared.clone())
     }
 
     pub fn extensions(&self) -> Option<&Arc<crate::extensions::Extensions>> {
