@@ -964,6 +964,8 @@ Address every finding, commit, re-run your checks and report `done` again.",
                     continue;
                 }
             };
+            // The transition reads the new facts (R11 approved commit), so set them first and undo on refusal.
+            let mut prior_done = None;
             if let Event::Report {
                 state: ReportState::Done,
                 ..
@@ -972,7 +974,7 @@ Address every finding, commit, re-run your checks and report `done` again.",
                 let done = done_facts(f);
                 let _ = sup.edit(|b| {
                     if let Some(t) = b.tasks.iter_mut().find(|t| t.id == r.task) {
-                        t.done = Some(done);
+                        prior_done = Some(t.done.replace(done));
                     }
                 });
             }
@@ -983,7 +985,15 @@ Address every finding, commit, re-run your checks and report `done` again.",
                     }
                 });
             }
-            self.apply_with(sup, &r.task, ev, &checks_text(f));
+            if !self.apply_with(sup, &r.task, ev, &checks_text(f))
+                && let Some(old) = prior_done
+            {
+                let _ = sup.edit(|b| {
+                    if let Some(t) = b.tasks.iter_mut().find(|t| t.id == r.task) {
+                        t.done = old;
+                    }
+                });
+            }
             self.applied(sup, p);
         }
     }
@@ -2771,6 +2781,19 @@ mod tests {
         );
         let list = fx.sup.run(json!({"action": "list"})).await.unwrap();
         assert!(list.contains("| reviewing (your call) |"), "{list}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_done_report_leaves_the_recorded_done_facts_alone() {
+        let fx = fixture(5);
+        // `done` from `ready` is refused by the board.
+        fx.task("T1-x", "faux/a", State::Ready);
+        write_report(&fx, "T1-x", 1, "tok", json!({"state": "done", "summary": "late"}));
+        let file = fx.sup.dir.join("inbox").join("T1-x-1.json");
+        fx.links.kick();
+        fx.until("applied", |_| !file.exists()).await;
+        let row = fx.sup.row("T1-x").unwrap();
+        assert_eq!((row.state, row.done.is_none()), (State::Ready, true));
     }
 
     #[tokio::test]
