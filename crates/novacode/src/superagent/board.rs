@@ -143,7 +143,8 @@ pub struct Done {
     /// The reported (pinned) commit; `None` outside git.
     pub commit: Option<String>,
     pub files: Vec<String>,
-    /// One line per check: its recorded command, folder and exit code.
+    /// One entry per check: its recorded command, folder, exit code and whether it ran
+    /// before the last edit, then the end of its recorded output when there is any.
     pub checks: Vec<String>,
     /// Screenshot paths and URLs.
     pub artifacts: Vec<String>,
