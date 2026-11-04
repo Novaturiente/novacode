@@ -27,6 +27,8 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 
 struct Repo {
     top: PathBuf,
+    /// Git's per-worktree admin folder (`.git/worktrees/<name>` in a linked one).
+    dir: PathBuf,
     common: PathBuf,
     /// Inside a linked worktree, not the main checkout.
     linked: bool,
@@ -57,6 +59,7 @@ fn repo(cwd: &Path) -> Result<Repo, String> {
         .unwrap_or_else(|| PathBuf::from(top));
     Ok(Repo {
         top: top.into(),
+        dir: dir.into(),
         common: common.into(),
         linked: dir != common,
         main,
@@ -85,7 +88,86 @@ fn env_copies(r: &Repo) -> Vec<String> {
         .collect()
 }
 
-pub struct EnterWorktree;
+/// `worktree.copy` default: untracked project files a worktree needs to work like the main checkout.
+pub const COPY_DEFAULT: &[&str] = &[
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".mcp.json",
+    ".codegraph/",
+    ".claude/",
+    ".novacode/",
+];
+
+/// Where the copied paths are recorded: in git's admin folder, so the record never shows as untracked.
+const COPIES: &str = "novacode-copies";
+
+/// Paths (relative, `/`-separated) that `enter` copied into the worktree `cwd` is in.
+/// They count as copies whatever their contents: not work, and deleted on removal.
+pub fn copies(cwd: &Path) -> Vec<String> {
+    repo(cwd).map(|r| read_copies(&r)).unwrap_or_default()
+}
+
+fn read_copies(r: &Repo) -> Vec<String> {
+    std::fs::read_to_string(r.dir.join(COPIES))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Copy each untracked file under the `list` entries from `main` to `wt`; returns the copied paths.
+/// Never tracked files, `daemon.*` (codegraph's lock), sockets or symlinks.
+fn copy_untracked(main: &Path, wt: &Path, list: &[String]) -> Vec<String> {
+    fn walk(main: &Path, wt: &Path, rel: &str, tracked: &[&str], out: &mut Vec<String>) {
+        let src = main.join(rel);
+        let Ok(meta) = std::fs::symlink_metadata(&src) else {
+            return;
+        };
+        if meta.is_dir() {
+            let mut names: Vec<_> = std::fs::read_dir(&src)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            for n in names {
+                walk(main, wt, &format!("{rel}/{n}"), tracked, out);
+            }
+            return;
+        }
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        let dst = wt.join(rel);
+        if !meta.is_file() || name.starts_with("daemon.") || tracked.contains(&rel) || dst.exists() {
+            return;
+        }
+        // std::fs::copy clones (reflinks) where the file system supports it.
+        let ok = dst.parent().is_some_and(|p| std::fs::create_dir_all(p).is_ok()) && std::fs::copy(&src, &dst).is_ok();
+        if ok {
+            out.push(rel.to_string());
+        }
+    }
+    let mut out = Vec::new();
+    for entry in list {
+        let rel = entry.trim_end_matches('/');
+        // Only plain paths inside the repo.
+        if rel.is_empty()
+            || !Path::new(rel)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            continue;
+        }
+        let rel = rel.replace('\\', "/");
+        let listed = git(main, &["ls-files", "-z", "--", &rel]).unwrap_or_default();
+        let tracked: Vec<&str> = listed.split('\0').filter(|s| !s.is_empty()).collect();
+        walk(main, wt, &rel, &tracked, &mut out);
+    }
+    out
+}
+
+pub struct EnterWorktree(pub Vec<String>);
 
 #[derive(Deserialize, JsonSchema)]
 struct EnterArgs {
@@ -97,19 +179,21 @@ struct EnterArgs {
 
 /// Create (or reuse) `<repo>/.worktrees/<name>` on branch `worktree-<name>`.
 /// Works from inside another worktree too: the folder is always under the main checkout.
-pub fn create(cwd: &Path, name: &str) -> Result<(PathBuf, String), String> {
+/// `copy` is the `worktree.copy` setting: untracked paths copied into a new worktree.
+pub fn create(cwd: &Path, name: &str, copy: &[String]) -> Result<(PathBuf, String), String> {
     enter(
         &repo(cwd)?.main,
         &EnterArgs {
             name: name.into(),
             base: None,
         },
+        copy,
     )
 }
 
 /// Like `create`, but never reuses (subagents): a taken name (folder, registered
 /// worktree or branch, say from an earlier session) gets `-2`, `-3`…
-pub fn create_new(cwd: &Path, name: &str) -> Result<(PathBuf, String), String> {
+pub fn create_new(cwd: &Path, name: &str, copy: &[String]) -> Result<(PathBuf, String), String> {
     let main = repo(cwd)?.main;
     let listed = git(&main, &["worktree", "list", "--porcelain"])?;
     let taken = |n: &str| {
@@ -130,10 +214,10 @@ pub fn create_new(cwd: &Path, name: &str) -> Result<(PathBuf, String), String> {
         i += 1;
         free = format!("{name}-{i}");
     }
-    enter(&main, &EnterArgs { name: free, base: None })
+    enter(&main, &EnterArgs { name: free, base: None }, copy)
 }
 
-fn enter(cwd: &Path, a: &EnterArgs) -> Result<(PathBuf, String), String> {
+fn enter(cwd: &Path, a: &EnterArgs, copy: &[String]) -> Result<(PathBuf, String), String> {
     if a.name.is_empty() || !a.name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
         return Err(format!("bad worktree name `{}`: letters, digits, . _ - only", a.name));
     }
@@ -205,6 +289,22 @@ fn enter(cwd: &Path, a: &EnterArgs) -> Result<(PathBuf, String), String> {
             copied.push(n);
         }
     }
+    let files = copy_untracked(&r.top, &path, copy);
+    if !files.is_empty() {
+        let admin = git(&path, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
+        std::fs::write(Path::new(&admin).join(COPIES), files.join("\n") + "\n").map_err(|e| e.to_string())?;
+        for e in copy {
+            let e = e.trim_end_matches('/').replace('\\', "/");
+            let under = |f: &String| f == &e || f.starts_with(&format!("{e}/"));
+            if files.iter().any(under) {
+                copied.push(if Path::new(&r.top.join(&e)).is_dir() {
+                    format!("{e}/")
+                } else {
+                    e
+                });
+            }
+        }
+    }
     let mut msg = format!("created worktree {} on branch {branch}", path.display());
     if !copied.is_empty() {
         msg += &format!("; copied {}", copied.join(", "));
@@ -253,12 +353,14 @@ pub fn here(cwd: &Path) -> Result<Here, String> {
         return Err("not inside a linked worktree".into());
     }
     let branch = git(&r.top, &["branch", "--show-current"]).unwrap_or_default();
-    // The .env copies made on entry aren't the user's changes.
-    let copies = env_copies(&r);
-    let dirty = git(&r.top, &["status", "--porcelain", "--ignore-submodules=all"])
+    // The copies made on entry aren't the user's changes. `-uall` lists files one by one,
+    // so a folder holding copies and new work isn't one line.
+    let mut copies = env_copies(&r);
+    copies.extend(read_copies(&r));
+    let dirty = git(&r.top, &["status", "--porcelain", "-uall", "--ignore-submodules=all"])
         .unwrap_or_default()
         .lines()
-        .filter(|l| !copies.iter().any(|c| l.trim_start_matches("?? ") == c))
+        .filter(|l| !l.strip_prefix("?? ").is_some_and(|p| copies.iter().any(|c| p == c)))
         .count();
     let main_head = git(&r.main, &["rev-parse", "HEAD"])?;
     let ahead = git(&r.top, &["rev-list", "--count", &format!("{main_head}..HEAD")]).unwrap_or_default();
@@ -276,6 +378,16 @@ pub fn remove(h: &Here) -> String {
     let (top, main) = (&h.r.top, &h.r.main);
     for c in env_copies(&h.r) {
         let _ = std::fs::remove_file(top.join(c));
+    }
+    for c in read_copies(&h.r) {
+        let f = top.join(&c);
+        let _ = std::fs::remove_file(&f);
+        // Folders the copies left empty; a folder holding anything else stays.
+        for dir in f.ancestors().skip(1).take_while(|d| d.starts_with(top) && *d != top) {
+            if std::fs::remove_dir(dir).is_err() {
+                break;
+            }
+        }
     }
     match git(main, &["worktree", "remove", &top.to_string_lossy()]) {
         Err(e) => format!(" Worktree NOT removed: {e}"),
@@ -321,7 +433,7 @@ impl Tool for EnterWorktree {
         crate::Exposure::Deferred
     }
     fn description(&self) -> &str {
-        "Create (or reuse) a git worktree at <repo>/.worktrees/<name> on branch worktree-<name> and move this session into it, so large changes don't touch the main checkout. Root .env files are copied in."
+        "Create (or reuse) a git worktree at <repo>/.worktrees/<name> on branch worktree-<name> and move this session into it, so large changes don't touch the main checkout. Root .env files and the untracked project files in the worktree.copy setting are copied in."
     }
     fn schema(&self) -> Value {
         schema_for::<EnterArgs>()
@@ -338,8 +450,8 @@ impl Tool for EnterWorktree {
                 Ok(a) => a,
                 Err(e) => return e,
             };
-            let cwd = ctx.cwd.clone();
-            match tokio::task::spawn_blocking(move || enter(&cwd, &a)).await {
+            let (cwd, copy) = (ctx.cwd.clone(), self.0.clone());
+            match tokio::task::spawn_blocking(move || enter(&cwd, &a, &copy)).await {
                 Ok(Ok((path, msg))) => set_cwd(
                     format!("{msg}. The working directory is now {}.", path.display()),
                     &path,
@@ -464,7 +576,7 @@ mod tests {
         ]);
         std::fs::write(root.join(".env"), "K=1\n").unwrap();
         let c = ctx(&root);
-        let o = EnterWorktree.execute(json!({"name": "fix-x"}), &c).await;
+        let o = EnterWorktree(vec![]).execute(json!({"name": "fix-x"}), &c).await;
         let wt = root.join(".worktrees/fix-x");
         assert!(!o.is_error, "{}", text(&o));
         let set = o.details.as_ref().unwrap()["set_cwd"].as_str().unwrap().to_string();
@@ -475,7 +587,12 @@ mod tests {
         assert_eq!(std::fs::read_to_string(wt.join(".env")).unwrap(), "K=1\n");
         // The folder is excluded, so the main checkout stays clean.
         assert_eq!(git(&root, &["status", "--porcelain"]).unwrap(), "?? .env");
-        assert!(EnterWorktree.execute(json!({"name": "bad name"}), &c).await.is_error);
+        assert!(
+            EnterWorktree(vec![])
+                .execute(json!({"name": "bad name"}), &c)
+                .await
+                .is_error
+        );
         // From inside: exit with nobody to ask keeps it.
         let o = ExitWorktree(None).execute(json!({}), &ctx(&wt)).await;
         assert!(text(&o).contains("Worktree kept"), "{}", text(&o));
@@ -486,11 +603,14 @@ mod tests {
         );
         assert!(wt.exists());
         // Entering again reuses it.
-        assert!(text(&EnterWorktree.execute(json!({"name": "fix-x"}), &c).await).contains("existing"));
+        assert!(text(&EnterWorktree(vec![]).execute(json!({"name": "fix-x"}), &c).await).contains("existing"));
         // `-w` / `/worktree` from inside a worktree resolve against the main checkout.
-        assert_eq!(create(&wt, "fix-x").unwrap().0, wt);
+        assert_eq!(create(&wt, "fix-x", &[]).unwrap().0, wt);
         // Subagents never reuse one: the taken name gets a suffix.
-        assert_eq!(create_new(&wt, "fix-x").unwrap().0, root.join(".worktrees/fix-x-2"));
+        assert_eq!(
+            create_new(&wt, "fix-x", &[]).unwrap().0,
+            root.join(".worktrees/fix-x-2")
+        );
         assert_eq!(here(&wt).unwrap().name().as_deref(), Some("fix-x"));
         assert!(here(&root).is_err());
         let l = list(&wt).unwrap();
@@ -524,5 +644,77 @@ mod tests {
             text(&o)
         );
         assert!(!wt.exists());
+    }
+
+    #[test]
+    fn copies_untracked_project_files_and_ignores_them() {
+        let d = tempfile::tempdir().unwrap();
+        let root = novacode_base::platform::canonicalize(d.path()).unwrap();
+        let w = |p: &str, s: &str| {
+            let f = root.join(p);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, s).unwrap();
+        };
+        git(&root, &["init", "-q"]).unwrap();
+        // `.claude/` is half tracked; `.codegraph/` is ignored, AGENTS.md is untracked but not ignored.
+        w("CLAUDE.md", "tracked\n");
+        w(".claude/settings.json", "{}\n");
+        w(".gitignore", ".codegraph/\n");
+        git(&root, &["add", "."]).unwrap();
+        git(
+            &root,
+            &["-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "-m", "x"],
+        )
+        .unwrap();
+        w("AGENTS.md", "rules\n");
+        w(".claude/local.md", "mine\n");
+        w(".claude/settings.json", "{\"changed\": 1}\n");
+        w(".codegraph/codegraph.db", "index");
+        w(".codegraph/sub/x.bin", "x");
+        w(".codegraph/daemon.pid", "123");
+        #[cfg(unix)]
+        let _sock = std::os::unix::net::UnixListener::bind(root.join(".codegraph/codegraph.sock")).unwrap();
+        let list: Vec<String> = COPY_DEFAULT.iter().map(|s| s.to_string()).collect();
+        let (wt, msg) = create(&root, "t", &list).unwrap();
+        assert!(msg.contains("AGENTS.md") && msg.contains(".codegraph/"), "{msg}");
+        let read = |p: &str| std::fs::read_to_string(wt.join(p)).ok();
+        assert_eq!(read("AGENTS.md").as_deref(), Some("rules\n"));
+        assert_eq!(read(".codegraph/codegraph.db").as_deref(), Some("index"));
+        assert_eq!(read(".codegraph/sub/x.bin").as_deref(), Some("x"));
+        assert_eq!(read(".claude/local.md").as_deref(), Some("mine\n"));
+        // Tracked files come from the branch, not the main checkout's edits.
+        assert_eq!(read(".claude/settings.json").as_deref(), Some("{}\n"));
+        assert!(!wt.join(".codegraph/daemon.pid").exists());
+        assert!(!wt.join(".codegraph/codegraph.sock").exists());
+        // The record sits in git's admin folder, not in the worktree.
+        let rec = std::fs::read_to_string(root.join(".git/worktrees/t/novacode-copies")).unwrap();
+        assert!(rec.lines().any(|l| l == "AGENTS.md"), "{rec}");
+        assert!(!rec.contains("settings.json"), "{rec}");
+        assert!(!wt.join("novacode-copies").exists());
+        let mut got = copies(&wt);
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                ".claude/local.md",
+                ".codegraph/codegraph.db",
+                ".codegraph/sub/x.bin",
+                "AGENTS.md"
+            ]
+        );
+        // Only copies: clean, even after a copy changed.
+        assert_eq!(here(&wt).unwrap().dirty, 0);
+        std::fs::write(wt.join("AGENTS.md"), "edited\n").unwrap();
+        std::fs::write(wt.join(".claude/local.md"), "edited\n").unwrap();
+        assert_eq!(here(&wt).unwrap().dirty, 0);
+        // Real work still counts.
+        std::fs::write(wt.join(".claude/new.md"), "new\n").unwrap();
+        assert_eq!(here(&wt).unwrap().dirty, 1);
+        std::fs::remove_file(wt.join(".claude/new.md")).unwrap();
+        let out = remove(&here(&wt).unwrap());
+        assert!(out.contains("Worktree and branch worktree-t removed"), "{out}");
+        assert!(!wt.exists());
+        // The main checkout's files are untouched.
+        assert!(root.join("AGENTS.md").exists() && root.join(".codegraph/daemon.pid").exists());
     }
 }
