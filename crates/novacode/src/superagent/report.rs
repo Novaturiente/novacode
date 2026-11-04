@@ -108,6 +108,10 @@ pub struct Check {
     /// `None` once ended = killed (or no exit, as `process list`).
     pub exit_code: Option<i32>,
     pub last_line: String,
+    /// The end of its output as the tool returned it: the last [`TAIL_LINES`] lines,
+    /// at most [`TAIL_CHARS`] characters. Shown to the review, never to super.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub tail: String,
     /// Still running in the process manager (a `process` command, or a `bash`
     /// command moved to the background); its exit event completes it.
     pub running: bool,
@@ -157,17 +161,32 @@ pub struct ProofLog {
     save: std::sync::OnceLock<Saver>,
 }
 
-/// The last line worth showing: not empty, not one of the tools' `[…]` status lines.
-fn last_line(out: &ToolOutput) -> String {
-    let text: String = out
-        .content
+/// Lines of a check's output kept for the review.
+pub const TAIL_LINES: usize = 40;
+/// Characters of a check's output kept for the review.
+pub const TAIL_CHARS: usize = 4000;
+
+fn out_text(out: &ToolOutput) -> String {
+    out.content
         .iter()
         .filter_map(|b| match b {
             novacode_types::Block::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n")
+}
+
+/// The last [`TAIL_LINES`] lines of `text`, cut to its last [`TAIL_CHARS`] characters.
+fn tail(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let kept = lines[lines.len().saturating_sub(TAIL_LINES)..].join("\n");
+    let skip = kept.chars().count().saturating_sub(TAIL_CHARS);
+    kept.chars().skip(skip).collect()
+}
+
+/// The last line worth showing: not empty, not one of the tools' `[…]` status lines.
+fn last_line(text: &str) -> String {
     let line = text
         .lines()
         .rev()
@@ -271,6 +290,7 @@ impl ProofLog {
                 let d = out.details.clone().unwrap_or_default();
                 let process = d["process_id"].as_str().map(String::from);
                 let exited = d.get("exit_code").map(|c| c.as_i64().map(|c| c as i32));
+                let text = out_text(out);
                 let mut check = Check {
                     n: log.checks.iter().map(|c| c.n).max().unwrap_or(0) + 1,
                     tool: tool.into(),
@@ -279,7 +299,8 @@ impl ProofLog {
                     started_at: now.saturating_sub(run.duration_ms),
                     ended_at: None,
                     exit_code: None,
-                    last_line: last_line(out),
+                    last_line: last_line(&text),
+                    tail: tail(&text),
                     running: false,
                     before_last_edit: false,
                     process: process.clone(),
@@ -465,6 +486,20 @@ fn cite(s: &str) -> Cited {
     Cited::Artifact(t.into())
 }
 
+/// The numbers of the criteria (1 to `n`) no finding names as "Criterion N" (any case).
+fn uncovered(n: usize, findings: &[String]) -> Vec<String> {
+    let text = findings.join("\n").to_lowercase();
+    (1..=n)
+        .filter(|i| {
+            let name = format!("criterion {i}");
+            !text
+                .match_indices(&name)
+                .any(|(at, _)| !text[at + name.len()..].starts_with(|c: char| c.is_ascii_digit()))
+        })
+        .map(|i| i.to_string())
+        .collect()
+}
+
 /// What git says about the task's folder.
 #[derive(Default)]
 struct Git {
@@ -575,9 +610,23 @@ impl ReportTool {
             let verdict = serde_json::to_value(a.verdict).unwrap_or_default();
             let chars = verdict.as_str().unwrap_or_default().chars().count()
                 + a.findings.iter().map(|f| f.chars().count()).sum::<usize>();
+            let approved = a.verdict == Some(Verdict::Approved) && !row.criteria.is_empty();
+            let fit = if approved {
+                "; write one short line per criterion, such as \"Criterion 1: met, #3 passes\""
+            } else {
+                ""
+            };
             if chars > MAX_VERDICT_CHARS {
                 return Err(format!(
-                    "verdict and findings are {chars} characters; at most {MAX_VERDICT_CHARS}"
+                    "verdict and findings are {chars} characters; at most {MAX_VERDICT_CHARS}{fit}"
+                ));
+            }
+            let missing = uncovered(row.criteria.len(), &a.findings);
+            if approved && !missing.is_empty() {
+                return Err(format!(
+                    "approved needs a finding for each criterion; missing: {}. Name each by number{fit}; \
+                     several lines may share a finding",
+                    missing.join(", ")
                 ));
             }
         }
@@ -710,7 +759,7 @@ impl Tool for ReportTool {
                 "summary": { "type": "string", "description": "At most 80 words; for `merge`, the one-line reason." },
                 "question": { "type": "string", "description": "Only with `state: blocked`: what you need answered." },
                 "checks": { "type": "array", "items": { "type": "string" }, "description": "Proof numbers from the `[proof #N]` marks on your bash and process results (e.g. \"#4\"); `done` on a write task needs at least one check that ran after your last edit and has exited, and a check from before it (such as the failing run of red-then-green) is allowed but marked `before the last edit`. Plus files a check produced (screenshots, logs) and URLs; never source files, commands or results: those go in `summary`." },
-                "findings": { "type": "array", "items": { "type": "string" }, "description": "Review task: at most 5 findings or proof requests (with the verdict, 1000 characters at most)." },
+                "findings": { "type": "array", "items": { "type": "string" }, "description": "Review task: at most 5 findings or proof requests (with the verdict, 1000 characters at most). `approved` must name every acceptance criterion by number, one short line each, like \"Criterion 1: met, #3 passes\"." },
                 "baseline": { "type": "object", "description": "Review task: base-commit check results, outside the 1000-character cap: {\"checks\": [{\"folder\", \"command\", \"exit_codes\": [first run, re-run], \"failing\": [test names]}]}." }
             }
         })
@@ -1062,6 +1111,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_check_keeps_the_last_40_lines_of_its_output_at_most_4000_chars() {
+        let f = Fixture::new(false, write_row());
+        f.edit("b.txt").await;
+        f.bash("seq 1 100").await;
+        f.bash("for i in 1 2 3; do printf 'x%.0s' $(seq 1 3000); echo; done")
+            .await;
+        let r = report(
+            &f.report(json!({"state": "done", "summary": "s", "checks": ["#1", "#2"]}))
+                .await,
+        );
+        let tail = r["checks"][0]["tail"].as_str().unwrap();
+        let want: Vec<String> = (61..=100).map(|n| n.to_string()).collect();
+        assert_eq!(tail.trim_end(), want.join("\n"));
+        let long = r["checks"][1]["tail"].as_str().unwrap();
+        assert_eq!(long.chars().count(), 4000);
+        assert!(long.ends_with("xxx\n") || long.ends_with("xxx"), "the end is kept");
+    }
+
+    #[tokio::test]
     async fn summary_over_80_words_is_refused() {
         let f = Fixture::new(false, Task::default());
         let long = vec!["word"; 81].join(" ");
@@ -1390,6 +1458,48 @@ mod tests {
                 .report(json!({"state": "done", "merge": "merged", "summary": "s"}))
                 .await,
             "exactly one",
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_needs_a_finding_for_each_criterion_by_number() {
+        let f = Fixture::new(
+            false,
+            Task {
+                kind: Kind::Review,
+                criteria: vec!["a".into(), "b".into(), "c".into()],
+                ..Task::default()
+            },
+        );
+        let o = f
+            .report(
+                json!({"verdict": "approved", "findings": ["Criterion 1: met", "criterion 2 met; criterion 10 n/a"]}),
+            )
+            .await;
+        refused(&o, "approved needs a finding for each criterion; missing: 3");
+        refused(&o, "one short line per criterion");
+        let o = f.report(json!({"verdict": "approved", "findings": ["all good"]})).await;
+        refused(&o, "missing: 1, 2, 3");
+        // Over the cap with criteria: the refusal says how to fit.
+        let long = vec!["x".repeat(400); 3];
+        refused(
+            &f.report(json!({"verdict": "approved", "findings": long})).await,
+            "one short line per criterion",
+        );
+        report(
+            &f.report(
+                json!({"verdict": "approved", "findings": ["CRITERION 1: met", "criterion 2: met\nCriterion 3: met"]}),
+            )
+            .await,
+        );
+        // Only approval is gated.
+        report(
+            &f.report(json!({"verdict": "rejected", "findings": ["tests fail"]}))
+                .await,
+        );
+        report(
+            &f.report(json!({"verdict": "needs-proof", "findings": ["run it"]}))
+                .await,
         );
     }
 

@@ -305,7 +305,7 @@ fn super_runs_a_write_task_through_review_merge_and_close() {
             ),
             tool(
                 "report",
-                json!({"verdict": "approved", "findings": ["note.txt exists (#1)"], "checks": ["#1"]}),
+                json!({"verdict": "approved", "findings": ["Criterion 1: met, note.txt exists (#1)"], "checks": ["#1"]}),
             ),
             say("approved"),
         ],

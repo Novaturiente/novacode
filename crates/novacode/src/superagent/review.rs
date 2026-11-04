@@ -276,7 +276,9 @@ the task's own worktree is not yours.\n",
         }
     }
     if !done.checks.is_empty() {
-        s += "\nChecks the task ran: re-run them, don't trust them.\n";
+        s += "\nRecorded checks: each check the task cited, as code recorded it when it ran (command, exit code, \
+whether it ran before the task's last edit, the end of its output); not the task's words. Re-run the ones that \
+matter, don't take them on trust.\n";
         for c in &done.checks {
             s += &format!("{c}\n");
         }
@@ -330,7 +332,9 @@ not a break; a flaky one is reported as flaky.\n",
         "\nEdit only under {} (scratch scripts, the base checkout); never in the task's worktree or the main checkout, \
 also not with bash. Report with `report`: `verdict` approved | needs-proof | rejected, and at most 5 `findings` \
 (for needs-proof, concrete proof requests such as a test for a named case or a browser check with a screenshot; \
-you may name skills for the fix, such as tdd or diagnosing-bugs).\n",
+you may name skills for the fix, such as tdd or diagnosing-bugs). `approved` is refused unless the findings name \
+every acceptance criterion by number, one short line each, such as \"Criterion 1: met, `cargo test` passes\"; \
+several lines may share a finding (1000 characters in all).\n",
         i.scratch.display()
     );
     s
@@ -725,7 +729,9 @@ mod tests {
                 task,
                 json!({"state": "done", "summary": "SECRET SUMMARY trust me", "commit": commit, "write": true,
                        "files_changed": files, "artifacts": ["/tmp/shot.png"],
-                       "checks": [{"n": 3, "command": "cargo test -p app", "folder": "/w", "exit_code": 0, "last_line": "CLAIM ok"}]}),
+                       "checks": [{"n": 3, "command": "cargo test -p app", "folder": "/w", "exit_code": 0, "last_line": "CLAIM ok",
+                                   "before_last_edit": true,
+                                   "tail": "running 3 tests\ntest result: ok. 3 passed"}]}),
             );
         }
 
@@ -834,8 +840,15 @@ mod tests {
         assert_eq!(rule.1, format!("review:{}", scratch_id(&rv)));
         assert!(start.env.contains(&("NOVACODE_TASK".into(), rv.id.clone())));
 
-        // Reasoning-free brief: facts, never the task's summary or its check output.
+        // Reasoning-free brief: facts, never the task's summary; the checks as code recorded them.
         let brief = fx.prompts("s2").remove(0);
+        assert!(
+            brief.contains("Recorded checks")
+                && brief.contains("- `cargo test -p app` in /w → exit 0 (before the last edit)")
+                && brief.contains("running 3 tests\ntest result: ok. 3 passed"),
+            "{brief}"
+        );
+        assert!(brief.contains("Criterion 1"), "the gate is explained: {brief}");
         for want in [
             "please fix",
             "the parser accepts tabs",

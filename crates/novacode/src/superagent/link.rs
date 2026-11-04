@@ -1154,11 +1154,15 @@ fn done_facts(f: &serde_json::Map<String, Value>) -> board::Done {
                 _ => "no exit code".into(),
             };
             let folder = c["folder"].as_str().map(|d| format!(" in {d}")).unwrap_or_default();
-            format!(
+            let mut line = format!(
                 "- `{}`{folder} → {code}{}",
                 c["command"].as_str().unwrap_or("?"),
                 stale(c)
-            )
+            );
+            if let Some(tail) = c["tail"].as_str().map(str::trim_end).filter(|t| !t.is_empty()) {
+                line += &format!("\n  The end of its output:\n~~~~\n{tail}\n~~~~");
+            }
+            line
         })
         .collect();
     board::Done {
