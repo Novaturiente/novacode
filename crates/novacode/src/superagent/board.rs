@@ -543,7 +543,9 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
         }
 
         // Retry a failed merge while the approval still covers the done commit (R19).
-        (Event::Merge, Ready | Blocked) if from == Ready || block_is(|b| b.merge) && t.approval_covers_done() => {
+        (Event::Merge, Ready | Blocked)
+            if from == Ready || block_is(|b| b.merge) && (t.approval_covers_done() || t.accepted) =>
+        {
             if t.repo.is_none() {
                 Err(format!(
                     "{} is not in a git repo; nothing to merge: ask the user whether to close it (`task close`)",
@@ -1157,6 +1159,9 @@ mod tests {
         // Not when the done commit is not the approved one.
         b.apply("T3", failed).unwrap();
         assert!(b.apply("T3", Event::Merge).is_err(), "unapproved commit");
+        // A task the user accepted without review may retry too.
+        b.tasks.iter_mut().find(|t| t.id == "T3").unwrap().accepted = true;
+        b.apply("T3", Event::Merge).unwrap();
         // Other blocks still refuse merge.
         let other = Task {
             block: Some(Block::new("reported blocked")),

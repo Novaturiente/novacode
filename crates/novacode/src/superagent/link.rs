@@ -1254,8 +1254,16 @@ card is the confirmation); otherwise offer to close it.",
                 t.state.name()
             ),
             MergeResult::PrOpened => format!("{} opened a pull request (now {}).", t.label, t.state.name()),
-            MergeResult::Failed(why) => format!("{} merge failed (now {}): {why}", t.label, t.state.name()),
+            MergeResult::Failed(why) => format!(
+                "{} merge failed (now {}): {why}\nOnce the cause is fixed, call `task merge` again; no work prompt is needed.",
+                t.label,
+                t.state.name()
+            ),
         },
+        Event::TurnUnreported if !t.write => format!(
+            "{} is blocked (code-made report): {reason}.\nIf its answer is good, `task accept` it; otherwise send it on.",
+            t.label
+        ),
         Event::TurnUnreported => format!("{} is blocked (code-made report): {reason}.", t.label),
         Event::TurnError(_) => format!("{} is blocked (code-made report): its turn ended on: {reason}", t.label),
         Event::TurnLimit(l) => format!(
@@ -2623,6 +2631,20 @@ mod tests {
             wakes.iter().any(|w| w.contains("T2-y opened a pull request")),
             "{wakes:?}"
         );
+    }
+
+    #[test]
+    fn failed_merges_and_unreported_read_tasks_name_the_next_action() {
+        let mut t = Task {
+            label: "T1-x".into(),
+            state: State::Blocked,
+            ..Task::default()
+        };
+        assert!(wake_text(&t, &Event::TurnUnreported).contains("`task accept`"));
+        t.write = true;
+        assert!(!wake_text(&t, &Event::TurnUnreported).contains("`task accept`"));
+        let failed = Event::MergeReport(MergeResult::Failed("dirty".into()));
+        assert!(wake_text(&t, &failed).contains("call `task merge` again"));
     }
 
     #[test]
