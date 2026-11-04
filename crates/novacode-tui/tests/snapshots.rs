@@ -423,6 +423,19 @@ fn key(a: &mut App, code: KeyCode, m: KeyModifiers) {
     a.on_key(KeyEvent::new(code, m));
 }
 
+/// R7 (L10.9): a board snapshot as the wire carries it (`ui` `board`) reaches an
+/// attached window's Tasks tab, which Ctrl+Alt+P then shows with its row.
+#[test]
+fn board_snapshot_from_the_wire_fills_the_tasks_tab() {
+    let (mut a, _rx) = app(vec![Message::user("go")]);
+    let wire = r#"{"kind":"board","tasks":[{"label":"T1-cli-input-errors","repo":"calc","state":"running","model":"claude/claude-haiku-5-5","tokens":0,"started_ms":1793809453000,"session":"01a1a760"}]}"#;
+    a.on_ui(serde_json::from_str::<UiEvent>(wire).unwrap());
+    a.tick();
+    key(&mut a, KeyCode::Char('p'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+    let s = screen(&mut a, 120, 16);
+    assert!(s.contains("Tasks") && s.contains("T1-cli-input-errors"), "{s}");
+}
+
 #[test]
 fn approval_card_blocks_input_and_answers() {
     let (mut a, _rx) = app(vec![]);
