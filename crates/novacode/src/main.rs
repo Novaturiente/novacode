@@ -1370,6 +1370,8 @@ impl Ctx {
         if let Some(p) = &self.cli.profile {
             policy = policy.with_profile(p).map_err(anyhow::Error::msg)?;
         }
+        // A super mode task's fence for the edit tools (L10.9); its subagents inherit the variable.
+        policy = policy.with_edit_rule(novacode_core::policy::EditRule::from_env().map_err(anyhow::Error::msg)?);
         // Shared: mode presets change it at run time, and subagents read its mode.
         let policy = Arc::new(policy);
         // A subagent: its role prompt, and only its tools and MCP servers (L10.1).
