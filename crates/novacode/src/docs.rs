@@ -29,6 +29,7 @@ const PAGES: &[(&str, &str)] = pages![
     "sessions.md",
     "skills.md",
     "subagents.md",
+    "super.md",
     "tools.md",
     "troubleshooting.md",
     "tui.md",
