@@ -243,7 +243,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "worktree.copy",
         "list",
         "`[\"AGENTS.md\", \"CLAUDE.md\", \".mcp.json\", \".codegraph/\", \".claude/\", \".novacode/\"]`",
-        "Untracked files and folders (relative to the repo root) copied into a new worktree (`-w`, `/worktree`, `enter_worktree`, subagent worktrees), besides root `.env*` files. Folders are copied whole except files git tracks; `daemon.*` files and sockets are never copied. Copies don't count as changes and are deleted when the worktree is removed.",
+        "Untracked files and folders (relative to the repo root) copied into a new worktree (`-w`, `/worktree`, `enter_worktree`, subagent worktrees), besides root `.env*` files. Folders are copied whole except files git tracks; `daemon.*` files, sockets and folders holding their own git repo are never copied. A copied folder is tool state: nothing untracked in it counts as a change, and it is deleted when the worktree is removed. A copied file counts as a change once it is edited or committed, and is then kept; unchanged copies are deleted only when git will then remove the worktree.",
     ),
     (
         "super.maxRunning",
