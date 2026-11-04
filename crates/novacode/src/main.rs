@@ -2682,6 +2682,8 @@ async fn serve_headless(ctx: &Ctx, store: Store, model: String) -> anyhow::Resul
             // The socket is up: launchers may attach now.
             let root = novacode_base::platform::canonicalize(std::env::current_dir()?)?;
             superagent::entry::write_session(ctx.paths.home(), &root, &host.id)?;
+            let dir = superagent::entry::dir(ctx.paths.home(), &root);
+            superagent::feed_board(host.hub.clone(), dir, ctx.paths.clone());
         }
         let (sink, _) = mpsc::unbounded_channel();
         if let Some(p) = ctx.cli.bg.clone().filter(|p| !p.trim().is_empty()) {

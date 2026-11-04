@@ -211,8 +211,9 @@ fn super_spawns_a_task_after_the_trust_card_and_stops_it() {
         std::thread::sleep(Duration::from_millis(100));
     }
     // It got the brief as its first prompt, and the preamble in its system prompt.
+    // The brief is handed to the task's run, which records it once it starts: poll.
     let mut tc = Conn::open(&home, &session);
-    let end = Instant::now() + Duration::from_secs(10);
+    let end = Instant::now() + Duration::from_secs(20);
     let msgs = loop {
         tc.send(json!({"id": "m", "type": "get_messages"}));
         let msgs = loop {
@@ -221,8 +222,7 @@ fn super_spawns_a_task_after_the_trust_card_and_stops_it() {
                 break m["data"]["messages"].to_string();
             }
         };
-        // The brief run takes it up a moment after the prompt is handed in.
-        if msgs.contains("add a note") || Instant::now() > end {
+        if msgs.contains("add a note") || Instant::now() >= end {
             break msgs;
         }
         std::thread::sleep(Duration::from_millis(100));

@@ -7,6 +7,7 @@
 //! table as a pure function, and [`Board::apply`] writes its result.
 
 use novacode_base::storage::{Durability, write_atomic, write_atomic_no_backup};
+use novacode_tui::panel::TaskRow;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io;
@@ -179,6 +180,28 @@ pub struct Task {
     /// Unix seconds.
     pub started: u64,
     pub updated: u64,
+}
+
+impl Task {
+    /// The state with its block reason or landing mark: `blocked: quota`, `ready (merged)`.
+    pub fn state_text(&self) -> String {
+        let state = self.state.name();
+        match (&self.block, self.landed) {
+            (Some(b), _) => format!("{state}: {}", b.reason),
+            (None, Some(Landed::Merged)) => format!("{state} (merged)"),
+            (None, Some(Landed::PrOpened)) => format!("{state} (PR opened)"),
+            _ => state.to_string(),
+        }
+    }
+
+    /// The repo's folder name, else the task's folder; `.` for the root itself.
+    pub fn repo_name(&self) -> String {
+        let name = match self.repo.as_deref().and_then(Path::file_name) {
+            Some(n) => n.to_string_lossy().into_owned(),
+            None => self.folder.display().to_string(),
+        };
+        if name.is_empty() { ".".into() } else { name }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -604,28 +627,49 @@ impl Board {
         write_atomic_no_backup(&dir.join("board.md"), self.render().as_bytes(), Durability::Fast)
     }
 
+    /// The board snapshot for the Tasks tab: every task not archived, with the
+    /// live model and tokens `live(session)` reads from its run file.
+    pub fn snapshot(&self, live: impl Fn(&str) -> Option<(String, u64)>) -> Vec<TaskRow> {
+        self.tasks
+            .iter()
+            .filter(|t| t.state != State::Archived)
+            .map(|t| {
+                let (model, tokens) = t
+                    .session
+                    .as_deref()
+                    .and_then(&live)
+                    .unwrap_or_else(|| (t.model.clone(), 0));
+                TaskRow {
+                    label: t.label.clone(),
+                    repo: t.repo_name(),
+                    state: t.state_text(),
+                    model,
+                    tokens,
+                    started_ms: t.started * 1000,
+                    summary: t.summary.clone(),
+                    session: t.session.clone(),
+                }
+            })
+            .collect()
+    }
+
     /// The board as a markdown table, archived rows last.
     pub fn render(&self) -> String {
         let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
-        let mut out =
-            String::from("# Super board\n\n| Task | Kind | State | Model | Summary |\n|---|---|---|---|---|\n");
+        let mut out = String::from(
+            "# Super board\n\n| Task | Repo | Kind | State | Model | Summary |\n|---|---|---|---|---|---|\n",
+        );
         let (live, archived): (Vec<_>, Vec<_>) = self.tasks.iter().partition(|t| t.state != State::Archived);
         for t in live.into_iter().chain(archived) {
-            let mut state = t.state.name().to_string();
-            match (&t.block, t.landed) {
-                (Some(b), _) => state = format!("{state}: {}", b.reason),
-                (None, Some(Landed::Merged)) => state.push_str(" (merged)"),
-                (None, Some(Landed::PrOpened)) => state.push_str(" (PR opened)"),
-                _ => {}
-            }
             let kind = match t.kind {
                 Kind::Work => "work",
                 Kind::Review => "review",
             };
             out.push_str(&format!(
-                "| {} | {kind} | {} | {} | {} |\n",
+                "| {} | {} | {kind} | {} | {} | {} |\n",
                 cell(&t.label),
-                cell(&state),
+                cell(&t.repo_name()),
+                cell(&t.state_text()),
                 cell(&t.model),
                 cell(t.summary.as_deref().unwrap_or("")),
             ));
@@ -1022,6 +1066,81 @@ mod tests {
         let json = std::fs::read_to_string(dir.join("board.json")).unwrap();
         assert!(json.contains("\"waiting-you\"") || json.contains("\"running\""));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn board_md_render() {
+        let b = Board {
+            tasks: vec![
+                Task {
+                    id: "T2".into(),
+                    label: "T2-old".into(),
+                    state: Archived,
+                    model: "claude/claude-haiku-5-5".into(),
+                    ..Task::default()
+                },
+                Task {
+                    id: "T1".into(),
+                    label: "T1-fix-parser".into(),
+                    folder: "proj/sub".into(),
+                    repo: Some("/root/proj".into()),
+                    state: Blocked,
+                    block: Some(Block::new("needs a | pipe")),
+                    model: "claude/claude-sonnet-5-5".into(),
+                    summary: Some("two lines\nof summary".into()),
+                    ..Task::default()
+                },
+                Task {
+                    id: "T3".into(),
+                    label: "T3-review-T1-fix-parser".into(),
+                    kind: Kind::Review,
+                    folder: "notes".into(),
+                    state: Ready,
+                    landed: Some(Landed::Merged),
+                    model: "codex/gpt-6.1-sol:high".into(),
+                    ..Task::default()
+                },
+            ],
+            merge_locks: BTreeMap::from([(PathBuf::from("/root/proj"), "T1".to_string())]),
+            holds: BTreeMap::from([("claude".to_string(), limit())]),
+        };
+        let want = "# Super board
+
+| Task | Repo | Kind | State | Model | Summary |
+|---|---|---|---|---|---|
+| T1-fix-parser | proj | work | blocked: needs a \\| pipe | claude/claude-sonnet-5-5 | two lines of summary |
+| T3-review-T1-fix-parser | notes | review | ready (merged) | codex/gpt-6.1-sol:high |  |
+| T2-old | . | work | archived | claude/claude-haiku-5-5 |  |
+
+- Merge lock: /root/proj held by T1
+- On hold: claude (quota)
+";
+        assert_eq!(b.render(), want);
+    }
+
+    #[test]
+    fn snapshot_rows_take_live_data_and_skip_archived() {
+        let mut b = board(&[("T1", Running), ("T2", Archived), ("T3", Queued)]);
+        b.tasks[0].session = Some("s1".into());
+        b.tasks[0].started = 100;
+        b.tasks[0].summary = Some("half done".into());
+        b.tasks[2].model = "claude/claude-haiku-5-5".into();
+        let rows = b.snapshot(|s| (s == "s1").then(|| ("codex/gpt-6.1-sol".to_string(), 1234)));
+        let got: Vec<_> = rows
+            .iter()
+            .map(|r| (r.label.as_str(), r.state.as_str(), r.model.as_str(), r.tokens))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("T1-x", "running", "codex/gpt-6.1-sol", 1234),
+                ("T3-x", "queued", "claude/claude-haiku-5-5", 0)
+            ]
+        );
+        assert_eq!(rows[0].started_ms, 100_000);
+        assert_eq!(rows[0].session.as_deref(), Some("s1"));
+        assert_eq!(rows[0].summary.as_deref(), Some("half done"));
+        assert_eq!(rows[0].repo, "r");
     }
 
     #[test]

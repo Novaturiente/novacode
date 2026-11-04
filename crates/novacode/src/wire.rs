@@ -451,6 +451,30 @@ mod tests {
                 })
                 .unwrap(),
             },
+            ServerMsg::Ui {
+                ui: serde_json::to_value(UiEvent::Board {
+                    tasks: vec![
+                        novacode_tui::panel::TaskRow {
+                            label: "T3-fix-parser".into(),
+                            repo: "novacode".into(),
+                            state: "blocked: quota".into(),
+                            model: "claude/claude-sonnet-5-5".into(),
+                            tokens: 41_200,
+                            started_ms: 1_793_000_000_000,
+                            summary: Some("parser fixed; tests pass".into()),
+                            session: Some("01def".into()),
+                        },
+                        novacode_tui::panel::TaskRow {
+                            label: "T4-docs".into(),
+                            repo: "site".into(),
+                            state: "queued".into(),
+                            model: "claude/claude-haiku-5-5".into(),
+                            ..Default::default()
+                        },
+                    ],
+                })
+                .unwrap(),
+            },
             ServerMsg::Approve {
                 id: 3,
                 tool: "bash".into(),

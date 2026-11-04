@@ -274,6 +274,11 @@ pub enum UiEvent {
     },
     /// Files tab: (path, +added, -removed) since the session started.
     FileStats(Vec<(String, u64, u64)>),
+    /// Super's board snapshot (L10.9): every task not archived, for the Tasks tab.
+    /// Sent on connect and on change; older clients skip the unknown kind.
+    Board {
+        tasks: Vec<crate::panel::TaskRow>,
+    },
     /// Open `path` in the editor; `base` holds its content from the session start, for a diff.
     OpenFile {
         path: std::path::PathBuf,
@@ -716,6 +721,7 @@ impl App {
             UiEvent::Dequeued { ok: false } => self.flash("too late: it already reached the model"),
             UiEvent::Procs { items } => self.panel.set_procs(items),
             UiEvent::FileStats(v) => self.panel.set_diffstat(v),
+            UiEvent::Board { tasks } => self.panel.set_tasks(tasks),
             UiEvent::OpenFile { path, base } => self.open_file = Some((path, base)),
             UiEvent::Page { title, text } => {
                 if !self.busy {
@@ -1027,6 +1033,25 @@ impl App {
             PanelAction::Command(c) => self.submit(c, self.busy),
             PanelAction::OpenFile(p) => self.send(Cmd::OpenFile(p)),
             PanelAction::OpenProc(id) => self.open_procs(Some(id)),
+            PanelAction::Attach { label, session } => {
+                let cmd = format!("novacode attach {session}");
+                if std::env::var_os("TMUX").is_none() {
+                    self.tr
+                        .notice(format!("{label}: run `{cmd}` in another terminal"), false);
+                    return;
+                }
+                let exe = std::env::current_exe().map_or("novacode".into(), |p| p.display().to_string());
+                let ok = std::process::Command::new("tmux")
+                    .args(["new-window", "-n", &label, &exe, "attach", &session])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success());
+                if !ok {
+                    self.tr.notice(format!("{label}: tmux failed; run `{cmd}`"), true);
+                }
+            }
             PanelAction::Ext { ext, tab, node, action } => {
                 let (width, height) = self.panel.size;
                 self.send(Cmd::ExtKey {
