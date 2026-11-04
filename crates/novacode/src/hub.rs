@@ -41,6 +41,8 @@ struct Inner {
     asks: BTreeMap<u64, (ServerMsg, AskReply)>,
     /// The owner's own TUI, if any: gets approvals and remote state changes.
     local: Option<mpsc::UnboundedSender<UiEvent>>,
+    /// Super's latest board snapshot (L10.9), for late windows.
+    board: Option<ServerMsg>,
     closed: bool,
 }
 
@@ -94,6 +96,7 @@ impl Hub {
                 approvals: BTreeMap::new(),
                 asks: BTreeMap::new(),
                 local,
+                board: None,
                 closed: false,
             }),
             handle,
@@ -289,6 +292,7 @@ impl Hub {
         first.extend(g.tail.iter().map(|e| ServerMsg::Event { event: e.clone() }));
         first.extend(g.approvals.values().map(|p| p.msg.clone()));
         first.extend(g.asks.values().map(|(m, _)| m.clone()));
+        first.extend(g.board.clone());
         if g.closed {
             first.push(ServerMsg::Bye {
                 reason: "session ended".into(),
@@ -298,6 +302,21 @@ impl Hub {
         g.next_client += 1;
         g.clients.insert(id, tx.clone());
         (id, first, tx, rx)
+    }
+
+    /// Super's board changed (L10.9): every window's Tasks tab gets the new rows,
+    /// and windows that connect later get the latest.
+    pub fn set_board(&self, tasks: Vec<novacode_tui::panel::TaskRow>) {
+        let Ok(ui) = serde_json::to_value(UiEvent::Board { tasks: tasks.clone() }) else {
+            return;
+        };
+        let mut g = self.inner.lock().unwrap();
+        let msg = ServerMsg::Ui { ui };
+        g.clients.retain(|_, c| c.send(msg.clone()).is_ok());
+        g.board = Some(msg);
+        if let Some(l) = &g.local {
+            let _ = l.send(UiEvent::Board { tasks });
+        }
     }
 
     pub fn disconnect(&self, id: u64) {

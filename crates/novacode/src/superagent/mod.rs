@@ -109,6 +109,31 @@ pub fn tiers(s: &Settings) -> Vec<(String, Tier)> {
         .collect()
 }
 
+/// The board snapshot feed (L10.9 dashboard): every 2 s, super's board plus each
+/// task's live model and tokens from its run file; windows hear only of changes.
+pub fn feed_board(hub: std::sync::Arc<crate::hub::Hub>, dir: std::path::PathBuf, paths: novacode_base::paths::Paths) {
+    tokio::spawn(async move {
+        let mut last = None;
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        while !hub.is_closed() {
+            tick.tick().await;
+            let Ok(b) = board::Board::load(&dir) else { continue };
+            let runs = crate::serve::live_sessions(&paths);
+            let rows = b.snapshot(|s| {
+                let f = runs.iter().find(|f| f.state.session == s)?;
+                Some((
+                    f.state.model.clone(),
+                    f.state.tokens.prompt_total() + f.state.tokens.output,
+                ))
+            });
+            if last.as_ref() != Some(&rows) {
+                hub.set_board(rows.clone());
+                last = Some(rows);
+            }
+        }
+    });
+}
+
 /// `super.maxRunning`: tasks in `running` at once; more wait as `queued`.
 pub fn max_running(s: &Settings) -> usize {
     s.get("super.maxRunning").unwrap_or(5)
