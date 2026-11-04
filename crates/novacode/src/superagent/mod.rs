@@ -23,7 +23,8 @@ separate novacode sessions you start, follow and finish with the `task` tool. Ta
 before routing, spawn a scout with `agent` (`cwd`: the project folder below your root); it gets that project's tools \
 and MCP servers.
 - Name the task by its label in every message about it.
-- Before spawning a non-trivial task, show the user 1-5 checkable acceptance criteria; a small, clear task starts at once. \
+- Before spawning a non-trivial task, show the user 1-5 checkable acceptance criteria, with the base branch: call \
+`task info` with the task's `folder` first and show what it says about the branch; a small, clear task starts at once. \
 When the user asks to see the criteria first, show them with `ask_user` and wait for the answer before you spawn.
 - A task is done only on proof. Read every report's checks critically (which commands ran, whether they cover the \
 change, whether the results support the claim) and ask the task for more proof when it is weak; never accept a \
@@ -175,9 +176,10 @@ pub fn feed_board(slot: crate::hub::HubSlot, sup: &std::sync::Arc<task::Super>, 
     });
 }
 
-/// `super.maxRunning`: tasks in `running` at once; more wait as `queued`.
+/// `super.maxRunning`: tasks in `running` at once; more wait as `queued`. At least 1:
+/// 0 would never start a task.
 pub fn max_running(s: &Settings) -> usize {
-    s.get("super.maxRunning").unwrap_or(5)
+    s.get("super.maxRunning").unwrap_or(5).max(1)
 }
 
 #[cfg(test)]
@@ -214,6 +216,19 @@ mod tests {
         assert!(PROMPT.contains("Never use `ask_user` to confirm a merge or a close"));
         assert!(PROMPT.contains("Use `pr: true` only when the user asked for a pull request"));
         assert!(PROMPT.contains("`ask_user` is for real choices only"));
+    }
+
+    /// B9: super shows the base branch with the criteria, from `task info`.
+    #[test]
+    fn criteria_are_shown_with_the_base_branch_from_task_info() {
+        assert!(PROMPT.contains("`task info` with the task's `folder`"), "{PROMPT}");
+    }
+
+    /// B8: `maxRunning: 0` would never start a task.
+    #[test]
+    fn max_running_is_at_least_one() {
+        let (_d, s) = settings(r#"{"super": {"maxRunning": 0}}"#);
+        assert_eq!(max_running(&s), 1);
     }
 
     #[test]

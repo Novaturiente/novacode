@@ -249,7 +249,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "super.maxRunning",
         "number",
         "5",
-        "Super mode (docs/super.md): tasks running at once, review tasks included; a new `task spawn` over the limit waits as `queued`. Messages to existing tasks never wait.",
+        "Super mode (docs/super.md): tasks running at once, review tasks included; a new `task spawn` over the limit waits as `queued`. Messages to existing tasks never wait. At least 1: `0` counts as 1.",
     ),
     (
         "super.tiers",

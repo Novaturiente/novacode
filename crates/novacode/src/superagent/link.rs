@@ -40,9 +40,9 @@ const HOLD_WITHOUT_RESET: u64 = 15 * 60;
 pub const LIMIT_CLEARED: &str = "continue: the provider limit has cleared";
 
 /// What an interrupted task the user chose to resume after super's restart is sent.
-const RESUMED: &str = "continue: super restarted while your process was gone. First check your folder and git (what \
+pub(super) const RESUMED: &str = "continue: super restarted while your process was gone. First check your folder and git (what \
 is committed, what already ran) and don't repeat anything outside it that already happened (a commit, a push, a \
-message); your proof log is empty, so re-run your checks before you cite them.";
+message).";
 /// The request id super's prompts carry (`Launcher::send`): a run that consumed
 /// only these is a turn on super's prompt.
 pub(super) const SUPER_ID: &str = "super";
@@ -979,11 +979,7 @@ Address every finding, commit, re-run your checks and report `done` again.",
                 });
             }
             if f.get("write").and_then(Value::as_bool) == Some(true) {
-                let _ = sup.edit(|b| {
-                    if let Some(t) = b.tasks.iter_mut().find(|t| t.id == r.task) {
-                        t.write = true;
-                    }
-                });
+                let _ = sup.became_write(&r.task, f.get("branch").and_then(Value::as_str));
             }
             if !self.apply_with(sup, &r.task, ev, &checks_text(f))
                 && let Some(old) = prior_done
