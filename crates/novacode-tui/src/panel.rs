@@ -448,7 +448,12 @@ impl Panel {
             })
             .collect();
         self.task_sessions = sessions;
+        let had = self.tabs.iter().any(|t| t.name == "tasks" && !t.empty());
         self.set_nodes("tasks", "board", nodes);
+        // The first rows put the tab on show (an empty Agent tab would show "(empty)").
+        if !had {
+            self.offer("tasks");
+        }
     }
 
     pub fn set_diffstat(&mut self, v: Vec<(String, u64, u64)>) {
@@ -923,16 +928,22 @@ impl Panel {
             .collect();
     }
 
-    /// Auto show/hide (L9.16): only the Agent tab opens the panel by itself, while
-    /// a todo or subagent is unfinished; it closes 5 s after they all finish.
+    /// Auto show/hide (L9.16): the Agent tab opens the panel by itself while a todo
+    /// or subagent is unfinished, the Tasks tab while one of super's tasks runs
+    /// (L10.9); it closes 5 s after they all finish.
     /// Every other tab is opened by hand (Ctrl+Alt+P).
     pub fn tick(&mut self) {
-        let pending = self.tabs.iter().find(|t| t.name == "agent").is_some_and(|t| {
-            t.sources
-                .iter()
-                .flat_map(|s| &s.nodes)
-                .any(|n| !matches!(n.status.as_deref(), Some("done" | "stopped" | "failed")))
-        });
+        let any = |name: &str, live: fn(Option<&str>) -> bool| {
+            self.tabs.iter().find(|t| t.name == name).is_some_and(|t| {
+                t.sources
+                    .iter()
+                    .flat_map(|s| &s.nodes)
+                    .any(|n| live(n.status.as_deref()))
+            })
+        };
+        let agent = any("agent", |s| !matches!(s, Some("done" | "stopped" | "failed")));
+        let tasks = any("tasks", |s| s == Some("running"));
+        let pending = agent || tasks;
         // Closed by hand: stays closed for this batch of work, opens again for the next.
         if pending && !self.was_pending && self.pinned == Some(false) && !self.never_auto {
             self.pinned = None;
@@ -944,7 +955,7 @@ impl Panel {
         }
         if pending {
             if !self.visible {
-                self.shown = Some("agent".into());
+                self.shown = Some(if agent { "agent" } else { "tasks" }.into());
             }
             self.idle_since = None;
             self.visible = true;
@@ -1923,6 +1934,31 @@ mod tests {
         // A later snapshot replaces the rows.
         p.set_tasks(vec![]);
         assert!(p.rows().is_empty());
+    }
+
+    /// R7 (L10.9): a running task opens the panel on the Tasks tab, like a running
+    /// subagent opens it on Agent; it closes once no task runs.
+    #[test]
+    fn running_task_opens_the_panel_on_tasks() {
+        let mut p = Panel::default();
+        let row = |state: &str| TaskRow {
+            label: "T1".into(),
+            state: state.into(),
+            ..Default::default()
+        };
+        p.set_tasks(vec![row("queued")]);
+        p.tick();
+        assert!(!p.visible, "a queued task alone does not open it");
+        assert_eq!(p.shown.as_deref(), Some("tasks"), "the only non-empty tab is shown");
+        p.shown = Some("agent".into());
+        p.set_tasks(vec![row("running")]);
+        p.tick();
+        assert!(p.visible, "a running task opens the panel");
+        assert_eq!(p.shown.as_deref(), Some("tasks"));
+        assert_eq!(p.rows().len(), 1);
+        p.set_tasks(vec![row("ready")]);
+        p.tick();
+        assert!(p.idle_since.is_some(), "no task runs: the close timer starts");
     }
 
     #[test]
