@@ -284,6 +284,138 @@ pub struct Policy {
     /// An activated skill's `allowed-tools` rules and `disallowed-tools` names,
     /// until the next user message (L5.25).
     turn: Mutex<(Vec<Rule>, Vec<String>)>,
+    /// Where the edit tools may write (super mode tasks, L10.9).
+    edit_rule: Option<EditRule>,
+}
+
+/// A super mode task's fence for `edit`, `write` and `apply_patch` (L10.9), from
+/// [`EditRule::ENV`]. An environment variable, so the task's subagents inherit it.
+/// `bash` stays unfenced: this guards against mistakes only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditRule {
+    /// `worktree:<task folder>`: only inside the git-registered linked worktree the
+    /// session's cwd is in, resolved at edit time (so `enter_worktree` makes one
+    /// usable). When the task folder is not in a git repo: only inside that folder.
+    Worktree { folder: PathBuf },
+    /// `review:<id>`: only under [`EditRule::review_scratch`].
+    Review { id: String },
+}
+
+impl EditRule {
+    pub const ENV: &str = "NOVACODE_EDIT_RULE";
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let bad = || {
+            format!(
+                "bad {}=`{s}`: expected `worktree:<absolute folder>` or `review:<id>`",
+                Self::ENV
+            )
+        };
+        match s.split_once(':').ok_or_else(bad)? {
+            ("worktree", f) if Path::new(f).is_absolute() => Ok(Self::Worktree { folder: f.into() }),
+            ("review", id) if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) => {
+                Ok(Self::Review { id: id.into() })
+            }
+            _ => Err(bad()),
+        }
+    }
+
+    /// The rule this process runs under; an unreadable value is an error, never no fence.
+    pub fn from_env() -> Result<Option<Self>, String> {
+        std::env::var_os(Self::ENV)
+            .map(|v| Self::parse(&v.to_string_lossy()))
+            .transpose()
+    }
+
+    /// A review task's scratch folder, `/tmp/novacode-review-<id>`.
+    pub fn review_scratch(id: &str) -> PathBuf {
+        let tmp = if cfg!(unix) {
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        tmp.join(format!("novacode-review-{id}"))
+    }
+
+    /// The folder edits must stay in, seen from `cwd`, or why there is none.
+    fn root(&self, cwd: &Path) -> Result<PathBuf, String> {
+        match self {
+            Self::Review { id } => Ok(Self::review_scratch(id)),
+            Self::Worktree { folder } => match git_common_dir(folder) {
+                None => Ok(folder.clone()),
+                Some(repo) => own_worktree(cwd, &repo).ok_or_else(|| {
+                    "this task edits files only inside its own worktree, and the session is not in one; call `enter_worktree` first".to_string()
+                }),
+            },
+        }
+    }
+
+    /// `Some(reason)` when `tool` writing `paths` from `cwd` is outside the fence.
+    fn refuses(&self, tool: &str, paths: &[String], cwd: &Path, home: &Path) -> Option<String> {
+        let root = match self.root(cwd) {
+            Ok(r) => real(&r),
+            Err(why) => return Some(format!("`{tool}` refused: {why}.")),
+        };
+        let p = paths.iter().find(|p| {
+            let abs = expand(p, cwd, home);
+            !(real(&lexical(&abs)).starts_with(&root) && real(&abs).starts_with(&root))
+        })?;
+        let place = match self {
+            Self::Review { .. } => "its scratch folder",
+            Self::Worktree { folder } if *folder == root || real(folder) == root => "its folder",
+            Self::Worktree { .. } => "its own worktree",
+        };
+        Some(format!(
+            "`{tool}` refused: {p} is outside {}. This task edits files only inside {place}.",
+            root.display()
+        ))
+    }
+}
+
+/// `git rev-parse` in `dir`: its output lines, or `None` outside a repo.
+fn rev_parse(dir: &Path, args: &[&str]) -> Option<Vec<String>> {
+    let o = novacode_base::git::command_in(dir)
+        .args(["rev-parse", "--path-format=absolute"])
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    o.status
+        .success()
+        .then(|| String::from_utf8_lossy(&o.stdout).lines().map(String::from).collect())
+}
+
+/// The common git dir of the repo `dir` is in. A folder that doesn't exist yet counts from its nearest existing ancestor.
+fn git_common_dir(dir: &Path) -> Option<PathBuf> {
+    let dir = dir.ancestors().find(|a| a.is_dir())?;
+    rev_parse(dir, &["--git-common-dir"])?
+        .into_iter()
+        .next()
+        .map(|d| real(Path::new(&d)))
+}
+
+/// The linked worktree of `repo` (a common git dir) that `cwd` is in, when git lists
+/// it as registered; never the main checkout.
+fn own_worktree(cwd: &Path, repo: &Path) -> Option<PathBuf> {
+    let r = rev_parse(cwd, &["--show-toplevel", "--git-dir", "--git-common-dir"])?;
+    let [top, dir, common] = r.as_slice() else { return None };
+    if dir == common || real(Path::new(common)) != repo {
+        return None;
+    }
+    let top = real(Path::new(top));
+    let o = novacode_base::git::command_in(cwd)
+        .args(["worktree", "list", "--porcelain"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .skip(1) // the main checkout
+        .any(|p| real(Path::new(p)) == top)
+        .then_some(top)
 }
 
 fn rules(list: &[String]) -> Vec<Rule> {
@@ -313,7 +445,14 @@ impl Policy {
             session_commands: Mutex::default(),
             judged: Mutex::default(),
             turn: Mutex::default(),
+            edit_rule: None,
         }
+    }
+
+    /// Fence the edit tools (super mode tasks, L10.9).
+    pub fn with_edit_rule(mut self, rule: Option<EditRule>) -> Self {
+        self.edit_rule = rule;
+        self
     }
 
     /// Restrict to a named profile (subagents, `--profile`). Unknown names are an error.
@@ -693,6 +832,14 @@ impl Policy {
                         "Refused by the safety check: `{tool}` on {p} writes into {why}. It can never run from novacode. Do it another way, or ask the user to do it themselves."
                     ));
                 }
+            }
+            // A task's edit rule, ahead of every allow rule and hook (L10.9).
+            if let Some(why) = self
+                .edit_rule
+                .as_ref()
+                .and_then(|r| r.refuses(tool, &written(&lower, args), cwd, &self.home))
+            {
+                return Verdict::Deny(why);
             }
         }
 
@@ -1766,6 +1913,166 @@ mod tests {
             None,
         );
         assert!(denied(&deny.check("write", &json!({"path": "src/x"}), &proj, true)));
+    }
+
+    /// A repo with the main checkout at `<d>/main`, registered worktrees `.worktrees/a`
+    /// and `.worktrees/b`, and a plain folder `.worktrees/x`. Returns the main checkout.
+    fn repo_with_worktrees(d: &Path) -> PathBuf {
+        let main = d.join("main");
+        std::fs::create_dir_all(main.join(".worktrees/x")).unwrap();
+        std::fs::write(main.join("f"), "x").unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(&main)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["add", "f"]);
+        git(&["-c", "commit.gpgsign=false", "commit", "-qm", "init"]);
+        git(&["worktree", "add", "-q", "-b", "wa", ".worktrees/a"]);
+        git(&["worktree", "add", "-q", "-b", "wb", ".worktrees/b"]);
+        main
+    }
+
+    fn worktree_policy(folder: &Path) -> Policy {
+        let rule = EditRule::parse(&format!("worktree:{}", folder.display())).unwrap();
+        Policy::new(Permissions::default(), "/home/u".into(), None).with_edit_rule(Some(rule))
+    }
+
+    /// Checks the edit tools from `cwd`: (write, edit, apply_patch) all allowed or all refused.
+    fn edits(p: &Policy, cwd: &Path, path: &Path) -> bool {
+        let patch = format!("*** Begin Patch\n*** Update File: {}\n*** End Patch", path.display());
+        let v = [
+            p.check("write", &json!({ "path": path }), cwd, false),
+            p.check("edit", &json!({ "path": path }), cwd, false),
+            p.check("apply_patch", &json!({ "patch": patch }), cwd, false),
+        ];
+        let allowed = v.iter().filter(|v| **v == Verdict::Allow).count();
+        assert!(allowed == 0 || allowed == 3, "{path:?} from {cwd:?}: {v:?}");
+        assert!(allowed == 3 || v.iter().all(denied), "{v:?}");
+        allowed == 3
+    }
+
+    #[test]
+    fn worktree_rule_allows_only_the_tasks_own_worktree() {
+        let d = tempfile::tempdir().unwrap();
+        let main = repo_with_worktrees(&d.path().canonicalize().unwrap());
+        let (a, b, x) = (
+            main.join(".worktrees/a"),
+            main.join(".worktrees/b"),
+            main.join(".worktrees/x"),
+        );
+        let p = worktree_policy(&main);
+        // In the main checkout the task has no worktree yet: every edit is refused.
+        assert!(!edits(&p, &main, &main.join("f")));
+        assert!(!edits(&p, &main, &a.join("f")));
+        // After `enter_worktree` (the session's cwd moved into `a`): `a` is its own.
+        assert!(edits(&p, &a, &a.join("f")));
+        std::fs::create_dir(a.join("sub")).unwrap();
+        assert!(edits(&p, &a.join("sub"), Path::new("new/file.rs")));
+        // Another task's worktree, the main checkout, and a `..` way out stay refused.
+        assert!(!edits(&p, &a, &b.join("f")));
+        assert!(!edits(&p, &a, &main.join("f")));
+        assert!(!edits(&p, &a, Path::new("nope/../../b/f")));
+        // A plain folder under `.worktrees/` is not a registered worktree.
+        assert!(!edits(&p, &x, &x.join("f")));
+        // `bash` stays unfenced (R4-Q9).
+        assert_eq!(p.check("bash", &bash("touch f"), &main, false), Verdict::Allow);
+        // A linked worktree of another repo (a subagent spawned with that `cwd`) is not the task's.
+        let other = repo_with_worktrees(&d.path().canonicalize().unwrap().join("other"));
+        let oa = other.join(".worktrees/a");
+        assert!(!edits(&p, &oa, &oa.join("f")));
+        // A patch with one file outside is refused whole.
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {}\n*** Update File: {}\n*** End Patch",
+            a.join("f").display(),
+            main.join("f").display()
+        );
+        assert!(denied(&p.check("apply_patch", &json!({ "patch": patch }), &a, false)));
+    }
+
+    /// A subagent is its own process: it inherits `NOVACODE_EDIT_RULE` and its
+    /// parent's cwd, and builds its policy from them.
+    #[test]
+    fn worktree_rule_holds_in_a_subagent() {
+        let d = tempfile::tempdir().unwrap();
+        let main = repo_with_worktrees(&d.path().canonicalize().unwrap());
+        for cwd in [main.join(".worktrees/a"), main.clone(), main.join(".worktrees/x")] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "policy::tests::edit_rule_subagent_case", "--ignored"])
+                .env(EditRule::ENV, format!("worktree:{}", main.display()))
+                .env("NOVACODE_TEST_REPO", &main)
+                .current_dir(&cwd)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success() && text.contains("1 passed"), "{cwd:?}: {text}");
+        }
+    }
+
+    #[test]
+    #[ignore = "run by worktree_rule_holds_in_a_subagent"]
+    fn edit_rule_subagent_case() {
+        let main = PathBuf::from(std::env::var_os("NOVACODE_TEST_REPO").unwrap());
+        let cwd = std::env::current_dir().unwrap();
+        let p =
+            Policy::new(Permissions::default(), "/home/u".into(), None).with_edit_rule(EditRule::from_env().unwrap());
+        let a = main.join(".worktrees/a");
+        assert_eq!(edits(&p, &cwd, &cwd.join("f")), cwd == a);
+        assert!(!edits(&p, &cwd, &main.join(".worktrees/b/f")));
+        assert!(!edits(&p, &cwd, &main.join("f")));
+    }
+
+    #[test]
+    fn worktree_rule_outside_git_fences_the_task_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().canonicalize().unwrap();
+        let folder = root.join("task");
+        std::fs::create_dir(&folder).unwrap();
+        let p = worktree_policy(&folder);
+        assert!(edits(&p, &folder, Path::new("src/new.rs")));
+        assert!(edits(&p, &folder, &folder.join("f")));
+        assert!(!edits(&p, &folder, &root.join("f")));
+        assert!(!edits(&p, &folder, Path::new("../f")));
+    }
+
+    #[test]
+    fn review_rule_allows_only_its_scratch_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let main = repo_with_worktrees(&d.path().canonicalize().unwrap());
+        let reviewed = main.join(".worktrees/a");
+        let scratch = EditRule::review_scratch("r7");
+        if cfg!(unix) {
+            assert_eq!(scratch, Path::new("/tmp/novacode-review-r7"));
+        }
+        let p = Policy::new(Permissions::default(), "/home/u".into(), None)
+            .with_edit_rule(Some(EditRule::parse("review:r7").unwrap()));
+        assert!(!edits(&p, &reviewed, &reviewed.join("f")));
+        assert!(!edits(&p, &reviewed, Path::new("f")));
+        assert!(edits(&p, &reviewed, &scratch.join("check.sh")));
+        assert!(edits(&p, &reviewed, &scratch.join("base/src/lib.rs")));
+        // Another review's scratch folder, and a name that only starts the same.
+        assert!(!edits(&p, &reviewed, &EditRule::review_scratch("r8").join("f")));
+        assert!(!edits(&p, &reviewed, Path::new("/tmp/novacode-review-r7x/f")));
+        assert!(!edits(&p, &reviewed, &scratch.join("../novacode-review-r8/f")));
+    }
+
+    #[test]
+    fn edit_rule_values() {
+        assert_eq!(
+            EditRule::parse("worktree:/w/t"),
+            Ok(EditRule::Worktree { folder: "/w/t".into() })
+        );
+        assert_eq!(EditRule::parse("review:a-1"), Ok(EditRule::Review { id: "a-1".into() }));
+        for bad in ["worktree", "worktree:rel", "review:", "review:a/../b", "lifted", ""] {
+            assert!(EditRule::parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

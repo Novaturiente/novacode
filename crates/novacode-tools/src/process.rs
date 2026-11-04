@@ -865,6 +865,16 @@ struct Args {
     unsandboxed: bool,
 }
 
+/// ST06 (L10.9): the process id, plus its structured exit code once it ended
+/// (`null` = killed); a running one gets its code from the `Ended` event.
+fn exit_details(id: &str, end: Option<&End>) -> serde_json::Value {
+    let mut d = serde_json::json!({ "process_id": id });
+    if let Some(e) = end {
+        d["exit_code"] = e.code.into();
+    }
+    d
+}
+
 fn fmt_info(i: &Info) -> String {
     let state = match &i.end {
         None => "running".to_string(),
@@ -952,13 +962,15 @@ impl crate::Tool for ProcessTool {
                     let failed = ended.as_ref().is_some_and(|e| e.code != Some(0));
                     let note = crate::bash::sandbox_note(ctx, a.unsandboxed, failed, &tail)
                         .map_or(String::new(), |n| format!("\n{n}"));
-                    match ended {
+                    let details = Some(exit_details(&id, ended.as_ref()));
+                    let out = match ended {
                         Some(e) => ToolOutput::error(format!(
                             "{id} ({name}) ended at once ({}):\n{tail}{note}",
                             e.code.map_or("killed".into(), |c| format!("exit {c}"))
                         )),
                         None => ToolOutput::text(format!("started {id} ({name}). First output:\n{tail}{note}")),
-                    }
+                    };
+                    ToolOutput { details, ..out }
                 }
                 Action::List => {
                     let l = pm.list();
@@ -973,7 +985,13 @@ impl crate::Tool for ProcessTool {
                         Err(e) => return e,
                     };
                     match pm.output(&id, a.lines.unwrap_or(100).clamp(1, 2000), a.filter.as_deref()) {
-                        Some(t) => ToolOutput::text(t),
+                        Some(t) => {
+                            let end = pm.list().into_iter().find(|i| i.id == id).and_then(|i| i.end);
+                            ToolOutput {
+                                details: Some(exit_details(&id, end.as_ref())),
+                                ..ToolOutput::text(t)
+                            }
+                        }
                         None => ToolOutput::error(format!("no process {id}")),
                     }
                 }
@@ -1038,6 +1056,44 @@ mod tests {
             .execute(serde_json::json!({"action": "watch", "id": "p1", "watches": w}), &c)
             .await;
         assert!(o.is_error && crate::testutil::text(&o).contains("not a valid regex"));
+    }
+
+    /// ST06: `process` carries the exit code in its details once the process ended.
+    #[tokio::test]
+    async fn process_tool_reports_exit_code() {
+        use crate::Tool;
+        use serde_json::json;
+        let d = tempfile::tempdir().unwrap();
+        let mut c = crate::testutil::ctx(d.path());
+        let pm = ProcessManager::new(d.path(), "s");
+        c.processes = Some(pm.clone());
+        let mut ev = pm.events.subscribe();
+        // Ends within the start call's wait.
+        let o = ProcessTool
+            .execute(json!({"action": "start", "command": "exit 5"}), &c)
+            .await;
+        assert_eq!(o.details, Some(json!({"process_id": "proc_1", "exit_code": 5})));
+        // Still running when the call returns: no code yet, then the exit event and `output` carry it.
+        let o = ProcessTool
+            .execute(json!({"action": "start", "command": "sleep 2; exit 7"}), &c)
+            .await;
+        assert_eq!(o.details, Some(json!({"process_id": "proc_2"})));
+        let end = loop {
+            let e = tokio::time::timeout(Duration::from_secs(10), ev.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let Event::Ended { id, end, .. } = e
+                && id == "proc_2"
+            {
+                break end;
+            }
+        };
+        assert_eq!(end.code, Some(7));
+        let o = ProcessTool
+            .execute(json!({"action": "output", "id": "proc_2"}), &c)
+            .await;
+        assert_eq!(o.details, Some(json!({"process_id": "proc_2", "exit_code": 7})));
     }
 
     #[tokio::test]

@@ -141,6 +141,20 @@ impl Providers {
         let (provider, model) = spec
             .split_once('/')
             .ok_or_else(|| setup(format!("`{spec}`: use provider/model, e.g. claude/claude-opus-5-5")))?;
+        if provider == FAUX {
+            if model != "script" {
+                return Err(setup(format!(
+                    "unknown faux model `{model}`; the only one is faux/script"
+                )));
+            }
+            return Ok(Route {
+                provider: FAUX.into(),
+                model: model.into(),
+                level,
+                info: ModelInfo::unknown(model),
+                api: Api::Faux,
+            });
+        }
         let p = self.profile(provider)?;
         let model = self
             .catalog
@@ -164,6 +178,9 @@ impl Providers {
         provider: &str,
         trace: Option<Trace>,
     ) -> Result<(Arc<dyn Adapter>, Option<String>), ConnectError> {
+        if provider == FAUX {
+            return Ok((Arc::new(crate::faux::Faux::from_env().map_err(setup)?), None));
+        }
         let p = self.profile(provider)?;
         if !p.oauth() {
             return self.adapter_for(provider, DEFAULT_ACCOUNT, trace).await;
@@ -301,7 +318,7 @@ impl Providers {
                 let token = self.auth.access_token(&p.id, account).await?;
                 Arc::new(crate::copilot::Copilot::new(token, trace))
             }
-            Api::Process => unreachable!("handled above"),
+            Api::Process | Api::Faux => unreachable!("handled above"),
         };
         Ok((adapter, key))
     }
@@ -354,6 +371,9 @@ impl Providers {
         )))
     }
 }
+
+/// The hidden scripted provider (`faux/script`, L10.9): no profile, so no picker lists it.
+const FAUX: &str = "faux";
 
 /// `*` matches any run of characters (`/` too), `?` one character.
 fn glob(pattern: &str, s: &str) -> bool {

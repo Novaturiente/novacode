@@ -1381,6 +1381,8 @@ impl Ctx {
         if let Some(p) = &self.cli.profile {
             policy = policy.with_profile(p).map_err(anyhow::Error::msg)?;
         }
+        // A super mode task's fence for the edit tools (L10.9); its subagents inherit the variable.
+        policy = policy.with_edit_rule(novacode_core::policy::EditRule::from_env().map_err(anyhow::Error::msg)?);
         // Shared: mode presets change it at run time, and subagents read its mode.
         let policy = Arc::new(policy);
         // A subagent: its role prompt, and only its tools and MCP servers (L10.1).
@@ -2009,7 +2011,7 @@ async fn print_mode(
             }) => {
                 eprintln!("retry {attempt} in {delay_ms}ms: {message}")
             }
-            Ok(AgentEvent::AgentEnd { stop }) => end = Some(stop),
+            Ok(AgentEvent::AgentEnd { stop, .. }) => end = Some(stop),
             // Done when nothing is queued and no subagent is still out: its report would start another run.
             Ok(AgentEvent::Settled) if end.is_some() && sup.as_ref().is_none_or(|s| s.pending() == 0) => {
                 break end.take().unwrap_or(StopReason::Stop);

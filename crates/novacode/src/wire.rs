@@ -319,6 +319,12 @@ pub enum ClientCmd {
     },
     /// End the session (a `--bg` one included).
     Shutdown,
+    /// Start a goal whose criteria the user already approved elsewhere (super's
+    /// window, L10.9): no approval card, and no run starts.
+    SetGoal {
+        objective: String,
+        criteria: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -351,6 +357,7 @@ impl ClientCmd {
             ClientCmd::RegisterTools { .. } => "register_tools",
             ClientCmd::ToolResult { .. } => "tool_result",
             ClientCmd::ExtKey { .. } => "ext_key",
+            ClientCmd::SetGoal { .. } => "set_goal",
         }
     }
 }
@@ -418,7 +425,10 @@ mod tests {
                 }),
             },
             ServerMsg::Event {
-                event: AgentEvent::AgentEnd { stop: StopReason::Stop },
+                event: AgentEvent::AgentEnd {
+                    stop: StopReason::Stop,
+                    prompts: vec![Some("1".into()), None],
+                },
             },
             ServerMsg::Response {
                 id: Some("1".into()),
@@ -536,6 +546,13 @@ mod tests {
                         text: None,
                         preview: None,
                     }]),
+                },
+            },
+            Request {
+                id: Some("10".into()),
+                cmd: ClientCmd::SetGoal {
+                    objective: "make the parser faster".into(),
+                    criteria: vec!["p95 under 120 ms".into()],
                 },
             },
         ];

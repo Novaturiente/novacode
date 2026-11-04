@@ -314,7 +314,7 @@ impl Goals {
                     AgentEvent::AgentStart => tools = 0,
                     AgentEvent::ToolStart { .. } => tools += 1,
                     AgentEvent::Message(m) => self.observe(&m),
-                    AgentEvent::AgentEnd { stop: s } => {
+                    AgentEvent::AgentEnd { stop: s, .. } => {
                         if s == StopReason::Aborted && self.pause_if_active("you interrupted it") {
                             self.notice("goal paused: you interrupted it (/goal resume continues)".into());
                         }
@@ -644,6 +644,20 @@ impl Goals {
         self.recent.lock().unwrap().clear();
         let audit = self.cfg.audit && self.sup.is_some();
         self.update(|g| *g = Some(Goal::new(objective, vec![], false, audit)));
+    }
+
+    /// `set_goal` (L10.9): start a goal whose criteria the user already approved
+    /// elsewhere. Returns the hidden note that tells the model so.
+    pub fn start_approved(&self, objective: String, criteria: Vec<String>) -> String {
+        self.recent.lock().unwrap().clear();
+        let audit = self.cfg.audit && self.sup.is_some();
+        let g = Goal::new(objective, criteria, false, audit);
+        let note = format!(
+            "A goal is set; the user has already approved it and its criteria, so don't ask about them again:\n{}\nPut the steps in `todo`, then work toward it; you are woken after each turn until it is met. When every criterion is met, call `goal` with action `complete` and your evidence.",
+            goal_text(&g)
+        );
+        self.update(|cur| *cur = Some(g));
+        note
     }
 
     /// `/goal edit` fills the input with this, to change and send back.

@@ -223,7 +223,13 @@ fn run_events(app: &mut App) {
             StopReason::Stop,
         )),
     );
-    ev(app, AgentEvent::AgentEnd { stop: StopReason::Stop });
+    ev(
+        app,
+        AgentEvent::AgentEnd {
+            stop: StopReason::Stop,
+            prompts: vec![],
+        },
+    );
     ev(app, AgentEvent::Settled);
 }
 
