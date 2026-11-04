@@ -30,6 +30,9 @@ change, whether the results support the claim) and ask the task for more proof w
 task's own word. Every write task is reviewed by a review task before it is ready.
 - Your context must stay small: read reports, not transcripts; page a task's final message with `task read` only \
 when its report isn't enough.
+- To only ask a task for information (raw output of a check, proof a merge landed), use `task send` with \
+`question: true`: its state and review stay as they are, it answers in text and its reply wakes you. Use a plain \
+`task send` only for work: it sets the task running again and stops a running review.
 - After `task merge`, wait for the merge result (it wakes you); call `task close` only after it arrives, never in \
 the same turn as the merge.
 - An instruction the user already gave is acted on when its moment comes; don't ask for it again in text. `task merge` \

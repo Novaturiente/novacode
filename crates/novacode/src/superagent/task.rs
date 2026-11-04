@@ -46,8 +46,12 @@ pub struct Start {
 pub trait Launcher: Send + Sync {
     /// Start a detached task session; returns its session id once its socket is up.
     fn start(&self, s: Start) -> BoxFuture<'_, Result<String, String>>;
-    /// Send one command to a live session.
-    fn send<'a>(&'a self, session: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>>;
+    /// Send one command to a live session, as super's request.
+    fn send<'a>(&'a self, session: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>> {
+        self.send_as(session, super::link::SUPER_ID, cmd)
+    }
+    /// Send one command with request id `id` (a prompt's id tells whose turn it starts).
+    fn send_as<'a>(&'a self, session: &'a str, id: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>>;
     fn alive(&self, session: &str) -> bool;
     /// A lasting connection to a live session's socket, for its link.
     fn link<'a>(&'a self, _session: &'a str) -> BoxFuture<'a, Result<super::link::Conn, String>> {
@@ -87,6 +91,7 @@ struct Args {
     skills: Vec<String>,
     goal: bool,
     message: Option<String>,
+    question: bool,
     pr: bool,
     note: Option<String>,
     all: bool,
@@ -327,6 +332,7 @@ impl Super {
         let t = self.find(a.task.as_deref().ok_or("`task` is missing")?)?;
         match a.action.as_str() {
             "read" => self.read(&t, a.offset.unwrap_or(0), a.limit.unwrap_or(200)),
+            "send" if a.question => self.ask(&t, a.message.as_deref().ok_or("`message` is missing")?).await,
             "send" => self.send(&t, a.message.as_deref().ok_or("`message` is missing")?).await,
             "stop" => self.stop(&t).await,
             "close" => self.close(&t).await,
@@ -695,9 +701,14 @@ impl Super {
 
     /// A raw prompt: a brief or message starting with `!` or `/` is not a command.
     async fn prompt(&self, session: &str, text: String) -> Result<(), String> {
+        self.prompt_as(session, super::link::SUPER_ID, text).await
+    }
+
+    /// [`prompt`](Self::prompt) with request id `id`.
+    async fn prompt_as(&self, session: &str, id: &str, text: String) -> Result<(), String> {
         let hash = super::board::prompt_hash(&text);
         self.launcher
-            .send(session, ClientCmd::Prompt { text, raw: true })
+            .send_as(session, id, ClientCmd::Prompt { text, raw: true })
             .await?;
         self.edit(|b| {
             if let Some(row) = b.tasks.iter_mut().find(|r| r.session.as_deref() == Some(session)) {
@@ -787,6 +798,30 @@ impl Super {
         }
         self.deliver(&t.id, message.to_string()).await?;
         Ok(format!("Sent to {} ({}).", t.label, n.to.name()))
+    }
+
+    /// `send` with `question: true`: the task answers in text; its board state and any
+    /// review stay as they are, and its reply wakes super (the link's watcher).
+    async fn ask(&self, t: &Task, message: &str) -> Result<String, String> {
+        self.check(&t.id, Event::Send)?;
+        if t.state == State::Queued {
+            return Err(format!("{} is queued: it has no session to answer yet", t.label));
+        }
+        let text = super::link::question_prompt(message);
+        let s = match &t.session {
+            Some(s) if self.launcher.alive(s) => s.clone(),
+            Some(_) => {
+                self.start(&t.id).await?;
+                self.row(&t.id)?.session.unwrap_or_default()
+            }
+            None => return Err(format!("{} has no session to answer", t.label)),
+        };
+        self.prompt_as(&s, super::link::SUPER_QUESTION_ID, text).await?;
+        Ok(format!(
+            "Asked {} (still {}); its reply wakes you when its turn ends.",
+            t.label,
+            t.state.name()
+        ))
     }
 
     async fn stop(&self, t: &Task) -> Result<String, String> {
@@ -1126,7 +1161,7 @@ impl Tool for TaskTool {
         "task"
     }
     fn description(&self) -> &str {
-        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], scope?, skills?[], goal?}; send {task, message}; stop {task}; close {task} and merge {task, pr?} (each asks the user on a card); accept {task} (a read task in reviewing; a write task blocked by used-up review rounds, after the user's OK on a card); review {task, note?}; list {all?}; read {task, offset?, limit?} (pages the task's final message)."
+        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], scope?, skills?[], goal?}; send {task, message, question?}; stop {task}; close {task} and merge {task, pr?} (each asks the user on a card); accept {task} (a read task in reviewing; a write task blocked by used-up review rounds, after the user's OK on a card); review {task, note?}; list {all?}; read {task, offset?, limit?} (pages the task's final message)."
     }
     fn schema(&self) -> Value {
         let s = |d: &str| json!({ "type": "string", "description": d });
@@ -1147,6 +1182,7 @@ impl Tool for TaskTool {
                 "skills": { "type": "array", "items": { "type": "string" }, "description": "spawn: skills the task should use." },
                 "goal": { "type": "boolean", "description": "spawn: open-ended work; the task keeps going until the criteria hold." },
                 "message": s("send: the message."),
+                "question": { "type": "boolean", "description": "send: only ask for information (raw output, proof): the task's state and review stay, it answers in text without a report, and its reply wakes you. Leave false for work: a plain send sets the task running and stops its review." },
                 "pr": { "type": "boolean", "description": "merge: open a pull request instead of merging locally." },
                 "note": s("review: what the review should look at."),
                 "all": { "type": "boolean", "description": "list: archived tasks too." },
@@ -1219,7 +1255,7 @@ impl Launcher for Procs {
         })
     }
 
-    fn send<'a>(&'a self, session: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>> {
+    fn send_as<'a>(&'a self, session: &'a str, rid: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
             let f = crate::serve::find_live(&self.paths, session).map_err(|e| e.to_string())?;
@@ -1228,7 +1264,7 @@ impl Launcher for Procs {
                 let s = crate::serve::connect(&f.socket).await.map_err(|e| e.to_string())?;
                 let (r, mut w) = tokio::io::split(s);
                 let req = Request {
-                    id: Some("super".into()),
+                    id: Some(rid.into()),
                     cmd,
                 };
                 w.write_all(line(&req).as_bytes()).await.map_err(|e| e.to_string())?;
@@ -1241,7 +1277,7 @@ impl Launcher for Procs {
                             ok,
                             error,
                             ..
-                        }) if id == "super" => {
+                        }) if id == rid => {
                             return if ok { Ok(()) } else { Err(error.unwrap_or_default()) };
                         }
                         Ok(ServerMsg::Bye { .. }) if shutdown => return Ok(()),
@@ -1291,6 +1327,8 @@ mod tests {
         log: Log,
         starts: Mutex<Vec<Start>>,
         sent: Mutex<Vec<(String, ClientCmd)>>,
+        /// The request id of each sent command.
+        ids: Mutex<Vec<String>>,
         alive: Mutex<HashSet<String>>,
     }
 
@@ -1305,8 +1343,9 @@ mod tests {
                 Ok(id)
             })
         }
-        fn send<'a>(&'a self, session: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>> {
+        fn send_as<'a>(&'a self, session: &'a str, id: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>> {
             Box::pin(async move {
+                self.ids.lock().unwrap().push(id.to_string());
                 self.log.lock().unwrap().push(format!("send {session} {}", cmd.name()));
                 if matches!(cmd, ClientCmd::Shutdown) {
                     self.alive.lock().unwrap().remove(session);
@@ -1742,6 +1781,49 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.contains("not possible"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_question_send_keeps_the_state_and_is_marked_as_a_question() {
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "t", false)).await.unwrap();
+        use State::*;
+        for s in [Ready, Running, Blocked] {
+            set_state(&fx, "T1-t", s);
+            let ask = json!({"action": "send", "task": "T1-t", "message": "paste check #9", "question": true});
+            let out = run(&fx, ask).await.unwrap();
+            assert!(out.contains("Asked T1-t"), "{out}");
+            assert_eq!(state(&fx, "T1-t"), s, "{s:?}");
+            let p = fx.launcher.prompts("s1").pop().unwrap();
+            assert!(
+                p.starts_with(super::super::link::QUESTION_PREFIX) && p.ends_with("paste check #9"),
+                "{p}"
+            );
+            assert_eq!(
+                fx.launcher.ids.lock().unwrap().last().unwrap(),
+                super::super::link::SUPER_QUESTION_ID
+            );
+        }
+        assert!(
+            fx.sup.row("T1-t").unwrap().follow_ups.is_empty(),
+            "a question is no follow-up"
+        );
+        // A plain send is unchanged.
+        set_state(&fx, "T1-t", Ready);
+        run(&fx, json!({"action": "send", "task": "T1-t", "message": "work"}))
+            .await
+            .unwrap();
+        assert_eq!(state(&fx, "T1-t"), Running);
+        assert_eq!(fx.launcher.prompts("s1").last().unwrap(), "work");
+        assert_eq!(
+            fx.launcher.ids.lock().unwrap().last().unwrap(),
+            super::super::link::SUPER_ID
+        );
+        // A queued task has no session to answer.
+        set_state(&fx, "T1-t", Queued);
+        let ask = json!({"action": "send", "task": "T1-t", "message": "q", "question": true});
+        assert!(run(&fx, ask).await.is_err());
     }
 
     #[tokio::test]

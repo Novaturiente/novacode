@@ -529,7 +529,7 @@ mod tests {
                 Ok(id)
             })
         }
-        fn send<'a>(&'a self, session: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>> {
+        fn send_as<'a>(&'a self, session: &'a str, _id: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>> {
             Box::pin(async move {
                 if matches!(cmd, ClientCmd::Shutdown) {
                     self.alive.lock().unwrap().remove(session);
@@ -971,6 +971,27 @@ mod tests {
         let list = fx.run(json!({"action": "list"})).await.unwrap();
         assert!(list.contains("| ready (accepted without review) |"), "{list}");
         assert_eq!(fx.row("T1-fix").reviewer, None, "no new review");
+    }
+
+    #[tokio::test]
+    async fn a_question_to_a_reviewing_task_keeps_its_review_running() {
+        let fx = fixture("faux/review");
+        let wt = fx.spawn("fix", "standard", "change").await;
+        let c1 = fx.commit(&wt, "src/a.rs");
+        fx.done("T1-fix", &c1, &["src/a.rs"]);
+        let rv = fx.review_of("T1-fix").await;
+        let ask = json!({"action": "send", "task": "T1-fix", "message": "paste check #3", "question": true});
+        fx.run(ask).await.unwrap();
+        let t = fx.row("T1-fix");
+        assert_eq!(
+            (t.state, t.reviewer.as_deref()),
+            (State::Reviewing, Some(rv.id.as_str()))
+        );
+        assert_eq!(fx.row(&rv.id).state, State::Running);
+        assert!(
+            fx.launcher.alive(rv.session.as_deref().unwrap()),
+            "the review task lives"
+        );
     }
 
     #[tokio::test]

@@ -45,7 +45,18 @@ is committed, what already ran) and don't repeat anything outside it that alread
 message); your proof log is empty, so re-run your checks before you cite them.";
 /// The request id super's prompts carry (`Launcher::send`): a run that consumed
 /// only these is a turn on super's prompt.
-const SUPER_ID: &str = "super";
+pub(super) const SUPER_ID: &str = "super";
+/// The request id of super's questions (`task send` with `question: true`): their
+/// turns need no report; the reply wakes super.
+pub(super) const SUPER_QUESTION_ID: &str = "super-question";
+/// What a question prompt starts with; the catch-up after a reconnect tells it by this.
+pub(super) const QUESTION_PREFIX: &str = "Super asks a question (answer in text in this turn; change nothing, \
+commit nothing and don't call `report`: no report is needed):\n\n";
+
+/// The prompt a question sends.
+pub(super) fn question_prompt(message: &str) -> String {
+    format!("{QUESTION_PREFIX}{message}")
+}
 
 /// What super's code tells super and the user.
 pub trait Inform: Send + Sync {
@@ -69,8 +80,10 @@ const LAST_TEXT_CHARS: usize = 600;
 /// Who started a run, from `agent_end`'s consumed prompts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Run {
-    /// Only super's prompts.
+    /// Only super's prompts, at least one of them work.
     Super,
+    /// Only super's questions.
+    Question,
     /// A prompt typed in a task window (no id) or sent by another client.
     User,
     /// No wire prompt: a subagent wake, a scheduled prompt, a goal reminder.
@@ -80,7 +93,12 @@ enum Run {
 fn run_of(prompts: &[Option<String>]) -> Run {
     if prompts.is_empty() {
         Run::Internal
-    } else if prompts.iter().all(|p| p.as_deref() == Some(SUPER_ID)) {
+    } else if prompts.iter().all(|p| p.as_deref() == Some(SUPER_QUESTION_ID)) {
+        Run::Question
+    } else if prompts
+        .iter()
+        .all(|p| matches!(p.as_deref(), Some(SUPER_ID | SUPER_QUESTION_ID)))
+    {
         Run::Super
     } else {
         Run::User
@@ -172,6 +190,8 @@ pub struct Watcher {
     /// The current run's last assistant text: a code-made report carries it.
     last_text: Option<String>,
     retry_after_ms: Option<u64>,
+    /// A question run ended: its reply for super.
+    reply: Option<String>,
     goal: Option<Goal>,
     /// The catch-up note already given: (super's prompt hash, messages after it).
     noted: Option<(String, usize)>,
@@ -198,6 +218,11 @@ impl Watcher {
             Some((i, _)) => format!("{}…", &t[..i]),
             None => t.to_string(),
         })
+    }
+
+    /// The reply of the question run that just ended, once.
+    pub fn take_reply(&mut self) -> Option<String> {
+        self.reply.take()
     }
 
     /// The session state (hello, state updates): its running processes.
@@ -277,11 +302,36 @@ impl Watcher {
                 }
                 self.turn_end(stop, goal)
             }
+            // Errors and limits block as on super's prompt; otherwise the reply wakes super.
+            Run::Question => {
+                let failed = self.failure(stop);
+                if failed.is_none() && !matches!(stop, StopReason::Aborted) {
+                    self.reply = Some(self.last_text().unwrap_or_else(|| "(no text)".into()));
+                }
+                failed
+            }
         }
     }
 
     /// A turn on super's prompt ended with no terminal report.
     fn turn_end(&mut self, stop: &StopReason, goal: Goal) -> Option<Event> {
+        if let Some(ev) = self.failure(stop) {
+            return Some(ev);
+        }
+        match stop {
+            // Stopped by super (its state is no longer live) or in the task's window.
+            StopReason::Aborted => None,
+            _ if goal == Goal::Active => None,
+            _ if self.background() => {
+                self.armed = true;
+                None
+            }
+            _ => Some(Event::TurnUnreported),
+        }
+    }
+
+    /// A turn that ended on an error, the length limit or a provider limit.
+    fn failure(&self, stop: &StopReason) -> Option<Event> {
         let limit = |kind, reset_at| {
             Some(Event::TurnLimit(Limit {
                 kind,
@@ -305,14 +355,7 @@ impl Watcher {
                     .unwrap_or_else(|| "the model call failed".into()),
             )),
             StopReason::Length => Some(Event::TurnError("the reply hit the output length limit".into())),
-            // Stopped by super (its state is no longer live) or in the task's window.
-            StopReason::Aborted => None,
-            _ if goal == Goal::Active => None,
-            _ if self.background() => {
-                self.armed = true;
-                None
-            }
-            _ => Some(Event::TurnUnreported),
+            _ => None,
         }
     }
 
@@ -368,7 +411,11 @@ impl Watcher {
         self.run_reported = false;
         self.last_error = last.error_message.clone();
         self.last_text = Some(last.text()).filter(|t| !t.trim().is_empty());
-        match self.end(Run::Super, &last.stop, goal) {
+        let run = match user_text(&history[i]) {
+            Some(t) if t.starts_with(QUESTION_PREFIX) => Run::Question,
+            _ => Run::Super,
+        };
+        match self.end(run, &last.stop, goal) {
             Some(ev) => CatchUp::Report(ev),
             None => CatchUp::Nothing,
         }
@@ -735,6 +782,14 @@ impl Links {
                 .note(format!("{}'s review task crashed ({why}); one retry.{extra}", t.label));
         }
         changed && n.from == State::Running
+    }
+
+    /// A question run of task `id` ended: its reply wakes super.
+    fn replied(&self, sup: &Super, id: &str, w: &mut Watcher) {
+        if let Some(r) = w.take_reply() {
+            let label = sup.row(id).map(|t| t.label).unwrap_or_else(|_| id.to_string());
+            self.inform.wake(format!("{label} replied: {r}"));
+        }
     }
 
     /// A review row's own change (start, card, archive): no wake.
@@ -1374,6 +1429,7 @@ async fn run_link(
                             ));
                         }
                     }
+                    links.replied(&sup, &id, &mut watcher);
                     history = Vec::new();
                 }
                 ServerMsg::Event { event } => {
@@ -1387,6 +1443,7 @@ async fn run_link(
                     {
                         links.kick();
                     }
+                    links.replied(&sup, &id, &mut watcher);
                 }
                 ServerMsg::Ask { .. } | ServerMsg::Approve { .. } => {
                     if let Some(card) = Card::from_msg(&msg) {
@@ -1537,6 +1594,49 @@ mod tests {
         assert!(cut.chars().count() <= 601 && cut.ends_with('…'), "{cut}");
         run(&mut w, &[], Goal::None);
         assert_eq!(w.last_text(), None);
+    }
+
+    const QUESTION: &[Option<&str>] = &[Some(SUPER_QUESTION_ID)];
+
+    #[test]
+    fn a_question_run_ends_with_a_reply_not_a_code_made_report() {
+        assert_ne!(SUPER_QUESTION_ID, SUPER_ID);
+        let mut w = Watcher::new("faux");
+        let ev = run(
+            &mut w,
+            &[says("check 9: exit 0"), end(QUESTION, StopReason::Stop)],
+            Goal::None,
+        );
+        assert_eq!(ev, None);
+        assert_eq!(w.take_reply().as_deref(), Some("check 9: exit 0"));
+        assert_eq!(w.take_reply(), None, "taken once");
+        // Errors still block, with no reply.
+        let ev = run(
+            &mut w,
+            &[
+                AgentEvent::Message(assistant(StopReason::Length, None)),
+                end(QUESTION, StopReason::Length),
+            ],
+            Goal::None,
+        );
+        assert!(matches!(ev, Some(Event::TurnError(_))), "{ev:?}");
+        assert_eq!(w.take_reply(), None);
+        // Super's plain prompt is unchanged.
+        assert_eq!(
+            run(&mut w, &[end(SUPER, StopReason::Stop)], Goal::None),
+            Some(Event::TurnUnreported)
+        );
+        assert_eq!(w.take_reply(), None);
+    }
+
+    #[test]
+    fn catch_up_treats_a_question_prompt_as_super_s_own_without_a_block() {
+        let q = question_prompt("paste check #9");
+        let hash = board::prompt_hash(&q);
+        let ended = vec![Message::user(&q), assistant(StopReason::Stop, None)];
+        let mut w = Watcher::new("faux");
+        assert_eq!(w.catch_up(&ended, Some(&hash), false, Goal::None), CatchUp::Nothing);
+        assert_eq!(w.take_reply().as_deref(), Some("x"));
     }
 
     #[test]
@@ -1840,7 +1940,7 @@ mod tests {
                 Ok(id)
             })
         }
-        fn send<'a>(&'a self, session: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>> {
+        fn send_as<'a>(&'a self, session: &'a str, _id: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>> {
             Box::pin(async move {
                 self.sent.lock().unwrap().push((session.into(), cmd));
                 Ok(())
@@ -2239,6 +2339,25 @@ mod tests {
             wakes[0]
         );
         assert!(said.contains(&"desktop: T1-x blocked".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_question_turn_wakes_super_with_the_reply_and_keeps_the_state() {
+        let fx = fixture(5);
+        let s = fx.task("T1-x", "faux/a", State::Ready);
+        let mut t = fx.end(&s).await;
+        t.catch_up(true, vec![], vec![]).await;
+        t.event(AgentEvent::AgentStart).await;
+        t.event(says("check 9 printed: ok")).await;
+        t.event(end(QUESTION, StopReason::Stop)).await;
+        fx.until("woken", |fx| fx.said().iter().any(|l| l.starts_with("wake:")))
+            .await;
+        let said = fx.said();
+        assert!(
+            said.contains(&"wake: T1-x replied: check 9 printed: ok".to_string()),
+            "{said:?}"
+        );
+        assert_eq!(fx.state("T1-x"), State::Ready);
     }
 
     #[tokio::test]
