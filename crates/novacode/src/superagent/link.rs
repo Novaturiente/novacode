@@ -1589,8 +1589,13 @@ async fn run_link(
                     }
                     links.replied(&sup, &id, &mut watcher);
                     if !busy {
-                        // Any run end missed while disconnected: nothing of super's is in flight.
-                        sup.ran(&session, usize::MAX).await;
+                        // A run end missed while disconnected: what its history shows consumed is no longer in flight.
+                        let seen: Vec<_> = history
+                            .iter()
+                            .filter_map(user_text)
+                            .map(|t| board::prompt_hash(&t))
+                            .collect();
+                        sup.caught_up(&session, &seen).await;
                     }
                     history = Vec::new();
                 }
@@ -3082,6 +3087,40 @@ mod tests {
         t.event(says("working")).await;
         t.event(report("done")).await;
         t.event(end(SUPER, StopReason::Stop)).await;
+        fx.until("question sent", |fx| questions(fx) == 1).await;
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_clears_only_in_flight_prompts_its_history_shows_consumed() {
+        // L10.9 R24: not busy is not enough; a prompt not yet in the history will start a run.
+        let fx = fixture(5);
+        let s = fx.task("T1-x", "faux/a", State::Running);
+        let mut t = fx.end(&s).await;
+        t.catch_up(true, vec![], vec![]).await;
+        let questions = |fx: &Fx| {
+            fx.launcher
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, c)| matches!(c, ClientCmd::Prompt { text, .. } if text.starts_with(QUESTION_PREFIX)))
+                .count()
+        };
+        fx.sup
+            .run(json!({"action": "send", "task": "T1-x", "message": "work"}))
+            .await
+            .unwrap();
+        let ask = json!({"action": "send", "task": "T1-x", "message": "which?", "question": true});
+        assert!(fx.sup.run(ask).await.unwrap().contains("held"));
+        drop(t);
+        let mut t = fx.end(&s).await;
+        t.catch_up(false, vec![], vec![]).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(questions(&fx), 0, "`work` is not in the history yet: still in flight");
+        drop(t);
+        let mut t = fx.end(&s).await;
+        let history = vec![Message::user("work"), assistant(StopReason::Stop, None)];
+        t.catch_up(false, history, vec![]).await;
         fx.until("question sent", |fx| questions(fx) == 1).await;
     }
 

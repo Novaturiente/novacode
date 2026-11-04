@@ -81,8 +81,8 @@ pub struct Super {
 struct Flight {
     /// The kind of the sent ones: questions.
     question: bool,
-    /// Sent and not yet seen consumed.
-    sent: usize,
+    /// The prompt hashes sent and not yet seen consumed, oldest first.
+    sent: Vec<String>,
     /// Waiting, in order: (question, text).
     held: Vec<(bool, String)>,
 }
@@ -867,12 +867,12 @@ impl Super {
         {
             let mut flights = self.flights.lock().unwrap();
             let f = flights.entry(session.to_string()).or_default();
-            if !f.held.is_empty() || (f.sent > 0 && f.question != question) {
+            if !f.held.is_empty() || (!f.sent.is_empty() && f.question != question) {
                 f.held.push((question, text));
                 return Ok(true);
             }
             f.question = question;
-            f.sent += 1;
+            f.sent.push(super::board::prompt_hash(&text));
         }
         self.send_prompt(session, id, text).await.map(|_| false)
     }
@@ -884,8 +884,10 @@ impl Super {
             .send_as(session, id, ClientCmd::Prompt { text, raw: true })
             .await
         {
-            if let Some(f) = self.flights.lock().unwrap().get_mut(session) {
-                f.sent = f.sent.saturating_sub(1);
+            if let Some(f) = self.flights.lock().unwrap().get_mut(session)
+                && let Some(i) = f.sent.iter().rposition(|h| *h == hash)
+            {
+                f.sent.remove(i);
             }
             return Err(e);
         }
@@ -902,14 +904,15 @@ impl Super {
         let (question, next) = {
             let mut flights = self.flights.lock().unwrap();
             let Some(f) = flights.get_mut(session) else { return };
-            f.sent = f.sent.saturating_sub(consumed);
-            let Some(&(question, _)) = f.held.first().filter(|_| f.sent == 0) else {
+            f.sent.drain(..consumed.min(f.sent.len()));
+            let Some(&(question, _)) = f.held.first().filter(|_| f.sent.is_empty()) else {
                 return;
             };
             let n = f.held.iter().take_while(|h| h.0 == question).count();
             f.question = question;
-            f.sent = n;
-            (question, f.held.drain(..n).map(|h| h.1).collect::<Vec<_>>())
+            let next: Vec<_> = f.held.drain(..n).map(|h| h.1).collect();
+            f.sent = next.iter().map(|t| super::board::prompt_hash(t)).collect();
+            (question, next)
         };
         let id = match question {
             true => super::link::SUPER_QUESTION_ID,
@@ -920,6 +923,21 @@ impl Super {
                 tracing::warn!(session, %e, "super: a held prompt couldn't be sent");
             }
         }
+    }
+
+    /// A reconnect found `session` not busy, its history's user prompts hashing to `seen`:
+    /// the in-flight prompts up to the last one seen were consumed; later ones stay in
+    /// flight (they will start a run).
+    pub(super) async fn caught_up(&self, session: &str, seen: &[String]) {
+        let consumed = {
+            let flights = self.flights.lock().unwrap();
+            let Some(f) = flights.get(session) else { return };
+            seen.iter()
+                .rev()
+                .find_map(|h| f.sent.iter().rposition(|s| s == h))
+                .map_or(0, |i| i + 1)
+        };
+        self.ran(session, consumed).await;
     }
 
     /// The session's run was stopped or its process is gone: nothing is in flight and
