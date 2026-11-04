@@ -1099,7 +1099,11 @@ fn done_facts(f: &serde_json::Map<String, Value>) -> board::Done {
                 _ => "no exit code".into(),
             };
             let folder = c["folder"].as_str().map(|d| format!(" in {d}")).unwrap_or_default();
-            format!("- `{}`{folder} → {code}", c["command"].as_str().unwrap_or("?"))
+            format!(
+                "- `{}`{folder} → {code}{}",
+                c["command"].as_str().unwrap_or("?"),
+                stale(c)
+            )
         })
         .collect();
     board::Done {
@@ -1224,6 +1228,15 @@ starts a new review.",
     s
 }
 
+/// The mark on a reported check that ran before the task's last edit.
+fn stale(c: &Value) -> &'static str {
+    if c["before_last_edit"] == true {
+        " (before the last edit)"
+    } else {
+        ""
+    }
+}
+
 /// The checks of a report, one line each, for super to judge.
 fn checks_text(f: &serde_json::Map<String, Value>) -> String {
     let mut out = Vec::new();
@@ -1235,8 +1248,9 @@ fn checks_text(f: &serde_json::Map<String, Value>) -> String {
         };
         let last = c["last_line"].as_str().unwrap_or("");
         out.push(format!(
-            "- #{} `{cmd}` → {code}{}",
+            "- #{} `{cmd}` → {code}{}{}",
             c["n"],
+            stale(c),
             if last.is_empty() {
                 String::new()
             } else {
@@ -2549,7 +2563,8 @@ mod tests {
             3,
             "tok",
             json!({"state": "done", "summary": "the answer is 42",
-                   "checks": [{"n": 1, "command": "cargo test", "exit_code": 0, "last_line": "ok"}]}),
+                   "checks": [{"n": 1, "command": "cargo test", "exit_code": 0, "last_line": "ok"},
+                              {"n": 0, "command": "sleep 45", "exit_code": 0, "last_line": "", "before_last_edit": true}]}),
         );
         fx.links.kick();
         fx.until("reviewing", |fx| fx.state("T1-x") == State::Reviewing).await;
@@ -2561,6 +2576,17 @@ mod tests {
         assert_eq!(wakes.len(), 1, "progress doesn't wake: {wakes:?}");
         assert!(wakes[0].contains("T1-x reported done (now reviewing): the answer is 42"));
         assert!(wakes[0].contains("#1 `cargo test` → exit 0: ok"), "{}", wakes[0]);
+        assert!(
+            wakes[0].contains("#0 `sleep 45` → exit 0 (before the last edit)"),
+            "{}",
+            wakes[0]
+        );
+        let done = row.done.as_ref().unwrap();
+        assert!(
+            done.checks[1].ends_with("→ exit 0 (before the last edit)"),
+            "{:?}",
+            done.checks
+        );
         // A read task: no review runs; super must judge it now.
         assert!(
             wakes[0].contains("No review runs for a read task") && wakes[0].contains("`task accept` or `task review`"),

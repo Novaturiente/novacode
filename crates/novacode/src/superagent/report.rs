@@ -109,6 +109,10 @@ pub struct Check {
     /// Still running in the process manager (a `process` command, or a `bash`
     /// command moved to the background); its exit event completes it.
     pub running: bool,
+    /// Set in a report: it started before the task's last edit (e.g. the red run
+    /// of red-then-green), so it doesn't prove the final code.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub before_last_edit: bool,
     #[serde(skip)]
     process: Option<String>,
 }
@@ -196,6 +200,7 @@ impl ProofLog {
                     exit_code: None,
                     last_line: last_line(out),
                     running: false,
+                    before_last_edit: false,
                     process: process.clone(),
                 };
                 match (exited, process.and_then(|p| log.ended.get(&p).copied())) {
@@ -519,12 +524,8 @@ impl ReportTool {
                             check.command
                         ));
                     }
-                    if done && last_edit.is_some_and(|e| check.started_at < e) {
-                        return Err(format!(
-                            "proof #{n} (`{}`) ran before your last edit; run it again and cite the new number",
-                            check.command
-                        ));
-                    }
+                    let mut check = check;
+                    check.before_last_edit = last_edit.is_some_and(|e| check.started_at < e);
                     checks.push(check);
                 }
                 Cited::Url(u) => artifacts.push(u),
@@ -551,9 +552,18 @@ impl ReportTool {
         }
         if done && write && checks.is_empty() {
             return Err(
-                "`done` needs proof: cite in `checks` the `[proof #N]` numbers of the checks you ran after your last edit"
+                "`done` needs proof: `checks` is a list field of proof numbers, like [\"#7\"]: cite there (not in \
+                 `summary`) the `[proof #N]` numbers of the checks you ran after your last edit"
                     .into(),
             );
+        }
+        if done && write && checks.iter().all(|c| c.before_last_edit) {
+            let cited: Vec<String> = checks.iter().map(|c| format!("#{} (`{}`)", c.n, c.command)).collect();
+            return Err(format!(
+                "every cited check ran before your last edit ({}): run a check now and cite its new number too; \
+                 checks from before the edit may stay, marked as such",
+                cited.join(", ")
+            ));
         }
         if done && write && git.repo && git.dirty > 0 {
             return Err(format!(
@@ -604,7 +614,7 @@ impl Tool for ReportTool {
         "report"
     }
     fn description(&self) -> &str {
-        "Report to super, the session that started this task. Work task: `state` (progress | done | blocked | failed), `summary` (at most 80 words), `question` (only with blocked), `checks` (the `[proof #N]` numbers of the bash and process calls that prove it, plus files a check produced, such as screenshots or logs, and URLs). Review task: `verdict` and `findings`. Merging: `merge` and a one-line `summary`."
+        "Report to super, the session that started this task. Work task: `state` (progress | done | blocked | failed), `summary` (at most 80 words), `question` (only with blocked), `checks` (a list of the `[proof #N]` numbers of the bash and process calls that prove it, like [\"#7\"], plus files a check produced, such as screenshots or logs, and URLs; `done` on a write task needs one check run after your last edit, and earlier ones are marked as before the last edit). Review task: `verdict` and `findings`. Merging: `merge` and a one-line `summary`."
     }
     fn schema(&self) -> Value {
         json!({
@@ -615,7 +625,7 @@ impl Tool for ReportTool {
                 "merge": { "type": "string", "enum": ["merged", "pr-opened", "failed"], "description": "Merging task, instead of `state`." },
                 "summary": { "type": "string", "description": "At most 80 words; for `merge`, the one-line reason." },
                 "question": { "type": "string", "description": "Only with `state: blocked`: what you need answered." },
-                "checks": { "type": "array", "items": { "type": "string" }, "description": "Proof numbers from the `[proof #N]` marks on your bash and process results (e.g. \"#4\"), plus files a check produced (screenshots, logs) and URLs; never source files, commands or results: those go in `summary`." },
+                "checks": { "type": "array", "items": { "type": "string" }, "description": "Proof numbers from the `[proof #N]` marks on your bash and process results (e.g. \"#4\"); `done` on a write task needs at least one check that ran after your last edit and has exited, and a check from before it (such as the failing run of red-then-green) is allowed but marked `before the last edit`. Plus files a check produced (screenshots, logs) and URLs; never source files, commands or results: those go in `summary`." },
                 "findings": { "type": "array", "items": { "type": "string" }, "description": "Review task: at most 5 findings or proof requests (with the verdict, 1000 characters at most)." },
                 "baseline": { "type": "object", "description": "Review task: base-commit check results, outside the 1000-character cap: {\"checks\": [{\"folder\", \"command\", \"exit_codes\": [first run, re-run], \"failing\": [test names]}]}." }
             }
@@ -623,7 +633,7 @@ impl Tool for ReportTool {
     }
     fn guidelines(&self) -> &[&str] {
         &[
-            "Call `report` when you are done, blocked or failed. `done` needs `checks`: the `[proof #N]` numbers of checks run after your last edit and finished, and committed work in a git worktree.",
+            "Call `report` when you are done, blocked or failed. `done` needs `checks`: the `[proof #N]` numbers of finished checks, at least one run after your last edit (earlier ones, like a red test run, are allowed and marked), and committed work in a git worktree.",
             "The proof log lives in memory: after a restart or resume it is empty, so run your checks again before citing them.",
         ]
     }
@@ -645,9 +655,16 @@ impl Tool for ReportTool {
                         .as_array()
                         .into_iter()
                         .flatten()
-                        .map(|c| match c["exit_code"].as_i64() {
-                            Some(code) => format!("#{} exit {code}", c["n"]),
-                            None => format!("#{} killed", c["n"]),
+                        .map(|c| {
+                            let s = match c["exit_code"].as_i64() {
+                                Some(code) => format!("#{} exit {code}", c["n"]),
+                                None => format!("#{} killed", c["n"]),
+                            };
+                            if c["before_last_edit"] == true {
+                                s + " (before the last edit)"
+                            } else {
+                                s
+                            }
                         })
                         .collect();
                     let mut text = format!("Report {} sent to super.", r["seq"]);
@@ -988,7 +1005,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_before_the_last_edit_is_refused() {
+    async fn only_checks_before_the_last_edit_are_refused() {
         let f = Fixture::new(false, write_row());
         f.bash("echo test").await;
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -996,13 +1013,40 @@ mod tests {
         refused(
             &f.report(json!({"state": "done", "summary": "s", "checks": ["#1"]}))
                 .await,
-            "ran before your last edit",
+            "every cited check ran before your last edit",
         );
         f.bash("echo test").await;
-        report(
+        let r = report(
             &f.report(json!({"state": "done", "summary": "s", "checks": ["#2"]}))
                 .await,
         );
+        assert!(r["checks"][0].get("before_last_edit").is_none());
+    }
+
+    #[tokio::test]
+    async fn check_before_the_last_edit_is_marked_beside_a_fresh_one() {
+        // Red then green: the failing run predates the fix.
+        let f = Fixture::new(false, write_row());
+        f.bash("exit 1").await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        f.edit("b.txt").await;
+        f.bash("echo green").await;
+        let o = f
+            .report(json!({"state": "done", "summary": "s", "checks": ["#1", "#2"]}))
+            .await;
+        let r = report(&o);
+        assert_eq!(r["checks"][0]["before_last_edit"], true);
+        assert!(r["checks"][1].get("before_last_edit").is_none());
+        assert!(text(&o).contains("#1 exit 1 (before the last edit)"), "{}", text(&o));
+    }
+
+    #[tokio::test]
+    async fn done_without_checks_names_the_field_shape() {
+        let f = Fixture::new(false, write_row());
+        let o = f
+            .report(json!({"state": "done", "summary": "tests pass, proof #3"}))
+            .await;
+        refused(&o, "`checks` is a list field of proof numbers, like [\"#7\"]");
     }
 
     #[tokio::test]
@@ -1014,7 +1058,7 @@ mod tests {
         refused(
             &f.report(json!({"state": "done", "summary": "s", "checks": ["#1"]}))
                 .await,
-            "ran before your last edit",
+            "every cited check ran before your last edit",
         );
     }
 
