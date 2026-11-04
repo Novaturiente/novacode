@@ -287,6 +287,13 @@ pub fn resolve(store: &TrustStore, dir: &Path, cli_trust: bool) -> bool {
     cli_trust || store.state(dir) == State::Trusted
 }
 
+/// A stable 16-hex-digit key for a path (FNV-1a 64 of its bytes), e.g. a folder name per root.
+pub fn path_key(p: &Path) -> String {
+    let mut h = Fnv::new();
+    h.write(p.as_os_str().as_encoded_bytes());
+    format!("{:016x}", h.0)
+}
+
 /// The fingerprint of `dir`'s project config: each config entry that exists
 /// ([`entries`]), hashed over its sorted relative paths and file contents. Missing
 /// entries are left out, so creating one changes the fingerprint.
