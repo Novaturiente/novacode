@@ -240,6 +240,12 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "MCP servers subagent type `<name>` gets by default (subagents start none otherwise).",
     ),
     (
+        "worktree.copy",
+        "list",
+        "`[\"AGENTS.md\", \"CLAUDE.md\", \".mcp.json\", \".codegraph/\", \".claude/\", \".novacode/\"]`",
+        "Untracked files and folders (relative to the repo root) copied into a new worktree (`-w`, `/worktree`, `enter_worktree`, subagent worktrees), besides root `.env*` files. Folders are copied whole except files git tracks; `daemon.*` files and sockets are never copied. Copies don't count as changes and are deleted when the worktree is removed.",
+    ),
+    (
         "goal.audit",
         "bool",
         "true",

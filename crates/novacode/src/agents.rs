@@ -649,6 +649,8 @@ struct Cfg {
     env: std::collections::BTreeMap<String, String>,
     /// The session's policy: children start in its effective mode, capped by its preset's tools.
     policy: Arc<novacode_core::policy::Policy>,
+    /// `worktree.copy`: untracked files copied into a child's worktree.
+    worktree_copy: Vec<String>,
 }
 
 impl Cfg {
@@ -671,6 +673,7 @@ impl Cfg {
             unattended: s.unattended,
             env: s.env,
             policy: s.policy,
+            worktree_copy: s.worktree_copy,
         }
     }
 }
@@ -700,6 +703,8 @@ pub struct Setup {
     pub unattended: bool,
     pub env: std::collections::BTreeMap<String, String>,
     pub policy: Arc<novacode_core::policy::Policy>,
+    /// `worktree.copy`, passed to `worktree::create_new`.
+    pub worktree_copy: Vec<String>,
 }
 
 impl Supervisor {
@@ -1003,7 +1008,7 @@ impl Supervisor {
         } else if a.worktree || def.worktree {
             // Git runs without the lock: the watchdog and event handling don't stall on it.
             let name = format!("{}-{n}", slug(&title));
-            let (path, _) = novacode_tools::worktree::create_new(&cwd, &name)?;
+            let (path, _) = novacode_tools::worktree::create_new(&cwd, &name, &cfg.worktree_copy)?;
             cwd = path;
         }
         let mut g = self.children.lock().unwrap();
@@ -1918,6 +1923,7 @@ mod tests {
                 false => Ok(()),
             }),
             skill_dirs: vec![],
+            worktree_copy: vec![],
             max_running: 4,
             exe: Some(fake_child(&tmp)),
             nerd: false,
@@ -1968,6 +1974,7 @@ mod tests {
             models: Arc::new(|_: &str, _: &str| None),
             allow: Arc::new(|_: &str| Ok(())),
             skill_dirs: vec![],
+            worktree_copy: vec![],
             max_running: 4,
             exe: Some(fake_child(&tmp)),
             nerd: false,
@@ -2062,6 +2069,7 @@ mod tests {
             allow: Arc::new(|_: &str| Ok(())),
             skill_dirs: vec![],
             max_running: 2,
+            worktree_copy: vec![],
             exe: Some(exe),
             nerd: false,
             env: Default::default(),
@@ -2129,6 +2137,7 @@ mod tests {
             allow: Arc::new(|_: &str| Ok(())),
             skill_dirs: vec![],
             max_running: 4,
+            worktree_copy: vec![],
             exe: Some(exe),
             nerd: false,
             env: Default::default(),
