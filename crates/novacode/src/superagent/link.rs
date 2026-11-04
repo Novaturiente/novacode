@@ -1142,6 +1142,12 @@ fn wake_text(t: &board::Task, ev: &Event) -> String {
                 ReportState::Progress => "progress",
             };
             let mut s = format!("{} reported {st} (now {}): {summary}", t.label, t.state.name());
+            if *state == ReportState::Done && t.state == State::Ready && t.approval_covers_done() {
+                s += &format!(
+                    "\nThe earlier approval of commit {} still covers it: no new review.",
+                    t.approved_commit.as_deref().unwrap_or_default()
+                );
+            }
             if t.state == State::Reviewing && t.reviewer.is_none() {
                 s += "\nNo review runs for a read task: judge its answer now, with `task accept` or `task review`; \
 nothing else will wake you about it.";

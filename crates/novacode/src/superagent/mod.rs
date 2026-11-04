@@ -34,6 +34,9 @@ when its report isn't enough.
 the same turn as the merge.
 - An instruction the user already gave is acted on when its moment comes; don't ask for it again in text. `task merge` \
 and `task close` open their own confirmation cards, and those cards are the confirmation: never ask in text first. \
+Never use `ask_user` to confirm a merge or a close (not \"Merge them now?\", not \"Close T1?\"): the user would \
+confirm twice. When the user asked for it, or to offer it, call `task merge` / `task close` directly; the user \
+answers on its card. `ask_user` is for real choices only (which option, which approach, missing facts). \
 When the user said to close a task after its merge, call `task close` as soon as the merge result arrives.
 - Act only on the user's requests.";
 
@@ -199,6 +202,12 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let p = prompt(empty.path());
         assert!(!p.contains("global_instructions") && p.contains("<super_overrides>"));
+    }
+
+    #[test]
+    fn merge_and_close_are_confirmed_only_on_their_own_cards() {
+        assert!(PROMPT.contains("Never use `ask_user` to confirm a merge or a close"));
+        assert!(PROMPT.contains("`ask_user` is for real choices only"));
     }
 
     #[test]

@@ -1103,6 +1103,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_resent_done_on_the_approved_commit_is_ready_without_a_new_review() {
+        let fx = fixture("faux/review");
+        let wt = fx.spawn("fix", "quick", "change").await;
+        let c = fx.commit(&wt, "src/a.rs");
+        fx.done("T1-fix", &c, &["src/a.rs"]);
+        let rv = fx.review_of("T1-fix").await;
+        fx.report(&rv.id, json!({"verdict": "approved", "findings": []}));
+        fx.until("ready", |fx| fx.row("T1-fix").state == State::Ready).await;
+        assert_eq!(fx.row("T1-fix").approved_commit.as_deref(), Some(c.as_str()));
+
+        // A failed merge, the user cleans up, super resends: the same commit again.
+        let send = json!({"action": "send", "task": "T1-fix", "message": "merge again"});
+        fx.run(send.clone()).await.unwrap();
+        assert_eq!(fx.row("T1-fix").state, State::Running);
+        fx.done("T1-fix", &c, &["src/a.rs"]);
+        fx.until("ready again", |fx| fx.row("T1-fix").state == State::Ready)
+            .await;
+        assert_eq!(fx.row("T1-fix").reviewer, None, "no new review");
+        assert_eq!(fx.launcher.starts.lock().unwrap().len(), 2, "the task and one review");
+        let said = fx.said();
+        assert!(
+            said.iter()
+                .any(|l| l.starts_with("wake: T1-fix reported done (now ready)")
+                    && l.contains("earlier approval of commit")
+                    && l.contains(&c)),
+            "{said:?}"
+        );
+
+        // Any other commit gets a review.
+        fx.run(send).await.unwrap();
+        let c2 = fx.commit(&wt, "src/b.rs");
+        fx.done("T1-fix", &c2, &["src/a.rs", "src/b.rs"]);
+        let rv2 = fx.review_of("T1-fix").await;
+        assert_ne!(rv2.id, rv.id);
+        assert_eq!(fx.row("T1-fix").state, State::Reviewing);
+    }
+
+    #[tokio::test]
     async fn a_branch_move_during_the_review_discards_its_verdict() {
         let fx = fixture("faux/review");
         let wt = fx.spawn("fix", "quick", "change").await;

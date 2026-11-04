@@ -194,6 +194,9 @@ pub struct Task {
     pub applied: Vec<String>,
     /// The facts of its last `done` report, for its review (never the task's summary).
     pub done: Option<Done>,
+    /// The commit its last approved review covered: a later `done` on exactly that
+    /// commit is ready without a new review (reviews are pinned to a commit).
+    pub approved_commit: Option<String>,
     pub landed: Option<Landed>,
     /// A write task the user accepted on a card after its review rounds ran out.
     pub accepted: bool,
@@ -245,6 +248,12 @@ impl Task {
             true => state.to_string(),
             false => format!("{state} ({})", marks.join(", ")),
         }
+    }
+
+    /// Its last `done` is on the commit an approved review already covered.
+    pub fn approval_covers_done(&self) -> bool {
+        let done = self.done.as_ref().and_then(|d| d.commit.as_ref());
+        done.is_some() && done == self.approved_commit.as_ref()
     }
 
     /// The repo's folder name, else the task's folder; `.` for the root itself.
@@ -452,6 +461,8 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
             (ReportState::Progress, s) if s.is_live() => go(s),
             (ReportState::Blocked, Running) => blocked(Block::new("reported blocked")),
             (ReportState::Failed, Running) => go(Failed),
+            // Reviews are pinned to a commit: the approval of this exact commit still holds.
+            (ReportState::Done, Running) if t.write && t.approval_covers_done() => go(Ready),
             (ReportState::Done, Running) if t.write => with(Reviewing, Effect::StartReview { uses_round: true }),
             (ReportState::Done, Running) => go(Reviewing),
             _ => refused(),
@@ -641,6 +652,9 @@ impl Board {
             Event::Verdict(v) => {
                 if *v != Verdict::Approved && !t.review_free {
                     t.review_rounds += 1;
+                }
+                if *v == Verdict::Approved {
+                    t.approved_commit = t.done.as_ref().and_then(|d| d.commit.clone());
                 }
                 t.review_free = false;
                 t.review_crashes = 0;
@@ -882,6 +896,40 @@ mod tests {
             (n.to, n.effects),
             (Reviewing, vec![Effect::StartReview { uses_round: true }])
         );
+        // Done again on the commit an approved review covered: ready, no new review.
+        let done_on = |c: &str| Done {
+            commit: Some(c.into()),
+            ..Done::default()
+        };
+        let covered = Task {
+            done: Some(done_on("c1")),
+            approved_commit: Some("c1".into()),
+            ..row(Running)
+        };
+        let n = next(&covered, &report(ReportState::Done), None).unwrap();
+        assert_eq!((n.to, n.effects), (Ready, vec![]));
+        let other = Task {
+            done: Some(done_on("c2")),
+            ..covered
+        };
+        assert_eq!(to(&other, report(ReportState::Done)), Reviewing);
+    }
+
+    #[test]
+    fn an_approved_verdict_records_its_commit() {
+        let mut b = Board {
+            tasks: vec![Task {
+                id: "T1".into(),
+                done: Some(Done {
+                    commit: Some("c1".into()),
+                    ..Done::default()
+                }),
+                ..under_review(0)
+            }],
+            ..Board::default()
+        };
+        b.apply("T1", Event::Verdict(Verdict::Approved)).unwrap();
+        assert_eq!(b.task("T1").unwrap().approved_commit.as_deref(), Some("c1"));
     }
 
     #[test]
