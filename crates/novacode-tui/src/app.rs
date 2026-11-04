@@ -857,7 +857,7 @@ impl App {
                 );
             }
             // The turn may have added files: the `@` list is read again on next use.
-            AgentEvent::AgentEnd { stop } => {
+            AgentEvent::AgentEnd { stop, .. } => {
                 self.files = None;
                 // The agent already asked the model to continue; it was still cut off.
                 if stop == StopReason::Length {

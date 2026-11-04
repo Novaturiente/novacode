@@ -46,6 +46,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `agents.env` | object | {} | Environment variables every subagent starts with, e.g. `{"CAVEMAN_DEFAULT_MODE": "off", "PONYTAIL_SUBAGENT_MATCHER": "^$"}` keeps those plugins' `SubagentStart` text out of subagents. |
 | `agents.<name>.tools` | list | the agent file's | Default tools of subagent type `<name>` (built-ins too); a subagent sees only its tools. |
 | `agents.<name>.mcp` | list | the agent file's | MCP servers subagent type `<name>` gets by default (subagents start none otherwise). |
+| `worktree.copy` | list | `["AGENTS.md", "CLAUDE.md", ".mcp.json", ".codegraph/", ".claude/", ".novacode/"]` | Untracked files and folders (relative to the repo root) copied into a new worktree (`-w`, `/worktree`, `enter_worktree`, subagent worktrees), besides root `.env*` files. Folders are copied whole except files git tracks; `daemon.*` files and sockets are never copied. Copies don't count as changes and are deleted when the worktree is removed. |
 | `goal.audit` | bool | true | `/goal` completion is checked by the `auditor` subagent before it counts. |
 | `goal.auditModel` | string | the session's model | Model of the goal auditor (`provider/model[:level]`). |
 | `goal.maxRuns` | number | 30 | Automatic continuations of a goal before it pauses (per start or `/goal resume`). |

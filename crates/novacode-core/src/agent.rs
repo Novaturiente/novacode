@@ -178,11 +178,17 @@ struct ObserverRun {
     error: Option<String>,
 }
 
+/// Queued user content: text, plus any attached images (L2.22).
+struct Queued {
+    content: Vec<Block>,
+    /// A wire prompt's request id, `Some(None)` when sent without one; `None` = from inside the session.
+    wire: Option<Option<String>>,
+}
+
 #[derive(Default)]
 struct Queues {
-    /// User content: text, plus any attached images (L2.22).
-    steering: VecDeque<Vec<Block>>,
-    follow_up: VecDeque<Vec<Block>>,
+    steering: VecDeque<Queued>,
+    follow_up: VecDeque<Queued>,
     /// Notes for the model (process exits, log matches): stored as reminders at
     /// the next model call (L4.12).
     reminders: VecDeque<(String, String)>,
@@ -1397,11 +1403,14 @@ impl Agent {
             }),
             send: Arc::new(move |text: String, steer: bool| {
                 let mut q = f.queues.lock().unwrap();
-                let content = vec![Block::text(text)];
+                let item = Queued {
+                    content: vec![Block::text(text)],
+                    wire: None,
+                };
                 if steer {
-                    q.steering.push_back(content);
+                    q.steering.push_back(item);
                 } else {
-                    q.follow_up.push_back(content);
+                    q.follow_up.push_back(item);
                 }
                 drop(q);
                 f.notify.notify_one();
@@ -1540,9 +1549,9 @@ impl Agent {
         });
     }
 
-    fn take_queued(&self, steering_only: bool) -> Vec<Vec<Block>> {
+    fn take_queued(&self, steering_only: bool) -> Vec<Queued> {
         let mut q = self.shared.queues.lock().unwrap();
-        let mut out: Vec<Vec<Block>> = q.steering.drain(..).collect();
+        let mut out: Vec<Queued> = q.steering.drain(..).collect();
         if !steering_only {
             out.extend(q.follow_up.drain(..));
         }
@@ -1633,10 +1642,13 @@ impl Agent {
         let start = self.store.branch().last().map(|e| e.id.clone());
         let mut first = true;
         let mut refused = false;
+        // Wire prompts this run took, for `AgentEnd` (L10.9).
+        let mut prompts = Vec::new();
         let stop = loop {
             let queued = self.take_queued(steering_only);
             let mut added = queued.is_empty();
-            for content in queued {
+            for Queued { content, wire } in queued {
+                prompts.extend(wire);
                 // A user message ends an activated skill's turn rules (L5.25).
                 self.policy.end_turn();
                 // UserPromptSubmit (L7.14): a plugin may refuse the prompt or add context after it.
@@ -1829,7 +1841,7 @@ impl Agent {
         self.finish_checkpoint().await;
         self.set_busy(false);
         self.update_report();
-        self.emit(AgentEvent::AgentEnd { stop });
+        self.emit(AgentEvent::AgentEnd { stop, prompts });
         let q = self.shared.queues.lock().unwrap();
         if q.steering.is_empty() && q.follow_up.is_empty() && !q.wake {
             self.emit(AgentEvent::Settled);
@@ -2383,7 +2395,22 @@ impl SessionHandle {
     }
     /// A prompt with images or other blocks.
     pub fn prompt_content(&self, content: Vec<Block>) {
-        self.shared.queues.lock().unwrap().follow_up.push_back(content);
+        self.queue(false, content, None);
+    }
+    /// A prompt from a wire client; its request `id` comes back on the `AgentEnd` of the run that takes it.
+    pub fn prompt_wire(&self, content: Vec<Block>, id: Option<String>) {
+        self.queue(false, content, Some(id));
+    }
+    /// A steer from a wire client, reported like `prompt_wire`.
+    pub fn steer_wire(&self, content: Vec<Block>, id: Option<String>) {
+        self.queue(true, content, Some(id));
+    }
+    fn queue(&self, steer: bool, content: Vec<Block>, wire: Option<Option<String>>) {
+        {
+            let mut q = self.shared.queues.lock().unwrap();
+            let q = if steer { &mut q.steering } else { &mut q.follow_up };
+            q.push_back(Queued { content, wire });
+        }
         self.shared.notify.notify_one();
     }
     /// Delivered before the next model call of the running turn (L3.7).
@@ -2406,8 +2433,7 @@ impl SessionHandle {
     }
 
     pub fn steer_content(&self, content: Vec<Block>) {
-        self.shared.queues.lock().unwrap().steering.push_back(content);
-        self.shared.notify.notify_one();
+        self.queue(true, content, None);
     }
     pub fn abort(&self) {
         if let Some(c) = self.shared.cancel.lock().unwrap().as_ref() {
@@ -2565,13 +2591,14 @@ impl SessionHandle {
     // shortcut: follow-ups holding images stay queued (the editor can't take them back); fine until image follow-ups are common.
     pub fn take_follow_ups(&self) -> Vec<String> {
         let mut q = self.shared.queues.lock().unwrap();
-        let text_only = |c: &Vec<Block>| c.iter().all(|b| matches!(b, Block::Text { .. }));
+        let text_only = |c: &Queued| c.content.iter().all(|b| matches!(b, Block::Text { .. }));
         let (taken, kept): (VecDeque<_>, VecDeque<_>) = q.follow_up.drain(..).partition(text_only);
         q.follow_up = kept;
         taken
             .into_iter()
             .map(|c| {
-                c.into_iter()
+                c.content
+                    .into_iter()
                     .filter_map(|b| match b {
                         Block::Text { text, .. } => Some(text),
                         _ => None,
