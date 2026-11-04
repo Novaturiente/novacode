@@ -9,9 +9,7 @@ use crate::hub::HubSlot;
 use crate::wire::ServerMsg;
 use futures_util::future::BoxFuture;
 use novacode_core::hooks::{Gate, Handler};
-use novacode_core::policy::{Approval, ApprovalRequest, Approver};
 use novacode_core::resources;
-use novacode_tools::ask::Asker;
 use novacode_tools::{Tool, ToolCtx, ToolOutput};
 use novacode_types::ui::{Node, Time, UiOp};
 use novacode_types::{AgentEvent, Message, StopReason, StreamEvent};
@@ -1250,15 +1248,11 @@ impl Supervisor {
                         break;
                     }
                 }
-                ServerMsg::Ask { id, questions } => self.relay_ask(&n, &title, id, questions),
-                ServerMsg::Approve {
-                    id,
-                    tool,
-                    detail,
-                    reason,
-                    rule,
-                    risky,
-                } => self.relay_approval(&n, &title, id, tool, detail, reason, rule, risky),
+                ServerMsg::Ask { .. } | ServerMsg::Approve { .. } => {
+                    if let Some(card) = crate::relay::Card::from_msg(&msg) {
+                        self.relay_card(&n, &title, card);
+                    }
+                }
                 ServerMsg::Bye { .. } => break,
                 _ => {}
             }
@@ -1369,16 +1363,20 @@ impl Supervisor {
         false
     }
 
-    fn relay_ask(self: &Arc<Self>, n: &str, title: &str, id: u64, mut questions: Vec<novacode_types::Question>) {
+    /// A child's card, re-opened in the parent's windows with its title in front.
+    fn relay_card(self: &Arc<Self>, n: &str, title: &str, card: crate::relay::Card) {
         self.with(n, |c| c.status = Status::Waiting);
-        for q in &mut questions {
-            q.question = format!("[{title}] {}", q.question);
-        }
-        let (me, n2) = (self.clone(), n.to_string());
+        let (me, n2, title) = (self.clone(), n.to_string(), title.to_string());
         let t = tokio::spawn(async move {
             let slot = me.c().slot.clone();
-            let replies = slot.ask(questions).await;
-            me.send_line(&n2, json!({"type": "answer", "ask": id, "replies": replies}));
+            let label = crate::relay::Label {
+                ask: &format!("[{title}] "),
+                approval: &format!("subagent \"{title}\": "),
+            };
+            let (cmd, _) = crate::relay::relay(&slot, &slot, card, label).await;
+            if let Ok(v) = serde_json::to_value(&cmd) {
+                me.send_line(&n2, v);
+            }
             // Not if it was stopped or finished meanwhile.
             me.with(&n2, |c| {
                 if c.status == Status::Waiting {
@@ -1396,48 +1394,6 @@ impl Supervisor {
             c.relays.retain(|r| !r.is_finished());
             c.relays.push(t.abort_handle());
         });
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn relay_approval(
-        self: &Arc<Self>,
-        n: &str,
-        title: &str,
-        id: u64,
-        tool: String,
-        detail: String,
-        reason: String,
-        rule: String,
-        risky: bool,
-    ) {
-        self.with(n, |c| c.status = Status::Waiting);
-        let key = if tool == "bash" { "command" } else { "path" };
-        let req = ApprovalRequest {
-            tool,
-            args: json!({ key: detail }),
-            reason: format!("subagent \"{title}\": {reason}"),
-            rule,
-            risky,
-        };
-        let (me, n2) = (self.clone(), n.to_string());
-        let t = tokio::spawn(async move {
-            let slot = me.c().slot.clone();
-            let answer = match slot.approve(req).await {
-                Approval::Once => json!("once"),
-                Approval::Session => json!("session"),
-                Approval::Always => json!("always"),
-                Approval::Deny(why) => json!({"deny": why}),
-            };
-            me.send_line(&n2, json!({"type": "approval", "approval": id, "answer": answer}));
-            me.with(&n2, |c| {
-                if c.status == Status::Waiting {
-                    c.status = Status::Running;
-                    // The wait for the user was no stall.
-                    c.last_activity = Instant::now();
-                }
-            });
-        });
-        self.keep_relay(n, &t);
     }
 
     fn send_line(&self, n: &str, v: Value) {
@@ -2349,7 +2305,18 @@ mod tests {
         idle();
         assert!(stalled(), "the exemption ends with the wait");
         // No window: the approval is refused at once, and the child is back to work, active.
-        sup.relay_approval(&n, "t", 1, "bash".into(), "ls".into(), "r".into(), "".into(), false);
+        sup.relay_card(
+            &n,
+            "t",
+            crate::relay::Card::Approve {
+                id: 1,
+                tool: "bash".into(),
+                detail: "ls".into(),
+                reason: "r".into(),
+                rule: "".into(),
+                risky: false,
+            },
+        );
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(sup.with(&n, |c| c.status), Some(Status::Running));
         assert!(fresh(), "answering a relay is activity");

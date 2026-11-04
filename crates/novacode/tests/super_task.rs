@@ -136,7 +136,10 @@ fn super_spawns_a_task_after_the_trust_card_and_stops_it() {
     ];
     let script: String = lines.iter().map(|l| format!("{l}\n")).collect();
     std::fs::write(scripts.join("super.jsonl"), script).unwrap();
-    std::fs::write(scripts.join("T1-note.jsonl"), "").unwrap();
+    // The task keeps working until super stops it: a turn on super's prompt that ended
+    // without a report would be blocked by code and wake super (ST13).
+    let work = json!({"text": "working", "tools": [{"name": "bash", "args": {"command": "sleep 30"}}]});
+    std::fs::write(scripts.join("T1-note.jsonl"), format!("{work}\n")).unwrap();
 
     let out = novacode(&home)
         .current_dir(&root)
@@ -209,12 +212,20 @@ fn super_spawns_a_task_after_the_trust_card_and_stops_it() {
     }
     // It got the brief as its first prompt, and the preamble in its system prompt.
     let mut tc = Conn::open(&home, &session);
-    tc.send(json!({"id": "m", "type": "get_messages"}));
+    let end = Instant::now() + Duration::from_secs(10);
     let msgs = loop {
-        let m = tc.next();
-        if m["type"] == "response" && m["id"] == "m" {
-            break m["data"]["messages"].to_string();
+        tc.send(json!({"id": "m", "type": "get_messages"}));
+        let msgs = loop {
+            let m = tc.next();
+            if m["type"] == "response" && m["id"] == "m" {
+                break m["data"]["messages"].to_string();
+            }
+        };
+        // The brief run takes it up a moment after the prompt is handed in.
+        if msgs.contains("add a note") || Instant::now() > end {
+            break msgs;
         }
+        std::thread::sleep(Duration::from_millis(100));
     };
     assert!(msgs.contains("add a note") && msgs.contains("1. note exists"), "{msgs}");
     assert!(msgs.contains("You are task T1-note"), "{msgs}");

@@ -49,6 +49,10 @@ pub trait Launcher: Send + Sync {
     /// Send one command to a live session.
     fn send<'a>(&'a self, session: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>>;
     fn alive(&self, session: &str) -> bool;
+    /// A lasting connection to a live session's socket, for its link.
+    fn link<'a>(&'a self, _session: &'a str) -> BoxFuture<'a, Result<super::link::Conn, String>> {
+        Box::pin(async { Err("no task sockets".to_string()) })
+    }
 }
 
 /// Super's side of its tasks: the board and everything that changes it.
@@ -60,7 +64,9 @@ pub struct Super {
     pub board: Mutex<Board>,
     cfg: Config,
     asker: Option<Arc<dyn Asker>>,
-    launcher: Arc<dyn Launcher>,
+    pub(super) launcher: Arc<dyn Launcher>,
+    /// The task links (ST13); set once after construction.
+    pub links: std::sync::OnceLock<Arc<super::link::Links>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -136,7 +142,7 @@ fn number(label: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn provider(model: &str) -> &str {
+pub(super) fn provider(model: &str) -> &str {
     model.split('/').next().unwrap_or(model)
 }
 
@@ -258,18 +264,24 @@ impl Super {
             cfg,
             asker,
             launcher,
+            links: std::sync::OnceLock::new(),
         })
     }
 
+    /// novacode's home (goal files, session files).
+    pub fn home(&self) -> &Path {
+        &self.cfg.home
+    }
+
     /// Change the board and save it.
-    fn edit<R>(&self, f: impl FnOnce(&mut Board) -> R) -> Result<R, String> {
+    pub(super) fn edit<R>(&self, f: impl FnOnce(&mut Board) -> R) -> Result<R, String> {
         let mut b = self.board.lock().unwrap();
         let r = f(&mut b);
         b.save(&self.dir).map_err(|e| format!("couldn't save the board: {e}"))?;
         Ok(r)
     }
 
-    fn row(&self, id: &str) -> Result<Task, String> {
+    pub(super) fn row(&self, id: &str) -> Result<Task, String> {
         self.board
             .lock()
             .unwrap()
@@ -603,6 +615,9 @@ impl Super {
                 }
             }
         })?;
+        if let Some(l) = self.links.get() {
+            l.open(id, &session);
+        }
         if resume.is_none() {
             t.pending = pending;
             self.prompt(&session, brief(&t)).await?;
@@ -612,11 +627,19 @@ impl Super {
 
     /// A raw prompt: a brief or message starting with `!` or `/` is not a command.
     async fn prompt(&self, session: &str, text: String) -> Result<(), String> {
-        self.launcher.send(session, ClientCmd::Prompt { text, raw: true }).await
+        let hash = super::board::prompt_hash(&text);
+        self.launcher
+            .send(session, ClientCmd::Prompt { text, raw: true })
+            .await?;
+        self.edit(|b| {
+            if let Some(row) = b.tasks.iter_mut().find(|r| r.session.as_deref() == Some(session)) {
+                row.last_prompt = Some(hash);
+            }
+        })
     }
 
     /// Send `text` to the task, resuming its session first when its process is gone.
-    async fn deliver(&self, id: &str, text: String) -> Result<(), String> {
+    pub(super) async fn deliver(&self, id: &str, text: String) -> Result<(), String> {
         let t = self.row(id)?;
         match &t.session {
             Some(s) if self.launcher.alive(s) => self.prompt(s, text).await,
@@ -1047,6 +1070,18 @@ impl Launcher for Procs {
 
     fn alive(&self, session: &str) -> bool {
         crate::serve::find_live(&self.paths, session).is_ok()
+    }
+
+    fn link<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Result<super::link::Conn, String>> {
+        Box::pin(async move {
+            let f = crate::serve::find_live(&self.paths, session).map_err(|e| e.to_string())?;
+            let s = crate::serve::connect(&f.socket).await.map_err(|e| e.to_string())?;
+            let (r, w) = tokio::io::split(s);
+            Ok(super::link::Conn {
+                read: Box::new(r),
+                write: Box::new(w),
+            })
+        })
     }
 }
 

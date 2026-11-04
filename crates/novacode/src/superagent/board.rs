@@ -173,6 +173,9 @@ pub struct Task {
     pub session: Option<String>,
     /// The folder its process runs in (absolute; in its worktree for a write task).
     pub cwd: Option<PathBuf>,
+    /// Hash of super's last prompt to it ([`prompt_hash`]): the catch-up after a
+    /// reconnect finds it in the task's messages.
+    pub last_prompt: Option<String>,
     /// Unix seconds.
     pub started: u64,
     pub updated: u64,
@@ -642,6 +645,14 @@ impl Board {
         }
         out
     }
+}
+
+/// A stable hash of a prompt's text (FNV-1a, hex): the same in every super process.
+pub fn prompt_hash(text: &str) -> String {
+    let h = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    });
+    format!("{h:016x}")
 }
 
 pub fn now() -> u64 {

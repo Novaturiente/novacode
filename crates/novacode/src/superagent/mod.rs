@@ -6,6 +6,7 @@
 pub mod board;
 pub mod entry;
 pub mod inbox;
+pub mod link;
 pub mod report;
 pub mod task;
 

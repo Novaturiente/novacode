@@ -37,6 +37,7 @@ mod hub;
 mod import;
 mod login;
 mod models;
+mod relay;
 mod schedule;
 mod serve;
 mod stats;
@@ -1540,8 +1541,16 @@ impl Ctx {
                 paths: self.paths.clone(),
             });
             let dir = superagent::entry::dir(home, &self.cwd);
-            let sup = task::Super::new(&self.cwd, dir, cfg, asker.clone(), launcher)?;
-            all.push(Arc::new(task::TaskTool(Arc::new(sup))));
+            let sup = Arc::new(task::Super::new(&self.cwd, dir, cfg, asker.clone(), launcher)?);
+            // Task links (L10.9): relay, code-made reports, inbox, wakes.
+            if let Some(slot) = slot.clone() {
+                let inform = Arc::new(superagent::link::HubInform {
+                    slot: slot.clone(),
+                    desktop: s.get("notifications.enabled").unwrap_or(true),
+                });
+                superagent::link::Links::start(&sup, Arc::new(slot.clone()), Arc::new(slot), inform);
+            }
+            all.push(Arc::new(task::TaskTool(sup)));
         }
         all.push(Arc::new(novacode_tools::todo::Todo::new(
             store.todo().map(|t| t.0).unwrap_or_default(),

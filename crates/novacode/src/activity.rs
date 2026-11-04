@@ -83,6 +83,11 @@ async fn tmux_seen(pane: &str) -> bool {
         == Some("1")
 }
 
+/// A desktop notification from a session with no window of its own (super, L10.9).
+pub async fn desktop(title: String, body: String) {
+    notify(&title, &body, std::env::var_os("TMUX").is_some()).await;
+}
+
 /// OSC 777 to every attached tmux client (reaches the laptop over SSH), or to
 /// our own terminal outside tmux.
 async fn notify(title: &str, body: &str, in_tmux: bool) {
