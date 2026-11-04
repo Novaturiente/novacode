@@ -1221,6 +1221,10 @@ impl Launcher for Procs {
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 use std::io::BufRead;
+                // A missing cwd fails spawn with ENOENT, which reads as a missing binary.
+                if !s.cwd.is_dir() {
+                    return Err(format!("the task folder {} no longer exists", s.cwd.display()));
+                }
                 let mut c = std::process::Command::new(&exe);
                 c.arg("--bg").args(["-m", &s.model]);
                 if s.trust {
