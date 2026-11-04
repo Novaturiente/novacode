@@ -424,10 +424,16 @@ impl Links {
         self.kick.notify_one();
     }
 
+    /// Start a turn of super's (code outside the links: a review that can't start).
+    pub(super) fn wake(&self, text: String) {
+        self.inform.wake(text);
+    }
+
     /// One pass: inbox, holds, links of live tasks not linked yet, then the queue.
     async fn tick(&self) {
         let Some(sup) = self.sup.upgrade() else { return };
-        self.apply_inbox(&sup);
+        self.apply_inbox(&sup).await;
+        self.branch_moves(&sup);
         self.lift_holds(&sup).await;
         let rows: Vec<(String, String)> = {
             let b = sup.board.lock().unwrap();
@@ -484,6 +490,14 @@ impl Links {
 
     /// [`apply`](Self::apply), with `extra` lines for the wake (a report's checks).
     fn apply_with(&self, sup: &Super, id: &str, ev: Event, extra: &str) -> bool {
+        let Ok(before) = sup.row(id) else { return false };
+        if before.kind == board::Kind::Review {
+            // A review row only runs or waits; its turn ends and exits are crashes of the review.
+            return match crash_reason(&ev) {
+                Some(why) => self.review_crashed(sup, &before, why),
+                None => self.apply_row(sup, id, ev),
+            };
+        }
         let had_hold = match &ev {
             Event::TurnLimit(l) => sup.board.lock().unwrap().holds.contains_key(&l.provider),
             _ => true,
@@ -518,16 +532,34 @@ impl Links {
                 ));
             }
         }
-        // shortcut: Effect::StartReview (a write task's `done`) starts its review task with ST15.
-        let changed = n.from != n.to;
-        if changed && matches!(n.to, State::Ready | State::Blocked | State::Failed) {
+        let mut extra = extra.to_string();
+        if let Some(old) = before.reviewer.as_deref().filter(|_| t.reviewer != before.reviewer) {
+            sup.retire_review(old);
+        }
+        let t = if n.effects.iter().any(|e| matches!(e, board::Effect::StartReview { .. })) {
+            match sup.open_review(id, None) {
+                Ok(review) => {
+                    extra += &format!("\nIts review task {review} starts.");
+                }
+                Err(e) => extra += &format!("\nIt is blocked now: {e}"),
+            }
+            match sup.row(id) {
+                Ok(t) => t,
+                Err(_) => return false,
+            }
+        } else {
+            t
+        };
+        let changed = n.from != t.state;
+        if changed && matches!(t.state, State::Ready | State::Blocked | State::Failed) {
             let why = t.block.as_ref().map(|b| b.reason.clone()).or(t.summary.clone());
             self.inform
-                .desktop(format!("{} {}", t.label, n.to.name()), why.unwrap_or_default());
+                .desktop(format!("{} {}", t.label, t.state.name()), why.unwrap_or_default());
         }
         let wakes = match &ev {
             Event::Report { state, .. } => changed && *state != ReportState::Progress,
-            Event::MergeReport(_) => true,
+            Event::MergeReport(_) | Event::Verdict(_) | Event::BranchMoved | Event::ReviewCantStart(_) => true,
+            Event::ReviewCrashed(_) => t.state == State::Blocked,
             Event::TurnUnreported
             | Event::TurnError(_)
             | Event::TurnLimit(_)
@@ -537,12 +569,124 @@ impl Links {
         };
         if wakes {
             self.inform.wake(format!("{}{extra}", wake_text(&t, &ev)));
+        } else if let Event::ReviewCrashed(why) = &ev {
+            self.inform
+                .note(format!("{}'s review task crashed ({why}); one retry.{extra}", t.label));
         }
         changed && n.from == State::Running
     }
 
+    /// A review row's own change (start, card, archive): no wake.
+    fn apply_row(&self, sup: &Super, id: &str, ev: Event) -> bool {
+        match sup.edit(|b| b.apply(id, ev)) {
+            Ok(Ok(n)) => n.from == State::Running && n.to != State::Running,
+            Ok(Err(e)) => {
+                tracing::debug!(task = id, %e, "super: event ignored");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(task = id, %e, "super: board");
+                false
+            }
+        }
+    }
+
+    /// A review task died or ended its turn without a verdict: one new review, then
+    /// the reviewed task is blocked with the reason.
+    fn review_crashed(&self, sup: &Super, rv: &board::Task, why: String) -> bool {
+        if rv.state == State::Archived {
+            return false;
+        }
+        let why = match &rv.summary {
+            Some(s) => format!("{why}; its last report: {s}"),
+            None => why,
+        };
+        let of = rv.reviewer_of.clone().unwrap_or_default();
+        let current = sup
+            .row(&of)
+            .is_ok_and(|t| t.reviewer.as_deref() == Some(rv.id.as_str()));
+        if !current {
+            sup.retire_review(&rv.id);
+            return true;
+        }
+        self.apply_with(sup, &of, Event::ReviewCrashed(format!("{}: {why}", rv.label)), "");
+        true
+    }
+
+    /// Reviewed tasks whose branch moved while their review ran: verdict discarded, back to `running`.
+    fn branch_moves(&self, sup: &Super) {
+        let reviewing: Vec<board::Task> = {
+            let b = sup.board.lock().unwrap();
+            b.tasks
+                .iter()
+                .filter(|t| t.state == State::Reviewing && t.reviewer.is_some())
+                .cloned()
+                .collect()
+        };
+        for t in reviewing {
+            if sup.branch_moved(&t) {
+                self.apply(sup, &t.id, Event::BranchMoved);
+            }
+        }
+    }
+
+    /// A review task's verdict: applied to the task it reviews. Code forwards the
+    /// findings of `needs-proof` and `rejected` word for word; the board counts the round.
+    async fn verdict(&self, sup: &Super, review: &str, f: &serde_json::Map<String, Value>) {
+        let Ok(rv) = sup.row(review) else { return };
+        if let Some(field) = f.get("baseline").filter(|v| v.is_object()) {
+            super::review::record_baseline(sup, &rv, field);
+        }
+        let of = rv.reviewer_of.clone().unwrap_or_default();
+        let current = sup
+            .row(&of)
+            .is_ok_and(|t| t.state == State::Reviewing && t.reviewer.as_deref() == Some(review));
+        if !current {
+            sup.retire_review(review);
+            return;
+        }
+        // The branch moved after the commit under review: the verdict is about old work.
+        if sup.row(&of).is_ok_and(|t| sup.branch_moved(&t)) {
+            self.apply(sup, &of, Event::BranchMoved);
+            return;
+        }
+        let verdict = match f.get("verdict").and_then(Value::as_str) {
+            Some("approved") => board::Verdict::Approved,
+            Some("needs-proof") => board::Verdict::NeedsProof,
+            _ => board::Verdict::Rejected,
+        };
+        let findings: Vec<String> = f
+            .get("findings")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        let list: String = findings.iter().map(|x| format!("\n- {x}")).collect();
+        let extra = if list.is_empty() {
+            String::new()
+        } else {
+            format!("\nFindings:{list}")
+        };
+        self.apply_with(sup, &of, board::Event::Verdict(verdict), &extra);
+        let Ok(t) = sup.row(&of) else { return };
+        if verdict != board::Verdict::Approved && t.state == State::Running {
+            let name = verdict_name(verdict);
+            let text = format!(
+                "Your review ({}) says {name} about commit {}. Its findings, word for word:{list}\n\n\
+Address every finding, commit, re-run your checks and report `done` again.",
+                rv.label,
+                t.done.as_ref().and_then(|d| d.commit.as_deref()).unwrap_or("?"),
+            );
+            if let Err(e) = sup.deliver(&of, text).await {
+                self.inform
+                    .note(format!("{}: the review findings couldn't be sent: {e}", t.label));
+            }
+        }
+    }
+
     /// Apply the inbox's reports in order.
-    fn apply_inbox(&self, sup: &Super) {
+    async fn apply_inbox(&self, sup: &Super) {
         let pending = {
             let b = sup.board.lock().unwrap();
             match super::inbox::read(&sup.dir, &b) {
@@ -577,9 +721,26 @@ impl Links {
                     "pr-opened" => MergeResult::PrOpened,
                     _ => MergeResult::Failed(summary),
                 }),
-                // shortcut: review verdicts are applied with the review loop (ST15); the file waits.
-                (None, None) => continue,
+                (None, None) => {
+                    if f.get("verdict").is_some_and(Value::is_string) {
+                        self.verdict(sup, &r.task, f).await;
+                    }
+                    self.applied(sup, p);
+                    continue;
+                }
             };
+            if let Event::Report {
+                state: ReportState::Done,
+                ..
+            } = &ev
+            {
+                let done = done_facts(f);
+                let _ = sup.edit(|b| {
+                    if let Some(t) = b.tasks.iter_mut().find(|t| t.id == r.task) {
+                        t.done = Some(done);
+                    }
+                });
+            }
             if f.get("write").and_then(Value::as_bool) == Some(true) {
                 let _ = sup.edit(|b| {
                     if let Some(t) = b.tasks.iter_mut().find(|t| t.id == r.task) {
@@ -588,17 +749,22 @@ impl Links {
                 });
             }
             self.apply_with(sup, &r.task, ev, &checks_text(f));
-            let id = r.id.clone();
-            let saved = sup.edit(|b| {
-                if let Some(t) = b.tasks.iter_mut().find(|t| t.id == r.task) {
-                    t.applied.push(id);
-                }
-            });
-            if saved.is_ok()
-                && let Err(e) = p.done()
-            {
-                tracing::warn!(%e, "super: inbox file not deleted");
+            self.applied(sup, p);
+        }
+    }
+
+    /// Record a report as applied and delete its file.
+    fn applied(&self, sup: &Super, p: super::inbox::Pending) {
+        let (task, id) = (p.report.task.clone(), p.report.id.clone());
+        let saved = sup.edit(|b| {
+            if let Some(t) = b.tasks.iter_mut().find(|t| t.id == task) {
+                t.applied.push(id);
             }
+        });
+        if saved.is_ok()
+            && let Err(e) = p.done()
+        {
+            tracing::warn!(%e, "super: inbox file not deleted");
         }
     }
 
@@ -720,6 +886,58 @@ impl Links {
     }
 }
 
+/// Why a review row's turn end or exit is a crash of the review; `None` for its other events.
+fn crash_reason(ev: &Event) -> Option<String> {
+    match ev {
+        Event::ProcessExit => Some("its process exited".into()),
+        Event::TurnUnreported => Some("it ended its turn without a verdict".into()),
+        Event::TurnError(e) => Some(format!("its turn ended on: {e}")),
+        Event::TurnLimit(l) => Some(format!("{} of provider {}", limit_name(l.kind), l.provider)),
+        Event::GoalEnded(how) => Some(how.clone()),
+        _ => None,
+    }
+}
+
+fn verdict_name(v: board::Verdict) -> &'static str {
+    match v {
+        board::Verdict::Approved => "approved",
+        board::Verdict::NeedsProof => "needs-proof",
+        board::Verdict::Rejected => "rejected",
+    }
+}
+
+/// What a `done` report recorded, for the review: commit, files, checks and artifacts.
+fn done_facts(f: &serde_json::Map<String, Value>) -> board::Done {
+    let strings = |k: &str| -> Vec<String> {
+        f.get(k)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    };
+    let checks = f
+        .get("checks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            let code = match &c["exit_code"] {
+                Value::Number(n) => format!("exit {n}"),
+                _ => "no exit code".into(),
+            };
+            let folder = c["folder"].as_str().map(|d| format!(" in {d}")).unwrap_or_default();
+            format!("- `{}`{folder} → {code}", c["command"].as_str().unwrap_or("?"))
+        })
+        .collect();
+    board::Done {
+        commit: f.get("commit").and_then(Value::as_str).map(String::from),
+        files: strings("files_changed"),
+        checks,
+        artifacts: strings("artifacts"),
+    }
+}
+
 /// A task blocked by `provider`'s limit.
 fn blocked_on(t: &board::Task, provider: &str) -> bool {
     t.state == State::Blocked
@@ -775,6 +993,33 @@ fn wake_text(t: &board::Task, ev: &Event) -> String {
         ),
         Event::GoalEnded(_) => format!("{} is blocked (code-made report): {reason}.", t.label),
         Event::ProcessExit => format!("{} failed: its process exited while it was working.", t.label),
+        Event::Verdict(board::Verdict::Approved) => format!(
+            "{}'s review approved it (now {}). If its findings or checks don't support the approval, ask for a \
+second review with `task review`.",
+            t.label,
+            t.state.name()
+        ),
+        Event::Verdict(v) if t.state == State::Blocked => format!(
+            "{}'s review says {} and its review rounds are used up (now blocked). Ask the user how to go on.",
+            t.label,
+            verdict_name(*v)
+        ),
+        Event::Verdict(v) => format!(
+            "{}'s review says {} (round {} of 2): code sent the findings to the task (now {}).",
+            t.label,
+            verdict_name(*v),
+            t.review_rounds,
+            t.state.name()
+        ),
+        Event::BranchMoved => format!(
+            "{}'s branch moved during its review: the verdict is discarded and it is {} again; its next `done` \
+starts a new review.",
+            t.label,
+            t.state.name()
+        ),
+        Event::ReviewCrashed(_) | Event::ReviewCantStart(_) => {
+            format!("{} is blocked: {reason}. Ask the user what to do.", t.label)
+        }
         _ => format!("{} is {}.", t.label, t.state.name()),
     };
     if let Some(q) = &t.question {

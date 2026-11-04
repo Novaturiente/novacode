@@ -118,6 +118,19 @@ pub enum Landed {
     PrOpened,
 }
 
+/// What code recorded from a `done` report: the review judges exactly this.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Done {
+    /// The reported (pinned) commit; `None` outside git.
+    pub commit: Option<String>,
+    pub files: Vec<String>,
+    /// One line per check: its recorded command, folder and exit code.
+    pub checks: Vec<String>,
+    /// Screenshot paths and URLs.
+    pub artifacts: Vec<String>,
+}
+
 /// One board row: only what super owns. Live data (busy, current model,
 /// tokens) comes from the task's run file and socket.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -161,6 +174,8 @@ pub struct Task {
     pub review_crashes: u8,
     /// Ids of reports already applied (inbox dedupe and crash recovery).
     pub applied: Vec<String>,
+    /// The facts of its last `done` report, for its review (never the task's summary).
+    pub done: Option<Done>,
     pub landed: Option<Landed>,
     /// The user's words, sent in the brief (kept so a queued task can start later).
     pub request: String,

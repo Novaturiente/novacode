@@ -217,6 +217,20 @@ pub fn create_new(cwd: &Path, name: &str, copy: &[String]) -> Result<(PathBuf, S
     enter(&main, &EnterArgs { name: free, base: None }, copy)
 }
 
+/// A detached checkout of `commit` at `path` (a review's scratch worktree), with the
+/// `copy` list's untracked files from the main checkout. Removed with `git worktree remove --force`.
+pub fn add_detached(cwd: &Path, path: &Path, commit: &str, copy: &[String]) -> Result<(), String> {
+    let r = repo(cwd)?;
+    git(
+        &r.main,
+        &["worktree", "add", "--detach", &path.to_string_lossy(), commit],
+    )
+    .map_err(|e| format!("git worktree add failed: {e}"))?;
+    novacode_base::git::pin(path, &r.common);
+    copy_untracked(&r.main, path, copy);
+    Ok(())
+}
+
 fn enter(cwd: &Path, a: &EnterArgs, copy: &[String]) -> Result<(PathBuf, String), String> {
     if a.name.is_empty() || !a.name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
         return Err(format!("bad worktree name `{}`: letters, digits, . _ - only", a.name));

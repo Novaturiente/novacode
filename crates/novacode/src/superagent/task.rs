@@ -134,7 +134,7 @@ fn type_name(t: TaskType) -> &'static str {
 }
 
 /// `n` of a `T<n>-…` label.
-fn number(label: &str) -> u64 {
+pub(super) fn number(label: &str) -> u64 {
     label
         .strip_prefix('T')
         .and_then(|r| r.split('-').next())
@@ -146,7 +146,16 @@ pub(super) fn provider(model: &str) -> &str {
     model.split('/').next().unwrap_or(model)
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+/// A task's secret for its reports.
+pub(super) fn new_token() -> String {
+    format!(
+        "{}{}",
+        novacode_base::new_id().simple(),
+        novacode_base::new_id().simple()
+    )
+}
+
+pub(super) fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let o = novacode_base::git::command_in(dir)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -204,13 +213,19 @@ thing super reads; a turn that ends without one is reported as blocked.
 - Edit files only inside your own worktree (or, outside git, your folder): the edit tools refuse anywhere else. \
 Don't write elsewhere with `bash` either. A read task that has to write calls `enter_worktree` first.
 - Commit your work before you report `done`.
+- A review task (its brief says so) reports a `verdict` instead of a `state` and edits only under its \
+/tmp/novacode-review-… scratch folder; the commit rule doesn't apply to it.
 - After a restart or resume: your proof log is empty, so re-run your checks before you cite them, and check \
 your folder and git before repeating anything outside it (a commit, a push, a message)."
     )
 }
 
-/// The brief a task gets as its first prompt.
+/// The brief a task gets as its first prompt. A review row holds its whole brief
+/// (made by [`Super::open_review`]) in `request`.
 fn brief(t: &Task) -> String {
+    if t.kind == Kind::Review {
+        return t.request.clone();
+    }
     let mut s = format!(
         "Task {}: {} ({} task).\n\nThe user's request:\n{}\n",
         t.label,
@@ -273,6 +288,10 @@ impl Super {
         &self.cfg.home
     }
 
+    pub(super) fn cfg(&self) -> &Config {
+        &self.cfg
+    }
+
     /// Change the board and save it.
     pub(super) fn edit<R>(&self, f: impl FnOnce(&mut Board) -> R) -> Result<R, String> {
         let mut b = self.board.lock().unwrap();
@@ -329,10 +348,13 @@ impl Super {
                 Ok(format!("{} is ready.", t.label))
             }
             "review" => {
-                // shortcut: the review task itself starts with ST15 (Effect::StartReview); `note` goes to it then.
-                let _ = a.note;
                 self.edit(|b| b.apply(&t.id, Event::Review))??;
-                Ok(format!("{} is reviewing.", t.label))
+                let review = self.open_review(&t.id, a.note.as_deref())?;
+                let mut out = format!("{} is reviewing; its review task is {review}.", t.label);
+                for n in self.pump().await {
+                    out += &format!("\n{n}");
+                }
+                Ok(out)
             }
             other => Err(format!(
                 "unknown action `{other}`: spawn, send, stop, close, accept, merge, review, list or read"
@@ -384,11 +406,7 @@ impl Super {
             tier,
             model,
             trusted,
-            token: format!(
-                "{}{}",
-                novacode_base::new_id().simple(),
-                novacode_base::new_id().simple()
-            ),
+            token: new_token(),
             write,
             criteria: a.criteria,
             scope: a.scope,
@@ -542,6 +560,16 @@ impl Super {
     async fn start(&self, id: &str) -> Result<(), String> {
         let r = self.start_inner(id).await;
         if let Err(e) = &r {
+            let row = self.row(id)?;
+            if let (Kind::Review, Some(of)) = (row.kind, &row.reviewer_of) {
+                // The review's model has no login, doesn't resolve, …: not a crash, not retried.
+                self.retire_review(id);
+                self.edit(|b| b.apply(of, Event::ReviewCantStart(format!("its review can't start: {e}"))))??;
+                if let Some(l) = self.links.get() {
+                    l.wake(format!("{of} is blocked: its review task {id} can't start: {e}"));
+                }
+                return r;
+            }
             self.edit(|b| {
                 if let Some(t) = b.tasks.iter_mut().find(|t| t.id == id) {
                     t.state = State::Failed;
@@ -559,6 +587,7 @@ impl Super {
         if t.cwd.is_none() {
             let folder = self.root.join(&t.folder);
             let cwd = match (&t.repo, t.write) {
+                _ if t.kind == Kind::Review => self.review_cwd(&t)?,
                 (Some(main), true) => {
                     let rel = repo_of(&folder).map(|(_, rel)| rel).unwrap_or_default();
                     t.base_branch = git(main, &["branch", "--show-current"]).ok().filter(|b| !b.is_empty());
@@ -582,8 +611,18 @@ impl Super {
             })?;
         }
         let cwd = t.cwd.clone().unwrap_or_default();
-        // Its own worktree (other worktrees of the repo stay refused), else its folder.
-        let fence = t.worktree.clone().unwrap_or_else(|| self.root.join(&t.folder));
+        // Its own worktree (other worktrees of the repo stay refused), else its folder;
+        // a review task only its scratch folder.
+        let rule = match t.kind {
+            Kind::Review => format!("review:{}", super::review::scratch_id(&t)),
+            Kind::Work => format!(
+                "worktree:{}",
+                t.worktree
+                    .clone()
+                    .unwrap_or_else(|| self.root.join(&t.folder))
+                    .display()
+            ),
+        };
         let env = vec![
             ("NOVACODE_TASK".to_string(), t.id.clone()),
             ("NOVACODE_TASK_TOKEN".to_string(), t.token.clone()),
@@ -591,10 +630,7 @@ impl Super {
                 "NOVACODE_SUPER_DIR".to_string(),
                 self.dir.to_string_lossy().into_owned(),
             ),
-            (
-                novacode_core::policy::EditRule::ENV.to_string(),
-                format!("worktree:{}", fence.display()),
-            ),
+            (novacode_core::policy::EditRule::ENV.to_string(), rule),
         ];
         let session = self
             .launcher
@@ -667,7 +703,7 @@ impl Super {
         if let Some(s) = r.session.as_deref().filter(|s| self.launcher.alive(s)) {
             let _ = self.launcher.send(s, ClientCmd::Shutdown).await;
         }
-        let _ = self.edit(|b| b.apply(&r.id, Event::Retire));
+        self.retire_review(&r.id);
     }
 
     async fn send(&self, t: &Task, message: &str) -> Result<String, String> {
@@ -869,7 +905,7 @@ If anything fails (a conflict, a dirty main checkout, a failed check), report `m
     }
 
     /// A page of the task's final message (its last reply), by lines.
-    fn read(&self, t: &Task, offset: usize, limit: usize) -> Result<String, String> {
+    pub(super) fn read(&self, t: &Task, offset: usize, limit: usize) -> Result<String, String> {
         let session = t
             .session
             .as_deref()

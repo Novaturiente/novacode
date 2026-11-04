@@ -602,7 +602,7 @@ impl Tool for ReportTool {
                 "question": { "type": "string", "description": "Only with `state: blocked`: what you need answered." },
                 "checks": { "type": "array", "items": { "type": "string" }, "description": "Proof numbers from the `[proof #N]` marks on your bash and process results (e.g. \"#4\"), plus screenshot or file paths and URLs." },
                 "findings": { "type": "array", "items": { "type": "string" }, "description": "Review task: at most 5 findings or proof requests (with the verdict, 1000 characters at most)." },
-                "baseline": { "type": "object", "description": "Review task: base-commit check results, outside the 1000-character cap." }
+                "baseline": { "type": "object", "description": "Review task: base-commit check results, outside the 1000-character cap: {\"checks\": [{\"folder\", \"command\", \"exit_codes\": [first run, re-run], \"failing\": [test names]}]}." }
             }
         })
     }
