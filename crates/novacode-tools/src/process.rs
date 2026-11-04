@@ -187,8 +187,8 @@ fn kill_group(pid: u32) {
     kill_group_hard(pid);
 }
 
-/// Stop this user's processes whose working folder is inside `dir` (a detached daemon a
-/// task left in its worktree): SIGTERM, up to 3 s to exit, then SIGKILL. Never this
+/// Stop this user's processes whose working folder is inside `dir`, or that hold a file open
+/// under it (a detached daemon a task left in its worktree, e.g. codegraph's): SIGTERM, up to 3 s to exit, then SIGKILL. Never this
 /// process or its ancestors. Returns how many it signalled.
 #[cfg(target_os = "linux")]
 pub fn stop_inside(dir: &Path) -> usize {
@@ -204,8 +204,16 @@ pub fn stop_inside(dir: &Path) -> usize {
     while let Some(p) = ppid(*spared.last().unwrap()).filter(|p| *p > 0 && !spared.contains(p)) {
         spared.push(p);
     }
-    // A process that exited (or is a zombie) has no readable cwd.
-    let inside = |pid: u32| std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|c| c.starts_with(&dir));
+    // A process that exited (or is a zombie) has no readable cwd or fds.
+    let under = |link: PathBuf| std::fs::read_link(link).is_ok_and(|c| c.starts_with(&dir));
+    let inside = |pid: u32| {
+        under(format!("/proc/{pid}/cwd").into())
+            || std::fs::read_dir(format!("/proc/{pid}/fd"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|fd| under(fd.path()))
+    };
     let found: Vec<u32> = std::fs::read_dir("/proc")
         .into_iter()
         .flatten()
@@ -1111,6 +1119,26 @@ mod tests {
         );
         let _ = outside.kill();
         let _ = outside.wait();
+    }
+
+    /// R22: codegraph's daemon keeps its db and socket in the worktree but runs from elsewhere.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_inside_ends_a_process_holding_a_file_open_in_the_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let inner = d.path().join("wt/.codegraph");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("codegraph.db"), "index").unwrap();
+        let db = std::fs::File::open(inner.join("codegraph.db")).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .current_dir(d.path())
+            .stdin(db)
+            .spawn()
+            .unwrap();
+        assert_eq!(stop_inside(&d.path().join("wt")), 1);
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "ended by a signal: {status:?}");
     }
 
     #[tokio::test]

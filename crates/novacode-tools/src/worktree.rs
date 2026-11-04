@@ -463,6 +463,11 @@ pub fn here(cwd: &Path) -> Result<Here, String> {
 /// Remove the worktree (git refuses uncommitted changes; an unmerged branch is kept).
 /// Returns what happened, starting with a space.
 pub fn remove(h: &Here) -> String {
+    remove_with(h, &mut || {})
+}
+
+/// `remove`, running `before_git` just before git removes the worktree (tests: a late write).
+fn remove_with(h: &Here, before_git: &mut dyn FnMut()) -> String {
     let (top, main) = (&h.r.top, &h.r.main);
     // Delete copies only when git will then remove the worktree.
     let st = status(&h.r);
@@ -474,17 +479,31 @@ pub fn remove(h: &Here) -> String {
             shown.join(", ")
         );
     }
-    for c in st.copies {
-        let f = top.join(&c);
-        let _ = std::fs::remove_file(&f);
-        // Folders the copies left empty; a folder holding anything else stays.
-        for dir in f.ancestors().skip(1).take_while(|d| d.starts_with(top) && *d != top) {
-            if std::fs::remove_dir(dir).is_err() {
-                break;
+    let delete = |copies: Vec<String>| {
+        for c in copies {
+            let f = top.join(&c);
+            let _ = std::fs::remove_file(&f);
+            // Folders the copies left empty; a folder holding anything else stays.
+            for dir in f.ancestors().skip(1).take_while(|d| d.starts_with(top) && *d != top) {
+                if std::fs::remove_dir(dir).is_err() {
+                    break;
+                }
             }
         }
+    };
+    delete(st.copies);
+    before_git();
+    let gone = || git(main, &["worktree", "remove", &top.to_string_lossy()]);
+    let mut res = gone();
+    // A daemon wrote into a copied folder meanwhile: if that is all git saw, delete it and retry once.
+    if res.is_err() {
+        let st = status(&h.r);
+        if st.work.is_empty() && !st.copies.is_empty() {
+            delete(st.copies);
+            res = gone();
+        }
     }
-    match git(main, &["worktree", "remove", &top.to_string_lossy()]) {
+    match res {
         Err(e) => format!(" Worktree NOT removed: {e}"),
         Ok(_) if h.branch.is_empty() => " Worktree removed.".into(),
         Ok(_) if git(main, &["branch", "-d", &h.branch]).is_ok() => {
@@ -876,6 +895,21 @@ mod tests {
         std::fs::write(wt.join(".codegraph/daemon.log"), "log").unwrap();
         assert_eq!(here(&wt).unwrap().dirty, 0);
         let out = remove(&here(&wt).unwrap());
+        assert!(out.contains("Worktree and branch worktree-t removed"), "{out}");
+        assert!(!wt.exists());
+    }
+
+    /// R22: a daemon writes into a copied folder after its copies were deleted, before git removes.
+    #[test]
+    fn a_file_reappearing_in_a_copied_folder_does_not_block_removal() {
+        let (_d, _root, wt) = copied_worktree();
+        let mut once = true;
+        let out = remove_with(&here(&wt).unwrap(), &mut || {
+            if std::mem::take(&mut once) {
+                std::fs::create_dir_all(wt.join(".codegraph")).unwrap();
+                std::fs::write(wt.join(".codegraph/daemon.log"), "late").unwrap();
+            }
+        });
         assert!(out.contains("Worktree and branch worktree-t removed"), "{out}");
         assert!(!wt.exists());
     }
