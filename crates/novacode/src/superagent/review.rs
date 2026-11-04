@@ -267,6 +267,20 @@ recorded, never the task's own summary.\n\nThe user's request:\n{}\n",
             s += &format!("- {}\n", f.trim());
         }
     }
+    if !t.asked.is_empty() {
+        s += "\nRecorded questions and answers (code's record, not the task's words): cards the task opened, \
+relayed to the user, with the answer given:\n";
+        for a in &t.asked {
+            let options = match a.options.is_empty() {
+                true => String::new(),
+                false => format!(" (options: {})", a.options.join(", ")),
+            };
+            s += &format!(
+                "- {} (unix time {}): {}{options}; answered: {}\n",
+                a.kind, a.at, a.text, a.answer
+            );
+        }
+    }
     if !t.criteria.is_empty() {
         s += "\nAcceptance criteria: check each one and name it in your findings as met or not met, with its proof.\n";
         for (n, c) in t.criteria.iter().enumerate() {
@@ -1101,6 +1115,36 @@ mod tests {
             "{brief}"
         );
         assert_eq!(fx.row("T1-fix").follow_ups, ["also add a README line"]);
+    }
+
+    #[tokio::test]
+    async fn the_review_brief_lists_the_recorded_questions_and_answers() {
+        let fx = fixture("faux/review");
+        let wt = fx.spawn("fix", "standard", "change").await;
+        fx.sup
+            .edit(|b| {
+                let row = b.tasks.iter_mut().find(|r| r.id == "T1-fix").unwrap();
+                row.asked.push(board::Asked {
+                    kind: "question".into(),
+                    text: "which port?".into(),
+                    options: vec!["8080".into(), "3000".into()],
+                    answer: "8080".into(),
+                    at: 1,
+                });
+            })
+            .unwrap();
+        let c1 = fx.commit(&wt, "src/a.rs");
+        fx.done("T1-fix", &c1, &["src/a.rs"]);
+        let rv = fx.review_of("T1-fix").await;
+        let brief = fx.prompts(&rv.session.clone().unwrap()).remove(0);
+        let at = brief
+            .find("Recorded questions and answers (code's record, not the task's words)")
+            .unwrap_or_else(|| panic!("{brief}"));
+        let rest = &brief[at..];
+        assert!(
+            rest.contains("which port?") && rest.contains("8080, 3000") && rest.contains("answered: 8080"),
+            "{brief}"
+        );
     }
 
     #[tokio::test]

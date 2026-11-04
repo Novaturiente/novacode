@@ -487,7 +487,7 @@ struct Inner {
     /// Task id → its link.
     links: HashMap<String, LinkSlot>,
     /// (task id, the task's card id) → super's copy.
-    cards: HashMap<(String, u64), tokio::task::AbortHandle>,
+    cards: HashMap<(String, u64), (tokio::task::AbortHandle, board::Asked)>,
     tasks: Vec<tokio::task::AbortHandle>,
 }
 
@@ -503,7 +503,7 @@ impl Drop for Links {
         for l in g.links.values() {
             l.task.abort();
         }
-        for c in g.cards.values() {
+        for (c, _) in g.cards.values() {
             c.abort();
         }
         for t in &g.tasks {
@@ -1166,7 +1166,7 @@ Address every finding, commit, re-run your checks and report `done` again.",
         }
         let keys: Vec<_> = g.cards.keys().filter(|(t, _)| t == id).cloned().collect();
         for k in keys {
-            if let Some(c) = g.cards.remove(&k) {
+            if let Some((c, _)) = g.cards.remove(&k) {
                 c.abort();
             }
         }
@@ -1196,6 +1196,7 @@ Address every finding, commit, re-run your checks and report `done` again.",
         let (me, id2, what) = (self.me.clone(), id.to_string(), card.what());
         let (asker, approver) = (self.asker.clone(), self.approver.clone());
         let card_id = card.id();
+        let asked = asked_of(&card);
         let t = tokio::spawn(async move {
             let l = format!("[{label}] ");
             let (cmd, said) =
@@ -1211,10 +1212,11 @@ Address every finding, commit, re-run your checks and report `done` again.",
             }
             if let Some(me) = me.upgrade() {
                 me.inform.note(format!("{label} asked {what}; you answered: {said}"));
+                me.record(&id2, card_id, said);
                 me.card_closed(&id2, card_id);
             }
         });
-        g.cards.insert(key, t.abort_handle());
+        g.cards.insert(key, (t.abort_handle(), asked));
         drop(g);
         self.apply(&sup, id, Event::CardOpened);
         let label = sup.row(id).map(|t| t.label).unwrap_or_default();
@@ -1224,10 +1226,18 @@ Address every finding, commit, re-run your checks and report `done` again.",
 
     /// The task's card was answered in its own window: close super's copy.
     fn card_done(&self, id: &str, card_id: u64) {
-        let Some(h) = self.inner.lock().unwrap().cards.remove(&(id.to_string(), card_id)) else {
+        let Some((h, _)) = self
+            .inner
+            .lock()
+            .unwrap()
+            .cards
+            .get(&(id.to_string(), card_id))
+            .cloned()
+        else {
             return;
         };
         h.abort();
+        self.record(id, card_id, "answered in the task's own window".into());
         if let Some(sup) = self.sup.upgrade() {
             let label = sup.row(id).map(|t| t.label).unwrap_or_default();
             self.inform
@@ -1251,6 +1261,28 @@ Address every finding, commit, re-run your checks and report `done` again.",
         }
     }
 
+    /// Note a relayed card's answer on the task's row, for its review (R25).
+    fn record(&self, id: &str, card_id: u64, answer: String) {
+        let Some(mut a) = self
+            .inner
+            .lock()
+            .unwrap()
+            .cards
+            .get(&(id.to_string(), card_id))
+            .map(|(_, a)| a.clone())
+        else {
+            return;
+        };
+        let Some(sup) = self.sup.upgrade() else { return };
+        a.answer = answer;
+        a.at = board::now();
+        let _ = sup.edit(|b| {
+            if let Some(row) = b.tasks.iter_mut().find(|r| r.id == id) {
+                row.record_asked(a);
+            }
+        });
+    }
+
     fn card_closed(&self, id: &str, card_id: u64) {
         let mut g = self.inner.lock().unwrap();
         g.cards.remove(&(id.to_string(), card_id));
@@ -1259,6 +1291,31 @@ Address every finding, commit, re-run your checks and report `done` again.",
         if !open && let Some(sup) = self.sup.upgrade() {
             self.apply(&sup, id, Event::LastCardAnswered);
         }
+    }
+}
+
+/// A card's record without its answer yet.
+fn asked_of(card: &Card) -> board::Asked {
+    let (kind, options) = match card {
+        Card::Ask { questions, .. } => (
+            "question",
+            questions
+                .iter()
+                .flat_map(|q| q.options.iter().map(|c| c.label.clone()))
+                .collect(),
+        ),
+        Card::Approve { .. } => ("approval", vec![]),
+    };
+    let what = card.what();
+    let mut text: String = what.chars().take(board::ASKED_TEXT).collect();
+    if text.len() < what.len() {
+        text.push('…');
+    }
+    board::Asked {
+        kind: kind.into(),
+        text,
+        options,
+        ..board::Asked::default()
     }
 }
 
@@ -2486,6 +2543,102 @@ mod tests {
             ),
             "{:?}",
             r.cmd
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relayed_question_and_its_answer_are_recorded_on_the_row_keeping_the_last_10() {
+        let fx = fixture(5);
+        let s = fx.task("T1-x", "faux/a", State::Running);
+        let mut t = fx.end(&s).await;
+        let port = |id| ServerMsg::Ask {
+            id,
+            questions: vec![Question {
+                question: format!("which port? {}", "x".repeat(300)),
+                header: None,
+                options: ["8080", "3000"]
+                    .map(|l| novacode_types::Choice {
+                        label: l.into(),
+                        description: None,
+                        preview: None,
+                        recommended: false,
+                    })
+                    .to_vec(),
+                multi: false,
+            }],
+        };
+        for n in 1..=12u64 {
+            t.put(port(n)).await;
+            fx.until("asked", |fx| fx.asker.waiting.lock().unwrap().len() == 1)
+                .await;
+            let tx = fx.asker.waiting.lock().unwrap().remove(0);
+            let reply = Reply {
+                question: "which port?".into(),
+                chosen: vec![format!("{}", 8000 + n)],
+                text: None,
+                preview: None,
+            };
+            tx.send(Some(vec![reply])).unwrap();
+            t.cmd().await;
+            let want = format!("{}", 8000 + n);
+            fx.until("recorded", |fx| {
+                fx.sup
+                    .row("T1-x")
+                    .unwrap()
+                    .asked
+                    .last()
+                    .is_some_and(|a| a.answer == want)
+            })
+            .await;
+        }
+        let asked = fx.sup.row("T1-x").unwrap().asked;
+        assert_eq!(asked.first().unwrap().answer, "8003", "the oldest two dropped");
+        let last = asked.last().unwrap();
+        assert_eq!((last.kind.as_str(), last.answer.as_str()), ("question", "8012"));
+        assert!(
+            last.text.starts_with("which port? x") && last.text.chars().count() <= 201,
+            "{}",
+            last.text
+        );
+        assert_eq!(last.options, ["8080", "3000"]);
+        assert!(last.at > 0);
+    }
+
+    #[tokio::test]
+    async fn a_relayed_approval_and_a_card_answered_in_the_task_window_are_recorded() {
+        let fx = fixture(5);
+        let s = fx.task("T1-x", "faux/a", State::Running);
+        let mut t = fx.end(&s).await;
+        t.put(ServerMsg::Approve {
+            id: 4,
+            tool: "bash".into(),
+            detail: "rm -rf target".into(),
+            reason: "risky".into(),
+            rule: "bash(rm *)".into(),
+            risky: true,
+        })
+        .await;
+        t.cmd().await;
+        fx.until("approval recorded", |fx| fx.sup.row("T1-x").unwrap().asked.len() == 1)
+            .await;
+        let a = fx.sup.row("T1-x").unwrap().asked.remove(0);
+        assert_eq!(
+            (a.kind.as_str(), a.text.as_str(), a.answer.as_str()),
+            ("approval", "to run bash rm -rf target", "allowed once")
+        );
+
+        t.put(ask(5)).await;
+        fx.until("asked", |fx| fx.asker.waiting.lock().unwrap().len() == 1)
+            .await;
+        t.put(ServerMsg::AskDone { id: 5 }).await;
+        fx.until("window answer recorded", |fx| {
+            fx.sup.row("T1-x").unwrap().asked.len() == 2
+        })
+        .await;
+        let q = fx.sup.row("T1-x").unwrap().asked.remove(1);
+        assert_eq!(
+            (q.kind.as_str(), q.text.as_str(), q.answer.as_str()),
+            ("question", "which db?", "answered in the task's own window")
         );
     }
 

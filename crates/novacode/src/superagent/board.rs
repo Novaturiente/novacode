@@ -172,6 +172,25 @@ pub struct Done {
     pub from_commits: bool,
 }
 
+/// A task's card super's code relayed, with its answer (L10.9 R25).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Asked {
+    /// `question` or `approval`.
+    pub kind: String,
+    /// The question, or what the approval would run (cut to [`ASKED_TEXT`] chars).
+    pub text: String,
+    pub options: Vec<String>,
+    pub answer: String,
+    /// Unix seconds.
+    pub at: u64,
+}
+
+/// Cards kept per row.
+pub const ASKED_KEPT: usize = 10;
+/// Chars of a card's text kept.
+pub const ASKED_TEXT: usize = 200;
+
 /// One board row: only what super owns. Live data (busy, current model,
 /// tokens) comes from the task's run file and socket.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -233,6 +252,9 @@ pub struct Task {
     pub pending: Vec<String>,
     /// Follow-ups super sent with `task send` (not code's resends): the review brief carries them.
     pub follow_ups: Vec<String>,
+    /// Its relayed cards and their answers, as code saw them (the last [`ASKED_KEPT`]): the review brief carries them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub asked: Vec<Asked>,
     /// The task's session id, once its process started.
     pub session: Option<String>,
     /// The folder its process runs in (absolute; in its worktree for a write task).
@@ -248,6 +270,13 @@ pub struct Task {
 }
 
 impl Task {
+    /// Record a relayed card's answer, keeping the last [`ASKED_KEPT`].
+    pub fn record_asked(&mut self, a: Asked) {
+        self.asked.push(a);
+        let extra = self.asked.len().saturating_sub(ASKED_KEPT);
+        self.asked.drain(..extra);
+    }
+
     /// The state with its block reason or marks: `blocked: quota`, `ready (merged)`,
     /// `reviewing (your call)` for a read task no review task judges.
     pub fn state_text(&self) -> String {
