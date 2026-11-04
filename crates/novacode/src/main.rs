@@ -1359,6 +1359,7 @@ impl Ctx {
         asker: Option<Arc<dyn novacode_tools::ask::Asker>>,
         slot: Option<hub::HubSlot>,
     ) -> anyhow::Result<(Agent, String)> {
+        let mut store = store;
         let carry = self.carry.lock().unwrap().take();
         // A resumed session keeps its own model unless -m says otherwise.
         let resumed = match (&self.cli.model, store.last_model()) {
@@ -1513,6 +1514,29 @@ impl Ctx {
         all.push(Arc::new(novacode_tools::todo::Todo::new(
             store.todo().map(|t| t.0).unwrap_or_default(),
         )));
+        // A super task's own session (L10.9): the `report` tool and its proof log; never in a subagent.
+        let task = {
+            use superagent::report::Identity;
+            let vars = Identity::from_vars(|v| std::env::var(v).ok());
+            let saved = Identity::saved(store.branch());
+            let task = Identity::resolve(agents::Place::from_env().depth, vars, saved.clone());
+            if let Some(id) = task.as_ref().filter(|id| saved.as_ref() != Some(*id)) {
+                // A failed write stays in memory and goes out with the next flush.
+                if let Err(e) = store.append(id.entry()) {
+                    tracing::warn!("super task identity not saved yet: {e}");
+                }
+            }
+            task.map(|id| {
+                let proof = Arc::new(superagent::report::ProofLog::default());
+                let seq = superagent::report::last_seq(store.branch());
+                all.push(Arc::new(superagent::report::ReportTool::new(
+                    id.clone(),
+                    proof.clone(),
+                    seq,
+                )));
+                (id, proof)
+            })
+        };
         if store.path().is_some() {
             all.push(Arc::new(novacode_core::export::SessionSearch {
                 sessions_root: self.paths.home().join("sessions"),
@@ -1801,6 +1825,9 @@ impl Ctx {
             )),
             Arc::new(novacode_core::hooks::BashWrites),
         ];
+        if let Some((_, proof)) = &task {
+            handlers.push(proof.clone());
+        }
         if !novacode_core::hooks::disabled() {
             let hook_cfg: novacode_core::hooks::Config = s.get("hooks").unwrap_or_default();
             let cmds = Arc::new(novacode_core::hooks::Commands {
@@ -1878,6 +1905,13 @@ impl Ctx {
         }
         if let Some(c) = carry {
             agent = agent.adopt(c);
+        }
+        if let Some((id, proof)) = task {
+            if let Some(pm) = agent.processes() {
+                proof.watch(pm);
+            }
+            superagent::report::spawn_writer(agent.subscribe(), id.dir.clone());
+            superagent::report::rewrite_unapplied(agent.store.branch(), &id);
         }
         Ok((agent, route.spec()))
     }

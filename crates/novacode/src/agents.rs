@@ -1190,6 +1190,10 @@ impl Supervisor {
         let mut chain = self.place.chain.clone();
         chain.push(self.me.clone());
         cmd.envs(&self.c().env);
+        // A super task's subagents can't report for it (L10.9).
+        for v in novacode_tools::env::TASK_VARS {
+            cmd.env_remove(v);
+        }
         cmd.current_dir(&cwd)
             .env("NOVACODE_HOME", &self.home)
             .env("NOVACODE_AGENT_DEPTH", (self.place.depth + 1).to_string())
@@ -1934,7 +1938,7 @@ mod tests {
             "    time.sleep(0.3)".into(),
             format!("    print({:?}, flush=True)", ev(AgentEvent::AgentStart)),
             format!(
-                "    print({reply:?}.replace('REPLY', os.getcwd() + ' :: ' + m['text'].split(chr(10))[-1] + os.environ.get('NC_ENV', '') + ' ARGS ' + ' '.join(sys.argv[1:])), flush=True)"
+                "    print({reply:?}.replace('REPLY', os.getcwd() + ' :: ' + m['text'].split(chr(10))[-1] + os.environ.get('NC_ENV', '') + os.environ.get('NOVACODE_TASK', '') + ' ARGS ' + ' '.join(sys.argv[1:])), flush=True)"
             ),
             format!("    print({:?}, flush=True)", ev(AgentEvent::Settled)),
         ];
@@ -2098,7 +2102,11 @@ mod tests {
             max_running: 4,
             exe: Some(fake_child(&tmp)),
             nerd: false,
-            env: [("NC_ENV".to_string(), " env-set".to_string())].into(),
+            env: [
+                ("NC_ENV".to_string(), " env-set".to_string()),
+                ("NOVACODE_TASK".to_string(), " task-leak".to_string()),
+            ]
+            .into(),
             root: None,
             policy: Arc::new(novacode_core::policy::Policy::new(
                 Default::default(),
@@ -2125,6 +2133,10 @@ mod tests {
             out.matches(" env-set").count(),
             3,
             "`agents.env` reaches every child: {out}"
+        );
+        assert!(
+            !out.contains("task-leak"),
+            "a task's identity never reaches its subagents: {out}"
         );
         assert_eq!(sup.children.lock().unwrap().len(), 3);
         let started: Vec<u64> = ["a1", "a2", "a3"]

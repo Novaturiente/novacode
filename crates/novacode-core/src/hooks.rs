@@ -23,6 +23,8 @@ pub struct Run {
     pub duration_ms: u64,
     /// Absolute paths the call changed (or, for `read`, looked at).
     pub touched: Vec<PathBuf>,
+    /// The folder the call ran in.
+    pub cwd: PathBuf,
 }
 
 impl Run {
@@ -144,7 +146,7 @@ pub enum Gate {
 }
 
 pub trait Handler: Send + Sync {
-    /// Tag of its feedback in the result (`[hook] …`, `[diagnostics] …`).
+    /// Tag of its feedback in the result (`[hook] …`, `[diagnostics] …`); empty = no tag.
     fn label(&self) -> &str {
         "hook"
     }
@@ -233,6 +235,7 @@ impl Hooks {
             call_id: call_id.into(),
             duration_ms: started.t0.elapsed().as_millis() as u64,
             touched,
+            cwd: cwd.to_path_buf(),
         };
         for h in &self.handlers {
             let Some(a) = h.after_tool(tool, args, out, &run).await else {
@@ -246,8 +249,12 @@ impl Hooks {
             }
             if let Some(text) = a.append.filter(|t| !t.trim().is_empty()) {
                 let text: String = text.trim().chars().take(8000).collect();
-                out.content
-                    .push(novacode_types::Block::text(format!("[{}] {text}", h.label())));
+                // An empty label appends the text as is (the proof log's `[proof #N]`).
+                let text = match h.label() {
+                    "" => text,
+                    label => format!("[{label}] {text}"),
+                };
+                out.content.push(novacode_types::Block::text(text));
             }
         }
     }
@@ -656,6 +663,38 @@ mod tests {
                 })
             })
         }
+    }
+
+    /// A handler with no label appends its text bare, and sees the call's folder.
+    struct Bare;
+    impl Handler for Bare {
+        fn label(&self) -> &str {
+            ""
+        }
+        fn after_tool<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a Value,
+            _: &'a ToolOutput,
+            run: &'a Run,
+        ) -> BoxFuture<'a, Option<After>> {
+            let text = format!("[proof #1] {}", run.cwd.display());
+            Box::pin(async move { Some(After::append(text)) })
+        }
+    }
+
+    #[tokio::test]
+    async fn unlabelled_feedback_is_appended_bare() {
+        let d = tempfile::tempdir().unwrap();
+        let hooks = Hooks {
+            handlers: vec![Arc::new(Bare)],
+        };
+        let mut out = ToolOutput::text("ran");
+        let started = hooks.start("bash", d.path()).await;
+        hooks
+            .after_tool("c1", "bash", &json!({"command": "x"}), d.path(), started, &mut out)
+            .await;
+        assert_eq!(text(&out), format!("ran\n[proof #1] {}", d.path().display()));
     }
 
     #[tokio::test]
