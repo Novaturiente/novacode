@@ -753,11 +753,11 @@ impl Super {
         self.retire_review(&r.id);
     }
 
-    /// `task accept`: a read task in `reviewing`, or a write task whose review rounds are
-    /// used up, after the user's OK on a card made by code.
+    /// `task accept`: a read task in `reviewing` or blocked by code, or a write task whose
+    /// review rounds are used up, after the user's OK on a card made by code.
     async fn accept(&self, t: &Task) -> Result<String, String> {
         self.check(&t.id, Event::Accept)?;
-        if t.state == State::Blocked {
+        if t.state == State::Blocked && t.write {
             let q = format!(
                 "Accept {} without an approved review? Its review rounds are used up; it becomes ready, \
                  marked accepted without review, and can be merged.",
@@ -1162,7 +1162,7 @@ impl Tool for TaskTool {
         "task"
     }
     fn description(&self) -> &str {
-        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], scope?, skills?[], goal?}; send {task, message, question?}; stop {task}; close {task} and merge {task, pr?} (each asks the user on a card); accept {task} (a read task in reviewing; a write task blocked by used-up review rounds, after the user's OK on a card); review {task, note?}; list {all?}; read {task, offset?, limit?} (pages the task's final message)."
+        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], scope?, skills?[], goal?}; send {task, message, question?}; stop {task}; close {task} and merge {task, pr?} (each asks the user on a card; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task blocked by used-up review rounds, after the user's OK on a card); review {task, note?}; list {all?}; read {task, offset?, limit?} (pages the task's final message)."
     }
     fn schema(&self) -> Value {
         let s = |d: &str| json!({ "type": "string", "description": d });
@@ -1923,6 +1923,20 @@ mod tests {
         assert!(fx.launcher.prompts("s1").last().unwrap().contains("merge: merged"));
         let q = fx.asker.asked.lock().unwrap()[1].question.clone();
         assert!(q.contains("Merge T1-m?") && q.contains("worktree-T1-m"), "{q}");
+    }
+
+    #[tokio::test]
+    async fn accept_of_a_read_task_blocked_by_code_needs_no_card() {
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "q", false)).await.unwrap();
+        fx.sup
+            .edit(|b| b.apply("T1-q", Event::TurnUnreported))
+            .unwrap()
+            .unwrap();
+        run(&fx, json!({"action": "accept", "task": "T1-q"})).await.unwrap();
+        assert_eq!(state(&fx, "T1-q"), State::Ready);
+        assert!(fx.asker.asked.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

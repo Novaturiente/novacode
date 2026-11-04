@@ -121,6 +121,9 @@ pub struct Block {
     /// so the task's own terminal report still applies (R18).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub code_made: bool,
+    /// Made by a failed merge or a merge exit: an approved task may merge again (R19).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub merge: bool,
 }
 
 impl Block {
@@ -129,11 +132,17 @@ impl Block {
             reason: reason.into(),
             limit: None,
             code_made: false,
+            merge: false,
         }
     }
 
     fn code_made(mut self) -> Block {
         self.code_made = true;
+        self
+    }
+
+    fn merge(mut self) -> Block {
+        self.merge = true;
         self
     }
 }
@@ -454,13 +463,14 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
         if let Some(to) = to {
             let mut n = with(to, Effect::CheckMergeLeft)?;
             if to == Blocked {
-                n.block = Some(turn_block(ev));
+                n.block = Some(turn_block(ev).merge());
             }
             return Ok(n);
         }
     }
 
     let reviewing = t.reviewer.is_some();
+    let block_is = |f: fn(&Block) -> bool| t.block.as_ref().is_some_and(f);
     // A code-made block is provisional: the task's own terminal report applies as from `running`.
     let from_report = match from {
         Blocked if t.block.as_ref().is_some_and(|b| b.code_made) => Running,
@@ -494,6 +504,8 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
         (Event::Restart, Running | WaitingYou) => go(Interrupted),
 
         (Event::Accept, Reviewing) if !t.write => go(Ready),
+        // A read task that answered in text without `report` (R20).
+        (Event::Accept, Blocked) if !t.write && block_is(|b| b.code_made) => go(Ready),
         (Event::Accept, Reviewing) => Err(format!(
             "{}: a write task becomes ready only through an approved review",
             t.label
@@ -530,7 +542,8 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
             }
         }
 
-        (Event::Merge, Ready) => {
+        // Retry a failed merge while the approval still covers the done commit (R19).
+        (Event::Merge, Ready | Blocked) if from == Ready || block_is(|b| b.merge) && t.approval_covers_done() => {
             if t.repo.is_none() {
                 Err(format!(
                     "{} is not in a git repo; nothing to merge: ask the user whether to close it (`task close`)",
@@ -546,7 +559,7 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
         }
         (Event::MergeReport(m), Merging) => match m {
             MergeResult::Merged | MergeResult::PrOpened => go(Ready),
-            MergeResult::Failed(why) => blocked(Block::new(why.clone())),
+            MergeResult::Failed(why) => blocked(Block::new(why.clone()).merge()),
         },
 
         (Event::Send, Blocked | Failed | Stopped | Ready | Interrupted) => go(Running),
@@ -568,6 +581,7 @@ fn turn_block(ev: &Event) -> Block {
             reason: limit.kind.label().into(),
             limit: Some(limit.clone()),
             code_made: false,
+            merge: false,
         },
         _ => Block::new("ended its turn without a report"),
     }
@@ -644,7 +658,7 @@ impl Board {
             t.landed = None;
             t.accepted = false;
         }
-        if ev == Event::Accept && n.from == State::Blocked {
+        if ev == Event::Accept && n.from == State::Blocked && t.write {
             t.accepted = true;
         }
         let ends_review = matches!(
@@ -712,7 +726,7 @@ impl Board {
             .find(|t| t.id == id)
             .ok_or_else(|| format!("no task {id}"))?;
         t.state = State::Blocked;
-        t.block = Some(Block::new(reason));
+        t.block = Some(Block::new(reason).merge());
         t.updated = now();
         Ok(())
     }
@@ -1013,6 +1027,7 @@ mod tests {
                 reason: "quota".into(),
                 limit: Some(limit()),
                 code_made: true,
+                merge: false,
             }),
             ..row(Blocked)
         };
@@ -1076,6 +1091,82 @@ mod tests {
         assert!(b.render().contains("ready (accepted without review)"));
         b.apply("T1", Event::Send).unwrap();
         assert!(!b.task("T1").unwrap().accepted, "cleared when it works again");
+    }
+
+    #[test]
+    fn a_read_task_blocked_by_code_can_be_accepted() {
+        // R20: a read task answered in text without `report`; super judges the answer.
+        let read = |state| Task {
+            write: false,
+            ..row(state)
+        };
+        let mut b = Board {
+            tasks: vec![read(Running)],
+            ..Board::default()
+        };
+        b.apply("T1", Event::TurnUnreported).unwrap();
+        b.apply("T1", Event::Accept).unwrap();
+        let t = b.task("T1").unwrap();
+        assert_eq!((t.state, t.state_text()), (Ready, "ready".into()));
+        // A block the task reported, or a write task's code-made block, still refuses accept.
+        let mut b = Board {
+            tasks: vec![
+                read(Running),
+                Task {
+                    id: "T2".into(),
+                    ..row(Running)
+                },
+            ],
+            ..Board::default()
+        };
+        b.apply("T1", report(ReportState::Blocked)).unwrap();
+        assert!(b.apply("T1", Event::Accept).is_err(), "reported block");
+        b.apply("T2", Event::TurnUnreported).unwrap();
+        assert!(b.apply("T2", Event::Accept).is_err(), "write task");
+    }
+
+    #[test]
+    fn a_failed_merge_of_an_approved_task_can_be_retried() {
+        // R19: the merge failed on a dirty main checkout; once it is clean, merge again.
+        let approved = |id: &str, done: &str| Task {
+            id: id.into(),
+            label: format!("{id}-x"),
+            repo: Some(format!("/r{id}").into()),
+            done: Some(Done {
+                commit: Some(done.into()),
+                ..Done::default()
+            }),
+            approved_commit: Some("c1".into()),
+            ..row(Ready)
+        };
+        let mut b = Board {
+            tasks: vec![approved("T1", "c1"), approved("T2", "c1"), approved("T3", "c2")],
+            ..Board::default()
+        };
+        let failed = Event::MergeReport(MergeResult::Failed("main checkout has uncommitted changes".into()));
+        for id in ["T1", "T2", "T3"] {
+            b.apply(id, Event::Merge).unwrap();
+        }
+        b.apply("T1", failed.clone()).unwrap();
+        b.apply("T1", Event::Merge).unwrap();
+        assert_eq!(b.task("T1").unwrap().state, Merging);
+        assert_eq!(b.merge_locks.get(Path::new("/rT1")).map(String::as_str), Some("T1"));
+        // A merge exit's block (a turn end while merging) is a merge block too.
+        b.apply("T2", Event::TurnUnreported).unwrap();
+        b.apply("T2", Event::Merge).unwrap();
+        // Not when the done commit is not the approved one.
+        b.apply("T3", failed).unwrap();
+        assert!(b.apply("T3", Event::Merge).is_err(), "unapproved commit");
+        // Other blocks still refuse merge.
+        let other = Task {
+            block: Some(Block::new("reported blocked")),
+            ..approved("T4", "c1")
+        };
+        let other = Task {
+            state: Blocked,
+            ..other
+        };
+        assert!(next(&other, &Event::Merge, None).is_err(), "other block");
     }
 
     #[test]
