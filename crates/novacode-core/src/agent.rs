@@ -168,9 +168,9 @@ struct Memory {
     auto_name: bool,
     /// What the last naming was based on: `start`, or a compaction's id.
     named_for: Option<String>,
-    /// This session's own compaction instructions (super's, L10.9): given to the
-    /// summary model and repeated after the summary.
-    guide: Option<String>,
+    /// This session's own compaction instructions (super's, L10.9): made at each
+    /// compaction, given to the summary model and repeated after the summary.
+    guide: Option<Arc<dyn Fn() -> String + Send + Sync>>,
 }
 
 /// What a background observer run produced.
@@ -799,9 +799,14 @@ impl Agent {
     }
 
     /// Compaction instructions of this session (after `with_memory`).
-    pub fn with_compaction_guide(mut self, text: String) -> Self {
+    pub fn with_compaction_guide(self, text: String) -> Self {
+        self.with_compaction_guide_fn(Arc::new(move || text.clone()))
+    }
+
+    /// Compaction instructions made when a compaction runs (super's carry its board then).
+    pub fn with_compaction_guide_fn(mut self, f: Arc<dyn Fn() -> String + Send + Sync>) -> Self {
         if let Some(m) = self.memory.as_mut() {
-            m.guide = Some(text);
+            m.guide = Some(f);
         }
         self
     }
@@ -1081,7 +1086,12 @@ impl Agent {
         self.collect_notes(true).await;
         let tokens_before = self.context_tokens();
         let Some(m) = self.memory.as_ref() else { return false };
-        let (settings, worker, observe, guide) = (m.settings.clone(), m.worker.clone(), m.observe, m.guide.clone());
+        let (settings, worker, observe, guide) = (
+            m.settings.clone(),
+            m.worker.clone(),
+            m.observe,
+            m.guide.as_ref().map(|f| f()),
+        );
         let (from, cut) = {
             let path = self.store.branch();
             let from = path

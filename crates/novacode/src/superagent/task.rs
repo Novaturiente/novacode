@@ -7,7 +7,7 @@
 //! [`Launcher`]; [`Procs`] is the real one. They outlive super.
 
 use super::Tier;
-use super::board::{Board, Event, Kind, Landed, State, Task, TaskType};
+use super::board::{Board, Event, Kind, Landed, MergeResult, State, Task, TaskType};
 use crate::wire::{ClientCmd, Request, ServerMsg, line};
 use futures_util::future::BoxFuture;
 use novacode_base::paths::Paths;
@@ -656,9 +656,44 @@ impl Super {
         }
         if resume.is_none() {
             t.pending = pending;
+            // Open-ended work: the criteria the user approved become the task's goal. `set_goal`
+            // starts no run; the brief does.
+            if t.goal {
+                let goal = ClientCmd::SetGoal {
+                    objective: t.request.trim().to_string(),
+                    criteria: t.criteria.clone(),
+                };
+                self.launcher.send(&session, goal).await?;
+            }
             self.prompt(&session, brief(&t)).await?;
         }
         Ok(())
+    }
+
+    /// A goal task whose goal is paused (a stop paused it) continues it: the message means continue.
+    async fn resume_goal(&self, id: &str, session: &str) -> Result<(), String> {
+        let goal = self.row(id)?.goal;
+        if goal && super::link::Goal::read(&self.cfg.home, session) == super::link::Goal::Paused {
+            let resume = ClientCmd::Prompt {
+                text: "/goal resume".into(),
+                raw: false,
+            };
+            self.launcher.send(session, resume).await?;
+        }
+        Ok(())
+    }
+
+    /// After an event that left `merging` other than by a merge report (its lock is
+    /// released): a merge left half-done blocks the task. Returns the block reason.
+    pub(super) fn merge_exit(&self, id: &str, n: &super::board::Next) -> Option<String> {
+        if !n.effects.contains(&super::board::Effect::CheckMergeLeft) {
+            return None;
+        }
+        let reason = format!("merge left half-done: {}", half_done(&self.row(id).ok()?)?);
+        match self.edit(|b| b.merge_left(id, &reason)) {
+            Ok(Ok(())) => Some(reason),
+            _ => None,
+        }
     }
 
     /// A raw prompt: a brief or message starting with `!` or `/` is not a command.
@@ -678,10 +713,14 @@ impl Super {
     pub(super) async fn deliver(&self, id: &str, text: String) -> Result<(), String> {
         let t = self.row(id)?;
         match &t.session {
-            Some(s) if self.launcher.alive(s) => self.prompt(s, text).await,
+            Some(s) if self.launcher.alive(s) => {
+                self.resume_goal(id, s).await?;
+                self.prompt(s, text).await
+            }
             Some(_) => {
                 self.start(id).await?;
                 let s = self.row(id)?.session.unwrap_or_default();
+                self.resume_goal(id, &s).await?;
                 self.prompt(&s, text).await
             }
             None => {
@@ -733,15 +772,24 @@ impl Super {
         if n.effects.contains(&super::board::Effect::StopReview) {
             self.stop_review(t.reviewer.clone()).await;
         }
-        // shortcut: Effect::CheckMergeLeft (a stop while merging) is handled with the merge flow (ST16).
         if let Some(s) = t.session.as_deref().filter(|s| self.launcher.alive(s)) {
             self.launcher.send(s, ClientCmd::Abort { drop_queued: true }).await?;
         }
+        let first = match self.merge_exit(&t.id, &n) {
+            Some(why) => format!(
+                "Stopped {}'s merge; the merge lock is released, but it is blocked: {why}.",
+                t.label
+            ),
+            None if n.from == State::Merging => {
+                format!(
+                    "Stopped {}'s merge; the merge lock is released. Its session stays.",
+                    t.label
+                )
+            }
+            None => format!("Stopped {}; its session stays.", t.label),
+        };
         let notes = self.pump().await;
-        Ok(std::iter::once(format!("Stopped {}; its session stays.", t.label))
-            .chain(notes)
-            .collect::<Vec<_>>()
-            .join("\n"))
+        Ok(std::iter::once(first).chain(notes).collect::<Vec<_>>().join("\n"))
     }
 
     /// Whether a task's branch is merged into its own base (not into `HEAD`, as `git branch -d` checks).
@@ -798,6 +846,12 @@ impl Super {
         if let Some(s) = t.session.as_deref().filter(|s| self.launcher.alive(s)) {
             let _ = self.launcher.send(s, ClientCmd::Shutdown).await;
         }
+        if let Some(why) = self.merge_exit(&t.id, &n) {
+            return Ok(format!(
+                "{}'s session ended, but it is blocked, not closed: {why}. Its worktree is kept.",
+                t.label
+            ));
+        }
         let mut out = format!("Closed {}.", t.label);
         if let Some(w) = &t.worktree {
             match (merged, novacode_tools::worktree::here(w)) {
@@ -838,7 +892,37 @@ impl Super {
             return Ok(format!("The user declined: {} is not merged.", t.label));
         }
         self.edit(|b| b.apply(&t.id, Event::Merge))??;
-        // shortcut: the merge flow's checks (base checked out, re-check after a moving rebase) come with ST16.
+        // The user's checkout is never switched: a local merge needs it on the task's base.
+        let refused = match &t.base_branch {
+            None => Some(format!("its base is commit {base}, not a branch")),
+            Some(want) if !pr => {
+                let on = git(&main, &["branch", "--show-current"]).unwrap_or_default();
+                (on != *want).then(|| {
+                    let on = if on.is_empty() { "a detached HEAD" } else { &on };
+                    format!("main checkout is on {on}, not {want}")
+                })
+            }
+            Some(_) => None,
+        };
+        if let Some(why) = refused {
+            self.edit(|b| b.apply(&t.id, Event::MergeReport(MergeResult::Failed(why.clone()))))??;
+            return Ok(format!(
+                "{} merge: failed (now blocked): {why}. The main checkout was not touched; the merge lock is released.",
+                t.label
+            ));
+        }
+        let tip = t
+            .base_branch
+            .as_ref()
+            .and_then(|b| git(&main, &["rev-parse", &format!("refs/heads/{b}")]).ok());
+        let recheck = match (tip, &t.base_commit) {
+            (Some(tip), Some(old)) if tip != *old => format!(
+                "{base} moved since your work started ({} → {}): after the rebase, re-run your checks and merge only if they pass.",
+                &old[..old.len().min(8)],
+                &tip[..tip.len().min(8)]
+            ),
+            _ => "If the rebase moved your branch, re-run your checks before you merge.".to_string(),
+        };
         let how = match pr {
             true => format!("push it and open a pull request against {base}, then report `merge: pr-opened`"),
             false => format!(
@@ -847,7 +931,7 @@ impl Super {
             ),
         };
         let text = format!(
-            "The user approved merging. Rebase {branch} on {base}; if the rebase moved it, re-run your checks. Then {how}. \
+            "The user approved merging. Rebase {branch} on {base}. {recheck} Then {how}. \
 If anything fails (a conflict, a dirty main checkout, a failed check), report `merge: failed` with the reason."
         );
         self.deliver(&t.id, text).await?;
@@ -931,6 +1015,30 @@ If anything fails (a conflict, a dirty main checkout, a failed check), report `m
         }
         Ok(out)
     }
+}
+
+/// What an unfinished merge left in the task's main checkout or worktree: a merge or
+/// rebase in progress, or uncommitted changes in the main checkout.
+pub(super) fn half_done(t: &Task) -> Option<String> {
+    let main = t.repo.as_ref()?;
+    let in_progress = |dir: &Path| -> Option<&'static str> {
+        let gd = PathBuf::from(git(dir, &["rev-parse", "--path-format=absolute", "--git-dir"]).ok()?);
+        if gd.join("MERGE_HEAD").exists() {
+            Some("a merge in progress")
+        } else if gd.join("rebase-merge").exists() || gd.join("rebase-apply").exists() {
+            Some("a rebase in progress")
+        } else {
+            None
+        }
+    };
+    if let Some(what) = in_progress(main) {
+        return Some(format!("the main checkout {} has {what}", main.display()));
+    }
+    if git(main, &["status", "--porcelain=v2", "--untracked-files=no"]).is_ok_and(|s| !s.is_empty()) {
+        return Some(format!("the main checkout {} has uncommitted changes", main.display()));
+    }
+    let wt = t.worktree.as_ref().filter(|w| w.exists())?;
+    in_progress(wt).map(|what| format!("its worktree {} has {what}", wt.display()))
 }
 
 /// The non-git write task already holding `t`'s folder.
@@ -1669,6 +1777,159 @@ mod tests {
         assert!(!e.contains("review task"), "read works on a review row: {e}");
         let e = run(&fx, json!({"action": "fly", "task": "T1-q"})).await.unwrap_err();
         assert!(e.contains("unknown action"), "{e}");
+    }
+
+    fn lock_holders(fx: &Fx) -> Vec<String> {
+        fx.sup.board.lock().unwrap().merge_locks.values().cloned().collect()
+    }
+
+    #[tokio::test]
+    async fn a_main_checkout_on_another_branch_fails_the_merge_without_touching_it() {
+        let fx = fixture(5, &[Some("Merge")]);
+        let app = repo(&fx.root, "app");
+        run(&fx, spawn_args("app", "m", true)).await.unwrap();
+        set_state(&fx, "T1-m", State::Ready);
+        sh(&app, &["checkout", "-qb", "other"]);
+        let before = fx.launcher.prompts("s1").len();
+        let out = run(&fx, json!({"action": "merge", "task": "T1-m"})).await.unwrap();
+        assert!(
+            out.contains("merge: failed") && out.contains("main checkout is on other, not main"),
+            "{out}"
+        );
+        let t = fx.sup.row("T1-m").unwrap();
+        assert_eq!(t.state, State::Blocked);
+        assert!(t.block.unwrap().reason.contains("main checkout is on other, not main"));
+        assert!(lock_holders(&fx).is_empty(), "the lock is released");
+        assert_eq!(fx.launcher.prompts("s1").len(), before, "the task is told nothing");
+        assert_eq!(git(&app, &["branch", "--show-current"]).unwrap(), "other");
+    }
+
+    #[tokio::test]
+    async fn one_merge_per_repo_and_non_git_tasks_get_the_close_offer() {
+        let fx = fixture(5, &[Some("Merge")]);
+        repo(&fx.root, "app");
+        run(&fx, spawn_args("app", "a", true)).await.unwrap();
+        run(&fx, spawn_args("app", "b", true)).await.unwrap();
+        set_state(&fx, "T1-a", State::Ready);
+        set_state(&fx, "T2-b", State::Ready);
+        run(&fx, json!({"action": "merge", "task": "T1-a"})).await.unwrap();
+        assert_eq!(state(&fx, "T1-a"), State::Merging);
+        assert_eq!(lock_holders(&fx), ["T1-a"]);
+        let e = run(&fx, json!({"action": "merge", "task": "T2-b"})).await.unwrap_err();
+        assert!(e.contains("T1-a is merging"), "{e}");
+        assert_eq!(fx.asker.asked.lock().unwrap().len(), 1, "no card for the refused merge");
+        // Outside git there is nothing to merge: super offers to close instead.
+        std::fs::create_dir(fx.root.join("plain")).unwrap();
+        run(&fx, spawn_args("plain", "c", true)).await.unwrap();
+        set_state(&fx, "T3-c", State::Ready);
+        let e = run(&fx, json!({"action": "merge", "task": "T3-c"})).await.unwrap_err();
+        assert!(e.contains("not in a git repo") && e.contains("task close"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn the_merge_asks_for_a_re_check_when_the_base_moved() {
+        let fx = fixture(5, &[Some("Merge"), Some("Merge")]);
+        let app = repo(&fx.root, "app");
+        run(&fx, spawn_args("app", "a", true)).await.unwrap();
+        set_state(&fx, "T1-a", State::Ready);
+        run(&fx, json!({"action": "merge", "task": "T1-a"})).await.unwrap();
+        let text = fx.launcher.prompts("s1").last().unwrap().clone();
+        assert!(!text.contains("moved since"), "{text}");
+        // The base gets a new commit after T2 started.
+        run(&fx, spawn_args("app", "b", true)).await.unwrap();
+        std::fs::write(app.join("sub/g"), "new").unwrap();
+        sh(&app, &["add", "."]);
+        sh(&app, &["commit", "-qm", "more"]);
+        set_state(&fx, "T1-a", State::Ready);
+        fx.sup.edit(|b| b.merge_locks.clear()).unwrap();
+        set_state(&fx, "T2-b", State::Ready);
+        run(&fx, json!({"action": "merge", "task": "T2-b"})).await.unwrap();
+        let text = fx.launcher.prompts("s2").last().unwrap().clone();
+        assert!(
+            text.contains("main moved since your work started") && text.contains("re-run your checks"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_or_close_while_merging_releases_the_lock_and_a_half_done_merge_blocks() {
+        let fx = fixture(5, &[Some("Merge"), Some("Merge"), Some("Merge"), Some("Close")]);
+        let app = repo(&fx.root, "app");
+        for s in ["a", "b", "c"] {
+            run(&fx, spawn_args("app", s, true)).await.unwrap();
+        }
+        // A clean stop: stopped, lock free.
+        set_state(&fx, "T1-a", State::Ready);
+        run(&fx, json!({"action": "merge", "task": "T1-a"})).await.unwrap();
+        run(&fx, json!({"action": "stop", "task": "T1-a"})).await.unwrap();
+        assert_eq!(state(&fx, "T1-a"), State::Stopped);
+        assert!(lock_holders(&fx).is_empty());
+        // The main checkout is left mid-merge: blocked with the reason, lock free.
+        set_state(&fx, "T2-b", State::Ready);
+        run(&fx, json!({"action": "merge", "task": "T2-b"})).await.unwrap();
+        let head = git(&app, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(app.join(".git/MERGE_HEAD"), format!("{head}\n")).unwrap();
+        let out = run(&fx, json!({"action": "stop", "task": "T2-b"})).await.unwrap();
+        let t = fx.sup.row("T2-b").unwrap();
+        assert_eq!(t.state, State::Blocked, "{out}");
+        assert!(t.block.unwrap().reason.contains("merge in progress"), "{out}");
+        assert!(out.contains("half-done"), "{out}");
+        assert!(lock_holders(&fx).is_empty());
+        std::fs::remove_file(app.join(".git/MERGE_HEAD")).unwrap();
+        // Close while merging with uncommitted changes left in the main checkout: blocked, worktree kept.
+        set_state(&fx, "T3-c", State::Ready);
+        run(&fx, json!({"action": "merge", "task": "T3-c"})).await.unwrap();
+        std::fs::write(app.join("sub/f"), "conflict").unwrap();
+        let out = run(&fx, json!({"action": "close", "task": "T3-c"})).await.unwrap();
+        let t = fx.sup.row("T3-c").unwrap();
+        assert_eq!(t.state, State::Blocked, "{out}");
+        assert!(t.block.unwrap().reason.contains("uncommitted changes"), "{out}");
+        assert!(app.join(".worktrees/T3-c").exists(), "{out}");
+        assert!(lock_holders(&fx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_goal_task_gets_set_goal_before_its_brief_and_send_after_stop_resumes_it() {
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        let mut a = spawn_args("p", "faster", false);
+        a["goal"] = json!(true);
+        run(&fx, a).await.unwrap();
+        run(&fx, spawn_args("p", "plain", false)).await.unwrap();
+        let sent = fx.launcher.sent.lock().unwrap().clone();
+        let s1: Vec<&ClientCmd> = sent.iter().filter(|(s, _)| s == "s1").map(|(_, c)| c).collect();
+        assert!(
+            matches!(s1[0], ClientCmd::SetGoal { objective, criteria }
+                if objective.contains("do faster") && criteria == &["it works".to_string()]),
+            "{s1:?}"
+        );
+        assert!(matches!(s1[1], ClientCmd::Prompt { raw: true, .. }), "{s1:?}");
+        assert!(
+            !sent
+                .iter()
+                .any(|(s, c)| s == "s2" && matches!(c, ClientCmd::SetGoal { .. })),
+            "no goal for a task with a clear result"
+        );
+        // Stop pauses the goal (the task's goal file says so); a send resumes it first.
+        run(&fx, json!({"action": "stop", "task": "T1-faster"})).await.unwrap();
+        std::fs::create_dir_all(fx.home.join("goals")).unwrap();
+        std::fs::write(fx.home.join("goals/s1.json"), r#"{"state": "paused"}"#).unwrap();
+        run(
+            &fx,
+            json!({"action": "send", "task": "T1-faster", "message": "continue"}),
+        )
+        .await
+        .unwrap();
+        let sent = fx.launcher.sent.lock().unwrap().clone();
+        let tail: Vec<&ClientCmd> = sent.iter().rev().take(2).map(|(_, c)| c).collect();
+        assert!(
+            matches!(tail[1], ClientCmd::Prompt { text, raw: false } if text == "/goal resume"),
+            "{tail:?}"
+        );
+        assert!(
+            matches!(tail[0], ClientCmd::Prompt { text, raw: true } if text == "continue"),
+            "{tail:?}"
+        );
     }
 
     #[test]

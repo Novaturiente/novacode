@@ -446,7 +446,10 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
 
         (Event::Merge, Ready) => {
             if t.repo.is_none() {
-                Err(format!("{} is not in a git repo; nothing to merge", t.label))
+                Err(format!(
+                    "{} is not in a git repo; nothing to merge: ask the user whether to close it (`task close`)",
+                    t.label
+                ))
             } else if t.landed == Some(Landed::Merged) {
                 Err(format!("{} is already merged", t.label))
             } else if let Some(other) = lock_holder {

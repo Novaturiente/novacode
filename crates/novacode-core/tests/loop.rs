@@ -1206,6 +1206,7 @@ async fn compaction_guide_reaches_the_summary_and_follows_it() {
     let home = tempfile::tempdir().unwrap();
     let big = "lorem ipsum ".repeat(300);
     let main = Faux::new((0..8).map(|i| FauxReply::text(&format!("answer {i} {big}"))));
+    let board = Arc::new(std::sync::Mutex::new(String::from("empty")));
     let agent = Agent::new(
         Arc::new(main.clone()),
         vec![],
@@ -1229,7 +1230,17 @@ async fn compaction_guide_reaches_the_summary_and_follows_it() {
         },
     )
     .without_observer()
-    .with_compaction_guide("GUIDE: keep the board; call task list after".into());
+    .with_compaction_guide_fn({
+        // Made at compaction time (super's holds the board as it is then).
+        let board = board.clone();
+        Arc::new(move || {
+            format!(
+                "GUIDE: keep the board ({}); call task list after",
+                board.lock().unwrap()
+            )
+        })
+    });
+    *board.lock().unwrap() = "T1 running".into();
     let prompts: Vec<String> = (0..5).map(|i| format!("task {i} {big}")).collect();
     let refs: Vec<&str> = prompts.iter().map(String::as_str).collect();
     let (agent, events) = drive(agent, &refs).await;
@@ -1241,7 +1252,8 @@ async fn compaction_guide_reaches_the_summary_and_follows_it() {
     );
     let p = format!("{:?}", agent.store.projection());
     let summary = p.find("Summary of the earlier conversation").expect("compacted");
-    assert!(p[summary..].contains("GUIDE: keep the board"), "{p}");
+    assert!(p[summary..].contains("GUIDE: keep the board (T1 running)"), "{p}");
+    assert!(asked.contains("GUIDE: keep the board (T1 running)"));
 }
 
 /// A model switch moves background calls too: the observer to the switch's helper,

@@ -42,6 +42,15 @@ pub const COMPACTION: &str = "This is novacode's super agent. Its summary keeps 
 and last report) plus the user's open requests and decisions, not a retelling of the chat. After a compaction, call \
 `task list` to re-read the board before acting: the board, not this summary, is the truth about the tasks.";
 
+/// Super's compaction guide, made at each compaction: [`COMPACTION`] plus the board as it
+/// is then (`<dir>/board.json`), so the summary is built from the board, not the chat.
+pub fn compaction_guide(dir: std::path::PathBuf) -> impl Fn() -> String + Send + Sync + 'static {
+    move || match board::Board::load(&dir) {
+        Ok(b) => format!("{COMPACTION}\n\nThe board now:\n{}", b.render()),
+        Err(_) => COMPACTION.to_string(),
+    }
+}
+
 /// The tools super's model sees (before `super.tools`).
 pub const TOOLS: [&str; 5] = ["task", "ask_user", "memory", "todo", "agent"];
 
@@ -168,6 +177,26 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let p = prompt(empty.path());
         assert!(!p.contains("global_instructions") && p.contains("<super_overrides>"));
+    }
+
+    #[test]
+    fn the_compaction_guide_carries_the_board_as_it_is_at_compaction_time() {
+        let d = tempfile::tempdir().unwrap();
+        let guide = compaction_guide(d.path().to_path_buf());
+        assert!(guide().starts_with(COMPACTION));
+        let b = board::Board {
+            tasks: vec![board::Task {
+                id: "T1-fix".into(),
+                label: "T1-fix".into(),
+                state: board::State::Blocked,
+                summary: Some("needs the db url".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        b.save(d.path()).unwrap();
+        let g = guide();
+        assert!(g.contains("| T1-fix |") && g.contains("needs the db url"), "{g}");
     }
 
     #[test]

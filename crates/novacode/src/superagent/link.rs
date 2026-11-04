@@ -38,6 +38,11 @@ pub struct Conn {
 const HOLD_WITHOUT_RESET: u64 = 15 * 60;
 /// What code sends to a task when its provider limit cleared.
 pub const LIMIT_CLEARED: &str = "continue: the provider limit has cleared";
+
+/// What an interrupted task the user chose to resume after super's restart is sent.
+const RESUMED: &str = "continue: super restarted while your process was gone. First check your folder and git (what \
+is committed, what already ran) and don't repeat anything outside it that already happened (a commit, a push, a \
+message); your proof log is empty, so re-run your checks before you cite them.";
 /// The request id super's prompts carry (`Launcher::send`): a run that consumed
 /// only these is a turn on super's prompt.
 const SUPER_ID: &str = "super";
@@ -406,6 +411,7 @@ impl Links {
             kick: Arc::default(),
         });
         let _ = sup.links.set(links.clone());
+        links.recover(sup);
         let (me, kick) = (Arc::downgrade(&links), links.kick.clone());
         let t = tokio::spawn(async move {
             loop {
@@ -417,6 +423,124 @@ impl Links {
         });
         links.inner.lock().unwrap().tasks.push(t.abort_handle());
         links
+    }
+
+    /// Restart recovery, once at start: the board's tasks whose process is gone. A dead
+    /// review is closed and a new one started for its task; dead tasks in `running` or
+    /// `waiting-you` become `interrupted`, a dead merge follows the merge exits; the user
+    /// is asked once which interrupted tasks to resume. Live tasks are linked by `tick`.
+    fn recover(&self, sup: &Arc<Super>) {
+        let dead: Vec<board::Task> = {
+            let b = sup.board.lock().unwrap();
+            b.tasks
+                .iter()
+                .filter(|t| t.state != State::Archived)
+                .filter(|t| t.session.as_deref().is_some_and(|s| !sup.launcher.alive(s)))
+                .cloned()
+                .collect()
+        };
+        let mut interrupted = Vec::new();
+        for t in &dead {
+            match t.kind {
+                board::Kind::Review if matches!(t.state, State::Running | State::WaitingYou) => {
+                    self.restart_review(sup, t)
+                }
+                board::Kind::Review => {}
+                board::Kind::Work => {
+                    let Ok(Ok(n)) = sup.edit(|b| b.apply(&t.id, Event::Restart)) else {
+                        continue;
+                    };
+                    if let Some(why) = sup.merge_exit(&t.id, &n) {
+                        self.inform.note(format!(
+                            "{} was merging when super went down; it is blocked: {why}",
+                            t.label
+                        ));
+                    }
+                    if sup.row(&t.id).is_ok_and(|r| r.state == State::Interrupted) && n.from != n.to {
+                        interrupted.push(t.label.clone());
+                    }
+                }
+            }
+        }
+        if interrupted.is_empty() {
+            return;
+        }
+        let (sup, asker, me) = (sup.clone(), self.asker.clone(), self.me.clone());
+        let t = tokio::spawn(async move {
+            let q = novacode_types::Question {
+                question: "Super restarted and found these tasks' processes gone; they are interrupted. Which should \
+                           resume? Each first checks its folder and git before repeating anything outside it."
+                    .into(),
+                header: Some("Resume tasks".into()),
+                options: interrupted
+                    .iter()
+                    .map(|l| novacode_types::Choice {
+                        label: l.clone(),
+                        description: None,
+                        preview: None,
+                        recommended: false,
+                    })
+                    .collect(),
+                multi: true,
+            };
+            let picked = asker
+                .ask(vec![q])
+                .await
+                .and_then(|r| r.into_iter().next())
+                .map(|r| r.chosen)
+                .unwrap_or_default();
+            let mut lines = Vec::new();
+            for label in &interrupted {
+                if !picked.contains(label) {
+                    continue;
+                }
+                let send = serde_json::json!({"action": "send", "task": label, "message": RESUMED});
+                match sup.run(send).await {
+                    Ok(_) => lines.push(format!("{label} resumed")),
+                    Err(e) => lines.push(format!("{label} didn't resume: {e}")),
+                }
+            }
+            let rest: Vec<&str> = interrupted
+                .iter()
+                .filter(|l| !picked.contains(l))
+                .map(String::as_str)
+                .collect();
+            if !rest.is_empty() {
+                lines.push(format!("{} stay interrupted", rest.join(", ")));
+            }
+            if let Some(me) = me.upgrade() {
+                me.inform
+                    .note(format!("After super's restart the user chose: {}.", lines.join("; ")));
+            }
+        });
+        self.inner.lock().unwrap().tasks.push(t.abort_handle());
+    }
+
+    /// A review task found dead at restart: closed, and a new review for its task (no round used).
+    fn restart_review(&self, sup: &Super, rv: &board::Task) {
+        let of = rv.reviewer_of.clone().unwrap_or_default();
+        sup.retire_review(&rv.id);
+        let current = sup
+            .row(&of)
+            .is_ok_and(|t| t.state == State::Reviewing && t.reviewer.as_deref() == Some(rv.id.as_str()));
+        if !current {
+            return;
+        }
+        let _ = sup.edit(|b| {
+            if let Some(t) = b.tasks.iter_mut().find(|t| t.id == of) {
+                t.reviewer = None;
+            }
+        });
+        match sup.open_review(&of, None) {
+            Ok(new) => self.inform.note(format!(
+                "{of}'s review task {} was gone after super's restart; its new review task is {new}.",
+                rv.label
+            )),
+            Err(e) => self.inform.wake(format!(
+                "{of} is blocked: its review task {} was gone after super's restart and a new one can't start: {e}",
+                rv.label
+            )),
+        }
     }
 
     /// Check the inbox and the holds now (tests; a report just written).
@@ -445,7 +569,7 @@ impl Links {
         };
         for (id, session) in rows {
             let linked = self.inner.lock().unwrap().links.contains_key(&id);
-            // A dead one found here is restart recovery's (ST16), not an exit seen live.
+            // A dead one found here was handled by restart recovery (`recover`), not an exit seen live.
             if !linked && sup.launcher.alive(&session) {
                 self.open(&id, &session);
             }
@@ -513,6 +637,13 @@ impl Links {
                 return false;
             }
         };
+        let mut extra = extra.to_string();
+        if n.effects.contains(&board::Effect::CheckMergeLeft) {
+            extra += &match sup.merge_exit(id, &n) {
+                Some(why) => format!("\nThe merge lock is released; it is blocked: {why}."),
+                None => "\nThe merge lock is released; the main checkout shows no half-done merge.".into(),
+            };
+        }
         let Ok(t) = sup.row(id) else { return false };
         if let Event::TurnLimit(limit) = &ev {
             // No reset time known: the hold ends after a fixed wait.
@@ -532,7 +663,6 @@ impl Links {
                 ));
             }
         }
-        let mut extra = extra.to_string();
         if let Some(old) = before.reviewer.as_deref().filter(|_| t.reviewer != before.reviewer) {
             sup.retire_review(old);
         }
@@ -979,7 +1109,11 @@ fn wake_text(t: &board::Task, ev: &Event) -> String {
             format!("{} reported {st} (now {}): {summary}", t.label, t.state.name())
         }
         Event::MergeReport(m) => match m {
-            MergeResult::Merged => format!("{} merged (now {}).", t.label, t.state.name()),
+            MergeResult::Merged => format!(
+                "{} merged (now {}). Ask the user now whether to close it (`task close`).",
+                t.label,
+                t.state.name()
+            ),
             MergeResult::PrOpened => format!("{} opened a pull request (now {}).", t.label, t.state.name()),
             MergeResult::Failed(why) => format!("{} merge failed (now {}): {why}", t.label, t.state.name()),
         },
@@ -992,13 +1126,27 @@ fn wake_text(t: &board::Task, ev: &Event) -> String {
             l.provider
         ),
         Event::GoalEnded(_) => format!("{} is blocked (code-made report): {reason}.", t.label),
-        Event::ProcessExit => format!("{} failed: its process exited while it was working.", t.label),
-        Event::Verdict(board::Verdict::Approved) => format!(
-            "{}'s review approved it (now {}). If its findings or checks don't support the approval, ask for a \
-second review with `task review`.",
+        Event::ProcessExit if t.state == State::Failed => {
+            format!("{} failed: its process exited while it was working.", t.label)
+        }
+        Event::ProcessExit => format!(
+            "{} is {}: its process exited while it was merging.",
             t.label,
             t.state.name()
         ),
+        Event::Verdict(board::Verdict::Approved) => {
+            let mut s = format!(
+                "{}'s review approved it (now {}). If its findings or checks don't support the approval, ask for a \
+second review with `task review`.",
+                t.label,
+                t.state.name()
+            );
+            if t.write && t.repo.is_none() && t.state == State::Ready {
+                s +=
+                    " It is not in git, so there is nothing to merge: ask the user whether to close it (`task close`).";
+            }
+            s
+        }
         Event::Verdict(v) if t.state == State::Blocked => format!(
             "{}'s review says {} and its review rounds are used up (now blocked). Ask the user how to go on.",
             t.label,
@@ -1662,6 +1810,12 @@ mod tests {
     }
 
     fn fixture(max_running: usize) -> Fx {
+        fixture_with(max_running, |_, _| {})
+    }
+
+    /// `before` fills the board and the live sessions before the links start, as a
+    /// board found by a restarted super.
+    fn fixture_with(max_running: usize, before: impl FnOnce(&Super, &FakeLauncher)) -> Fx {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().canonicalize().unwrap();
         let (root, home) = (base.join("root"), base.join("home"));
@@ -1683,6 +1837,7 @@ mod tests {
         };
         let sup =
             Arc::new(Super::new(&root, home.join("super/x"), cfg, Some(asker.clone()), launcher.clone()).unwrap());
+        before(&sup, &launcher);
         let log = Log::default();
         let links = Links::start(&sup, asker.clone(), Arc::new(Allow), Arc::new(Said(log.clone())));
         Fx {
@@ -1960,6 +2115,215 @@ mod tests {
                 .any(|(s2, c)| s2 == &s && matches!(c, ClientCmd::Prompt { text, raw: true } if text == LIMIT_CLEARED)),
             "{sent:?}"
         );
+    }
+
+    /// A repo with one commit on `main`.
+    fn git_repo(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("f"), "x").unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["add", "."],
+            &["commit", "-qm", "init"],
+        ] {
+            let ok = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        }
+    }
+
+    impl Fx {
+        /// `id` merging in `repo`, holding its merge lock.
+        fn merging(&self, id: &str, repo: &std::path::Path) -> String {
+            let s = self.task(id, "faux/a", State::Merging);
+            self.sup
+                .edit(|b| {
+                    b.tasks.iter_mut().find(|t| t.id == id).unwrap().repo = Some(repo.to_path_buf());
+                    b.merge_locks.insert(repo.to_path_buf(), id.into());
+                })
+                .unwrap();
+            s
+        }
+        fn locks(&self) -> usize {
+            self.sup.board.lock().unwrap().merge_locks.len()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_killed_merging_task_releases_the_lock_and_a_half_done_merge_blocks_it() {
+        let fx = fixture(5);
+        let (clean, dirty) = (fx.sup.root.join("clean"), fx.sup.root.join("dirty"));
+        git_repo(&clean);
+        git_repo(&dirty);
+        let s1 = fx.merging("T1-x", &clean);
+        let s2 = fx.merging("T2-y", &dirty);
+        let (mut t1, mut t2) = (fx.end(&s1).await, fx.end(&s2).await);
+        t1.catch_up(true, vec![], vec![]).await;
+        t2.catch_up(true, vec![], vec![]).await;
+        std::fs::write(dirty.join("f"), "conflict markers").unwrap();
+        fx.launcher.alive.lock().unwrap().clear();
+        drop((t1, t2));
+        fx.until("both out of merging", |fx| {
+            fx.state("T1-x") != State::Merging && fx.state("T2-y") != State::Merging
+        })
+        .await;
+        assert_eq!(fx.state("T1-x"), State::Failed);
+        let t2 = fx.sup.row("T2-y").unwrap();
+        assert_eq!(t2.state, State::Blocked);
+        assert!(t2.block.unwrap().reason.contains("uncommitted changes"));
+        assert_eq!(fx.locks(), 0, "both locks released");
+        let wakes: Vec<_> = fx.said().into_iter().filter(|l| l.starts_with("wake:")).collect();
+        assert!(
+            wakes
+                .iter()
+                .any(|w| w.contains("T2-y is blocked") && w.contains("merge left half-done")),
+            "{wakes:?}"
+        );
+        assert!(
+            wakes
+                .iter()
+                .any(|w| w.contains("T1-x failed") && w.contains("merge lock is released")),
+            "{wakes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_reports_release_the_lock_and_a_merged_task_gets_the_close_offer() {
+        let fx = fixture(5);
+        let (a, b) = (fx.sup.root.join("a"), fx.sup.root.join("b"));
+        fx.merging("T1-x", &a);
+        fx.merging("T2-y", &b);
+        write_report(&fx, "T1-x", 1, "tok", json!({"merge": "merged", "summary": "ff"}));
+        write_report(&fx, "T2-y", 1, "tok", json!({"merge": "pr-opened", "summary": "#12"}));
+        fx.links.kick();
+        fx.until("both ready", |fx| {
+            fx.state("T1-x") == State::Ready && fx.state("T2-y") == State::Ready
+        })
+        .await;
+        assert_eq!(fx.locks(), 0);
+        assert_eq!(fx.sup.row("T2-y").unwrap().landed, Some(board::Landed::PrOpened));
+        let wakes: Vec<_> = fx.said().into_iter().filter(|l| l.starts_with("wake:")).collect();
+        assert!(
+            wakes
+                .iter()
+                .any(|w| w.contains("T1-x merged") && w.contains("task close")),
+            "{wakes:?}"
+        );
+        assert!(
+            wakes.iter().any(|w| w.contains("T2-y opened a pull request")),
+            "{wakes:?}"
+        );
+    }
+
+    #[test]
+    fn an_approved_non_git_write_task_gets_the_close_offer() {
+        let mut t = Task {
+            label: "T1-x".into(),
+            write: true,
+            state: State::Ready,
+            ..Task::default()
+        };
+        let approved = Event::Verdict(board::Verdict::Approved);
+        assert!(wake_text(&t, &approved).contains("task close"));
+        t.repo = Some("/r".into());
+        assert!(!wake_text(&t, &approved).contains("task close"));
+    }
+
+    #[tokio::test]
+    async fn a_restart_links_live_tasks_marks_dead_ones_interrupted_restarts_dead_reviews_and_asks_once() {
+        let fx = fixture_with(5, |sup, launcher| {
+            let row = |id: &str, state: State, kind: Kind| Task {
+                id: id.into(),
+                label: id.into(),
+                kind,
+                model: "faux/a".into(),
+                token: "tok".into(),
+                state,
+                session: Some(format!("s-{id}")),
+                cwd: Some(sup.root.clone()),
+                request: "r".into(),
+                ..Task::default()
+            };
+            launcher.alive.lock().unwrap().insert("s-T1-live".into());
+            let mut merging = row("T5-merge", State::Merging, Kind::Work);
+            merging.repo = Some(sup.root.join("gone"));
+            let mut reviewed = row("T6-rev", State::Reviewing, Kind::Work);
+            (reviewed.write, reviewed.tier, reviewed.reviewer) =
+                (true, Some("quick".into()), Some("T7-review-T6-rev".into()));
+            let mut review = row("T7-review-T6-rev", State::Running, Kind::Review);
+            review.reviewer_of = Some("T6-rev".into());
+            sup.edit(|b| {
+                b.tasks = vec![
+                    row("T1-live", State::Running, Kind::Work),
+                    row("T2-dead", State::Running, Kind::Work),
+                    row("T3-wait", State::WaitingYou, Kind::Work),
+                    row("T4-ready", State::Ready, Kind::Work),
+                    merging,
+                    reviewed,
+                    review,
+                ];
+                b.merge_locks.insert(sup.root.join("gone"), "T5-merge".into());
+            })
+            .unwrap();
+        });
+        let mut live = fx.end("s-T1-live").await;
+        live.catch_up(true, vec![], vec![]).await;
+        assert_eq!(fx.state("T1-live"), State::Running);
+        for id in ["T2-dead", "T3-wait", "T5-merge"] {
+            assert_eq!(fx.state(id), State::Interrupted, "{id}");
+        }
+        assert_eq!(fx.state("T4-ready"), State::Ready, "not live: unchanged");
+        assert_eq!(fx.locks(), 0, "the dead merge's lock is released");
+        // The dead review is closed and a new one starts for the same task, without a round.
+        assert_eq!(fx.state("T7-review-T6-rev"), State::Archived);
+        let t6 = fx.sup.row("T6-rev").unwrap();
+        assert_eq!((t6.state, t6.review_rounds), (State::Reviewing, 0));
+        let new = t6.reviewer.clone().unwrap();
+        assert!(new.starts_with("T8-review-T6-rev"), "{new}");
+        fx.until("new review runs", |fx| fx.state(&new) == State::Running).await;
+
+        // One card, one line per interrupted task.
+        fx.until("asked", |fx| fx.asker.waiting.lock().unwrap().len() == 1)
+            .await;
+        let q = fx.asker.asked.lock().unwrap()[0].clone();
+        let labels: Vec<&str> = q.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, ["T2-dead", "T3-wait", "T5-merge"]);
+        assert!(q.multi);
+        let tx = fx.asker.waiting.lock().unwrap().remove(0);
+        let reply = Reply {
+            question: q.question.clone(),
+            chosen: vec!["T2-dead".into()],
+            text: None,
+            preview: None,
+        };
+        tx.send(Some(vec![reply])).unwrap();
+        fx.until("T2 resumed", |fx| fx.state("T2-dead") == State::Running).await;
+        assert_eq!(fx.state("T3-wait"), State::Interrupted);
+        let starts = fx.launcher.starts.lock().unwrap().clone();
+        assert!(
+            starts.iter().any(|s| s.resume.as_deref() == Some("s-T2-dead")),
+            "{starts:?}"
+        );
+        let sent = fx.launcher.sent.lock().unwrap().clone();
+        assert!(
+            sent.iter()
+                .any(|(_, c)| matches!(c, ClientCmd::Prompt { text, raw: true } if text.contains("check your folder and git"))),
+            "{sent:?}"
+        );
+        assert!(fx.asker.asked.lock().unwrap().len() == 1, "asked once");
     }
 
     fn write_report(fx: &Fx, task: &str, seq: u64, token: &str, fields: Value) {

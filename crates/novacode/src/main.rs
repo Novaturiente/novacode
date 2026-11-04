@@ -1921,7 +1921,8 @@ impl Ctx {
                 None => agent = agent.with_memory(session_worker, m).without_observer(),
             }
             if is_super {
-                agent = agent.with_compaction_guide(superagent::COMPACTION.into());
+                let dir = superagent::entry::dir(self.paths.home(), &self.cwd);
+                agent = agent.with_compaction_guide_fn(Arc::new(superagent::compaction_guide(dir)));
             }
             // Named for the session list (L4.18); not scripts, pipelines or subagents.
             if self.cli.print.is_none() && !self.cli.rpc {
