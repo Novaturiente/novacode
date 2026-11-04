@@ -251,7 +251,13 @@ async fn dispatch(
             host.handle_as(Cmd::Steer(text), ui, false, Some(id)).await;
             Ok(Value::Null)
         }
-        ClientCmd::Abort => via(Cmd::Abort).await,
+        ClientCmd::Abort { drop_queued } => {
+            // Dropped before the abort, so the cancelled run finds nothing to start next.
+            if drop_queued {
+                hub.handle.drop_follow_ups();
+            }
+            via(Cmd::Abort).await
+        }
         ClientCmd::SetModel { model } => via(Cmd::SetModel(model)).await,
         ClientCmd::SetThinking { level } => via(Cmd::SetThinking(level)).await,
         ClientCmd::Compact => via(Cmd::Compact).await,
@@ -754,7 +760,7 @@ pub async fn attach(
             let cmd = match c {
                 Cmd::Prompt(text) => ClientCmd::Prompt { text, raw: false },
                 Cmd::Steer(text) => ClientCmd::Steer { text },
-                Cmd::Abort => ClientCmd::Abort,
+                Cmd::Abort => ClientCmd::Abort { drop_queued: false },
                 Cmd::SetModel(model) => ClientCmd::SetModel { model },
                 Cmd::SetThinking(level) => ClientCmd::SetThinking { level },
                 Cmd::ListModels => ClientCmd::ListModels,

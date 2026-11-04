@@ -41,6 +41,8 @@ pub struct Host {
     pub login: Mutex<Option<(UnboundedSender<String>, tokio::task::AbortHandle)>>,
     /// The current model's adapter, for `/account`, and the task copying its account into the state.
     pub adapter: Mutex<Option<(Arc<dyn Adapter>, tokio::task::AbortHandle)>>,
+    /// `worktree.copy`, for `/worktree <name>`.
+    pub worktree_copy: Vec<String>,
 }
 
 /// Mode commands (L10.7), handled here so they work in every window and over RPC.
@@ -578,6 +580,7 @@ impl Host {
                 let (h, ui) = (self.hub.handle.clone(), ui.clone());
                 // The session's folder: the agent keeps the process cwd in step (move_to).
                 let cwd = std::env::current_dir().unwrap_or_else(|_| self.cwd.clone());
+                let copy = self.worktree_copy.clone();
                 tokio::task::spawn_blocking(move || {
                     use novacode_tools::worktree;
                     let ev = |r: Result<String, String>| match r {
@@ -601,7 +604,7 @@ impl Host {
                             h.move_to(w.main().to_path_buf());
                             format!("back in the main checkout {}.{note}", w.main().display())
                         })),
-                        name => ev(worktree::create(&cwd, name).map(|(path, msg)| {
+                        name => ev(worktree::create(&cwd, name, &copy).map(|(path, msg)| {
                             h.move_to(path);
                             msg
                         })),

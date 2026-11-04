@@ -15,6 +15,7 @@
 {"id":"1b","type":"prompt","text":"/home/x is a path, !not a command","raw":true}
 {"type":"steer","text":"also tests"}
 {"type":"abort"}
+{"type":"abort","drop_queued":true}
 {"id":"2","type":"set_model","model":"codex/gpt-5.5:high"}
 {"type":"set_thinking","level":"low"}
 {"type":"export","html":true}
