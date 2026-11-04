@@ -13,7 +13,7 @@ use novacode_base::settings;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -297,8 +297,9 @@ pub enum EditRule {
     /// worktree, or when the folder is in the main checkout, the one the session's cwd
     /// is in, resolved at edit time (so `enter_worktree` makes one usable). When the task folder is not in a git repo: only inside that folder.
     Worktree { folder: PathBuf },
-    /// `review:<id>`: only under [`EditRule::review_scratch`].
-    Review { id: String },
+    /// `review:<absolute folder>`: only under the review's scratch folder
+    /// (`<super dir>/review/<id>`, on disk: a review's builds can be large).
+    Review { dir: PathBuf },
 }
 
 impl EditRule {
@@ -307,14 +308,19 @@ impl EditRule {
     pub fn parse(s: &str) -> Result<Self, String> {
         let bad = || {
             format!(
-                "bad {}=`{s}`: expected `worktree:<absolute folder>` or `review:<id>`",
+                "bad {}=`{s}`: expected `worktree:<absolute folder>` or `review:<absolute folder>`",
                 Self::ENV
             )
         };
         match s.split_once(':').ok_or_else(bad)? {
             ("worktree", f) if Path::new(f).is_absolute() => Ok(Self::Worktree { folder: f.into() }),
-            ("review", id) if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) => {
-                Ok(Self::Review { id: id.into() })
+            ("review", d)
+                if Path::new(d).is_absolute()
+                    && Path::new(d)
+                        .components()
+                        .all(|c| !matches!(c, Component::ParentDir | Component::CurDir)) =>
+            {
+                Ok(Self::Review { dir: d.into() })
             }
             _ => Err(bad()),
         }
@@ -327,20 +333,10 @@ impl EditRule {
             .transpose()
     }
 
-    /// A review task's scratch folder, `/tmp/novacode-review-<id>`.
-    pub fn review_scratch(id: &str) -> PathBuf {
-        let tmp = if cfg!(unix) {
-            PathBuf::from("/tmp")
-        } else {
-            std::env::temp_dir()
-        };
-        tmp.join(format!("novacode-review-{id}"))
-    }
-
     /// The folder edits must stay in, seen from `cwd`, or why there is none.
     fn root(&self, cwd: &Path) -> Result<PathBuf, String> {
         match self {
-            Self::Review { id } => Ok(Self::review_scratch(id)),
+            Self::Review { dir } => Ok(dir.clone()),
             Self::Worktree { folder } => match git_common_dir(folder) {
                 None => Ok(folder.clone()),
                 // A task started in its own worktree keeps to it; else the one its cwd is in.
@@ -2062,20 +2058,19 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let main = repo_with_worktrees(&d.path().canonicalize().unwrap());
         let reviewed = main.join(".worktrees/a");
-        let scratch = EditRule::review_scratch("r7");
-        if cfg!(unix) {
-            assert_eq!(scratch, Path::new("/tmp/novacode-review-r7"));
-        }
+        // C4: the scratch folder is the one the rule names (under super's folder, on disk).
+        let reviews = d.path().canonicalize().unwrap().join("super/review");
+        let scratch = reviews.join("r7");
         let p = Policy::new(Permissions::default(), "/home/u".into(), None)
-            .with_edit_rule(Some(EditRule::parse("review:r7").unwrap()));
+            .with_edit_rule(Some(EditRule::parse(&format!("review:{}", scratch.display())).unwrap()));
         assert!(!edits(&p, &reviewed, &reviewed.join("f")));
         assert!(!edits(&p, &reviewed, Path::new("f")));
         assert!(edits(&p, &reviewed, &scratch.join("check.sh")));
         assert!(edits(&p, &reviewed, &scratch.join("base/src/lib.rs")));
         // Another review's scratch folder, and a name that only starts the same.
-        assert!(!edits(&p, &reviewed, &EditRule::review_scratch("r8").join("f")));
-        assert!(!edits(&p, &reviewed, Path::new("/tmp/novacode-review-r7x/f")));
-        assert!(!edits(&p, &reviewed, &scratch.join("../novacode-review-r8/f")));
+        assert!(!edits(&p, &reviewed, &reviews.join("r8/f")));
+        assert!(!edits(&p, &reviewed, &reviews.join("r7x/f")));
+        assert!(!edits(&p, &reviewed, &scratch.join("../r8/f")));
     }
 
     #[test]
@@ -2084,8 +2079,21 @@ mod tests {
             EditRule::parse("worktree:/w/t"),
             Ok(EditRule::Worktree { folder: "/w/t".into() })
         );
-        assert_eq!(EditRule::parse("review:a-1"), Ok(EditRule::Review { id: "a-1".into() }));
-        for bad in ["worktree", "worktree:rel", "review:", "review:a/../b", "lifted", ""] {
+        assert_eq!(
+            EditRule::parse("review:/s/review/a-1"),
+            Ok(EditRule::Review {
+                dir: "/s/review/a-1".into()
+            })
+        );
+        for bad in [
+            "worktree",
+            "worktree:rel",
+            "review:",
+            "review:a-1",
+            "review:/a/../b",
+            "lifted",
+            "",
+        ] {
             assert!(EditRule::parse(bad).is_err(), "{bad}");
         }
     }

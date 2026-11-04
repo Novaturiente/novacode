@@ -84,6 +84,19 @@ pub fn sh() -> PathBuf {
     bash()
 }
 
+/// A super mode task's identity (L10.9): kept out of every process a task's session
+/// starts (commands, subagents, hooks, MCP servers, extensions), so only the task's own
+/// session can report for it.
+pub const TASK_VARS: [&str; 3] = ["NOVACODE_TASK", "NOVACODE_TASK_TOKEN", "NOVACODE_SUPER_DIR"];
+
+/// Remove [`TASK_VARS`] from `c`'s environment. For a tokio command: `drop_task_vars(c.as_std_mut())`.
+pub fn drop_task_vars(c: &mut Command) -> &mut Command {
+    for v in TASK_VARS {
+        c.env_remove(v);
+    }
+    c
+}
+
 /// Start `c` in its own process group (pgid = pid), so a group kill reaches its children.
 /// For a tokio command: `own_group(c.as_std_mut())`.
 #[cfg(unix)]

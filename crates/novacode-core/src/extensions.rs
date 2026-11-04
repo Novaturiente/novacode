@@ -197,14 +197,15 @@ impl ExtHost for Host {
                         return Err(format!("refused: {}", risk.reason));
                     }
                     let secs = args["timeout"].as_u64().unwrap_or(60).clamp(1, 600);
-                    let run = tokio::process::Command::new(novacode_base::platform::bash())
-                        .arg("-c")
+                    let mut run = tokio::process::Command::new(novacode_base::platform::bash());
+                    run.arg("-c")
                         .arg(&cmd)
                         .current_dir(&cwd)
                         .stdin(std::process::Stdio::null())
                         .env(crate::hooks::DISABLED_ENV, "1")
-                        .kill_on_drop(true)
-                        .output();
+                        .kill_on_drop(true);
+                    novacode_base::platform::drop_task_vars(run.as_std_mut());
+                    let run = run.output();
                     let o = tokio::time::timeout(Duration::from_secs(secs), run)
                         .await
                         .map_err(|_| format!("timed out after {secs}s"))?

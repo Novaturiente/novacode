@@ -412,6 +412,7 @@ async fn run(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     novacode_base::platform::own_group(c.as_std_mut());
+    novacode_base::platform::drop_task_vars(c.as_std_mut());
     if let Some(t) = input["tool"].as_str() {
         c.env("NOVACODE_TOOL", t);
     }
@@ -668,6 +669,31 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// C3 (L10.9): a super task's identity never reaches its hooks. Runs
+    /// [`task_env_case`] in a child test process that has the variables set.
+    #[test]
+    fn task_env_is_removed() {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "hooks::tests::task_env_case", "--ignored"]);
+        for v in ["NOVACODE_TASK", "NOVACODE_TASK_TOKEN", "NOVACODE_SUPER_DIR"] {
+            cmd.env(v, "secret");
+        }
+        let out = cmd.output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && text.contains("1 passed"), "{text}");
+    }
+
+    #[tokio::test]
+    #[ignore = "run by task_env_is_removed"]
+    async fn task_env_case() {
+        let d = tempfile::tempdir().unwrap();
+        let cmd = "echo task=$NOVACODE_TASK token=$NOVACODE_TASK_TOKEN dir=$NOVACODE_SUPER_DIR";
+        let (_, out, _) = run(cmd, "afterTool", d.path(), "s", &json!({}), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(out.trim(), "task= token= dir=");
     }
 
     fn commands(config: Value, dir: &Path) -> Commands {

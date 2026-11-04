@@ -99,21 +99,97 @@ pub const COPY_DEFAULT: &[&str] = &[
 ];
 
 /// Where the copied paths are recorded: in git's admin folder, so the record never shows as untracked.
+/// One line per `worktree.copy` entry copied: `<dir>/` for a folder, `<blob id> <file>` for a file
+/// (older records: a bare path per copied file).
 const COPIES: &str = "novacode-copies";
 
-/// Paths (relative, `/`-separated) that `enter` copied into the worktree `cwd` is in.
-/// They count as copies whatever their contents: not work, and deleted on removal.
+/// The untracked paths (relative, `/`-separated) in the worktree `cwd` is in that are
+/// copies, not work: deleted on removal.
 pub fn copies(cwd: &Path) -> Vec<String> {
-    repo(cwd).map(|r| read_copies(&r)).unwrap_or_default()
+    repo(cwd).map(|r| status(&r).copies).unwrap_or_default()
 }
 
-fn read_copies(r: &Repo) -> Vec<String> {
+/// A recorded copy: a folder (tool state: anything untracked in it is not work), or a file
+/// with the blob id it was copied with (edited or tracked since = work).
+enum Copied {
+    Dir(String),
+    File(String, Option<String>),
+}
+
+fn read_copies(r: &Repo) -> Vec<Copied> {
     std::fs::read_to_string(r.dir.join(COPIES))
         .unwrap_or_default()
         .lines()
         .filter(|l| !l.is_empty())
-        .map(String::from)
+        .map(|l| match (l.strip_suffix('/'), l.split_once(' ')) {
+            (Some(d), _) => Copied::Dir(d.to_string()),
+            (_, Some((id, f))) if id.len() >= 40 && id.chars().all(|c| c.is_ascii_hexdigit()) => {
+                Copied::File(f.to_string(), Some(id.to_string()))
+            }
+            _ => Copied::File(l.to_string(), None),
+        })
         .collect()
+}
+
+/// The worktree's `git status`, split into untracked copies (safe to delete) and work.
+struct Status {
+    copies: Vec<String>,
+    work: Vec<String>,
+}
+
+fn status(r: &Repo) -> Status {
+    let rec = read_copies(r);
+    let env = env_copies(r);
+    // File copies whose contents changed since they were copied.
+    let hashed: Vec<(&str, &str)> = rec
+        .iter()
+        .filter_map(|c| match c {
+            Copied::File(f, Some(id)) if r.top.join(f).is_file() => Some((f.as_str(), id.as_str())),
+            _ => None,
+        })
+        .collect();
+    let mut edited: Vec<&str> = Vec::new();
+    if !hashed.is_empty() {
+        let mut args = vec!["hash-object", "--"];
+        args.extend(hashed.iter().map(|(f, _)| *f));
+        let now = git(&r.top, &args).unwrap_or_default();
+        let now: Vec<&str> = now.lines().collect();
+        for (i, (f, id)) in hashed.iter().enumerate() {
+            if now.get(i) != Some(id) {
+                edited.push(f);
+            }
+        }
+    }
+    let is_copy = |p: &str| {
+        env.iter().any(|e| e == p)
+            || rec.iter().any(|c| match c {
+                Copied::Dir(d) => p.starts_with(&format!("{d}/")),
+                Copied::File(f, _) => f == p && !edited.contains(&p),
+            })
+    };
+    let (mut copies, mut work) = (Vec::new(), Vec::new());
+    // `-uall` lists files one by one, so a folder holding copies and new work isn't one line.
+    for l in git(&r.top, &["status", "--porcelain", "-uall", "--ignore-submodules=all"])
+        .unwrap_or_default()
+        .lines()
+    {
+        match l.strip_prefix("?? ") {
+            Some(p) if is_copy(p) => copies.push(p.to_string()),
+            _ => work.push(l.get(3..).unwrap_or(l).to_string()),
+        }
+    }
+    // An edited copy git ignores is still work, unless it is tracked (committed) now.
+    if !edited.is_empty() {
+        let mut args = vec!["ls-files", "--"];
+        args.extend(edited.iter().copied());
+        let tracked = git(&r.top, &args).unwrap_or_default();
+        for f in edited {
+            if !work.iter().any(|w| w == f) && !tracked.lines().any(|t| t == f) {
+                work.push(f.to_string());
+            }
+        }
+    }
+    Status { copies, work }
 }
 
 /// Copy each untracked file under the `list` entries from `main` to `wt`; returns the copied paths.
@@ -125,6 +201,10 @@ fn copy_untracked(main: &Path, wt: &Path, list: &[String]) -> Vec<String> {
             return;
         };
         if meta.is_dir() {
+            // A nested repo would show as one `?? dir/` line, never a copy.
+            if src.join(".git").exists() {
+                return;
+            }
             let mut names: Vec<_> = std::fs::read_dir(&src)
                 .into_iter()
                 .flatten()
@@ -305,19 +385,20 @@ fn enter(cwd: &Path, a: &EnterArgs, copy: &[String]) -> Result<(PathBuf, String)
     }
     let files = copy_untracked(&r.top, &path, copy);
     if !files.is_empty() {
-        let admin = git(&path, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
-        std::fs::write(Path::new(&admin).join(COPIES), files.join("\n") + "\n").map_err(|e| e.to_string())?;
+        let mut record = String::new();
         for e in copy {
             let e = e.trim_end_matches('/').replace('\\', "/");
-            let under = |f: &String| f == &e || f.starts_with(&format!("{e}/"));
-            if files.iter().any(under) {
-                copied.push(if Path::new(&r.top.join(&e)).is_dir() {
-                    format!("{e}/")
-                } else {
-                    e
-                });
+            if files.contains(&e) {
+                let id = git(&path, &["hash-object", "--", &e])?;
+                record += &format!("{id} {e}\n");
+                copied.push(e);
+            } else if files.iter().any(|f| f.starts_with(&format!("{e}/"))) {
+                record += &format!("{e}/\n");
+                copied.push(format!("{e}/"));
             }
         }
+        let admin = git(&path, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
+        std::fs::write(Path::new(&admin).join(COPIES), record).map_err(|e| e.to_string())?;
     }
     let mut msg = format!("created worktree {} on branch {branch}", path.display());
     if !copied.is_empty() {
@@ -367,15 +448,8 @@ pub fn here(cwd: &Path) -> Result<Here, String> {
         return Err("not inside a linked worktree".into());
     }
     let branch = git(&r.top, &["branch", "--show-current"]).unwrap_or_default();
-    // The copies made on entry aren't the user's changes. `-uall` lists files one by one,
-    // so a folder holding copies and new work isn't one line.
-    let mut copies = env_copies(&r);
-    copies.extend(read_copies(&r));
-    let dirty = git(&r.top, &["status", "--porcelain", "-uall", "--ignore-submodules=all"])
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.strip_prefix("?? ").is_some_and(|p| copies.iter().any(|c| p == c)))
-        .count();
+    // The copies made on entry aren't the user's changes.
+    let dirty = status(&r).work.len();
     let main_head = git(&r.main, &["rev-parse", "HEAD"])?;
     let ahead = git(&r.top, &["rev-list", "--count", &format!("{main_head}..HEAD")]).unwrap_or_default();
     Ok(Here {
@@ -390,10 +464,17 @@ pub fn here(cwd: &Path) -> Result<Here, String> {
 /// Returns what happened, starting with a space.
 pub fn remove(h: &Here) -> String {
     let (top, main) = (&h.r.top, &h.r.main);
-    for c in env_copies(&h.r) {
-        let _ = std::fs::remove_file(top.join(c));
+    // Delete copies only when git will then remove the worktree.
+    let st = status(&h.r);
+    if !st.work.is_empty() {
+        let shown: Vec<&str> = st.work.iter().take(5).map(String::as_str).collect();
+        return format!(
+            " Worktree NOT removed: {} uncommitted file(s) ({}).",
+            st.work.len(),
+            shown.join(", ")
+        );
     }
-    for c in read_copies(&h.r) {
+    for c in st.copies {
         let f = top.join(&c);
         let _ = std::fs::remove_file(&f);
         // Folders the copies left empty; a folder holding anything else stays.
@@ -702,33 +783,131 @@ mod tests {
         assert!(!wt.join(".codegraph/codegraph.sock").exists());
         // The record sits in git's admin folder, not in the worktree.
         let rec = std::fs::read_to_string(root.join(".git/worktrees/t/novacode-copies")).unwrap();
-        assert!(rec.lines().any(|l| l == "AGENTS.md"), "{rec}");
+        assert!(rec.lines().any(|l| l.ends_with(" AGENTS.md")), "{rec}");
+        assert!(rec.lines().any(|l| l == ".codegraph/"), "{rec}");
         assert!(!rec.contains("settings.json"), "{rec}");
         assert!(!wt.join("novacode-copies").exists());
+        // The untracked copies git shows (`.codegraph/` is ignored).
         let mut got = copies(&wt);
         got.sort();
-        assert_eq!(
-            got,
-            [
-                ".claude/local.md",
-                ".codegraph/codegraph.db",
-                ".codegraph/sub/x.bin",
-                "AGENTS.md"
-            ]
-        );
-        // Only copies: clean, even after a copy changed.
+        assert_eq!(got, [".claude/local.md", "AGENTS.md"]);
+        // Only copies: clean, even after a file in a copied folder changed (tool state).
         assert_eq!(here(&wt).unwrap().dirty, 0);
-        std::fs::write(wt.join("AGENTS.md"), "edited\n").unwrap();
         std::fs::write(wt.join(".claude/local.md"), "edited\n").unwrap();
+        std::fs::write(wt.join(".claude/new.md"), "new\n").unwrap();
         assert_eq!(here(&wt).unwrap().dirty, 0);
         // Real work still counts.
-        std::fs::write(wt.join(".claude/new.md"), "new\n").unwrap();
+        std::fs::write(wt.join("new.md"), "new\n").unwrap();
         assert_eq!(here(&wt).unwrap().dirty, 1);
-        std::fs::remove_file(wt.join(".claude/new.md")).unwrap();
+        std::fs::remove_file(wt.join("new.md")).unwrap();
         let out = remove(&here(&wt).unwrap());
         assert!(out.contains("Worktree and branch worktree-t removed"), "{out}");
         assert!(!wt.exists());
         // The main checkout's files are untouched.
         assert!(root.join("AGENTS.md").exists() && root.join(".codegraph/daemon.pid").exists());
+    }
+
+    /// A repo with one commit, AGENTS.md and `.codegraph/` untracked (not ignored), and a
+    /// worktree `t` made with the default copy list.
+    fn copied_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let root = novacode_base::platform::canonicalize(d.path()).unwrap();
+        git(&root, &["init", "-q"]).unwrap();
+        std::fs::write(root.join("README"), "x\n").unwrap();
+        git(&root, &["add", "."]).unwrap();
+        git(
+            &root,
+            &["-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "-m", "x"],
+        )
+        .unwrap();
+        std::fs::write(root.join("AGENTS.md"), "rules\n").unwrap();
+        std::fs::create_dir_all(root.join(".codegraph")).unwrap();
+        std::fs::write(root.join(".codegraph/codegraph.db"), "index").unwrap();
+        let list: Vec<String> = COPY_DEFAULT.iter().map(|s| s.to_string()).collect();
+        let (wt, _) = create(&root, "t", &list).unwrap();
+        (d, root, wt)
+    }
+
+    #[test]
+    fn an_unchanged_copy_is_removed_with_the_worktree() {
+        let (_d, _root, wt) = copied_worktree();
+        assert_eq!(here(&wt).unwrap().dirty, 0);
+        let out = remove(&here(&wt).unwrap());
+        assert!(out.contains("Worktree and branch worktree-t removed"), "{out}");
+        assert!(!wt.exists());
+    }
+
+    #[test]
+    fn an_edited_copy_counts_as_work_and_is_kept() {
+        let (_d, _root, wt) = copied_worktree();
+        std::fs::write(wt.join("AGENTS.md"), "edited rules\n").unwrap();
+        assert_eq!(here(&wt).unwrap().dirty, 1);
+        let out = remove(&here(&wt).unwrap());
+        assert!(out.contains("NOT removed"), "{out}");
+        assert_eq!(std::fs::read_to_string(wt.join("AGENTS.md")).unwrap(), "edited rules\n");
+    }
+
+    #[test]
+    fn a_now_tracked_copy_is_kept() {
+        let (_d, root, wt) = copied_worktree();
+        // Staged: work, never deleted.
+        git(&wt, &["add", "AGENTS.md"]).unwrap();
+        assert_eq!(here(&wt).unwrap().dirty, 1);
+        let out = remove(&here(&wt).unwrap());
+        assert!(out.contains("NOT removed"), "{out}");
+        assert_eq!(std::fs::read_to_string(wt.join("AGENTS.md")).unwrap(), "rules\n");
+        // Committed: removal leaves the file alone, so git removes the worktree and the branch keeps it.
+        git(
+            &wt,
+            &["-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "-m", "y"],
+        )
+        .unwrap();
+        assert_eq!(here(&wt).unwrap().dirty, 0);
+        let out = remove(&here(&wt).unwrap());
+        assert!(out.contains("branch worktree-t kept"), "{out}");
+        assert_eq!(git(&root, &["show", "worktree-t:AGENTS.md"]).unwrap(), "rules");
+    }
+
+    /// C9: a copied folder is tool state (codegraph writes into `.codegraph/`).
+    #[test]
+    fn a_copied_folder_is_tool_state_whatever_is_written_in_it() {
+        let (_d, _root, wt) = copied_worktree();
+        std::fs::write(wt.join(".codegraph/codegraph.db"), "changed index").unwrap();
+        std::fs::write(wt.join(".codegraph/daemon.log"), "log").unwrap();
+        assert_eq!(here(&wt).unwrap().dirty, 0);
+        let out = remove(&here(&wt).unwrap());
+        assert!(out.contains("Worktree and branch worktree-t removed"), "{out}");
+        assert!(!wt.exists());
+    }
+
+    /// C2: a nested git repo inside a copied folder is not copied (it would show as `?? dir/`).
+    #[test]
+    fn a_nested_repo_is_not_copied() {
+        let d = tempfile::tempdir().unwrap();
+        let root = novacode_base::platform::canonicalize(d.path()).unwrap();
+        git(&root, &["init", "-q"]).unwrap();
+        git(
+            &root,
+            &[
+                "-c",
+                "user.email=a@b",
+                "-c",
+                "user.name=a",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ],
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".novacode/plug")).unwrap();
+        git(&root.join(".novacode/plug"), &["init", "-q"]).unwrap();
+        std::fs::write(root.join(".novacode/plug/x"), "x").unwrap();
+        std::fs::write(root.join(".novacode/settings.json"), "{}").unwrap();
+        let (wt, _) = create(&root, "t", &[".novacode/".into()]).unwrap();
+        assert!(wt.join(".novacode/settings.json").exists());
+        assert!(!wt.join(".novacode/plug").exists());
+        assert_eq!(here(&wt).unwrap().dirty, 0);
     }
 }

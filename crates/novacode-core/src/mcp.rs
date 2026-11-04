@@ -545,6 +545,7 @@ fn spawn_stdio(c: &ServerConfig, cwd: &Path, log: &Path) -> Result<Transport, St
         .stdout(std::process::Stdio::piped())
         .kill_on_drop(true);
     novacode_base::platform::own_group(p.as_std_mut());
+    novacode_base::platform::drop_task_vars(p.as_std_mut());
     if let Some(dir) = log.parent() {
         let _ = std::fs::create_dir_all(dir);
     }

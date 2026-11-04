@@ -460,6 +460,7 @@ async fn run(mut c: tokio::process::Command, cwd: &Path, input: &Value, timeout:
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     novacode_base::platform::own_group(c.as_std_mut());
+    novacode_base::platform::drop_task_vars(c.as_std_mut());
     let mut child = c
         .spawn()
         .map_err(|e| tracing::warn!("plugin hook did not start: {e}"))
