@@ -160,19 +160,11 @@ pub(super) fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 /// The main checkout of the repo `folder` is in, and `folder` relative to its own checkout.
+/// Pins that repo: one nested in super's own (pinned) repo is resolved on its own, so
+/// every later git call in it uses its common dir, not the outer repo's.
 fn repo_of(folder: &Path) -> Option<(PathBuf, PathBuf)> {
-    let out = git(
-        folder,
-        &[
-            "rev-parse",
-            "--path-format=absolute",
-            "--show-toplevel",
-            "--git-common-dir",
-        ],
-    )
-    .ok()?;
-    let mut lines = out.lines();
-    let (top, common) = (lines.next()?, Path::new(lines.next()?));
+    let (top, common) = novacode_base::git::pin_repo(folder)?;
+    let common = common.as_path();
     // A bare repo's common dir is not `<main>/.git`: no main checkout to work in.
     if common.file_name()? != ".git" {
         return None;
@@ -263,9 +255,14 @@ impl Super {
         launcher: Arc<dyn Launcher>,
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
+        let board = Board::load(&dir)?;
+        // A restarted super pins its tasks' repos again (nested repos included).
+        for main in board.tasks.iter().filter_map(|t| t.repo.as_deref()) {
+            novacode_base::git::pin_repo(main);
+        }
         Ok(Super {
             root: novacode_base::platform::canonicalize(root)?,
-            board: Mutex::new(Board::load(&dir)?),
+            board: Mutex::new(board),
             dir,
             cfg,
             asker,
@@ -824,6 +821,12 @@ impl Super {
     }
 
     async fn close(&self, t: &Task) -> Result<String, String> {
+        if t.state == State::Merging {
+            return Err(format!(
+                "{} is merging: wait for the merge result before closing it (or `task stop` it to end the merge)",
+                t.label
+            ));
+        }
         self.check(&t.id, Event::Close)?;
         let merged = Self::merged(t);
         let mut q = format!("Close {}? Its session ends; the session file is kept.", t.label);
@@ -1930,8 +1933,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_or_close_while_merging_releases_the_lock_and_a_half_done_merge_blocks() {
-        let fx = fixture(5, &[Some("Merge"), Some("Merge"), Some("Merge"), Some("Close")]);
+    async fn stop_while_merging_releases_the_lock_and_a_half_done_merge_blocks() {
+        let fx = fixture(5, &[Some("Merge"), Some("Merge"), Some("Merge")]);
         let app = repo(&fx.root, "app");
         for s in ["a", "b", "c"] {
             run(&fx, spawn_args("app", s, true)).await.unwrap();
@@ -1954,16 +1957,91 @@ mod tests {
         assert!(out.contains("half-done"), "{out}");
         assert!(lock_holders(&fx).is_empty());
         std::fs::remove_file(app.join(".git/MERGE_HEAD")).unwrap();
-        // Close while merging with uncommitted changes left in the main checkout: blocked, worktree kept.
+        // Stop while merging with uncommitted changes left in the main checkout: blocked, worktree kept.
         set_state(&fx, "T3-c", State::Ready);
         run(&fx, json!({"action": "merge", "task": "T3-c"})).await.unwrap();
         std::fs::write(app.join("sub/f"), "conflict").unwrap();
-        let out = run(&fx, json!({"action": "close", "task": "T3-c"})).await.unwrap();
+        let out = run(&fx, json!({"action": "stop", "task": "T3-c"})).await.unwrap();
         let t = fx.sup.row("T3-c").unwrap();
         assert_eq!(t.state, State::Blocked, "{out}");
         assert!(t.block.unwrap().reason.contains("uncommitted changes"), "{out}");
         assert!(app.join(".worktrees/T3-c").exists(), "{out}");
         assert!(lock_holders(&fx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_nested_repo_inside_super_s_pinned_repo_gets_its_own_worktree_and_merge() {
+        let fx = fixture(5, &[Some("Merge"), Some("Close")]);
+        // Super runs inside an outer repo (its process pinned it), on another branch;
+        // the task folder `app` is its own repo, untracked in the outer one.
+        let outer = repo(&fx.root, "");
+        sh(&outer, &["checkout", "-qb", "outer"]);
+        novacode_base::git::pin_repo(&outer).unwrap();
+        let app = repo(&fx.root, "app");
+        let out = run(&fx, spawn_args("app/sub", "n", true)).await.unwrap();
+        let t = fx.sup.row("T1-n").unwrap();
+        let wt = app.join(".worktrees/T1-n");
+        assert_eq!(t.repo.as_deref(), Some(app.as_path()), "{out}");
+        assert_eq!(t.worktree.as_deref(), Some(wt.as_path()), "{out}");
+        assert_eq!(t.base_branch.as_deref(), Some("main"), "{out}");
+        assert!(wt.join("sub/f").exists());
+        assert!(!outer.join(".worktrees").exists(), "nothing in the outer repo");
+        assert!(git(&app, &["rev-parse", "--verify", "refs/heads/worktree-T1-n"]).is_ok());
+        // Merge and the half-done check see the nested repo.
+        set_state(&fx, "T1-n", State::Ready);
+        run(&fx, json!({"action": "merge", "task": "T1-n"})).await.unwrap();
+        assert_eq!(state(&fx, "T1-n"), State::Merging);
+        let head = git(&app, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(app.join(".git/MERGE_HEAD"), format!("{head}\n")).unwrap();
+        let out = run(&fx, json!({"action": "stop", "task": "T1-n"})).await.unwrap();
+        assert_eq!(state(&fx, "T1-n"), State::Blocked, "{out}");
+        std::fs::remove_file(app.join(".git/MERGE_HEAD")).unwrap();
+        // Close sees the nested branch as merged into its base.
+        sh(&app, &["merge", "-q", "--ff-only", "worktree-T1-n"]);
+        let out = run(&fx, json!({"action": "close", "task": "T1-n"})).await.unwrap();
+        assert!(out.contains("Closed T1-n") && !wt.exists(), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_reloaded_board_pins_its_task_repos() {
+        let fx = fixture(5, &[]);
+        let app = repo(&fx.root, "app");
+        fx.sup
+            .edit(|b| {
+                b.tasks.push(Task {
+                    id: "T1-r".into(),
+                    label: "T1-r".into(),
+                    repo: Some(app.clone()),
+                    ..Task::default()
+                })
+            })
+            .unwrap();
+        assert_eq!(novacode_base::git::pinned(&app), None);
+        let cfg = Config {
+            max_running: 5,
+            tiers: Vec::new(),
+            worktree_copy: Vec::new(),
+            home: fx.home.clone(),
+            allow: fx.sup.cfg.allow.clone(),
+        };
+        let _again = Super::new(&fx.root, fx.sup.dir.clone(), cfg, None, fx.launcher.clone()).unwrap();
+        assert_eq!(novacode_base::git::pinned(&app), Some(app.join(".git")));
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_the_merge_result_unless_the_merge_was_stopped() {
+        let fx = fixture(5, &[Some("Merge"), Some("Close")]);
+        repo(&fx.root, "app");
+        run(&fx, spawn_args("app", "m", true)).await.unwrap();
+        set_state(&fx, "T1-m", State::Ready);
+        run(&fx, json!({"action": "merge", "task": "T1-m"})).await.unwrap();
+        let e = run(&fx, json!({"action": "close", "task": "T1-m"})).await.unwrap_err();
+        assert!(e.contains("wait for the merge result"), "{e}");
+        assert_eq!(state(&fx, "T1-m"), State::Merging);
+        assert_eq!(fx.asker.asked.lock().unwrap().len(), 1, "no close card");
+        run(&fx, json!({"action": "stop", "task": "T1-m"})).await.unwrap();
+        let out = run(&fx, json!({"action": "close", "task": "T1-m"})).await.unwrap();
+        assert!(out.contains("Closed T1-m"), "{out}");
     }
 
     #[tokio::test]

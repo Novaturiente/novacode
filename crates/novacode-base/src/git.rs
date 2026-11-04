@@ -66,11 +66,14 @@ pub fn pin(root: &Path, common_dir: &Path) {
     pins.push((root, common_dir.to_path_buf()));
 }
 
-/// Resolves the work tree and common git dir of `dir` and pins them; `None`
-/// outside a work tree. Call it before any model command runs there: it reads
-/// `commondir`. A folder already pinned keeps its pinned dir.
-pub fn pin_repo(dir: &Path) -> Option<PathBuf> {
-    let o = command_in(dir)
+/// Resolves the work tree and common git dir of `dir` and pins them; returns
+/// (work tree root, its pinned common dir), `None` outside a work tree. Call it
+/// before any model command runs there: it reads `commondir`. A work tree
+/// already pinned keeps its pinned dir; a repo nested in a pinned one is
+/// resolved on its own, not through the outer pin, and pinned as the deeper root.
+pub fn pin_repo(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let o = command()
+        .current_dir(dir)
         .args([
             "rev-parse",
             "--path-format=absolute",
@@ -85,8 +88,18 @@ pub fn pin_repo(dir: &Path) -> Option<PathBuf> {
     let out = String::from_utf8_lossy(&o.stdout);
     let mut lines = out.lines();
     let (top, common) = (PathBuf::from(lines.next()?), PathBuf::from(lines.next()?));
+    let root = crate::platform::canonicalize(&top).unwrap_or_else(|_| top.clone());
+    let kept = PINS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(r, _)| *r == root)
+        .map(|(_, c)| c.clone());
+    if let Some(c) = kept {
+        return Some((top, c));
+    }
     pin(&top, &common);
-    Some(common)
+    Some((top, common))
 }
 
 /// The pinned common git dir for `dir`: the deepest pinned root holding it.
@@ -219,7 +232,7 @@ mod tests {
         // Resolved at session start, before anything is planted.
         // git prints `C:/…` on Windows: compare the folders, not the strings.
         let real = |c: PathBuf| crate::platform::canonicalize(c).unwrap();
-        assert_eq!(pin_repo(&p).map(real), Some(p.join(".git")));
+        assert_eq!(pin_repo(&p).map(|(_, c)| real(c)), Some(p.join(".git")));
         // Worktrees work pinned: their common dir is the main repo's `.git`.
         let wt = root.join("wt");
         let o = command_in(&p)
@@ -266,6 +279,8 @@ mod tests {
         std::fs::write(p.join(".gitattributes"), "* filter=x\n").unwrap();
         std::fs::write(p.join("f.txt"), "b\n").unwrap();
         std::fs::write(p.join("new.txt"), "n\n").unwrap();
+        // Pinning again keeps the first pin, not the planted dir.
+        assert_eq!(pin_repo(&p).map(|(_, c)| real(c)), Some(p.join(".git")));
         // Unpinned git follows the planted `commondir` (the attack works).
         let other = root.join("other");
         let o = command()

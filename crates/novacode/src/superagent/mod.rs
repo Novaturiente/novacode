@@ -29,6 +29,8 @@ change, whether the results support the claim) and ask the task for more proof w
 task's own word. Every write task is reviewed by a review task before it is ready.
 - Your context must stay small: read reports, not transcripts; page a task's final message with `task read` only \
 when its report isn't enough.
+- After `task merge`, wait for the merge result (it wakes you); call `task close` only after it arrives, never in \
+the same turn as the merge.
 - Act only on the user's requests.";
 
 /// Follows the global `AGENTS.md`: what of it doesn't apply to super.
