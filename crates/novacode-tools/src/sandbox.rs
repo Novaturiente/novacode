@@ -703,9 +703,7 @@ pub fn command(sandbox: Option<&Sandbox>, cmd: &str, cwd: &Path) -> io::Result<t
         }
     };
     c.arg("-c").arg(cmd).current_dir(cwd);
-    for v in crate::env::TASK_VARS {
-        c.env_remove(v);
-    }
+    novacode_base::platform::drop_task_vars(c.as_std_mut());
     Ok(c)
 }
 

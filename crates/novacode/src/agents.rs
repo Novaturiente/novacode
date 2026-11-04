@@ -1189,9 +1189,7 @@ impl Supervisor {
         chain.push(self.me.clone());
         cmd.envs(&self.c().env);
         // A super task's subagents can't report for it (L10.9).
-        for v in novacode_tools::env::TASK_VARS {
-            cmd.env_remove(v);
-        }
+        novacode_base::platform::drop_task_vars(cmd.as_std_mut());
         cmd.current_dir(&cwd)
             .env("NOVACODE_HOME", &self.home)
             .env("NOVACODE_AGENT_DEPTH", (self.place.depth + 1).to_string())

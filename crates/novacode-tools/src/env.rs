@@ -12,9 +12,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// A super mode task's identity (L10.9): kept out of every command and subagent
-/// it starts, so only the task's own session can report for it.
-pub const TASK_VARS: [&str; 3] = ["NOVACODE_TASK", "NOVACODE_TASK_TOKEN", "NOVACODE_SUPER_DIR"];
+pub use novacode_base::platform::TASK_VARS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileMeta {

@@ -92,6 +92,7 @@ impl ProcessExt {
             .stdout(std::process::Stdio::piped())
             .kill_on_drop(true);
         novacode_base::platform::own_group(p.as_std_mut());
+        novacode_base::platform::drop_task_vars(p.as_std_mut());
         if let Some(d) = log.parent() {
             let _ = std::fs::create_dir_all(d);
         }
