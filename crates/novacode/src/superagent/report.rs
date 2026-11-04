@@ -16,7 +16,7 @@
 use super::board::{Board, Kind};
 use futures_util::future::BoxFuture;
 use novacode_core::hooks::{After, Handler, Run};
-use novacode_core::session::{Entry, EntryKind};
+use novacode_core::session::{Entry, EntryKind, now_ms};
 use novacode_tools::process::{Event as ProcEvent, ProcessManager};
 use novacode_tools::{Tool, ToolCtx, ToolOutput};
 use novacode_types::{AgentEvent, Message};
@@ -36,12 +36,6 @@ pub const MAX_FINDINGS: usize = 5;
 /// The `ext` of the session entry that saves the task's identity.
 const EXT: &str = "superagent";
 const EXT_KIND: &str = "task";
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
-}
 
 // ---------------------------------------------------------------------------
 // Identity

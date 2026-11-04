@@ -289,8 +289,13 @@ pub fn resolve(store: &TrustStore, dir: &Path, cli_trust: bool) -> bool {
 
 /// A stable 16-hex-digit key for a path (FNV-1a 64 of its bytes), e.g. a folder name per root.
 pub fn path_key(p: &Path) -> String {
+    fnv_hex(p.as_os_str().as_encoded_bytes())
+}
+
+/// FNV-1a 64 of `bytes` as 16 hex digits: the same in every process and version.
+pub fn fnv_hex(bytes: &[u8]) -> String {
     let mut h = Fnv::new();
-    h.write(p.as_os_str().as_encoded_bytes());
+    h.write(bytes);
     format!("{:016x}", h.0)
 }
 

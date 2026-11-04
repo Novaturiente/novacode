@@ -211,14 +211,6 @@ fn outside_scope(file: &str, scope: Option<&str>) -> bool {
     !items.is_empty() && !items.iter().any(|i| file.contains(i))
 }
 
-fn type_name(t: TaskType) -> &'static str {
-    match t {
-        TaskType::Bugfix => "bugfix",
-        TaskType::Change => "change",
-        TaskType::Question => "question",
-    }
-}
-
 /// What the review brief is built from, besides the reviewed row.
 struct BriefIn<'a> {
     label: &'a str,
@@ -239,7 +231,7 @@ You judge the work, not a story about it: you get the user's request, the accept
 recorded, never the task's own summary.\n\nThe user's request:\n{}\n",
         i.label,
         t.label,
-        type_name(t.ty),
+        t.ty.name(),
         if t.write { "write" } else { "read" },
         t.request.trim()
     );

@@ -361,8 +361,10 @@ pub enum AgentEvent {
     /// The loop stopped. `stop` is the last assistant message's stop reason.
     AgentEnd {
         stop: StopReason,
-        /// Request ids of the wire prompts this run consumed, drained ones included;
-        /// `None` = sent without an id. Empty for a run started inside the session (L10.9).
+        /// Request ids of the wire prompts this run gave the model, queued ones it took
+        /// mid-run included; `None` = sent without an id. Prompts dropped before a run took
+        /// them (`Abort { drop_queued }`, taken back) never appear. Empty for a run started
+        /// inside the session (L10.9).
         #[serde(default)]
         prompts: Vec<Option<String>>,
     },

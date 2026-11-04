@@ -4,7 +4,7 @@
 //! - **Relay:** the task's `ask_user` forms and approvals are re-opened in super's
 //!   windows with the label in front ([`crate::relay`]), keyed by (task, card id)
 //!   so a reconnect opens no duplicate; a card answered in the task's own window
-//!   closes super's copy.
+//!   closes super's copy, also when it was answered while the link was down.
 //! - **Code-made reports:** [`Watcher`] turns the task's turn ends into board events:
 //!   `blocked` for a turn on super's prompts that ended without a terminal report,
 //!   on an error, the length limit or a provider limit, or a goal that ended
@@ -658,7 +658,7 @@ impl Links {
                 self.inform.notice(format!(
                     "Provider {} is on hold ({}){}: its queued tasks wait; blocked tasks are resent when it clears.",
                     limit.provider,
-                    limit_name(limit.kind),
+                    limit.kind.label(),
                     until(sup, &limit.provider)
                 ));
             }
@@ -780,11 +780,11 @@ impl Links {
             self.apply(sup, &of, Event::BranchMoved);
             return;
         }
-        let verdict = match f.get("verdict").and_then(Value::as_str) {
-            Some("approved") => board::Verdict::Approved,
-            Some("needs-proof") => board::Verdict::NeedsProof,
-            _ => board::Verdict::Rejected,
-        };
+        let said = f.get("verdict").and_then(Value::as_str);
+        let verdict = board::Verdict::ALL
+            .into_iter()
+            .find(|v| Some(v.name()) == said)
+            .unwrap_or(board::Verdict::Rejected);
         let findings: Vec<String> = f
             .get("findings")
             .and_then(Value::as_array)
@@ -801,7 +801,7 @@ impl Links {
         self.apply_with(sup, &of, board::Event::Verdict(verdict), &extra);
         let Ok(t) = sup.row(&of) else { return };
         if verdict != board::Verdict::Approved && t.state == State::Running {
-            let name = verdict_name(verdict);
+            let name = verdict.name();
             let text = format!(
                 "Your review ({}) says {name} about commit {}. Its findings, word for word:{list}\n\n\
 Address every finding, commit, re-run your checks and report `done` again.",
@@ -1005,6 +1005,21 @@ Address every finding, commit, re-run your checks and report `done` again.",
         self.card_closed(id, card_id);
     }
 
+    /// After a reconnect's catch-up: close super's copies of the task's cards it no longer has open.
+    fn cards_gone(&self, id: &str, open: &HashSet<u64>) {
+        let gone: Vec<u64> = {
+            let g = self.inner.lock().unwrap();
+            g.cards
+                .keys()
+                .filter(|(t, c)| t == id && !open.contains(c))
+                .map(|(_, c)| *c)
+                .collect()
+        };
+        for c in gone {
+            self.card_done(id, c);
+        }
+    }
+
     fn card_closed(&self, id: &str, card_id: u64) {
         let mut g = self.inner.lock().unwrap();
         g.cards.remove(&(id.to_string(), card_id));
@@ -1022,17 +1037,9 @@ fn crash_reason(ev: &Event) -> Option<String> {
         Event::ProcessExit => Some("its process exited".into()),
         Event::TurnUnreported => Some("it ended its turn without a verdict".into()),
         Event::TurnError(e) => Some(format!("its turn ended on: {e}")),
-        Event::TurnLimit(l) => Some(format!("{} of provider {}", limit_name(l.kind), l.provider)),
+        Event::TurnLimit(l) => Some(format!("{} of provider {}", l.kind.label(), l.provider)),
         Event::GoalEnded(how) => Some(how.clone()),
         _ => None,
-    }
-}
-
-fn verdict_name(v: board::Verdict) -> &'static str {
-    match v {
-        board::Verdict::Approved => "approved",
-        board::Verdict::NeedsProof => "needs-proof",
-        board::Verdict::Rejected => "rejected",
     }
 }
 
@@ -1077,13 +1084,6 @@ fn blocked_on(t: &board::Task, provider: &str) -> bool {
             .is_some_and(|l| l.provider == provider)
 }
 
-fn limit_name(k: LimitKind) -> &'static str {
-    match k {
-        LimitKind::Quota => "quota",
-        LimitKind::RateLimit => "rate limit",
-    }
-}
-
 fn until(sup: &Super, provider: &str) -> String {
     let b = sup.board.lock().unwrap();
     match b.holds.get(provider).and_then(|l| l.reset_at) {
@@ -1122,7 +1122,7 @@ fn wake_text(t: &board::Task, ev: &Event) -> String {
         Event::TurnLimit(l) => format!(
             "{} is blocked (code-made report): {} of provider {}; code resends when it clears.",
             t.label,
-            limit_name(l.kind),
+            l.kind.label(),
             l.provider
         ),
         Event::GoalEnded(_) => format!("{} is blocked (code-made report): {reason}.", t.label),
@@ -1150,12 +1150,12 @@ second review with `task review`.",
         Event::Verdict(v) if t.state == State::Blocked => format!(
             "{}'s review says {} and its review rounds are used up (now blocked). Ask the user how to go on.",
             t.label,
-            verdict_name(*v)
+            v.name()
         ),
         Event::Verdict(v) => format!(
             "{}'s review says {} (round {} of 2): code sent the findings to the task (now {}).",
             t.label,
-            verdict_name(*v),
+            v.name(),
             t.review_rounds,
             t.state.name()
         ),
@@ -1256,6 +1256,8 @@ async fn run_link(
         *writer.lock().await = Some(write);
         let mut lines = BufReader::new(read).lines();
         let mut history = Vec::new();
+        // Cards the catch-up re-sent: super's copies of any others were answered meanwhile.
+        let mut open = HashSet::new();
         let mut busy = false;
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
@@ -1283,6 +1285,7 @@ async fn run_link(
                 }
                 ServerMsg::History { messages } => history = messages,
                 ServerMsg::Response { id: Some(r), .. } if r == "link" => {
+                    links.cards_gone(&id, &open);
                     let last = sup.row(&id).ok().and_then(|t| t.last_prompt);
                     let goal = Goal::read(sup.home(), &session);
                     match watcher.catch_up(&history, last.as_deref(), busy, goal) {
@@ -1316,6 +1319,7 @@ async fn run_link(
                 }
                 ServerMsg::Ask { .. } | ServerMsg::Approve { .. } => {
                     if let Some(card) = Card::from_msg(&msg) {
+                        open.insert(card.id());
                         links.card(&id, card);
                     }
                 }
@@ -1996,6 +2000,31 @@ mod tests {
             "{:?}",
             r.cmd
         );
+    }
+
+    #[tokio::test]
+    async fn a_card_answered_while_the_link_was_down_closes_super_s_copy_on_reconnect() {
+        let fx = fixture(5);
+        let s = fx.task("T1-x", "faux/a", State::Running);
+        let mut t = fx.end(&s).await;
+        t.catch_up(false, vec![], vec![ask(3), ask(4)]).await;
+        fx.until("asked", |fx| fx.asker.waiting.lock().unwrap().len() == 2)
+            .await;
+        assert_eq!(fx.state("T1-x"), State::WaitingYou);
+        // Card 3 is answered in the task's window while the link is down; 4 stays open.
+        drop(t);
+        let mut t = fx.end(&s).await;
+        t.catch_up(false, vec![], vec![ask(4)]).await;
+        fx.until("copy of 3 closed", |fx| fx.asker.waiting.lock().unwrap()[0].is_closed())
+            .await;
+        assert!(!fx.asker.waiting.lock().unwrap()[1].is_closed(), "4 is still open");
+        assert_eq!(fx.state("T1-x"), State::WaitingYou);
+        // Then 4 too: the task runs again.
+        drop(t);
+        let mut t = fx.end(&s).await;
+        t.catch_up(false, vec![], vec![]).await;
+        fx.until("running", |fx| fx.state("T1-x") == State::Running).await;
+        assert_eq!(fx.asker.asked.lock().unwrap().len(), 2, "no card opened again");
     }
 
     #[tokio::test]

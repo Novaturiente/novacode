@@ -52,7 +52,7 @@ pub struct TaskRow {
     pub state: String,
     /// The model the task runs now (its run file), else the one at spawn.
     pub model: String,
-    /// Session tokens so far (0 while it isn't running).
+    /// Session tokens so far; the last seen once its process is gone.
     pub tokens: u64,
     /// Unix ms the task was spawned: its age.
     pub started_ms: u64,

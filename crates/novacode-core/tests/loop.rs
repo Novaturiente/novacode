@@ -2473,8 +2473,8 @@ async fn agent_end_marks_idless_prompts_and_lists_none_for_wakes() {
     task.await.unwrap();
 }
 
-/// Prompt, prompt, abort: how many runs start before the session settles (L10.9 Stop).
-async fn runs_after_abort(drop_queued: bool) -> usize {
+/// Prompt, then a follow-up (or a steer), abort: how many runs start before the session settles (L10.9 Stop).
+async fn runs_after_abort(drop_queued: bool, steer: bool) -> usize {
     let work = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let (agent, asked) = waiting_on_approval(work.path(), home.path());
@@ -2482,7 +2482,11 @@ async fn runs_after_abort(drop_queued: bool) -> usize {
     let mut rx = h.subscribe();
     h.prompt("make a file");
     asked.notified().await;
-    h.prompt("then this");
+    if steer {
+        h.steer("then this");
+    } else {
+        h.prompt("then this");
+    }
     if drop_queued {
         h.drop_follow_ups();
     }
@@ -2506,10 +2510,15 @@ async fn runs_after_abort(drop_queued: bool) -> usize {
 
 #[tokio::test]
 async fn abort_dropping_queued_starts_no_second_run() {
-    assert_eq!(runs_after_abort(true).await, 1);
+    assert_eq!(runs_after_abort(true, false).await, 1);
+}
+
+#[tokio::test]
+async fn abort_dropping_queued_drops_a_steer_too() {
+    assert_eq!(runs_after_abort(true, true).await, 1);
 }
 
 #[tokio::test]
 async fn plain_abort_keeps_the_queued_prompt() {
-    assert_eq!(runs_after_abort(false).await, 2);
+    assert_eq!(runs_after_abort(false, false).await, 2);
 }

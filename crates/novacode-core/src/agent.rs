@@ -798,12 +798,8 @@ impl Agent {
         self
     }
 
-    /// Compaction instructions of this session (after `with_memory`).
-    pub fn with_compaction_guide(self, text: String) -> Self {
-        self.with_compaction_guide_fn(Arc::new(move || text.clone()))
-    }
-
-    /// Compaction instructions made when a compaction runs (super's carry its board then).
+    /// Compaction instructions of this session (after `with_memory`), made when a
+    /// compaction runs (super's carry its board then).
     pub fn with_compaction_guide_fn(mut self, f: Arc<dyn Fn() -> String + Send + Sync>) -> Self {
         if let Some(m) = self.memory.as_mut() {
             m.guide = Some(f);
@@ -2633,9 +2629,12 @@ impl SessionHandle {
             .collect()
     }
 
-    /// Drop every queued follow-up, images too, so an abort right after starts no run (super's Stop, L10.9).
+    /// Drop every queued follow-up and steer, images too, so an abort right after starts no
+    /// run (super's Stop, L10.9). Dropped prompts never reach the model or `AgentEnd.prompts`.
     pub fn drop_follow_ups(&self) {
-        self.shared.queues.lock().unwrap().follow_up.clear();
+        let mut q = self.shared.queues.lock().unwrap();
+        q.follow_up.clear();
+        q.steering.clear();
     }
 
     /// Compact now, or as soon as the running turn ends (`/compact`, L4.5).

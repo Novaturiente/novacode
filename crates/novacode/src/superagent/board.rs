@@ -71,11 +71,34 @@ pub enum TaskType {
     Question,
 }
 
+impl TaskType {
+    pub const ALL: [TaskType; 3] = [TaskType::Bugfix, TaskType::Change, TaskType::Question];
+
+    /// Its serde name, as in a spawn's `type`.
+    pub fn name(self) -> &'static str {
+        match self {
+            TaskType::Bugfix => "bugfix",
+            TaskType::Change => "change",
+            TaskType::Question => "question",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LimitKind {
     Quota,
     RateLimit,
+}
+
+impl LimitKind {
+    /// In words, for block reasons and notes: `quota`, `rate limit`.
+    pub fn label(self) -> &'static str {
+        match self {
+            LimitKind::Quota => "quota",
+            LimitKind::RateLimit => "rate limit",
+        }
+    }
 }
 
 /// A provider limit that blocked a task or holds a provider.
@@ -187,6 +210,8 @@ pub struct Task {
     /// Hash of super's last prompt to it ([`prompt_hash`]): the catch-up after a
     /// reconnect finds it in the task's messages.
     pub last_prompt: Option<String>,
+    /// Session tokens last seen in its run file: the Tasks tab shows them once it's gone.
+    pub tokens: u64,
     /// Unix seconds.
     pub started: u64,
     pub updated: u64,
@@ -227,6 +252,19 @@ pub enum Verdict {
     Approved,
     NeedsProof,
     Rejected,
+}
+
+impl Verdict {
+    pub const ALL: [Verdict; 3] = [Verdict::Approved, Verdict::NeedsProof, Verdict::Rejected];
+
+    /// Its name in a review report's `verdict`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Verdict::Approved => "approved",
+            Verdict::NeedsProof => "needs-proof",
+            Verdict::Rejected => "rejected",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -474,10 +512,7 @@ fn turn_block(ev: &Event) -> Block {
     match ev {
         Event::TurnError(text) => Block::new(text.clone()),
         Event::TurnLimit(limit) => Block {
-            reason: match limit.kind {
-                LimitKind::Quota => "quota".into(),
-                LimitKind::RateLimit => "rate limit".into(),
-            },
+            reason: limit.kind.label().into(),
             limit: Some(limit.clone()),
         },
         _ => Block::new("ended its turn without a report"),
@@ -640,8 +675,24 @@ impl Board {
         write_atomic_no_backup(&dir.join("board.md"), self.render().as_bytes(), Durability::Fast)
     }
 
+    /// Save the tokens `live(session)` reads from each task's run file on its row.
+    /// Returns whether a row changed (the board then needs saving).
+    pub fn note_tokens(&mut self, live: impl Fn(&str) -> Option<(String, u64)>) -> bool {
+        let mut changed = false;
+        for t in &mut self.tasks {
+            if let Some((_, n)) = t.session.as_deref().and_then(&live)
+                && n != t.tokens
+            {
+                t.tokens = n;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// The board snapshot for the Tasks tab: every task not archived, with the
-    /// live model and tokens `live(session)` reads from its run file.
+    /// live model and tokens `live(session)` reads from its run file, else the
+    /// model at spawn and the tokens last seen.
     pub fn snapshot(&self, live: impl Fn(&str) -> Option<(String, u64)>) -> Vec<TaskRow> {
         self.tasks
             .iter()
@@ -651,7 +702,7 @@ impl Board {
                     .session
                     .as_deref()
                     .and_then(&live)
-                    .unwrap_or_else(|| (t.model.clone(), 0));
+                    .unwrap_or_else(|| (t.model.clone(), t.tokens));
                 TaskRow {
                     label: t.label.clone(),
                     repo: t.repo_name(),
@@ -694,11 +745,7 @@ impl Board {
             out.push_str(&format!("- Merge lock: {} held by {id}\n", repo.display()));
         }
         for (provider, limit) in &self.holds {
-            let kind = match limit.kind {
-                LimitKind::Quota => "quota",
-                LimitKind::RateLimit => "rate limit",
-            };
-            out.push_str(&format!("- On hold: {provider} ({kind})\n"));
+            out.push_str(&format!("- On hold: {provider} ({})\n", limit.kind.label()));
         }
         out
     }
@@ -706,16 +753,12 @@ impl Board {
 
 /// A stable hash of a prompt's text (FNV-1a, hex): the same in every super process.
 pub fn prompt_hash(text: &str) -> String {
-    let h = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
-    });
-    format!("{h:016x}")
+    novacode_core::trust::fnv_hex(text.as_bytes())
 }
 
+/// Unix seconds: the board's clock.
 pub fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+    novacode_core::session::now_ms() / 1000
 }
 
 #[cfg(test)]
@@ -1152,6 +1195,20 @@ mod tests {
         assert_eq!(rows[0].session.as_deref(), Some("s1"));
         assert_eq!(rows[0].summary.as_deref(), Some("half done"));
         assert_eq!(rows[0].repo, "r");
+    }
+
+    #[test]
+    fn a_task_s_last_seen_tokens_stay_after_its_run_file_is_gone() {
+        let mut b = board(&[("T1", Running)]);
+        b.tasks[0].session = Some("s1".into());
+        let live = |s: &str| (s == "s1").then(|| ("faux/a".to_string(), 1234));
+        assert!(b.note_tokens(live));
+        assert!(!b.note_tokens(live), "unchanged: nothing to save");
+        b.tasks[0].state = Stopped;
+        let rows = b.snapshot(|_| None);
+        assert_eq!(rows[0].tokens, 1234);
+        let back: Board = serde_json::from_slice(&serde_json::to_vec(&b).unwrap()).unwrap();
+        assert_eq!(back.tasks[0].tokens, 1234, "saved on the row");
     }
 
     #[test]

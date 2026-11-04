@@ -252,8 +252,8 @@ pub enum ClientCmd {
     Steer {
         text: String,
     },
-    /// Stops the running turn; queued prompts then start, unless `drop_queued`
-    /// drops them first (super's Stop, L10.9).
+    /// Stops the running turn; queued prompts and steers then start, unless
+    /// `drop_queued` drops them first (super's Stop, L10.9).
     Abort {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         drop_queued: bool,

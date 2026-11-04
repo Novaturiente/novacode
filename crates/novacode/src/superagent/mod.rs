@@ -122,21 +122,37 @@ pub fn tiers(s: &Settings) -> Vec<(String, Tier)> {
 
 /// The board snapshot feed (L10.9 dashboard): every 2 s, super's board plus each
 /// task's live model and tokens from its run file; windows hear only of changes.
-pub fn feed_board(hub: std::sync::Arc<crate::hub::Hub>, dir: std::path::PathBuf, paths: novacode_base::paths::Paths) {
+/// The tokens seen are saved on the board rows, so a stopped task still shows them.
+pub fn feed_board(slot: crate::hub::HubSlot, sup: &std::sync::Arc<task::Super>, paths: novacode_base::paths::Paths) {
+    let sup = std::sync::Arc::downgrade(sup);
     tokio::spawn(async move {
         let mut last = None;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
-        while !hub.is_closed() {
+        loop {
             tick.tick().await;
-            let Ok(b) = board::Board::load(&dir) else { continue };
+            let Some(sup) = sup.upgrade() else { break };
+            // The hub starts after super's tools are made.
+            let Some(hub) = slot.0.get().map(|w| w.upgrade()) else {
+                continue;
+            };
+            let Some(hub) = hub.filter(|h| !h.is_closed()) else {
+                break;
+            };
             let runs = crate::serve::live_sessions(&paths);
-            let rows = b.snapshot(|s| {
+            let live = |s: &str| {
                 let f = runs.iter().find(|f| f.state.session == s)?;
                 Some((
                     f.state.model.clone(),
                     f.state.tokens.prompt_total() + f.state.tokens.output,
                 ))
-            });
+            };
+            let rows = {
+                let mut b = sup.board.lock().unwrap();
+                if b.note_tokens(live) {
+                    let _ = b.save(&sup.dir);
+                }
+                b.snapshot(live)
+            };
             if last.as_ref() != Some(&rows) {
                 hub.set_board(rows.clone());
                 last = Some(rows);

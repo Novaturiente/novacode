@@ -113,24 +113,15 @@ pub fn check_slug(s: &str) -> Result<(), String> {
 
 /// `type` and `write` must agree: `question` reads, `bugfix` and `change` write.
 fn task_type(ty: Option<&str>, write: bool) -> Result<TaskType, String> {
-    let (t, name) = match ty.unwrap_or("change") {
-        "bugfix" => (TaskType::Bugfix, "bugfix"),
-        "change" => (TaskType::Change, "change"),
-        "question" => (TaskType::Question, "question"),
-        other => return Err(format!("bad type `{other}`: bugfix, change or question")),
-    };
+    let name = ty.unwrap_or("change");
+    let t = TaskType::ALL
+        .into_iter()
+        .find(|t| t.name() == name)
+        .ok_or_else(|| format!("bad type `{name}`: bugfix, change or question"))?;
     if (t == TaskType::Question) == write {
         return Err(format!("`type: {name}` needs `write: {}`", !write));
     }
     Ok(t)
-}
-
-fn type_name(t: TaskType) -> &'static str {
-    match t {
-        TaskType::Bugfix => "bugfix",
-        TaskType::Change => "change",
-        TaskType::Question => "question",
-    }
 }
 
 /// `n` of a `T<n>-…` label.
@@ -229,7 +220,7 @@ fn brief(t: &Task) -> String {
     let mut s = format!(
         "Task {}: {} ({} task).\n\nThe user's request:\n{}\n",
         t.label,
-        type_name(t.ty),
+        t.ty.name(),
         if t.write { "write" } else { "read" },
         t.request.trim()
     );
@@ -422,7 +413,19 @@ impl Super {
         let notes = self.pump().await;
         let t = self.row(&label)?;
         let mut out = match t.state {
-            State::Queued => format!("{label} is queued: {}.", self.why_queued(&t)),
+            State::Queued => {
+                let mut s = format!("{label} is queued: {}.", self.why_queued(&t));
+                let on = t
+                    .repo
+                    .as_ref()
+                    .filter(|_| t.write)
+                    .and_then(|main| git(main, &["branch", "--show-current"]).ok())
+                    .filter(|b| !b.is_empty());
+                if let Some(b) = on {
+                    s += &format!(" Its worktree branches from {b} (the main checkout's branch) when it starts.");
+                }
+                s
+            }
             State::Failed => format!("{label} failed to start: {}", t.summary.unwrap_or_default()),
             s => {
                 let mut s = format!("Started {label} ({}, {}).", s.name(), t.model);
@@ -801,24 +804,31 @@ impl Super {
 
     /// A confirmation card made by code: true only when the user picks `ok`.
     async fn confirm(&self, header: String, question: String, ok: &str) -> Result<bool, String> {
+        Ok(self.choose(header, question, &[ok, "Cancel"]).await?.as_deref() == Some(ok))
+    }
+
+    /// A card made by code: the choice the user picked, `None` when dismissed.
+    async fn choose(&self, header: String, question: String, choices: &[&str]) -> Result<Option<String>, String> {
         let asker = self.asker.as_ref().ok_or("no window to confirm in")?;
         let q = Question {
             question,
             header: Some(header),
-            options: vec![ok_choice(ok), ok_choice("Cancel")],
+            options: choices.iter().map(|c| ok_choice(c)).collect(),
             multi: false,
         };
         Ok(asker
             .ask(vec![q])
             .await
             .and_then(|r| r.into_iter().next())
-            .is_some_and(|r| r.chosen.iter().any(|c| c == ok)))
+            .and_then(|r| r.chosen.into_iter().find(|c| choices.contains(&c.as_str()))))
     }
 
     async fn close(&self, t: &Task) -> Result<String, String> {
         self.check(&t.id, Event::Close)?;
         let merged = Self::merged(t);
         let mut q = format!("Close {}? Its session ends; the session file is kept.", t.label);
+        let (close, close_rm) = ("Close", "Close and remove worktree");
+        let mut choices = vec![close, "Cancel"];
         if let (Some(w), Some(b)) = (&t.worktree, &t.branch) {
             let base = t
                 .base_branch
@@ -830,15 +840,22 @@ impl Super {
                     " Branch {b} is merged into {base}: its worktree {} is removed.",
                     w.display()
                 ),
-                _ => format!(
-                    " Branch {b} is NOT merged into {base}: its worktree {} is kept.",
-                    w.display()
-                ),
+                _ => {
+                    choices.insert(1, close_rm);
+                    format!(
+                        " Branch {b} is NOT merged into {base}: its worktree {} is kept, unless you \
+                         remove it (the branch stays either way).",
+                        w.display()
+                    )
+                }
             };
         }
-        if !self.confirm(format!("{}: close", t.label), q, "Close").await? {
-            return Ok(format!("The user declined: {} stays open.", t.label));
-        }
+        let pick = self.choose(format!("{}: close", t.label), q, &choices).await?;
+        let remove = match pick.as_deref() {
+            Some(p) if p == close => merged == Some(true),
+            Some(p) if p == close_rm => true,
+            _ => return Ok(format!("The user declined: {} stays open.", t.label)),
+        };
         let n = self.edit(|b| b.apply(&t.id, Event::Close))??;
         if n.effects.contains(&super::board::Effect::StopReview) {
             self.stop_review(t.reviewer.clone()).await;
@@ -854,9 +871,9 @@ impl Super {
         }
         let mut out = format!("Closed {}.", t.label);
         if let Some(w) = &t.worktree {
-            match (merged, novacode_tools::worktree::here(w)) {
-                (Some(true), Ok(h)) => out += &novacode_tools::worktree::remove(&h),
-                (Some(true), Err(e)) => out += &format!(" Worktree not removed: {e}."),
+            match (remove, novacode_tools::worktree::here(w)) {
+                (true, Ok(h)) => out += &novacode_tools::worktree::remove(&h),
+                (true, Err(e)) => out += &format!(" Worktree not removed: {e}."),
                 _ => out += &format!(" Worktree {} kept (not merged).", w.display()),
             }
         }
@@ -892,15 +909,18 @@ impl Super {
             return Ok(format!("The user declined: {} is not merged.", t.label));
         }
         self.edit(|b| b.apply(&t.id, Event::Merge))??;
-        // The user's checkout is never switched: a local merge needs it on the task's base.
+        // The user's checkout is never switched or merged into while dirty: a local merge
+        // needs it clean and on the task's base.
         let refused = match &t.base_branch {
             None => Some(format!("its base is commit {base}, not a branch")),
             Some(want) if !pr => {
                 let on = git(&main, &["branch", "--show-current"]).unwrap_or_default();
-                (on != *want).then(|| {
+                if on != *want {
                     let on = if on.is_empty() { "a detached HEAD" } else { &on };
-                    format!("main checkout is on {on}, not {want}")
-                })
+                    Some(format!("main checkout is on {on}, not {want}"))
+                } else {
+                    changes(&main).then(|| "main checkout has uncommitted changes".to_string())
+                }
             }
             Some(_) => None,
         };
@@ -1017,8 +1037,14 @@ If anything fails (a conflict, a dirty main checkout, a failed check), report `m
     }
 }
 
+/// Uncommitted changes to tracked files (untracked files, such as `.worktrees/`, don't count).
+fn changes(dir: &Path) -> bool {
+    git(dir, &["status", "--porcelain", "--untracked-files=no"]).is_ok_and(|s| !s.is_empty())
+}
+
 /// What an unfinished merge left in the task's main checkout or worktree: a merge or
-/// rebase in progress, or uncommitted changes in the main checkout.
+/// rebase in progress, or uncommitted changes in the main checkout. A local merge starts
+/// only in a clean main checkout, so any change there is the merge's.
 pub(super) fn half_done(t: &Task) -> Option<String> {
     let main = t.repo.as_ref()?;
     let in_progress = |dir: &Path| -> Option<&'static str> {
@@ -1034,7 +1060,7 @@ pub(super) fn half_done(t: &Task) -> Option<String> {
     if let Some(what) = in_progress(main) {
         return Some(format!("the main checkout {} has {what}", main.display()));
     }
-    if git(main, &["status", "--porcelain=v2", "--untracked-files=no"]).is_ok_and(|s| !s.is_empty()) {
+    if changes(main) {
         return Some(format!("the main checkout {} has uncommitted changes", main.display()));
     }
     let wt = t.worktree.as_ref().filter(|w| w.exists())?;
@@ -1631,6 +1657,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_queued_write_task_names_the_branch_it_will_start_from() {
+        let fx = fixture(1, &[]);
+        repo(&fx.root, "app");
+        run(&fx, spawn_args("app", "a", true)).await.unwrap();
+        let out = run(&fx, spawn_args("app", "b", true)).await.unwrap();
+        assert_eq!(state(&fx, "T2-b"), State::Queued);
+        assert!(out.contains("branches from main"), "{out}");
+    }
+
+    #[tokio::test]
     async fn a_second_non_git_write_task_in_one_folder_queues() {
         let fx = fixture(5, &[]);
         std::fs::create_dir(fx.root.join("plain")).unwrap();
@@ -1714,6 +1750,28 @@ mod tests {
         let q = fx.asker.asked.lock().unwrap()[2].question.clone();
         assert!(q.contains("is merged into main"), "{q}");
         assert!(!wt2.exists(), "{out}");
+    }
+
+    #[tokio::test]
+    async fn close_on_an_unmerged_branch_can_remove_the_worktree_and_keeps_the_branch() {
+        let fx = fixture(5, &[Some("Close and remove worktree")]);
+        let app = repo(&fx.root, "app");
+        run(&fx, spawn_args("app", "drop", true)).await.unwrap();
+        let wt = app.join(".worktrees/T1-drop");
+        std::fs::write(wt.join("new"), "y").unwrap();
+        sh(&wt, &["add", "new"]);
+        sh(&wt, &["commit", "-qm", "work"]);
+        let out = run(&fx, json!({"action": "close", "task": "T1-drop"})).await.unwrap();
+        let q = fx.asker.asked.lock().unwrap()[0].clone();
+        let labels: Vec<&str> = q.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, ["Close", "Close and remove worktree", "Cancel"], "{q:?}");
+        assert_eq!(state(&fx, "T1-drop"), State::Archived);
+        assert!(!wt.exists(), "{out}");
+        let branch = fx.sup.row("T1-drop").unwrap().branch.unwrap();
+        assert!(
+            git(&app, &["rev-parse", "--verify", &branch]).is_ok(),
+            "the branch stays: {out}"
+        );
     }
 
     #[tokio::test]
@@ -1802,6 +1860,26 @@ mod tests {
         assert!(lock_holders(&fx).is_empty(), "the lock is released");
         assert_eq!(fx.launcher.prompts("s1").len(), before, "the task is told nothing");
         assert_eq!(git(&app, &["branch", "--show-current"]).unwrap(), "other");
+    }
+
+    #[tokio::test]
+    async fn a_dirty_main_checkout_fails_the_merge_without_touching_it() {
+        let fx = fixture(5, &[Some("Merge")]);
+        let app = repo(&fx.root, "app");
+        run(&fx, spawn_args("app", "m", true)).await.unwrap();
+        set_state(&fx, "T1-m", State::Ready);
+        std::fs::write(app.join("sub/f"), "user's edit").unwrap();
+        let before = fx.launcher.prompts("s1").len();
+        let out = run(&fx, json!({"action": "merge", "task": "T1-m"})).await.unwrap();
+        assert!(
+            out.contains("merge: failed") && out.contains("main checkout has uncommitted changes"),
+            "{out}"
+        );
+        let t = fx.sup.row("T1-m").unwrap();
+        assert_eq!(t.state, State::Blocked);
+        assert!(lock_holders(&fx).is_empty(), "the lock is released");
+        assert_eq!(fx.launcher.prompts("s1").len(), before, "the task is told nothing");
+        assert_eq!(std::fs::read_to_string(app.join("sub/f")).unwrap(), "user's edit");
     }
 
     #[tokio::test]
