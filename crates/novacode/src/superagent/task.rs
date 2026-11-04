@@ -1183,7 +1183,7 @@ impl Tool for TaskTool {
                 "goal": { "type": "boolean", "description": "spawn: open-ended work; the task keeps going until the criteria hold." },
                 "message": s("send: the message."),
                 "question": { "type": "boolean", "description": "send: only ask for information (raw output, proof): the task's state and review stay, it answers in text without a report, and its reply wakes you. Leave false for work: a plain send sets the task running and stops its review." },
-                "pr": { "type": "boolean", "description": "merge: open a pull request instead of merging locally." },
+                "pr": { "type": "boolean", "description": "merge: open a pull request instead of merging locally; only when the user asked for a pull request." },
                 "note": s("review: what the review should look at."),
                 "all": { "type": "boolean", "description": "list: archived tasks too." },
                 "offset": { "type": "integer", "description": "read: first line (0-based)." },

@@ -33,6 +33,8 @@ when its report isn't enough.
 - To only ask a task for information (raw output of a check, proof a merge landed), use `task send` with \
 `question: true`: its state and review stay as they are, it answers in text and its reply wakes you. Use a plain \
 `task send` only for work: it sets the task running again and stops a running review.
+- `task merge` merges locally. Use `pr: true` only when the user asked for a pull request, never by your own \
+choice (a remote existing is not a request).
 - After `task merge`, wait for the merge result (it wakes you); call `task close` only after it arrives, never in \
 the same turn as the merge.
 - An instruction the user already gave is acted on when its moment comes; don't ask for it again in text. `task merge` \
@@ -210,6 +212,7 @@ mod tests {
     #[test]
     fn merge_and_close_are_confirmed_only_on_their_own_cards() {
         assert!(PROMPT.contains("Never use `ask_user` to confirm a merge or a close"));
+        assert!(PROMPT.contains("Use `pr: true` only when the user asked for a pull request"));
         assert!(PROMPT.contains("`ask_user` is for real choices only"));
     }
 
