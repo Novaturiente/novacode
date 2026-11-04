@@ -32,6 +32,8 @@ pub struct Faux {
     replies: Arc<Mutex<std::collections::VecDeque<FauxReply>>>,
     /// Requests seen, in order.
     pub requests: Arc<Mutex<Vec<Request>>>,
+    /// When the replies run out: an empty stop reply (`faux/script`) instead of an error.
+    stop_when_empty: bool,
 }
 
 impl Faux {
@@ -41,6 +43,68 @@ impl Faux {
             ..Default::default()
         }
     }
+
+    /// The hidden `faux/script` model (L10.9): replies from a JSON Lines file, one
+    /// `{"text": ..., "tools": [{"name": ..., "args": {...}}]}` per reply, then empty stops.
+    /// The file is `$NOVACODE_FAUX_SCRIPT_DIR/<label>.jsonl` (label: `$NOVACODE_TASK`, else
+    /// `super`), else `$NOVACODE_FAUX_SCRIPT`.
+    pub fn from_env() -> Result<Self, String> {
+        let var = |k| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let path = match (var("NOVACODE_FAUX_SCRIPT_DIR"), var("NOVACODE_FAUX_SCRIPT")) {
+            (Some(dir), _) => {
+                let label = var("NOVACODE_TASK").unwrap_or_else(|| "super".into());
+                std::path::Path::new(&dir).join(format!("{label}.jsonl"))
+            }
+            (None, Some(file)) => file.into(),
+            (None, None) => return Err("faux/script needs NOVACODE_FAUX_SCRIPT or NOVACODE_FAUX_SCRIPT_DIR".into()),
+        };
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("faux/script: {}: {e}", path.display()))?;
+        Self::script(&text).map_err(|e| format!("faux/script: {}: {e}", path.display()))
+    }
+
+    /// Parse a script's JSON Lines (blank lines skipped).
+    pub fn script(text: &str) -> Result<Self, String> {
+        #[derive(serde::Deserialize)]
+        struct Line {
+            #[serde(default)]
+            text: String,
+            #[serde(default)]
+            tools: Vec<Tool>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Tool {
+            name: String,
+            #[serde(default)]
+            args: serde_json::Value,
+        }
+        let mut replies = Vec::new();
+        for (n, raw) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+            let line: Line = serde_json::from_str(raw).map_err(|e| format!("line {}: {e}", n + 1))?;
+            let mut blocks = Vec::new();
+            if !line.text.is_empty() {
+                blocks.push(Block::text(&line.text));
+            }
+            for (i, t) in line.tools.into_iter().enumerate() {
+                blocks.push(Block::ToolCall(novacode_types::ToolCall {
+                    id: format!("faux-{}-{i}", n + 1),
+                    name: t.name,
+                    arguments: t.args,
+                    arguments_error: None,
+                    replay: None,
+                }));
+            }
+            let tools = blocks.iter().any(|b| matches!(b, Block::ToolCall(_)));
+            replies.push(FauxReply::Message {
+                blocks,
+                stop: if tools { StopReason::ToolUse } else { StopReason::Stop },
+                usage: Usage::default(),
+            });
+        }
+        Ok(Self {
+            stop_when_empty: true,
+            ..Self::new(replies)
+        })
+    }
 }
 
 const CHUNK: usize = 4;
@@ -48,7 +112,13 @@ const CHUNK: usize = 4;
 impl Adapter for Faux {
     fn stream(&self, req: Request, cancel: CancellationToken) -> mpsc::Receiver<StreamEvent> {
         let (tx, rx) = mpsc::channel(EVENT_BUFFER);
-        let reply = self.replies.lock().unwrap().pop_front();
+        let reply = self.replies.lock().unwrap().pop_front().or_else(|| {
+            self.stop_when_empty.then(|| FauxReply::Message {
+                blocks: Vec::new(),
+                stop: StopReason::Stop,
+                usage: Usage::default(),
+            })
+        });
         let model = req.model.clone();
         self.requests.lock().unwrap().push(req);
         tokio::spawn(async move {
@@ -152,5 +222,20 @@ mod tests {
             }
         );
         assert_eq!(faux.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_script_ends_in_empty_stops_and_names_a_bad_line() {
+        let faux = Faux::script("{\"text\": \"one\"}\n\n").unwrap();
+        assert_eq!(
+            collect(faux.stream(req(), CancellationToken::new())).await.text(),
+            "one"
+        );
+        for _ in 0..2 {
+            let m = collect(faux.stream(req(), CancellationToken::new())).await;
+            assert_eq!((m.stop, m.content.len()), (StopReason::Stop, 0));
+        }
+        let err = Faux::script("{\"text\": \"ok\"}\nnot json").err().unwrap();
+        assert!(err.starts_with("line 2:"), "{err}");
     }
 }
