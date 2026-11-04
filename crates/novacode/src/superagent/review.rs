@@ -17,7 +17,6 @@
 use super::board::{self, Event, Kind, State, Task, TaskType};
 use super::task::Super;
 use crate::wire::ClientCmd;
-use novacode_core::policy::EditRule;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -548,6 +547,7 @@ mod tests {
     use crate::superagent::link::{Inform, Links};
     use crate::superagent::task::{Config, Launcher, Start};
     use futures_util::future::BoxFuture;
+    use novacode_core::policy::EditRule;
     use novacode_core::policy::{Approval, ApprovalRequest, Approver};
     use novacode_tools::ask::Asker;
     use novacode_types::{Question, Reply};
@@ -874,7 +874,11 @@ mod tests {
         let scratch = scratch(&fx.sup.dir, &rv);
         assert!(
             scratch.starts_with(fx.sup.dir.join("review"))
-                && scratch.file_name().unwrap().to_string_lossy().starts_with("T2-review-T1-fix-"),
+                && scratch
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("T2-review-T1-fix-"),
             "{}",
             scratch.display()
         );
@@ -922,11 +926,7 @@ mod tests {
         assert_eq!(fx.row(&rv.id).state, State::Archived, "archived by code");
         assert_eq!(fx.row("T1-fix").reviewer, None);
         assert!(!scratch.exists(), "scratch removed");
-        assert!(
-            !worktrees(&fx.app).contains(&scratch_id(&rv)),
-            "{}",
-            worktrees(&fx.app)
-        );
+        assert!(!worktrees(&fx.app).contains(&scratch_id(&rv)), "{}", worktrees(&fx.app));
         // Clean as `report` and `close` see it (its own `worktree.copy` files don't count).
         assert_eq!(
             novacode_tools::worktree::here(&wt).unwrap().dirty,
@@ -954,7 +954,8 @@ mod tests {
         assert_eq!(rv.model, "faux/deep");
         let brief = fx.prompts("s2").remove(0);
         assert!(
-            brief.contains("red then green") && brief.contains(&format!("{}/base", scratch(&fx.sup.dir, &rv).display())),
+            brief.contains("red then green")
+                && brief.contains(&format!("{}/base", scratch(&fx.sup.dir, &rv).display())),
             "{brief}"
         );
 

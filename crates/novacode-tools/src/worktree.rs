@@ -888,7 +888,17 @@ mod tests {
         git(&root, &["init", "-q"]).unwrap();
         git(
             &root,
-            &["-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "x"],
+            &[
+                "-c",
+                "user.email=a@b",
+                "-c",
+                "user.name=a",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ],
         )
         .unwrap();
         std::fs::create_dir_all(root.join(".novacode/plug")).unwrap();
