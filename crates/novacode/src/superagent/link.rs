@@ -193,6 +193,8 @@ pub struct Watcher {
     /// A question run ended: its reply for super.
     reply: Option<String>,
     goal: Option<Goal>,
+    /// A run is going: a goal that ends meanwhile is judged at its end (R18).
+    running: bool,
     /// The catch-up note already given: (super's prompt hash, messages after it).
     noted: Option<(String, usize)>,
     /// The provider of the task's model (`provider/model`), for holds.
@@ -234,6 +236,7 @@ impl Watcher {
     pub fn event(&mut self, ev: &AgentEvent, goal: impl FnOnce() -> Goal) -> Option<Event> {
         match ev {
             AgentEvent::AgentStart => {
+                self.running = true;
                 self.run_reported = false;
                 self.last_error = None;
                 self.last_text = None;
@@ -272,8 +275,15 @@ impl Watcher {
                 self.subagents.insert(node.id.clone(), !node.dim);
             }
             AgentEvent::AgentEnd { stop, prompts } => {
+                self.running = false;
                 let goal = goal();
-                return self.end(run_of(prompts), stop, goal);
+                let ev = self.end(run_of(prompts), stop, goal);
+                // A goal that ended in this run, judged now its reports are in.
+                let ended = self.goal(goal);
+                return match ev {
+                    Some(Event::TurnError(_) | Event::TurnLimit(_)) => ev,
+                    _ => ended.or(ev),
+                };
             }
             _ => {}
         }
@@ -359,9 +369,13 @@ impl Watcher {
         }
     }
 
-    /// The goal file now says `now`: a goal that left the active state as done,
+    /// The goal file now says `now` (ignored mid-run: the run's end judges it): a goal
+    /// that left the active state as done,
     /// blocked or failed with no terminal report since super's last prompt is reported.
     pub fn goal(&mut self, now: Goal) -> Option<Event> {
+        if self.running {
+            return None;
+        }
         let before = self.goal.replace(now);
         if before != Some(Goal::Active) || self.reported_since_super {
             return None;
@@ -378,6 +392,8 @@ impl Watcher {
     /// After a reconnect: the turn super's last prompt (hash `last_prompt`) started
     /// may have ended unseen. Reported only when nothing but super's prompt came in.
     pub fn catch_up(&mut self, history: &[Message], last_prompt: Option<&str>, busy: bool, goal: Goal) -> CatchUp {
+        // A run end missed while disconnected must not hold goal ends back.
+        self.running = busy;
         let Some(hash) = last_prompt else {
             return CatchUp::Nothing;
         };
@@ -765,7 +781,10 @@ impl Links {
                 .desktop(format!("{} {}", t.label, t.state.name()), why.unwrap_or_default());
         }
         let wakes = match &ev {
-            Event::Report { state, .. } => changed && *state != ReportState::Progress,
+            // Over a code-made block the task's own report always counts (R18).
+            Event::Report { state, .. } => {
+                *state != ReportState::Progress && (changed || before.block.as_ref().is_some_and(|b| b.code_made))
+            }
             Event::MergeReport(_) | Event::Verdict(_) | Event::BranchMoved | Event::ReviewCantStart(_) => true,
             Event::ReviewCrashed(_) => t.state == State::Blocked,
             Event::TurnUnreported
@@ -1841,6 +1860,40 @@ mod tests {
     }
 
     #[test]
+    fn a_goal_that_ends_mid_run_is_judged_at_the_run_s_end() {
+        // R18: the goal is done mid-run, the task reports `done` later in the same run.
+        for runs in [SUPER, &[] as &[Option<&str>]] {
+            let mut w = Watcher::new("faux");
+            w.goal(Goal::Active);
+            w.event(&AgentEvent::AgentStart, || Goal::Active);
+            assert_eq!(w.goal(Goal::Done), None, "not judged mid-run");
+            assert_eq!(w.event(&report("done"), || Goal::Done), None);
+            assert_eq!(w.event(&end(runs, StopReason::Stop), || Goal::Done), None);
+            assert_eq!(w.goal(Goal::Done), None);
+
+            // Reported first, then the goal ends in the same run.
+            let mut w = Watcher::new("faux");
+            w.goal(Goal::Active);
+            w.event(&AgentEvent::AgentStart, || Goal::Active);
+            w.event(&report("done"), || Goal::Active);
+            assert_eq!(w.goal(Goal::Done), None);
+            assert_eq!(w.event(&end(runs, StopReason::Stop), || Goal::Done), None);
+            assert_eq!(w.goal(Goal::Done), None);
+
+            // No report by the run's end: the goal end is reported then, once.
+            let mut w = Watcher::new("faux");
+            w.goal(Goal::Active);
+            w.event(&AgentEvent::AgentStart, || Goal::Active);
+            assert_eq!(w.goal(Goal::Done), None);
+            assert_eq!(
+                w.event(&end(runs, StopReason::Stop), || Goal::Done),
+                Some(Event::GoalEnded("goal done without a report".into()))
+            );
+            assert_eq!(w.goal(Goal::Done), None, "once");
+        }
+    }
+
+    #[test]
     fn catch_up_reports_only_when_super_s_prompt_was_the_only_one() {
         let brief = "Task T1: do it";
         let hash = board::prompt_hash(brief);
@@ -2718,5 +2771,28 @@ mod tests {
         );
         let list = fx.sup.run(json!({"action": "list"})).await.unwrap();
         assert!(list.contains("| reviewing (your call) |"), "{list}");
+    }
+
+    #[tokio::test]
+    async fn a_done_report_moves_a_task_on_from_a_code_made_block() {
+        // R18: blocked by "goal done without a report", then the task's own `done` arrives.
+        let fx = fixture(5);
+        fx.task("T1-x", "faux/a", State::Running);
+        fx.sup
+            .edit(|b| b.apply("T1-x", Event::GoalEnded("goal done without a report".into())))
+            .unwrap()
+            .unwrap();
+        write_report(&fx, "T1-x", 1, "tok", json!({"state": "done", "summary": "all good"}));
+        fx.links.kick();
+        fx.until("reviewing", |fx| fx.state("T1-x") == State::Reviewing).await;
+        let row = fx.sup.row("T1-x").unwrap();
+        assert_eq!((row.block, row.summary.as_deref()), (None, Some("all good")));
+        let wakes: Vec<_> = fx.said().into_iter().filter(|l| l.starts_with("wake:")).collect();
+        assert!(
+            wakes
+                .iter()
+                .any(|w| w.contains("T1-x reported done (now reviewing): all good")),
+            "{wakes:?}"
+        );
     }
 }

@@ -117,6 +117,10 @@ pub struct Block {
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<Limit>,
+    /// Made by code from a turn or goal end, not reported by the task: provisional,
+    /// so the task's own terminal report still applies (R18).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub code_made: bool,
 }
 
 impl Block {
@@ -124,7 +128,13 @@ impl Block {
         Block {
             reason: reason.into(),
             limit: None,
+            code_made: false,
         }
+    }
+
+    fn code_made(mut self) -> Block {
+        self.code_made = true;
+        self
     }
 }
 
@@ -451,6 +461,11 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
     }
 
     let reviewing = t.reviewer.is_some();
+    // A code-made block is provisional: the task's own terminal report applies as from `running`.
+    let from_report = match from {
+        Blocked if t.block.as_ref().is_some_and(|b| b.code_made) => Running,
+        s => s,
+    };
     match (ev, from) {
         (Event::SlotFree, Queued) => go(Running),
 
@@ -458,7 +473,8 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
         (Event::CardOpened, Merging | Reviewing) => with(from, Effect::RelayCard),
         (Event::LastCardAnswered, WaitingYou) => go(Running),
 
-        (Event::Report { state, .. }, _) => match (state, from) {
+        (Event::Report { state, .. }, _) => match (state, from_report) {
+            (ReportState::Progress, _) if from != from_report => refused(),
             (ReportState::Progress, s) if s.is_live() => go(s),
             (ReportState::Blocked, Running) => blocked(Block::new("reported blocked")),
             (ReportState::Failed, Running) => go(Failed),
@@ -471,7 +487,7 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
 
         (Event::TurnUnreported | Event::TurnError(_) | Event::TurnLimit(_), Running) => blocked(turn_block(ev)),
         (Event::LimitCleared, Blocked) if t.block.as_ref().is_some_and(|b| b.limit.is_some()) => go(Running),
-        (Event::GoalEnded(how), Running) => blocked(Block::new(how.clone())),
+        (Event::GoalEnded(how), Running) => blocked(Block::new(how.clone()).code_made()),
 
         (Event::ProcessExit, Running | WaitingYou) => go(Failed),
         (Event::ProcessExit | Event::Restart, s) if !s.is_live() => go(s),
@@ -551,9 +567,11 @@ fn turn_block(ev: &Event) -> Block {
         Event::TurnLimit(limit) => Block {
             reason: limit.kind.label().into(),
             limit: Some(limit.clone()),
+            code_made: false,
         },
         _ => Block::new("ended its turn without a report"),
     }
+    .code_made()
 }
 
 fn event_name(ev: &Event) -> &'static str {
@@ -615,7 +633,8 @@ impl Board {
 
         let t = &mut self.tasks[i];
         t.state = n.to;
-        if n.from != n.to {
+        // A report replaces a provisional block even when the state stays `blocked`.
+        if n.from != n.to || matches!(ev, Event::Report { .. }) && n.block.is_some() {
             t.block = n.block.clone();
             if n.to != State::Blocked {
                 t.question = None;
@@ -917,6 +936,53 @@ mod tests {
     }
 
     #[test]
+    fn a_task_report_overrides_a_code_made_block() {
+        // R18: code-made blocks are provisional; the task's own terminal report applies.
+        for ev in [
+            Event::TurnUnreported,
+            Event::TurnError("e".into()),
+            Event::TurnLimit(limit()),
+            Event::GoalEnded("goal done without a report".into()),
+        ] {
+            let mut b = Board {
+                tasks: vec![row(Running)],
+                ..Board::default()
+            };
+            b.apply("T1", ev.clone()).unwrap();
+            assert_eq!(b.task("T1").unwrap().state, Blocked);
+            let n = b.apply("T1", report(ReportState::Done)).unwrap();
+            assert_eq!(
+                (n.from, n.to, n.effects),
+                (Blocked, Reviewing, vec![Effect::StartReview { uses_round: true }]),
+                "{ev:?}"
+            );
+            assert_eq!(b.task("T1").unwrap().block, None);
+            let mut b2 = Board {
+                tasks: vec![row(Running)],
+                ..Board::default()
+            };
+            b2.apply("T1", ev.clone()).unwrap();
+            b2.apply("T1", report(ReportState::Blocked)).unwrap();
+            assert_eq!(b2.task("T1").unwrap().block, Some(Block::new("reported blocked")));
+            b2.apply("T1", Event::Send).unwrap();
+            b2.apply("T1", Event::TurnUnreported).unwrap();
+            assert_eq!(to(b2.task("T1").unwrap(), report(ReportState::Failed)), Failed);
+        }
+        // A block the task reported itself, or one from review, is not provisional.
+        let mut b = Board {
+            tasks: vec![row(Running)],
+            ..Board::default()
+        };
+        b.apply("T1", report(ReportState::Blocked)).unwrap();
+        assert!(b.apply("T1", report(ReportState::Done)).is_err());
+        let used_up = Task {
+            block: Some(Block::new(ROUNDS_USED_UP)),
+            ..row(Blocked)
+        };
+        assert!(next(&used_up, &report(ReportState::Done), None).is_err());
+    }
+
+    #[test]
     fn an_approved_verdict_records_its_commit() {
         let mut b = Board {
             tasks: vec![Task {
@@ -946,6 +1012,7 @@ mod tests {
             block: Some(Block {
                 reason: "quota".into(),
                 limit: Some(limit()),
+                code_made: true,
             }),
             ..row(Blocked)
         };

@@ -1074,7 +1074,8 @@ If anything fails (a conflict, a dirty main checkout, a failed check), report `m
         let paths = Paths::new(&self.cfg.home);
         let cwd = t.cwd.clone().unwrap_or_else(|| self.root.clone());
         let file = novacode_core::session::find(&paths, &cwd, session).map_err(|e| e.to_string())?;
-        let store = novacode_core::session::Store::open(&file).map_err(|e| e.to_string())?;
+        // A live task holds its session lock; read without it (R17).
+        let store = novacode_core::session::Store::peek(&file).map_err(|e| e.to_string())?;
         let text = store
             .projection()
             .iter()
@@ -1964,6 +1965,47 @@ mod tests {
         assert!(!e.contains("review task"), "read works on a review row: {e}");
         let e = run(&fx, json!({"action": "fly", "task": "T1-q"})).await.unwrap_err();
         assert!(e.contains("unknown action"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn read_works_on_a_live_task_whose_session_is_locked() {
+        use novacode_core::session::{EntryKind, Store};
+        let fx = fixture(5, &[]);
+        let mut s = Store::create(&Paths::new(&fx.home), &fx.root, false);
+        s.append(EntryKind::Message {
+            message: novacode_types::Message::user("q"),
+        })
+        .unwrap();
+        s.append(EntryKind::Message {
+            message: novacode_types::Message::Assistant(novacode_types::AssistantMessage {
+                content: vec![novacode_types::Block::text("the answer")],
+                stop: novacode_types::StopReason::Stop,
+                usage: Default::default(),
+                provider: "faux".into(),
+                model: "m".into(),
+                response_id: None,
+                error_message: None,
+                thinking_level: None,
+            }),
+        })
+        .unwrap();
+        let file = s.path().unwrap().to_path_buf();
+        drop(s);
+        // The live task's own process holds the lock (R17).
+        let _live = Store::open(&file).unwrap();
+        fx.sup
+            .edit(|b| {
+                b.tasks.push(Task {
+                    id: "T1-q".into(),
+                    label: "T1-q".into(),
+                    state: State::Running,
+                    session: Some(file.display().to_string()),
+                    ..Task::default()
+                })
+            })
+            .unwrap();
+        let out = run(&fx, json!({"action": "read", "task": "T1-q"})).await.unwrap();
+        assert_eq!(out, "the answer");
     }
 
     fn lock_holders(fx: &Fx) -> Vec<String> {

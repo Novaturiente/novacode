@@ -240,6 +240,20 @@ impl Store {
             f.seek(SeekFrom::End(0))?;
             f.write_all(b"\n")?;
         }
+        let mut s = Self::parse(path, &text)?;
+        s._lock = Some(lock);
+        Ok(s)
+    }
+
+    /// A read-only copy of a session that may be open in another process:
+    /// no lock, no newline repair, and appends stay in memory (no path).
+    pub fn peek(path: &Path) -> Result<Self, StoreError> {
+        let mut s = Self::parse(path, &std::fs::read_to_string(path)?)?;
+        s.path = None;
+        Ok(s)
+    }
+
+    fn parse(path: &Path, text: &str) -> Result<Self, StoreError> {
         let mut lines = text.lines();
         let header: Header = lines
             .next()
@@ -255,7 +269,7 @@ impl Store {
             on_disk: true,
             saved: 0,
             failed: false,
-            _lock: Some(lock),
+            _lock: None,
         };
         for (n, line) in lines.enumerate() {
             if line.trim().is_empty() {
@@ -1095,6 +1109,11 @@ mod tests {
             matches!(Store::open(&path), Err(StoreError::Busy(_))),
             "second opener is refused"
         );
+        // A reader needs no lock and writes nothing (R17).
+        let before = std::fs::read(&path).unwrap();
+        let peek = Store::peek(&path).unwrap();
+        assert_eq!(peek.projection(), want);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(list(&paths, cwd), vec![path.clone()]);
         assert_eq!(find(&paths, Path::new("/elsewhere"), &s2.id()[..8]).unwrap(), path);
     }
