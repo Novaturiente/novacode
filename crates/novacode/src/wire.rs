@@ -413,7 +413,10 @@ mod tests {
                 }),
             },
             ServerMsg::Event {
-                event: AgentEvent::AgentEnd { stop: StopReason::Stop },
+                event: AgentEvent::AgentEnd {
+                    stop: StopReason::Stop,
+                    prompts: vec![Some("1".into()), None],
+                },
             },
             ServerMsg::Response {
                 id: Some("1".into()),

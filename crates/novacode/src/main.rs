@@ -1997,7 +1997,7 @@ async fn print_mode(
             }) => {
                 eprintln!("retry {attempt} in {delay_ms}ms: {message}")
             }
-            Ok(AgentEvent::AgentEnd { stop }) => end = Some(stop),
+            Ok(AgentEvent::AgentEnd { stop, .. }) => end = Some(stop),
             // Done when nothing is queued and no subagent is still out: its report would start another run.
             Ok(AgentEvent::Settled) if end.is_some() && sup.as_ref().is_none_or(|s| s.pending() == 0) => {
                 break end.take().unwrap_or(StopReason::Stop);

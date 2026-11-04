@@ -208,6 +208,18 @@ impl Host {
 
     /// Do `c` for a window; replies go to `ui`. `local` = the session's own TUI.
     pub async fn handle(self: &Arc<Self>, c: Cmd, ui: &UnboundedSender<UiEvent>, local: bool) {
+        self.handle_as(c, ui, local, None).await
+    }
+
+    /// `handle`; `wire` = the request id of the wire prompt or steer `c` came from
+    /// (`Some(None)` when sent without one), reported on the `agent_end` of the run that takes it.
+    pub async fn handle_as(
+        self: &Arc<Self>,
+        c: Cmd,
+        ui: &UnboundedSender<UiEvent>,
+        local: bool,
+        wire: Option<Option<String>>,
+    ) {
         let h = &self.hub.handle;
         let steer = matches!(c, Cmd::Steer(_));
         match c {
@@ -294,7 +306,7 @@ impl Host {
                         // Set at once (not left to the model); the how-to rides as a hidden note after the prompt.
                         g.start(arg.clone());
                         self.hub.handle.remind_as("goal", crate::goals::START_NOTE, false);
-                        Box::pin(self.handle(Cmd::Prompt(format!("Goal: {arg}")), ui, local)).await;
+                        Box::pin(self.handle_as(Cmd::Prompt(format!("Goal: {arg}")), ui, local, wire)).await;
                     }
                     Err(e) => {
                         let _ = ui.send(UiEvent::Notice { text: e, error: true });
@@ -303,7 +315,7 @@ impl Host {
             }
             Cmd::Prompt(t) | Cmd::Steer(t) if is_mode_command(&t) => {
                 if let Some(task) = self.mode_command(&t, ui) {
-                    Box::pin(self.handle(Cmd::Prompt(task), ui, local)).await;
+                    Box::pin(self.handle_as(Cmd::Prompt(task), ui, local, wire)).await;
                 }
             }
             Cmd::Prompt(t) | Cmd::Steer(t) if t.starts_with('/') && self.ext_command(&t, ui).await => {}
@@ -328,10 +340,11 @@ impl Host {
                     let error = !n.starts_with("attached");
                     let _ = ui.send(UiEvent::Notice { text: n, error });
                 }
-                if steer {
-                    h.steer_content(blocks)
-                } else {
-                    h.prompt_content(blocks)
+                match (steer, wire) {
+                    (true, Some(id)) => h.steer_wire(blocks, id),
+                    (false, Some(id)) => h.prompt_wire(blocks, id),
+                    (true, None) => h.steer_content(blocks),
+                    (false, None) => h.prompt_content(blocks),
                 }
             }
             Cmd::Abort => h.abort(),
