@@ -601,6 +601,7 @@ mod tests {
             call_id: "c".into(),
             duration_ms: 0,
             touched: vec![],
+            cwd: Default::default(),
         };
         let a = h
             .after_tool("read", &json!({"path": "a.rs"}), &out, &run)

@@ -189,6 +189,7 @@ async fn api_v1_surface() {
         call_id: "c1".into(),
         duration_ms: 5,
         touched: vec![d.path().join("a")],
+        cwd: d.path().to_path_buf(),
     };
     exts.after_tool("read", &json!({"path": "a"}), &ToolOutput::text("out"), &run)
         .await;

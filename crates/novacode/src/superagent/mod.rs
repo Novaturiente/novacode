@@ -2,3 +2,4 @@
 
 pub mod board;
 pub mod inbox;
+pub mod report;

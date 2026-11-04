@@ -327,6 +327,39 @@ mod tests {
         }
     }
 
+    /// ST08 (L10.9): a super task's identity never reaches its commands. Runs
+    /// [`task_env_case`] in a child test process that has the variables set.
+    #[test]
+    fn task_env_is_removed() {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "bash::tests::task_env_case", "--ignored"]);
+        for v in crate::env::TASK_VARS {
+            cmd.env(v, "secret");
+        }
+        let out = cmd.output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && text.contains("1 passed"), "{text}");
+    }
+
+    #[tokio::test]
+    #[ignore = "run by task_env_is_removed"]
+    async fn task_env_case() {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = ctx(d.path());
+        let cmd = "echo task=$NOVACODE_TASK token=$NOVACODE_TASK_TOKEN dir=$NOVACODE_SUPER_DIR";
+        for managed in [false, true] {
+            if managed {
+                c.processes = Some(crate::process::ProcessManager::new(&d.path().join("procs"), "s"));
+            }
+            let o = Bash.execute(json!({ "command": cmd }), &c).await;
+            assert_eq!(text(&o), "task= token= dir=", "managed={managed}");
+        }
+        let pm = c.processes.clone().unwrap();
+        let id = pm.start("p", cmd, d.path(), &[], true, None).unwrap();
+        pm.wait(&id, Duration::from_secs(5), |_| {}).await.unwrap();
+        assert!(pm.output(&id, 5, None).unwrap().contains("task= token= dir="));
+    }
+
     #[tokio::test]
     async fn timeout_kills_the_group() {
         let d = tempfile::tempdir().unwrap();
