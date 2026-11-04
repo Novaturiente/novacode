@@ -394,13 +394,13 @@ fn listen(sock: &Path, on: impl Fn(Reader, Writer) + Send + 'static) -> std::io:
 
 /// Connect to a live session's address.
 #[cfg(unix)]
-async fn connect(sock: &Path) -> std::io::Result<tokio::net::UnixStream> {
+pub(crate) async fn connect(sock: &Path) -> std::io::Result<tokio::net::UnixStream> {
     tokio::net::UnixStream::connect(sock).await
 }
 
 /// Busy = every instance taken for a moment; the server makes the next one at once.
 #[cfg(windows)]
-async fn connect(sock: &Path) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+pub(crate) async fn connect(sock: &Path) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
     const ERROR_PIPE_BUSY: i32 = 231;
     let mut tries = 0;
     loop {

@@ -161,6 +161,18 @@ pub struct Task {
     /// Ids of reports already applied (inbox dedupe and crash recovery).
     pub applied: Vec<String>,
     pub landed: Option<Landed>,
+    /// The user's words, sent in the brief (kept so a queued task can start later).
+    pub request: String,
+    /// Skills the brief names.
+    pub skills: Vec<String>,
+    /// `task spawn {goal: true}`: an open-ended task.
+    pub goal: bool,
+    /// Messages sent while `queued`: added to the brief.
+    pub pending: Vec<String>,
+    /// The task's session id, once its process started.
+    pub session: Option<String>,
+    /// The folder its process runs in (absolute; in its worktree for a write task).
+    pub cwd: Option<PathBuf>,
     /// Unix seconds.
     pub started: u64,
     pub updated: u64,
@@ -632,7 +644,7 @@ impl Board {
     }
 }
 
-fn now() -> u64 {
+pub fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())

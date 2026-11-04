@@ -115,7 +115,7 @@ fn rows(report: &str, title: &str) -> Vec<String> {
         .collect()
 }
 
-/// L10.9 "The super agent": its model sees only its own tools (`task` joins with ST12),
+/// L10.9 "The super agent": its model sees only its own tools,
 /// and its prompt has no project `AGENTS.md` and no skills, though the root has both and
 /// a global MCP server is configured.
 #[cfg(unix)]
@@ -151,7 +151,7 @@ fn super_session_sees_exactly_its_tools_and_no_project_files() {
     let report = report.unwrap();
     let mut tools = rows(&report, "tools");
     tools.sort();
-    assert_eq!(tools, ["agent", "ask_user", "memory", "todo"], "{report}");
+    assert_eq!(tools, ["agent", "ask_user", "memory", "task", "todo"], "{report}");
     let sections = rows(&report, "system prompt");
     assert!(sections.contains(&"preamble".to_string()), "{report}");
     for absent in ["project_context", "skills"] {

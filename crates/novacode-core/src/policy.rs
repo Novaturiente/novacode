@@ -293,9 +293,9 @@ pub struct Policy {
 /// `bash` stays unfenced: this guards against mistakes only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditRule {
-    /// `worktree:<task folder>`: only inside the git-registered linked worktree the
-    /// session's cwd is in, resolved at edit time (so `enter_worktree` makes one
-    /// usable). When the task folder is not in a git repo: only inside that folder.
+    /// `worktree:<task folder>`: only inside the task folder's git-registered linked
+    /// worktree, or when the folder is in the main checkout, the one the session's cwd
+    /// is in, resolved at edit time (so `enter_worktree` makes one usable). When the task folder is not in a git repo: only inside that folder.
     Worktree { folder: PathBuf },
     /// `review:<id>`: only under [`EditRule::review_scratch`].
     Review { id: String },
@@ -343,7 +343,8 @@ impl EditRule {
             Self::Review { id } => Ok(Self::review_scratch(id)),
             Self::Worktree { folder } => match git_common_dir(folder) {
                 None => Ok(folder.clone()),
-                Some(repo) => own_worktree(cwd, &repo).ok_or_else(|| {
+                // A task started in its own worktree keeps to it; else the one its cwd is in.
+                Some(repo) => own_worktree(folder, &repo).or_else(|| own_worktree(cwd, &repo)).ok_or_else(|| {
                     "this task edits files only inside its own worktree, and the session is not in one; call `enter_worktree` first".to_string()
                 }),
             },
@@ -1995,6 +1996,20 @@ mod tests {
             main.join("f").display()
         );
         assert!(denied(&p.check("apply_patch", &json!({ "patch": patch }), &a, false)));
+    }
+
+    /// A write task started in its own worktree (super sets `worktree:<that worktree>`):
+    /// only that worktree, even when the session's cwd is in another one.
+    #[test]
+    fn worktree_rule_on_a_worktree_folder_keeps_to_that_worktree() {
+        let d = tempfile::tempdir().unwrap();
+        let main = repo_with_worktrees(&d.path().canonicalize().unwrap());
+        let (a, b) = (main.join(".worktrees/a"), main.join(".worktrees/b"));
+        let p = worktree_policy(&a);
+        assert!(edits(&p, &a, &a.join("f")));
+        assert!(edits(&p, &main, &a.join("f")));
+        assert!(!edits(&p, &b, &b.join("f")));
+        assert!(!edits(&p, &a, &main.join("f")));
     }
 
     /// A subagent is its own process: it inherits `NOVACODE_EDIT_RULE` and its

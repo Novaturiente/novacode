@@ -1,0 +1,1608 @@
+//! The `task` tool (L10.9 "Tasks", "Controls", "Brief"): super's model starts and
+//! steers tasks with it. Code owns everything around the model's call: the root and
+//! trust checks, the label, the worktree, the process start, the queue, the board
+//! writes and the confirmation cards for `close` and `merge`.
+//!
+//! Task processes are detached `novacode --bg` sessions started through a
+//! [`Launcher`]; [`Procs`] is the real one. They outlive super.
+
+use super::Tier;
+use super::board::{Board, Event, Kind, Landed, State, Task, TaskType};
+use crate::wire::{ClientCmd, Request, ServerMsg, line};
+use futures_util::future::BoxFuture;
+use novacode_base::paths::Paths;
+use novacode_tools::ask::Asker;
+use novacode_tools::{Tool, ToolCtx, ToolOutput};
+use novacode_types::{Choice, Question};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+/// What `super.*` and the session give the tool.
+pub struct Config {
+    pub max_running: usize,
+    pub tiers: Vec<(String, Tier)>,
+    /// `worktree.copy`.
+    pub worktree_copy: Vec<String>,
+    /// novacode's home: `trust.json` and the session files.
+    pub home: PathBuf,
+    /// `models.deny` and model resolution.
+    pub allow: crate::agents::ModelCheck,
+}
+
+/// How a task process starts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Start {
+    pub cwd: PathBuf,
+    pub model: String,
+    pub trust: bool,
+    /// Resume this session instead of starting a new one.
+    pub resume: Option<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// Starts task processes and talks to their sockets.
+pub trait Launcher: Send + Sync {
+    /// Start a detached task session; returns its session id once its socket is up.
+    fn start(&self, s: Start) -> BoxFuture<'_, Result<String, String>>;
+    /// Send one command to a live session.
+    fn send<'a>(&'a self, session: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>>;
+    fn alive(&self, session: &str) -> bool;
+}
+
+/// Super's side of its tasks: the board and everything that changes it.
+pub struct Super {
+    /// Canonical root folder: tasks run only in it or below.
+    pub root: PathBuf,
+    /// `<home>/super/<root-hash>`.
+    pub dir: PathBuf,
+    pub board: Mutex<Board>,
+    cfg: Config,
+    asker: Option<Arc<dyn Asker>>,
+    launcher: Arc<dyn Launcher>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Args {
+    action: String,
+    task: Option<String>,
+    request: Option<String>,
+    folder: Option<String>,
+    slug: Option<String>,
+    write: Option<bool>,
+    tier: Option<String>,
+    model: Option<String>,
+    #[serde(rename = "type")]
+    ty: Option<String>,
+    criteria: Vec<String>,
+    scope: Option<String>,
+    skills: Vec<String>,
+    goal: bool,
+    message: Option<String>,
+    pr: bool,
+    note: Option<String>,
+    all: bool,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+/// The label's slug: 1 to 4 words of `a-z0-9` joined by `-`, at most 30 characters.
+pub fn check_slug(s: &str) -> Result<(), String> {
+    let words: Vec<&str> = s.split('-').collect();
+    let ok = s.len() <= 30
+        && (1..=4).contains(&words.len())
+        && words
+            .iter()
+            .all(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "bad slug `{s}`: 1 to 4 words of a-z and 0-9 joined by `-`, at most 30 characters"
+        ))
+    }
+}
+
+/// `type` and `write` must agree: `question` reads, `bugfix` and `change` write.
+fn task_type(ty: Option<&str>, write: bool) -> Result<TaskType, String> {
+    let (t, name) = match ty.unwrap_or("change") {
+        "bugfix" => (TaskType::Bugfix, "bugfix"),
+        "change" => (TaskType::Change, "change"),
+        "question" => (TaskType::Question, "question"),
+        other => return Err(format!("bad type `{other}`: bugfix, change or question")),
+    };
+    if (t == TaskType::Question) == write {
+        return Err(format!("`type: {name}` needs `write: {}`", !write));
+    }
+    Ok(t)
+}
+
+fn type_name(t: TaskType) -> &'static str {
+    match t {
+        TaskType::Bugfix => "bugfix",
+        TaskType::Change => "change",
+        TaskType::Question => "question",
+    }
+}
+
+/// `n` of a `T<n>-…` label.
+fn number(label: &str) -> u64 {
+    label
+        .strip_prefix('T')
+        .and_then(|r| r.split('-').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+fn provider(model: &str) -> &str {
+    model.split('/').next().unwrap_or(model)
+}
+
+fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let o = novacode_base::git::command_in(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    if o.status.success() {
+        Ok(String::from_utf8_lossy(&o.stdout).trim_end().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&o.stderr).trim().to_string())
+    }
+}
+
+/// The main checkout of the repo `folder` is in, and `folder` relative to its own checkout.
+fn repo_of(folder: &Path) -> Option<(PathBuf, PathBuf)> {
+    let out = git(
+        folder,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-common-dir",
+        ],
+    )
+    .ok()?;
+    let mut lines = out.lines();
+    let (top, common) = (lines.next()?, Path::new(lines.next()?));
+    // A bare repo's common dir is not `<main>/.git`: no main checkout to work in.
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    let main = novacode_base::platform::canonicalize(common.parent()?).ok()?;
+    let top = novacode_base::platform::canonicalize(top).ok()?;
+    Some((main, folder.strip_prefix(&top).ok()?.to_path_buf()))
+}
+
+fn ok_choice(label: &str) -> Choice {
+    Choice {
+        label: label.into(),
+        description: None,
+        preview: None,
+        recommended: false,
+    }
+}
+
+/// The task preamble, in the task's system prompt (not a user message, so it stays cached).
+pub fn preamble(label: &str) -> String {
+    format!(
+        "You are task {label}, a session started by novacode's super agent. The user talks to the super agent, \
+not to you; your first message is your brief, with the user's request and its acceptance criteria.
+
+- Call `report` when you are done, blocked or failed: `done` with `checks` (the `[proof #N]` numbers of the \
+checks that prove each criterion), `blocked` with a `question` when you need the user. Reports are the only \
+thing super reads; a turn that ends without one is reported as blocked.
+- Your `ask_user` questions and approvals reach the user in super's window, labelled {label}.
+- Edit files only inside your own worktree (or, outside git, your folder): the edit tools refuse anywhere else. \
+Don't write elsewhere with `bash` either. A read task that has to write calls `enter_worktree` first.
+- Commit your work before you report `done`.
+- After a restart or resume: your proof log is empty, so re-run your checks before you cite them, and check \
+your folder and git before repeating anything outside it (a commit, a push, a message)."
+    )
+}
+
+/// The brief a task gets as its first prompt.
+fn brief(t: &Task) -> String {
+    let mut s = format!(
+        "Task {}: {} ({} task).\n\nThe user's request:\n{}\n",
+        t.label,
+        type_name(t.ty),
+        if t.write { "write" } else { "read" },
+        t.request.trim()
+    );
+    if !t.criteria.is_empty() {
+        s.push_str("\nAcceptance criteria:\n");
+        for (i, c) in t.criteria.iter().enumerate() {
+            s.push_str(&format!("{}. {c}\n", i + 1));
+        }
+    }
+    if let Some(scope) = &t.scope {
+        s.push_str(&format!("\nScope (the areas the change should touch): {scope}\n"));
+    }
+    if !t.skills.is_empty() {
+        s.push_str(&format!("\nUse these skills: {}\n", t.skills.join(", ")));
+    }
+    match (&t.worktree, &t.branch) {
+        (Some(w), Some(b)) => s.push_str(&format!(
+            "\nYou work in the worktree {} on branch {b}, based on {}. Commit there; never touch the main checkout.\n",
+            w.display(),
+            t.base_branch.as_deref().or(t.base_commit.as_deref()).unwrap_or("HEAD")
+        )),
+        _ if !t.write => s.push_str("\nThis is a read task: answer, don't edit.\n"),
+        _ => {}
+    }
+    if t.ty == TaskType::Bugfix {
+        s.push_str("\nAs proof, show a test or reproduction that fails before your fix and passes after it.\n");
+    }
+    for m in &t.pending {
+        s.push_str(&format!("\nAlso from the super agent:\n{m}\n"));
+    }
+    s
+}
+
+impl Super {
+    pub fn new(
+        root: &Path,
+        dir: PathBuf,
+        cfg: Config,
+        asker: Option<Arc<dyn Asker>>,
+        launcher: Arc<dyn Launcher>,
+    ) -> std::io::Result<Self> {
+        std::fs::create_dir_all(&dir)?;
+        Ok(Super {
+            root: novacode_base::platform::canonicalize(root)?,
+            board: Mutex::new(Board::load(&dir)?),
+            dir,
+            cfg,
+            asker,
+            launcher,
+        })
+    }
+
+    /// Change the board and save it.
+    fn edit<R>(&self, f: impl FnOnce(&mut Board) -> R) -> Result<R, String> {
+        let mut b = self.board.lock().unwrap();
+        let r = f(&mut b);
+        b.save(&self.dir).map_err(|e| format!("couldn't save the board: {e}"))?;
+        Ok(r)
+    }
+
+    fn row(&self, id: &str) -> Result<Task, String> {
+        self.board
+            .lock()
+            .unwrap()
+            .task(id)
+            .cloned()
+            .ok_or_else(|| format!("no task {id}"))
+    }
+
+    /// A task by its label, or by `T<n>`.
+    fn find(&self, name: &str) -> Result<Task, String> {
+        let b = self.board.lock().unwrap();
+        b.tasks
+            .iter()
+            .find(|t| t.label == name || t.id == name)
+            .or_else(|| {
+                let n = name.strip_prefix('T')?.parse::<u64>().ok()?;
+                b.tasks.iter().find(|t| number(&t.label) == n)
+            })
+            .cloned()
+            .ok_or_else(|| format!("no task {name}; `task list {{all: true}}` shows every task"))
+    }
+
+    /// Whether `ev` is possible for `id` now, without changing anything.
+    fn check(&self, id: &str, ev: Event) -> Result<(), String> {
+        self.board.lock().unwrap().clone().apply(id, ev).map(|_| ())
+    }
+
+    pub async fn run(&self, args: Value) -> Result<String, String> {
+        let a: Args = serde_json::from_value(args).map_err(|e| format!("invalid arguments: {e}"))?;
+        if a.action == "spawn" {
+            return self.spawn(a).await;
+        }
+        if a.action == "list" {
+            return Ok(self.list(a.all));
+        }
+        let t = self.find(a.task.as_deref().ok_or("`task` is missing")?)?;
+        match a.action.as_str() {
+            "read" => self.read(&t, a.offset.unwrap_or(0), a.limit.unwrap_or(200)),
+            "send" => self.send(&t, a.message.as_deref().ok_or("`message` is missing")?).await,
+            "stop" => self.stop(&t).await,
+            "close" => self.close(&t).await,
+            "merge" => self.merge(&t, a.pr).await,
+            "accept" => {
+                self.edit(|b| b.apply(&t.id, Event::Accept))??;
+                Ok(format!("{} is ready.", t.label))
+            }
+            "review" => {
+                // shortcut: the review task itself starts with ST15 (Effect::StartReview); `note` goes to it then.
+                let _ = a.note;
+                self.edit(|b| b.apply(&t.id, Event::Review))??;
+                Ok(format!("{} is reviewing.", t.label))
+            }
+            other => Err(format!(
+                "unknown action `{other}`: spawn, send, stop, close, accept, merge, review, list or read"
+            )),
+        }
+    }
+
+    async fn spawn(&self, a: Args) -> Result<String, String> {
+        let request = a
+            .request
+            .filter(|r| !r.trim().is_empty())
+            .ok_or("`request` is missing")?;
+        let slug = a.slug.ok_or("`slug` is missing")?;
+        check_slug(&slug)?;
+        let write = a.write.ok_or("`write` is missing")?;
+        let ty = task_type(a.ty.as_deref(), write)?;
+        if a.criteria.is_empty() || a.criteria.len() > 5 {
+            return Err("give 1 to 5 checkable acceptance `criteria`".into());
+        }
+        let folder = self.in_root(a.folder.as_deref().ok_or("`folder` is missing")?)?;
+        let (tier, model) = match (a.tier, a.model) {
+            (Some(_), Some(_)) => return Err("give `tier` or `model`, not both".into()),
+            (None, Some(m)) => (None, m),
+            (tier, None) => {
+                let name = tier.unwrap_or_else(|| "standard".into());
+                let t = self.cfg.tiers.iter().find(|(n, _)| *n == name).ok_or_else(|| {
+                    let names: Vec<&str> = self.cfg.tiers.iter().map(|(n, _)| n.as_str()).collect();
+                    format!("no tier `{name}`: {}", names.join(", "))
+                })?;
+                (Some(name), t.1.model.clone())
+            }
+        };
+        (self.cfg.allow)(&model)?;
+        let repo = repo_of(&folder);
+        let label = {
+            let b = self.board.lock().unwrap();
+            let n = b.tasks.iter().map(|t| number(&t.label)).max().unwrap_or(0) + 1;
+            format!("T{n}-{slug}")
+        };
+        let trusted = self.trust(&label, &folder, repo.as_ref()).await?;
+        let now = super::board::now();
+        let row = Task {
+            id: label.clone(),
+            label: label.clone(),
+            kind: Kind::Work,
+            ty,
+            folder: folder.strip_prefix(&self.root).unwrap_or(Path::new("")).to_path_buf(),
+            repo: repo.map(|(main, _)| main),
+            tier,
+            model,
+            trusted,
+            token: format!(
+                "{}{}",
+                novacode_base::new_id().simple(),
+                novacode_base::new_id().simple()
+            ),
+            write,
+            criteria: a.criteria,
+            scope: a.scope,
+            request,
+            skills: a.skills,
+            goal: a.goal,
+            state: State::Queued,
+            started: now,
+            updated: now,
+            ..Task::default()
+        };
+        self.edit(|b| b.tasks.push(row))?;
+        let notes = self.pump().await;
+        let t = self.row(&label)?;
+        let mut out = match t.state {
+            State::Queued => format!("{label} is queued: {}.", self.why_queued(&t)),
+            State::Failed => format!("{label} failed to start: {}", t.summary.unwrap_or_default()),
+            s => {
+                let mut s = format!("Started {label} ({}, {}).", s.name(), t.model);
+                if let (Some(w), Some(b)) = (&t.worktree, &t.branch) {
+                    s += &format!(
+                        " Worktree {} on branch {b}, from {}.",
+                        w.display(),
+                        t.base_branch.as_deref().or(t.base_commit.as_deref()).unwrap_or("HEAD")
+                    );
+                }
+                s
+            }
+        };
+        for n in notes.into_iter().filter(|n| !n.starts_with(&label)) {
+            out += &format!("\n{n}");
+        }
+        Ok(out)
+    }
+
+    /// The task folder, resolved (symlinks followed); refused outside the root.
+    fn in_root(&self, folder: &str) -> Result<PathBuf, String> {
+        let p = Path::new(folder);
+        let p = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.root.join(p)
+        };
+        let real = novacode_base::platform::canonicalize(&p).map_err(|e| format!("folder `{folder}`: {e}"))?;
+        if !real.starts_with(&self.root) {
+            return Err(format!(
+                "`{}` is outside the super root {}: tasks run only there",
+                real.display(),
+                self.root.display()
+            ));
+        }
+        if !real.is_dir() {
+            return Err(format!("`{}` is not a folder", real.display()));
+        }
+        Ok(real)
+    }
+
+    /// Trust for the task's project, checked at its main checkout (a new worktree has no
+    /// entry of its own); asks the user on a card when it is untrusted or changed.
+    async fn trust(&self, label: &str, folder: &Path, repo: Option<&(PathBuf, PathBuf)>) -> Result<bool, String> {
+        use novacode_core::trust::{self, TrustStore};
+        let at = repo.map_or(folder.to_path_buf(), |(main, rel)| main.join(rel));
+        let store = TrustStore::new(self.cfg.home.join("trust.json"));
+        let (state, fp) = store.check(&at);
+        if state == trust::State::Trusted {
+            return Ok(true);
+        }
+        if !trust::has_project_config(&at) {
+            return Ok(false);
+        }
+        let Some(asker) = &self.asker else { return Ok(false) };
+        let base = repo
+            .and_then(|(main, _)| git(main, &["branch", "--show-current"]).ok())
+            .filter(|b| !b.is_empty());
+        let mut q = match &state {
+            trust::State::Changed(c) => format!(
+                "{label} would run in {}, whose project config changed since you trusted it ({}).",
+                at.display(),
+                c.join(", ")
+            ),
+            _ => format!(
+                "{label} would run in {}, which has project config (settings, MCP servers, skills, hooks).",
+                at.display()
+            ),
+        };
+        if let Some(b) = base {
+            q += &format!(" Its worktree branches from {b}.");
+        }
+        q += " Trusting it lets that config change settings and run code. Trust it?";
+        let (this, once, never) = ("Trust this folder", "Trust for this task only", "Don't trust");
+        let question = Question {
+            question: q,
+            header: Some(format!("{label}: trust")),
+            options: vec![ok_choice(this), ok_choice(once), ok_choice(never)],
+            multi: false,
+        };
+        let pick = asker
+            .ask(vec![question])
+            .await
+            .and_then(|r| r.into_iter().next())
+            .and_then(|r| r.chosen.into_iter().next());
+        let err = |e: std::io::Error| format!("couldn't save the trust decision: {e}");
+        Ok(match pick.as_deref() {
+            Some(p) if p == this => {
+                store.trust_with(&at, &at, fp).map_err(err)?;
+                true
+            }
+            Some(p) if p == once => true,
+            Some(p) if p == never => {
+                store.set(&at, false).map_err(err)?;
+                false
+            }
+            _ => false,
+        })
+    }
+
+    fn why_queued(&self, t: &Task) -> String {
+        let b = self.board.lock().unwrap();
+        if let Some(l) = b.holds.get(provider(&t.model)) {
+            return format!("{} is on hold ({:?})", l.provider, l.kind);
+        }
+        if let Some(o) = folder_holder(&b, t) {
+            return format!("{} writes in that folder (no git), one at a time", o.label);
+        }
+        format!("{} tasks run already (super.maxRunning)", self.cfg.max_running)
+    }
+
+    /// Start queued tasks while slots are free: reviews first, then the oldest; tasks on
+    /// a provider on hold, and non-git write tasks whose folder is taken, wait.
+    /// Returns a note per task that failed to start.
+    pub async fn pump(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        loop {
+            let pick = {
+                let b = self.board.lock().unwrap();
+                pick(&b, self.cfg.max_running)
+            };
+            let Some(id) = pick else { break };
+            if let Err(e) = self.edit(|b| b.apply(&id, Event::SlotFree)) {
+                notes.push(e);
+                break;
+            }
+            if let Err(e) = self.start(&id).await {
+                notes.push(format!("{id} failed to start: {e}"));
+            }
+        }
+        notes
+    }
+
+    /// Start (or resume) a task's process; a new one gets its brief. On failure the row is `failed`.
+    async fn start(&self, id: &str) -> Result<(), String> {
+        let r = self.start_inner(id).await;
+        if let Err(e) = &r {
+            self.edit(|b| {
+                if let Some(t) = b.tasks.iter_mut().find(|t| t.id == id) {
+                    t.state = State::Failed;
+                    t.summary = Some(format!("didn't start: {e}"));
+                    t.updated = super::board::now();
+                }
+            })?;
+        }
+        r
+    }
+
+    async fn start_inner(&self, id: &str) -> Result<(), String> {
+        let mut t = self.row(id)?;
+        let resume = t.session.clone();
+        if t.cwd.is_none() {
+            let folder = self.root.join(&t.folder);
+            let cwd = match (&t.repo, t.write) {
+                (Some(main), true) => {
+                    let rel = repo_of(&folder).map(|(_, rel)| rel).unwrap_or_default();
+                    t.base_branch = git(main, &["branch", "--show-current"]).ok().filter(|b| !b.is_empty());
+                    t.base_commit = Some(git(main, &["rev-parse", "HEAD"])?);
+                    let (wt, _) = novacode_tools::worktree::create_new(main, &t.label, &self.cfg.worktree_copy)?;
+                    let name = wt.file_name().unwrap_or_default().to_string_lossy();
+                    t.branch = Some(format!("worktree-{name}"));
+                    t.worktree = Some(wt.clone());
+                    let cwd = wt.join(rel);
+                    std::fs::create_dir_all(&cwd).map_err(|e| e.to_string())?;
+                    cwd
+                }
+                _ => folder,
+            };
+            t.cwd = Some(cwd);
+            let t = t.clone();
+            self.edit(|b| {
+                if let Some(row) = b.tasks.iter_mut().find(|r| r.id == t.id) {
+                    *row = t;
+                }
+            })?;
+        }
+        let cwd = t.cwd.clone().unwrap_or_default();
+        // Its own worktree (other worktrees of the repo stay refused), else its folder.
+        let fence = t.worktree.clone().unwrap_or_else(|| self.root.join(&t.folder));
+        let env = vec![
+            ("NOVACODE_TASK".to_string(), t.id.clone()),
+            ("NOVACODE_TASK_TOKEN".to_string(), t.token.clone()),
+            (
+                "NOVACODE_SUPER_DIR".to_string(),
+                self.dir.to_string_lossy().into_owned(),
+            ),
+            (
+                novacode_core::policy::EditRule::ENV.to_string(),
+                format!("worktree:{}", fence.display()),
+            ),
+        ];
+        let session = self
+            .launcher
+            .start(Start {
+                cwd,
+                model: t.model.clone(),
+                trust: t.trusted,
+                resume: resume.clone(),
+                env,
+            })
+            .await?;
+        let pending = std::mem::take(&mut t.pending);
+        self.edit(|b| {
+            if let Some(row) = b.tasks.iter_mut().find(|r| r.id == id) {
+                row.session = Some(session.clone());
+                if resume.is_none() {
+                    row.pending.clear();
+                }
+            }
+        })?;
+        if resume.is_none() {
+            t.pending = pending;
+            self.prompt(&session, brief(&t)).await?;
+        }
+        Ok(())
+    }
+
+    /// A raw prompt: a brief or message starting with `!` or `/` is not a command.
+    async fn prompt(&self, session: &str, text: String) -> Result<(), String> {
+        self.launcher.send(session, ClientCmd::Prompt { text, raw: true }).await
+    }
+
+    /// Send `text` to the task, resuming its session first when its process is gone.
+    async fn deliver(&self, id: &str, text: String) -> Result<(), String> {
+        let t = self.row(id)?;
+        match &t.session {
+            Some(s) if self.launcher.alive(s) => self.prompt(s, text).await,
+            Some(_) => {
+                self.start(id).await?;
+                let s = self.row(id)?.session.unwrap_or_default();
+                self.prompt(&s, text).await
+            }
+            None => {
+                self.edit(|b| {
+                    if let Some(row) = b.tasks.iter_mut().find(|r| r.id == id) {
+                        row.pending.push(text);
+                    }
+                })?;
+                self.start(id).await
+            }
+        }
+    }
+
+    /// The review task of a reviewed row stops with it (`send` or `stop` on `reviewing`).
+    async fn stop_review(&self, reviewer: Option<String>) {
+        let Some(r) = reviewer.and_then(|r| self.row(&r).ok()) else {
+            return;
+        };
+        if let Some(s) = r.session.as_deref().filter(|s| self.launcher.alive(s)) {
+            let _ = self.launcher.send(s, ClientCmd::Shutdown).await;
+        }
+        let _ = self.edit(|b| b.apply(&r.id, Event::Retire));
+    }
+
+    async fn send(&self, t: &Task, message: &str) -> Result<String, String> {
+        if t.state == State::Queued {
+            self.edit(|b| {
+                b.apply(&t.id, Event::Send)?;
+                if let Some(row) = b.tasks.iter_mut().find(|r| r.id == t.id) {
+                    row.pending.push(message.to_string());
+                }
+                Ok::<_, String>(())
+            })??;
+            return Ok(format!("Added to {}'s brief; it is still queued.", t.label));
+        }
+        let n = self.edit(|b| b.apply(&t.id, Event::Send))??;
+        if n.effects.contains(&super::board::Effect::StopReview) {
+            self.stop_review(t.reviewer.clone()).await;
+        }
+        self.deliver(&t.id, message.to_string()).await?;
+        Ok(format!("Sent to {} ({}).", t.label, n.to.name()))
+    }
+
+    async fn stop(&self, t: &Task) -> Result<String, String> {
+        let n = self.edit(|b| b.apply(&t.id, Event::Stop))??;
+        if n.from == State::Queued {
+            return Ok(format!("{} is out of the queue (stopped).", t.label));
+        }
+        if n.effects.contains(&super::board::Effect::StopReview) {
+            self.stop_review(t.reviewer.clone()).await;
+        }
+        // shortcut: Effect::CheckMergeLeft (a stop while merging) is handled with the merge flow (ST16).
+        if let Some(s) = t.session.as_deref().filter(|s| self.launcher.alive(s)) {
+            self.launcher.send(s, ClientCmd::Abort { drop_queued: true }).await?;
+        }
+        let notes = self.pump().await;
+        Ok(std::iter::once(format!("Stopped {}; its session stays.", t.label))
+            .chain(notes)
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    /// Whether a task's branch is merged into its own base (not into `HEAD`, as `git branch -d` checks).
+    fn merged(t: &Task) -> Option<bool> {
+        let (main, branch) = (t.repo.as_ref()?, t.branch.as_ref()?);
+        let base = t.base_branch.as_ref().or(t.base_commit.as_ref())?;
+        Some(git(main, &["merge-base", "--is-ancestor", branch, base]).is_ok())
+    }
+
+    /// A confirmation card made by code: true only when the user picks `ok`.
+    async fn confirm(&self, header: String, question: String, ok: &str) -> Result<bool, String> {
+        let asker = self.asker.as_ref().ok_or("no window to confirm in")?;
+        let q = Question {
+            question,
+            header: Some(header),
+            options: vec![ok_choice(ok), ok_choice("Cancel")],
+            multi: false,
+        };
+        Ok(asker
+            .ask(vec![q])
+            .await
+            .and_then(|r| r.into_iter().next())
+            .is_some_and(|r| r.chosen.iter().any(|c| c == ok)))
+    }
+
+    async fn close(&self, t: &Task) -> Result<String, String> {
+        self.check(&t.id, Event::Close)?;
+        let merged = Self::merged(t);
+        let mut q = format!("Close {}? Its session ends; the session file is kept.", t.label);
+        if let (Some(w), Some(b)) = (&t.worktree, &t.branch) {
+            let base = t
+                .base_branch
+                .as_deref()
+                .or(t.base_commit.as_deref())
+                .unwrap_or("its base");
+            q += &match merged {
+                Some(true) => format!(
+                    " Branch {b} is merged into {base}: its worktree {} is removed.",
+                    w.display()
+                ),
+                _ => format!(
+                    " Branch {b} is NOT merged into {base}: its worktree {} is kept.",
+                    w.display()
+                ),
+            };
+        }
+        if !self.confirm(format!("{}: close", t.label), q, "Close").await? {
+            return Ok(format!("The user declined: {} stays open.", t.label));
+        }
+        let n = self.edit(|b| b.apply(&t.id, Event::Close))??;
+        if n.effects.contains(&super::board::Effect::StopReview) {
+            self.stop_review(t.reviewer.clone()).await;
+        }
+        if let Some(s) = t.session.as_deref().filter(|s| self.launcher.alive(s)) {
+            let _ = self.launcher.send(s, ClientCmd::Shutdown).await;
+        }
+        let mut out = format!("Closed {}.", t.label);
+        if let Some(w) = &t.worktree {
+            match (merged, novacode_tools::worktree::here(w)) {
+                (Some(true), Ok(h)) => out += &novacode_tools::worktree::remove(&h),
+                (Some(true), Err(e)) => out += &format!(" Worktree not removed: {e}."),
+                _ => out += &format!(" Worktree {} kept (not merged).", w.display()),
+            }
+        }
+        for n in self.pump().await {
+            out += &format!("\n{n}");
+        }
+        Ok(out)
+    }
+
+    async fn merge(&self, t: &Task, pr: bool) -> Result<String, String> {
+        self.check(&t.id, Event::Merge)?;
+        let (main, branch) = (
+            t.repo.clone().unwrap_or_default(),
+            t.branch.clone().unwrap_or_else(|| "its branch".into()),
+        );
+        let base = t
+            .base_branch
+            .clone()
+            .or(t.base_commit.clone())
+            .unwrap_or_else(|| "its base".into());
+        let q = match pr {
+            true => format!(
+                "Merge {}? Branch {branch} is rebased on {base}, pushed, and a pull request against {base} is opened.",
+                t.label
+            ),
+            false => format!(
+                "Merge {}? Branch {branch} is rebased on {base} and merged into {base} in the main checkout {}.",
+                t.label,
+                main.display()
+            ),
+        };
+        if !self.confirm(format!("{}: merge", t.label), q, "Merge").await? {
+            return Ok(format!("The user declined: {} is not merged.", t.label));
+        }
+        self.edit(|b| b.apply(&t.id, Event::Merge))??;
+        // shortcut: the merge flow's checks (base checked out, re-check after a moving rebase) come with ST16.
+        let how = match pr {
+            true => format!("push it and open a pull request against {base}, then report `merge: pr-opened`"),
+            false => format!(
+                "merge it into {base} in the main checkout {} (fast-forward), then report `merge: merged`",
+                main.display()
+            ),
+        };
+        let text = format!(
+            "The user approved merging. Rebase {branch} on {base}; if the rebase moved it, re-run your checks. Then {how}. \
+If anything fails (a conflict, a dirty main checkout, a failed check), report `merge: failed` with the reason."
+        );
+        self.deliver(&t.id, text).await?;
+        Ok(format!("{} is merging.", t.label))
+    }
+
+    fn list(&self, all: bool) -> String {
+        let b = self.board.lock().unwrap();
+        let now = super::board::now();
+        let rows: Vec<String> = b
+            .tasks
+            .iter()
+            .filter(|t| all || t.state != State::Archived)
+            .map(|t| {
+                let mut state = t.state.name().to_string();
+                match (&t.block, t.landed) {
+                    (Some(bl), _) => state += &format!(": {}", bl.reason),
+                    (None, Some(Landed::Merged)) => state += " (merged)",
+                    (None, Some(Landed::PrOpened)) => state += " (PR opened)",
+                    _ => {}
+                }
+                let repo = t
+                    .repo
+                    .as_ref()
+                    .and_then(|r| r.strip_prefix(&self.root).ok())
+                    .unwrap_or(&t.folder)
+                    .display()
+                    .to_string();
+                let age = now.saturating_sub(t.started);
+                let age = match age {
+                    0..3600 => format!("{}m", age / 60),
+                    3600..86400 => format!("{}h", age / 3600),
+                    _ => format!("{}d", age / 86400),
+                };
+                let mut line = format!(
+                    "{} | {} | {state} | {} | {age}",
+                    t.label,
+                    if repo.is_empty() { "." } else { &repo },
+                    t.model
+                );
+                if let Some(s) = &t.summary {
+                    line += &format!(" | {s}");
+                }
+                if let Some(q) = &t.question {
+                    line += &format!(" | asks: {q}");
+                }
+                line
+            })
+            .collect();
+        if rows.is_empty() {
+            "No tasks.".into()
+        } else {
+            rows.join("\n")
+        }
+    }
+
+    /// A page of the task's final message (its last reply), by lines.
+    fn read(&self, t: &Task, offset: usize, limit: usize) -> Result<String, String> {
+        let session = t
+            .session
+            .as_deref()
+            .ok_or_else(|| format!("{} has not started", t.label))?;
+        let paths = Paths::new(&self.cfg.home);
+        let cwd = t.cwd.clone().unwrap_or_else(|| self.root.clone());
+        let file = novacode_core::session::find(&paths, &cwd, session).map_err(|e| e.to_string())?;
+        let store = novacode_core::session::Store::open(&file).map_err(|e| e.to_string())?;
+        let text = store
+            .projection()
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                novacode_types::Message::Assistant(a) if !a.text().trim().is_empty() => Some(a.text()),
+                _ => None,
+            })
+            .ok_or_else(|| format!("{} has no final message yet", t.label))?;
+        let lines: Vec<&str> = text.lines().collect();
+        let end = (offset + limit.max(1)).min(lines.len());
+        let mut out = lines.get(offset..end).unwrap_or_default().join("\n");
+        if end < lines.len() {
+            out += &format!("\n[{} more lines: read with offset {end}]", lines.len() - end);
+        }
+        Ok(out)
+    }
+}
+
+/// The non-git write task already holding `t`'s folder.
+fn folder_holder<'a>(b: &'a Board, t: &Task) -> Option<&'a Task> {
+    if !t.write || t.repo.is_some() || t.kind != Kind::Work {
+        return None;
+    }
+    b.tasks.iter().find(|o| {
+        o.id != t.id
+            && o.write
+            && o.repo.is_none()
+            && o.folder == t.folder
+            && !matches!(o.state, State::Queued | State::Archived)
+    })
+}
+
+/// The queued task to start next, if a slot is free.
+fn pick(b: &Board, max_running: usize) -> Option<String> {
+    let running = b.tasks.iter().filter(|t| t.state == State::Running).count();
+    if running >= max_running {
+        return None;
+    }
+    b.tasks
+        .iter()
+        .filter(|t| t.state == State::Queued)
+        .filter(|t| !b.holds.contains_key(provider(&t.model)))
+        .filter(|t| folder_holder(b, t).is_none())
+        .min_by_key(|t| (t.kind != Kind::Review, t.started, number(&t.label)))
+        .map(|t| t.id.clone())
+}
+
+/// Super's `task` tool.
+pub struct TaskTool(pub Arc<Super>);
+
+impl Tool for TaskTool {
+    fn name(&self) -> &str {
+        "task"
+    }
+    fn description(&self) -> &str {
+        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], scope?, skills?[], goal?}; send {task, message}; stop {task}; close {task} and merge {task, pr?} (each asks the user on a card); accept {task} (read tasks); review {task, note?}; list {all?}; read {task, offset?, limit?} (pages the task's final message)."
+    }
+    fn schema(&self) -> Value {
+        let s = |d: &str| json!({ "type": "string", "description": d });
+        json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["spawn", "send", "stop", "close", "accept", "merge", "review", "list", "read"] },
+                "task": s("The task's label (T3-fix-parser) or T<n>."),
+                "request": s("spawn: the user's words, as given."),
+                "folder": s("spawn: the project folder, inside your root (relative to it or absolute)."),
+                "slug": s("spawn: 1-4 words of a-z0-9 joined by -, at most 30 characters; the label becomes T<n>-<slug>."),
+                "write": { "type": "boolean", "description": "spawn: the task changes files (it gets its own worktree in git)." },
+                "tier": s("spawn: quick, standard, deep or review (default standard)."),
+                "model": s("spawn: a model the user named (provider/model), instead of a tier."),
+                "type": { "type": "string", "enum": ["bugfix", "change", "question"], "description": "spawn: question needs write false; bugfix and change need write true. Default change." },
+                "criteria": { "type": "array", "items": { "type": "string" }, "description": "spawn: 1-5 checkable acceptance criteria." },
+                "scope": s("spawn: the areas the change should touch."),
+                "skills": { "type": "array", "items": { "type": "string" }, "description": "spawn: skills the task should use." },
+                "goal": { "type": "boolean", "description": "spawn: open-ended work; the task keeps going until the criteria hold." },
+                "message": s("send: the message."),
+                "pr": { "type": "boolean", "description": "merge: open a pull request instead of merging locally." },
+                "note": s("review: what the review should look at."),
+                "all": { "type": "boolean", "description": "list: archived tasks too." },
+                "offset": { "type": "integer", "description": "read: first line (0-based)." },
+                "limit": { "type": "integer", "description": "read: lines (default 200)." }
+            },
+            "required": ["action"]
+        })
+    }
+    fn sequential(&self) -> bool {
+        true
+    }
+    fn large_output(&self) -> bool {
+        false
+    }
+    fn execute<'a>(&'a self, args: Value, _ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput> {
+        Box::pin(async move {
+            match self.0.run(args).await {
+                Ok(text) => ToolOutput::text(text),
+                Err(e) => ToolOutput::error(e),
+            }
+        })
+    }
+}
+
+/// The real launcher: detached `novacode --bg` processes and their sockets.
+pub struct Procs {
+    /// The live path of this executable (after an update, not `… (deleted)`).
+    pub exe: PathBuf,
+    pub paths: Paths,
+}
+
+impl Launcher for Procs {
+    fn start(&self, s: Start) -> BoxFuture<'_, Result<String, String>> {
+        let exe = self.exe.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                use std::io::BufRead;
+                let mut c = std::process::Command::new(&exe);
+                c.arg("--bg").args(["-m", &s.model]);
+                if s.trust {
+                    c.arg("--trust");
+                }
+                if let Some(r) = &s.resume {
+                    c.args(["-r", r]);
+                }
+                // Not spawn_bg: its NOVACODE_BG_CHILD would reach everything the task starts.
+                c.current_dir(&s.cwd)
+                    .env_remove("NOVACODE_BG_CHILD")
+                    .envs(s.env.iter().map(|(k, v)| (k, v)))
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null());
+                novacode_base::platform::own_group(&mut c);
+                let mut child = c.spawn().map_err(|e| format!("{}: {e}", exe.display()))?;
+                let mut id = String::new();
+                if let Some(out) = child.stdout.take() {
+                    let _ = std::io::BufReader::new(out).read_line(&mut id);
+                }
+                std::thread::spawn(move || child.wait());
+                let id = id.trim().to_string();
+                if id.is_empty() {
+                    Err("the task's session didn't start; see ~/.novacode/logs".to_string())
+                } else {
+                    Ok(id)
+                }
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        })
+    }
+
+    fn send<'a>(&'a self, session: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let f = crate::serve::find_live(&self.paths, session).map_err(|e| e.to_string())?;
+            let shutdown = matches!(cmd, ClientCmd::Shutdown);
+            let talk = async {
+                let s = crate::serve::connect(&f.socket).await.map_err(|e| e.to_string())?;
+                let (r, mut w) = tokio::io::split(s);
+                let req = Request {
+                    id: Some("super".into()),
+                    cmd,
+                };
+                w.write_all(line(&req).as_bytes()).await.map_err(|e| e.to_string())?;
+                w.flush().await.map_err(|e| e.to_string())?;
+                let mut lines = tokio::io::BufReader::new(r).lines();
+                while let Ok(Some(l)) = lines.next_line().await {
+                    match serde_json::from_str::<ServerMsg>(&l) {
+                        Ok(ServerMsg::Response {
+                            id: Some(id),
+                            ok,
+                            error,
+                            ..
+                        }) if id == "super" => {
+                            return if ok { Ok(()) } else { Err(error.unwrap_or_default()) };
+                        }
+                        Ok(ServerMsg::Bye { .. }) if shutdown => return Ok(()),
+                        _ => {}
+                    }
+                }
+                if shutdown {
+                    Ok(())
+                } else {
+                    Err("the task closed the connection".to_string())
+                }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(15), talk)
+                .await
+                .map_err(|_| format!("session {session} didn't answer"))?
+        })
+    }
+
+    fn alive(&self, session: &str) -> bool {
+        crate::serve::find_live(&self.paths, session).is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novacode_types::Reply;
+    use std::collections::{HashSet, VecDeque};
+
+    /// What the fakes saw, in order: `start <cwd>`, `send <session> <command>`, `ask <header>`.
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    #[derive(Default)]
+    struct FakeLauncher {
+        log: Log,
+        starts: Mutex<Vec<Start>>,
+        sent: Mutex<Vec<(String, ClientCmd)>>,
+        alive: Mutex<HashSet<String>>,
+    }
+
+    impl Launcher for FakeLauncher {
+        fn start(&self, s: Start) -> BoxFuture<'_, Result<String, String>> {
+            Box::pin(async move {
+                let mut starts = self.starts.lock().unwrap();
+                let id = s.resume.clone().unwrap_or_else(|| format!("s{}", starts.len() + 1));
+                self.log.lock().unwrap().push(format!("start {}", s.cwd.display()));
+                starts.push(s);
+                self.alive.lock().unwrap().insert(id.clone());
+                Ok(id)
+            })
+        }
+        fn send<'a>(&'a self, session: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                self.log.lock().unwrap().push(format!("send {session} {}", cmd.name()));
+                if matches!(cmd, ClientCmd::Shutdown) {
+                    self.alive.lock().unwrap().remove(session);
+                }
+                self.sent.lock().unwrap().push((session.to_string(), cmd));
+                Ok(())
+            })
+        }
+        fn alive(&self, session: &str) -> bool {
+            self.alive.lock().unwrap().contains(session)
+        }
+    }
+
+    impl FakeLauncher {
+        fn prompts(&self, session: &str) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(s, _)| s == session)
+                .filter_map(|(_, c)| match c {
+                    ClientCmd::Prompt { text, raw: true } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    /// Answers cards in order: `Some(label)` picks that choice, `None` dismisses.
+    struct FakeAsker {
+        log: Log,
+        answers: Mutex<VecDeque<Option<&'static str>>>,
+        asked: Mutex<Vec<Question>>,
+    }
+
+    impl Asker for FakeAsker {
+        fn ask(&self, questions: Vec<Question>) -> BoxFuture<'_, Option<Vec<Reply>>> {
+            Box::pin(async move {
+                let q = questions[0].clone();
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push(format!("ask {}", q.header.clone().unwrap_or_default()));
+                self.asked.lock().unwrap().push(q.clone());
+                let a = self.answers.lock().unwrap().pop_front().flatten()?;
+                Some(vec![Reply {
+                    question: q.question,
+                    chosen: vec![a.to_string()],
+                    text: None,
+                    preview: None,
+                }])
+            })
+        }
+    }
+
+    struct Fx {
+        _tmp: tempfile::TempDir,
+        root: PathBuf,
+        home: PathBuf,
+        sup: Super,
+        launcher: Arc<FakeLauncher>,
+        asker: Arc<FakeAsker>,
+        log: Log,
+    }
+
+    fn fixture(max_running: usize, answers: &[Option<&'static str>]) -> Fx {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let (root, home) = (base.join("root"), base.join("home"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let log: Log = Arc::default();
+        let launcher = Arc::new(FakeLauncher {
+            log: log.clone(),
+            ..FakeLauncher::default()
+        });
+        let asker = Arc::new(FakeAsker {
+            log: log.clone(),
+            answers: Mutex::new(answers.iter().copied().collect()),
+            asked: Mutex::default(),
+        });
+        let tiers = ["quick", "standard", "deep", "review"]
+            .iter()
+            .map(|n| {
+                (
+                    n.to_string(),
+                    Tier {
+                        model: format!("faux/{n}"),
+                        note: String::new(),
+                    },
+                )
+            })
+            .collect();
+        let cfg = Config {
+            max_running,
+            tiers,
+            worktree_copy: vec!["AGENTS.md".into()],
+            home: home.clone(),
+            allow: Arc::new(|m: &str| match m.starts_with("denied/") {
+                true => Err(format!("{m} is denied by models.deny")),
+                false => Ok(()),
+            }),
+        };
+        let sup = Super::new(&root, home.join("super/x"), cfg, Some(asker.clone()), launcher.clone()).unwrap();
+        Fx {
+            _tmp: tmp,
+            root,
+            home,
+            sup,
+            launcher,
+            asker,
+            log,
+        }
+    }
+
+    fn sh(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// `<root>/<name>`: a repo on branch `main` with one commit and a `sub/` folder.
+    fn repo(root: &Path, name: &str) -> PathBuf {
+        let r = root.join(name);
+        std::fs::create_dir_all(r.join("sub")).unwrap();
+        std::fs::write(r.join("sub/f"), "x").unwrap();
+        sh(&r, &["init", "-q", "-b", "main"]);
+        sh(&r, &["add", "."]);
+        sh(&r, &["commit", "-qm", "init"]);
+        r
+    }
+
+    fn spawn_args(folder: &str, slug: &str, write: bool) -> Value {
+        json!({
+            "action": "spawn", "request": format!("do {slug}"), "folder": folder, "slug": slug,
+            "write": write, "type": if write { "change" } else { "question" }, "criteria": ["it works"]
+        })
+    }
+
+    async fn run(fx: &Fx, args: Value) -> Result<String, String> {
+        fx.sup.run(args).await
+    }
+
+    fn state(fx: &Fx, id: &str) -> State {
+        fx.sup.row(id).unwrap().state
+    }
+
+    fn set_state(fx: &Fx, id: &str, s: State) {
+        fx.sup
+            .edit(|b| b.tasks.iter_mut().find(|t| t.id == id).unwrap().state = s)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bad_slugs_and_type_write_mismatches_are_refused() {
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        for bad in ["Fix", "a-b-c-d-e", "", "fix_it", "a--b", &"x".repeat(31)] {
+            let e = run(&fx, spawn_args("p", bad, false)).await.unwrap_err();
+            assert!(e.contains("bad slug"), "{bad}: {e}");
+        }
+        check_slug("fix-the-parser-2").unwrap();
+        for (ty, write) in [("question", true), ("change", false), ("bugfix", false)] {
+            let mut a = spawn_args("p", "x", write);
+            a["type"] = json!(ty);
+            let e = run(&fx, a).await.unwrap_err();
+            assert!(e.contains(&format!("`type: {ty}` needs")), "{e}");
+        }
+        let mut a = spawn_args("p", "x", false);
+        a["model"] = json!("denied/m");
+        assert!(run(&fx, a).await.unwrap_err().contains("denied"));
+        assert!(fx.sup.board.lock().unwrap().tasks.is_empty());
+        assert!(fx.launcher.starts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn folders_outside_the_root_are_refused_with_symlinks_resolved() {
+        let fx = fixture(5, &[]);
+        let outside = fx.home.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, fx.root.join("link")).unwrap();
+            let e = run(&fx, spawn_args("link", "x", false)).await.unwrap_err();
+            assert!(e.contains("outside the super root"), "{e}");
+        }
+        let e = run(&fx, spawn_args(outside.to_str().unwrap(), "x", false))
+            .await
+            .unwrap_err();
+        assert!(e.contains("outside the super root"), "{e}");
+        let e = run(&fx, spawn_args("../home", "x", false)).await.unwrap_err();
+        assert!(e.contains("outside the super root"), "{e}");
+        std::fs::create_dir(fx.root.join("in")).unwrap();
+        run(&fx, spawn_args("in", "x", false)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_write_task_starts_in_its_own_worktree_with_env_and_a_raw_brief() {
+        let fx = fixture(5, &[]);
+        let app = repo(&fx.root, "app");
+        std::fs::write(app.join("AGENTS.md"), "untracked rule").unwrap();
+        let out = run(&fx, spawn_args("app/sub", "fix-it", true)).await.unwrap();
+        assert!(out.contains("Started T1-fix-it"), "{out}");
+        let t = fx.sup.row("T1-fix-it").unwrap();
+        let wt = app.join(".worktrees/T1-fix-it");
+        assert_eq!(t.state, State::Running);
+        assert_eq!(t.worktree.as_deref(), Some(wt.as_path()));
+        assert_eq!(t.branch.as_deref(), Some("worktree-T1-fix-it"));
+        assert_eq!(t.base_branch.as_deref(), Some("main"));
+        assert_eq!(t.base_commit, git(&app, &["rev-parse", "HEAD"]).ok());
+        assert_eq!(t.repo.as_deref(), Some(app.as_path()));
+        assert_eq!(t.session.as_deref(), Some("s1"));
+        assert!(wt.join("AGENTS.md").exists(), "worktree.copy applied");
+        let s = fx.launcher.starts.lock().unwrap()[0].clone();
+        assert_eq!(s.cwd, wt.join("sub"), "same subfolder inside the worktree");
+        assert_eq!(s.resume, None);
+        let env: std::collections::HashMap<_, _> = s.env.into_iter().collect();
+        assert_eq!(env["NOVACODE_TASK"], "T1-fix-it");
+        assert_eq!(env["NOVACODE_TASK_TOKEN"], t.token);
+        assert!(t.token.len() >= 32);
+        assert_eq!(env["NOVACODE_SUPER_DIR"], fx.sup.dir.to_string_lossy());
+        assert_eq!(env["NOVACODE_EDIT_RULE"], format!("worktree:{}", wt.display()));
+        let brief = fx.launcher.prompts("s1");
+        assert_eq!(brief.len(), 1);
+        assert!(
+            brief[0].contains("do fix-it") && brief[0].contains("1. it works"),
+            "{}",
+            brief[0]
+        );
+        // Board saved; no project config, so no trust card.
+        assert_eq!(
+            Board::load(&fx.sup.dir)
+                .unwrap()
+                .task("T1-fix-it")
+                .unwrap()
+                .session
+                .as_deref(),
+            Some("s1")
+        );
+        assert!(fx.asker.asked.lock().unwrap().is_empty());
+        // Labels count up and are never reused; a read task runs in place.
+        std::fs::create_dir(fx.root.join("docs")).unwrap();
+        run(&fx, spawn_args("docs", "why", false)).await.unwrap();
+        let s = fx.launcher.starts.lock().unwrap()[1].clone();
+        assert_eq!(s.cwd, fx.root.join("docs"));
+        assert!(fx.sup.row("T2-why").unwrap().worktree.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_project_starts_only_after_the_trust_card() {
+        let fx = fixture(5, &[Some("Trust for this task only"), Some("Don't trust")]);
+        let app = repo(&fx.root, "app");
+        std::fs::write(app.join(".mcp.json"), r#"{"mcpServers": {}}"#).unwrap();
+        run(&fx, spawn_args("app", "one", true)).await.unwrap();
+        let log = fx.log.lock().unwrap().clone();
+        assert_eq!(log[0], "ask T1-one: trust", "{log:?}");
+        assert!(log[1].starts_with("start "), "{log:?}");
+        let q = fx.asker.asked.lock().unwrap()[0].question.clone();
+        assert!(q.contains("branches from main"), "{q}");
+        assert!(fx.sup.row("T1-one").unwrap().trusted);
+        assert!(fx.launcher.starts.lock().unwrap()[0].trust);
+        // "Don't trust": it starts without the project config, and the answer is stored.
+        run(&fx, spawn_args("app", "two", true)).await.unwrap();
+        assert!(!fx.launcher.starts.lock().unwrap()[1].trust);
+        let store = novacode_core::trust::TrustStore::new(fx.home.join("trust.json"));
+        assert_eq!(store.decision(&app), Some(false));
+    }
+
+    #[tokio::test]
+    async fn trusting_the_folder_on_the_card_stores_it() {
+        let fx = fixture(5, &[Some("Trust this folder")]);
+        let app = repo(&fx.root, "app");
+        std::fs::write(app.join(".mcp.json"), r#"{"mcpServers": {}}"#).unwrap();
+        run(&fx, spawn_args("app", "one", true)).await.unwrap();
+        let store = novacode_core::trust::TrustStore::new(fx.home.join("trust.json"));
+        assert_eq!(store.state(&app), novacode_core::trust::State::Trusted);
+        // Trusted now: the next task asks nothing.
+        run(&fx, spawn_args("app", "two", true)).await.unwrap();
+        assert_eq!(fx.asker.asked.lock().unwrap().len(), 1);
+        assert!(fx.launcher.starts.lock().unwrap()[1].trust);
+    }
+
+    #[tokio::test]
+    async fn the_running_limit_queues_and_stop_frees_a_slot() {
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        for i in 1..=7 {
+            run(&fx, spawn_args("p", &format!("t{i}"), false)).await.unwrap();
+        }
+        assert_eq!(fx.launcher.starts.lock().unwrap().len(), 5);
+        assert_eq!(state(&fx, "T6-t6"), State::Queued);
+        // Stop on a queued task takes it out of the queue; nothing is sent.
+        let out = run(&fx, json!({"action": "stop", "task": "T6"})).await.unwrap();
+        assert!(out.contains("out of the queue"), "{out}");
+        assert_eq!(state(&fx, "T6-t6"), State::Stopped);
+        // A send to a queued task joins its brief.
+        run(&fx, json!({"action": "send", "task": "T7-t7", "message": "also X"}))
+            .await
+            .unwrap();
+        // Stop on a running one: Abort that drops queued input, and the queue moves on.
+        run(&fx, json!({"action": "stop", "task": "T1-t1"})).await.unwrap();
+        let sent = fx.launcher.sent.lock().unwrap().clone();
+        assert!(
+            sent.iter()
+                .any(|(s, c)| s == "s1" && matches!(c, ClientCmd::Abort { drop_queued: true }))
+        );
+        assert_eq!(state(&fx, "T1-t1"), State::Stopped);
+        assert_eq!(state(&fx, "T7-t7"), State::Running);
+        let brief = fx.launcher.prompts("s6");
+        assert!(brief[0].contains("also X"), "{brief:?}");
+        // A stopped task can't be stopped again: the pair is not in the table.
+        let e = run(&fx, json!({"action": "stop", "task": "T1-t1"})).await.unwrap_err();
+        assert!(e.contains("not possible"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn reviews_start_first_and_held_providers_wait() {
+        let fx = fixture(1, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "busy", false)).await.unwrap();
+        run(&fx, spawn_args("p", "work", false)).await.unwrap();
+        let mut a = spawn_args("p", "held", false);
+        a["model"] = json!("held/m");
+        run(&fx, a).await.unwrap();
+        fx.sup
+            .edit(|b| {
+                b.holds.insert(
+                    "held".into(),
+                    super::super::board::Limit {
+                        kind: super::super::board::LimitKind::Quota,
+                        provider: "held".into(),
+                        reset_at: None,
+                    },
+                );
+                b.tasks.push(Task {
+                    id: "T9-review-x".into(),
+                    label: "T9-review-x".into(),
+                    kind: Kind::Review,
+                    model: "faux/review".into(),
+                    state: State::Queued,
+                    started: u64::MAX,
+                    ..Task::default()
+                });
+            })
+            .unwrap();
+        let why = fx.sup.why_queued(&fx.sup.row("T3-held").unwrap());
+        assert!(why.contains("on hold"), "{why}");
+        run(&fx, json!({"action": "stop", "task": "T1-busy"})).await.unwrap();
+        assert_eq!(state(&fx, "T9-review-x"), State::Running, "the review goes first");
+        assert_eq!(state(&fx, "T2-work"), State::Queued);
+        set_state(&fx, "T9-review-x", State::Archived);
+        fx.sup.pump().await;
+        assert_eq!(state(&fx, "T2-work"), State::Running);
+        set_state(&fx, "T2-work", State::Stopped);
+        fx.sup.pump().await;
+        assert_eq!(state(&fx, "T3-held"), State::Queued, "its provider is on hold");
+    }
+
+    #[tokio::test]
+    async fn a_second_non_git_write_task_in_one_folder_queues() {
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("plain")).unwrap();
+        run(&fx, spawn_args("plain", "one", true)).await.unwrap();
+        let out = run(&fx, spawn_args("plain", "two", true)).await.unwrap();
+        assert!(out.contains("queued") && out.contains("T1-one"), "{out}");
+        let s = fx.launcher.starts.lock().unwrap()[0].clone();
+        let rule = s.env.iter().find(|(k, _)| k == "NOVACODE_EDIT_RULE").unwrap();
+        assert_eq!(rule.1, format!("worktree:{}", fx.root.join("plain").display()));
+        let out = run(&fx, json!({"action": "close", "task": "T1-one"})).await.unwrap();
+        assert!(out.contains("declined"), "a dismissed card: {out}");
+        set_state(&fx, "T1-one", State::Archived);
+        fx.sup.pump().await;
+        assert_eq!(state(&fx, "T2-two"), State::Running);
+    }
+
+    #[tokio::test]
+    async fn send_continues_every_resumable_state_and_resumes_a_dead_session() {
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "t", false)).await.unwrap();
+        use State::*;
+        for (i, s) in [Blocked, Failed, Stopped, Reviewing, Ready, Interrupted]
+            .into_iter()
+            .enumerate()
+        {
+            set_state(&fx, "T1-t", s);
+            let dead = i % 2 == 1;
+            if dead {
+                fx.launcher.alive.lock().unwrap().remove("s1");
+            }
+            let out = run(
+                &fx,
+                json!({"action": "send", "task": "T1-t", "message": format!("m{i}")}),
+            )
+            .await
+            .unwrap();
+            assert!(out.contains("running"), "{s:?}: {out}");
+            assert_eq!(state(&fx, "T1-t"), Running, "{s:?}");
+            assert_eq!(fx.launcher.prompts("s1").last().unwrap(), &format!("m{i}"));
+        }
+        let starts = fx.launcher.starts.lock().unwrap().clone();
+        assert_eq!(starts.len(), 4, "three resumes after the first start");
+        assert!(starts[1..].iter().all(|s| s.resume.as_deref() == Some("s1")));
+        // While running the message is just delivered; archived tasks refuse it.
+        run(&fx, json!({"action": "send", "task": "T1-t", "message": "more"}))
+            .await
+            .unwrap();
+        set_state(&fx, "T1-t", Archived);
+        let e = run(&fx, json!({"action": "send", "task": "T1-t", "message": "x"}))
+            .await
+            .unwrap_err();
+        assert!(e.contains("not possible"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn close_asks_on_a_card_and_keeps_an_unmerged_worktree() {
+        let fx = fixture(5, &[None, Some("Close"), Some("Close")]);
+        let app = repo(&fx.root, "app");
+        run(&fx, spawn_args("app", "keep", true)).await.unwrap();
+        let wt = app.join(".worktrees/T1-keep");
+        std::fs::write(wt.join("new"), "y").unwrap();
+        sh(&wt, &["add", "new"]);
+        sh(&wt, &["commit", "-qm", "work"]);
+        // Dismissed card: nothing happens.
+        let out = run(&fx, json!({"action": "close", "task": "T1-keep"})).await.unwrap();
+        assert!(out.contains("declined"), "{out}");
+        assert_eq!(state(&fx, "T1-keep"), State::Running);
+        assert!(fx.launcher.alive("s1"));
+        let q = fx.asker.asked.lock().unwrap()[0].question.clone();
+        assert!(q.contains("worktree-T1-keep is NOT merged into main"), "{q}");
+        // Confirmed: archived, process ended, unmerged worktree kept.
+        run(&fx, json!({"action": "close", "task": "T1-keep"})).await.unwrap();
+        assert_eq!(state(&fx, "T1-keep"), State::Archived);
+        assert!(!fx.launcher.alive("s1"));
+        assert!(wt.exists());
+        // A branch merged into its base: the worktree goes.
+        run(&fx, spawn_args("app", "done", true)).await.unwrap();
+        let wt2 = app.join(".worktrees/T2-done");
+        let out = run(&fx, json!({"action": "close", "task": "T2-done"})).await.unwrap();
+        let q = fx.asker.asked.lock().unwrap()[2].question.clone();
+        assert!(q.contains("is merged into main"), "{q}");
+        assert!(!wt2.exists(), "{out}");
+    }
+
+    #[tokio::test]
+    async fn merge_asks_on_a_card_and_does_nothing_on_decline() {
+        let fx = fixture(5, &[Some("Cancel"), Some("Merge")]);
+        repo(&fx.root, "app");
+        run(&fx, spawn_args("app", "m", true)).await.unwrap();
+        let e = run(&fx, json!({"action": "merge", "task": "T1-m"})).await.unwrap_err();
+        assert!(e.contains("not possible"), "not ready yet: {e}");
+        assert!(fx.asker.asked.lock().unwrap().is_empty(), "refused before any card");
+        set_state(&fx, "T1-m", State::Ready);
+        let before = fx.launcher.prompts("s1").len();
+        let out = run(&fx, json!({"action": "merge", "task": "T1-m"})).await.unwrap();
+        assert!(out.contains("declined"), "{out}");
+        assert_eq!(state(&fx, "T1-m"), State::Ready);
+        assert_eq!(fx.launcher.prompts("s1").len(), before);
+        run(&fx, json!({"action": "merge", "task": "T1-m"})).await.unwrap();
+        assert_eq!(state(&fx, "T1-m"), State::Merging);
+        assert!(fx.launcher.prompts("s1").last().unwrap().contains("merge: merged"));
+        let q = fx.asker.asked.lock().unwrap()[1].question.clone();
+        assert!(q.contains("Merge T1-m?") && q.contains("worktree-T1-m"), "{q}");
+    }
+
+    #[tokio::test]
+    async fn accept_review_list_read_and_review_rows() {
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "q", false)).await.unwrap();
+        set_state(&fx, "T1-q", State::Reviewing);
+        run(&fx, json!({"action": "accept", "task": "T1-q"})).await.unwrap();
+        assert_eq!(state(&fx, "T1-q"), State::Ready);
+        // A doubted approval: back to reviewing, no round used.
+        run(&fx, json!({"action": "review", "task": "T1-q"})).await.unwrap();
+        let t = fx.sup.row("T1-q").unwrap();
+        assert_eq!((t.state, t.review_rounds), (State::Reviewing, 0));
+        fx.sup
+            .edit(|b| {
+                b.tasks.push(Task {
+                    id: "T2-review-q".into(),
+                    label: "T2-review-q".into(),
+                    kind: Kind::Review,
+                    reviewer_of: Some("T1-q".into()),
+                    state: State::Running,
+                    model: "faux/review".into(),
+                    ..Task::default()
+                })
+            })
+            .unwrap();
+        for action in ["send", "stop", "close", "merge", "accept", "review"] {
+            let e = run(&fx, json!({"action": action, "task": "T2-review-q", "message": "x"}))
+                .await
+                .unwrap_err();
+            assert!(e.contains("review task"), "{action}: {e}");
+        }
+        let list = run(&fx, json!({"action": "list"})).await.unwrap();
+        assert!(list.contains("T1-q | p | reviewing | faux/standard"), "{list}");
+        assert!(list.contains("T2-review-q"), "{list}");
+        let e = run(&fx, json!({"action": "read", "task": "T2-review-q"}))
+            .await
+            .unwrap_err();
+        assert!(!e.contains("review task"), "read works on a review row: {e}");
+        let e = run(&fx, json!({"action": "fly", "task": "T1-q"})).await.unwrap_err();
+        assert!(e.contains("unknown action"), "{e}");
+    }
+
+    #[test]
+    fn preamble_names_the_task_and_the_restart_rule() {
+        let p = preamble("T3-fix");
+        assert!(p.contains("T3-fix") && p.contains("`report`") && p.contains("re-run your checks"));
+    }
+}

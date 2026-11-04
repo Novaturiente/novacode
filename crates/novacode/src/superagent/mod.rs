@@ -7,6 +7,7 @@ pub mod board;
 pub mod entry;
 pub mod inbox;
 pub mod report;
+pub mod task;
 
 use novacode_base::settings::Settings;
 use serde::Deserialize;

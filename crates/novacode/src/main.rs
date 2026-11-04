@@ -973,7 +973,10 @@ async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         None
     };
     // --bg: start a detached copy of this command and report its session id.
-    if cli.bg.is_some() && !cli.super_serve && std::env::var_os("NOVACODE_BG_CHILD").is_none() {
+    // A super task is already detached by super (L10.9), without NOVACODE_BG_CHILD: that
+    // would reach every `--bg` the task's commands start.
+    let detached = std::env::var_os("NOVACODE_BG_CHILD").is_some() || std::env::var_os("NOVACODE_TASK").is_some();
+    if cli.bg.is_some() && !cli.super_serve && !detached {
         return spawn_bg();
     }
     let headless = cli.bg.is_some() || cli.rpc || cli.profile_startup;
@@ -1359,7 +1362,6 @@ impl Ctx {
         asker: Option<Arc<dyn novacode_tools::ask::Asker>>,
         slot: Option<hub::HubSlot>,
     ) -> anyhow::Result<(Agent, String)> {
-        let mut store = store;
         let carry = self.carry.lock().unwrap().take();
         // A resumed session keeps its own model unless -m says otherwise.
         let resumed = match (&self.cli.model, store.last_model()) {
@@ -1439,6 +1441,15 @@ impl Ctx {
         let granted: Option<Vec<String>> = def
             .as_ref()
             .map(|d| self.cli.mcp.as_ref().map_or_else(|| d.mcp.clone(), csv));
+        // A super task's own session (L10.9): which task it is, from its env or saved entry.
+        let (task_id, task_saved) = {
+            use superagent::report::Identity;
+            let vars = Identity::from_vars(|v| std::env::var(v).ok());
+            let saved = Identity::saved(store.branch());
+            let task = Identity::resolve(agents::Place::from_env().depth, vars, saved.clone());
+            let known = task.is_some() && saved == task;
+            (task, known)
+        };
         let (window_tokens, max_tokens) = models::Limits::new(s).of(&route);
         // Cross-session memory (L10.4); `memory.store: false` turns it off.
         let memories = s
@@ -1469,6 +1480,9 @@ impl Ctx {
                 tool_guidelines: vec![],
                 agent: if is_super {
                     Some((superagent::prompt(self.paths.home()), true))
+                } else if let Some(id) = task_id.as_ref().filter(|_| def.is_none()) {
+                    // The task preamble: in the system prompt, so it stays cached.
+                    Some((superagent::task::preamble(&id.task), false))
                 } else {
                     def.as_ref()
                         .filter(|d| !d.prompt.is_empty())
@@ -1511,22 +1525,30 @@ impl Ctx {
         if let Some(a) = asker.clone() {
             all.push(Arc::new(novacode_tools::ask::AskUser(a)));
         }
+        if is_super {
+            use superagent::task;
+            let home = self.paths.home();
+            let cfg = task::Config {
+                max_running: superagent::max_running(s),
+                tiers: superagent::tiers(s),
+                worktree_copy: worktree_copy(s),
+                home: home.to_path_buf(),
+                allow: models::spawn_check(self.providers.clone()),
+            };
+            let launcher = Arc::new(task::Procs {
+                exe: live_path(std::env::current_exe()?),
+                paths: self.paths.clone(),
+            });
+            let dir = superagent::entry::dir(home, &self.cwd);
+            let sup = task::Super::new(&self.cwd, dir, cfg, asker.clone(), launcher)?;
+            all.push(Arc::new(task::TaskTool(Arc::new(sup))));
+        }
         all.push(Arc::new(novacode_tools::todo::Todo::new(
             store.todo().map(|t| t.0).unwrap_or_default(),
         )));
         // A super task's own session (L10.9): the `report` tool and its proof log; never in a subagent.
         let task = {
-            use superagent::report::Identity;
-            let vars = Identity::from_vars(|v| std::env::var(v).ok());
-            let saved = Identity::saved(store.branch());
-            let task = Identity::resolve(agents::Place::from_env().depth, vars, saved.clone());
-            if let Some(id) = task.as_ref().filter(|id| saved.as_ref() != Some(*id)) {
-                // A failed write stays in memory and goes out with the next flush.
-                if let Err(e) = store.append(id.entry()) {
-                    tracing::warn!("super task identity not saved yet: {e}");
-                }
-            }
-            task.map(|id| {
+            task_id.map(|id| {
                 let proof = Arc::new(superagent::report::ProofLog::default());
                 let seq = superagent::report::last_seq(store.branch());
                 all.push(Arc::new(superagent::report::ReportTool::new(
@@ -1907,6 +1929,12 @@ impl Ctx {
             agent = agent.adopt(c);
         }
         if let Some((id, proof)) = task {
+            // Saved after the agent wrote a new session's system prompt (an entry before it
+            // would make the session look old, and the prompt would never be written).
+            if !task_saved && let Err(e) = agent.store.append(id.entry()) {
+                // A failed write stays in memory and goes out with the next flush.
+                tracing::warn!("super task identity not saved yet: {e}");
+            }
             if let Some(pm) = agent.processes() {
                 proof.watch(pm);
             }
