@@ -652,13 +652,27 @@ pub async fn attach(
     let mut last = state.clone();
     let bye: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
     let bye_seen = bye.clone();
-    tokio::spawn(async move {
+    // L8.14: this window publishes the session's state to its own pane and herdr.
+    // A panel pane sits beside the session's own window, which already does.
+    let (state_tx, state_rx) = tokio::sync::watch::channel(state.clone());
+    let (act_tx, act_rx) = tokio::sync::broadcast::channel(64);
+    let sinks = (!panel_only && (base.sinks.tmux_pane.is_some() || base.sinks.herdr.is_some())).then(|| {
+        tokio::spawn(crate::activity::follow(
+            base.sinks.clone(),
+            state_rx,
+            Some(act_rx),
+            || true,
+            || false,
+        ))
+    });
+    let reader = tokio::spawn(async move {
         while let Ok(Some(l)) = lines.next_line().await {
             let Ok(m) = serde_json::from_str::<ServerMsg>(&l) else {
                 continue;
             };
             match m {
                 ServerMsg::Event { event } => {
+                    let _ = act_tx.send(event.clone());
                     let _ = etx.send(event);
                 }
                 ServerMsg::Ui { ui } => {
@@ -729,6 +743,7 @@ pub async fn attach(
                             price: state.price,
                         });
                     }
+                    let _ = state_tx.send(state.clone());
                     last = state;
                 }
                 ServerMsg::Response {
@@ -861,7 +876,13 @@ pub async fn attach(
         images: base.images.clone(),
         procs: Vec::new(),
     };
-    novacode_tui::run(init, erx, ui_rx, cmd_tx).await?;
+    let ran = novacode_tui::run(init, erx, ui_rx, cmd_tx).await;
+    // Closing the feed ends the sinks, which clear the pane options.
+    reader.abort();
+    if let Some(s) = sinks {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), s).await;
+    }
+    ran?;
     match bye.lock().unwrap().take() {
         // The owner is rebuilding it: the caller reconnects (None).
         Some(reason) if reason == RELOADING => return Ok(None),

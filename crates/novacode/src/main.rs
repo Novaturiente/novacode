@@ -2237,6 +2237,8 @@ pub(crate) struct TuiBase {
     nerd_icons: bool,
     slow: bool,
     images: String,
+    /// What an attach window publishes to its own pane (L8.14).
+    pub(crate) sinks: activity::Sinks,
 }
 
 /// `ui.panel.host`: `tmux` (or `auto` inside tmux) opens the panel as a split
@@ -2328,6 +2330,7 @@ fn tui_base(paths: &Paths, settings: &Settings) -> TuiBase {
         nerd_icons: settings.get::<String>("ui.icons").is_none_or(|v| v != "unicode"),
         slow: settings.get::<bool>("ui.slow").unwrap_or_else(slow_terminal),
         images: settings.get::<String>("ui.images").unwrap_or_else(|| "auto".into()),
+        sinks: activity::Sinks::for_attach(settings),
     }
 }
 

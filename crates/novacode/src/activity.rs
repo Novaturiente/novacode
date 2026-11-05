@@ -8,7 +8,7 @@ use novacode_types::AgentEvent;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::process::Command;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 #[derive(Clone, Default)]
 pub struct Sinks {
@@ -23,7 +23,7 @@ pub struct Sinks {
 }
 
 impl Sinks {
-    /// For the session's own window. `--bg`, RPC and attach windows have no pane of their own.
+    /// For the session's own window. `--bg` and RPC sessions have no pane of their own.
     pub fn for_window(settings: &novacode_base::settings::Settings) -> Self {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         Sinks {
@@ -33,6 +33,16 @@ impl Sinks {
                 .flatten(),
             hook: settings.get::<String>("hooks.onActivity"),
             notify: settings.get("notifications.enabled").unwrap_or(true),
+        }
+    }
+
+    /// For an attach window (super, Tasks-tab and /watch panes): its own pane and
+    /// herdr only; the session itself runs the hook and the notifications.
+    pub fn for_attach(settings: &novacode_base::settings::Settings) -> Self {
+        Sinks {
+            hook: None,
+            notify: false,
+            ..Self::for_window(settings)
         }
     }
 
@@ -57,6 +67,19 @@ pub async fn project(dir: &Path) -> Option<String> {
     Some(common.parent()?.file_name()?.to_string_lossy().into_owned())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests never run tmux: the command lines land here instead.
+    static TMUX_CALLS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+async fn tmux(args: &[&str]) -> Option<String> {
+    TMUX_CALLS.with_borrow_mut(|c| c.push(args.join(" ")));
+    None
+}
+
+#[cfg(not(test))]
 async fn tmux(args: &[&str]) -> Option<String> {
     let out = Command::new("tmux")
         .args(args)
@@ -222,25 +245,47 @@ async fn run_hook(cmd: &str, s: &State, prev: ActState) {
 
 /// Follow the hub until it closes; then clear the tmux options (agent "off").
 pub fn spawn(hub: &Arc<Hub>, sinks: Sinks) -> tokio::task::JoinHandle<()> {
-    let mut changed = hub.changed.subscribe();
-    let mut events = hub.handle.subscribe();
-    let hub = hub.clone();
-    tokio::spawn(async move {
+    let changed = hub.changed.subscribe();
+    let events = hub.handle.subscribe();
+    let (focused, closed) = (hub.clone(), hub.clone());
+    tokio::spawn(follow(
+        sinks,
+        changed,
+        Some(events),
+        move || focused.focused(),
+        move || closed.is_closed(),
+    ))
+}
+
+/// The next event, or never when there is no feed.
+async fn next_event(
+    events: &mut Option<broadcast::Receiver<AgentEvent>>,
+) -> Result<AgentEvent, broadcast::error::RecvError> {
+    match events {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Follow `changed` until its sender drops (or `is_closed`); then clear the tmux
+/// options (agent "off"). `events` feeds the edited-project tracking.
+pub async fn follow(
+    sinks: Sinks,
+    mut changed: watch::Receiver<State>,
+    mut events: Option<broadcast::Receiver<AgentEvent>>,
+    focused: impl Fn() -> bool,
+    is_closed: impl Fn() -> bool,
+) {
+    {
         let mut last: Option<State> = None;
         let mut edited_project: Option<String> = None;
-        let cwd_project = project(Path::new(&hub.state().cwd)).await;
+        let first = changed.borrow().clone();
+        let cwd_project = project(Path::new(&first.cwd)).await;
         if let Some((sock, pane)) = &sinks.herdr {
-            herdr(
-                sock,
-                pane,
-                "pane.report_agent_session",
-                serde_json::json!({}),
-                &hub.state(),
-            )
-            .await;
+            herdr(sock, pane, "pane.report_agent_session", serde_json::json!({}), &first).await;
         }
         loop {
-            if hub.is_closed() {
+            if is_closed() {
                 break;
             }
             let s = changed.borrow_and_update().clone();
@@ -282,7 +327,7 @@ pub fn spawn(hub: &Arc<Hub>, sinks: Sinks) -> tokio::task::JoinHandle<()> {
                         .unwrap_or_default();
                     notify(&format!("novacode {st}"), &place, true).await;
                 }
-            } else if state_changed && sinks.notify && sinks.tmux_pane.is_none() && !hub.focused() {
+            } else if state_changed && sinks.notify && sinks.tmux_pane.is_none() && !focused() {
                 let done = prev != ActState::Idle && s.activity.state == ActState::Idle;
                 if done || s.activity.state == ActState::Blocked {
                     let place = Path::new(&s.cwd)
@@ -312,11 +357,11 @@ pub fn spawn(hub: &Arc<Hub>, sinks: Sinks) -> tokio::task::JoinHandle<()> {
             last = Some(s);
             tokio::select! {
                 r = changed.changed() => if r.is_err() { break },
-                ev = events.recv() => match ev {
+                ev = next_event(&mut events) => match ev {
                     // The edited file's repo, so the sidebar shows where the work happens.
                     Ok(AgentEvent::ToolStart { call }) if matches!(call.name.as_str(), "edit" | "write" | "apply_patch") => {
                         if let Some(path) = call.arguments["path"].as_str() {
-                            let abs = Path::new(&hub.state().cwd).join(path);
+                            let abs = Path::new(&changed.borrow().cwd).join(path);
                             if let Some(pr) = project(abs.parent().unwrap_or(&abs)).await
                                 && edited_project.as_ref() != Some(&pr)
                             {
@@ -352,7 +397,7 @@ pub fn spawn(hub: &Arc<Hub>, sinks: Sinks) -> tokio::task::JoinHandle<()> {
             }
             tmux(&args).await;
         }
-    })
+    }
 }
 
 #[cfg(test)]
@@ -384,6 +429,56 @@ mod tests {
         );
         run_hook(&cmd, &State::default(), ActState::Idle).await;
         assert_eq!(std::fs::read_to_string(&f).unwrap().trim(), "task= token= dir=");
+    }
+
+    /// L8.14: an attach window publishes to its own pane only; the session itself
+    /// runs the hook and the notifications, so they never fire twice.
+    #[test]
+    fn attach_sinks_have_no_hook_and_no_notify() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("settings.json");
+        std::fs::write(
+            &f,
+            r#"{"hooks":{"onActivity":"echo hi"},"notifications":{"enabled":true}}"#,
+        )
+        .unwrap();
+        let settings = novacode_base::settings::Settings::load(&f, None, false);
+        let own = Sinks::for_window(&settings);
+        assert!(own.hook.is_some() && own.notify);
+        let s = Sinks::for_attach(&settings);
+        assert!(s.hook.is_none() && !s.notify);
+        assert_eq!((s.tmux_pane, s.herdr), (own.tmux_pane, own.herdr));
+    }
+
+    /// L8.14: the loop follows a watch channel (an attach window's), publishes the
+    /// pane options, and clears them once the channel closes.
+    #[tokio::test]
+    async fn a_watch_channel_drives_the_pane_options() {
+        let s = State {
+            cwd: "/nonexistent-w".into(),
+            model: "claude/claude-opus-5-5".into(),
+            account: Some("mili".into()),
+            ..Default::default()
+        };
+        let (tx, rx) = tokio::sync::watch::channel(s);
+        drop(tx);
+        let sinks = Sinks {
+            tmux_pane: Some("%9".into()),
+            ..Default::default()
+        };
+        TMUX_CALLS.with_borrow_mut(Vec::clear);
+        follow(sinks, rx, None, || true, || false).await;
+        let calls = TMUX_CALLS.with_borrow(Clone::clone);
+        assert!(
+            calls.iter().any(|c| c.contains("set -p -t %9 @agent_account mili")),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .last()
+                .is_some_and(|c| c.contains("set -p -t %9 -u @agent_account")),
+            "{calls:?}"
+        );
     }
 
     #[test]

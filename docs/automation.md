@@ -319,7 +319,7 @@ After 10 seconds novacode kills the shell; processes the command started may kee
 
 ### tmux agent state
 
-Inside tmux, a session in its own window sets these options on its pane, so your status line or scripts can read them (`tmux show -p -v @agent_state`):
+Inside tmux, a session in its own window sets these options on its pane, and so does every attach window (the super window, Tasks-tab and `/watch` panes, `novacode attach`) on its own pane, so your status line or scripts can read them (`tmux show -p -v @agent_state`):
 
 | Option | Value |
 |---|---|
@@ -332,11 +332,11 @@ Inside tmux, a session in its own window sets these options on its pane, so your
 | `@agent_project` | The repo name |
 | `@agent_bg` | How many background processes are running (unset when none) |
 
-These need `$TMUX_PANE`. Turn it off with `tmux.agentState: false`. When a turn ends or needs you while the pane is unwatched, novacode also sends a terminal notification (`notifications.enabled`). `--bg` and `--rpc` sessions have no pane, so they don't set these options; use `novacode status` or `hooks.onActivity` for them.
+These need `$TMUX_PANE`. Turn it off with `tmux.agentState: false`. When a turn ends or needs you while the pane is unwatched, novacode also sends a terminal notification (`notifications.enabled`). An attach window sends no notification and doesn't run `hooks.onActivity`: the session itself does that. A `--bg` or `--rpc` session has no pane of its own, so with no window attached nothing sets these options; use `novacode status` or `hooks.onActivity` for it.
 
 ### herdr
 
-If novacode runs inside herdr (a terminal workspace manager for agents), it reports its state there too. It does this when `HERDR_ENV=1` and `HERDR_SOCKET_PATH` and `HERDR_PANE_ID` are set. You don't configure anything.
+If novacode runs inside herdr (a terminal workspace manager for agents), it reports its state there too. It does this when `HERDR_ENV=1` and `HERDR_SOCKET_PATH` and `HERDR_PANE_ID` are set. Attach windows (the super window, Tasks-tab and `/watch` panes, `novacode attach`) report the session's state for their own pane too; `--bg` and `--rpc` sessions with no window attached don't. You don't configure anything.
 
 ### Command hooks
 
