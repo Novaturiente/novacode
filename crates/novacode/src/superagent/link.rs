@@ -1055,6 +1055,11 @@ Address every finding, commit, re-run your checks and report `done` again.",
                     _ => MergeResult::Failed(summary),
                 }),
                 (None, Some(m)) => Event::MergeReport(match m {
+                    // A local merge's result is made only by code (R29); the report tool refuses this too.
+                    "merged" if sup.row(&r.task).is_ok_and(|t| !t.pr) => MergeResult::Failed(
+                        "the task reported `merged` for a local merge; only code fast-forwards the main checkout"
+                            .into(),
+                    ),
                     "merged" => MergeResult::Merged,
                     "pr-opened" => MergeResult::PrOpened,
                     _ => MergeResult::Failed(summary),
@@ -3123,6 +3128,23 @@ mod tests {
             wakes.iter().any(|w| w.contains("T2-y opened a pull request")),
             "{wakes:?}"
         );
+    }
+
+    /// R29: only code makes a local merge result; a `merged` file in the inbox is a merge block.
+    #[tokio::test]
+    async fn an_inbox_merged_report_for_a_local_merge_is_a_merge_block() {
+        let fx = fixture(5);
+        let a = fx.sup.root.join("a");
+        fx.merging_branch("T1-x", &a);
+        let head = git_head(&a, "HEAD");
+        write_report(&fx, "T1-x", 1, "tok", json!({"merge": "merged", "summary": "merged"}));
+        fx.links.kick();
+        fx.until("blocked", |fx| fx.state("T1-x") == State::Blocked).await;
+        let t = fx.sup.row("T1-x").unwrap();
+        assert_eq!(t.landed, None);
+        assert!(t.block.as_ref().is_some_and(|b| b.merge), "{:?}", t.block);
+        assert_eq!(git_head(&a, "HEAD"), head, "main untouched");
+        assert_eq!(fx.locks(), 0);
     }
 
     #[tokio::test]
