@@ -500,21 +500,47 @@ fn uncovered(n: usize, findings: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The first criterion (1 to `n`) a finding calls not met: "Criterion N: not met",
-/// "criterion N not met" or "Criterion N: unmet" (any case; "metered" doesn't count).
+/// The first criterion (1 to `n`) a finding calls not met. Each "Criterion N" (any case,
+/// "#N" too, not "subcriterion") gets the last verdict in its clause (up to a newline, `.`,
+/// `;` or the next "criterion"): "met", or not met for "not met", "unmet", "partially met",
+/// "not fully met". So "not met on base, met on the branch" is met; "metered" is no verdict.
 fn not_met(n: usize, findings: &[String]) -> Option<usize> {
     let text = findings.join("\n").to_lowercase();
-    (1..=n).find(|i| {
-        let name = format!("criterion {i}");
-        text.match_indices(&name).any(|(at, _)| {
-            let rest = &text[at + name.len()..];
-            let rest = rest.strip_prefix(':').unwrap_or(rest).trim_start();
-            ["not met", "unmet"].iter().any(|w| {
-                rest.strip_prefix(w)
-                    .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric()))
-            })
-        })
-    })
+    let mut found = Vec::new();
+    for (at, _) in text.match_indices("criterion") {
+        if text[..at].ends_with(|c: char| c.is_alphanumeric()) {
+            continue;
+        }
+        let rest = text[at + "criterion".len()..].trim_start();
+        let rest = rest.strip_prefix('#').unwrap_or(rest);
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let Ok(i) = rest[..digits].parse::<usize>() else {
+            continue;
+        };
+        let clause = &rest[digits..];
+        let end = clause.find(['\n', '.', ';']).unwrap_or(clause.len());
+        let end = clause[..end].find("criterion").unwrap_or(end);
+        let words: Vec<&str> = clause[..end]
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+        let verdict = (0..words.len()).rev().find_map(|k| {
+            let before = |d: usize| k.checked_sub(d).map(|j| words[j]);
+            match words[k] {
+                "unmet" => Some(false),
+                "met" => Some(match before(1) {
+                    Some("not" | "never" | "partially" | "partly") => false,
+                    Some("fully" | "yet" | "entirely" | "completely" | "quite") => before(2) != Some("not"),
+                    _ => true,
+                }),
+                _ => None,
+            }
+        });
+        if verdict == Some(false) && (1..=n).contains(&i) {
+            found.push(i);
+        }
+    }
+    found.into_iter().min()
 }
 
 /// What git says about the task's folder.
@@ -929,6 +955,31 @@ mod tests {
     use crate::superagent::board::Task;
     use std::process::Command;
     use std::time::Duration;
+
+    #[test]
+    fn not_met_reads_each_criterions_verdict() {
+        // (finding, the criterion it calls not met, checked with n = 4)
+        for (f, want) in [
+            ("Criterion 4: not met", Some(4)),
+            ("Criterion 4 - not met", Some(4)),
+            ("Criterion 4: partially met", Some(4)),
+            ("Criterion 4: not fully met", Some(4)),
+            ("Criterion #4: not met", Some(4)),
+            ("criterion 4 NOT MET", Some(4)),
+            ("Criterion 4: unmet", Some(4)),
+            ("Criterion 2: not met on base, met on the branch", None),
+            ("subcriterion 4 not met", None),
+            ("Criterion 4: met", None),
+            ("Criterion 1: met, not flaky", None),
+            ("Criterion 3: not flaky, met", None),
+            ("Criterion 2: met; criterion 20 not met is unrelated", None),
+            ("Criterion 3: not metered but met", None),
+            ("Criterion 4: met (not a regression)", None),
+            ("Criterion 1: met. Criterion 3: not met", Some(3)),
+        ] {
+            assert_eq!(not_met(4, &[f.to_string()]), want, "{f}");
+        }
+    }
 
     fn text(o: &ToolOutput) -> String {
         o.content
