@@ -141,8 +141,11 @@ impl Block {
         self
     }
 
+    /// A merge block is never provisional: the merge lock is gone, so no report or review
+    /// moves the task on from it (only `task merge`, `send` or `close`).
     fn merge(mut self) -> Block {
         self.merge = true;
+        self.code_made = false;
         self
     }
 }
@@ -558,7 +561,12 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
                 from,
                 to: Reviewing,
                 block: None,
-                effects: vec![Effect::StopReview, Effect::StartReview { uses_round: true }],
+                effects: vec![
+                    Effect::StopReview,
+                    Effect::StartReview {
+                        uses_round: !t.review_free,
+                    },
+                ],
             }),
             _ => refused(),
         },
@@ -1407,6 +1415,25 @@ mod tests {
     }
 
     #[test]
+    fn a_free_review_restarted_by_a_new_done_stays_free() {
+        // L10.9 Y5: `task review` on a ready task uses no round, nor does its restart.
+        let mut b = Board {
+            tasks: vec![Task {
+                id: "T1".into(),
+                review_free: true,
+                ..under_review(1)
+            }],
+            ..Board::default()
+        };
+        let n = b.apply("T1", report(ReportState::Done)).unwrap();
+        assert_eq!(
+            n.effects,
+            vec![Effect::StopReview, Effect::StartReview { uses_round: false }]
+        );
+        assert!(b.task("T1").unwrap().review_free);
+    }
+
+    #[test]
     fn close_is_refused_while_merging() {
         // A11 (audit r5): the table itself refuses it, not only `task close`.
         assert!(next(&row(Merging), &Event::Close, None).is_err());
@@ -1492,6 +1519,34 @@ mod tests {
         };
         let e = next(&reported, &Event::Review, None).unwrap_err();
         assert!(e.contains("review is not possible while it is blocked"), "{e}");
+    }
+
+    #[test]
+    fn a_merge_exit_block_is_not_provisional() {
+        // L10.9 Y1: a turn end while merging blocks the task, but no report or review moves it
+        // on from there: only `task merge` (R19), `task send` or `task close`.
+        for accepted in [false, true] {
+            let merging = Task {
+                done: Some(Done {
+                    commit: Some("c1".into()),
+                    ..Done::default()
+                }),
+                approved_commit: (!accepted).then(|| "c1".into()),
+                accepted,
+                ..row(Merging)
+            };
+            let mut b = Board {
+                tasks: vec![merging],
+                ..Board::default()
+            };
+            b.apply("T1", Event::TurnUnreported).unwrap();
+            assert!(b.task("T1").unwrap().block.as_ref().unwrap().merge);
+            for ev in [report(ReportState::Done), report(ReportState::Failed), Event::Review] {
+                assert!(b.apply("T1", ev.clone()).is_err(), "{ev:?} accepted={accepted}");
+            }
+            assert_eq!(b.task("T1").unwrap().accepted, accepted);
+            b.apply("T1", Event::Merge).unwrap();
+        }
     }
 
     #[test]
