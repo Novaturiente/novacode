@@ -144,12 +144,13 @@ fn user_text(m: &Message) -> Option<String> {
 }
 
 /// The task's goal, as its goal file shows it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Goal {
     None,
     /// Active or being audited: the task keeps itself going.
     Active,
-    Paused,
+    /// With its goal file's note: why it paused.
+    Paused(Option<String>),
     Done,
     Blocked,
     Failed,
@@ -161,6 +162,8 @@ impl Goal {
         #[derive(serde::Deserialize)]
         struct G {
             state: crate::goals::State,
+            #[serde(default)]
+            note: Option<String>,
         }
         let path = home.join("goals").join(format!("{session}.json"));
         use crate::goals::State as S;
@@ -168,7 +171,7 @@ impl Goal {
             None => Goal::None,
             Some(g) => match g.state {
                 S::Active | S::Auditing => Goal::Active,
-                S::Paused => Goal::Paused,
+                S::Paused => Goal::Paused(g.note),
                 S::Done => Goal::Done,
                 S::Blocked => Goal::Blocked,
                 S::Failed => Goal::Failed,
@@ -289,7 +292,7 @@ impl Watcher {
             AgentEvent::AgentEnd { stop, prompts } => {
                 self.running = false;
                 let goal = goal();
-                let ev = self.end(run_of(prompts), stop, goal);
+                let ev = self.end(run_of(prompts), stop, goal.clone());
                 // A goal that ended in this run, judged now its reports are in.
                 let ended = self.goal(goal);
                 return match ev {
@@ -399,19 +402,20 @@ impl Watcher {
         if self.running {
             return None;
         }
-        let before = self.goal.replace(now);
+        let before = self.goal.replace(now.clone());
         if before != Some(Goal::Active) || self.reported_since_super {
             return None;
         }
         let how = match now {
-            Goal::Done => "goal done without a report",
-            Goal::Blocked => "goal blocked",
-            Goal::Failed => "goal can't be met",
-            // It paused itself (or super's stop paused it: the board then refuses this, the task is `stopped`).
-            Goal::Paused => "goal paused (it stalled or used up its runs)",
+            Goal::Done => "goal done without a report".into(),
+            Goal::Blocked => "goal blocked".into(),
+            Goal::Failed => "goal can't be met".into(),
+            // It stalled, used up its runs or the user interrupted it (or super's stop paused it:
+            // the board then refuses this, the task is `stopped`).
+            Goal::Paused(note) => note.map_or("goal paused".into(), |n| format!("goal paused: {n}")),
             Goal::None | Goal::Active => return None,
         };
-        Some(Event::GoalEnded(how.into()))
+        Some(Event::GoalEnded(how))
     }
 
     /// After a reconnect: the turn super's last prompt (hash `last_prompt`) started
@@ -1427,6 +1431,7 @@ fn until(sup: &Super, provider: &str) -> String {
 /// The wake line for a board event on task `t` (after it was applied).
 fn wake_text(t: &board::Task, ev: &Event) -> String {
     let reason = t.block.as_ref().map(|b| b.reason.clone()).unwrap_or_default();
+    let merge = t.block.as_ref().is_some_and(|b| b.merge);
     let mut s = match ev {
         Event::Report { state, summary, .. } => {
             let st = match state {
@@ -1456,11 +1461,7 @@ card is the confirmation); otherwise offer to close it.",
                 t.state.name()
             ),
             MergeResult::PrOpened => format!("{} opened a pull request (now {}).", t.label, t.state.name()),
-            MergeResult::Failed(why) => format!(
-                "{} merge failed (now {}): {why}\nOnce the cause is fixed, call `task merge` again; no work prompt is needed.",
-                t.label,
-                t.state.name()
-            ),
+            MergeResult::Failed(why) => format!("{} merge failed (now {}): {why}", t.label, t.state.name()),
         },
         Event::TurnUnreported if !t.write => format!(
             "{} is blocked (code-made report): {reason}.\nIf its answer is good, `task accept` it; otherwise send it on.",
@@ -1468,6 +1469,13 @@ card is the confirmation); otherwise offer to close it.",
         ),
         Event::TurnUnreported => format!("{} is blocked (code-made report): {reason}.", t.label),
         Event::TurnError(_) => format!("{} is blocked (code-made report): its turn ended on: {reason}", t.label),
+        // A merge block is never resent (A3).
+        Event::TurnLimit(l) if merge => format!(
+            "{} is blocked (code-made report): {} of provider {}.",
+            t.label,
+            l.kind.label(),
+            l.provider
+        ),
         Event::TurnLimit(l) => format!(
             "{} is blocked (code-made report): {} of provider {}; code resends when it clears.",
             t.label,
@@ -1520,6 +1528,10 @@ starts a new review.",
         }
         _ => format!("{} is {}.", t.label, t.state.name()),
     };
+    // A failed merge or a merge exit: `task merge` retries it (R19).
+    if merge && t.state == State::Blocked {
+        s += "\nOnce the cause is fixed, call `task merge` again; no work prompt is needed.";
+    }
     if let Some(q) = &t.question {
         s += &format!("\nIt asks: {q}");
     }
@@ -1628,6 +1640,8 @@ async fn run_link(
         // Cards the catch-up re-sent: super's copies of any others were answered meanwhile.
         let mut open = HashSet::new();
         let mut busy = false;
+        // The grounded count when the current run started (unknown for a run going at connect).
+        let mut run_grounds = None;
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             let l = tokio::select! {
@@ -1687,7 +1701,10 @@ async fn run_link(
                 ServerMsg::Event { event } => {
                     if let AgentEvent::AgentStart = event {
                         busy = true;
+                        run_grounds = Some(sup.grounds(&session));
                     }
+                    // A run super stopped: what it consumed was taken out of flight then (Y3).
+                    let stale = run_grounds.is_some_and(|g| g != sup.grounds(&session));
                     let home = sup.home().to_path_buf();
                     let ev = watcher.event(&event, || Goal::read(&home, &session));
                     if let Some(ev) = ev
@@ -1697,7 +1714,9 @@ async fn run_link(
                     }
                     links.replied(&sup, &id, &mut watcher);
                     // Held prompts of the other kind go once this run took all of super's (R24).
-                    if let AgentEvent::AgentEnd { prompts, .. } = &event {
+                    if let AgentEvent::AgentEnd { prompts, .. } = &event
+                        && !stale
+                    {
                         let ours = prompts
                             .iter()
                             .filter(|p| matches!(p.as_deref(), Some(SUPER_ID | SUPER_QUESTION_ID)))
@@ -1705,7 +1724,9 @@ async fn run_link(
                         sup.ran(&session, ours).await;
                     }
                     // Nothing queued: what no run took is no longer in flight (R27).
-                    if let AgentEvent::Settled = &event {
+                    if let AgentEvent::Settled = &event
+                        && !stale
+                    {
                         sup.settled(&session).await;
                     }
                 }
@@ -1825,9 +1846,9 @@ mod tests {
     /// Feed `events` as one run; the result of its end.
     fn run(w: &mut Watcher, events: &[AgentEvent], goal: Goal) -> Option<Event> {
         let mut out = None;
-        w.event(&AgentEvent::AgentStart, || goal);
+        w.event(&AgentEvent::AgentStart, || goal.clone());
         for e in events {
-            out = w.event(e, || goal);
+            out = w.event(e, || goal.clone());
         }
         out
     }
@@ -2109,8 +2130,8 @@ mod tests {
         // idle; a pause by super's stop is refused by the board (the task is `stopped`).
         w.goal(Goal::Active);
         assert_eq!(
-            w.goal(Goal::Paused),
-            Some(Event::GoalEnded("goal paused (it stalled or used up its runs)".into()))
+            w.goal(Goal::Paused(Some("reached goal.maxRuns (3)".into()))),
+            Some(Event::GoalEnded("goal paused: reached goal.maxRuns (3)".into()))
         );
         w.goal(Goal::Active);
         assert_eq!(w.goal(Goal::Blocked), Some(Event::GoalEnded("goal blocked".into())));
@@ -2118,6 +2139,58 @@ mod tests {
         w.goal(Goal::Active);
         run(&mut w, &[report("done"), end(&[], StopReason::Stop)], Goal::Active);
         assert_eq!(w.goal(Goal::Failed), None);
+    }
+
+    #[test]
+    fn a_merge_exit_block_s_wake_says_to_merge_again() {
+        // L10.9 Y7: a turn end while merging is retried by `task merge` (R19), like a failed merge.
+        let mut b = board::Board {
+            tasks: vec![Task {
+                id: "T1".into(),
+                label: "T1-x".into(),
+                write: true,
+                state: State::Merging,
+                ..Task::default()
+            }],
+            ..board::Board::default()
+        };
+        for ev in [
+            Event::TurnUnreported,
+            Event::TurnError("overloaded".into()),
+            Event::GoalEnded("goal blocked".into()),
+            Event::TurnLimit(Limit {
+                kind: board::LimitKind::Quota,
+                provider: "faux".into(),
+                reset_at: None,
+            }),
+            Event::MergeReport(MergeResult::Failed("dirty".into())),
+        ] {
+            b.tasks[0].state = State::Merging;
+            b.apply("T1", ev.clone()).unwrap();
+            let s = wake_text(b.task("T1").unwrap(), &ev);
+            assert_eq!(s.matches("call `task merge` again").count(), 1, "{s}");
+            assert!(!s.contains("code resends"), "a merge block is never resent: {s}");
+        }
+        // Not for a block outside a merge.
+        b.tasks[0].state = State::Running;
+        b.apply("T1", Event::TurnUnreported).unwrap();
+        let s = wake_text(b.task("T1").unwrap(), &Event::TurnUnreported);
+        assert!(!s.contains("task merge"), "{s}");
+    }
+
+    #[test]
+    fn a_paused_goal_is_blocked_with_its_own_pause_reason() {
+        // L10.9 Y4: the user aborted the goal's run in the task's window.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("goals")).unwrap();
+        let file = home.path().join("goals/s1.json");
+        std::fs::write(&file, r#"{"state": "paused", "note": "you interrupted it"}"#).unwrap();
+        let mut w = Watcher::new("faux");
+        w.goal(Goal::Active);
+        assert_eq!(
+            w.goal(Goal::read(home.path(), "s1")),
+            Some(Event::GoalEnded("goal paused: you interrupted it".into()))
+        );
     }
 
     #[test]
@@ -2983,6 +3056,12 @@ mod tests {
         t.write = true;
         assert!(!wake_text(&t, &Event::TurnUnreported).contains("`task accept`"));
         let failed = Event::MergeReport(MergeResult::Failed("dirty".into()));
+        t.block = Some(board::Block {
+            reason: "dirty".into(),
+            limit: None,
+            code_made: false,
+            merge: true,
+        });
         assert!(wake_text(&t, &failed).contains("call `task merge` again"));
     }
 
@@ -3294,6 +3373,7 @@ mod tests {
                         question: false,
                         text: "work".into(),
                     }],
+                    unconfirmed: 0,
                 }),
                 ..Task::default()
             };
@@ -3340,6 +3420,29 @@ mod tests {
             fx.sup.deliver("T1-x", "more".into()).await.unwrap(),
             "work waits for the question"
         );
+    }
+
+    #[tokio::test]
+    async fn the_end_of_a_run_super_stopped_does_not_take_the_next_prompt_out_of_flight() {
+        // L10.9 Y3: the stopped run's end arrives after super already sent new work.
+        let fx = fixture(5);
+        let s = fx.task("T1-x", "faux/a", State::Running);
+        let mut t = fx.end(&s).await;
+        t.catch_up(true, vec![], vec![]).await;
+        t.event(AgentEvent::AgentStart).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        fx.sup.run(json!({"action": "stop", "task": "T1-x"})).await.unwrap();
+        fx.sup
+            .run(json!({"action": "send", "task": "T1-x", "message": "work"}))
+            .await
+            .unwrap();
+        t.event(end(SUPER, StopReason::Aborted)).await;
+        t.event(AgentEvent::Settled).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let ask = json!({"action": "send", "task": "T1-x", "message": "which?", "question": true});
+        let out = fx.sup.run(ask).await.unwrap();
+        assert!(out.contains("held"), "the work's run has not run yet: {out}");
+        assert_eq!(questions_sent(&fx), 0);
     }
 
     #[tokio::test]

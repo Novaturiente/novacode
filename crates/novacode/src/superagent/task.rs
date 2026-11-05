@@ -71,6 +71,9 @@ pub struct Super {
     pub(super) launcher: Arc<dyn Launcher>,
     /// The task links (ST13); set once after construction.
     pub links: std::sync::OnceLock<Arc<super::link::Links>>,
+    /// Session → how often [`grounded`](Self::grounded) ran: a run that started before the
+    /// last time ends with prompts already out of flight (Y3).
+    grounds: Mutex<std::collections::HashMap<String, u64>>,
 }
 
 /// What a tool result adds when its prompt was held.
@@ -297,6 +300,7 @@ impl Super {
             asker,
             launcher,
             links: std::sync::OnceLock::new(),
+            grounds: Mutex::default(),
         })
     }
 
@@ -790,7 +794,12 @@ impl Super {
     /// A goal task whose goal is paused (a stop paused it) continues it: the message means continue.
     async fn resume_goal(&self, id: &str, session: &str) -> Result<(), String> {
         let goal = self.row(id)?.goal;
-        if goal && super::link::Goal::read(&self.cfg.home, session) == super::link::Goal::Paused {
+        if goal
+            && matches!(
+                super::link::Goal::read(&self.cfg.home, session),
+                super::link::Goal::Paused(_)
+            )
+        {
             let resume = ClientCmd::Prompt {
                 text: "/goal resume".into(),
                 raw: false,
@@ -879,6 +888,7 @@ impl Super {
             }
             f.question = question;
             f.sent.push(hash);
+            f.unconfirmed += 1;
             false
         });
         if held == Some(true) {
@@ -924,6 +934,7 @@ impl Super {
             .await
         {
             self.flight(session, |f| {
+                f.unconfirmed = f.unconfirmed.saturating_sub(1);
                 if let Some(i) = f.sent.iter().rposition(|h| *h == hash) {
                     f.sent.remove(i);
                     if i < f.ended {
@@ -933,6 +944,7 @@ impl Super {
             });
             return Err(e);
         }
+        self.flight(session, |f| f.unconfirmed = f.unconfirmed.saturating_sub(1));
         self.edit(|b| {
             if let Some(row) = b.tasks.iter_mut().find(|r| r.session.as_deref() == Some(session)) {
                 row.last_prompt = Some(hash);
@@ -945,7 +957,8 @@ impl Super {
     pub(super) async fn ran(&self, session: &str, consumed: usize) {
         self.flight(session, |f| {
             f.sent.drain(..consumed.min(f.sent.len()));
-            f.ended = f.sent.len();
+            // One the task has not confirmed may reach it only after this run settles.
+            f.ended = f.sent.len().saturating_sub(f.unconfirmed);
         });
         self.release(session).await;
     }
@@ -969,6 +982,7 @@ impl Super {
                 let next: Vec<String> = f.held.drain(..n).map(|h| h.text).collect();
                 f.question = question;
                 f.sent = next.iter().map(|t| super::board::prompt_hash(t)).collect();
+                f.unconfirmed += next.len();
                 f.ended = 0;
                 Some((question, next))
             });
@@ -1009,9 +1023,16 @@ impl Super {
         self.ran(session, consumed.unwrap_or(0)).await;
     }
 
+    /// How often `session` was [`grounded`](Self::grounded): a run that started at another
+    /// count ends having consumed only prompts no longer in flight.
+    pub(super) fn grounds(&self, session: &str) -> u64 {
+        self.grounds.lock().unwrap().get(session).copied().unwrap_or(0)
+    }
+
     /// The session's run was stopped or its process is gone: nothing is in flight and
     /// nothing held is sent. Returns the held ones dropped.
     pub(super) fn grounded(&self, session: &str) -> Vec<Held> {
+        *self.grounds.lock().unwrap().entry(session.to_string()).or_default() += 1;
         self.flight(session, |f| {
             f.sent.clear();
             std::mem::take(&mut f.held)
@@ -1070,23 +1091,31 @@ impl Super {
                 return Ok(format!("The user declined: {} stays blocked.", t.label));
             }
         }
-        let n = self.edit(|b| b.apply(&t.id, Event::Accept))??;
+        let (n, reviewer) = self.edit(|b| {
+            let r = reviewer(b, &t.id);
+            b.apply(&t.id, Event::Accept).map(|n| (n, r))
+        })??;
         if n.effects.contains(&super::board::Effect::StopReview) {
-            self.stop_review(t.reviewer.clone()).await;
+            self.stop_review(reviewer).await;
         }
         Ok(format!("{} is ready.", t.label))
     }
 
     async fn send(&self, t: &Task, message: &str) -> Result<String, String> {
-        let follow_up = |b: &mut Board| {
+        // New work: an earlier approval did not judge it, so even a `done` on the approved
+        // commit is reviewed again (Y2). A resend after a failed merge is no new work (R11).
+        let follow_up = |b: &mut Board, merge_retry: bool| {
             if let Some(row) = b.tasks.iter_mut().find(|r| r.id == t.id) {
                 row.follow_ups.push(message.to_string());
+                if !merge_retry {
+                    row.approved_commit = None;
+                }
             }
         };
         if t.state == State::Queued {
             self.edit(|b| {
                 b.apply(&t.id, Event::Send)?;
-                follow_up(b);
+                follow_up(b, false);
                 if let Some(row) = b.tasks.iter_mut().find(|r| r.id == t.id) {
                     row.pending.push(message.to_string());
                 }
@@ -1096,8 +1125,11 @@ impl Super {
         }
         let (n, reviewer) = self.edit(|b| {
             let r = reviewer(b, &t.id);
+            let merge_retry = b
+                .task(&t.id)
+                .is_some_and(|row| row.state == State::Merging || row.block.as_ref().is_some_and(|x| x.merge));
             let n = b.apply(&t.id, Event::Send)?;
-            follow_up(b);
+            follow_up(b, merge_retry);
             Ok::<_, String>((n, r))
         })??;
         if n.effects.contains(&super::board::Effect::StopReview) {
@@ -1744,6 +1776,8 @@ mod tests {
         fail_start: Mutex<bool>,
         /// The next this many sends fail.
         fail_sends: Mutex<usize>,
+        /// Set: each send waits for a notification before it goes.
+        gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     }
 
     impl Launcher for FakeLauncher {
@@ -1762,6 +1796,10 @@ mod tests {
         }
         fn send_as<'a>(&'a self, session: &'a str, id: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>> {
             Box::pin(async move {
+                let gate = self.gate.lock().unwrap().clone();
+                if let Some(g) = gate {
+                    g.notified().await;
+                }
                 let mut fail = self.fail_sends.lock().unwrap();
                 if *fail > 0 {
                     *fail -= 1;
@@ -2339,6 +2377,31 @@ mod tests {
         run(&fx, json!({"action": "stop", "task": "T1-t"})).await.unwrap();
         fx.sup.ran("s1", 1).await;
         assert_eq!(sent().len(), 3, "{:?}", sent());
+    }
+
+    #[tokio::test]
+    async fn a_prompt_still_being_sent_when_a_run_ends_is_not_dropped_when_the_task_settles() {
+        // L10.9 Y3: the prompt reaches the task after that run settled, and starts a run of its own.
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "t", false)).await.unwrap();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *fx.launcher.gate.lock().unwrap() = Some(gate.clone());
+        let sup = fx.sup.clone();
+        let work = tokio::spawn(async move { sup.prompt("s1", "work".into()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The brief's run ends and settles while "work" is on its way.
+        fx.sup.ran("s1", 1).await;
+        fx.sup.settled("s1").await;
+        *fx.launcher.gate.lock().unwrap() = None;
+        gate.notify_one();
+        assert!(!work.await.unwrap().unwrap());
+        let held = fx
+            .sup
+            .prompt_as("s1", super::super::link::SUPER_QUESTION_ID, "which?".into())
+            .await
+            .unwrap();
+        assert!(held, "the question waits for the run on the work");
     }
 
     #[tokio::test]
@@ -3028,6 +3091,43 @@ mod tests {
         run(&fx, json!({"action": "close", "task": "T1-q"})).await.unwrap();
         assert_eq!(state(&fx, "T1-q"), State::Archived);
         assert_eq!(state(&fx, "T2-review-q"), State::Archived, "the review is stopped");
+    }
+
+    /// L10.9 Y6: accept stops the review that runs when it applies, not the one its caller saw.
+    #[tokio::test]
+    async fn accept_stops_the_review_running_when_it_applies() {
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "q", false)).await.unwrap();
+        let review = |id: &str, s: &str| Task {
+            id: id.into(),
+            label: id.into(),
+            kind: Kind::Review,
+            reviewer_of: Some("T1-q".into()),
+            state: State::Running,
+            session: Some(s.into()),
+            ..Task::default()
+        };
+        fx.sup
+            .edit(|b| {
+                b.tasks.push(review("T2-review-q", "s-rv2"));
+                b.tasks[0].state = State::Reviewing;
+                b.tasks[0].reviewer = Some("T2-review-q".into());
+            })
+            .unwrap();
+        let seen = fx.sup.row("T1-q").unwrap();
+        // Meanwhile the review crashed and its retry runs.
+        fx.launcher.alive.lock().unwrap().insert("s-rv3".into());
+        fx.sup
+            .edit(|b| {
+                b.tasks[1].state = State::Archived;
+                b.tasks.push(review("T3-review-q", "s-rv3"));
+                b.tasks[0].reviewer = Some("T3-review-q".into());
+            })
+            .unwrap();
+        fx.sup.accept(&seen).await.unwrap();
+        assert_eq!(state(&fx, "T1-q"), State::Ready);
+        assert_eq!(state(&fx, "T3-review-q"), State::Archived, "the review is stopped");
     }
 
     /// B6: a row added while the trust card is open doesn't share the new task's number.
