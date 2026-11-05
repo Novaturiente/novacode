@@ -262,7 +262,7 @@ recorded, never the task's own summary.\n\nThe user's request:\n{}\n",
         t.request.trim()
     );
     if !t.follow_ups.is_empty() {
-        s += "\nFollow-up requests the user added later (part of the request):\n";
+        s += "\nFollow-ups super sent (on the user's behalf) later (part of the request):\n";
         for f in &t.follow_ups {
             s += &format!("- {}\n", f.trim());
         }
@@ -1098,7 +1098,10 @@ mod tests {
         let follow = brief
             .find("also add a README line")
             .unwrap_or_else(|| panic!("{brief}"));
-        assert!(request < follow && brief.contains("Follow-up requests"), "{brief}");
+        assert!(
+            request < follow && brief.contains("Follow-ups super sent (on the user's behalf)"),
+            "{brief}"
+        );
         // The findings code forwards are not follow-ups.
         fx.report(&rv.id, json!({"verdict": "rejected", "findings": ["F1 tabs"]}));
         fx.until("running", |fx| fx.row("T1-fix").state == State::Running).await;
