@@ -534,8 +534,10 @@ impl Super {
         if live.is_none() {
             // What its process started may outlive it (codegraph's daemon) and keep writing there.
             novacode_tools::process::stop_inside(&dir);
+            remove_scratch(rv.repo.as_deref(), &dir);
         }
-        remove_scratch(rv.repo.as_deref(), &dir);
+        // A live one's scratch goes once it has shut down and what it started is stopped: a
+        // daemon in a removed folder can't be found (a crash meanwhile: `sweep_scratch` at start).
         if let Err(e) = self.edit(|b| b.apply(review, Event::Retire)) {
             tracing::warn!(review, %e, "super: review row");
         }
@@ -955,7 +957,8 @@ mod tests {
         fx.until("ready", |fx| fx.row("T1-fix").state == State::Ready).await;
         assert_eq!(fx.row(&rv.id).state, State::Archived, "archived by code");
         assert_eq!(fx.row("T1-fix").reviewer, None);
-        assert!(!scratch.exists(), "scratch removed");
+        // Once the live review has shut down.
+        fx.until("scratch removed", |_| !scratch.exists()).await;
         assert!(!worktrees(&fx.app).contains(&scratch_id(&rv)), "{}", worktrees(&fx.app));
         // Clean as `report` and `close` see it (its own `worktree.copy` files don't count).
         assert_eq!(
@@ -1350,6 +1353,41 @@ mod tests {
         assert!(!worktrees(&fx.app).contains(&scratch_id(&rv)), "{}", worktrees(&fx.app));
     }
 
+    /// L-leak: retiring a live review removed its scratch before stopping what runs there,
+    /// so a daemon it started (codegraph's) was never found again and ran on.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn retiring_a_live_review_stops_its_daemon() {
+        let fx = fixture("faux/review");
+        let wt = fx.spawn("fix", "quick", "change").await;
+        let c = fx.commit(&wt, "src/a.rs");
+        fx.done("T1-fix", &c, &["src/a.rs"]);
+        let rv = fx.review_of("T1-fix").await;
+        let s = scratch(&fx.sup.dir, &rv);
+        // Detached like a daemon: no controlling terminal.
+        let mut daemon = std::process::Command::new("setsid")
+            .args(["sleep", "300"])
+            .current_dir(s.join("work"))
+            .spawn()
+            .unwrap();
+        assert!(fx.launcher.alive(rv.session.as_deref().unwrap()));
+        fx.sup.retire_review(&rv.id);
+        fx.until("scratch removed", |_| !s.exists()).await;
+        let mut ended = None;
+        for _ in 0..100 {
+            ended = daemon.try_wait().unwrap();
+            if ended.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if ended.is_none() {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
+        assert!(ended.is_some(), "the daemon in the scratch folder was stopped");
+    }
+
     #[tokio::test]
     async fn a_resent_done_on_the_approved_commit_is_ready_without_a_new_review() {
         let fx = fixture("faux/review");
@@ -1400,7 +1438,8 @@ mod tests {
         fx.links.kick();
         fx.until("running", |fx| fx.row("T1-fix").state == State::Running).await;
         assert_eq!(fx.row(&rv.id).state, State::Archived);
-        assert!(!scratch(&fx.sup.dir, &rv).exists());
+        fx.until("scratch removed", |fx| !scratch(&fx.sup.dir, &rv).exists())
+            .await;
         assert_eq!(fx.row("T1-fix").review_rounds, 0);
         assert!(fx.said().iter().any(|l| l.contains("branch moved during its review")));
     }
