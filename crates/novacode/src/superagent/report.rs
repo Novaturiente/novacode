@@ -524,19 +524,22 @@ fn not_met(n: usize, findings: &[String]) -> Option<usize> {
             .split(|c: char| !c.is_alphanumeric())
             .filter(|w| !w.is_empty())
             .collect();
-        let verdict = (0..words.len()).rev().find_map(|k| {
-            let before = |d: usize| k.checked_sub(d).map(|j| words[j]);
-            match words[k] {
-                "unmet" => Some(false),
-                "met" => Some(match before(1) {
-                    Some("not" | "never" | "partially" | "partly") => false,
-                    Some("fully" | "yet" | "entirely" | "completely" | "quite") => before(2) != Some("not"),
-                    _ => true,
-                }),
-                _ => None,
-            }
-        });
-        if verdict == Some(false) && (1..=n).contains(&i) {
+        let verdicts: Vec<bool> = (0..words.len())
+            .filter_map(|k| {
+                let before = |d: usize| k.checked_sub(d).map(|j| words[j]);
+                match words[k] {
+                    "unmet" => Some(false),
+                    "met" => Some(match before(1) {
+                        Some("not" | "never" | "partially" | "partly") => false,
+                        Some("fully" | "yet" | "entirely" | "completely" | "quite") => before(2) != Some("not"),
+                        _ => true,
+                    }),
+                    _ => None,
+                }
+            })
+            .collect();
+        // Any not-met verdict in the clause counts: a wrong refusal costs a resend, a wrong pass the gate.
+        if verdicts.contains(&false) && (1..=n).contains(&i) {
             found.push(i);
         }
     }
@@ -967,7 +970,9 @@ mod tests {
             ("Criterion #4: not met", Some(4)),
             ("criterion 4 NOT MET", Some(4)),
             ("Criterion 4: unmet", Some(4)),
-            ("Criterion 2: not met on base, met on the branch", None),
+            // Any not-met verdict in the clause wins: a wrong refusal costs a resend, a wrong pass costs the gate.
+            ("Criterion 2: not met on base, met on the branch", Some(2)),
+            ("Criterion 4: not met, although the docs are met", Some(4)),
             ("subcriterion 4 not met", None),
             ("Criterion 4: met", None),
             ("Criterion 1: met, not flaky", None),

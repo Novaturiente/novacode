@@ -66,6 +66,8 @@ pub(super) fn sweep_scratch(dir: &Path, board: &board::Board) {
             .iter()
             .find(|t| t.kind == Kind::Review && scratch_id(t) == name)
             .and_then(|t| t.repo.clone());
+        // A crash left it: stop its daemons (codegraph) before removing it, like retire does.
+        novacode_tools::process::stop_inside(&path);
         remove_scratch(repo.as_deref(), &path);
     }
 }
