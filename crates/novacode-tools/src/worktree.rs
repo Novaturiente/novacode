@@ -99,9 +99,13 @@ pub const COPY_DEFAULT: &[&str] = &[
     ".novacode/",
 ];
 
+/// Copied folders that are tool state: a daemon writes there (codegraph's index), so whatever is
+/// untracked in them is not work. In any other copied folder only the unchanged copies are.
+const TOOL_STATE: &[&str] = &[".codegraph/"];
+
 /// Where the copied paths are recorded: in git's admin folder, so the record never shows as untracked.
-/// One line per `worktree.copy` entry copied: `<dir>/` for a folder, `<blob id> <file>` for a file
-/// (older records: a bare path per copied file).
+/// `<dir>/` per `worktree.copy` folder copied, `<blob id> <file>` per file copied (a file entry, or a
+/// file in a folder that is not tool state; older records: a bare path per copied file).
 const COPIES: &str = "novacode-copies";
 
 /// The untracked paths (relative, `/`-separated) in the worktree `cwd` is in that are
@@ -110,8 +114,8 @@ pub fn copies(cwd: &Path) -> Vec<String> {
     repo(cwd).map(|r| status(&r).copies).unwrap_or_default()
 }
 
-/// A recorded copy: a folder (tool state: anything untracked in it is not work), or a file
-/// with the blob id it was copied with (edited or tracked since = work).
+/// A recorded copy: a folder (when in `TOOL_STATE`, anything untracked in it is not work), or a
+/// file with the blob id it was copied with (edited or tracked since = work).
 enum Copied {
     Dir(String),
     File(String, Option<String>),
@@ -141,11 +145,37 @@ struct Status {
 fn status(r: &Repo) -> Status {
     let rec = read_copies(r);
     let env = env_copies(r);
+    // `-uall` lists files one by one, so a folder holding copies and new work isn't one line.
+    // `-z`: paths unquoted (spaces, non-ASCII); a rename or copy record is followed by its source.
+    let out = git(
+        &r.top,
+        &["status", "--porcelain", "-z", "-uall", "--ignore-submodules=all"],
+    )
+    .unwrap_or_default();
+    let mut lines = Vec::new();
+    let mut recs = out.split('\0').filter(|s| !s.is_empty());
+    while let Some(l) = recs.next() {
+        if l.get(..2).is_some_and(|xy| xy.contains(['R', 'C'])) {
+            recs.next();
+        }
+        lines.push(l);
+    }
+    let untracked: std::collections::HashSet<&str> = lines.iter().filter_map(|l| l.strip_prefix("?? ")).collect();
+    // A file copied with a folder matters only when git lists it (ignored ones never block removal),
+    // so a large copied folder isn't hashed on every status.
+    let in_folder = |f: &str| {
+        rec.iter()
+            .any(|c| matches!(c, Copied::Dir(d) if f.starts_with(&format!("{d}/"))))
+    };
     // File copies whose contents changed since they were copied.
     let hashed: Vec<(&str, &str)> = rec
         .iter()
         .filter_map(|c| match c {
-            Copied::File(f, Some(id)) if r.top.join(f).is_file() => Some((f.as_str(), id.as_str())),
+            Copied::File(f, Some(id))
+                if r.top.join(f).is_file() && (untracked.contains(f.as_str()) || !in_folder(f)) =>
+            {
+                Some((f.as_str(), id.as_str()))
+            }
             _ => None,
         })
         .collect();
@@ -164,16 +194,15 @@ fn status(r: &Repo) -> Status {
     let is_copy = |p: &str| {
         env.iter().any(|e| e == p)
             || rec.iter().any(|c| match c {
-                Copied::Dir(d) => p.starts_with(&format!("{d}/")),
+                Copied::Dir(d) => {
+                    let d = format!("{d}/");
+                    TOOL_STATE.contains(&d.as_str()) && p.starts_with(&d)
+                }
                 Copied::File(f, _) => f == p && !edited.contains(&p),
             })
     };
     let (mut copies, mut work) = (Vec::new(), Vec::new());
-    // `-uall` lists files one by one, so a folder holding copies and new work isn't one line.
-    for l in git(&r.top, &["status", "--porcelain", "-uall", "--ignore-submodules=all"])
-        .unwrap_or_default()
-        .lines()
-    {
+    for l in lines {
         match l.strip_prefix("?? ") {
             Some(p) if is_copy(p) => copies.push(p.to_string()),
             _ => work.push(l.get(3..).unwrap_or(l).to_string()),
@@ -181,11 +210,11 @@ fn status(r: &Repo) -> Status {
     }
     // An edited copy git ignores is still work, unless it is tracked (committed) now.
     if !edited.is_empty() {
-        let mut args = vec!["ls-files", "--"];
+        let mut args = vec!["ls-files", "-z", "--"];
         args.extend(edited.iter().copied());
         let tracked = git(&r.top, &args).unwrap_or_default();
         for f in edited {
-            if !work.iter().any(|w| w == f) && !tracked.lines().any(|t| t == f) {
+            if !work.iter().any(|w| w == f) && !tracked.split('\0').any(|t| t == f) {
                 work.push(f.to_string());
             }
         }
@@ -387,15 +416,28 @@ fn enter(cwd: &Path, a: &EnterArgs, copy: &[String]) -> Result<(PathBuf, String)
     let files = copy_untracked(&r.top, &path, copy);
     if !files.is_empty() {
         let mut record = String::new();
+        // The files whose blob ids are recorded: file entries, and folders that are not tool state.
+        let mut hash: Vec<&str> = Vec::new();
         for e in copy {
             let e = e.trim_end_matches('/').replace('\\', "/");
+            let dir = format!("{e}/");
             if files.contains(&e) {
-                let id = git(&path, &["hash-object", "--", &e])?;
-                record += &format!("{id} {e}\n");
+                hash.extend(files.iter().filter(|f| **f == e).map(String::as_str));
                 copied.push(e);
-            } else if files.iter().any(|f| f.starts_with(&format!("{e}/"))) {
-                record += &format!("{e}/\n");
-                copied.push(format!("{e}/"));
+            } else if files.iter().any(|f| f.starts_with(&dir)) {
+                record += &format!("{dir}\n");
+                if !TOOL_STATE.contains(&dir.as_str()) {
+                    hash.extend(files.iter().filter(|f| f.starts_with(&dir)).map(String::as_str));
+                }
+                copied.push(dir);
+            }
+        }
+        if !hash.is_empty() {
+            let mut args = vec!["hash-object", "--"];
+            args.extend(hash.iter().copied());
+            let ids = git(&path, &args)?;
+            for (id, f) in ids.lines().zip(&hash) {
+                record += &format!("{id} {f}\n");
             }
         }
         let admin = git(&path, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
@@ -811,11 +853,16 @@ mod tests {
         let mut got = copies(&wt);
         got.sort();
         assert_eq!(got, [".claude/local.md", "AGENTS.md"]);
-        // Only copies: clean, even after a file in a copied folder changed (tool state).
+        // Only copies: clean, even after a file in the tool state folder changed.
         assert_eq!(here(&wt).unwrap().dirty, 0);
+        std::fs::write(wt.join(".codegraph/codegraph.db"), "new index").unwrap();
+        assert_eq!(here(&wt).unwrap().dirty, 0);
+        // M1: in another copied folder an edited or new file is work.
         std::fs::write(wt.join(".claude/local.md"), "edited\n").unwrap();
         std::fs::write(wt.join(".claude/new.md"), "new\n").unwrap();
-        assert_eq!(here(&wt).unwrap().dirty, 0);
+        assert_eq!(here(&wt).unwrap().dirty, 2);
+        std::fs::write(wt.join(".claude/local.md"), "mine\n").unwrap();
+        std::fs::remove_file(wt.join(".claude/new.md")).unwrap();
         // Real work still counts.
         std::fs::write(wt.join("new.md"), "new\n").unwrap();
         assert_eq!(here(&wt).unwrap().dirty, 1);
@@ -924,6 +971,44 @@ mod tests {
         });
         assert!(out.contains("Worktree and branch worktree-t removed"), "{out}");
         assert!(!wt.exists());
+    }
+
+    /// M4: `git status` quotes a path with a space or non-ASCII, which never matched a copy.
+    #[test]
+    fn a_copy_whose_name_git_quotes_is_still_a_copy() {
+        let (_d, root, _) = copied_worktree();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(root.join(".claude/a b.md"), "x").unwrap();
+        std::fs::write(root.join(".claude/ü.md"), "y").unwrap();
+        let list: Vec<String> = COPY_DEFAULT.iter().map(|s| s.to_string()).collect();
+        let (wt, _) = create(&root, "q", &list).unwrap();
+        assert_eq!(status(&here(&wt).unwrap().r).work, Vec::<String>::new());
+        // A renamed tracked file: one record with two paths, one piece of work.
+        git(&wt, &["mv", "README", "READ ME"]).unwrap();
+        assert_eq!(status(&here(&wt).unwrap().r).work, vec!["READ ME".to_string()]);
+        git(&wt, &["mv", "READ ME", "README"]).unwrap();
+        let out = remove(&here(&wt).unwrap());
+        assert!(out.contains("Worktree and branch worktree-q removed"), "{out}");
+    }
+
+    /// M1: only `.codegraph/` is tool state; a new or edited file in another copied folder is work.
+    #[test]
+    fn a_new_file_in_a_copied_settings_folder_is_work() {
+        let (_d, root, _) = copied_worktree();
+        std::fs::create_dir_all(root.join(".novacode")).unwrap();
+        std::fs::write(root.join(".novacode/settings.json"), "{}").unwrap();
+        let list: Vec<String> = COPY_DEFAULT.iter().map(|s| s.to_string()).collect();
+        let (wt, _) = create(&root, "s", &list).unwrap();
+        assert_eq!(here(&wt).unwrap().dirty, 0);
+        std::fs::create_dir_all(wt.join(".novacode/skills/x")).unwrap();
+        std::fs::write(wt.join(".novacode/skills/x/SKILL.md"), "skill").unwrap();
+        assert_eq!(here(&wt).unwrap().dirty, 1);
+        let out = remove(&here(&wt).unwrap());
+        assert!(out.contains("NOT removed") && out.contains("SKILL.md"), "{out}");
+        assert!(wt.join(".novacode/skills/x/SKILL.md").exists());
+        std::fs::remove_dir_all(wt.join(".novacode/skills")).unwrap();
+        std::fs::write(wt.join(".novacode/settings.json"), "{\"edited\": 1}").unwrap();
+        assert_eq!(here(&wt).unwrap().dirty, 1, "an edited copy is work");
     }
 
     /// C2: a nested git repo inside a copied folder is not copied (it would show as `?? dir/`).
