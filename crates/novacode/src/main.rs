@@ -9,7 +9,7 @@ use novacode_ai::trace::Trace;
 use novacode_base::redact::Redactor;
 use novacode_base::{logging, new_id, paths::Paths, settings, settings::Settings};
 use novacode_core::agent::{self, Agent, Config};
-use novacode_core::policy::{Approver, Mode, Permissions, Policy, Security};
+use novacode_core::policy::{Approver, EditRule, Mode, Permissions, Policy, Security};
 use novacode_core::resources;
 use novacode_core::session::{self, Store};
 use novacode_core::trust::{self, TrustStore};
@@ -385,8 +385,15 @@ fn permissions(s: &Settings) -> Permissions {
 
 /// The sandbox of a session in `cwd` (L6.5): its project folders, the settings'
 /// extra places and the user's protected paths. At the lenient level without a
-/// `sandbox.mode` it only locks credentials (L6.9).
-fn session_sandbox(s: &Settings, cwd: &Path, novacode_home: &Path, perms: &Permissions) -> Arc<Sandbox> {
+/// `sandbox.mode` it only locks credentials (L6.9). A review task (`edit_rule` `review:`) may
+/// also write its whole scratch folder, where it puts the base checkout (L10.9).
+fn session_sandbox(
+    s: &Settings,
+    cwd: &Path,
+    novacode_home: &Path,
+    perms: &Permissions,
+    edit_rule: Option<&EditRule>,
+) -> Arc<Sandbox> {
     // Host git pin (L6.5): the project's common git dir, resolved before any model command runs.
     novacode_base::git::pin_repo(cwd);
     let (mode, light) = sandbox_mode(s, perms.security);
@@ -398,6 +405,9 @@ fn session_sandbox(s: &Settings, cwd: &Path, novacode_home: &Path, perms: &Permi
         std::env::var_os("CARGO_HOME").as_deref(),
         std::env::var_os("GOPATH").as_deref(),
     ));
+    if let Some(EditRule::Review { dir }) = edit_rule {
+        allow_write.push(dir.to_string_lossy().into_owned());
+    }
     let sb = Arc::new(Sandbox::new(sbx::Config {
         mode,
         light,
@@ -689,7 +699,8 @@ async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
                     }
                 }
                 let perms = permissions(&settings);
-                let sb = session_sandbox(&settings, &cwd, paths.home(), &perms);
+                let rule = EditRule::from_env().ok().flatten();
+                let sb = session_sandbox(&settings, &cwd, paths.home(), &perms, rule.as_ref());
                 return Ok(doctor::doctor(&p, &settings, &sb, perms.security, problems, shadowed).await);
             }
             return Ok(doctor::auth_status(&p));
@@ -1400,7 +1411,8 @@ impl Ctx {
             Security::Lenient => Some("off".to_string()),
             Security::Hardened => perms.judge.clone(),
         };
-        let sandbox = session_sandbox(s, &self.cwd, self.paths.home(), &perms);
+        let edit_rule = EditRule::from_env().map_err(anyhow::Error::msg)?;
+        let sandbox = session_sandbox(s, &self.cwd, self.paths.home(), &perms, edit_rule.as_ref());
         let mut policy = Policy::new(
             perms,
             novacode_base::platform::home().unwrap_or_default(),
@@ -1413,7 +1425,7 @@ impl Ctx {
             policy = policy.with_profile(p).map_err(anyhow::Error::msg)?;
         }
         // A super mode task's fence for the edit tools (L10.9); its subagents inherit the variable.
-        policy = policy.with_edit_rule(novacode_core::policy::EditRule::from_env().map_err(anyhow::Error::msg)?);
+        policy = policy.with_edit_rule(edit_rule);
         // Shared: mode presets change it at run time, and subagents read its mode.
         let policy = Arc::new(policy);
         // A subagent: its role prompt, and only its tools and MCP servers (L10.1).
@@ -3758,6 +3770,61 @@ mod tests {
         );
         assert!(super::relocated_caches(Some(OsStr::new("")), Some(OsStr::new(""))).is_empty());
         assert!(super::relocated_caches(None, None).is_empty());
+    }
+
+    /// M2: a review edits only under its scratch folder, so its sandbox lets it write the whole
+    /// folder, not only the `work` checkout: the brief's base checkout goes next to it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_review_session_s_sandbox_can_write_its_whole_scratch_folder() {
+        use std::path::Path;
+        // Not under /tmp: that is writable anyway.
+        let tmp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (app, scratch) = (root.join("app"), root.join("super/review/T2"));
+        let work = scratch.join("work");
+        std::fs::create_dir_all(&app).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&app, &["init", "-q"]);
+        git(&app, &["commit", "-q", "--allow-empty", "-m", "x"]);
+        std::fs::create_dir_all(&scratch).unwrap();
+        git(
+            &app,
+            &["worktree", "add", "-q", "--detach", &work.to_string_lossy(), "HEAD"],
+        );
+        let file = root.join("settings.json");
+        std::fs::write(&file, r#"{"sandbox": {"mode": "on"}}"#).unwrap();
+        let s = novacode_base::settings::Settings::load(&file, None, false);
+        let rule = super::EditRule::Review { dir: scratch.clone() };
+        let sb = super::session_sandbox(&s, &work, &root.join("home"), &super::permissions(&s), Some(&rule));
+        if !sb.available() {
+            eprintln!("no bubblewrap here: skipped");
+            return;
+        }
+        let cmd = format!("git worktree add -q --detach '{}' HEAD", scratch.join("base").display());
+        let out = super::sbx::command(Some(&sb), &cmd, &work)
+            .unwrap()
+            .output()
+            .await
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(scratch.join("base/.git").exists());
     }
 
     #[test]
