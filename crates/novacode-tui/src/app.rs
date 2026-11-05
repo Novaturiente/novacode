@@ -1034,14 +1034,14 @@ impl App {
             PanelAction::OpenFile(p) => self.send(Cmd::OpenFile(p)),
             PanelAction::OpenProc(id) => self.open_procs(Some(id)),
             PanelAction::Attach { label, session } => {
-                let cmd = format!("novacode attach {session}");
+                let home = std::env::var("NOVACODE_HOME").ok().filter(|h| !h.is_empty());
+                let cmd = attach_cmd(&session, home.as_deref());
                 if std::env::var_os("TMUX").is_none() {
                     self.tr
                         .notice(format!("{label}: run `{cmd}` in another terminal"), false);
                     return;
                 }
                 let exe = std::env::current_exe().map_or("novacode".into(), |p| p.display().to_string());
-                let home = std::env::var("NOVACODE_HOME").ok().filter(|h| !h.is_empty());
                 let out = std::process::Command::new("tmux")
                     .args(tmux_attach_args(&label, &session, &exe, home.as_deref()))
                     .stdin(std::process::Stdio::null())
@@ -2565,6 +2565,14 @@ fn tmux_attach_args(label: &str, session: &str, exe: &str, home: Option<&str>) -
     a
 }
 
+/// The attach command to run by hand, with this window's home when it isn't the default.
+fn attach_cmd(session: &str, home: Option<&str>) -> String {
+    match home {
+        Some(h) => format!("NOVACODE_HOME={h} novacode attach {session}"),
+        None => format!("novacode attach {session}"),
+    }
+}
+
 #[cfg(test)]
 mod screen_tests {
     #[test]
@@ -2581,6 +2589,15 @@ mod screen_tests {
 
     /// R9 (L10.9): a tmux window gets tmux's environment, not ours, so the attach
     /// window is told this window's home; else it finds no live session and closes at once.
+    #[test]
+    fn the_attach_hint_names_the_home() {
+        assert_eq!(super::attach_cmd("01a1", None), "novacode attach 01a1");
+        assert_eq!(
+            super::attach_cmd("01a1", Some("/h/home")),
+            "NOVACODE_HOME=/h/home novacode attach 01a1"
+        );
+    }
+
     #[test]
     fn tmux_attach_passes_the_home_along() {
         let args = super::tmux_attach_args("T1", "01a1", "/bin/nc", Some("/h/home")).join(" ");
