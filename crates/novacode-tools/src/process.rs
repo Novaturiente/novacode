@@ -187,9 +187,9 @@ fn kill_group(pid: u32) {
     kill_group_hard(pid);
 }
 
-/// Stop this user's processes whose working folder is inside `dir`, or that hold a file open
-/// under it with no controlling terminal (a detached daemon a task left in its worktree, e.g.
-/// codegraph's; an editor or `tail -f` on a terminal is the user's): SIGTERM, up to 3 s to
+/// Stop this user's processes with no controlling terminal whose working folder is inside `dir`,
+/// or that hold a file open under it (a detached daemon a task left in its worktree, e.g.
+/// codegraph's; a shell, editor or `tail -f` on a terminal is the user's): SIGTERM, up to 3 s to
 /// exit, then SIGKILL. Never this process or its ancestors. Returns how many it signalled.
 #[cfg(target_os = "linux")]
 pub fn stop_inside(dir: &Path) -> usize {
@@ -211,13 +211,13 @@ pub fn stop_inside(dir: &Path) -> usize {
     // A process that exited (or is a zombie) has no readable cwd or fds.
     let under = |link: PathBuf| std::fs::read_link(link).is_ok_and(|c| c.starts_with(&dir));
     let inside = |pid: u32| {
-        under(format!("/proc/{pid}/cwd").into())
-            || daemon(pid)
-                && std::fs::read_dir(format!("/proc/{pid}/fd"))
+        daemon(pid)
+            && (under(format!("/proc/{pid}/cwd").into())
+                || std::fs::read_dir(format!("/proc/{pid}/fd"))
                     .into_iter()
                     .flatten()
                     .flatten()
-                    .any(|fd| under(fd.path()))
+                    .any(|fd| under(fd.path())))
     };
     let found: Vec<u32> = std::fs::read_dir("/proc")
         .into_iter()
@@ -1099,14 +1099,20 @@ impl crate::Tool for ProcessTool {
 mod tests {
     use super::*;
 
+    /// One `stop_inside` test at a time: a child another one forks holds its open files until it execs.
+    #[cfg(target_os = "linux")]
+    static ONE: Mutex<()> = Mutex::new(());
+
     #[cfg(target_os = "linux")]
     #[test]
     fn stop_inside_ends_a_process_whose_cwd_is_in_the_folder() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
         let inner = d.path().join("wt/.codegraph");
         std::fs::create_dir_all(&inner).unwrap();
-        let mut child = std::process::Command::new("sleep")
-            .arg("300")
+        // Detached like a daemon: no controlling terminal, even when the tests run in one.
+        let mut child = std::process::Command::new("setsid")
+            .args(["sleep", "300"])
             .current_dir(&inner)
             .spawn()
             .unwrap();
@@ -1130,6 +1136,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn stop_inside_ends_a_process_holding_a_file_open_in_the_folder() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
         let inner = d.path().join("wt/.codegraph");
         std::fs::create_dir_all(&inner).unwrap();
@@ -1151,6 +1158,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn stop_inside_spares_a_terminal_program_holding_a_file_open_in_the_folder() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
         let inner = d.path().join("wt");
         std::fs::create_dir_all(&inner).unwrap();
@@ -1183,6 +1191,43 @@ mod tests {
         assert!(held(), "the program has the file open");
         let n = stop_inside(&inner);
         let still = held();
+        let _ = term.kill();
+        let _ = term.wait();
+        assert_eq!((n, still), (0, true));
+    }
+
+    /// M3: a shell or editor on a terminal whose working folder is there is the user's too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_inside_spares_a_terminal_program_whose_cwd_is_in_the_folder() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        let inner = std::fs::canonicalize(d.path()).unwrap().join("wt");
+        std::fs::create_dir_all(&inner).unwrap();
+        // `script` gives the program a terminal of its own; `script` itself runs outside.
+        let cmd = format!("cd '{}' && exec sleep 300", inner.display());
+        let mut term = std::process::Command::new("script")
+            .args(["-qec", &cmd, "/dev/null"])
+            .current_dir(d.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let there = || {
+            std::fs::read_dir("/proc")
+                .unwrap()
+                .flatten()
+                .any(|e| std::fs::read_link(e.path().join("cwd")).is_ok_and(|l| l == inner))
+        };
+        for _ in 0..100 {
+            if there() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(there(), "the program runs there");
+        let n = stop_inside(&inner);
+        let still = there();
         let _ = term.kill();
         let _ = term.wait();
         assert_eq!((n, still), (0, true));
