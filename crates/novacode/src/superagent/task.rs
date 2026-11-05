@@ -1070,23 +1070,31 @@ impl Super {
                 return Ok(format!("The user declined: {} stays blocked.", t.label));
             }
         }
-        let n = self.edit(|b| b.apply(&t.id, Event::Accept))??;
+        let (n, reviewer) = self.edit(|b| {
+            let r = reviewer(b, &t.id);
+            b.apply(&t.id, Event::Accept).map(|n| (n, r))
+        })??;
         if n.effects.contains(&super::board::Effect::StopReview) {
-            self.stop_review(t.reviewer.clone()).await;
+            self.stop_review(reviewer).await;
         }
         Ok(format!("{} is ready.", t.label))
     }
 
     async fn send(&self, t: &Task, message: &str) -> Result<String, String> {
-        let follow_up = |b: &mut Board| {
+        // New work: an earlier approval did not judge it, so even a `done` on the approved
+        // commit is reviewed again (Y2). A resend after a failed merge is no new work (R11).
+        let follow_up = |b: &mut Board, merge_retry: bool| {
             if let Some(row) = b.tasks.iter_mut().find(|r| r.id == t.id) {
                 row.follow_ups.push(message.to_string());
+                if !merge_retry {
+                    row.approved_commit = None;
+                }
             }
         };
         if t.state == State::Queued {
             self.edit(|b| {
                 b.apply(&t.id, Event::Send)?;
-                follow_up(b);
+                follow_up(b, false);
                 if let Some(row) = b.tasks.iter_mut().find(|r| r.id == t.id) {
                     row.pending.push(message.to_string());
                 }
@@ -1096,8 +1104,11 @@ impl Super {
         }
         let (n, reviewer) = self.edit(|b| {
             let r = reviewer(b, &t.id);
+            let merge_retry = b
+                .task(&t.id)
+                .is_some_and(|row| row.state == State::Merging || row.block.as_ref().is_some_and(|x| x.merge));
             let n = b.apply(&t.id, Event::Send)?;
-            follow_up(b);
+            follow_up(b, merge_retry);
             Ok::<_, String>((n, r))
         })??;
         if n.effects.contains(&super::board::Effect::StopReview) {
@@ -3028,6 +3039,43 @@ mod tests {
         run(&fx, json!({"action": "close", "task": "T1-q"})).await.unwrap();
         assert_eq!(state(&fx, "T1-q"), State::Archived);
         assert_eq!(state(&fx, "T2-review-q"), State::Archived, "the review is stopped");
+    }
+
+    /// L10.9 Y6: accept stops the review that runs when it applies, not the one its caller saw.
+    #[tokio::test]
+    async fn accept_stops_the_review_running_when_it_applies() {
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "q", false)).await.unwrap();
+        let review = |id: &str, s: &str| Task {
+            id: id.into(),
+            label: id.into(),
+            kind: Kind::Review,
+            reviewer_of: Some("T1-q".into()),
+            state: State::Running,
+            session: Some(s.into()),
+            ..Task::default()
+        };
+        fx.sup
+            .edit(|b| {
+                b.tasks.push(review("T2-review-q", "s-rv2"));
+                b.tasks[0].state = State::Reviewing;
+                b.tasks[0].reviewer = Some("T2-review-q".into());
+            })
+            .unwrap();
+        let seen = fx.sup.row("T1-q").unwrap();
+        // Meanwhile the review crashed and its retry runs.
+        fx.launcher.alive.lock().unwrap().insert("s-rv3".into());
+        fx.sup
+            .edit(|b| {
+                b.tasks[1].state = State::Archived;
+                b.tasks.push(review("T3-review-q", "s-rv3"));
+                b.tasks[0].reviewer = Some("T3-review-q".into());
+            })
+            .unwrap();
+        fx.sup.accept(&seen).await.unwrap();
+        assert_eq!(state(&fx, "T1-q"), State::Ready);
+        assert_eq!(state(&fx, "T3-review-q"), State::Archived, "the review is stopped");
     }
 
     /// B6: a row added while the trust card is open doesn't share the new task's number.

@@ -1362,6 +1362,13 @@ mod tests {
         assert_eq!(fx.row("T1-fix").approved_commit.as_deref(), Some(c.as_str()));
 
         // A failed merge, the user cleans up, super resends: the same commit again.
+        fx.sup
+            .edit(|b| {
+                b.apply("T1-fix", Event::Merge)?;
+                b.apply("T1-fix", Event::MergeReport(board::MergeResult::Failed("dirty".into())))
+            })
+            .unwrap()
+            .unwrap();
         let send = json!({"action": "send", "task": "T1-fix", "message": "merge again"});
         fx.run(send.clone()).await.unwrap();
         assert_eq!(fx.row("T1-fix").state, State::Running);
@@ -1383,6 +1390,24 @@ mod tests {
         fx.run(send).await.unwrap();
         let c2 = fx.commit(&wt, "src/b.rs");
         fx.done("T1-fix", &c2, &["src/a.rs", "src/b.rs"]);
+        let rv2 = fx.review_of("T1-fix").await;
+        assert_ne!(rv2.id, rv.id);
+        assert_eq!(fx.row("T1-fix").state, State::Reviewing);
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_done_on_the_approved_commit_is_reviewed_again() {
+        // L10.9 Y2: the approval judged the work before the follow-up, not the follow-up.
+        let fx = fixture("faux/review");
+        let wt = fx.spawn("fix", "quick", "change").await;
+        let c = fx.commit(&wt, "src/a.rs");
+        fx.done("T1-fix", &c, &["src/a.rs"]);
+        let rv = fx.review_of("T1-fix").await;
+        fx.report(&rv.id, json!({"verdict": "approved", "findings": []}));
+        fx.until("ready", |fx| fx.row("T1-fix").state == State::Ready).await;
+        let send = json!({"action": "send", "task": "T1-fix", "message": "also check the empty input"});
+        fx.run(send).await.unwrap();
+        fx.done("T1-fix", &c, &["src/a.rs"]);
         let rv2 = fx.review_of("T1-fix").await;
         assert_ne!(rv2.id, rv.id);
         assert_eq!(fx.row("T1-fix").state, State::Reviewing);
