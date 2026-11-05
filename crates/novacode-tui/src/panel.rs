@@ -61,6 +61,9 @@ pub struct TaskRow {
     /// The task's session, once its process started: Enter attaches to it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// A review task, not a work one: `/watch` leaves it out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub review: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1886,6 +1889,7 @@ mod tests {
                 started_ms: ago(7200),
                 summary: Some("parser fixed; tests pass".into()),
                 session: Some("01def".into()),
+                review: false,
             },
             TaskRow {
                 label: "T4-docs".into(),
@@ -1896,6 +1900,7 @@ mod tests {
                 started_ms: ago(3600),
                 summary: None,
                 session: None,
+                review: false,
             },
         ]);
         p.show_tab("tasks");

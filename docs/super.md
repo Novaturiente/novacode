@@ -75,6 +75,8 @@ The super agent keeps a board of all tasks in its folder, `~/.novacode/super/<ro
 
 The **Tasks** tab in the side panel of a super window shows each task's label, repo, state, model, tokens, age and last summary, refreshed every 2 seconds. While a task is running, the panel opens by itself on the Tasks tab, and it becomes the shown tab when the first tasks appear. Press Enter on a row to open that task in a new tmux window (outside tmux, the attach command is printed, with `NOVACODE_HOME=<path>` in front when your `NOVACODE_HOME` is set). The new window gets your `NOVACODE_HOME`, so it finds the task; if tmux fails, a notice shows tmux's error and the attach command.
 
+`/watch` opens every live work task (not review tasks, and not archived, failed or interrupted ones) at once in tiled tmux panes, each attached to its task and titled with its label: up to 6 panes per window, named `watch`, or `watch 1`, `watch 2`, … when there are more. Outside tmux it prints one shell command that opens the same grid in a new tmux session named `novacode-watch`.
+
 | State | Meaning |
 |---|---|
 | `queued` | Waiting for a free slot |

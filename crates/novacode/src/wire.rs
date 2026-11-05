@@ -463,6 +463,7 @@ mod tests {
                             started_ms: 1_793_000_000_000,
                             summary: Some("parser fixed; tests pass".into()),
                             session: Some("01def".into()),
+                            review: false,
                         },
                         novacode_tui::panel::TaskRow {
                             label: "T4-docs".into(),

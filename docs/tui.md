@@ -154,6 +154,7 @@ Type `/` to see the list. A line that is only `/something` unknown to novacode i
 | `/export [html]` | Write this branch to a file. |
 | `/copy` | Copy the last reply (also `Ctrl+X`). |
 | `/btw [question]` | Side chat. See [below](#side-questions-with-btw). |
+| `/watch` | Super window only: open super's live tasks in a tmux grid, 6 panes per window (outside tmux, print the command). See [super](super.md). |
 | `/context` | Where the context window goes. |
 | `/docs [question]` | Add a hidden note telling the model where novacode's own docs (`~/.novacode/docs/`) and your config files are, then ask the question if you gave one. Use it to have the session set up or customise novacode. |
 | `/usage` | Tokens and cost per route, cache warming, memory workers and subscription windows. |

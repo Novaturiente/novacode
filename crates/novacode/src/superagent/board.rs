@@ -893,6 +893,7 @@ impl Board {
                     started_ms: t.started * 1000,
                     summary: t.summary.clone(),
                     session: t.session.clone(),
+                    review: t.kind == Kind::Review,
                 }
             })
             .collect()
