@@ -2,7 +2,8 @@
 //! model: super spawns a write task in a git repo; the task asks a question (relayed to
 //! super's window with its label), edits, commits and reports `done` citing its proof
 //! number; code starts its review task, which approves; super merges after the user's OK
-//! on the merge card, the task merges and reports, and super closes it after the close card.
+//! on the merge card, the task rebases and reports, code fast-forwards main, and super closes
+//! it after the close card.
 //!
 //! Each step that could race another waits for super to go idle: the user's answer to the
 //! relayed card and two gate files the scripted commands wait for are given only after
@@ -282,17 +283,13 @@ fn super_runs_a_write_task_through_review_merge_and_close() {
                 json!({"state": "done", "summary": "note.txt added and committed", "checks": ["#1"]}),
             ),
             say("reported"),
-            // The merge prompt.
+            // The merge prompt: the task rebases in its worktree; code fast-forwards main (R29).
             tool(
                 "bash",
-                json!({"command": format!(
-                    "{} && {GIT} -C {} merge -q --ff-only worktree-{label}",
-                    wait_for(&merge_gate),
-                    app.display()
-                )}),
+                json!({"command": format!("{} && {GIT} rebase -q main && test -f note.txt", wait_for(&merge_gate))}),
             ),
-            tool("report", json!({"merge": "merged", "summary": "fast-forwarded main"})),
-            say("merged"),
+            tool("report", json!({"merge": "rebased", "summary": "rebased on main"})),
+            say("rebased"),
         ],
     );
     script(

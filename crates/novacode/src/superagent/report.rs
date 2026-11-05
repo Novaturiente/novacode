@@ -432,6 +432,7 @@ enum Verdict {
 #[serde(rename_all = "kebab-case")]
 enum Merge {
     Merged,
+    Rebased,
     PrOpened,
     Failed,
 }
@@ -443,7 +444,7 @@ struct Args {
     state: Option<WorkState>,
     /// Review task, instead of `state`: approved | needs-proof | rejected.
     verdict: Option<Verdict>,
-    /// Merging task, instead of `state`: merged | pr-opened | failed.
+    /// Merging task, instead of `state`: rebased | pr-opened | failed (merged: only a PR merge).
     merge: Option<Merge>,
     /// At most 80 words; for `merge`, the one-line reason.
     summary: Option<String>,
@@ -637,11 +638,22 @@ impl ReportTool {
         let merging = row.state == super::board::State::Merging;
         if merging && a.state.is_some_and(|s| s != WorkState::Progress) {
             return Err(
-                "you are merging: report with `merge` (merged | pr-opened | failed) and a one-line `summary`".into(),
+                "you are merging: report with `merge` (rebased | pr-opened | failed) and a one-line `summary`".into(),
             );
         }
         if !merging && a.merge.is_some() {
             return Err("`merge` is only for a merging task; report with `state`".into());
+        }
+        // R29: code fast-forwards the main checkout after a local merge's rebase.
+        if a.merge == Some(Merge::Merged) && !row.pr {
+            return Err(
+                "novacode merges into the main checkout itself: rebase your branch, re-run your checks, \
+commit, and report `merge: rebased`"
+                    .into(),
+            );
+        }
+        if a.merge == Some(Merge::Rebased) && row.pr {
+            return Err("`merge: rebased` is for a local merge; for a pull request report `merge: pr-opened`".into());
         }
         let summary = a.summary.clone().unwrap_or_default();
         if a.verdict.is_none() && summary.trim().is_empty() {
@@ -809,7 +821,7 @@ impl Tool for ReportTool {
         "report"
     }
     fn description(&self) -> &str {
-        "Report to super, the session that started this task. Work task: `state` (progress | done | blocked | failed), `summary` (at most 80 words), `question` (only with blocked), `checks` (a list of the `[proof #N]` numbers of the bash and process calls that prove it, like [\"#7\"], plus files a check produced, such as screenshots or logs, and URLs; `done` on a write task needs one check run after your last edit, and earlier ones are marked as before the last edit). Review task: `verdict` and `findings`. Merging: `merge` and a one-line `summary`."
+        "Report to super, the session that started this task. Work task: `state` (progress | done | blocked | failed), `summary` (at most 80 words), `question` (only with blocked), `checks` (a list of the `[proof #N]` numbers of the bash and process calls that prove it, like [\"#7\"], plus files a check produced, such as screenshots or logs, and URLs; `done` on a write task needs one check run after your last edit, and earlier ones are marked as before the last edit). Review task: `verdict` and `findings`. Merging: `merge` and a one-line `summary` (`rebased` for a local merge: novacode then fast-forwards the main checkout)."
     }
     fn schema(&self) -> Value {
         json!({
@@ -817,7 +829,7 @@ impl Tool for ReportTool {
             "properties": {
                 "state": { "type": "string", "enum": ["progress", "done", "blocked", "failed"], "description": "Work task: how it went." },
                 "verdict": { "type": "string", "enum": ["approved", "needs-proof", "rejected"], "description": "Review task, instead of `state`." },
-                "merge": { "type": "string", "enum": ["merged", "pr-opened", "failed"], "description": "Merging task, instead of `state`." },
+                "merge": { "type": "string", "enum": ["rebased", "merged", "pr-opened", "failed"], "description": "Merging task, instead of `state`." },
                 "summary": { "type": "string", "description": "At most 80 words; for `merge`, the one-line reason." },
                 "question": { "type": "string", "description": "Only with `state: blocked`: what you need answered." },
                 "checks": { "type": "array", "items": { "type": "string" }, "description": "Proof numbers from the `[proof #N]` marks on your bash and process results (e.g. \"#4\"); `done` on a write task needs at least one check that ran after your last edit and has exited, and a check from before it (such as the failing run of red-then-green) is allowed but marked `before the last edit`. Plus files a check produced (screenshots, logs) and URLs; never source files, commands or results: those go in `summary`." },
@@ -1539,10 +1551,33 @@ mod tests {
             },
         );
         std::fs::write(work.work.join("dirty.txt"), "x").unwrap();
-        for m in ["merged", "pr-opened", "failed"] {
-            let r = report(&work.report(json!({"merge": m, "summary": "rebased and merged"})).await);
+        for m in ["rebased", "pr-opened", "failed"] {
+            let r = report(&work.report(json!({"merge": m, "summary": "rebased on main"})).await);
             assert_eq!(r["merge"], m);
         }
+        // R29: a local merge's `merged` is code's result; a PR merge keeps its report path.
+        refused(
+            &work.report(json!({"merge": "merged", "summary": "s"})).await,
+            "report `merge: rebased`",
+        );
+        let pr = Fixture::new(
+            true,
+            Task {
+                state: crate::superagent::board::State::Merging,
+                pr: true,
+                ..write_row()
+            },
+        );
+        for m in ["merged", "pr-opened"] {
+            assert_eq!(
+                report(&pr.report(json!({"merge": m, "summary": "#12"})).await)["merge"],
+                m
+            );
+        }
+        refused(
+            &pr.report(json!({"merge": "rebased", "summary": "s"})).await,
+            "for a local merge",
+        );
         refused(
             &work.report(json!({"merge": "failed", "summary": "a\nb"})).await,
             "one line",

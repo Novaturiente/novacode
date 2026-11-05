@@ -1337,20 +1337,18 @@ impl Super {
         if !self.confirm(format!("{}: merge", t.label), q, "Merge").await? {
             return Ok(format!("The user declined: {} is not merged.", t.label));
         }
-        self.edit(|b| b.apply(&t.id, Event::Merge))??;
+        self.edit(|b| {
+            let n = b.apply(&t.id, Event::Merge)?;
+            if let Some(row) = b.tasks.iter_mut().find(|r| r.id == t.id) {
+                row.pr = pr;
+            }
+            Ok::<_, String>(n)
+        })??;
         // The user's checkout is never switched or merged into while dirty: a local merge
         // needs it clean and on the task's base.
         let refused = match &t.base_branch {
             None => Some(format!("its base is commit {base}, not a branch")),
-            Some(want) if !pr => {
-                let on = git(&main, &["branch", "--show-current"]).unwrap_or_default();
-                if on != *want {
-                    let on = if on.is_empty() { "a detached HEAD" } else { &on };
-                    Some(format!("main checkout is on {on}, not {want}"))
-                } else {
-                    changes(&main).then(|| "main checkout has uncommitted changes".to_string())
-                }
-            }
+            Some(want) if !pr => main_refuses(&main, want),
             Some(_) => None,
         };
         if let Some(why) = refused {
@@ -1366,25 +1364,31 @@ impl Super {
             .and_then(|b| git(&main, &["rev-parse", &format!("refs/heads/{b}")]).ok());
         let recheck = match (tip, &t.base_commit) {
             (Some(tip), Some(old)) if tip != *old => format!(
-                "{base} moved since your work started ({} → {}): after the rebase, re-run your checks and merge only if they pass.",
+                "{base} moved since your work started ({} → {}): after the rebase, re-run your checks and {} only if they pass.",
                 &old[..old.len().min(8)],
-                &tip[..tip.len().min(8)]
+                &tip[..tip.len().min(8)],
+                if pr { "merge" } else { "go on" }
             ),
-            _ => "If the rebase moved your branch, re-run your checks before you merge.".to_string(),
+            _ if pr => "If the rebase moved your branch, re-run your checks before you merge.".to_string(),
+            _ => "Then re-run your checks.".to_string(),
         };
-        let how = match pr {
-            true => format!("push it and open a pull request against {base}, then report `merge: pr-opened`"),
+        let text = match pr {
+            true => format!(
+                "The user approved merging. Rebase {branch} on {base}. {recheck} Then push it and open a pull \
+request against {base}, then report `merge: pr-opened`. If anything fails (a conflict, uncommitted changes to tracked \
+files in the main checkout, a failed check), report `merge: failed` with the reason. Untracked files (build output, \
+caches) are not a reason to stop: git refuses by itself if the merge would overwrite one."
+            ),
+            // R29: a task's shell may be sandboxed to its worktree, so code does the last step.
             false => format!(
-                "merge it into {base} in the main checkout {} (fast-forward), then report `merge: merged`",
+                "The user approved merging. Rebase {branch} onto {base} as it is now in the main checkout {} \
+(the same repo: no fetch is needed), and resolve any conflicts. {recheck} Commit anything the rebase left, then \
+report `merge: rebased`: novacode then fast-forwards {base} in the main checkout to your branch. Don't touch the \
+main checkout yourself. If anything fails (a conflict you can't resolve, a failed check), report `merge: failed` \
+with the reason.",
                 main.display()
             ),
         };
-        let text = format!(
-            "The user approved merging. Rebase {branch} on {base}. {recheck} Then {how}. \
-If anything fails (a conflict, uncommitted changes to tracked files in the main checkout, a failed check), report \
-`merge: failed` with the reason. Untracked files (build output, caches) are not a reason to stop: git refuses by \
-itself if the merge would overwrite one."
-        );
         let held = self.deliver(&t.id, text).await?;
         Ok(format!("{} is merging.{}", t.label, held_note(held)))
     }
@@ -1478,6 +1482,37 @@ fn worktree_of(main: &Path, branch: &str) -> Option<PathBuf> {
         .lines()
         .find_map(|l| l.strip_prefix("worktree "))
         .map(PathBuf::from)
+}
+
+/// Why the main checkout `main` can't take a local merge into `want`: on another branch, or dirty.
+fn main_refuses(main: &Path, want: &str) -> Option<String> {
+    let on = git(main, &["branch", "--show-current"]).unwrap_or_default();
+    if on != want {
+        let on = if on.is_empty() { "a detached HEAD" } else { &on };
+        Some(format!("main checkout is on {on}, not {want}"))
+    } else {
+        changes(main).then(|| "main checkout has uncommitted changes".to_string())
+    }
+}
+
+/// A local merge's last step, after the task reported `merge: rebased` (R29): code, never
+/// the task (whose shell may be sandboxed to its worktree), fast-forwards the main checkout
+/// to the task's branch. Blocking git calls: run it off the async runtime.
+pub(super) fn fast_forward(t: &Task) -> Result<(), String> {
+    let (Some(main), Some(branch), Some(base)) = (&t.repo, &t.branch, &t.base_branch) else {
+        return Err("no main checkout, branch or base branch to merge".into());
+    };
+    if let Some(why) = main_refuses(main, base) {
+        return Err(why);
+    }
+    if git(main, &["merge-base", "--is-ancestor", "HEAD", branch]).is_err() {
+        return Err(format!(
+            "{branch} is not rebased on the main checkout's {base} ({base} moved since the rebase, or it wasn't rebased): rebase it again"
+        ));
+    }
+    git(main, &["merge", "-q", "--ff-only", branch])
+        .map(drop)
+        .map_err(|e| format!("git merge --ff-only {branch} failed: {e}"))
 }
 
 /// Uncommitted changes to tracked files (untracked files, such as `.worktrees/`, don't count).
@@ -2600,7 +2635,14 @@ mod tests {
         assert_eq!(fx.launcher.prompts("s1").len(), before);
         run(&fx, json!({"action": "merge", "task": "T1-m"})).await.unwrap();
         assert_eq!(state(&fx, "T1-m"), State::Merging);
-        assert!(fx.launcher.prompts("s1").last().unwrap().contains("merge: merged"));
+        // R29: the task rebases and reports; code fast-forwards the main checkout.
+        let text = fx.launcher.prompts("s1").last().unwrap().clone();
+        assert!(
+            text.contains("merge: rebased") && !text.contains("merge: merged"),
+            "{text}"
+        );
+        assert!(text.contains("Don't touch the main checkout"), "{text}");
+        assert!(!fx.sup.row("T1-m").unwrap().pr);
         let q = fx.asker.asked.lock().unwrap()[1].question.clone();
         assert!(q.contains("Merge T1-m?") && q.contains("worktree-T1-m"), "{q}");
     }
@@ -2778,10 +2820,7 @@ mod tests {
         run(&fx, json!({"action": "merge", "task": "T1-a"})).await.unwrap();
         let text = fx.launcher.prompts("s1").last().unwrap().clone();
         assert!(!text.contains("moved since"), "{text}");
-        assert!(
-            text.contains("Untracked files (build output, caches) are not a reason to stop"),
-            "{text}"
-        );
+        assert!(text.contains("no fetch is needed"), "{text}");
         // The base gets a new commit after T2 started.
         run(&fx, spawn_args("app", "b", true)).await.unwrap();
         std::fs::write(app.join("sub/g"), "new").unwrap();

@@ -1042,6 +1042,18 @@ Address every finding, commit, re-run your checks and report `done` again.",
                         question: text("question"),
                     }
                 }
+                // R29: the task rebased; code fast-forwards the main checkout (never sandboxed).
+                (None, Some("rebased")) => Event::MergeReport(match sup.row(&r.task) {
+                    Ok(t) if t.state == State::Merging && !t.pr => {
+                        match tokio::task::spawn_blocking(move || super::task::fast_forward(&t)).await {
+                            Ok(Ok(())) => MergeResult::Merged,
+                            Ok(Err(why)) => MergeResult::Failed(why),
+                            Err(e) => MergeResult::Failed(format!("the fast-forward crashed: {e}")),
+                        }
+                    }
+                    // Not merging locally: the board refuses it.
+                    _ => MergeResult::Failed(summary),
+                }),
                 (None, Some(m)) => Event::MergeReport(match m {
                     "merged" => MergeResult::Merged,
                     "pr-opened" => MergeResult::PrOpened,
@@ -2953,11 +2965,33 @@ mod tests {
     fn git_repo(dir: &std::path::Path) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("f"), "x").unwrap();
-        for args in [
-            &["init", "-q", "-b", "main"][..],
-            &["add", "."],
-            &["commit", "-qm", "init"],
-        ] {
+        git_in(
+            dir,
+            &[
+                &["init", "-q", "-b", "main"][..],
+                &["add", "."],
+                &["commit", "-qm", "init"],
+            ],
+        );
+    }
+
+    /// A commit of `file` on the branch checked out in `dir`.
+    fn commit_file(dir: &std::path::Path, file: &str) {
+        std::fs::write(dir.join(file), file).unwrap();
+        git_in(dir, &[&["add", "."][..], &["commit", "-qm", file]]);
+    }
+
+    fn git_head(dir: &std::path::Path, rev: &str) -> String {
+        let o = std::process::Command::new("git")
+            .args(["rev-parse", rev])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    fn git_in(dir: &std::path::Path, all: &[&[&str]]) {
+        for args in all {
             let ok = std::process::Command::new("git")
                 .args([
                     "-c",
@@ -2967,7 +3001,7 @@ mod tests {
                     "-c",
                     "commit.gpgsign=false",
                 ])
-                .args(args)
+                .args(*args)
                 .current_dir(dir)
                 .output()
                 .unwrap()
@@ -2991,6 +3025,23 @@ mod tests {
         }
         fn locks(&self) -> usize {
             self.sup.board.lock().unwrap().merge_locks.len()
+        }
+        /// `id` merging a real repo at `repo` locally: its branch `worktree-<id>` is one
+        /// commit ahead of `main`, and the main checkout is on `main`.
+        fn merging_branch(&self, id: &str, repo: &std::path::Path) {
+            git_repo(repo);
+            let branch = format!("worktree-{id}");
+            git_in(repo, &[&["checkout", "-qb", &branch][..]]);
+            commit_file(repo, &format!("{id}.txt"));
+            git_in(repo, &[&["checkout", "-q", "main"][..]]);
+            self.merging(id, repo);
+            self.sup
+                .edit(|b| {
+                    let t = b.tasks.iter_mut().find(|t| t.id == id).unwrap();
+                    t.branch = Some(branch);
+                    t.base_branch = Some("main".into());
+                })
+                .unwrap();
         }
     }
 
@@ -3036,9 +3087,16 @@ mod tests {
     async fn merge_reports_release_the_lock_and_a_merged_task_gets_the_close_offer() {
         let fx = fixture(5);
         let (a, b) = (fx.sup.root.join("a"), fx.sup.root.join("b"));
-        fx.merging("T1-x", &a);
+        fx.merging_branch("T1-x", &a);
         fx.merging("T2-y", &b);
-        write_report(&fx, "T1-x", 1, "tok", json!({"merge": "merged", "summary": "ff"}));
+        // R29: the task rebased; code fast-forwards the main checkout.
+        write_report(
+            &fx,
+            "T1-x",
+            1,
+            "tok",
+            json!({"merge": "rebased", "summary": "rebased on main"}),
+        );
         write_report(&fx, "T2-y", 1, "tok", json!({"merge": "pr-opened", "summary": "#12"}));
         fx.links.kick();
         fx.until("both ready", |fx| {
@@ -3046,6 +3104,13 @@ mod tests {
         })
         .await;
         assert_eq!(fx.locks(), 0);
+        assert_eq!(
+            git_head(&a, "HEAD"),
+            git_head(&a, "worktree-T1-x"),
+            "main fast-forwarded"
+        );
+        assert!(a.join("T1-x.txt").exists());
+        assert_eq!(fx.sup.row("T1-x").unwrap().landed, Some(board::Landed::Merged));
         assert_eq!(fx.sup.row("T2-y").unwrap().landed, Some(board::Landed::PrOpened));
         let wakes: Vec<_> = fx.said().into_iter().filter(|l| l.starts_with("wake:")).collect();
         assert!(
@@ -3058,6 +3123,47 @@ mod tests {
             wakes.iter().any(|w| w.contains("T2-y opened a pull request")),
             "{wakes:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_rebased_report_on_a_moved_or_dirty_main_checkout_is_a_merge_block() {
+        let fx = fixture(5);
+        let (moved, dirty) = (fx.sup.root.join("moved"), fx.sup.root.join("dirty"));
+        fx.merging_branch("T1-x", &moved);
+        fx.merging_branch("T2-y", &dirty);
+        // main moved since the task's rebase; the user edited a tracked file.
+        commit_file(&moved, "later");
+        std::fs::write(dirty.join("f"), "user's edit").unwrap();
+        let (moved_head, dirty_head) = (git_head(&moved, "HEAD"), git_head(&dirty, "HEAD"));
+        write_report(&fx, "T1-x", 1, "tok", json!({"merge": "rebased", "summary": "rebased"}));
+        write_report(&fx, "T2-y", 1, "tok", json!({"merge": "rebased", "summary": "rebased"}));
+        fx.links.kick();
+        fx.until("both blocked", |fx| {
+            fx.state("T1-x") == State::Blocked && fx.state("T2-y") == State::Blocked
+        })
+        .await;
+        assert_eq!(fx.locks(), 0, "both locks released");
+        let (t1, t2) = (fx.sup.row("T1-x").unwrap(), fx.sup.row("T2-y").unwrap());
+        let (b1, b2) = (t1.block.unwrap(), t2.block.unwrap());
+        assert!(
+            b1.merge && b1.reason.contains("not rebased on the main checkout's main"),
+            "{b1:?}"
+        );
+        assert!(b2.merge && b2.reason.contains("uncommitted changes"), "{b2:?}");
+        assert_eq!(t1.landed, None);
+        // The main checkouts are left as they were.
+        assert_eq!(git_head(&moved, "HEAD"), moved_head);
+        assert_eq!(git_head(&dirty, "HEAD"), dirty_head);
+        assert_eq!(std::fs::read_to_string(dirty.join("f")).unwrap(), "user's edit");
+        let wakes: Vec<_> = fx.said().into_iter().filter(|l| l.starts_with("wake:")).collect();
+        for label in ["T1-x", "T2-y"] {
+            assert!(
+                wakes
+                    .iter()
+                    .any(|w| w.contains(&format!("{label} merge failed")) && w.contains("call `task merge` again")),
+                "{wakes:?}"
+            );
+        }
     }
 
     #[test]

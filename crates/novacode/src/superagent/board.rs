@@ -271,6 +271,10 @@ pub struct Task {
     /// commit is ready without a new review (reviews are pinned to a commit).
     pub approved_commit: Option<String>,
     pub landed: Option<Landed>,
+    /// Its last `task merge` opens a pull request; else code fast-forwards the main checkout
+    /// after the task rebased (R29).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub pr: bool,
     /// A write task the user accepted on a card after its review rounds ran out.
     pub accepted: bool,
     /// The user's words, sent in the brief (kept so a queued task can start later).
