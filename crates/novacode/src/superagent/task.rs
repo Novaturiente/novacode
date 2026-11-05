@@ -71,6 +71,9 @@ pub struct Super {
     pub(super) launcher: Arc<dyn Launcher>,
     /// The task links (ST13); set once after construction.
     pub links: std::sync::OnceLock<Arc<super::link::Links>>,
+    /// Session → how often [`grounded`](Self::grounded) ran: a run that started before the
+    /// last time ends with prompts already out of flight (Y3).
+    grounds: Mutex<std::collections::HashMap<String, u64>>,
 }
 
 /// What a tool result adds when its prompt was held.
@@ -297,6 +300,7 @@ impl Super {
             asker,
             launcher,
             links: std::sync::OnceLock::new(),
+            grounds: Mutex::default(),
         })
     }
 
@@ -884,6 +888,7 @@ impl Super {
             }
             f.question = question;
             f.sent.push(hash);
+            f.unconfirmed += 1;
             false
         });
         if held == Some(true) {
@@ -929,6 +934,7 @@ impl Super {
             .await
         {
             self.flight(session, |f| {
+                f.unconfirmed = f.unconfirmed.saturating_sub(1);
                 if let Some(i) = f.sent.iter().rposition(|h| *h == hash) {
                     f.sent.remove(i);
                     if i < f.ended {
@@ -938,6 +944,7 @@ impl Super {
             });
             return Err(e);
         }
+        self.flight(session, |f| f.unconfirmed = f.unconfirmed.saturating_sub(1));
         self.edit(|b| {
             if let Some(row) = b.tasks.iter_mut().find(|r| r.session.as_deref() == Some(session)) {
                 row.last_prompt = Some(hash);
@@ -950,7 +957,8 @@ impl Super {
     pub(super) async fn ran(&self, session: &str, consumed: usize) {
         self.flight(session, |f| {
             f.sent.drain(..consumed.min(f.sent.len()));
-            f.ended = f.sent.len();
+            // One the task has not confirmed may reach it only after this run settles.
+            f.ended = f.sent.len().saturating_sub(f.unconfirmed);
         });
         self.release(session).await;
     }
@@ -974,6 +982,7 @@ impl Super {
                 let next: Vec<String> = f.held.drain(..n).map(|h| h.text).collect();
                 f.question = question;
                 f.sent = next.iter().map(|t| super::board::prompt_hash(t)).collect();
+                f.unconfirmed += next.len();
                 f.ended = 0;
                 Some((question, next))
             });
@@ -1014,9 +1023,16 @@ impl Super {
         self.ran(session, consumed.unwrap_or(0)).await;
     }
 
+    /// How often `session` was [`grounded`](Self::grounded): a run that started at another
+    /// count ends having consumed only prompts no longer in flight.
+    pub(super) fn grounds(&self, session: &str) -> u64 {
+        self.grounds.lock().unwrap().get(session).copied().unwrap_or(0)
+    }
+
     /// The session's run was stopped or its process is gone: nothing is in flight and
     /// nothing held is sent. Returns the held ones dropped.
     pub(super) fn grounded(&self, session: &str) -> Vec<Held> {
+        *self.grounds.lock().unwrap().entry(session.to_string()).or_default() += 1;
         self.flight(session, |f| {
             f.sent.clear();
             std::mem::take(&mut f.held)
@@ -1760,6 +1776,8 @@ mod tests {
         fail_start: Mutex<bool>,
         /// The next this many sends fail.
         fail_sends: Mutex<usize>,
+        /// Set: each send waits for a notification before it goes.
+        gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     }
 
     impl Launcher for FakeLauncher {
@@ -1778,6 +1796,10 @@ mod tests {
         }
         fn send_as<'a>(&'a self, session: &'a str, id: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>> {
             Box::pin(async move {
+                let gate = self.gate.lock().unwrap().clone();
+                if let Some(g) = gate {
+                    g.notified().await;
+                }
                 let mut fail = self.fail_sends.lock().unwrap();
                 if *fail > 0 {
                     *fail -= 1;
@@ -2355,6 +2377,31 @@ mod tests {
         run(&fx, json!({"action": "stop", "task": "T1-t"})).await.unwrap();
         fx.sup.ran("s1", 1).await;
         assert_eq!(sent().len(), 3, "{:?}", sent());
+    }
+
+    #[tokio::test]
+    async fn a_prompt_still_being_sent_when_a_run_ends_is_not_dropped_when_the_task_settles() {
+        // L10.9 Y3: the prompt reaches the task after that run settled, and starts a run of its own.
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "t", false)).await.unwrap();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *fx.launcher.gate.lock().unwrap() = Some(gate.clone());
+        let sup = fx.sup.clone();
+        let work = tokio::spawn(async move { sup.prompt("s1", "work".into()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The brief's run ends and settles while "work" is on its way.
+        fx.sup.ran("s1", 1).await;
+        fx.sup.settled("s1").await;
+        *fx.launcher.gate.lock().unwrap() = None;
+        gate.notify_one();
+        assert!(!work.await.unwrap().unwrap());
+        let held = fx
+            .sup
+            .prompt_as("s1", super::super::link::SUPER_QUESTION_ID, "which?".into())
+            .await
+            .unwrap();
+        assert!(held, "the question waits for the run on the work");
     }
 
     #[tokio::test]

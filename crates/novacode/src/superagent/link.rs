@@ -1640,6 +1640,8 @@ async fn run_link(
         // Cards the catch-up re-sent: super's copies of any others were answered meanwhile.
         let mut open = HashSet::new();
         let mut busy = false;
+        // The grounded count when the current run started (unknown for a run going at connect).
+        let mut run_grounds = None;
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             let l = tokio::select! {
@@ -1699,7 +1701,10 @@ async fn run_link(
                 ServerMsg::Event { event } => {
                     if let AgentEvent::AgentStart = event {
                         busy = true;
+                        run_grounds = Some(sup.grounds(&session));
                     }
+                    // A run super stopped: what it consumed was taken out of flight then (Y3).
+                    let stale = run_grounds.is_some_and(|g| g != sup.grounds(&session));
                     let home = sup.home().to_path_buf();
                     let ev = watcher.event(&event, || Goal::read(&home, &session));
                     if let Some(ev) = ev
@@ -1709,7 +1714,9 @@ async fn run_link(
                     }
                     links.replied(&sup, &id, &mut watcher);
                     // Held prompts of the other kind go once this run took all of super's (R24).
-                    if let AgentEvent::AgentEnd { prompts, .. } = &event {
+                    if let AgentEvent::AgentEnd { prompts, .. } = &event
+                        && !stale
+                    {
                         let ours = prompts
                             .iter()
                             .filter(|p| matches!(p.as_deref(), Some(SUPER_ID | SUPER_QUESTION_ID)))
@@ -1717,7 +1724,9 @@ async fn run_link(
                         sup.ran(&session, ours).await;
                     }
                     // Nothing queued: what no run took is no longer in flight (R27).
-                    if let AgentEvent::Settled = &event {
+                    if let AgentEvent::Settled = &event
+                        && !stale
+                    {
                         sup.settled(&session).await;
                     }
                 }
@@ -3364,6 +3373,7 @@ mod tests {
                         question: false,
                         text: "work".into(),
                     }],
+                    unconfirmed: 0,
                 }),
                 ..Task::default()
             };
@@ -3410,6 +3420,29 @@ mod tests {
             fx.sup.deliver("T1-x", "more".into()).await.unwrap(),
             "work waits for the question"
         );
+    }
+
+    #[tokio::test]
+    async fn the_end_of_a_run_super_stopped_does_not_take_the_next_prompt_out_of_flight() {
+        // L10.9 Y3: the stopped run's end arrives after super already sent new work.
+        let fx = fixture(5);
+        let s = fx.task("T1-x", "faux/a", State::Running);
+        let mut t = fx.end(&s).await;
+        t.catch_up(true, vec![], vec![]).await;
+        t.event(AgentEvent::AgentStart).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        fx.sup.run(json!({"action": "stop", "task": "T1-x"})).await.unwrap();
+        fx.sup
+            .run(json!({"action": "send", "task": "T1-x", "message": "work"}))
+            .await
+            .unwrap();
+        t.event(end(SUPER, StopReason::Aborted)).await;
+        t.event(AgentEvent::Settled).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let ask = json!({"action": "send", "task": "T1-x", "message": "which?", "question": true});
+        let out = fx.sup.run(ask).await.unwrap();
+        assert!(out.contains("held"), "the work's run has not run yet: {out}");
+        assert_eq!(questions_sent(&fx), 0);
     }
 
     #[tokio::test]

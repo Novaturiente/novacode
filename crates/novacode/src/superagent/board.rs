@@ -205,6 +205,10 @@ pub struct Flight {
     pub ended: usize,
     /// Waiting, in order.
     pub held: Vec<Held>,
+    /// How many of `sent` (the newest) the task has not confirmed yet: one may reach it only
+    /// after a run ending now settled, so that settling doesn't count it (Y3).
+    #[serde(skip)]
+    pub unconfirmed: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
