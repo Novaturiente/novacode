@@ -271,7 +271,12 @@ fn brief(t: &Task) -> String {
             w.display(),
             t.base_branch.as_deref().or(t.base_commit.as_deref()).unwrap_or("HEAD")
         )),
-        _ if !t.write => s.push_str("\nThis is a read task: answer, don't edit.\n"),
+        // R26: without the delivery rule, answers longer than a summary came as text with no `report`.
+        _ if !t.write => s.push_str(
+            "\nThis is a read task: don't edit. When you have the answer, first call `report` with `state: done`, \
+             the direct answer in `summary` (at most 80 words; super reads only this) and your checks; \
+             then write your full answer as your final message.\n",
+        ),
         _ => {}
     }
     if t.ty == TaskType::Bugfix {
@@ -2683,6 +2688,21 @@ mod tests {
             matches!(tail[0], ClientCmd::Prompt { text, raw: true } if text == "continue"),
             "{tail:?}"
         );
+    }
+
+    /// Real run A/L (R26): read tasks whose answer did not fit in 80 words answered in
+    /// text and never called `report` (3 of 8 haiku runs). The brief must say how to deliver it.
+    #[test]
+    fn a_read_brief_says_to_report_first_and_answer_in_full_after() {
+        let t = Task {
+            label: "T3-q".into(),
+            request: "what does mul(0.1, 3) return?".into(),
+            ..Task::default()
+        };
+        let b = brief(&t);
+        assert!(b.contains("don't edit"), "{b}");
+        assert!(b.contains("call `report` with `state: done`"), "{b}");
+        assert!(b.contains("then write your full answer"), "{b}");
     }
 
     #[test]
