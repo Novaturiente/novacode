@@ -826,7 +826,9 @@ impl Host {
             return;
         }
         let cwd = PathBuf::from(self.hub.state().cwd);
-        let run = tokio::process::Command::new(novacode_base::platform::bash())
+        let mut run = tokio::process::Command::new(novacode_base::platform::bash());
+        novacode_base::platform::drop_task_vars(run.as_std_mut());
+        let run = run
             .arg("-c")
             .arg(&cmd)
             .current_dir(&cwd)

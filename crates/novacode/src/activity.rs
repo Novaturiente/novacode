@@ -189,7 +189,9 @@ async fn herdr(sock: &str, pane: &str, method: &str, mut params: serde_json::Val
 
 async fn run_hook(cmd: &str, s: &State, prev: ActState) {
     use tokio::io::AsyncWriteExt;
-    let child = Command::new("sh")
+    let mut child = Command::new("sh");
+    novacode_base::platform::drop_task_vars(child.as_std_mut());
+    let child = child
         .arg("-c")
         .arg(cmd)
         .env("NOVACODE_SESSION", &s.session)
@@ -356,6 +358,33 @@ pub fn spawn(hub: &Arc<Hub>, sinks: Sinks) -> tokio::task::JoinHandle<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L10.9 Z7: a super task's identity never reaches `hooks.onActivity`. Runs
+    /// [`task_env_case`] in a child test process that has the variables set.
+    #[test]
+    fn task_env_is_removed() {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "activity::tests::task_env_case", "--ignored"]);
+        for v in novacode_base::platform::TASK_VARS {
+            cmd.env(v, "secret");
+        }
+        let out = cmd.output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && text.contains("1 passed"), "{text}");
+    }
+
+    #[tokio::test]
+    #[ignore = "run by task_env_is_removed"]
+    async fn task_env_case() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("out");
+        let cmd = format!(
+            "echo task=$NOVACODE_TASK token=$NOVACODE_TASK_TOKEN dir=$NOVACODE_SUPER_DIR > '{}'",
+            f.display()
+        );
+        run_hook(&cmd, &State::default(), ActState::Idle).await;
+        assert_eq!(std::fs::read_to_string(&f).unwrap().trim(), "task= token= dir=");
+    }
 
     #[test]
     fn the_account_is_published_and_a_switch_republishes() {
