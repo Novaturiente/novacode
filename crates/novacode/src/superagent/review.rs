@@ -1229,6 +1229,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_review_on_an_unreported_task_whose_head_is_approved_makes_it_ready() {
+        // L10.9 R27 (7): its approved commit needs no new review.
+        let fx = fixture("faux/review");
+        let wt = fx.spawn("fix", "quick", "change").await;
+        let head = fx.commit(&wt, "src/a.rs");
+        block_unreported(&fx, "T1-fix");
+        fx.sup
+            .edit(|b| b.tasks.iter_mut().find(|t| t.id == "T1-fix").unwrap().approved_commit = Some(head.clone()))
+            .unwrap();
+        let out = fx.run(json!({"action": "review", "task": "T1-fix"})).await.unwrap();
+        let t = fx.row("T1-fix");
+        assert_eq!((t.state, t.reviewer), (State::Ready, None), "{out}");
+        assert_eq!(t.done.unwrap().commit.as_deref(), Some(head.as_str()));
+    }
+
+    #[tokio::test]
     async fn task_review_on_a_task_that_never_reported_nor_committed_is_refused() {
         let fx = fixture("faux/review");
         fx.spawn("fix", "quick", "change").await;

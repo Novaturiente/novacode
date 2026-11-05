@@ -188,18 +188,22 @@ fn kill_group(pid: u32) {
 }
 
 /// Stop this user's processes whose working folder is inside `dir`, or that hold a file open
-/// under it (a detached daemon a task left in its worktree, e.g. codegraph's): SIGTERM, up to 3 s to exit, then SIGKILL. Never this
-/// process or its ancestors. Returns how many it signalled.
+/// under it with no controlling terminal (a detached daemon a task left in its worktree, e.g.
+/// codegraph's; an editor or `tail -f` on a terminal is the user's): SIGTERM, up to 3 s to
+/// exit, then SIGKILL. Never this process or its ancestors. Returns how many it signalled.
 #[cfg(target_os = "linux")]
 pub fn stop_inside(dir: &Path) -> usize {
     use nix::sys::signal::{Signal, kill};
     use std::os::unix::fs::MetadataExt;
     let Ok(dir) = std::fs::canonicalize(dir) else { return 0 };
     let uid = std::fs::metadata("/proc/self").map(|m| m.uid()).ok();
-    let ppid = |pid: u32| -> Option<u32> {
+    // Fields after `(comm)`: state, ppid, pgrp, session, tty_nr, …
+    let stat = |pid: u32, field: usize| -> Option<u32> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+        stat.rsplit_once(')')?.1.split_whitespace().nth(field)?.parse().ok()
     };
+    let ppid = |pid: u32| stat(pid, 1);
+    let daemon = |pid: u32| stat(pid, 4) == Some(0);
     let mut spared = vec![std::process::id()];
     while let Some(p) = ppid(*spared.last().unwrap()).filter(|p| *p > 0 && !spared.contains(p)) {
         spared.push(p);
@@ -208,11 +212,12 @@ pub fn stop_inside(dir: &Path) -> usize {
     let under = |link: PathBuf| std::fs::read_link(link).is_ok_and(|c| c.starts_with(&dir));
     let inside = |pid: u32| {
         under(format!("/proc/{pid}/cwd").into())
-            || std::fs::read_dir(format!("/proc/{pid}/fd"))
-                .into_iter()
-                .flatten()
-                .flatten()
-                .any(|fd| under(fd.path()))
+            || daemon(pid)
+                && std::fs::read_dir(format!("/proc/{pid}/fd"))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .any(|fd| under(fd.path()))
     };
     let found: Vec<u32> = std::fs::read_dir("/proc")
         .into_iter()
@@ -1130,8 +1135,9 @@ mod tests {
         std::fs::create_dir_all(&inner).unwrap();
         std::fs::write(inner.join("codegraph.db"), "index").unwrap();
         let db = std::fs::File::open(inner.join("codegraph.db")).unwrap();
-        let mut child = std::process::Command::new("sleep")
-            .arg("300")
+        // Detached like a daemon: no controlling terminal, even when the tests run in one.
+        let mut child = std::process::Command::new("setsid")
+            .args(["sleep", "300"])
             .current_dir(d.path())
             .stdin(db)
             .spawn()
@@ -1139,6 +1145,47 @@ mod tests {
         assert_eq!(stop_inside(&d.path().join("wt")), 1);
         let status = child.wait().unwrap();
         assert!(!status.success(), "ended by a signal: {status:?}");
+    }
+
+    /// R27: a program on a terminal with a file open there (an editor, `tail -f`, `less`) is the user's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_inside_spares_a_terminal_program_holding_a_file_open_in_the_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let inner = d.path().join("wt");
+        std::fs::create_dir_all(&inner).unwrap();
+        let file = inner.join("notes.txt");
+        std::fs::write(&file, "x").unwrap();
+        // `script` gives the program a terminal of its own.
+        let cmd = format!("exec sleep 300 3<'{}'", file.display());
+        let mut term = std::process::Command::new("script")
+            .args(["-qec", &cmd, "/dev/null"])
+            .current_dir(d.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let held = || {
+            std::fs::read_dir("/proc").unwrap().flatten().any(|e| {
+                std::fs::read_dir(e.path().join("fd"))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|l| l == file))
+            })
+        };
+        for _ in 0..100 {
+            if held() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(held(), "the program has the file open");
+        let n = stop_inside(&inner);
+        let still = held();
+        let _ = term.kill();
+        let _ = term.wait();
+        assert_eq!((n, still), (0, true));
     }
 
     #[tokio::test]

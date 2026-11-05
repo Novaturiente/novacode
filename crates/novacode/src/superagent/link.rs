@@ -569,6 +569,15 @@ impl Links {
         };
         let mut interrupted = Vec::new();
         for t in &dead {
+            // Saved held prompts (R27) can't go to a process that is gone.
+            let lost = sup.grounded(t.session.as_deref().unwrap_or_default());
+            if !lost.is_empty() {
+                self.inform.note(format!(
+                    "{}'s process was gone after super's restart: {} prompt(s) super had held for it were not sent.",
+                    t.label,
+                    lost.len()
+                ));
+            }
             match t.kind {
                 board::Kind::Review if matches!(t.state, State::Running | State::WaitingYou) => {
                     self.restart_review(sup, t)
@@ -1226,6 +1235,16 @@ Address every finding, commit, re-run your checks and report `done` again.",
 
     /// The task's card was answered in its own window: close super's copy.
     fn card_done(&self, id: &str, card_id: u64) {
+        self.card_ended(
+            id,
+            card_id,
+            "answered in the task's own window",
+            "was answered in its own window",
+        );
+    }
+
+    /// The task's card closed there: close super's copy, recording `answer` and noting `how`.
+    fn card_ended(&self, id: &str, card_id: u64, answer: &str, how: &str) {
         let Some((h, _)) = self
             .inner
             .lock()
@@ -1237,11 +1256,10 @@ Address every finding, commit, re-run your checks and report `done` again.",
             return;
         };
         h.abort();
-        self.record(id, card_id, "answered in the task's own window".into());
+        self.record(id, card_id, answer.into());
         if let Some(sup) = self.sup.upgrade() {
             let label = sup.row(id).map(|t| t.label).unwrap_or_default();
-            self.inform
-                .note(format!("{label}'s question was answered in its own window"));
+            self.inform.note(format!("{label}'s question {how}"));
         }
         self.card_closed(id, card_id);
     }
@@ -1256,8 +1274,14 @@ Address every finding, commit, re-run your checks and report `done` again.",
                 .map(|(_, c)| *c)
                 .collect()
         };
+        // Answered there, or closed by an abort or the run's end: which is unknown (R27).
         for c in gone {
-            self.card_done(id, c);
+            self.card_ended(
+                id,
+                c,
+                "closed in the task (answer unknown)",
+                "was closed in the task while super was disconnected (answer unknown)",
+            );
         }
     }
 
@@ -1274,7 +1298,7 @@ Address every finding, commit, re-run your checks and report `done` again.",
             return;
         };
         let Some(sup) = self.sup.upgrade() else { return };
-        a.answer = answer;
+        a.answer = cut(&answer);
         a.at = board::now();
         let _ = sup.edit(|b| {
             if let Some(row) = b.tasks.iter_mut().find(|r| r.id == id) {
@@ -1294,6 +1318,15 @@ Address every finding, commit, re-run your checks and report `done` again.",
     }
 }
 
+/// A card's question or answer as recorded: at most [`board::ASKED_TEXT`] chars and `…`.
+fn cut(s: &str) -> String {
+    let mut text: String = s.chars().take(board::ASKED_TEXT).collect();
+    if text.len() < s.len() {
+        text.push('…');
+    }
+    text
+}
+
 /// A card's record without its answer yet.
 fn asked_of(card: &Card) -> board::Asked {
     let (kind, options) = match card {
@@ -1306,14 +1339,9 @@ fn asked_of(card: &Card) -> board::Asked {
         ),
         Card::Approve { .. } => ("approval", vec![]),
     };
-    let what = card.what();
-    let mut text: String = what.chars().take(board::ASKED_TEXT).collect();
-    if text.len() < what.len() {
-        text.push('…');
-    }
     board::Asked {
         kind: kind.into(),
-        text,
+        text: cut(&card.what()),
         options,
         ..board::Asked::default()
     }
@@ -1675,6 +1703,10 @@ async fn run_link(
                             .filter(|p| matches!(p.as_deref(), Some(SUPER_ID | SUPER_QUESTION_ID)))
                             .count();
                         sup.ran(&session, ours).await;
+                    }
+                    // Nothing queued: what no run took is no longer in flight (R27).
+                    if let AgentEvent::Settled = &event {
+                        sup.settled(&session).await;
                     }
                 }
                 ServerMsg::Ask { .. } | ServerMsg::Approve { .. } => {
@@ -3241,6 +3273,132 @@ mod tests {
         t.event(report("done")).await;
         t.event(end(SUPER, StopReason::Stop)).await;
         fx.until("question sent", |fx| questions(fx) == 1).await;
+    }
+
+    #[tokio::test]
+    async fn held_prompts_of_a_task_gone_at_restart_are_dropped_with_a_note() {
+        // L10.9 R27 (1).
+        let fx = fixture_with(5, |sup, _| {
+            let t = Task {
+                id: "T1-x".into(),
+                label: "T1-x".into(),
+                model: "faux/a".into(),
+                state: State::Running,
+                session: Some("s-dead".into()),
+                flight: Some(board::Flight {
+                    session: "s-dead".into(),
+                    question: true,
+                    sent: vec!["h".into()],
+                    ended: 0,
+                    held: vec![board::Held {
+                        question: false,
+                        text: "work".into(),
+                    }],
+                }),
+                ..Task::default()
+            };
+            sup.edit(|b| b.tasks.push(t)).unwrap();
+        });
+        let row = fx.sup.row("T1-x").unwrap();
+        assert_eq!((row.state, row.flight), (State::Interrupted, None));
+        assert!(
+            fx.said()
+                .iter()
+                .any(|l| l.contains("1 prompt(s) super had held for it were not sent")),
+            "{:?}",
+            fx.said()
+        );
+    }
+
+    fn questions_sent(fx: &Fx) -> usize {
+        fx.launcher
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, c)| matches!(c, ClientCmd::Prompt { text, .. } if text.starts_with(QUESTION_PREFIX)))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_prompt_no_run_took_is_dropped_when_the_task_settles_and_what_waits_goes() {
+        // L10.9 R27 (2): the user took super's work prompt back in the task's window.
+        let fx = fixture(5);
+        let s = fx.task("T1-x", "faux/a", State::Running);
+        let mut t = fx.end(&s).await;
+        t.catch_up(true, vec![], vec![]).await;
+        assert!(!fx.sup.deliver("T1-x", "work".into()).await.unwrap());
+        let ask = json!({"action": "send", "task": "T1-x", "message": "which?", "question": true});
+        assert!(fx.sup.run(ask).await.unwrap().contains("held"));
+        // The user's own run ends and nothing is queued.
+        t.event(end(&[None], StopReason::Stop)).await;
+        t.event(AgentEvent::Settled).await;
+        fx.until("question sent", |fx| questions_sent(fx) == 1).await;
+        // A run on that question ends: its settling keeps the question just sent in flight.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            fx.sup.deliver("T1-x", "more".into()).await.unwrap(),
+            "work waits for the question"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prompt_consumed_while_the_link_was_down_is_dropped_at_the_next_settle() {
+        // L10.9 R27 (3): reconnected while the user's next run was going.
+        let fx = fixture(5);
+        let s = fx.task("T1-x", "faux/a", State::Running);
+        let mut t = fx.end(&s).await;
+        t.catch_up(true, vec![], vec![]).await;
+        fx.sup.deliver("T1-x", "work".into()).await.unwrap();
+        let ask = json!({"action": "send", "task": "T1-x", "message": "which?", "question": true});
+        assert!(fx.sup.run(ask).await.unwrap().contains("held"));
+        drop(t);
+        let mut t = fx.end(&s).await;
+        let history = vec![
+            Message::user("work"),
+            assistant(StopReason::Stop, None),
+            Message::user("mine"),
+        ];
+        t.catch_up(true, history, vec![]).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(questions_sent(&fx), 0, "the user's run is going");
+        t.event(end(&[None], StopReason::Stop)).await;
+        t.event(AgentEvent::Settled).await;
+        fx.until("question sent", |fx| questions_sent(fx) == 1).await;
+    }
+
+    #[tokio::test]
+    async fn a_card_gone_at_reconnect_is_recorded_with_its_answer_unknown_and_answers_are_cut() {
+        // L10.9 R27 (8): a card closed by an abort or a run end was not answered.
+        let fx = fixture(5);
+        let s = fx.task("T1-x", "faux/a", State::Running);
+        let mut t = fx.end(&s).await;
+        t.catch_up(false, vec![], vec![ask(3)]).await;
+        fx.until("asked", |fx| fx.asker.waiting.lock().unwrap().len() == 1)
+            .await;
+        drop(t);
+        let mut t = fx.end(&s).await;
+        t.catch_up(false, vec![], vec![]).await;
+        fx.until("recorded", |fx| fx.sup.row("T1-x").unwrap().asked.len() == 1)
+            .await;
+        let a = fx.sup.row("T1-x").unwrap().asked.remove(0);
+        assert_eq!(a.answer, "closed in the task (answer unknown)");
+        // A long answer is cut like the question.
+        t.put(ask(4)).await;
+        fx.until("asked again", |fx| fx.asker.waiting.lock().unwrap().len() == 2)
+            .await;
+        let tx = fx.asker.waiting.lock().unwrap().remove(1);
+        let reply = Reply {
+            question: "which db?".into(),
+            chosen: vec!["y".repeat(500)],
+            text: None,
+            preview: None,
+        };
+        tx.send(Some(vec![reply])).unwrap();
+        fx.until("answer recorded", |fx| fx.sup.row("T1-x").unwrap().asked.len() == 2)
+            .await;
+        let a = fx.sup.row("T1-x").unwrap().asked.remove(1);
+        assert!(a.answer.chars().count() <= board::ASKED_TEXT + 1, "{}", a.answer.len());
     }
 
     #[tokio::test]

@@ -186,6 +186,30 @@ pub struct Asked {
     pub at: u64,
 }
 
+/// Super's prompts to one session: questions and work never share a run (R24), so the
+/// other kind waits here until the run that took the sent ones ends.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Flight {
+    /// The session they went to.
+    pub session: String,
+    /// The kind of the sent ones: questions.
+    pub question: bool,
+    /// The prompt hashes sent and not yet seen consumed, oldest first.
+    pub sent: Vec<String>,
+    /// How many of `sent` were sent before the last run end seen: when the task then
+    /// settles with nothing queued, no run took them (R27).
+    pub ended: usize,
+    /// Waiting, in order.
+    pub held: Vec<Held>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Held {
+    pub question: bool,
+    pub text: String,
+}
+
 /// Cards kept per row.
 pub const ASKED_KEPT: usize = 10;
 /// Chars of a card's text kept.
@@ -262,6 +286,9 @@ pub struct Task {
     /// Hash of super's last prompt to it ([`prompt_hash`]): the catch-up after a
     /// reconnect finds it in the task's messages.
     pub last_prompt: Option<String>,
+    /// Super's prompts to its session in flight and held (R24); saved so a restart keeps them (R27).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flight: Option<Flight>,
     /// Session tokens last seen in its run file: the Tasks tab shows them once it's gone.
     pub tokens: u64,
     /// Unix seconds.
@@ -559,7 +586,9 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
         (Event::Review, Reviewing) if !t.write && !reviewing => {
             with(Reviewing, Effect::StartReview { uses_round: true })
         }
-        // A write task that keeps ending without a report: the caller records its commits first (R23).
+        // A write task that keeps ending without a report: the caller records its commits first (R23);
+        // a head already approved needs no new review (R27).
+        (Event::Review, Blocked) if t.write && block_is(|b| b.code_made) && t.approval_covers_done() => go(Ready),
         (Event::Review, Blocked) if t.write && block_is(|b| b.code_made) => {
             with(Reviewing, Effect::StartReview { uses_round: true })
         }

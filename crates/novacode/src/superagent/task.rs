@@ -7,7 +7,7 @@
 //! [`Launcher`]; [`Procs`] is the real one. They outlive super.
 
 use super::Tier;
-use super::board::{Board, Event, Kind, MergeResult, State, Task, TaskType};
+use super::board::{Board, Event, Flight, Held, Kind, MergeResult, State, Task, TaskType};
 use crate::wire::{ClientCmd, Request, ServerMsg, line};
 use futures_util::future::BoxFuture;
 use novacode_base::paths::Paths;
@@ -71,20 +71,6 @@ pub struct Super {
     pub(super) launcher: Arc<dyn Launcher>,
     /// The task links (ST13); set once after construction.
     pub links: std::sync::OnceLock<Arc<super::link::Links>>,
-    /// Super's prompts per session not yet consumed by a run's end (R24).
-    flights: Mutex<std::collections::HashMap<String, Flight>>,
-}
-
-/// Super's prompts to one session: questions and work never share a run (R24), so the
-/// other kind waits here until the run that took the sent ones ends.
-#[derive(Default)]
-struct Flight {
-    /// The kind of the sent ones: questions.
-    question: bool,
-    /// The prompt hashes sent and not yet seen consumed, oldest first.
-    sent: Vec<String>,
-    /// Waiting, in order: (question, text).
-    held: Vec<(bool, String)>,
 }
 
 /// What a tool result adds when its prompt was held.
@@ -311,7 +297,6 @@ impl Super {
             asker,
             launcher,
             links: std::sync::OnceLock::new(),
-            flights: Mutex::default(),
         })
     }
 
@@ -384,14 +369,28 @@ impl Super {
                 self.check(&t.id, Event::Review)?;
                 // A code-made block (R23): no report, so code takes the facts from its commits.
                 let unreported = (t.state == State::Blocked).then(|| commits_done(&t)).transpose()?;
-                self.edit(|b| {
-                    let n = b.apply(&t.id, Event::Review)?;
-                    if let (Some(done), Some(row)) = (unreported, b.tasks.iter_mut().find(|r| r.id == t.id)) {
+                // Recorded first: an approved head goes to `ready` without a review (R27).
+                let n = self.edit(|b| {
+                    let row = b.tasks.iter_mut().find(|r| r.id == t.id).ok_or("no task")?;
+                    let before = (row.done.clone(), row.summary.clone());
+                    if let Some(done) = unreported {
                         row.done = Some(done);
                         row.summary = Some("no report; reviewed from its commits".into());
                     }
-                    Ok::<_, String>(n)
+                    let n = b.apply(&t.id, Event::Review);
+                    if n.is_err()
+                        && let Some(row) = b.tasks.iter_mut().find(|r| r.id == t.id)
+                    {
+                        (row.done, row.summary) = before;
+                    }
+                    n
                 })??;
+                if n.to == State::Ready {
+                    return Ok(format!(
+                        "{} is ready: its head is the commit its review already approved.",
+                        t.label
+                    ));
+                }
                 let review = self.open_review(&t.id, a.note.as_deref())?;
                 let mut out = format!("{} is reviewing; its review task is {review}.", t.label);
                 for n in self.pump().await {
@@ -869,17 +868,52 @@ impl Super {
     /// other kind (question or work) is sent and its run has not ended.
     async fn prompt_as(&self, session: &str, id: &str, text: String) -> Result<bool, String> {
         let question = id == super::link::SUPER_QUESTION_ID;
-        {
-            let mut flights = self.flights.lock().unwrap();
-            let f = flights.entry(session.to_string()).or_default();
+        let hash = super::board::prompt_hash(&text);
+        let held = self.flight(session, |f| {
             if !f.held.is_empty() || (!f.sent.is_empty() && f.question != question) {
-                f.held.push((question, text));
-                return Ok(true);
+                f.held.push(Held {
+                    question,
+                    text: text.clone(),
+                });
+                return true;
             }
             f.question = question;
-            f.sent.push(super::board::prompt_hash(&text));
+            f.sent.push(hash);
+            false
+        });
+        if held == Some(true) {
+            return Ok(true);
         }
-        self.send_prompt(session, id, text).await.map(|_| false)
+        let sent = self.send_prompt(session, id, text).await;
+        if sent.is_err() {
+            self.release(session).await;
+        }
+        sent.map(|_| false)
+    }
+
+    /// Change `session`'s flight on its row (a fresh one when the row's session changed);
+    /// the board is saved when it changed. `None` when no row has that session.
+    fn flight<R>(&self, session: &str, f: impl FnOnce(&mut Flight) -> R) -> Option<R> {
+        let mut b = self.board.lock().unwrap();
+        let row = b.tasks.iter_mut().find(|r| r.session.as_deref() == Some(session))?;
+        let before = row.flight.clone();
+        let fl = row.flight.get_or_insert_with(Flight::default);
+        if fl.session != session {
+            *fl = Flight {
+                session: session.to_string(),
+                ..Flight::default()
+            };
+        }
+        let r = f(fl);
+        if fl.sent.is_empty() && fl.held.is_empty() {
+            row.flight = None;
+        }
+        if row.flight != before
+            && let Err(e) = b.save(&self.dir)
+        {
+            tracing::warn!(session, %e, "super: couldn't save the board");
+        }
+        Some(r)
     }
 
     async fn send_prompt(&self, session: &str, id: &str, text: String) -> Result<(), String> {
@@ -889,11 +923,14 @@ impl Super {
             .send_as(session, id, ClientCmd::Prompt { text, raw: true })
             .await
         {
-            if let Some(f) = self.flights.lock().unwrap().get_mut(session)
-                && let Some(i) = f.sent.iter().rposition(|h| *h == hash)
-            {
-                f.sent.remove(i);
-            }
+            self.flight(session, |f| {
+                if let Some(i) = f.sent.iter().rposition(|h| *h == hash) {
+                    f.sent.remove(i);
+                    if i < f.ended {
+                        f.ended -= 1;
+                    }
+                }
+            });
             return Err(e);
         }
         self.edit(|b| {
@@ -906,49 +943,80 @@ impl Super {
     /// A run of `session` ended having consumed `consumed` of super's prompts: once none is
     /// left, the held ones of the next kind are sent.
     pub(super) async fn ran(&self, session: &str, consumed: usize) {
-        let (question, next) = {
-            let mut flights = self.flights.lock().unwrap();
-            let Some(f) = flights.get_mut(session) else { return };
+        self.flight(session, |f| {
             f.sent.drain(..consumed.min(f.sent.len()));
-            let Some(&(question, _)) = f.held.first().filter(|_| f.sent.is_empty()) else {
-                return;
+            f.ended = f.sent.len();
+        });
+        self.release(session).await;
+    }
+
+    /// `session` settled (its run ended, nothing queued): the prompts sent before that run's
+    /// end that no run took never will (taken back or aborted in the task's window, R27).
+    pub(super) async fn settled(&self, session: &str) {
+        self.flight(session, |f| {
+            f.sent.drain(..f.ended.min(f.sent.len()));
+            f.ended = 0;
+        });
+        self.release(session).await;
+    }
+
+    /// Nothing in flight: send the held ones of the next kind (and on, past any that fail).
+    async fn release(&self, session: &str) {
+        loop {
+            let next = self.flight(session, |f| {
+                let question = f.held.first().filter(|_| f.sent.is_empty())?.question;
+                let n = f.held.iter().take_while(|h| h.question == question).count();
+                let next: Vec<String> = f.held.drain(..n).map(|h| h.text).collect();
+                f.question = question;
+                f.sent = next.iter().map(|t| super::board::prompt_hash(t)).collect();
+                f.ended = 0;
+                Some((question, next))
+            });
+            let Some(Some((question, next))) = next else { return };
+            let id = match question {
+                true => super::link::SUPER_QUESTION_ID,
+                false => super::link::SUPER_ID,
             };
-            let n = f.held.iter().take_while(|h| h.0 == question).count();
-            f.question = question;
-            let next: Vec<_> = f.held.drain(..n).map(|h| h.1).collect();
-            f.sent = next.iter().map(|t| super::board::prompt_hash(t)).collect();
-            (question, next)
-        };
-        let id = match question {
-            true => super::link::SUPER_QUESTION_ID,
-            false => super::link::SUPER_ID,
-        };
-        for text in next {
-            if let Err(e) = self.send_prompt(session, id, text).await {
-                tracing::warn!(session, %e, "super: a held prompt couldn't be sent");
+            for text in next {
+                if let Err(e) = self.send_prompt(session, id, text).await {
+                    tracing::warn!(session, %e, "super: a held prompt couldn't be sent");
+                }
             }
         }
     }
 
     /// A reconnect found `session` not busy, its history's user prompts hashing to `seen`:
     /// the in-flight prompts up to the last one seen were consumed; later ones stay in
-    /// flight (they will start a run).
+    /// flight (they will start a run). A prompt sent n times counts as seen only as often
+    /// as the history shows it (R27).
     pub(super) async fn caught_up(&self, session: &str, seen: &[String]) {
-        let consumed = {
-            let flights = self.flights.lock().unwrap();
-            let Some(f) = flights.get(session) else { return };
-            seen.iter()
-                .rev()
-                .find_map(|h| f.sent.iter().rposition(|s| s == h))
-                .map_or(0, |i| i + 1)
-        };
-        self.ran(session, consumed).await;
+        let consumed = self.flight(session, |f| {
+            let mut left: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+            for h in seen {
+                *left.entry(h.as_str()).or_default() += 1;
+            }
+            let mut used: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+            let mut consumed = 0;
+            for (i, s) in f.sent.iter().enumerate() {
+                let u = used.entry(s.as_str()).or_default();
+                *u += 1;
+                if *u <= left.get(s.as_str()).copied().unwrap_or(0) {
+                    consumed = i + 1;
+                }
+            }
+            consumed
+        });
+        self.ran(session, consumed.unwrap_or(0)).await;
     }
 
     /// The session's run was stopped or its process is gone: nothing is in flight and
-    /// nothing held is sent.
-    pub(super) fn grounded(&self, session: &str) {
-        self.flights.lock().unwrap().remove(session);
+    /// nothing held is sent. Returns the held ones dropped.
+    pub(super) fn grounded(&self, session: &str) -> Vec<Held> {
+        self.flight(session, |f| {
+            f.sent.clear();
+            std::mem::take(&mut f.held)
+        })
+        .unwrap_or_default()
     }
 
     /// Send `text` to the task, resuming its session first when its process is gone.
@@ -1194,9 +1262,12 @@ impl Super {
         if let Some(w) = &t.worktree {
             match (remove, novacode_tools::worktree::here(w)) {
                 (true, Ok(h)) => {
-                    // A daemon the task started (codegraph's) outlives it and keeps writing there.
-                    let dir = w.clone();
-                    let _ = tokio::task::spawn_blocking(move || novacode_tools::process::stop_inside(&dir)).await;
+                    // A daemon the task started (codegraph's) outlives it and keeps writing there;
+                    // a worktree kept for its uncommitted work keeps what runs in it too (R27).
+                    if h.dirty == 0 {
+                        let dir = w.clone();
+                        let _ = tokio::task::spawn_blocking(move || novacode_tools::process::stop_inside(&dir)).await;
+                    }
                     out += &novacode_tools::worktree::remove(&h)
                 }
                 (true, Err(e)) => out += &format!(" Worktree not removed: {e}."),
@@ -1671,6 +1742,8 @@ mod tests {
         alive: Mutex<HashSet<String>>,
         /// Every start fails (a model without a login, …).
         fail_start: Mutex<bool>,
+        /// The next this many sends fail.
+        fail_sends: Mutex<usize>,
     }
 
     impl Launcher for FakeLauncher {
@@ -1689,6 +1762,12 @@ mod tests {
         }
         fn send_as<'a>(&'a self, session: &'a str, id: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>> {
             Box::pin(async move {
+                let mut fail = self.fail_sends.lock().unwrap();
+                if *fail > 0 {
+                    *fail -= 1;
+                    return Err("socket gone".to_string());
+                }
+                drop(fail);
                 self.ids.lock().unwrap().push(id.to_string());
                 self.log.lock().unwrap().push(format!("send {session} {}", cmd.name()));
                 if matches!(cmd, ClientCmd::Shutdown) {
@@ -1778,6 +1857,40 @@ mod tests {
             asked: Mutex::default(),
             hook: Mutex::default(),
         });
+        let sup = Arc::new(
+            Super::new(
+                &root,
+                home.join("super/x"),
+                test_cfg(&home, max_running),
+                Some(asker.clone()),
+                launcher.clone(),
+            )
+            .unwrap(),
+        );
+        Fx {
+            _tmp: tmp,
+            root,
+            home,
+            sup,
+            launcher,
+            asker,
+            log,
+        }
+    }
+
+    /// The fixture's super after a restart: the same board, a fresh process.
+    fn restarted(fx: &Fx) -> Super {
+        Super::new(
+            &fx.root,
+            fx.home.join("super/x"),
+            test_cfg(&fx.home, 5),
+            Some(fx.asker.clone()),
+            fx.launcher.clone(),
+        )
+        .unwrap()
+    }
+
+    fn test_cfg(home: &Path, max_running: usize) -> Config {
         let tiers = ["quick", "standard", "deep", "review"]
             .iter()
             .map(|n| {
@@ -1790,26 +1903,15 @@ mod tests {
                 )
             })
             .collect();
-        let cfg = Config {
+        Config {
             max_running,
             tiers,
             worktree_copy: vec!["AGENTS.md".into(), ".codegraph".into()],
-            home: home.clone(),
+            home: home.to_path_buf(),
             allow: Arc::new(|m: &str| match m.starts_with("denied/") {
                 true => Err(format!("{m} is denied by models.deny")),
                 false => Ok(()),
             }),
-        };
-        let sup =
-            Arc::new(Super::new(&root, home.join("super/x"), cfg, Some(asker.clone()), launcher.clone()).unwrap());
-        Fx {
-            _tmp: tmp,
-            root,
-            home,
-            sup,
-            launcher,
-            asker,
-            log,
         }
     }
 
@@ -2240,6 +2342,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_held_prompt_survives_super_s_restart_and_goes_when_the_run_ends() {
+        // L10.9 R27 (1): held work lived only in memory; the row stayed `running` forever.
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "t", false)).await.unwrap();
+        fx.sup.ran("s1", 1).await;
+        let ask = json!({"action": "send", "task": "T1-t", "message": "which?", "question": true});
+        run(&fx, ask).await.unwrap();
+        let out = run(&fx, json!({"action": "send", "task": "T1-t", "message": "work"}))
+            .await
+            .unwrap();
+        assert!(out.contains("held"), "{out}");
+        let sup = restarted(&fx);
+        // The question's run ends after the restart: the held work goes.
+        sup.ran("s1", 1).await;
+        assert_eq!(fx.launcher.prompts("s1").last().unwrap(), "work");
+        assert_eq!(
+            fx.launcher.ids.lock().unwrap().last().unwrap(),
+            super::super::link::SUPER_ID
+        );
+    }
+
+    #[tokio::test]
+    async fn a_held_prompt_whose_turn_failed_to_send_does_not_hold_the_next_forever() {
+        // L10.9 R27 (4).
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "t", false)).await.unwrap();
+        // The brief's run is going: a question, then work, wait.
+        let ask = json!({"action": "send", "task": "T1-t", "message": "which?", "question": true});
+        assert!(run(&fx, ask).await.unwrap().contains("held"));
+        let out = run(&fx, json!({"action": "send", "task": "T1-t", "message": "work"}))
+            .await
+            .unwrap();
+        assert!(out.contains("held"), "{out}");
+        // The question can't be sent: nothing of it is in flight, so the work goes.
+        *fx.launcher.fail_sends.lock().unwrap() = 1;
+        fx.sup.ran("s1", 1).await;
+        assert_eq!(fx.launcher.prompts("s1").last().unwrap(), "work");
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_counts_a_repeated_prompt_once_per_time_its_history_shows_it() {
+        // L10.9 R27 (5): two identical prompts sent, the history shows one consumed.
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "t", false)).await.unwrap();
+        fx.sup.ran("s1", 1).await;
+        fx.sup.prompt("s1", "again".into()).await.unwrap();
+        fx.sup.prompt("s1", "again".into()).await.unwrap();
+        let held = fx
+            .sup
+            .prompt_as("s1", super::super::link::SUPER_QUESTION_ID, "which?".into())
+            .await
+            .unwrap();
+        assert!(held);
+        let brief = fx.launcher.prompts("s1")[0].clone();
+        let seen: Vec<String> = [brief.as_str(), "again"]
+            .iter()
+            .map(|t| super::super::board::prompt_hash(t))
+            .collect();
+        fx.sup.caught_up("s1", &seen).await;
+        assert_eq!(
+            fx.launcher.prompts("s1").len(),
+            3,
+            "the second `again` is still in flight"
+        );
+        let seen: Vec<String> = [brief.as_str(), "again", "again"]
+            .iter()
+            .map(|t| super::super::board::prompt_hash(t))
+            .collect();
+        fx.sup.caught_up("s1", &seen).await;
+        assert!(fx.launcher.prompts("s1").last().unwrap().ends_with("which?"));
+    }
+
+    #[tokio::test]
     async fn close_asks_on_a_card_and_keeps_an_unmerged_worktree() {
         let fx = fixture(5, &[None, Some("Close"), Some("Close")]);
         let app = repo(&fx.root, "app");
@@ -2318,6 +2496,29 @@ mod tests {
         let _ = daemon.wait();
         assert!(gone, "the daemon is stopped: {out:?}");
         assert!(!wt.exists(), "{out:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn close_of_a_worktree_with_uncommitted_work_stops_nothing_in_it() {
+        // L10.9 R27 (6): the worktree is kept, so what runs in it (an editor, `tail -f`) is left alone.
+        // Nothing committed: the branch is merged, so a plain close removes the worktree.
+        let fx = fixture(5, &[Some("Close")]);
+        let app = repo(&fx.root, "app");
+        run(&fx, spawn_args("app", "wip", true)).await.unwrap();
+        let wt = app.join(".worktrees/T1-wip");
+        std::fs::write(wt.join("sub/f"), "changed").unwrap();
+        let mut user = std::process::Command::new("sleep")
+            .arg("300")
+            .current_dir(wt.join("sub"))
+            .spawn()
+            .unwrap();
+        let out = run(&fx, json!({"action": "close", "task": "T1-wip"})).await.unwrap();
+        let alive = user.try_wait().unwrap().is_none();
+        let _ = user.kill();
+        let _ = user.wait();
+        assert!(out.contains("NOT removed"), "{out}");
+        assert!(alive, "left running: {out}");
     }
 
     #[tokio::test]
