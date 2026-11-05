@@ -19,7 +19,8 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
         .output()
         .map_err(|e| format!("git: {e}"))?;
     if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        // trim_end: a porcelain status line starts with a meaningful space (` M path`).
+        Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
@@ -854,6 +855,17 @@ mod tests {
         let out = remove(&here(&wt).unwrap());
         assert!(out.contains("Worktree and branch worktree-t removed"), "{out}");
         assert!(!wt.exists());
+    }
+
+    /// R28: `git()` trimmed the leading space of the first ` M path` status line, so the
+    /// refusal named `EADME` and a modified file counted twice with an edited copy.
+    #[test]
+    fn a_modified_tracked_file_is_named_in_full() {
+        let (_d, _root, wt) = copied_worktree();
+        std::fs::write(wt.join("README"), "changed\n").unwrap();
+        assert_eq!(status(&here(&wt).unwrap().r).work, vec!["README".to_string()]);
+        let out = remove(&here(&wt).unwrap());
+        assert!(out.contains("README") && !out.contains(" EADME"), "{out}");
     }
 
     #[test]
