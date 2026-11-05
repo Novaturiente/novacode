@@ -790,7 +790,12 @@ impl Super {
     /// A goal task whose goal is paused (a stop paused it) continues it: the message means continue.
     async fn resume_goal(&self, id: &str, session: &str) -> Result<(), String> {
         let goal = self.row(id)?.goal;
-        if goal && super::link::Goal::read(&self.cfg.home, session) == super::link::Goal::Paused {
+        if goal
+            && matches!(
+                super::link::Goal::read(&self.cfg.home, session),
+                super::link::Goal::Paused(_)
+            )
+        {
             let resume = ClientCmd::Prompt {
                 text: "/goal resume".into(),
                 raw: false,
