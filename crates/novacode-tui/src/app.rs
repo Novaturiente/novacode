@@ -2666,10 +2666,10 @@ fn watch_shell(cmds: &[Vec<String>]) -> String {
         }
     };
     let mut cmds = cmds.to_vec();
+    // An attached new-session runs the chained commands in itself; no fixed name to clash with.
     if let Some(first) = cmds.first_mut() {
-        first.splice(0..1, ["new-session", "-d", "-s", "novacode-watch"].map(String::from));
+        first.splice(0..1, ["new-session".to_string()]);
     }
-    cmds.push(["attach", "-t", "novacode-watch"].map(String::from).to_vec());
     let args: Vec<String> = tmux_chain(&cmds).iter().map(|a| quote(a)).collect();
     format!("tmux {}", args.join(" "))
 }
@@ -2793,9 +2793,9 @@ mod screen_tests {
         let cmds = super::watch_cmds(&rows, "/my apps/nc", Some("/h"));
         assert_eq!(
             super::watch_shell(&cmds),
-            "tmux new-session -d -s novacode-watch -n watch -e NOVACODE_HOME=/h '/my apps/nc' attach s1 \\; \
+            "tmux new-session -n watch -e NOVACODE_HOME=/h '/my apps/nc' attach s1 \\; \
              select-pane -T T1 \\; split-window -e NOVACODE_HOME=/h '/my apps/nc' attach s2 \\; \
-             select-layout tiled \\; select-pane -T T2 \\; attach -t novacode-watch"
+             select-layout tiled \\; select-pane -T T2"
         );
     }
 }
