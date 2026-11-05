@@ -105,8 +105,8 @@ async fn snapshot(cwd: &Path) -> Option<Snap> {
     )
 }
 
-/// Outside git: every file under `cwd` (no `.git`, `node_modules`, `target` or
-/// dot-folders), or `None` past [`WALK_CAP`] files. shortcut: a full walk before
+/// Outside git: every file under `cwd` (no `.git`, `node_modules`, `target`, `__pycache__`
+/// or dot-folders, no `*.pyc` files), or `None` past [`WALK_CAP`] files. shortcut: a full walk before
 /// and after each `bash` call; only a super task's proof log asks for it.
 fn walk(cwd: &Path) -> Option<Snap> {
     let mut snap = Snap::new();
@@ -118,9 +118,12 @@ fn walk(cwd: &Path) -> Option<Snap> {
             let name = e.file_name();
             let name = name.to_string_lossy();
             if t.is_dir() {
-                if !name.starts_with('.') && name != "node_modules" && name != "target" {
+                if !name.starts_with('.') && !["node_modules", "target", "__pycache__"].contains(&&*name) {
                     dirs.push(e.path());
                 }
+                continue;
+            }
+            if name.ends_with(".pyc") {
                 continue;
             }
             if snap.len() == WALK_CAP {
@@ -636,6 +639,17 @@ impl Handler for BashWrites {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_walk_skips_python_bytecode() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("__pycache__")).unwrap();
+        std::fs::write(d.path().join("__pycache__/a.cpython-312.pyc"), "x").unwrap();
+        std::fs::write(d.path().join("b.pyc"), "x").unwrap();
+        std::fs::write(d.path().join("a.py"), "x").unwrap();
+        let snap = super::walk(d.path()).unwrap();
+        assert_eq!(snap.keys().collect::<Vec<_>>(), [&d.path().join("a.py")]);
+    }
+
     #[test]
     fn spots_bash_file_writes() {
         for c in [
