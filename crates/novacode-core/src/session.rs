@@ -248,7 +248,11 @@ impl Store {
     /// A read-only copy of a session that may be open in another process:
     /// no lock, no newline repair, and appends stay in memory (no path).
     pub fn peek(path: &Path) -> Result<Self, StoreError> {
-        let mut s = Self::parse(path, &std::fs::read_to_string(path)?)?;
+        // The writer may be mid-append: drop the unfinished last line, which can end
+        // inside a multi-byte char.
+        let mut bytes = std::fs::read(path)?;
+        bytes.truncate(bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1));
+        let mut s = Self::parse(path, &String::from_utf8_lossy(&bytes))?;
         s.path = None;
         Ok(s)
     }
@@ -1114,6 +1118,12 @@ mod tests {
         let peek = Store::peek(&path).unwrap();
         assert_eq!(peek.projection(), want);
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        // Read while another process appends: half a multi-byte char at the end.
+        let mut torn = before.clone();
+        torn.extend_from_slice("{\"text\":\"é".as_bytes().split_last().unwrap().1);
+        std::fs::write(&path, &torn).unwrap();
+        assert_eq!(Store::peek(&path).unwrap().projection(), want);
+        std::fs::write(&path, &before).unwrap();
         assert_eq!(list(&paths, cwd), vec![path.clone()]);
         assert_eq!(find(&paths, Path::new("/elsewhere"), &s2.id()[..8]).unwrap(), path);
     }

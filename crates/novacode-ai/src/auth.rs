@@ -363,7 +363,8 @@ pub fn resolve_key(value: &str) -> Result<String, AuthError> {
         return std::env::var(var).map_err(|_| AuthError::Key(format!("env var {var} is not set")));
     }
     if let Some(cmd) = v.strip_prefix('!') {
-        let out = std::process::Command::new(novacode_base::platform::sh())
+        let mut c = std::process::Command::new(novacode_base::platform::sh());
+        let out = novacode_base::platform::drop_task_vars(&mut c)
             .arg("-c")
             .arg(cmd)
             .output()?;
@@ -965,6 +966,32 @@ pub mod copilot {
 
 #[cfg(test)]
 mod tests {
+    /// L10.9 Z7: a super task's identity never reaches a `!cmd` key helper or a process
+    /// provider. Runs the `task_env_case`s in a child test process that has the variables set.
+    #[test]
+    fn task_env_is_removed() {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "auth::tests::task_env_case",
+            "process::tests::task_env_case",
+            "--ignored",
+        ]);
+        for v in novacode_base::platform::TASK_VARS {
+            cmd.env(v, "secret");
+        }
+        let out = cmd.output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && text.contains("2 passed"), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run by task_env_is_removed"]
+    fn task_env_case() {
+        let key = super::resolve_key("!echo task=$NOVACODE_TASK token=$NOVACODE_TASK_TOKEN dir=$NOVACODE_SUPER_DIR");
+        assert_eq!(key.unwrap(), "task= token= dir=");
+    }
+
     #[test]
     fn antigravity_client_decodes() {
         let url = super::antigravity::authorize_url("c", "s");
