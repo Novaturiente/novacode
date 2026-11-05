@@ -2,6 +2,21 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.7.0] - 2026-11-05
+
+### Added
+
+- **Super mode (experimental).** `novacode --super` starts one background super agent for a folder. You give it tasks; it runs each as a separate background session (in its own git worktree when it changes code), tracks them on a board, relays their questions and approvals to you labelled by task, checks every `done` against recorded proof, has a stronger model review each code change, and merges or closes only on your confirmation. A **Tasks** tab in the side panel shows the board; Enter attaches to a task (in a new tmux window inside tmux). Tasks outlive the super agent, and a restart reconnects them. See [super mode](docs/super.md).
+- **`models.deny`** setting: glob patterns of models that are never used (session model, `/model`, subagents, helpers, judges). Denied models leave the model list; past costs still count. See [configuration](docs/config.md).
+- **`worktree.copy`** setting: untracked project files (by default `AGENTS.md`, `CLAUDE.md`, `.mcp.json`, `.codegraph/`, `.claude/`, `.novacode/`) are copied into new worktrees, so a gitignored `AGENTS.md` or a codegraph index isn't lost there. Codegraph daemon locks and sockets are never copied.
+- **Wire protocol:** `abort` takes `drop_queued` (also drops queued follow-ups and steering), `agent_end` lists the prompts a run consumed, `set_goal` starts an already-approved goal, and bash/process tool details carry a structured `exit_code`.
+
+### Fixed
+
+- **A git repo nested inside another** gets its own worktrees and git commands instead of the outer repo's.
+- **Child processes of hooks, MCP servers, plugins and extensions** no longer inherit a task's identity variables.
+- **Removing a worktree** names the changed files correctly (the first file lost its first letter) and handles file names git quotes.
+
 ## [0.6.7] - 2026-11-03
 
 ### Fixed
