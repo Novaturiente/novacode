@@ -286,6 +286,12 @@ relayed to the user, with the answer given:\n";
             s += &format!("{}. {c}\n", n + 1);
         }
     }
+    if !t.after.is_empty() {
+        s += "\nAfter merge (runs after merge, not judged now):\n";
+        for a in &t.after {
+            s += &format!("- {a}\n");
+        }
+    }
     if let Some(scope) = &t.scope {
         s += &format!("\nScope (the areas the change should touch): {scope}\n");
     }
@@ -878,6 +884,40 @@ mod tests {
         assert_eq!(b.find("", "make").unwrap().status, BaseStatus::Passes);
     }
 
+    /// L10.9 item 2: after-merge steps (deploy) are listed, not judged; the approval gate
+    /// counts only the criteria.
+    #[tokio::test]
+    async fn the_review_lists_after_steps_without_judging_them() {
+        let fx = fixture("faux/review");
+        fx.run(json!({
+            "action": "spawn", "request": "fix and deploy", "folder": "app", "slug": "fix",
+            "write": true, "type": "change", "criteria": ["the parser accepts tabs"],
+            "after": ["deploy to prod"]
+        }))
+        .await
+        .unwrap();
+        let wt = fx.row("T1-fix").worktree.unwrap();
+        let commit = fx.commit(&wt, "src/a.rs");
+        fx.done("T1-fix", &commit, &["src/a.rs"]);
+        let rv = fx.review_of("T1-fix").await;
+        assert_eq!(
+            rv.criteria,
+            ["the parser accepts tabs"],
+            "the gate counts only the criteria"
+        );
+        assert!(rv.after.is_empty());
+        let brief = fx.prompts("s2").remove(0);
+        assert!(
+            brief.contains("After merge (runs after merge, not judged now):\n- deploy to prod\n"),
+            "{brief}"
+        );
+        fx.report(
+            &rv.id,
+            json!({"verdict": "approved", "findings": ["Criterion 1: met, #3 passes"]}),
+        );
+        fx.until("ready", |fx| fx.row("T1-fix").state == State::Ready).await;
+    }
+
     #[tokio::test]
     async fn a_write_task_s_done_starts_a_review_in_a_scratch_worktree_and_approval_makes_it_ready() {
         let fx = fixture("faux/review");
@@ -1069,8 +1109,8 @@ mod tests {
         let wt = fx.spawn("fix", "standard", "change").await;
         let accept = json!({"action": "accept", "task": "T1-fix"});
         let e = fx.run(accept.clone()).await.unwrap_err();
-        assert!(e.contains("nothing committed"), "{e}");
-        assert!(fx.cards.asked.lock().unwrap().is_empty(), "no card without commits");
+        assert!(e.contains("wait for its report or stop it"), "{e}");
+        assert!(fx.cards.asked.lock().unwrap().is_empty(), "no card while it runs");
         let c = fx.commit(&wt, "src/a.rs");
         fx.done("T1-fix", &c, &["src/a.rs"]);
         let rv = fx.review_of("T1-fix").await;
