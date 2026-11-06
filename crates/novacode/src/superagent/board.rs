@@ -754,14 +754,14 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
         (Event::Accept, Reviewing) if !t.write => stop_review(Ready),
         // A read task that answered in text without `report` (R20).
         (Event::Accept, Blocked) if !t.write && block_is(|b| b.code_made) => go(Ready),
-        (Event::Accept, Reviewing) => Err(format!(
-            "{}: a write task becomes ready only through an approved review",
-            t.label
+        (Event::Accept, Ready | Merging | Archived | Queued) if t.write => Err(format!(
+            "{}: can't ship it without review: it is {} already",
+            t.label,
+            t.state_text()
         )),
-        // The user's call once the rounds are used up (the caller asks on a card first).
-        (Event::Accept, Blocked) if t.write && t.block.as_ref().is_some_and(|b| b.reason == ROUNDS_USED_UP) => {
-            go(Ready)
-        }
+        // Shipped without an approved review: the user's call (the caller checks its commits
+        // and asks on a card first).
+        (Event::Accept, _) if t.write => stop_review(Ready),
         (Event::Review, Reviewing) if !t.write && !reviewing => {
             with(Reviewing, Effect::StartReview { uses_round: true })
         }
@@ -777,10 +777,10 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
                 },
             )
         }
-        // A write task that keeps ending without a report: the caller records its commits first (R23);
-        // a head already approved needs no new review (R27).
-        (Event::Review, Blocked) if t.write && block_is(|b| b.code_made) && t.approval_covers_done() => go(Ready),
-        (Event::Review, Blocked) if t.write && block_is(|b| b.code_made) => {
+        // A write task that keeps ending without a report, or reported `blocked`: the caller records
+        // its commits first (R23, L10.9); a head already approved needs no new review (R27).
+        (Event::Review, Blocked) if t.write && block_is(|b| !b.merge) && t.approval_covers_done() => go(Ready),
+        (Event::Review, Blocked) if t.write && block_is(|b| !b.merge) => {
             with(Reviewing, Effect::StartReview { uses_round: true })
         }
         (Event::Review, Ready) if t.landed != Some(Landed::Merged) => {
@@ -1004,7 +1004,7 @@ impl Board {
             t.landed = None;
             t.accepted = false;
         }
-        if ev == Event::Accept && n.from == State::Blocked && t.write {
+        if ev == Event::Accept && t.write {
             t.accepted = true;
         }
         let ends_review = matches!(
@@ -1597,8 +1597,9 @@ mod tests {
             (n.to, n.effects),
             (Reviewing, vec![Effect::StartReview { uses_round: true }])
         );
-        // A write task becomes ready only through an approved verdict.
-        assert!(next(&row(Reviewing), &Event::Accept, None).is_err());
+        // A write task under review ships without it only on the user's card (the caller asks).
+        let n = next(&row(Reviewing), &Event::Accept, None).unwrap();
+        assert_eq!((n.to, n.effects), (Ready, vec![]));
     }
 
     #[test]
@@ -1608,7 +1609,14 @@ mod tests {
             ..row(Blocked)
         };
         assert_eq!(to(&used_up, Event::Accept), Ready);
-        assert!(next(&row(Blocked), &Event::Accept, None).is_err(), "other blocks");
+        assert_eq!(
+            to(&row(Blocked), Event::Accept),
+            Ready,
+            "other blocks: the caller's card"
+        );
+        for s in [Ready, Merging, Archived, Queued] {
+            assert!(next(&row(s), &Event::Accept, None).is_err(), "{s:?}");
+        }
         let mut b = Board {
             tasks: vec![Task {
                 id: "T1".into(),
@@ -1641,21 +1649,13 @@ mod tests {
         b.apply("T1", Event::Accept).unwrap();
         let t = b.task("T1").unwrap();
         assert_eq!((t.state, t.state_text()), (Ready, "ready".into()));
-        // A block the task reported, or a write task's code-made block, still refuses accept.
+        // A block the read task reported still refuses accept.
         let mut b = Board {
-            tasks: vec![
-                read(Running),
-                Task {
-                    id: "T2".into(),
-                    ..row(Running)
-                },
-            ],
+            tasks: vec![read(Running)],
             ..Board::default()
         };
         b.apply("T1", report(ReportState::Blocked)).unwrap();
         assert!(b.apply("T1", Event::Accept).is_err(), "reported block");
-        b.apply("T2", Event::TurnUnreported).unwrap();
-        assert!(b.apply("T2", Event::Accept).is_err(), "write task");
     }
 
     #[test]
@@ -1966,7 +1966,7 @@ mod tests {
     }
 
     #[test]
-    fn review_from_a_code_made_block_uses_a_round_but_not_from_a_reported_one() {
+    fn review_from_a_code_made_or_reported_block_uses_a_round() {
         // R23: a write task that keeps ending without a report can be reviewed from its commits.
         let mut b = Board {
             tasks: vec![row(Running)],
@@ -1979,11 +1979,21 @@ mod tests {
             (Blocked, Reviewing, vec![Effect::StartReview { uses_round: true }])
         );
         assert_eq!(b.task("T1").unwrap().block, None);
+        // L10.9: a block the task reported too (the caller checks its commits first).
         let reported = Task {
             block: Some(Block::new("reported blocked")),
             ..row(Blocked)
         };
-        let e = next(&reported, &Event::Review, None).unwrap_err();
+        let n = next(&reported, &Event::Review, None).unwrap();
+        assert_eq!(
+            (n.to, n.effects),
+            (Reviewing, vec![Effect::StartReview { uses_round: true }])
+        );
+        let merge = Task {
+            block: Some(Block::new("conflict").merge()),
+            ..row(Blocked)
+        };
+        let e = next(&merge, &Event::Review, None).unwrap_err();
         assert!(e.contains("review is not possible while it is blocked"), "{e}");
     }
 
@@ -2023,7 +2033,7 @@ mod tests {
             (Ready, Event::Stop),
             (Blocked, Event::Stop),
             (Queued, Event::Merge),
-            (Running, Event::Accept),
+            (Merging, Event::Accept),
             (Blocked, report(ReportState::Done)),
             (Ready, report(ReportState::Progress)),
             (Queued, Event::CardOpened),

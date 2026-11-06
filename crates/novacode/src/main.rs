@@ -1636,6 +1636,7 @@ impl Ctx {
                     id.clone(),
                     proof.clone(),
                     seq,
+                    worktree_copy(s),
                 )));
                 (id, proof)
             })

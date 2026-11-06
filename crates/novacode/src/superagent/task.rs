@@ -446,10 +446,25 @@ impl Super {
             "scope" => self.scope(&t, a.request, a.criteria, a.scope).await,
             "review" => {
                 self.check(&t.id, Event::Review)?;
-                // A code-made block (R23): no report, so code takes the facts from its commits.
-                let unreported = (t.state == State::Blocked && t.block.as_ref().is_some_and(|b| b.code_made))
-                    .then(|| commits_done(&t))
-                    .transpose()?;
+                // A code-made block (R23): no report, so code takes the facts from its commits; a
+                // block it reported keeps its `done`, if any, but needs commits too (L10.9).
+                // A worktree now on another branch: its row adopts it first, so the review pins its HEAD.
+                if let Some(wt) = t.worktree.as_ref().filter(|_| t.write) {
+                    let on = git(wt, &["branch", "--show-current"]).ok();
+                    self.adopt_branch(&t.id, on.as_deref().filter(|b| !b.is_empty())).await;
+                }
+                let t = self.row(&t.id)?;
+                let block = t
+                    .block
+                    .as_ref()
+                    .filter(|b| t.state == State::Blocked && t.write && !b.merge);
+                let unreported = match block {
+                    Some(b) => {
+                        let done = commits_done(&t)?;
+                        (b.code_made || t.done.is_none()).then_some(done)
+                    }
+                    None => None,
+                };
                 // Recorded first: an approved head goes to `ready` without a review (R27).
                 let n = self.edit(|b| {
                     let row = b.tasks.iter_mut().find(|r| r.id == t.id).ok_or("no task")?;
@@ -866,6 +881,7 @@ impl Super {
     /// Returns a note per task that failed to start.
     pub async fn pump(&self) -> Vec<String> {
         let mut notes = Vec::new();
+        self.repick_held_reviews();
         loop {
             // Pick and take the slot under one lock: the tick and the tool both pump.
             let took = {
@@ -889,6 +905,36 @@ impl Super {
             }
         }
         notes
+    }
+
+    /// A queued review that never started and waits only for its provider's hold re-picks
+    /// super's current review model; a model that can't be used, or is held too, changes nothing.
+    fn repick_held_reviews(&self) {
+        let held = |b: &Board, t: &Task| {
+            t.kind == Kind::Review
+                && t.state == State::Queued
+                && t.session.is_none()
+                && b.holds.contains_key(provider(&t.model))
+        };
+        let any = {
+            let b = self.board.lock().unwrap();
+            b.tasks.iter().any(|t| held(&b, t))
+        };
+        if !any {
+            return;
+        }
+        let Ok(model) = self.cfg().models.review(&self.current_review_model()) else {
+            return;
+        };
+        let _ = self.edit(|b| {
+            if b.holds.contains_key(provider(&model)) {
+                return;
+            }
+            let ids: Vec<String> = b.tasks.iter().filter(|t| held(b, t)).map(|t| t.id.clone()).collect();
+            for t in b.tasks.iter_mut().filter(|t| ids.contains(&t.id)) {
+                t.model = model.clone();
+            }
+        });
     }
 
     /// Start (or resume) a task's process; a new one gets its brief. On failure the row
@@ -1086,6 +1132,30 @@ impl Super {
                 }
             }
         })
+    }
+
+    /// A write task's report names another branch than its row, checked out in its own worktree:
+    /// the row adopts it, with a charter note, so review, merge and close follow its `HEAD`.
+    pub(super) async fn adopt_branch(&self, id: &str, branch: Option<&str>) {
+        let Ok(t) = self.row(id) else {
+            return;
+        };
+        let (Some(main), Some(wt), Some(old), Some(new)) = (&t.repo, &t.worktree, &t.branch, branch) else {
+            return;
+        };
+        let same = |a: &Path, b: &Path| a.canonicalize().ok().is_some_and(|a| b.canonicalize().ok() == Some(a));
+        if !t.write || old == new || !worktree_of(main, new).is_some_and(|w| same(&w, wt)) {
+            return;
+        }
+        let note = format!("branch changed from {old} to {new}");
+        let adopted = self.edit(|b| {
+            if let Some(row) = b.tasks.iter_mut().find(|r| r.id == id) {
+                row.branch = Some(new.to_string());
+            }
+        });
+        if adopted.is_ok() {
+            let _ = self.add_note(id, note).await;
+        }
     }
 
     /// A raw prompt: a brief or message starting with `!` or `/` is not a command.
@@ -1415,19 +1485,42 @@ impl Super {
     /// review rounds are used up, after the user's OK on a card made by code.
     async fn accept(&self, t: &Task) -> Result<String, String> {
         self.check(&t.id, Event::Accept)?;
-        if t.state == State::Blocked && t.write {
+        // A write task ships without an approved review only on the user's yes, and only committed work.
+        let unreported = if t.write {
+            let done = commits_done(t).map_err(|_| {
+                format!(
+                    "{}: nothing committed past its base, so there is nothing to ship",
+                    t.label
+                )
+            })?;
+            let why = if t
+                .block
+                .as_ref()
+                .is_some_and(|b| b.reason == super::board::ROUNDS_USED_UP)
+            {
+                "Its review rounds are used up"
+            } else {
+                "No review approved its commits"
+            };
             let q = format!(
-                "Accept {} without an approved review? Its review rounds are used up; it becomes ready, \
-                 marked accepted without review, and can be merged.",
+                "Ship {} without an approved review? {why}; it becomes ready, marked accepted without review, \
+                 and can be merged.",
                 t.label
             );
             if !self.confirm(format!("{}: accept", t.label), q, "Accept").await? {
-                return Ok(format!("The user declined: {} stays blocked.", t.label));
+                return Ok(format!("The user declined: {} stays {}.", t.label, t.state.name()));
             }
-        }
+            t.done.is_none().then_some(done)
+        } else {
+            None
+        };
         let (n, reviewer) = self.edit(|b| {
             let r = reviewer(b, &t.id);
-            b.apply(&t.id, Event::Accept).map(|n| (n, r))
+            let n = b.apply(&t.id, Event::Accept)?;
+            if let Some(row) = b.tasks.iter_mut().find(|r| r.id == t.id && r.done.is_none()) {
+                row.done = unreported;
+            }
+            Ok::<_, String>((n, r))
         })??;
         if n.effects.contains(&super::board::Effect::StopReview) {
             self.stop_review(reviewer).await;
@@ -1902,14 +1995,21 @@ pub(super) fn half_done(t: &Task) -> Option<String> {
 /// files changed since its base; no checks. Refused when nothing is committed beyond the base.
 fn commits_done(t: &Task) -> Result<super::board::Done, String> {
     let nothing = || format!("{}: nothing committed to review; send it on or close it", t.label);
-    let (Some(main), Some(branch), Some(base)) = (&t.repo, &t.branch, &t.base_commit) else {
+    let (Some(main), Some(branch), Some(base)) =
+        (&t.repo, &t.branch, t.base_commit.as_ref().or(t.base_branch.as_ref()))
+    else {
         return Err(nothing());
     };
-    let ahead = git(main, &["rev-list", "--count", &format!("{base}..{branch}")])?;
+    // Its worktree's HEAD (the branch it is on), counted from where it left the base.
+    let head = match &t.worktree {
+        Some(wt) => git(wt, &["rev-parse", "HEAD"])?,
+        None => git(main, &["rev-parse", branch])?,
+    };
+    let base = git(main, &["merge-base", &head, base])?;
+    let ahead = git(main, &["rev-list", "--count", &format!("{base}..{head}")])?;
     if ahead.trim() == "0" {
         return Err(nothing());
     }
-    let head = git(main, &["rev-parse", branch])?;
     let copies = t
         .worktree
         .as_deref()
@@ -1965,7 +2065,7 @@ impl Tool for TaskTool {
         "task"
     }
     fn description(&self) -> &str {
-        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], scope?, skills?[], goal?}; info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task, pr?} (each asks the user on a card; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task blocked by used-up review rounds, after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked by code because it kept ending without a report: code takes its commit and changed files from its branch, refused when nothing is committed, and the review uses a round); note {task, note} (keeps a user decision about the task on its charter, which you see with every message); scope {task, request? | criteria? | scope?} (changes the brief, criteria or scope only after the user's OK on a card; code then updates the charter and tells the task); model {task | all, provider | model} (only when the user asks to switch models: each task moves to the matching tier on that provider, or to that model, after one card listing each task's old and new model; a task blocked by a provider limit is told to continue); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
+        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], scope?, skills?[], goal?}; info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task, pr?} (each asks the user on a card; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task with commits past its base, not merging or ready, ships without an approved review after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked because it kept ending without a report, or that reported `blocked`: code takes its commit and changed files from its worktree's HEAD when it has no `done`, refused when nothing is committed, and the review uses a round); note {task, note} (keeps a user decision about the task on its charter, which you see with every message); scope {task, request? | criteria? | scope?} (changes the brief, criteria or scope only after the user's OK on a card; code then updates the charter and tells the task); model {task | all, provider | model} (only when the user asks to switch models: each task moves to the matching tier on that provider, or to that model, after one card listing each task's old and new model; a task blocked by a provider limit is told to continue); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
     }
     fn schema(&self) -> Value {
         let s = |d: &str| json!({ "type": "string", "description": d });
@@ -2757,6 +2857,43 @@ pub(super) mod tests {
         set_state(&fx, "T2-work", State::Stopped);
         fx.sup.pump().await;
         assert_eq!(state(&fx, "T3-held"), State::Queued, "its provider is on hold");
+    }
+
+    #[tokio::test]
+    async fn a_queued_review_on_a_held_provider_re_picks_super_s_current_model() {
+        let fx = fixture(5, &[]);
+        fx.sup
+            .edit(|b| {
+                b.holds.insert(
+                    "held".into(),
+                    super::super::board::Limit {
+                        kind: super::super::board::LimitKind::Quota,
+                        provider: "held".into(),
+                        reset_at: None,
+                    },
+                );
+                for (id, session) in [("T8-review-x", Some("s8")), ("T9-review-y", None)] {
+                    b.tasks.push(Task {
+                        id: id.into(),
+                        label: id.into(),
+                        kind: Kind::Review,
+                        model: "held/m:high".into(),
+                        state: State::Queued,
+                        session: session.map(String::from),
+                        ..Task::default()
+                    });
+                }
+            })
+            .unwrap();
+        fx.sup.pump().await;
+        let t = fx.sup.row("T9-review-y").unwrap();
+        assert_eq!((t.state, t.model.as_str()), (State::Running, "faux/script:medium"));
+        let started = fx.sup.row("T8-review-x").unwrap();
+        assert_eq!(
+            (started.state, started.model.as_str()),
+            (State::Queued, "held/m:high"),
+            "a review that started once keeps its model"
+        );
     }
 
     /// Super on claude with claude and codex logged in, presets only (no overrides).

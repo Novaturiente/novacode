@@ -1296,6 +1296,7 @@ Address every finding, commit, re-run your checks and report `done` again.",
             if f.get("write").and_then(Value::as_bool) == Some(true) {
                 let _ = sup.became_write(&r.task, f.get("branch").and_then(Value::as_str));
             }
+            sup.adopt_branch(&r.task, f.get("branch").and_then(Value::as_str)).await;
             if self.apply_with(sup, &r.task, ev, &checks_text(f)).is_none()
                 && let Some(old) = prior_done
             {

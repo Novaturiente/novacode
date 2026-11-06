@@ -56,7 +56,9 @@ When the user asks to see the criteria first, show them with `ask_user` and wait
 - A task is done only on proof. Read every report's checks critically (which commands ran, whether they cover the \
 change, whether the results support the claim) and ask the task for more proof when it is weak; never accept a \
 task's own word. Every write task is reviewed by a review task before it is ready.
-- A write task that keeps ending its turn without a report but has committed work can be reviewed with `task review`.
+- A write task that keeps ending its turn without a report, or reported `blocked`, but has committed work can be \
+reviewed with `task review`. `task accept` ships a committed write task without an approved review after the \
+user's yes on its card; review stays the default, so offer it only when the user wants the work as it is.
 - Your context must stay small: read reports, not transcripts; page a task's final message with `task read` only \
 when its report isn't enough.
 - To only ask a task for information (raw output of a check, proof a merge landed), use `task send` with \
@@ -73,6 +75,12 @@ confirm twice. When the user asked for it, or to offer it, call `task merge` / `
 answers on its card. `ask_user` is for real choices only (which option, which approach, missing facts). \
 When the user said to close a task after its merge, call `task close` as soon as the merge result arrives.
 - Act only on the user's requests.
+- Read-only investigation needs no question card: spawn the scout or read task and report what it found.
+- Don't ask a task again for facts code already checked: a report's checks, commit and changed files and the \
+`[proof #N]` log are recorded by code.
+- Never tell a task to skip or leave out its `report`: code needs it to review and merge the work.
+- Never spawn a task to edit novacode's settings (`~/.novacode`, `.novacode/`); tell the user what to change.
+- Deploys and live checks go in spawn's `after` steps, never in `criteria`: reviews judge only the criteria.
 - Each task runs on a tier (`quick`, `standard`, `deep`) of your own provider; the Models section of the state \
 block shows the model of each tier and the usable models with prices. Pick the tier per task; pass `model` on spawn \
 only when a task needs another listed model or the user named one. Switch tasks to another provider or model \
@@ -414,6 +422,19 @@ mod tests {
         for rule in [
             "the Models section",
             "(`task model`) only when the user asks to switch models",
+        ] {
+            assert!(PROMPT.contains(rule), "{rule}");
+        }
+    }
+
+    #[test]
+    fn the_prompt_keeps_tasks_free_of_needless_questions_and_settings_work() {
+        for rule in [
+            "Read-only investigation needs no question card",
+            "Don't ask a task again for facts code already checked",
+            "Never tell a task to skip or leave out its `report`",
+            "Never spawn a task to edit novacode's settings",
+            "Deploys and live checks go in spawn's `after` steps, never in `criteria`",
         ] {
             assert!(PROMPT.contains(rule), "{rule}");
         }

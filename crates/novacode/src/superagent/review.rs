@@ -888,8 +888,10 @@ mod tests {
         assert_eq!(rv.label, "T2-review-T1-fix");
         assert_eq!((rv.kind, rv.model.as_str()), (Kind::Review, "faux/script:medium"));
         assert_eq!(fx.row("T1-fix").state, State::Reviewing);
-        let e = fx.run(json!({"action": "accept", "task": "T1-fix"})).await.unwrap_err();
-        assert!(e.contains("only through an approved review"), "{e}");
+        // Shipping without review needs the user's yes on a card; declined, the review goes on.
+        let out = fx.run(json!({"action": "accept", "task": "T1-fix"})).await.unwrap();
+        assert!(out.contains("declined"), "{out}");
+        assert_eq!(fx.row("T1-fix").state, State::Reviewing);
 
         // Its own scratch worktree of the pinned commit, with the copy list; only it is editable.
         // C4: on disk under super's folder, never /tmp (tmpfs).
@@ -1047,7 +1049,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|q| q.starts_with("T1-fix · blocked")
-                    && q.contains("\n\nAccept T1-fix without an approved review?")),
+                    && q.contains("\n\nShip T1-fix without an approved review?")),
             "{:?}",
             fx.cards.asked.lock().unwrap()
         );
@@ -1059,6 +1061,77 @@ mod tests {
         let list = fx.run(json!({"action": "list"})).await.unwrap();
         assert!(list.contains("| ready (accepted without review) |"), "{list}");
         assert_eq!(fx.row("T1-fix").reviewer, None, "no new review");
+    }
+
+    #[tokio::test]
+    async fn accept_ships_a_committed_write_task_without_review_after_a_card() {
+        let fx = fixture("faux/review");
+        let wt = fx.spawn("fix", "standard", "change").await;
+        let accept = json!({"action": "accept", "task": "T1-fix"});
+        let e = fx.run(accept.clone()).await.unwrap_err();
+        assert!(e.contains("nothing committed"), "{e}");
+        assert!(fx.cards.asked.lock().unwrap().is_empty(), "no card without commits");
+        let c = fx.commit(&wt, "src/a.rs");
+        fx.done("T1-fix", &c, &["src/a.rs"]);
+        let rv = fx.review_of("T1-fix").await;
+        *fx.cards.pick.lock().unwrap() = Some("Accept".into());
+        let out = fx.run(accept.clone()).await.unwrap();
+        assert!(out.contains("T1-fix is ready"), "{out}");
+        let q = fx.cards.asked.lock().unwrap().last().cloned().unwrap();
+        assert!(q.contains("Ship T1-fix without an approved review?"), "{q}");
+        let t = fx.row("T1-fix");
+        assert_eq!((t.state, t.accepted, t.reviewer), (State::Ready, true, None));
+        assert_eq!(fx.row(&rv.id).state, State::Archived, "its review is stopped");
+        let e = fx.run(accept).await.unwrap_err();
+        assert!(e.contains("already"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_task_on_another_branch_in_its_worktree_is_adopted_and_reviewed_at_its_head() {
+        let fx = fixture("faux/review");
+        let wt = fx.spawn("fix", "standard", "change").await;
+        sh(&wt, &["checkout", "-qb", "feature-x"]);
+        let head = fx.commit(&wt, "src/a.rs");
+        fx.report(
+            "T1-fix",
+            json!({"state": "done", "summary": "s", "commit": head, "branch": "feature-x", "write": true,
+                   "files_changed": ["src/a.rs"],
+                   "checks": [{"n": 1, "command": "cargo test", "folder": "/w", "exit_code": 0, "tail": "ok"}]}),
+        );
+        let rv = fx.review_of("T1-fix").await;
+        let t = fx.row("T1-fix");
+        assert_eq!(t.branch.as_deref(), Some("feature-x"));
+        assert!(
+            t.notes
+                .iter()
+                .any(|n| n == "branch changed from worktree-T1-fix to feature-x"),
+            "{:?}",
+            t.notes
+        );
+        assert!(!fx.sup.branch_moved(&t), "the review pins the adopted branch's head");
+        assert_eq!(rv.state, State::Running);
+        assert_eq!(
+            sh(&fx.launcher.starts.lock().unwrap()[1].cwd, &["rev-parse", "HEAD"]),
+            head
+        );
+    }
+
+    #[tokio::test]
+    async fn task_review_of_an_unreported_task_on_another_branch_reviews_its_worktree_head() {
+        let fx = fixture("faux/review");
+        let wt = fx.spawn("fix", "quick", "change").await;
+        sh(&wt, &["checkout", "-qb", "feature-y"]);
+        let head = fx.commit(&wt, "src/a.rs");
+        block_unreported(&fx, "T1-fix");
+        fx.run(json!({"action": "review", "task": "T1-fix"})).await.unwrap();
+        let t = fx.row("T1-fix");
+        assert_eq!(t.branch.as_deref(), Some("feature-y"));
+        let done = t.done.clone().unwrap();
+        assert_eq!(
+            (done.commit.as_deref(), done.files),
+            (Some(head.as_str()), vec!["src/a.rs".to_string()])
+        );
+        assert!(!fx.sup.branch_moved(&t));
     }
 
     #[tokio::test]
@@ -1257,16 +1330,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_review_on_a_task_that_reported_blocked_is_refused() {
+    async fn task_review_on_a_task_that_reported_blocked_reviews_its_commits() {
         let fx = fixture("faux/review");
         let wt = fx.spawn("fix", "quick", "change").await;
-        fx.commit(&wt, "src/a.rs");
         fx.report("T1-fix", json!({"state": "blocked", "summary": "need a key"}));
         fx.until("blocked", |fx| fx.row("T1-fix").state == State::Blocked).await;
-        let e = fx.run(json!({"action": "review", "task": "T1-fix"})).await.unwrap_err();
-        assert!(e.contains("review is not possible while it is blocked"), "{e}");
+        let review = json!({"action": "review", "task": "T1-fix"});
+        let e = fx.run(review.clone()).await.unwrap_err();
+        assert_eq!(e, "T1-fix: nothing committed to review; send it on or close it");
+        assert_eq!(fx.row("T1-fix").state, State::Blocked);
+        let head = fx.commit(&wt, "src/a.rs");
+        let out = fx.run(review).await.unwrap();
+        assert!(out.contains("T2-review-T1-fix"), "{out}");
         let t = fx.row("T1-fix");
-        assert_eq!((t.done, t.reviewer), (None, None));
+        assert_eq!((t.state, t.block.clone()), (State::Reviewing, None));
+        let done = t.done.unwrap();
+        assert_eq!(
+            (done.commit.as_deref(), done.files),
+            (Some(head.as_str()), vec!["src/a.rs".to_string()])
+        );
     }
 
     #[tokio::test]

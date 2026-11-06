@@ -553,7 +553,7 @@ struct Git {
     repo: bool,
     branch: Option<String>,
     commit: Option<String>,
-    /// Uncommitted files, copies from `worktree.copy` not counted.
+    /// Uncommitted files, copies from `worktree.copy` and untracked files under its folders not counted.
     dirty: usize,
     linked: bool,
     files: Vec<String>,
@@ -570,17 +570,28 @@ fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
-fn git_facts(cwd: &Path, base: Option<&str>) -> Git {
+fn git_facts(cwd: &Path, base: Option<&str>, copy: &[String]) -> Git {
     if git_out(cwd, &["rev-parse", "--show-toplevel"]).is_none() {
         return Git::default();
     }
     let copies = novacode_tools::worktree::copies(cwd);
+    let status = git_out(cwd, &["status", "--porcelain", "-uall", "--ignore-submodules=all"]).unwrap_or_default();
+    // Untracked files under `worktree.copy` folders (`.novacode/`, `.claude/`) are not work to commit;
+    // close still keeps a worktree holding them (M1).
+    let in_copy: Vec<&str> = status
+        .lines()
+        .filter_map(|l| l.strip_prefix("?? "))
+        .filter(|p| {
+            copy.iter()
+                .any(|c| p.starts_with(&format!("{}/", c.trim_end_matches('/'))))
+        })
+        .collect();
     let (dirty, linked) = match novacode_tools::worktree::here(cwd) {
-        Ok(h) => (h.dirty, true),
-        Err(_) => {
-            let status = git_out(cwd, &["status", "--porcelain", "-uall", "--ignore-submodules=all"]);
-            (status.unwrap_or_default().lines().count(), false)
+        Ok(h) => {
+            let counted = in_copy.iter().filter(|p| !copies.iter().any(|c| c == *p)).count();
+            (h.dirty.saturating_sub(counted), true)
         }
+        Err(_) => (status.lines().count() - in_copy.len(), false),
     };
     let files = base
         .and_then(|b| git_out(cwd, &["diff", "--name-only", &format!("{b}...HEAD")]))
@@ -605,15 +616,18 @@ pub struct ReportTool {
     pub proof: Arc<ProofLog>,
     /// The next report's `seq`.
     seq: AtomicU64,
+    /// `worktree.copy`: untracked files under its folders don't refuse `done`.
+    pub copy: Vec<String>,
 }
 
 impl ReportTool {
     /// `last_seq`: the highest `seq` already on the session's branch ([`last_seq`]).
-    pub fn new(id: Identity, proof: Arc<ProofLog>, last_seq: u64) -> Self {
+    pub fn new(id: Identity, proof: Arc<ProofLog>, last_seq: u64, copy: Vec<String>) -> Self {
         ReportTool {
             id,
             proof,
             seq: AtomicU64::new(last_seq + 1),
+            copy,
         }
     }
 
@@ -709,7 +723,8 @@ commit, and report `merge: rebased`"
         }
         let base = row.base_commit.clone().or(row.base_branch.clone());
         let cwd = ctx.cwd.clone();
-        let git = tokio::task::spawn_blocking(move || git_facts(&cwd, base.as_deref()))
+        let copy = self.copy.clone();
+        let git = tokio::task::spawn_blocking(move || git_facts(&cwd, base.as_deref(), &copy))
             .await
             .unwrap_or_default();
         let write = row.write || git.linked;
@@ -1080,7 +1095,7 @@ mod tests {
             let saved = Arc::new(Mutex::new(Vec::new()));
             let mut f = Fixture {
                 hooks: Default::default(),
-                tool: ReportTool::new(id, Default::default(), 0),
+                tool: ReportTool::new(id, Default::default(), 0, copy_default()),
                 ctx,
                 work,
                 _tmp: tmp,
@@ -1101,7 +1116,7 @@ mod tests {
             }));
             let proof = Arc::new(proof);
             self.hooks.handlers = vec![proof.clone()];
-            self.tool = ReportTool::new(self.tool.id.clone(), proof, 0);
+            self.tool = ReportTool::new(self.tool.id.clone(), proof, 0, self.tool.copy.clone());
         }
 
         /// `/reload` or a resumed task: a new proof log from the saved entries.
@@ -1134,6 +1149,13 @@ mod tests {
         async fn report(&self, args: Value) -> ToolOutput {
             self.call(&self.tool, args).await
         }
+    }
+
+    fn copy_default() -> Vec<String> {
+        novacode_tools::worktree::COPY_DEFAULT
+            .iter()
+            .map(|p| p.to_string())
+            .collect()
     }
 
     fn write_row() -> Task {
@@ -1495,6 +1517,15 @@ mod tests {
         let r = report(&f.report(done).await);
         assert_eq!(r["branch"], "feature");
         assert_eq!(r["files_changed"], json!(["b.txt"]));
+        // L10.9: untracked files under `worktree.copy` folders are not work to commit; others are.
+        for p in [".novacode/settings.json", ".claude/notes/x.md"] {
+            std::fs::create_dir_all(f.work.join(p).parent().unwrap()).unwrap();
+            std::fs::write(f.work.join(p), "x").unwrap();
+        }
+        let done = json!({"state": "done", "summary": "s", "checks": ["#1"]});
+        report(&f.report(done.clone()).await);
+        std::fs::write(f.work.join("c.txt"), "x").unwrap();
+        refused(&f.report(done).await, "1 uncommitted file(s)");
         let head = String::from_utf8(
             Command::new("git")
                 .args(["rev-parse", "HEAD"])
