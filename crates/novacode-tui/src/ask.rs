@@ -27,6 +27,14 @@ pub struct AskReq {
 /// The most preview rows a form shows.
 const PREVIEW_ROWS: usize = 24;
 
+#[derive(Default)]
+struct Sections {
+    choices: Vec<usize>,
+    context_end: usize,
+    preview_start: usize,
+    help_start: usize,
+}
+
 pub struct AskForm {
     pub req: AskReq,
     q: usize,
@@ -44,6 +52,12 @@ pub struct AskForm {
     edited: BTreeSet<(usize, usize)>,
     /// The key that opens the editor, for the keys line (empty = not shown).
     pub edit_key: String,
+    context_scroll: Cell<usize>,
+    context_page: Cell<usize>,
+    context_max: Cell<usize>,
+    /// Number shortcuts may only confirm choices shown in the last draw.
+    visible_shortcuts: Cell<u16>,
+    rendered_selection: Cell<Option<(usize, usize)>>,
 }
 
 pub enum Done {
@@ -72,6 +86,11 @@ impl AskForm {
             width: Cell::new(40),
             edited: BTreeSet::new(),
             edit_key: String::new(),
+            context_scroll: Cell::new(0),
+            context_page: Cell::new(1),
+            context_max: Cell::new(0),
+            visible_shortcuts: Cell::new(u16::MAX),
+            rendered_selection: Cell::new(None),
         }
     }
 
@@ -149,6 +168,7 @@ impl AskForm {
     fn advance(&mut self) -> Done {
         self.typing = false;
         self.noting = false;
+        self.context_scroll.set(0);
         if self.q + 1 < self.req.questions.len() {
             self.q += 1;
             Done::Pending
@@ -170,6 +190,26 @@ impl AskForm {
     /// `a` is the key's editor action from the keymap; the open input edits like the prompt.
     pub fn handle(&mut self, k: KeyEvent, a: Option<A>) -> Done {
         let q = self.q;
+        if matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) {
+            let scroll = self.context_scroll.get();
+            self.context_scroll.set(if k.code == KeyCode::PageUp {
+                scroll.saturating_sub(self.context_page.get())
+            } else {
+                scroll
+                    .saturating_add(self.context_page.get())
+                    .min(self.context_max.get())
+            });
+            return Done::Pending;
+        }
+        // Navigation and confirmation can arrive before the next draw.
+        if matches!(k.code, KeyCode::Enter | KeyCode::Tab)
+            && self
+                .rendered_selection
+                .get()
+                .is_some_and(|shown| shown != (q, self.sel[q]))
+        {
+            return Done::Pending;
+        }
         if self.typing || self.noting {
             let ed = if self.typing {
                 &mut self.typed[q]
@@ -207,6 +247,11 @@ impl AskForm {
                 let i = d as usize - '1' as usize;
                 if i < rows - 1 {
                     self.sel[q] = i;
+                    if self.visible_shortcuts.get() & (1 << i) == 0
+                        || self.rendered_selection.get().is_some_and(|(shown_q, _)| shown_q != q)
+                    {
+                        return Done::Pending;
+                    }
                     if !self.cur().multi {
                         return self.advance();
                     }
@@ -226,7 +271,10 @@ impl AskForm {
                 }
                 return self.advance();
             }
-            KeyCode::Left | KeyCode::BackTab if self.q > 0 => self.q -= 1,
+            KeyCode::Left | KeyCode::BackTab if self.q > 0 => {
+                self.q -= 1;
+                self.context_scroll.set(0);
+            }
             KeyCode::Esc => return Done::Dismissed,
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Done::Dismissed,
             _ => {}
@@ -237,6 +285,12 @@ impl AskForm {
     /// `spaced`: a blank line between the parts, dropped when the screen is short.
     /// Also gives the open input's cursor (row, column).
     fn lines(&self, w: usize, t: &Theme, spaced: bool) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+        let (lines, cursor, _) = self.content(w, t, spaced);
+        (lines, cursor)
+    }
+
+    fn content(&self, w: usize, t: &Theme, spaced: bool) -> (Vec<Line<'static>>, Option<(usize, usize)>, Sections) {
+        let mut sections = Sections::default();
         let q = self.cur();
         let mut out = Vec::new();
         let mut cursor = None;
@@ -277,8 +331,10 @@ impl AskForm {
             ));
         }
         gap(&mut out);
+        sections.context_end = out.len();
         let sel = self.sel[self.q];
         for (i, o) in q.options.iter().enumerate() {
+            sections.choices.push(out.len());
             let focused = i == sel && !self.typing && !self.noting;
             let mark = if q.multi {
                 if self.picked[self.q].contains(&i) {
@@ -317,6 +373,7 @@ impl AskForm {
                 gap(&mut out);
             }
         }
+        sections.choices.push(out.len());
         let typed = &self.typed[self.q];
         let on_text = sel == q.options.len();
         let lead = vec![
@@ -332,6 +389,7 @@ impl AskForm {
             ));
         }
         gap(&mut out);
+        sections.preview_start = out.len();
         if let Some(p) = q.options.get(sel).and_then(|o| o.preview.as_ref()) {
             // Wrapped, not cut: a plan's lines are long. Capped so the keys line stays on screen.
             if self.edited.contains(&(self.q, sel)) {
@@ -370,9 +428,10 @@ impl AskForm {
             };
             keys = format!("{} {what} · {keys}", self.edit_key);
         }
+        sections.help_start = out.len();
         // Wrapped, so a narrow form never hides "Esc dismiss".
         out.extend(wrap::wrap(vec![Span::styled(keys, t.dim)], w, &[], &[]));
-        (out, cursor)
+        (out, cursor, sections)
     }
 
     pub fn height(&self, width: u16) -> u16 {
@@ -393,11 +452,89 @@ impl AskForm {
         }
         let inner = crate::dialog::frame(f, area, &title, t);
         let w = inner.width as usize;
-        let mut lines = self.lines(w, t, true);
-        if lines.0.len() > inner.height as usize {
-            lines = self.lines(w, t, false);
+        let h = inner.height as usize;
+        let mut content = self.content(w, t, true);
+        if content.0.len() > h {
+            content = self.content(w, t, false);
         }
-        let (lines, cursor) = lines;
+        let (mut lines, mut cursor, sections) = content;
+        self.visible_shortcuts.set(u16::MAX);
+        self.rendered_selection.set(Some((self.q, self.sel[self.q])));
+        self.context_max.set(0);
+        if lines.len() > h {
+            let help = lines.split_off(sections.help_start);
+            let preview = lines.split_off(sections.preview_start);
+            let controls = lines.split_off(sections.context_end);
+            // Long cards keep controls and help fixed; overflow shares the context viewport.
+            let budget = h.saturating_sub(help.len() + 1);
+            let control_h = controls.len().min((budget * 2 / 3).max(1)).min(budget);
+            let focus = sections.choices[self.sel[self.q]] - sections.context_end;
+            let choice_end = sections
+                .choices
+                .get(self.sel[self.q] + 1)
+                .map_or(controls.len(), |row| row - sections.context_end);
+            let overflow = cursor.is_none() && choice_end - focus > control_h;
+            if overflow {
+                lines.extend(controls[focus + control_h..choice_end].iter().cloned());
+            }
+            lines.extend(preview);
+            let context_h = budget.saturating_sub(control_h);
+            let max = lines.len().saturating_sub(context_h);
+            self.context_max.set(max);
+            self.context_page.set(context_h.max(1));
+            let top = self.context_scroll.get().min(max);
+            self.context_scroll.set(top);
+            let mut shown: Vec<_> = lines.into_iter().skip(top).take(context_h).collect();
+            shown.push(Line::styled(
+                format!(
+                    "PgUp/PgDn context{} · {}–{} / {}",
+                    if overflow { "/choice" } else { "" },
+                    top + 1,
+                    top + context_h,
+                    max + context_h
+                ),
+                t.dim,
+            ));
+            let target = cursor.map_or(
+                choice_end.saturating_sub(1).min(focus + control_h.saturating_sub(1)),
+                |(r, _)| r - sections.context_end,
+            );
+            let start = target
+                .saturating_sub(control_h.saturating_sub(1))
+                .min(controls.len().saturating_sub(control_h));
+            // A long note still names the choice that Enter will send.
+            let pinned = (focus < start && control_h > 1).then_some(focus);
+            let start = start + usize::from(pinned.is_some());
+            let end = (start + control_h - usize::from(pinned.is_some())).min(controls.len());
+            let control_y = shown.len();
+            if let Some(row) = pinned {
+                shown.push(controls[row].clone());
+            }
+            shown.extend(controls[start..end].iter().cloned());
+            let visible = |row: usize| pinned == Some(row) || (start..end).contains(&row);
+            if !visible(focus) {
+                self.rendered_selection.set(Some((usize::MAX, usize::MAX)));
+            }
+            self.visible_shortcuts.set(
+                sections
+                    .choices
+                    .windows(2)
+                    .take(9)
+                    .enumerate()
+                    .fold(0, |mask, (i, rows)| {
+                        let fully_visible = (rows[0]..rows[1]).all(|row| visible(row - sections.context_end));
+                        mask | if fully_visible { 1 << i } else { 0 }
+                    }),
+            );
+            cursor = cursor.and_then(|(r, c)| {
+                let row = r - sections.context_end;
+                (start..end)
+                    .contains(&row)
+                    .then(|| (control_y + usize::from(pinned.is_some()) + row - start, c))
+            });
+            shown.extend(help);
+            lines = shown;
+        }
         f.render_widget(Paragraph::new(lines), inner);
         if let Some((r, c)) = cursor.filter(|&(r, _)| r < inner.height as usize) {
             f.set_cursor_position(Position::new(inner.x + c as u16, inner.y + r as u16));
@@ -420,6 +557,268 @@ mod tests {
             k,
             crate::keys::Keymap::default().lookup(&k, &[crate::keys::Scope::Editor]),
         )
+    }
+
+    fn structured_form() -> AskForm {
+        let (reply, _) = oneshot::channel();
+        let mut question = String::new();
+        for task in 1..=3 {
+            question.push_str(&format!("Task {task}\n"));
+            for heading in ["Context", "Evidence", "Decision", "Impact", "Recommendation"] {
+                question.push_str(&format!("{heading}:\nTask {task} {heading} details\n\n"));
+            }
+        }
+        AskForm::new(AskReq {
+            id: 1,
+            questions: vec![Question {
+                question,
+                header: Some("T1, T2, T3: question".into()),
+                options: ["Approve", "Revise", "Wait"]
+                    .into_iter()
+                    .map(|label| Choice {
+                        label: label.into(),
+                        description: None,
+                        preview: None,
+                        recommended: false,
+                    })
+                    .collect(),
+                multi: false,
+            }],
+            reply,
+        })
+    }
+
+    fn screen(f: &AskForm, width: u16, height: u16) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        term.draw(|fr| {
+            let area = Rect::new(0, 0, width, f.height(width).min(height * 2 / 3));
+            f.render(fr, area, &Theme::default());
+        })
+        .unwrap();
+        let b = term.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| b[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect()
+    }
+
+    #[test]
+    fn structured_context_scrolls_with_visible_answers() {
+        for (width, height) in [(80, 24), (120, 40)] {
+            let mut f = structured_form();
+            let initial = screen(&f, width, height);
+            for control in [
+                "Task 1",
+                "▸ 1. Approve",
+                "2. Revise",
+                "3. Wait",
+                "Type something",
+                "Esc dismiss",
+                "PgUp/PgDn",
+            ] {
+                assert!(initial.contains(control), "missing {control}: {initial}");
+            }
+            let mut seen = initial;
+            for _ in 0..60 {
+                assert!(matches!(hit(&mut f, KeyCode::PageDown), Done::Pending));
+                let shown = screen(&f, width, height);
+                assert!(
+                    shown.contains("▸ 1. Approve") && shown.contains("Esc dismiss"),
+                    "{shown}"
+                );
+                seen.push_str(&shown);
+            }
+            for task in 1..=3 {
+                for heading in ["Context", "Evidence", "Decision", "Impact", "Recommendation"] {
+                    assert!(seen.contains(&format!("Task {task} {heading} details")), "{seen}");
+                }
+            }
+            for _ in 0..60 {
+                hit(&mut f, KeyCode::PageUp);
+            }
+            assert!(screen(&f, width, height).contains("Task 1"));
+            hit(&mut f, KeyCode::Down);
+            assert!(screen(&f, width, height).contains("▸ 2. Revise"));
+            let Done::Answered(replies) = hit(&mut f, KeyCode::Enter) else {
+                panic!("not answered")
+            };
+            assert_eq!(replies[0].chosen, ["Revise"]);
+        }
+    }
+
+    #[test]
+    fn structured_context_keeps_typed_answer_and_note_visible() {
+        let mut f = structured_form();
+        hit(&mut f, KeyCode::Char('n'));
+        f.paste("with tests");
+        assert!(screen(&f, 80, 24).contains("note: with tests"));
+        hit(&mut f, KeyCode::Esc);
+        hit(&mut f, KeyCode::Up);
+        assert!(screen(&f, 80, 24).contains("Type something"));
+        hit(&mut f, KeyCode::Enter);
+        f.paste("my answer");
+        let shown = screen(&f, 80, 24);
+        assert!(shown.contains("my answer") && shown.contains("Enter answer"), "{shown}");
+        let Done::Answered(replies) = hit(&mut f, KeyCode::Enter) else {
+            panic!("not answered")
+        };
+        assert_eq!(replies[0].text.as_deref(), Some("my answer"));
+    }
+
+    #[test]
+    fn hidden_number_shortcut_focuses_before_confirming() {
+        let mut f = structured_form();
+        for option in &mut f.req.questions[0].options {
+            option.description = Some("Description wraps across many rows. ".repeat(20));
+        }
+        let initial = screen(&f, 80, 24);
+        assert!(initial.contains("▸ 1. Approve"));
+        assert!(!initial.contains("3. Wait"));
+        assert!(matches!(hit(&mut f, KeyCode::Char('3')), Done::Pending));
+        assert!(
+            matches!(hit(&mut f, KeyCode::Enter), Done::Pending),
+            "must draw the new selection first"
+        );
+        let shown = screen(&f, 80, 24);
+        assert!(shown.contains("▸ 3. Wait") && shown.contains("Esc dismiss"), "{shown}");
+        let Done::Answered(replies) = hit(&mut f, KeyCode::Enter) else {
+            panic!("not answered")
+        };
+        assert_eq!(replies[0].chosen, ["Wait"]);
+    }
+
+    #[test]
+    fn partially_visible_number_shortcut_only_focuses() {
+        for multi in [false, true] {
+            let mut f = structured_form();
+            f.req.questions[0].multi = multi;
+            f.req.questions[0].options[1].label = format!("{}LabelEnd", "Wrapped choice ".repeat(40));
+            f.req.questions[0].options[1].description = Some("Hidden description".into());
+            let initial = screen(&f, 80, 24);
+            assert!(
+                initial.contains("2.") && initial.contains("Wrapped choice"),
+                "{initial}"
+            );
+            assert!(
+                !initial.contains("LabelEnd") && !initial.contains("Hidden description"),
+                "{initial}"
+            );
+            assert!(matches!(hit(&mut f, KeyCode::Char('2')), Done::Pending));
+            assert_eq!(f.sel[0], 1);
+            assert!(f.picked[0].is_empty());
+            assert!(matches!(hit(&mut f, KeyCode::Enter), Done::Pending));
+            screen(&f, 80, 24);
+            let mut seen = String::new();
+            for _ in 0..100 {
+                hit(&mut f, KeyCode::PageDown);
+                seen.push_str(&screen(&f, 80, 24));
+            }
+            assert!(
+                seen.contains("LabelEnd") && seen.contains("Hidden description"),
+                "{seen}"
+            );
+            let Done::Answered(replies) = hit(&mut f, KeyCode::Enter) else {
+                panic!("not answered")
+            };
+            assert_eq!(replies[0].chosen, [f.req.questions[0].options[1].label.clone()]);
+        }
+        let mut f = structured_form();
+        screen(&f, 80, 24);
+        let Done::Answered(replies) = hit(&mut f, KeyCode::Char('2')) else {
+            panic!("fully visible choice should submit immediately")
+        };
+        assert_eq!(replies[0].chosen, ["Revise"]);
+    }
+
+    #[test]
+    fn later_choice_shows_wrapped_label_and_description() {
+        let mut f = structured_form();
+        f.req.questions[0].options[1].label = format!("{}label end", "Later choice ".repeat(7));
+        f.req.questions[0].options[1].description = Some("Description end".into());
+        screen(&f, 80, 24);
+        hit(&mut f, KeyCode::Down);
+        let shown = screen(&f, 80, 24);
+        for text in ["▸ 2. Later choice", "label end", "Description end", "Esc dismiss"] {
+            assert!(shown.contains(text), "missing {text}: {shown}");
+        }
+    }
+
+    #[test]
+    fn later_choice_overflow_is_readable_by_paging() {
+        for width in [40, 80] {
+            let mut f = structured_form();
+            f.req.questions[0].options[2].label = "Long label ".repeat(30);
+            f.req.questions[0].options[2].description = Some((0..80).map(|i| format!("Detail-{i:02} ")).collect());
+            f.req.questions[0].options[2].preview = Some("Preview end".into());
+            screen(&f, width, 24);
+            hit(&mut f, KeyCode::Down);
+            hit(&mut f, KeyCode::Down);
+            let (lines, _, sections) = f.content(width as usize - 4, &Theme::default(), false);
+            let expected = &lines[sections.choices[2]..sections.choices[3]];
+            let mut seen = screen(&f, width, 24);
+            assert!(seen.contains("context/choice"), "{seen}");
+            for _ in 0..100 {
+                hit(&mut f, KeyCode::PageDown);
+                let shown = screen(&f, width, 24);
+                assert!(
+                    shown.contains("▸ 3. Long label") && shown.contains("Esc dismiss"),
+                    "{shown}"
+                );
+                seen.push_str(&shown);
+            }
+            for row in expected {
+                let text = wrap::plain(row);
+                assert!(seen.contains(text.trim()), "missing {text}: {seen}");
+            }
+            assert!(seen.contains("Preview end"), "{seen}");
+            for _ in 0..100 {
+                hit(&mut f, KeyCode::PageUp);
+            }
+            assert!(screen(&f, width, 24).contains("Task 1"));
+            let Done::Answered(replies) = hit(&mut f, KeyCode::Enter) else {
+                panic!("not answered")
+            };
+            assert_eq!(replies[0].chosen, [f.req.questions[0].options[2].label.clone()]);
+        }
+    }
+
+    #[test]
+    fn scrolling_preserves_preview_note_and_question_back() {
+        let mut f = structured_form();
+        f.req.questions[0].options[0].preview = Some("Preview first\nPreview last".into());
+        let second = f.req.questions[0].clone();
+        // Build both questions together so their editor and selection state is initialized.
+        let (reply, _) = oneshot::channel();
+        let mut f = AskForm::new(AskReq {
+            id: 1,
+            questions: vec![f.req.questions[0].clone(), second],
+            reply,
+        });
+        screen(&f, 80, 24);
+        for _ in 0..60 {
+            hit(&mut f, KeyCode::PageDown);
+            screen(&f, 80, 24);
+        }
+        let shown = screen(&f, 80, 24);
+        assert!(
+            shown.contains("Preview last") && shown.contains("▸ 1. Approve"),
+            "{shown}"
+        );
+        hit(&mut f, KeyCode::Char('n'));
+        f.paste(&"long note ".repeat(100));
+        f.paste("note end");
+        let shown = screen(&f, 80, 24);
+        assert!(
+            shown.contains("1. Approve") && shown.contains("note end") && shown.contains("Enter choose with note"),
+            "{shown}"
+        );
+        assert!(matches!(hit(&mut f, KeyCode::Enter), Done::Pending));
+        assert!(screen(&f, 80, 24).contains("Task 1"));
+        hit(&mut f, KeyCode::Left);
+        let shown = screen(&f, 80, 24);
+        assert!(
+            shown.contains("Question 1 of 2") && shown.contains("Task 1") && shown.contains("▸ 1. Approve"),
+            "{shown}"
+        );
     }
 
     #[test]

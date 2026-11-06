@@ -1193,6 +1193,7 @@ fn say_of(tool: &Tool) -> novacode_types::Say {
         kind: s("kind"),
         priority: s("priority"),
         tasks: serde_json::from_value(a["tasks"].clone()).unwrap_or_default(),
+        sections: serde_json::from_value(a["sections"].clone()).unwrap_or_default(),
         status: s("status"),
         body: s("body"),
         choices: serde_json::from_value(a["choices"].clone()).unwrap_or_default(),
@@ -1233,30 +1234,75 @@ pub fn lay_say(s: &novacode_types::Say, open: bool, width: usize, t: &Theme) -> 
     let row = |spans: Vec<Span<'static>>, lines: &mut Vec<Line<'static>>| {
         lines.extend(wrap::wrap(spans, width, &bar, &bar));
     };
-    // Labels named without a status line (a call still being written): the labels alone.
-    if s.lines.is_empty() && !s.tasks.is_empty() {
-        row(vec![Span::styled(sanitize(&s.tasks.join(", ")), t.dim)], &mut lines);
-    }
-    for l in &s.lines {
-        row(vec![Span::styled(sanitize(l), t.text)], &mut lines);
-    }
-    if !s.status.is_empty() {
-        row(
-            vec![
-                Span::styled("Where things stand: ", t.text.add_modifier(Modifier::BOLD)),
-                Span::styled(sanitize(&s.status), t.text),
-            ],
-            &mut lines,
-        );
-    }
-    if !s.body.is_empty() {
-        if !s.lines.is_empty() || !s.status.is_empty() {
-            lines.push(Line::from(bar.to_vec()));
+    if s.sections.is_empty() {
+        // Labels named without a status line (a call still being written): the labels alone.
+        if s.lines.is_empty() && !s.tasks.is_empty() {
+            row(vec![Span::styled(sanitize(&s.tasks.join(", ")), t.dim)], &mut lines);
         }
-        for l in markdown::render(&s.body, width.saturating_sub(2).max(1), t, true) {
-            let mut spans = bar.to_vec();
-            spans.extend(l.spans);
-            lines.push(Line::from(spans));
+        for l in &s.lines {
+            row(vec![Span::styled(sanitize(l), t.text)], &mut lines);
+        }
+        if !s.status.is_empty() {
+            row(
+                vec![
+                    Span::styled("Where things stand: ", t.text.add_modifier(Modifier::BOLD)),
+                    Span::styled(sanitize(&s.status), t.text),
+                ],
+                &mut lines,
+            );
+        }
+        if !s.body.is_empty() {
+            if !s.lines.is_empty() || !s.status.is_empty() {
+                lines.push(Line::from(bar.to_vec()));
+            }
+            for l in markdown::render(&s.body, width.saturating_sub(2).max(1), t, true) {
+                let mut spans = bar.to_vec();
+                spans.extend(l.spans);
+                lines.push(Line::from(spans));
+            }
+        }
+    } else {
+        for section in &s.sections {
+            row(
+                vec![Span::styled(
+                    sanitize(&section.task),
+                    t.text.add_modifier(Modifier::BOLD),
+                )],
+                &mut lines,
+            );
+            if !section.line.is_empty() {
+                row(vec![Span::styled(sanitize(&section.line), t.text)], &mut lines);
+            }
+            if let Some(question) = &section.question {
+                for (heading, content) in question.paragraphs() {
+                    row(
+                        vec![Span::styled(format!("{heading}:"), t.text.add_modifier(Modifier::BOLD))],
+                        &mut lines,
+                    );
+                    for l in markdown::render(content, width.saturating_sub(2).max(1), t, true) {
+                        let mut spans = bar.to_vec();
+                        spans.extend(l.spans);
+                        lines.push(Line::from(spans));
+                    }
+                }
+                continue;
+            }
+            if !section.status.is_empty() {
+                row(
+                    vec![
+                        Span::styled("Where things stand: ", t.text.add_modifier(Modifier::BOLD)),
+                        Span::styled(sanitize(&section.status), t.text),
+                    ],
+                    &mut lines,
+                );
+            }
+            if !section.body.is_empty() {
+                for l in markdown::render(&section.body, width.saturating_sub(2).max(1), t, true) {
+                    let mut spans = bar.to_vec();
+                    spans.extend(l.spans);
+                    lines.push(Line::from(spans));
+                }
+            }
         }
     }
     for (i, c) in s.choices.iter().enumerate() {
@@ -1727,6 +1773,280 @@ mod say_tests {
             body: "It asked for **DATABASE_URL**.".into(),
             choices: vec![],
             answer: None,
+            ..Default::default()
+        }
+    }
+
+    fn sectioned() -> Say {
+        serde_json::from_value(json!({
+            "kind": "update", "priority": "high", "time": "14:05", "trigger": "reports",
+            "sections": [
+                {"task": "T1-ui", "line": "T1-ui · done", "status": "UI ready", "body": "First **body**."},
+                {"task": "T2-api", "line": "T2-api · blocked", "status": "Needs URL", "body": "Second body."},
+                {"task": "General", "line": "", "status": "Review next", "body": "Shared note."}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn sections_group_two_tasks_and_general_without_dividers() {
+        let t = Theme::default();
+        let lines = lay_say(&sectioned(), false, 100, &t);
+        assert_eq!(
+            plain(&lines),
+            [
+                "",
+                "╭  UPDATE  HIGH · 14:05 · reports",
+                "│ T1-ui",
+                "│ T1-ui · done",
+                "│ Where things stand: UI ready",
+                "│ First body.",
+                "│ T2-api",
+                "│ T2-api · blocked",
+                "│ Where things stand: Needs URL",
+                "│ Second body.",
+                "│ General",
+                "│ Where things stand: Review next",
+                "│ Shared note.",
+                "╰─",
+            ]
+        );
+        for title in ["T1-ui", "T2-api", "General"] {
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|l| &l.spans)
+                    .any(|s| { s.content == title && s.style.add_modifier.contains(ratatui::style::Modifier::BOLD) }),
+                "{title} must be bold"
+            );
+        }
+    }
+
+    #[test]
+    fn single_section_and_unfinished_call_render_the_same_content() {
+        let args = json!({"kind": "update", "sections": [
+            {"task": "T1-ui", "status": "Building", "body": "One task."}
+        ]});
+        let s: Say = serde_json::from_value(args.clone()).unwrap();
+        let expected = [
+            "",
+            "╭  UPDATE",
+            "│ T1-ui",
+            "│ Where things stand: Building",
+            "│ One task.",
+            "╰─",
+        ];
+        assert_eq!(plain(&lay_say(&s, false, 80, &Theme::default())), expected);
+        let mut tr = Transcript::default();
+        tr.on_message(&call(args));
+        let rendered = plain(&tr.layout(80, &Theme::default()).lines);
+        for line in &expected[1..] {
+            assert!(rendered.iter().any(|l| l == line), "missing {line}: {rendered:?}");
+        }
+        assert!(!rendered.iter().any(|l| l.starts_with("│ T1-ui ·")), "{rendered:?}");
+    }
+
+    #[test]
+    fn sectioned_question_keeps_choices_and_answer() {
+        let mut s = sectioned();
+        s.kind = "question".into();
+        s.choices = vec![Choice {
+            label: "Wait".into(),
+            description: Some("keep blocked".into()),
+            preview: None,
+            recommended: false,
+        }];
+        let t = Theme::default();
+        let open = plain(&lay_say(&s, true, 100, &t));
+        assert_eq!(open[1], "╭  QUESTION  HIGH · 14:05 · reports");
+        assert_eq!(
+            &open[open.len() - 3..],
+            [
+                "│ 1. Wait — keep blocked",
+                "│ waiting for your answer on its card",
+                "╰─"
+            ]
+        );
+        s.answer = Some("Wait".into());
+        let answered = plain(&lay_say(&s, false, 100, &t));
+        assert_eq!(
+            &answered[answered.len() - 3..],
+            ["│ 1. Wait — keep blocked", "│ ✓ you answered: Wait", "╰─"]
+        );
+    }
+
+    fn structured_question() -> Value {
+        let question = json!({
+            "requested": "Ship **the change**.",
+            "verified_result": "Tests passed.",
+            "blockers": [
+                {"issue": "Missing URL.", "evidence": "Config is empty.", "impact": "Cannot connect."},
+                {"issue": "Missing token.", "evidence": "Auth failed.", "impact": "Cannot publish."}
+            ],
+            "input_needed": "Only you own the credentials.",
+            "recommendation": "Provide test credentials.",
+            "risk": "Publishing remains blocked.",
+            "unchanged": "Production stays untouched.",
+            "decision": "Supply credentials or wait."
+        });
+        let mut general = question.clone();
+        general["blockers"] = json!([]);
+        general["input_needed"] = json!("Choose the next priority.");
+        general["risk"] = json!("Not applicable: this only chooses a priority.");
+        general["unchanged"] = json!("Not applicable: no code changes are proposed.");
+        json!({
+            "kind": "question",
+            "sections": [
+                {"task": "T1-ui", "line": "T1-ui · blocked", "question": question,
+                 "status": "Legacy status must not appear", "body": "Legacy body must not appear"},
+                {"task": "T2-api", "line": "T2-api · blocked", "question": question},
+                {"task": "General", "question": general}
+            ],
+            "choices": [{"label": "Wait — keep tasks blocked", "description": "No changes"}]
+        })
+    }
+
+    #[test]
+    fn structured_question_groups_tasks_and_general_with_bold_markdown_paragraphs() {
+        let s: Say = serde_json::from_value(structured_question()).unwrap();
+        let lines = lay_say(&s, false, 100, &Theme::default());
+        let text = plain(&lines);
+        let first = text.iter().position(|l| l == "│ T1-ui").unwrap();
+        let second = text.iter().position(|l| l == "│ T2-api").unwrap();
+        let general = text.iter().position(|l| l == "│ General").unwrap();
+        let paragraphs = [
+            "│ What you requested:",
+            "│ Ship the change.",
+            "│ Verified result:",
+            "│ Tests passed.",
+            "│ Blocker 1:",
+            "│ Missing URL.",
+            "│ Evidence:",
+            "│ Config is empty.",
+            "│ Impact:",
+            "│ Cannot connect.",
+            "│ Blocker 2:",
+            "│ Missing token.",
+            "│ Evidence:",
+            "│ Auth failed.",
+            "│ Impact:",
+            "│ Cannot publish.",
+            "│ Why your input is needed:",
+            "│ Only you own the credentials.",
+            "│ Recommendation:",
+            "│ Provide test credentials.",
+            "│ Risk:",
+            "│ Publishing remains blocked.",
+            "│ What stays unchanged:",
+            "│ Production stays untouched.",
+            "│ Decision:",
+            "│ Supply credentials or wait.",
+        ];
+        assert_eq!(&text[first + 2..second], paragraphs);
+        assert_eq!(&text[second + 2..general], paragraphs);
+        assert_eq!(text[first + 1], "│ T1-ui · blocked");
+        assert_eq!(text[second + 1], "│ T2-api · blocked");
+        assert!(!text.iter().any(|l| l.contains("Legacy") || l == "│"));
+        let general_text = &text[general..];
+        assert!(
+            !general_text
+                .iter()
+                .any(|l| l.contains("Blocker") || l.contains("Evidence:") || l.contains("Impact:"))
+        );
+        assert!(
+            general_text
+                .iter()
+                .any(|l| l == "│ Not applicable: this only chooses a priority.")
+        );
+        assert!(
+            general_text
+                .iter()
+                .any(|l| l == "│ Not applicable: no code changes are proposed.")
+        );
+        for heading in [
+            "What you requested:",
+            "Verified result:",
+            "Blocker 1:",
+            "Blocker 2:",
+            "Evidence:",
+            "Impact:",
+            "Why your input is needed:",
+            "Recommendation:",
+            "Risk:",
+            "What stays unchanged:",
+            "Decision:",
+            "the change",
+        ] {
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|l| &l.spans)
+                    .any(|s| s.content == heading && s.style.add_modifier.contains(ratatui::style::Modifier::BOLD)),
+                "missing bold {heading}"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_question_unfinished_call_keeps_content_choices_and_answer() {
+        let args = structured_question();
+        let mut tr = Transcript::default();
+        tr.on_message(&call(args.clone()));
+        let text = plain(&tr.layout(100, &Theme::default()).lines);
+        assert!(text.iter().any(|l| l == "│ What you requested:"), "{text:?}");
+        assert!(text.iter().any(|l| l == "│ 1. Wait — keep tasks blocked — No changes"));
+        let mut s: Say = serde_json::from_value(args).unwrap();
+        let open = plain(&lay_say(&s, true, 100, &Theme::default()));
+        assert!(open.iter().any(|l| l == "│ waiting for your answer on its card"));
+        s.answer = Some("Wait — keep tasks blocked".into());
+        let answered = plain(&lay_say(&s, false, 100, &Theme::default()));
+        assert!(
+            answered
+                .iter()
+                .any(|l| l == "│ 1. Wait — keep tasks blocked — No changes")
+        );
+        assert!(
+            answered
+                .iter()
+                .any(|l| l == "│ ✓ you answered: Wait — keep tasks blocked")
+        );
+        assert!(!answered.iter().any(|l| l.contains("waiting for your answer")));
+    }
+
+    #[test]
+    fn old_sections_and_structured_questions_replay_identically_to_live() {
+        for (args, expected) in [
+            (
+                serde_json::to_value(sectioned()).unwrap(),
+                "│ Where things stand: UI ready",
+            ),
+            (structured_question(), "│ What you requested:"),
+        ] {
+            let mut s: Say = serde_json::from_value(args.clone()).unwrap();
+            s.answer = Some("Wait — keep tasks blocked".into());
+            let result = Message::ToolResult {
+                call_id: "c1".into(),
+                tool_name: "say".into(),
+                content: vec![Block::text("Shown to the user.")],
+                is_error: false,
+                details: Some(json!({"say": s, "need": "say-1"})),
+            };
+            let mut live = Transcript::default();
+            live.on_message(&call(args.clone()));
+            live.tool_start("c1");
+            live.tool_update("c1", &serde_json::to_string(&json!({"say": s})).unwrap());
+            live.on_message(&result);
+            live.tool_end("c1", false, 5);
+            live.settle();
+            let mut replay = Transcript::default();
+            replay.on_message(&call(args));
+            replay.on_message(&result);
+            replay.settle();
+            let text = plain(&live.layout(100, &Theme::default()).lines);
+            assert_eq!(text, plain(&replay.layout(100, &Theme::default()).lines));
+            assert!(text.iter().any(|l| l == expected), "{text:?}");
+            assert!(text.iter().any(|l| l == "│ ✓ you answered: Wait — keep tasks blocked"));
         }
     }
 
@@ -1808,14 +2128,16 @@ mod say_tests {
     #[test]
     fn a_reattached_window_draws_the_same_block_and_it_never_folds() {
         let t = Theme::default();
-        let s = say("warning");
+        let mut legacy = serde_json::to_value(say("warning")).unwrap();
+        legacy.as_object_mut().unwrap().remove("sections");
+        let s: Say = serde_json::from_value(legacy.clone()).unwrap();
         let args = json!({"kind": "warning", "tasks": ["T2-api"], "status": s.status, "body": s.body});
         let result = Message::ToolResult {
             call_id: "c1".into(),
             tool_name: "say".into(),
             content: vec![Block::text("Shown to the user.")],
             is_error: false,
-            details: Some(json!({"say": s, "need": "say-1"})),
+            details: Some(json!({"say": legacy, "need": "say-1"})),
         };
         // Live: the call, its progress update, the result, then the turn settles.
         let mut live = Transcript::default();

@@ -45,7 +45,7 @@ pub fn builder(
         plain: Some(context_window::Plain {
             tool: "say".into(),
             nudge: super::say::NUDGE.into(),
-            args: Arc::new(|text: &str| json!({ "kind": "note", "body": text })),
+            args: Arc::new(|text: &str| json!({ "kind": "note", "sections": [{"task": "General", "body": text}] })),
         }),
         state: Arc::new(move |store: &Store| {
             *trigger.lock().unwrap() = super::say::trigger(&store.branch());

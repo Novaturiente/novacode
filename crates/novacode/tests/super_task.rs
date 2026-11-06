@@ -129,7 +129,7 @@ fn super_spawns_a_task_after_the_trust_card_and_stops_it() {
     }});
     let stop = json!({"name": "task", "args": {"action": "stop", "task": "T1-note"}});
     // Super's messages go through `say`; an empty reply ends its turn.
-    let say = |t: &str| json!({"tools": [{"name": "say", "args": {"kind": "update", "body": t}}]});
+    let say = |t: &str| json!({"tools": [{"name": "say", "args": {"kind": "update", "sections": [{"task": "General", "body": t}]}}]});
     let lines = [
         json!({"text": "spawning", "tools": [spawn]}),
         say("spawned"),

@@ -812,7 +812,10 @@ pub struct Say {
     pub time: String,
     /// What started the run that sent it: `after T2 reported blocked`, `health check`, `reply to you`.
     pub trigger: String,
-    /// Task labels it is about.
+    /// Task-scoped content; empty for legacy persisted blocks.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<SaySection>,
+    /// Task labels it is about (also used by Needs you).
     pub tasks: Vec<String>,
     /// One board status line per task, written by code.
     pub lines: Vec<String>,
@@ -824,6 +827,69 @@ pub struct Say {
     /// The user's answer on the question's card.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub answer: Option<String>,
+}
+
+/// A task subtitle and its facts within a super message.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SaySection {
+    /// Board task label, or `General` for unrelated content.
+    pub task: String,
+    /// Board status supplied by code; empty for General.
+    pub line: String,
+    pub status: String,
+    pub body: String,
+    /// Required for new questions; absent in older persisted sections.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question: Option<SayQuestion>,
+}
+
+/// The facts and permission boundary needed to answer a super question.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SayQuestion {
+    pub requested: String,
+    pub verified_result: String,
+    pub blockers: Vec<SayBlocker>,
+    pub input_needed: String,
+    pub recommendation: String,
+    pub risk: String,
+    pub unchanged: String,
+    pub decision: String,
+}
+
+/// One distinct blocker; unknowns and explained non-applicability are valid facts.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SayBlocker {
+    pub issue: String,
+    pub evidence: String,
+    pub impact: String,
+}
+
+impl SayQuestion {
+    /// The same readable headings in the transcript and the answer card.
+    pub fn paragraphs(&self) -> Vec<(String, &str)> {
+        let mut parts = vec![
+            ("What you requested".into(), self.requested.as_str()),
+            ("Verified result".into(), self.verified_result.as_str()),
+        ];
+        for (i, b) in self.blockers.iter().enumerate() {
+            parts.extend([
+                (format!("Blocker {}", i + 1), b.issue.as_str()),
+                ("Evidence".into(), b.evidence.as_str()),
+                ("Impact".into(), b.impact.as_str()),
+            ]);
+        }
+        parts.extend([
+            ("Why your input is needed".into(), self.input_needed.as_str()),
+            ("Recommendation".into(), self.recommendation.as_str()),
+            ("Risk".into(), self.risk.as_str()),
+            ("What stays unchanged".into(), self.unchanged.as_str()),
+            ("Decision".into(), self.decision.as_str()),
+        ]);
+        parts
+    }
 }
 
 /// The user's answer to one [`Question`].

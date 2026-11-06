@@ -103,7 +103,13 @@ fn say(text: &str) -> Value {
 
 /// Super's message to the user (its `say` tool), then the empty reply that ends its turn.
 fn tell(text: &str) -> [Value; 2] {
-    [tool("say", json!({"kind": "update", "body": text})), json!({})]
+    [
+        tool(
+            "say",
+            json!({"kind": "update", "sections": [{"task": "General", "body": text}]}),
+        ),
+        json!({}),
+    ]
 }
 
 /// Waits (at most 30 s) until `ok` holds.

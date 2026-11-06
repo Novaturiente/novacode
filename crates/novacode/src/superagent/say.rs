@@ -1,5 +1,5 @@
 //! Super's `say` tool (L10.9 "Structured messages to the user"): every message to the
-//! user is a typed block. The model writes kind, status, body and choices; code checks
+//! user is a typed block. The model writes kind, task sections and choices; code checks
 //! them and adds the frame (time, trigger, a board status line per task), saved in the
 //! result's `details.say` so every window draws the same block, now and on reattach.
 
@@ -8,7 +8,7 @@ use super::task::Super;
 use novacode_core::session::{Entry, EntryKind};
 use novacode_tools::ask::Asker;
 use novacode_tools::{Tool, ToolCtx, ToolOutput};
-use novacode_types::{Block, Choice, Message, Question, Say};
+use novacode_types::{Block, Choice, Message, Question, Say, SayQuestion, SaySection};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,7 @@ pub const KINDS: [&str; 6] = ["update", "question", "warning", "done", "note", "
 
 /// What the code's plain-text nudge starts with (one per run, then a note block).
 pub const NUDGE: &str = "[say] Your last reply was plain text, which the user doesn't get as a message. Send it \
-again with `say` (pick the kind; name the tasks; for a question or warning give the status). If you meant \
+again with `say` (pick the kind; use sections with task labels or General; questions need structured question context, warnings need status). If you meant \
 nothing for the user, reply with nothing.";
 
 /// The trigger of super's current run, set by the context builder at each model call.
@@ -114,12 +114,7 @@ struct Args {
     kind: String,
     #[serde(default)]
     priority: Option<String>,
-    #[serde(default)]
-    tasks: Vec<String>,
-    #[serde(default)]
-    status: String,
-    #[serde(default)]
-    body: String,
+    sections: Vec<ArgSection>,
     #[serde(default)]
     choices: Vec<ArgChoice>,
     #[serde(default)]
@@ -127,10 +122,23 @@ struct Args {
 }
 
 #[derive(Deserialize)]
+struct ArgSection {
+    task: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    question: Option<SayQuestion>,
+}
+
+#[derive(Deserialize)]
 struct ArgChoice {
     label: String,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    action: Option<String>,
 }
 
 /// The checks code makes on a `say` (each refusal goes back to the model).
@@ -143,17 +151,20 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
     {
         return Err("`priority` must be normal or high".into());
     }
-    if matches!(a.kind.as_str(), "question" | "warning") && a.status.trim().is_empty() {
+    if a.sections.is_empty() {
+        return Err("`sections` must not be empty".into());
+    }
+    if a.kind == "warning" && a.sections.iter().any(|s| s.status.trim().is_empty()) {
         return Err(format!(
             "a {} needs `status`: what is true now and what led here",
             a.kind
         ));
     }
     let unknown: Vec<&str> = a
-        .tasks
+        .sections
         .iter()
-        .filter(|l| board.by_label(l).is_none())
-        .map(String::as_str)
+        .map(|s| s.task.as_str())
+        .filter(|l| *l != "General" && board.by_label(l).is_none())
         .collect();
     if !unknown.is_empty() {
         let known: Vec<&str> = board.tasks.iter().map(|t| t.label.as_str()).collect();
@@ -175,12 +186,77 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
     }
     if a.kind == "question" && a.choices.is_empty() && !a.exact_answer {
         return Err(
-            "a question needs `choices`, or `exact_answer: true` when the body asks for one exact answer (a name, a number, a path)"
+            "a question needs `choices`, or `exact_answer: true` when its decision asks for one exact answer (a name, a number, a path)"
                 .into(),
         );
     }
-    if a.body.trim().is_empty() && a.status.trim().is_empty() {
-        return Err("`body` is empty".into());
+    let mut labels = std::collections::HashSet::new();
+    if a.sections.iter().any(|s| !labels.insert(&s.task)) {
+        return Err("each task (or General) must have only one section".into());
+    }
+    if a.kind == "question" {
+        for s in &a.sections {
+            if !s.status.trim().is_empty() || !s.body.trim().is_empty() {
+                return Err(format!(
+                    "{}: question sections use structured question context, not status/body",
+                    s.task
+                ));
+            }
+            let q = s
+                .question
+                .as_ref()
+                .ok_or_else(|| format!("{} needs structured `question` context", s.task))?;
+            for (field, value) in [
+                ("requested", &q.requested),
+                ("verified_result", &q.verified_result),
+                ("input_needed", &q.input_needed),
+                ("recommendation", &q.recommendation),
+                ("risk", &q.risk),
+                ("unchanged", &q.unchanged),
+                ("decision", &q.decision),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(format!(
+                        "{}: question.{field} must not be empty; explain unknown or not applicable truthfully",
+                        s.task
+                    ));
+                }
+            }
+            if q.blockers.is_empty() {
+                return Err(format!(
+                    "{}: question.blockers needs at least one entry; explain if no technical blocker applies",
+                    s.task
+                ));
+            }
+            for (i, b) in q.blockers.iter().enumerate() {
+                for (field, value) in [("issue", &b.issue), ("evidence", &b.evidence), ("impact", &b.impact)] {
+                    if value.trim().is_empty() {
+                        return Err(format!(
+                            "{}: question.blockers[{i}].{field} must not be empty; ask the worker for facts or state what is unknown",
+                            s.task
+                        ));
+                    }
+                }
+            }
+        }
+        if a.choices
+            .iter()
+            .any(|c| !matches!(c.action.as_deref(), Some("answer" | "plan" | "execute")))
+        {
+            return Err(
+                "each question choice needs `action`: answer, plan (prepare only), or execute (make changes)".into(),
+            );
+        }
+    } else {
+        if a.sections.iter().any(|s| s.question.is_some()) {
+            return Err("only a question has structured `question` context; other kinds use status/body".into());
+        }
+        if a.sections
+            .iter()
+            .any(|s| s.body.trim().is_empty() && s.status.trim().is_empty())
+        {
+            return Err("`body` is empty".into());
+        }
     }
     Ok(())
 }
@@ -207,15 +283,35 @@ fn frame(a: &Args, board: &Board, at_ms: u64, trigger: &str) -> Say {
         at_ms,
         time: local_time(at_ms),
         trigger: trigger.to_string(),
-        tasks: a.tasks.clone(),
-        lines: a.tasks.iter().filter_map(|l| board.status_line(l)).collect(),
-        status: a.status.trim().to_string(),
-        body: a.body.trim().to_string(),
+        sections: a
+            .sections
+            .iter()
+            .map(|s| SaySection {
+                task: s.task.clone(),
+                line: board.status_line(&s.task).unwrap_or_default(),
+                status: s.status.trim().to_string(),
+                body: s.body.trim().to_string(),
+                question: s.question.clone(),
+            })
+            .collect(),
+        tasks: a
+            .sections
+            .iter()
+            .filter(|s| s.task != "General")
+            .map(|s| s.task.clone())
+            .collect(),
+        lines: vec![],
+        status: String::new(),
+        body: String::new(),
         choices: a
             .choices
             .iter()
             .map(|c| Choice {
-                label: c.label.clone(),
+                label: match c.action.as_deref() {
+                    Some("plan") => format!("Prepare plan only: {}", c.label),
+                    Some("execute") => format!("Execute changes: {}", c.label),
+                    _ => c.label.clone(),
+                },
                 description: c.description.clone(),
                 preview: None,
                 recommended: false,
@@ -225,7 +321,8 @@ fn frame(a: &Args, board: &Board, at_ms: u64, trigger: &str) -> Say {
     }
 }
 
-/// The question's card: the task labels on its label; status lines, status and body as its text.
+/// The question's card: task subtitles, board lines and the same context headings as the transcript.
+/// Older saved blocks keep their status/body layout.
 pub fn card(s: &Say) -> Question {
     let mut text = String::new();
     for l in &s.lines {
@@ -238,6 +335,27 @@ pub fn card(s: &Say) -> Question {
         text.push('\n');
     }
     text.push_str(&s.body);
+    for section in &s.sections {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(&section.task);
+        text.push('\n');
+        if !section.line.is_empty() {
+            text.push_str(&format!("{}\n", section.line));
+        }
+        if let Some(q) = &section.question {
+            for (heading, content) in q.paragraphs() {
+                text.push_str(&format!("\n{heading}:\n{}\n", content.trim()));
+            }
+        } else {
+            if !section.status.is_empty() {
+                text.push_str(&format!("Where things stand: {}\n", section.status));
+            }
+            text.push('\n');
+            text.push_str(&section.body);
+        }
+    }
     let who = match s.tasks.is_empty() {
         true => "super".to_string(),
         false => s.tasks.join(", "),
@@ -265,13 +383,32 @@ returns the user's answer."
             "properties": {
                 "kind": { "type": "string", "enum": KINDS, "description": "update (task news), question (you need the user's answer), warning (something is wrong), done (work finished), note (an aside), reply (answer to the user's message)." },
                 "priority": { "type": "string", "enum": ["normal", "high"], "description": "high only when the user should look now. Default normal." },
-                "tasks": { "type": "array", "items": { "type": "string" }, "description": "Labels of the tasks it is about (code adds each one's board status). May be empty." },
-                "status": { "type": "string", "description": "Where things stand now and what led here. Required for question and warning." },
-                "body": { "type": "string", "description": "Markdown: what happened, then what you did or need." },
-                "choices": { "type": "array", "items": { "type": "object", "properties": { "label": { "type": "string" }, "description": { "type": "string" } }, "required": ["label"] }, "description": "Only for kind question: its answers (2-6); the user can also type their own." },
-                "exact_answer": { "type": "boolean", "description": "A question without choices: the body asks for one exact answer (a name, number or path) the user types." }
+                "sections": { "type": "array", "minItems": 1, "description": "One subsection per task, with only its facts. Use General for unrelated content. Do not repeat labels.", "items": { "type": "object", "properties": {
+                    "task": { "type": "string", "description": "Exact board task label, or General." },
+                    "status": { "type": "string", "description": "For non-question kinds: where this task stands and what led here. Required for warning." },
+                    "body": { "type": "string", "description": "For non-question kinds: Markdown facts for this task only, then a concrete next action. Questions use question instead." },
+                    "question": { "type": "object", "description": "Required only for question, in every section. Ask the worker for missing facts first. State unknowns explicitly, never invent evidence or impact. For General, truthful not-applicable explanations are valid.", "properties": {
+                        "requested": { "type": "string", "minLength": 1, "description": "What the user requested, in plain language." },
+                        "verified_result": { "type": "string", "minLength": 1, "description": "What is verified now, and what behaviour remains unproven. Do not treat deployment as proof that behaviour works." },
+                        "blockers": { "type": "array", "minItems": 1, "description": "Separate issues, one entry each. If none applies, explain why in an entry; do not invent a technical blocker.", "items": { "type": "object", "properties": {
+                            "issue": { "type": "string", "minLength": 1, "description": "The exact blocker, or why blockers are not applicable." },
+                            "evidence": { "type": "string", "minLength": 1, "description": "Exact failed command/error or observed result; explicitly say what is unknown if unavailable." },
+                            "impact": { "type": "string", "minLength": 1, "description": "Effect on requested behaviour or users; explicitly unknown if not established." }
+                        }, "required": ["issue", "evidence", "impact"] } },
+                        "input_needed": { "type": "string", "minLength": 1, "description": "Why this needs the user's decision rather than more worker fact-finding." },
+                        "recommendation": { "type": "string", "minLength": 1, "description": "Concrete next action; distinguish preparing a plan from executing changes." },
+                        "risk": { "type": "string", "minLength": 1, "description": "Risk of the recommendation, or explain what is unknown/not applicable." },
+                        "unchanged": { "type": "string", "minLength": 1, "description": "What stays unchanged if the user accepts, including production and scope boundaries." },
+                        "decision": { "type": "string", "minLength": 1, "description": "The precise decision or exact answer needed. Permission to plan is not permission to execute." }
+                    }, "required": ["requested", "verified_result", "blockers", "input_needed", "recommendation", "risk", "unchanged", "decision"] }
+                }, "required": ["task"] } },
+                "choices": { "type": "array", "items": { "type": "object", "properties": {
+                    "label": { "type": "string" }, "description": { "type": "string" },
+                    "action": { "type": "string", "enum": ["answer", "plan", "execute"], "description": "answer: information/preference/no changes; plan: prepare a plan only; execute: make the specified changes. Code labels plan/execute explicitly. Never label permission to execute as answer." }
+                }, "required": ["label", "action"] }, "description": "Only for kind question: its answers (2-6); the user can also type their own. Distinguish preparing a plan from executing changes." },
+                "exact_answer": { "type": "boolean", "description": "A question without choices: question.decision asks for one exact answer (a name, number or path) the user types." }
             },
-            "required": ["kind", "body"]
+            "required": ["kind", "sections"]
         })
     }
     fn sequential(&self) -> bool {
@@ -299,7 +436,19 @@ returns the user's answer."
                 // A card's question is kept with its row: a restarted super opens it again.
                 let kept = (a.kind == "question" && !typed).then(|| card(say));
                 if let Err(e) = self.sup.edit(|b| {
-                    b.note_say(&id, &say.kind, &say.tasks, &say.status, typed);
+                    let status = say
+                        .sections
+                        .iter()
+                        .filter_map(|s| {
+                            let status = s
+                                .question
+                                .as_ref()
+                                .map_or(s.status.as_str(), |q| q.verified_result.as_str());
+                            (!status.trim().is_empty()).then(|| format!("{}: {}", s.task, status.trim()))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    b.note_say(&id, &say.kind, &say.tasks, &status, typed);
                     if let Some(n) = b.needs.iter_mut().find(|n| n.id == id) {
                         n.card = kept;
                     }
@@ -366,29 +515,261 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
+    fn question_section(task: &str) -> Value {
+        json!({"task": task, "question": {
+            "requested": "Prove that live input is transformed correctly.",
+            "verified_result": "Deployment succeeded; the live transformation is not yet verified.",
+            "blockers": [
+                {"issue": "Live transformation has no proof", "evidence": "Unknown: worker has not identified a safe live test.", "impact": "The requested live behaviour is still unproven."},
+                {"issue": "Workspace gate failed", "evidence": "scripts/check.sh exited 101: test scoring::round_trip FAILED", "impact": "Unknown: worker must establish whether users are affected."}
+            ],
+            "input_needed": "Investigation outside the scoring files exceeds the approved scope.",
+            "recommendation": "Prepare a bounded investigation plan only; do not execute changes.",
+            "risk": "Completion remains blocked while the plan is prepared.",
+            "unchanged": "Production and the current deployment remain unchanged.",
+            "decision": "May I prepare the investigation plan without changing production?"
+        }})
+    }
+
+    fn question_args(task: &str) -> Value {
+        json!({"kind": "question", "sections": [question_section(task)], "choices": [
+            {"label": "Investigate", "action": "plan"}, {"label": "Keep blocked", "action": "answer"}
+        ]})
+    }
+
+    #[test]
+    fn question_context_requires_every_fact_or_explicit_unknown() {
+        let b = board();
+        let valid = question_args("T2-api");
+        assert_eq!(check(&args(valid.clone()), &b), Ok(()));
+        for field in [
+            "requested",
+            "verified_result",
+            "input_needed",
+            "recommendation",
+            "risk",
+            "unchanged",
+            "decision",
+        ] {
+            for missing in [false, true] {
+                let mut v = valid.clone();
+                let q = v["sections"][0]["question"].as_object_mut().unwrap();
+                if missing {
+                    q.remove(field);
+                } else {
+                    q.insert(field.into(), json!("  \n "));
+                }
+                let e = check(&args(v), &b).unwrap_err();
+                assert!(e.contains(field), "{field}: {e}");
+            }
+        }
+        for field in ["issue", "evidence", "impact"] {
+            let mut v = valid.clone();
+            v["sections"][0]["question"]["blockers"][1]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(check(&args(v), &b).unwrap_err().contains(field));
+        }
+        let mut v = valid.clone();
+        v["sections"][0]["question"]["blockers"] = json!([]);
+        assert!(check(&args(v), &b).unwrap_err().contains("blockers"));
+        let mut v = valid.clone();
+        v["sections"][0].as_object_mut().unwrap().remove("question");
+        assert!(check(&args(v), &b).unwrap_err().contains("question"));
+        let mut v = valid.clone();
+        v["kind"] = json!("note");
+        v["choices"] = json!([]);
+        assert!(check(&args(v), &b).unwrap_err().contains("only a question"));
+        for field in ["status", "body"] {
+            let mut v = valid.clone();
+            v["sections"][0][field] = json!("Do not silently discard these facts");
+            assert!(check(&args(v), &b).unwrap_err().contains("not status/body"));
+        }
+        for action in [json!(null), json!("approve")] {
+            let mut v = valid.clone();
+            v["choices"][0]["action"] = action;
+            let e = check(&args(v), &b).unwrap_err();
+            assert!(e.contains("action"), "{e}");
+        }
+    }
+
+    #[test]
+    fn question_cards_keep_each_tasks_evidence_and_plan_permission_separate() {
+        let mut b = board();
+        b.tasks.push(Task {
+            id: "T1".into(),
+            label: "T1-ui".into(),
+            ..Default::default()
+        });
+        let mut v = question_args("T2-api");
+        v["sections"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, question_section("T1-ui"));
+        v["sections"][0]["question"]["verified_result"] = json!("UI result verified by screenshot.");
+        v["choices"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"label": "Approved patch", "action": "execute"}));
+        let a = args(v);
+        assert_eq!(check(&a, &b), Ok(()));
+        let s = frame(&a, &b, 0, "reply to you");
+        let q = card(&s);
+        let first = q.question.find("T1-ui\n").unwrap();
+        let second = q.question.find("T2-api\n").unwrap();
+        assert!(q.question[first..second].contains("Verified result:\nUI result verified by screenshot."));
+        assert!(q.question[second..].contains("scripts/check.sh exited 101: test scoring::round_trip FAILED"));
+        for heading in [
+            "What you requested",
+            "Blocker 1",
+            "Blocker 2",
+            "Evidence",
+            "Impact",
+            "Why your input is needed",
+            "Recommendation",
+            "Risk",
+            "What stays unchanged",
+            "Decision",
+        ] {
+            assert!(
+                q.question.contains(&format!("{heading}:\n")),
+                "{heading}: {}",
+                q.question
+            );
+        }
+        assert_eq!(q.options[0].label, "Prepare plan only: Investigate");
+        assert_eq!(q.options[1].label, "Keep blocked");
+        assert_eq!(q.options[2].label, "Execute changes: Approved patch");
+        let replay: Say = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(card(&replay), q);
+    }
+
+    #[test]
+    fn general_questions_need_no_fabricated_task_or_technical_blocker() {
+        let mut v = question_args("General");
+        v["choices"] = json!([]);
+        v["exact_answer"] = json!(true);
+        v["sections"][0]["question"] = json!({
+            "requested": "Choose a project name.", "verified_result": "No name has been selected.",
+            "blockers": [{"issue": "Not applicable: this is a naming preference, not a technical failure.", "evidence": "Your request leaves the name open.", "impact": "Only the name depends on your answer."}],
+            "input_needed": "The name is your preference.", "recommendation": "Use Atlas.",
+            "risk": "Unknown: trademark availability has not been checked.", "unchanged": "No files or deployments will change.",
+            "decision": "What name should I record?"
+        });
+        let a = args(v);
+        assert_eq!(check(&a, &Board::default()), Ok(()));
+        let s = frame(&a, &Board::default(), 0, "reply to you");
+        assert!(s.tasks.is_empty());
+        let q = card(&s);
+        assert!(q.question.starts_with("General\n"));
+        assert!(q.question.contains("Not applicable: this is a naming preference"));
+        assert!(q.question.contains("What name should I record?"));
+    }
+
+    #[test]
+    fn legacy_question_cards_replay_without_structured_context() {
+        for (saved, expected) in [
+            (
+                json!({"kind": "question", "tasks": ["T2-api"], "lines": ["T2-api · blocked"], "status": "Old status", "body": "Old decision?"}),
+                "T2-api · blocked\nWhere things stand: Old status\n\nOld decision?",
+            ),
+            (
+                json!({"kind": "question", "tasks": ["T2-api"], "sections": [{"task": "T2-api", "line": "T2-api · blocked", "status": "Old status", "body": "Old decision?"}]}),
+                "T2-api\nT2-api · blocked\nWhere things stand: Old status\n\nOld decision?",
+            ),
+        ] {
+            let s: Say = serde_json::from_value(saved).unwrap();
+            assert_eq!(card(&s).question, expected);
+        }
+    }
+
+    #[test]
+    fn sections_keep_each_tasks_facts_and_general_separate() {
+        let mut b = board();
+        b.tasks.push(Task {
+            id: "T1".into(),
+            label: "T1-ui".into(),
+            ..Default::default()
+        });
+        let a = args(json!({"kind": "update", "sections": [
+            {"task": "T1-ui", "status": "UI ready", "body": "UI facts"},
+            {"task": "T2-api", "status": "API blocked", "body": "API facts"},
+            {"task": "General", "body": "Unrelated facts"}
+        ]}));
+        assert_eq!(check(&a, &b), Ok(()));
+        let s = frame(&a, &b, 0, "reply to you");
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["sections"][0]["task"], "T1-ui");
+        assert!(v["sections"][0]["line"].as_str().unwrap().starts_with("T1-ui ·"));
+        assert_eq!(v["sections"][1]["body"], "API facts");
+        assert!(
+            v["sections"][1]["line"]
+                .as_str()
+                .unwrap()
+                .starts_with("T2-api · blocked")
+        );
+        assert_eq!(v["sections"][2]["line"], "");
+        assert_eq!(v["sections"][2]["body"], "Unrelated facts");
+        assert_eq!(s.tasks, ["T1-ui", "T2-api"]);
+        let q = card(&s);
+        assert!(q.question.contains("T1-ui\n") && q.question.contains("General\n\nUnrelated facts"));
+    }
+
     #[test]
     fn each_refusal_goes_back_to_the_model() {
         let b = board();
         let no = |v: Value| check(&args(v), &b).unwrap_err();
-        assert!(no(json!({"kind": "shout", "body": "x"})).contains("`kind` must be one of"));
-        assert!(no(json!({"kind": "note", "priority": "urgent", "body": "x"})).contains("normal or high"));
-        assert!(no(json!({"kind": "question", "body": "x", "exact_answer": true})).contains("needs `status`"));
-        assert!(no(json!({"kind": "warning", "body": "x"})).contains("a warning needs `status`"));
-        let e = no(json!({"kind": "update", "tasks": ["T9"], "body": "x"}));
+        assert!(
+            no(json!({"kind":"shout","sections":[{"task":"General","status":"","body":"x"}]}))
+                .contains("`kind` must be one of")
+        );
+        assert!(
+            no(json!({"kind":"note","priority":"urgent","sections":[{"task":"General","status":"","body":"x"}]}))
+                .contains("normal or high")
+        );
+        assert!(
+            no(json!({"kind":"question","exact_answer":true,"sections":[{"task":"General"}]}))
+                .contains("needs structured `question` context")
+        );
+        assert!(
+            no(json!({"kind":"warning","sections":[{"task":"General","status":"","body":"x"}]}))
+                .contains("a warning needs `status`")
+        );
+        let e = no(json!({"kind":"update","sections":[{"task":"T9","status":"","body":"x"}]}));
         assert!(e.contains("unknown task label(s): T9") && e.contains("T2-api"), "{e}");
-        assert!(no(json!({"kind": "question", "status": "s", "body": "Port?"})).contains("`exact_answer: true`"));
-        assert!(no(json!({"kind": "note", "body": " "})).contains("`body` is empty"));
+        assert!(
+            no(json!({"kind":"question","sections":[{"task":"General","status":"s","body":"Port?"}]}))
+                .contains("`exact_answer: true`")
+        );
+        assert!(
+            no(json!({"kind":"note","sections":[{"task":"General","status":"","body":" "}]}))
+                .contains("`body` is empty")
+        );
+        assert!(no(json!({"kind": "note", "sections": []})).contains("must not be empty"));
+        assert!(
+            no(json!({"kind": "note", "sections": [
+                {"task": "General", "body": "a"}, {"task": "General", "body": "b"}
+            ]}))
+            .contains("only one section")
+        );
+        assert!(serde_json::from_value::<Args>(json!({"kind": "note", "body": "old input"})).is_err());
         // Choices belong to a question only: it is its own `say`.
-        let e = no(json!({"kind": "done", "body": "Done. Merge?", "choices": [{"label": "Merge"}]}));
+        let e = no(
+            json!({"kind":"done","choices":[{"label":"Merge"}],"sections":[{"task":"General","status":"","body":"Done. Merge?"}]}),
+        );
         assert!(
             e.contains("only a question has `choices`") && e.contains("its own `say` with kind question"),
             "{e}"
         );
         // Accepted: a question with choices, or one exact answer.
+        let mut typed = question_args("General");
+        typed["choices"] = json!([]);
+        typed["exact_answer"] = json!(true);
         for ok in [
-            json!({"kind": "question", "status": "s", "body": "Which?", "choices": [{"label": "A"}]}),
-            json!({"kind": "question", "status": "s", "body": "Port?", "exact_answer": true}),
-            json!({"kind": "update", "tasks": ["T2-api"], "body": "x"}),
+            question_args("General"),
+            typed,
+            json!({"kind":"update","sections":[{"task":"T2-api","status":"","body":"x"}]}),
         ] {
             assert_eq!(check(&args(ok.clone()), &b), Ok(()), "{ok}");
         }
@@ -397,10 +778,16 @@ mod tests {
     #[test]
     fn the_frame_carries_board_status_lines_time_and_trigger() {
         let a = args(
-            json!({"kind": "warning", "priority": "high", "tasks": ["T2-api"], "status": "blocked", "body": "**x**"}),
+            json!({"kind":"warning","priority":"high","sections":[{"task":"T2-api","status":"blocked","body":"**x**"}]}),
         );
         let s = frame(&a, &board(), 1_700_000_000_000, "after T2-api reported blocked");
-        assert_eq!(s.lines, ["T2-api · blocked · needs the db url · no report yet"]);
+        assert_eq!(s.sections.len(), 1);
+        assert_eq!(s.sections[0].task, "T2-api");
+        assert_eq!(
+            s.sections[0].line,
+            "T2-api · blocked · needs the db url · no report yet"
+        );
+        assert!(s.lines.is_empty() && s.body.is_empty() && s.status.is_empty());
         assert_eq!((s.kind.as_str(), s.priority.as_str()), ("warning", "high"));
         assert_eq!(s.trigger, "after T2-api reported blocked");
         assert!(s.time.len() == 5 && s.time.as_bytes()[2] == b':', "{}", s.time);
@@ -414,7 +801,9 @@ mod tests {
             ..s
         });
         assert_eq!(q.header.as_deref(), Some("T2-api: question"));
-        assert!(q.question.starts_with("T2-api · blocked") && q.question.contains("Where things stand: blocked"));
+        assert!(
+            q.question.starts_with("T2-api\nT2-api · blocked") && q.question.contains("Where things stand: blocked")
+        );
     }
 
     fn entry(kind: EntryKind) -> Entry {
@@ -617,13 +1006,9 @@ mod tests {
     async fn a_question_with_choices_opens_a_card_and_returns_the_answer() {
         let (t, asker, d) = tool(Some("Wait")).await;
         let ctx = ctx(d.path());
-        let o = t
-            .execute(
-                json!({"kind": "question", "tasks": ["T2-api"], "status": "T2-api is blocked", "body": "Wait or stop?",
-                       "choices": [{"label": "Wait"}, {"label": "Stop"}]}),
-                &ctx,
-            )
-            .await;
+        let mut input = question_args("T2-api");
+        input["choices"] = json!([{"label": "Wait", "action": "answer"}, {"label": "Prepare a fix", "action": "plan"}]);
+        let o = t.execute(input, &ctx).await;
         assert!(!o.is_error);
         let q = asker.0.lock().unwrap()[0].clone();
         assert_eq!(q.header.as_deref(), Some("T2-api: question"));
@@ -635,34 +1020,87 @@ mod tests {
         assert!(t.sup.board.lock().unwrap().needs.is_empty());
         // A warning stays there until an update on its task.
         t.execute(
-            json!({"kind": "warning", "tasks": ["T2-api"], "status": "s", "body": "b"}),
+            json!({"kind":"warning","sections":[{"task":"T2-api","status":"s","body":"b"}]}),
             &ctx,
         )
         .await;
         assert_eq!(t.sup.board.lock().unwrap().needs.len(), 1);
-        t.execute(json!({"kind": "update", "tasks": ["T2-api"], "body": "fixed"}), &ctx)
-            .await;
+        assert_eq!(t.sup.board.lock().unwrap().needs[0].status, "T2-api: s");
+        t.execute(
+            json!({"kind":"update","sections":[{"task":"T2-api","status":"","body":"fixed"}]}),
+            &ctx,
+        )
+        .await;
         assert!(Board::load(&t.sup.dir).unwrap().needs.is_empty());
         // A refusal is an error result.
-        let o = t.execute(json!({"kind": "warning", "body": "b"}), &ctx).await;
+        let o = t
+            .execute(
+                json!({"kind":"warning","sections":[{"task":"General","status":"","body":"b"}]}),
+                &ctx,
+            )
+            .await;
         assert!(o.is_error);
+    }
+
+    #[test]
+    fn plain_text_fallback_is_a_general_section() {
+        let b = crate::superagent::context::builder(
+            std::path::PathBuf::new(),
+            Arc::new(|| {}),
+            Arc::new(|_| String::new()),
+            Default::default(),
+            Default::default(),
+        );
+        let a = args((b.plain.unwrap().args)("plain reply"));
+        assert_eq!(check(&a, &board()), Ok(()));
+        let s = frame(&a, &board(), 0, "reply to you");
+        assert_eq!(s.sections[0].task, "General");
+        assert_eq!(s.sections[0].body, "plain reply");
+        assert!(s.sections[0].line.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_structured_typed_question_stays_until_a_reply() {
+        let (t, asker, d) = tool(None).await;
+        let ctx = ctx(d.path());
+        let mut input = question_args("General");
+        input["choices"] = json!([]);
+        input["exact_answer"] = json!(true);
+        let o = t.execute(input, &ctx).await;
+        assert!(!o.is_error);
+        assert!(asker.0.lock().unwrap().is_empty());
+        let saved = Board::load(&t.sup.dir).unwrap();
+        assert_eq!(saved.needs.len(), 1);
+        assert!(saved.needs[0].typed && saved.needs[0].card.is_none());
+        assert!(saved.needs[0].status.starts_with("General: Deployment succeeded"));
+        let o = t
+            .execute(
+                json!({"kind": "reply", "sections": [{"task": "General", "body": "I will prepare the plan only."}]}),
+                &ctx,
+            )
+            .await;
+        assert!(!o.is_error);
+        assert!(Board::load(&t.sup.dir).unwrap().needs.is_empty());
     }
 
     #[tokio::test]
     async fn a_dismissed_card_stays_on_needs_you() {
         let (t, _, d) = tool(None).await;
         let ctx = ctx(d.path());
-        let o = t
-            .execute(
-                json!({"kind": "question", "status": "s", "body": "Which?", "choices": [{"label": "A"}]}),
-                &ctx,
-            )
-            .await;
+        let o = t.execute(question_args("General"), &ctx).await;
         let text = match &o.content[0] {
             Block::Text { text, .. } => text.clone(),
             _ => String::new(),
         };
         assert!(text.contains("closed the card"), "{text}");
-        assert_eq!(t.sup.board.lock().unwrap().needs.len(), 1);
+        let saved = Board::load(&t.sup.dir).unwrap();
+        assert_eq!(saved.needs.len(), 1);
+        assert!(saved.needs[0].status.starts_with("General: Deployment succeeded"));
+        let kept = saved.needs[0].card.as_ref().unwrap();
+        assert!(
+            kept.question
+                .contains("What stays unchanged:\nProduction and the current deployment remain unchanged.")
+        );
+        assert_eq!(kept.options[0].label, "Prepare plan only: Investigate");
     }
 }

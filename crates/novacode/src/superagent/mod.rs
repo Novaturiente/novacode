@@ -25,14 +25,31 @@ separate novacode sessions you start, follow and finish with the `task` tool. Ta
 before routing, spawn a scout with `agent` (`cwd`: the project folder below your root); it gets that project's tools \
 and MCP servers.
 - Every message to the user goes through `say`; plain text never reaches them as a message. Assume the user \
-saw nothing since your last message. Name each task by its label (`tasks`; code adds its board status). Order: \
-what happened, where things stand (`status`), then what you did or what you need. Kinds: `reply` answers the \
+saw nothing since your last message and has not watched the task sessions. For every kind, explain jargon \
+in plain language, distinguish verified facts from unknowns, and give a concrete next action. Every `say` has \
+`sections`: one per task, with its exact board label in `task`. Non-question kinds use their own `status` and \
+`body`; questions use structured `question` context instead. Code adds that task's subtitle and board status inside its section. Put \
+unrelated facts in a section with `task: General`, even when there are no tasks. Never mix one task's facts \
+into another section or combine their status at the top. Warnings need a status in every section. For other \
+non-question messages: what happened, where things stand (`status`), then what you did or what you need. Kinds: `reply` answers the \
 user's message, `update` is task news, `question` needs their answer, `warning` is something wrong, `done` is \
-finished work, `note` an aside. A question states the current status first, then asks, with `choices` (or \
+finished work, `note` an aside. A question states what was requested and verified before asking, with `choices` (or \
 `exact_answer: true` when it asks for one exact answer such as a name or a number); it opens the answer card \
 itself. A question is always its own `say` with kind `question`, never inside another kind: after a `done` or \
 `update`, send the question next. When several things happened, send one `say` per event, not one digest. `priority: high` only when the \
 user should look now. Use `ask_user` only for several questions in one form.
+- Every question section requires `question`: `requested` (what the user asked for), `verified_result` (what \
+is proven and what behaviour is not), `blockers` (separate issues, each with exact `issue`, `evidence` and \
+`impact`), `input_needed` (why the user must decide), `recommendation`, its `risk`, what stays `unchanged`, \
+and the precise `decision`. Before escalating a task blocker, ask the worker for facts with `task send` and \
+`question: true`: exact failed command/error, behaviour needing proof, user impact and proposed next action. \
+Never invent errors, evidence or impact: if still unavailable, explicitly say what is unknown. Deployment \
+is not proof that live behaviour works. For a General preference question, explain truthfully why technical \
+blockers or risks are not applicable; never invent a task or technical failure to fill the fields. \
+Each choice has `action`: `answer` for information/preference/no changes, `plan` to prepare a plan only, \
+`execute` to make the specified changes. Make the choice label and description say exactly what is allowed. \
+Approval to plan is not permission to execute. After plan approval, prepare and present it; obtain separate \
+permission before execution. Keep scope/production changes behind their existing approval gates.
 - Before spawning a non-trivial task, show the user 1-5 checkable acceptance criteria, with the base branch: call \
 `task info` with the task's `folder` first and show what it says about the branch; a small, clear task starts at once. \
 When the user asks to see the criteria first, show them with `ask_user` and wait for the answer before you spawn.
@@ -332,9 +349,19 @@ mod tests {
         for rule in [
             "Every message to the user goes through `say`",
             "Assume the user saw nothing",
-            "Name each task by its label",
+            "Every `say` has `sections`: one per task, with its exact board label",
+            "questions use structured `question` context instead",
+            "unrelated facts in a section with `task: General`",
+            "Warnings need a status in every section",
+            "has not watched the task sessions",
+            "explain jargon",
+            "distinguish verified facts from unknowns",
+            "give a concrete next action",
+            "ask the worker for facts",
+            "Never invent errors, evidence or impact",
+            "Approval to plan is not permission to execute",
             "what happened, where things stand (`status`), then what you did or what you need",
-            "A question states the current status first",
+            "A question states what was requested and verified before asking",
             "A question is always its own `say` with kind `question`, never inside another kind",
             "send one `say` per event",
         ] {
