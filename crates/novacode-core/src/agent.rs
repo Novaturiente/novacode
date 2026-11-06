@@ -139,6 +139,8 @@ pub struct Agent {
     /// Super's rebuilt context (L10.9): each request is built from the projection; the
     /// session file is unchanged. `None` = the projection is sent as is.
     context: Option<crate::context_window::Builder>,
+    /// Super's root-based name, never replaced by manual or automatic naming.
+    fixed_name: Option<String>,
 }
 
 struct Plugins {
@@ -461,6 +463,7 @@ impl Agent {
             extensions: None,
             plugins: None,
             context: None,
+            fixed_name: None,
             pending_cp: None,
             cwd_gone: false,
         };
@@ -837,6 +840,18 @@ impl Agent {
         self
     }
 
+    /// Fix the session's name, including when resuming an older named session.
+    pub fn with_fixed_name(mut self, name: String) -> Self {
+        if self.store.name() != Some((name.clone(), false)) {
+            self.add(EntryKind::SessionInfo {
+                name: name.clone(),
+                auto: false,
+            });
+        }
+        self.fixed_name = Some(name);
+        self
+    }
+
     /// Name the session automatically (L4.18); needs the observer's small model.
     pub fn with_auto_name(mut self) -> Self {
         if let Some(m) = self.memory.as_mut() {
@@ -850,7 +865,7 @@ impl Agent {
     /// touched; the name lands when the owner is idle. A `/name` pins the name.
     fn start_naming(&mut self) {
         let Some(m) = self.memory.as_mut() else { return };
-        if !m.auto_name {
+        if !m.auto_name || self.fixed_name.is_some() {
             return;
         }
         let path = self.store.branch();
@@ -2882,17 +2897,24 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
             agent.flush_ext_state();
             agent.collect_notes(false).await;
             if let Some(name) = agent.shared.rename.lock().unwrap().take() {
-                log_err(agent.store.append(crate::session::EntryKind::SessionInfo {
-                    name: name.clone(),
-                    auto: false,
-                }));
-                agent.emit(AgentEvent::Stream(StreamEvent::Notice {
-                    text: format!("session named \"{name}\""),
-                }));
-                agent.emit(AgentEvent::SessionNamed { name });
+                if let Some(fixed) = &agent.fixed_name {
+                    agent.emit(AgentEvent::Stream(StreamEvent::Notice {
+                        text: format!("this session's name is fixed as \"{fixed}\"; /name cannot change it"),
+                    }));
+                } else {
+                    log_err(agent.store.append(crate::session::EntryKind::SessionInfo {
+                        name: name.clone(),
+                        auto: false,
+                    }));
+                    agent.emit(AgentEvent::Stream(StreamEvent::Notice {
+                        text: format!("session named \"{name}\""),
+                    }));
+                    agent.emit(AgentEvent::SessionNamed { name });
+                }
             }
             let auto = agent.shared.auto_name.lock().unwrap().take();
             if let Some(name) = auto
+                && agent.fixed_name.is_none()
                 && agent.store.name().is_none_or(|(_, auto)| auto)
             {
                 log_err(agent.store.append(crate::session::EntryKind::SessionInfo {

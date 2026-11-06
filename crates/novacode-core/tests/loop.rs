@@ -953,6 +953,69 @@ async fn session_is_named_by_the_small_model_unless_pinned() {
     assert_eq!(asked, 0);
 }
 
+/// Super names replace old conversation names on resume and cannot be changed.
+#[tokio::test]
+async fn fixed_super_name_survives_resume_and_refuses_renaming() {
+    use novacode_core::memory::{Settings, Worker};
+    use novacode_core::session::EntryKind;
+    for old in [None, Some(("conversation title", true)), Some(("custom title", false))] {
+        let work = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut store = Store::create(&Paths::new(home.path()), work.path(), false);
+        if let Some((name, auto)) = old {
+            store
+                .append(EntryKind::SessionInfo {
+                    name: name.into(),
+                    auto,
+                })
+                .unwrap();
+            store.flush().unwrap();
+            let path = store.path().unwrap().to_path_buf();
+            drop(store);
+            store = Store::open(&path).unwrap();
+        }
+        let namer = Faux::new([FauxReply::text("wrong title")]);
+        let asked = namer.requests.clone();
+        let agent = Agent::new(
+            Arc::new(Faux::new([FauxReply::text("hello")])),
+            vec![],
+            store,
+            cfg(work.path(), home.path()),
+            Arc::new(LocalEnv),
+        )
+        .with_fixed_name("Super · EEC-Learning".into())
+        .with_memory(
+            Worker {
+                adapter: Arc::new(namer),
+                provider: "faux".into(),
+                model: "small".into(),
+            },
+            Settings::for_window(200_000),
+        )
+        .with_auto_name();
+        assert_eq!(agent.store.name(), Some(("Super · EEC-Learning".into(), false)));
+        let (h, task) = agent::spawn(agent);
+        let mut rx = h.subscribe();
+        h.rename("replace the super name");
+        h.prompt("hello");
+        let mut refused = false;
+        loop {
+            match rx.recv().await.unwrap() {
+                AgentEvent::Stream(novacode_types::StreamEvent::Notice { text }) => {
+                    refused |= text.contains("fixed") && text.contains("Super · EEC-Learning");
+                }
+                AgentEvent::Settled => break,
+                _ => {}
+            }
+        }
+        h.shutdown();
+        let agent = task.await.unwrap();
+        assert!(refused, "manual rename must explain the fixed name");
+        assert_eq!(agent.store.name(), Some(("Super · EEC-Learning".into(), false)));
+        assert!(asked.lock().unwrap().is_empty(), "fixed names never call the namer");
+    }
+}
+
 /// M7 check: a long session compacts with no LLM call for the summary. The
 /// observer runs in the background as the session grows, catches up to the cut,
 /// and the next request carries the rendered notes plus the kept tail.

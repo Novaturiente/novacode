@@ -1991,6 +1991,8 @@ impl Ctx {
                 None => agent = agent.with_memory(session_worker, m).without_observer(),
             }
             if is_super {
+                let root = self.cwd.file_name().unwrap_or(self.cwd.as_os_str()).to_string_lossy();
+                agent = agent.with_fixed_name(format!("Super · {root}"));
                 let dir = superagent::entry::dir(self.paths.home(), &self.cwd);
                 agent = agent.with_compaction_guide_fn(Arc::new(superagent::compaction_guide(dir.clone())));
                 // Rebuilt every request: state block + newest chat in 6k tokens (L10.9).
@@ -2021,7 +2023,7 @@ impl Ctx {
                 ));
             }
             // Named for the session list (L4.18); not scripts, pipelines or subagents.
-            if self.cli.print.is_none() && !self.cli.rpc {
+            if !is_super && self.cli.print.is_none() && !self.cli.rpc {
                 agent = agent.with_auto_name();
             }
         }

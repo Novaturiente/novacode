@@ -72,7 +72,10 @@ fn two_concurrent_launches_give_one_super_and_both_attach() {
     // A third launch reattaches to the same super; a nested one is refused.
     let c = launch(&root, &home, &[]).output().unwrap();
     let nested = launch(&root.join("app"), &home, &[]).output().unwrap();
+    let run: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join("run").join(format!("{ida}.json"))).unwrap()).unwrap();
     cleanup(&ida);
+    assert_eq!(run["state"]["name"], "Super · projects");
     assert_eq!(live, 1, "one super runs: {list}");
     assert_eq!(String::from_utf8_lossy(&c.stdout).trim(), ida, "{}", text(&c));
     assert!(!nested.status.success(), "{}", text(&nested));
@@ -80,6 +83,42 @@ fn two_concurrent_launches_give_one_super_and_both_attach() {
         String::from_utf8_lossy(&nested.stderr).contains("inside"),
         "{}",
         text(&nested)
+    );
+}
+
+#[test]
+fn resumed_super_replaces_its_old_conversation_name() {
+    use novacode_base::paths::Paths;
+    use novacode_core::session::{EntryKind, Store};
+    let dir = tempfile::tempdir().unwrap();
+    let (home, root) = (dir.path().join("home"), dir.path().join("EEC-Learning"));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut old = Store::create(&Paths::new(&home), &root, false);
+    old.append(EntryKind::SessionInfo {
+        name: "old conversation".into(),
+        auto: true,
+    })
+    .unwrap();
+    old.flush().unwrap();
+    let id = old.id().to_string();
+    let path = old.path().unwrap().to_path_buf();
+    drop(old);
+    let super_dir = home.join("super").join(novacode_core::trust::path_key(&root));
+    std::fs::create_dir_all(&super_dir).unwrap();
+    std::fs::write(super_dir.join("session"), &id).unwrap();
+    let script = dir.path().join("super.jsonl");
+    std::fs::write(&script, "").unwrap();
+    let out = launch(&root, &home, &["-m", "faux/script"])
+        .env("NOVACODE_FAUX_SCRIPT", &script)
+        .output()
+        .unwrap();
+    let resumed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    stop(&home, &resumed);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(resumed, id);
+    assert_eq!(
+        Store::open(&path).unwrap().name(),
+        Some(("Super · EEC-Learning".into(), false))
     );
 }
 
