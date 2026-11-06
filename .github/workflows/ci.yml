@@ -37,7 +37,7 @@ jobs:
       - run: cargo build --locked -p novacode --no-default-features
   # The release builds macOS too; catch Linux-only code before a tag does.
   macos:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
