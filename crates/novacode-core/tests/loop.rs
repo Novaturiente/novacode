@@ -1310,6 +1310,129 @@ async fn plain_text_is_nudged_once_then_sent_as_a_note_and_a_check_ok_stays_quie
     assert_eq!(results, 2);
 }
 
+/// L10.9 super's `say`: plain text is never shown raw in a window. Text with no `say` in the
+/// run is held back (no message event) while its nudge is pending, then hidden; text after a
+/// `say` in the same run is a redundant recap: hidden, no nudge. The session file keeps both.
+#[tokio::test]
+async fn plain_text_is_never_shown_raw_and_a_recap_after_say_gets_no_nudge() {
+    use novacode_core::context_window::{Builder, Plain};
+    struct Rec;
+    impl novacode_tools::Tool for Rec {
+        fn name(&self) -> &str {
+            "say"
+        }
+        fn description(&self) -> &str {
+            "say"
+        }
+        fn schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn read_only(&self) -> bool {
+            true
+        }
+        fn execute<'a>(
+            &'a self,
+            _: Value,
+            _: &'a novacode_tools::ToolCtx,
+        ) -> futures_util::future::BoxFuture<'a, novacode_tools::ToolOutput> {
+            Box::pin(async { novacode_tools::ToolOutput::text("shown") })
+        }
+    }
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let say_call = Block::ToolCall(ToolCall {
+        id: "c1".into(),
+        name: "say".into(),
+        arguments: json!({"kind": "update", "body": "x"}),
+        arguments_error: None,
+        replay: None,
+    });
+    let main = Faux::new([
+        FauxReply::text("plain one"),
+        FauxReply::Message {
+            blocks: vec![say_call],
+            stop: StopReason::Stop,
+            usage: Usage::default(),
+        },
+        FauxReply::text("recap of what I said"),
+    ]);
+    let reqs = main.requests.clone();
+    let mut tools = novacode_tools::builtins(false);
+    tools.push(Arc::new(Rec));
+    let agent = Agent::new(
+        Arc::new(main),
+        tools,
+        Store::create(&Paths::new(home.path()), work.path(), false),
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_context_builder(Builder {
+        budget: 6000,
+        state: Arc::new(|_: &Store| "BOARD".to_string()),
+        quiet: None,
+        plain: Some(Plain {
+            tool: "say".into(),
+            nudge: "[say] resend it with say".into(),
+            args: Arc::new(|t: &str| json!({"kind": "note", "body": t})),
+        }),
+    });
+    let (h, task) = agent::spawn(agent);
+    let mut rx = h.subscribe();
+    h.prompt("status?");
+    let mut evs = Vec::new();
+    loop {
+        let ev = rx.recv().await.unwrap();
+        let done = matches!(ev, AgentEvent::Settled);
+        evs.push(ev);
+        if done {
+            break;
+        }
+    }
+    h.shutdown();
+    let agent = task.await.unwrap();
+    let shown: Vec<String> = evs
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Message(Message::Assistant(a)) if !a.text().is_empty() => Some(a.text()),
+            _ => None,
+        })
+        .collect();
+    assert!(shown.is_empty(), "no raw text reaches a window: {shown:?}");
+    let rollbacks = evs
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Stream(novacode_types::StreamEvent::RetryRollback)))
+        .count();
+    assert_eq!(rollbacks, 2, "both streamed texts are dropped");
+    let reqs = reqs.lock().unwrap();
+    assert_eq!(reqs.len(), 3, "one nudge; the recap gets none");
+    let nudged = format!("{:?}", reqs[1].messages);
+    assert!(
+        nudged.contains("plain one") && nudged.contains("[say] resend it with say"),
+        "the model sees what it wrote: {nudged}"
+    );
+    let texts: Vec<String> = agent
+        .store
+        .transcript()
+        .iter()
+        .filter_map(|m| match m {
+            Message::Assistant(a) if !a.text().is_empty() => Some(a.text()),
+            _ => None,
+        })
+        .collect();
+    assert!(texts.is_empty(), "a reattached window shows neither: {texts:?}");
+    let kept = agent
+        .store
+        .entries()
+        .iter()
+        .filter(|e| {
+            matches!(&e.kind, novacode_core::session::EntryKind::Message {
+            message: Message::Assistant(a)
+        } if !a.text().is_empty())
+        })
+        .count();
+    assert_eq!(kept, 2, "the session file keeps both");
+}
+
 /// L10.9 super: a context builder rebuilds every request (state block + newest chat in
 /// budget); the session file keeps everything, and auto-compaction never fires. Without
 /// a builder, the request is the projection, unchanged.

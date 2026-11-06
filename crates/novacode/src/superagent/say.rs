@@ -23,13 +23,21 @@ nothing for the user, reply with nothing.";
 /// The trigger of super's current run, set by the context builder at each model call.
 pub type Trigger = Arc<Mutex<String>>;
 
-/// What started the run the newest entry belongs to: `reply to you` for a user message,
-/// `health check`, or `after <the wake's first words>`. A run is the entries after the
-/// last assistant reply without tool calls; what started it is what came before its first
-/// reply: a user message first, else the last wake (notes queued earlier ride along with
-/// it). Runs started only by code's nudges belong to the run before them.
+/// What the newest entry answers: `reply to you` for a user message, `after <the wake's
+/// first words>` for a task event, or `health check`. It is the newest batch of messages
+/// between two assistant replies that holds such an event; within a batch (queued wakes)
+/// a user message wins, then a task event, then a health check. Code's nudges (decision
+/// checks, the plain-text `[say]` nudge, todo and hook notes) are never triggers: a run
+/// they start belongs to the event before them.
 pub fn trigger(entries: &[&Entry]) -> String {
-    let ends_run = |e: &Entry| matches!(&e.kind, EntryKind::Message { message: Message::Assistant(a) } if a.tool_calls().next().is_none());
+    let is_reply = |e: &&&Entry| {
+        matches!(
+            &e.kind,
+            EntryKind::Message {
+                message: Message::Assistant(_)
+            }
+        )
+    };
     let starter = |e: &Entry| match &e.kind {
         EntryKind::Message {
             message: Message::User { content },
@@ -43,44 +51,34 @@ pub fn trigger(entries: &[&Entry]) -> String {
                 .collect();
             (!text.starts_with("<system-reminder>")).then(|| "reply to you".to_string())
         }
-        EntryKind::CustomMessage { kind, text, .. } if kind == "super" => Some(describe(text)),
+        EntryKind::CustomMessage { kind, text, .. } if kind == "super" => describe(text),
         EntryKind::CustomMessage { kind, .. } if !matches!(kind.as_str(), "nudge" | "todo" | "hook") => {
             Some(format!("after a {kind} note"))
         }
         _ => None,
     };
-    let mut end = entries.len();
-    loop {
-        let start = entries[..end].iter().rposition(|e| ends_run(e)).map_or(0, |i| i + 1);
-        let head: Vec<String> = entries[start..end]
-            .iter()
-            .take_while(|e| {
-                !matches!(
-                    &e.kind,
-                    EntryKind::Message {
-                        message: Message::Assistant(_)
-                    }
-                )
-            })
-            .filter_map(|e| starter(e))
-            .collect();
-        if let Some(t) = head.iter().find(|t| *t == "reply to you").or(head.last()) {
-            return t.clone();
-        }
-        if start == 0 {
-            return "your own run".into();
-        }
-        end = start - 1;
-    }
+    let rank = |t: &String| match t.as_str() {
+        "reply to you" => 2,
+        "health check" => 0,
+        _ => 1,
+    };
+    entries
+        .split(|e| is_reply(&e))
+        .rev()
+        .find_map(|batch| {
+            // `max_by_key` keeps the last of equals: the newest task event.
+            batch.iter().filter_map(|e| starter(e)).max_by_key(rank)
+        })
+        .unwrap_or_else(|| "your own run".into())
 }
 
-/// A wake's text as a trigger.
-fn describe(text: &str) -> String {
+/// A wake's text as a trigger; `None` for code's decision-check nudge.
+fn describe(text: &str) -> Option<String> {
     if text.starts_with(super::link::HEALTH_CHECK) {
-        return "health check".into();
+        return Some("health check".into());
     }
-    if text.starts_with("Decision check") {
-        return "decision check".into();
+    if text.starts_with(super::context::DECISION_CHECK) {
+        return None;
     }
     let first = text.lines().next().unwrap_or("").trim();
     let cut = [" (", ": ", ". "]
@@ -92,7 +90,7 @@ fn describe(text: &str) -> String {
     if first[..cut].chars().count() > 60 {
         s.push('…');
     }
-    format!("after {s}")
+    Some(format!("after {s}"))
 }
 
 /// Local `HH:MM` now.
@@ -167,6 +165,12 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
             } else {
                 known.join(", ")
             }
+        ));
+    }
+    if a.kind != "question" && !a.choices.is_empty() {
+        return Err(format!(
+            "only a question has `choices`; send this {} without them, then the question as its own `say` with kind question",
+            a.kind
         ));
     }
     if a.kind == "question" && a.choices.is_empty() && !a.exact_answer {
@@ -264,7 +268,7 @@ returns the user's answer."
                 "tasks": { "type": "array", "items": { "type": "string" }, "description": "Labels of the tasks it is about (code adds each one's board status). May be empty." },
                 "status": { "type": "string", "description": "Where things stand now and what led here. Required for question and warning." },
                 "body": { "type": "string", "description": "Markdown: what happened, then what you did or need." },
-                "choices": { "type": "array", "items": { "type": "object", "properties": { "label": { "type": "string" }, "description": { "type": "string" } }, "required": ["label"] }, "description": "A question's answers (2-6); the user can also type their own." },
+                "choices": { "type": "array", "items": { "type": "object", "properties": { "label": { "type": "string" }, "description": { "type": "string" } }, "required": ["label"] }, "description": "Only for kind question: its answers (2-6); the user can also type their own." },
                 "exact_answer": { "type": "boolean", "description": "A question without choices: the body asks for one exact answer (a name, number or path) the user types." }
             },
             "required": ["kind", "body"]
@@ -370,6 +374,12 @@ mod tests {
         assert!(e.contains("unknown task label(s): T9") && e.contains("T2-api"), "{e}");
         assert!(no(json!({"kind": "question", "status": "s", "body": "Port?"})).contains("`exact_answer: true`"));
         assert!(no(json!({"kind": "note", "body": " "})).contains("`body` is empty"));
+        // Choices belong to a question only: it is its own `say`.
+        let e = no(json!({"kind": "done", "body": "Done. Merge?", "choices": [{"label": "Merge"}]}));
+        assert!(
+            e.contains("only a question has `choices`") && e.contains("its own `say` with kind question"),
+            "{e}"
+        );
         // Accepted: a question with choices, or one exact answer.
         for ok in [
             json!({"kind": "question", "status": "s", "body": "Which?", "choices": [{"label": "A"}]}),
@@ -480,7 +490,65 @@ mod tests {
             ]),
             "after T2-api reported blocked"
         );
-        assert_eq!(describe("T1 merged (now ready). If the user"), "after T1 merged");
+        assert_eq!(
+            describe("T1 merged (now ready). If the user").as_deref(),
+            Some("after T1 merged")
+        );
+    }
+
+    /// A live run: a decision-check nudge was the last wake before the task report's run.
+    /// Nudges are never triggers; the say after the task report names it.
+    #[test]
+    fn nudges_are_never_triggers_and_a_task_event_wins_a_batch() {
+        let t = |es: Vec<Entry>| trigger(&es.iter().collect::<Vec<_>>());
+        let user = entry(EntryKind::Message {
+            message: Message::user("list the w files"),
+        });
+        let decision = custom("super", &super::super::context::nudge("list only w files in T1"));
+        let report = custom("super", "T1-list-w-files reported done (now review): listed 3 files");
+        let want = "after T1-list-w-files reported done";
+        // The exact order: user msg, say reply, decision check, todo call, task report, say.
+        assert_eq!(
+            t(vec![
+                user.clone(),
+                assistant(true),
+                decision.clone(),
+                assistant(true),
+                report.clone(),
+                assistant(true)
+            ]),
+            want
+        );
+        // The same with the runs ended by empty replies.
+        assert_eq!(
+            t(vec![
+                user,
+                assistant(true),
+                assistant(false),
+                decision.clone(),
+                assistant(true),
+                assistant(false),
+                report.clone(),
+                assistant(true)
+            ]),
+            want
+        );
+        // A run started only by a decision check belongs to the event before it.
+        assert_eq!(
+            t(vec![
+                report.clone(),
+                assistant(false),
+                decision.clone(),
+                assistant(true)
+            ]),
+            want
+        );
+        // Queued wakes: the task event, not the health check, whatever the order.
+        let check = custom("super", &super::super::link::health_check_text());
+        assert_eq!(
+            t(vec![assistant(false), report, check, decision, assistant(true)]),
+            want
+        );
     }
 
     struct Answer(Mutex<Vec<Question>>, Option<&'static str>);

@@ -30,7 +30,8 @@ what happened, where things stand (`status`), then what you did or what you need
 user's message, `update` is task news, `question` needs their answer, `warning` is something wrong, `done` is \
 finished work, `note` an aside. A question states the current status first, then asks, with `choices` (or \
 `exact_answer: true` when it asks for one exact answer such as a name or a number); it opens the answer card \
-itself. When several things happened, send one `say` per event, not one digest. `priority: high` only when the \
+itself. A question is always its own `say` with kind `question`, never inside another kind: after a `done` or \
+`update`, send the question next. When several things happened, send one `say` per event, not one digest. `priority: high` only when the \
 user should look now. Use `ask_user` only for several questions in one form.
 - Before spawning a non-trivial task, show the user 1-5 checkable acceptance criteria, with the base branch: call \
 `task info` with the task's `folder` first and show what it says about the branch; a small, clear task starts at once. \
@@ -370,6 +371,7 @@ mod tests {
             "Name each task by its label",
             "what happened, where things stand (`status`), then what you did or what you need",
             "A question states the current status first",
+            "A question is always its own `say` with kind `question`, never inside another kind",
             "send one `say` per event",
         ] {
             assert!(PROMPT.contains(rule), "{rule}");

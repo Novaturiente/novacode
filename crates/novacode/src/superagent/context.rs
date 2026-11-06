@@ -284,10 +284,13 @@ pub fn decision_check(
     });
 }
 
+/// What a decision-check nudge starts with (never a `say` trigger).
+pub const DECISION_CHECK: &str = "Decision check:";
+
 /// The one-line nudge for an unrecorded decision.
 pub fn nudge(decision: &str) -> String {
     format!(
-        "Decision check: the user's last message holds a decision you didn't record ({decision}). Record it now: \
+        "{DECISION_CHECK} the user's last message holds a decision you didn't record ({decision}). Record it now: \
 `task note` for a task, `memory` for a preference, `todo` for a request; then stop."
     )
 }

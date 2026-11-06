@@ -1590,12 +1590,12 @@ impl Agent {
         }
     }
 
-    fn nudge(&mut self, text: &str) {
+    fn nudge(&mut self, text: &str) -> String {
         self.add(EntryKind::CustomMessage {
             kind: "nudge".into(),
             text: text.into(),
             display: false,
-        });
+        })
     }
 
     fn take_queued(&self, steering_only: bool) -> Vec<Queued> {
@@ -1697,8 +1697,11 @@ impl Agent {
         // no prompt and no tool call.
         let mut quiet_note: Option<String> = None;
         let mut plain = true;
-        // `context_window::Plain`: this run was a marked check; its plain-text nudge went out.
+        // `context_window::Plain`: this run was a marked check; its plain-text nudge went out;
+        // it called the tool. `held`: plain text kept out of the windows and its nudge, hidden
+        // from the context once the run ends.
         let (mut checked, mut plain_nudged, mut said) = (false, false, false);
+        let mut held: Vec<String> = Vec::new();
         let stop = loop {
             let queued = self.take_queued(steering_only);
             let mut added = queued.is_empty();
@@ -1827,7 +1830,7 @@ impl Agent {
                 && stop == StopReason::Stop
                 && has_text
                 && !(checked && text.trim() == "OK");
-            if let Some(p) = plain_cfg.filter(|_| plain_text && plain_nudged) {
+            if let Some(p) = plain_cfg.filter(|_| plain_text && plain_nudged && !said) {
                 // Plain text after the nudge: code sends it through the tool.
                 self.emit(AgentEvent::Stream(StreamEvent::RetryRollback));
                 let mut msg = msg;
@@ -1848,6 +1851,19 @@ impl Agent {
             }
             match quiet_note.take().filter(|_| quiet) {
                 Some(note) => self.hide_ok(msg, note),
+                // Plain text after the tool in the same run is a redundant recap: hidden, no nudge.
+                None if plain_text && said => {
+                    let id = self.hold_plain(msg);
+                    self.add(EntryKind::ContextEdit {
+                        target: id,
+                        replace: None,
+                    });
+                }
+                // Plain text before its nudge: the model still sees it, no window does.
+                None if plain_text && !plain_nudged => {
+                    let id = self.hold_plain(msg);
+                    held.push(id);
+                }
                 None => {
                     self.add(EntryKind::Message {
                         message: Message::Assistant(msg),
@@ -1909,13 +1925,14 @@ impl Agent {
                 self.nudge(&say);
                 continue;
             }
-            if plain_text && !std::mem::replace(&mut plain_nudged, true) {
+            if plain_text && !said && !std::mem::replace(&mut plain_nudged, true) {
                 let n = self
                     .context
                     .as_ref()
                     .and_then(|c| c.plain.as_ref())
                     .map(|p| p.nudge.clone());
-                self.nudge(&n.unwrap_or_default());
+                let id = self.nudge(&n.unwrap_or_default());
+                held.push(id);
                 continue;
             }
             if !self.shared.queues.lock().unwrap().follow_up.is_empty() {
@@ -1924,6 +1941,9 @@ impl Agent {
             }
             break stop;
         };
+        for target in held {
+            self.add(EntryKind::ContextEdit { target, replace: None });
+        }
         // Stop (L7.14): a plugin hook's block keeps the agent going with its reason.
         if stop == StopReason::Stop
             && !refused
@@ -2166,6 +2186,18 @@ impl Agent {
         if let Some(q) = self.context.as_ref().and_then(|c| c.quiet.as_ref()) {
             (q.on_ok)();
         }
+    }
+
+    /// Plain text in a `context_window::Plain` window: saved, never shown raw. The windows
+    /// drop what it streamed and get no message event.
+    fn hold_plain(&mut self, m: AssistantMessage) -> String {
+        self.emit(AgentEvent::Stream(StreamEvent::RetryRollback));
+        self.add_as(
+            EntryKind::Message {
+                message: Message::Assistant(m),
+            },
+            false,
+        )
     }
 
     /// Keep a failed attempt on record, hidden from the model. It is asked for again,
