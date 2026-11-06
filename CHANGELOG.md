@@ -2,6 +2,28 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.8.0] - 2026-11-06
+
+### Added
+
+- **Super speaks in framed blocks.** Every message from super is a typed block (update, question, warning, done, note, reply) with the time, what triggered it and a status line per task taken from the board. A question always opens its own card. A "new since you last looked" divider marks what arrived while you were away (needs `focus-events on` in tmux), and a **Needs you** list at the top of the Tasks tab keeps open questions and warnings, also across a restart. See [super mode](docs/super.md).
+- **Super stays small for days.** Its context is rebuilt on every wake from a code-written state block (board, each task's charter of brief, criteria and your decisions, open requests) plus the newest 6k tokens of chat. New `task note` and `task scope` actions (a scope change needs your card), a `history_search` tool, and a check that nudges super when you made a decision it didn't record. Tasks ask you when super's message conflicts with their brief.
+- **Health checks and progress.** While tasks run, super checks them every `super.watch.everyMinutes` (default 30) using code-recorded facts (event age, running tool, error streak, repeated calls, unanswered cards); a fine check is silent. Tasks report progress at milestones and get one nudge after `super.watch.progressMinutes` (default 20) without one.
+- **`/watch`** in a super window opens its live tasks in a tmux grid, 6 panes per window (outside tmux it prints the command).
+- **Attach windows publish to their own tmux pane and herdr** (`@agent_*` options, including the account), so a super window and task panes show model, account and usage in the sidebar.
+
+### Changed
+
+- **`~/.novacode` protects only its secrets:** logins (`auth.json`, `auth-*.json`, `mcp-auth.json`), `trust.json`, `settings.json`, `extensions/` and `packages/`. Other files there (`run/`, `super/`, sessions, logs) follow the normal rules. Stale claim files of dead sessions are removed automatically. See [security](docs/security.md).
+- **Super loads no package hooks**, and its scouts get every tool.
+
+### Fixed
+
+- **Review tasks can write their scratch folder** under the default sandbox, so they can run tests and the red-then-green check.
+- **Stopping a hung task** ends its process when it doesn't answer.
+- **`novacode --super` right after `novacode stop`** waits for the old super to exit instead of attaching to it.
+- **Question cards keep their line breaks.**
+
 ## [0.7.0] - 2026-11-05
 
 ### Added

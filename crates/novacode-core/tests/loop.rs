@@ -1502,7 +1502,8 @@ async fn a_context_builder_rebuilds_requests_and_keeps_the_session_whole() {
                 plain: None,
             });
         }
-        let prompts: Vec<String> = (0..8).map(|i| format!("p{i}")).collect();
+        // Distinct markers: a bare "p0" also matches a random temp folder name like /tmp/.tmp0EK.
+        let prompts: Vec<String> = (0..8).map(|i| format!("prompt-{i}-marker")).collect();
         let prompts: Vec<&str> = prompts.iter().map(String::as_str).collect();
         let (agent, _) = drive(agent, &prompts).await;
         let reqs = reqs.lock().unwrap().clone();
@@ -1526,7 +1527,7 @@ async fn a_context_builder_rebuilds_requests_and_keeps_the_session_whole() {
     let last = reqs.last().unwrap();
     let text = format!("{:?}", last.messages);
     assert!(
-        text.contains("BOARD ROWS") && text.contains("p7") && !text.contains("p0"),
+        text.contains("BOARD ROWS") && text.contains("prompt-7-marker") && !text.contains("prompt-0-marker"),
         "{text}"
     );
     let chat: u64 = last
