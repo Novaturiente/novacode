@@ -604,8 +604,12 @@ impl Agent {
             if compacted {
                 m.cause = "compaction (expected once)".into();
             }
-            let text = format!("cache miss: {} prompt tokens not read from cache ({})", m.lost, m.cause);
-            self.emit(AgentEvent::Stream(StreamEvent::Notice { text }));
+            // A window whose context is rebuilt on every request (super) misses by design:
+            // logged, not shown.
+            if self.context.is_none() {
+                let text = format!("cache miss: {} prompt tokens not read from cache ({})", m.lost, m.cause);
+                self.emit(AgentEvent::Stream(StreamEvent::Notice { text }));
+            }
             let line = serde_json::json!({
                 "session": self.store.id(),
                 "provider": self.cfg.provider,

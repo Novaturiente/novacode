@@ -555,6 +555,37 @@ pub fn find_live(paths: &Paths, prefix: &str) -> anyhow::Result<RunFile> {
     }
 }
 
+/// Whether the live session `id` is shutting down (`novacode stop` just reached it): its
+/// socket is gone or says bye before it answers a state request. Unsure (no answer in 2 s): no.
+pub async fn closing(paths: &Paths, id: &str) -> bool {
+    let Ok(f) = find_live(paths, id) else { return true };
+    let Ok(stream) = connect(&f.socket).await else {
+        return true;
+    };
+    let (r, mut w) = tokio::io::split(stream);
+    let probe = Request {
+        id: Some("probe".into()),
+        cmd: ClientCmd::GetState,
+    };
+    if w.write_all(line(&probe).as_bytes()).await.is_err() || w.flush().await.is_err() {
+        return true;
+    }
+    let mut lines = BufReader::new(r).lines();
+    let answer = async {
+        while let Ok(Some(l)) = lines.next_line().await {
+            match serde_json::from_str::<ServerMsg>(&l) {
+                Ok(ServerMsg::Bye { .. }) => return true,
+                Ok(ServerMsg::Response { id: Some(rid), .. }) if rid == "probe" => return false,
+                _ => {}
+            }
+        }
+        true
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), answer)
+        .await
+        .unwrap_or(false)
+}
+
 /// `novacode agents`: live sessions on this machine.
 pub fn agents(paths: &Paths) -> std::process::ExitCode {
     let all = live_sessions(paths);

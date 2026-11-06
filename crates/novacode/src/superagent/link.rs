@@ -633,6 +633,7 @@ impl Links {
         });
         let _ = sup.links.set(links.clone());
         links.recover(sup);
+        links.reopen_cards(sup);
         let (me, kick) = (Arc::downgrade(&links), links.kick.clone());
         let t = tokio::spawn(async move {
             loop {
@@ -764,6 +765,35 @@ impl Links {
             }
         });
         self.inner.lock().unwrap().tasks.push(t.abort_handle());
+    }
+
+    /// Restart, once at start: each question on Needs you whose card was open when super
+    /// went down opens again (once a window is there). The answer takes it off the list and
+    /// wakes super with it; a closed card leaves the row for the user to dismiss.
+    fn reopen_cards(&self, sup: &Arc<Super>) {
+        let open: Vec<(String, novacode_types::Question)> = {
+            let b = sup.board.lock().unwrap();
+            b.needs
+                .iter()
+                .filter_map(|n| Some((n.id.clone(), n.card.clone()?)))
+                .collect()
+        };
+        for (id, q) in open {
+            let (sup, asker, me) = (Arc::downgrade(sup), self.asker.clone(), self.me.clone());
+            let t = tokio::spawn(async move {
+                let header = q.header.clone().unwrap_or_default();
+                let Some(r) = asker.ask(vec![q]).await else { return };
+                let Some(sup) = sup.upgrade() else { return };
+                let _ = sup.edit(|b| b.drop_need(&id));
+                if let Some(me) = me.upgrade() {
+                    me.inform.wake(format!(
+                        "The user answered your question from before super's restart ({header}):\n{}",
+                        novacode_tools::ask::render(&r)
+                    ));
+                }
+            });
+            self.inner.lock().unwrap().tasks.push(t.abort_handle());
+        }
     }
 
     /// A review task found dead at restart: closed, and a new review for its task (no round used).
@@ -2902,6 +2932,45 @@ mod tests {
             .iter()
             .filter(|s| s.starts_with(&format!("wake: {HEALTH_CHECK}")))
             .count()
+    }
+
+    /// S4 (live test): a question card open when super stopped is on Needs you after the
+    /// restart, and its card opens again; the answer drops the row and wakes super with it.
+    #[tokio::test]
+    async fn an_open_question_card_comes_back_after_a_restart() {
+        let q = Question {
+            question: "Which port?".into(),
+            header: Some("T1-x: question".into()),
+            options: vec![],
+            multi: false,
+        };
+        let card = q.clone();
+        let fx = fixture_with(5, move |sup, _| {
+            sup.edit(|b| {
+                b.note_say("say-1", "question", &["T1-x".into()], "T1-x waits", false);
+                b.needs[0].card = Some(card);
+                b.note_say("say-2", "warning", &[], "disk full", false);
+            })
+            .unwrap();
+        });
+        fx.until("the card again", |fx| fx.asker.asked.lock().unwrap().len() == 1)
+            .await;
+        assert_eq!(fx.asker.asked.lock().unwrap()[0], q);
+        assert_eq!(fx.sup.board.lock().unwrap().needs.len(), 2, "listed while open");
+        let tx = fx.asker.waiting.lock().unwrap().remove(0);
+        let _ = tx.send(Some(vec![Reply {
+            question: "Which port?".into(),
+            chosen: vec!["8080".into()],
+            text: None,
+            preview: None,
+        }]));
+        fx.until("answered", |fx| fx.sup.board.lock().unwrap().needs.len() == 1)
+            .await;
+        assert_eq!(fx.sup.board.lock().unwrap().needs[0].id, "say-2");
+        fx.until("super woken", |fx| {
+            fx.said().iter().any(|s| s.starts_with("wake:") && s.contains("8080"))
+        })
+        .await;
     }
 
     #[tokio::test]

@@ -228,6 +228,46 @@ fn restart_recovery_card_waits_for_a_late_window() {
     until("the task resumed", || resumed.exists());
 }
 
+/// S3 (live test): `novacode --super` right after `novacode stop <super>` found the old super
+/// still shutting down and attached to it ("the session is over"). It waits for that one to
+/// exit and starts a new one.
+#[test]
+fn relaunch_right_after_stop_starts_a_new_super() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let (home, root, scripts) = (base.join("home"), base.join("projects"), base.join("scripts"));
+    for d in [&home, &root, &scripts] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let settings = json!({"memory": {"enabled": false}, "notifications": {"enabled": false}});
+    std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
+    script(&scripts, "super", &tell("hi"));
+    let pid = |sup: &str| -> Option<u64> {
+        let text = std::fs::read_to_string(run_file(&home, sup)).ok()?;
+        serde_json::from_str::<Value>(&text).ok()?["pid"].as_u64()
+    };
+    let mut sup = start_super(&home, &root, &scripts);
+    let mut cleanup = Cleanup(home.clone(), sup.clone());
+    let mut old = pid(&sup).unwrap();
+    for _ in 0..3 {
+        novacode(&home).args(["stop", &sup]).output().unwrap();
+        let again = start_super(&home, &root, &scripts);
+        cleanup.1 = again.clone();
+        let new = pid(&again);
+        assert!(
+            new.is_some_and(|p| p != old),
+            "attached to the super that was shutting down"
+        );
+        (sup, old) = (again.clone(), new.unwrap());
+        let run: Value = serde_json::from_str(&std::fs::read_to_string(run_file(&home, &again)).unwrap()).unwrap();
+        let sock = UnixStream::connect(run["socket"].as_str().unwrap()).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut l = String::new();
+        BufReader::new(sock).read_line(&mut l).unwrap();
+        assert!(l.contains("\"hello\""), "{l}");
+    }
+}
+
 #[test]
 fn super_runs_a_write_task_through_review_merge_and_close() {
     let dir = tempfile::tempdir().unwrap();

@@ -472,7 +472,9 @@ pub struct App {
     task_started: Option<Instant>,
     started: Instant,
     /// The terminal lost focus (L10.9): the first `say` block after that gets the
-    /// "new since you last looked" divider (`away.1`: placed already).
+    /// "new since you last looked" divider (`away.1`: placed already). A terminal reports
+    /// focus only when it changes, so a new window counts as away until focus in, a key,
+    /// a click or a paste shows the user is there.
     away: (bool, bool),
     #[cfg(feature = "images")]
     images: Option<crate::images::Images>,
@@ -591,7 +593,7 @@ impl App {
             mcp: (0, 0),
             task_started: None,
             started: Instant::now(),
-            away: (false, false),
+            away: (true, false),
             #[cfg(feature = "images")]
             images: None,
         }
@@ -1186,6 +1188,9 @@ impl App {
 
     pub fn on_event(&mut self, ev: Event) {
         self.dirty = true;
+        if matches!(ev, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)) {
+            self.away.0 = false;
+        }
         match ev {
             Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
             // An approval card takes the keys first, so it takes pastes too (its reason box).

@@ -55,6 +55,10 @@ pub trait Launcher: Send + Sync {
     /// Send one command with request id `id` (a prompt's id tells whose turn it starts).
     fn send_as<'a>(&'a self, session: &'a str, id: &'a str, cmd: ClientCmd) -> BoxFuture<'a, Result<(), String>>;
     fn alive(&self, session: &str) -> bool;
+    /// End a live session's process that stopped answering (SIGTERM, then SIGKILL).
+    fn kill<'a>(&'a self, _session: &'a str) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Err("no task processes here".to_string()) })
+    }
     /// A lasting connection to a live session's socket, for its link.
     fn link<'a>(&'a self, _session: &'a str) -> BoxFuture<'a, Result<super::link::Conn, String>> {
         Box::pin(async { Err("no task sockets".to_string()) })
@@ -1309,8 +1313,21 @@ impl Super {
         if let Some(s) = t.session.as_deref() {
             self.grounded(s);
         }
-        if let Some(s) = t.session.as_deref().filter(|s| self.launcher.alive(s)) {
-            self.launcher.send(s, ClientCmd::Abort { drop_queued: true }).await?;
+        // A frozen task never answers the Abort (the send gives up after 15 s): code ends
+        // its process. One gone meanwhile needs nothing.
+        let mut ended = String::new();
+        if let Some(s) = t.session.as_deref().filter(|s| self.launcher.alive(s))
+            && let Err(e) = self.launcher.send(s, ClientCmd::Abort { drop_queued: true }).await
+            && self.launcher.alive(s)
+        {
+            self.launcher
+                .kill(s)
+                .await
+                .map_err(|k| format!("{e}; ending {}'s process failed: {k}", t.label))?;
+            ended = format!(
+                "\n{} didn't answer the stop ({e}); its process was ended (SIGTERM, then SIGKILL).",
+                t.label
+            );
         }
         let first = match self.merge_exit(&t.id, &n) {
             Some(why) => format!(
@@ -1324,7 +1341,7 @@ impl Super {
                 )
             }
             None => format!("Stopped {}; its session stays.", t.label),
-        };
+        } + &ended;
         let notes = self.pump().await;
         Ok(std::iter::once(first).chain(notes).collect::<Vec<_>>().join("\n"))
     }
@@ -1914,6 +1931,20 @@ impl Launcher for Procs {
         crate::serve::find_live(&self.paths, session).is_ok()
     }
 
+    fn kill<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            // Tasks start in their own process group (`own_group`): its pid is the group's.
+            let pid = crate::serve::find_live(&self.paths, session)
+                .map_err(|e| e.to_string())?
+                .pid;
+            tokio::task::spawn_blocking(move || {
+                novacode_tools::process::end_group(pid, std::time::Duration::from_secs(5))
+            })
+            .await
+            .map_err(|e| e.to_string())
+        })
+    }
+
     fn link<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Result<super::link::Conn, String>> {
         Box::pin(async move {
             let f = crate::serve::find_live(&self.paths, session).map_err(|e| e.to_string())?;
@@ -1950,6 +1981,8 @@ pub(super) mod tests {
         fail_sends: Mutex<usize>,
         /// Set: each send waits for a notification before it goes.
         gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+        /// A failed send finds the process gone.
+        dies_on_send: Mutex<bool>,
     }
 
     impl Launcher for FakeLauncher {
@@ -1975,6 +2008,9 @@ pub(super) mod tests {
                 let mut fail = self.fail_sends.lock().unwrap();
                 if *fail > 0 {
                     *fail -= 1;
+                    if *self.dies_on_send.lock().unwrap() {
+                        self.alive.lock().unwrap().remove(session);
+                    }
                     return Err("socket gone".to_string());
                 }
                 drop(fail);
@@ -1989,6 +2025,13 @@ pub(super) mod tests {
         }
         fn alive(&self, session: &str) -> bool {
             self.alive.lock().unwrap().contains(session)
+        }
+        fn kill<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                self.log.lock().unwrap().push(format!("kill {session}"));
+                self.alive.lock().unwrap().remove(session);
+                Ok(())
+            })
         }
     }
 
@@ -2358,6 +2401,46 @@ pub(super) mod tests {
         // A stopped task can't be stopped again: the pair is not in the table.
         let e = run(&fx, json!({"action": "stop", "task": "T1-t1"})).await.unwrap_err();
         assert!(e.contains("not possible"), "{e}");
+    }
+
+    /// S6 (live test): a frozen task never answers stop's Abort. Its process is ended and
+    /// super is told; a task whose process is gone needs no kill.
+    #[tokio::test]
+    async fn a_task_that_does_not_answer_stop_has_its_process_ended() {
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "hung", false)).await.unwrap();
+        run(&fx, spawn_args("p", "gone", false)).await.unwrap();
+        *fx.launcher.fail_sends.lock().unwrap() = 1;
+        let out = run(&fx, json!({"action": "stop", "task": "T1-hung"})).await.unwrap();
+        assert!(out.contains("didn't answer the stop") && out.contains("ended"), "{out}");
+        assert!(fx.launcher.log.lock().unwrap().contains(&"kill s1".to_string()));
+        assert_eq!(state(&fx, "T1-hung"), State::Stopped);
+        // Gone between the check and the Abort: nothing to kill, no error.
+        *fx.launcher.fail_sends.lock().unwrap() = 1;
+        *fx.launcher.dies_on_send.lock().unwrap() = true;
+        let out = run(&fx, json!({"action": "stop", "task": "T2-gone"})).await.unwrap();
+        assert!(!out.contains("ended"), "{out}");
+        assert!(!fx.launcher.log.lock().unwrap().contains(&"kill s2".to_string()));
+    }
+
+    /// S6: a stopped (SIGSTOP) process group is ended: SIGCONT, SIGTERM, then SIGKILL.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_frozen_process_group_is_ended() {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "trap '' TERM; sleep 30"]);
+        novacode_base::platform::own_group(&mut c);
+        let mut child = c.spawn().unwrap();
+        let pid = child.id();
+        std::process::Command::new("kill")
+            .args(["-STOP", &pid.to_string()])
+            .status()
+            .unwrap();
+        let t = std::time::Instant::now();
+        novacode_tools::process::end_group(pid, std::time::Duration::from_millis(300));
+        assert!(child.wait().is_ok_and(|s| !s.success()));
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[tokio::test]

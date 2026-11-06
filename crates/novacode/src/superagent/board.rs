@@ -306,6 +306,9 @@ pub struct Need {
     pub at: u64,
     /// A question with no card (one exact answer): super's next `reply` answers it.
     pub typed: bool,
+    /// A question's card, kept so a restarted super opens it again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card: Option<novacode_types::Question>,
 }
 
 /// Chars of a task's charter notes before the oldest are summarised.
@@ -934,6 +937,7 @@ impl Board {
                 status: status.into(),
                 at: now(),
                 typed,
+                card: None,
             });
         }
     }
@@ -1188,6 +1192,17 @@ impl Board {
         for o in open {
             s.push_str(&format!("- {o}\n"));
         }
+        // Open on the user's list; a question's card is open in their windows.
+        if !self.needs.is_empty() {
+            s.push_str("\n## Needs you\n");
+        }
+        for n in &self.needs {
+            let tasks = match n.tasks.is_empty() {
+                true => String::new(),
+                false => format!(" ({})", n.tasks.join(", ")),
+            };
+            s.push_str(&format!("- {}{tasks}: {}\n", n.kind, cell(&n.status)));
+        }
         s
     }
 
@@ -1317,6 +1332,16 @@ mod tests {
         let mut b = Board::load(d.path()).unwrap();
         assert_eq!(b.needs[0].status, "disk full");
         assert!(b.drop_need("c8") && !b.drop_need("c8"));
+    }
+
+    /// S4: super sees the open Needs you rows (after a restart its chat may not show them).
+    #[test]
+    fn the_state_block_lists_needs_you() {
+        let mut b = Board::default();
+        assert!(!b.state_block(&[]).contains("## Needs you"));
+        b.note_say("c1", "question", &["T1".into()], "T1 needs a port", false);
+        let s = b.state_block(&[]);
+        assert!(s.contains("## Needs you\n- question (T1): T1 needs a port\n"), "{s}");
     }
 
     #[test]

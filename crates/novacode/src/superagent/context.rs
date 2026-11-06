@@ -29,6 +29,7 @@ pub fn builder(
     dir: PathBuf,
     on_ok: Arc<dyn Fn() + Send + Sync>,
     trigger: super::say::Trigger,
+    shown: Shown,
 ) -> context_window::Builder {
     context_window::Builder {
         budget: CHAT_BUDGET,
@@ -44,10 +45,12 @@ pub fn builder(
         state: Arc::new(move |store: &Store| {
             *trigger.lock().unwrap() = super::say::trigger(&store.branch());
             let open = open_requests(store);
-            match Board::load(&dir) {
+            let block = match Board::load(&dir) {
                 Ok(b) => b.state_block(&open),
                 Err(e) => format!("The board couldn't be read ({e}); call `task list`.\n"),
-            }
+            };
+            *shown.lock().unwrap() = block.clone();
+            block
         }),
     }
 }
@@ -204,22 +207,34 @@ all the given words. Read-only; newest matches first, capped."
     }
 }
 
-const DECISION: &str = "You check a coding agent's bookkeeping. The user's message to the agent is given, and \
-what the agent recorded during its reply (task notes, memories, todo items, tasks started). A decision is a \
-choice, preference, limit or request the user stated that should still matter later (e.g. \"use port 8080\", \
-\"never deploy on Fridays\", \"also check the logs tomorrow\"). Questions, thanks and status checks are not \
-decisions. If the message holds a decision that nothing recorded covers, reply with one line naming it. \
-Otherwise reply exactly NONE.";
+const DECISION: &str = "You check a coding agent's bookkeeping. Given: the user's message to the agent, what \
+the agent recorded during its reply (task notes, memories, todo items, tasks started), and the agent's state \
+block (its task charters and open requests, as code shows them to it). A decision counts only when it lasts: a \
+task's scope or limits, a preference or a rule that should still matter in later turns (e.g. \"use port 8080 for \
+T1\", \"never deploy on Fridays\", \"also check the logs tomorrow\"). Not decisions: questions, thanks, status \
+checks; one-off requests (\"just this once\", \"do X now\"); instructions already carried out in this reply; \
+anything about how the agent's own tools work internally (card types, argument fields, bookkeeping mechanics). \
+A decision already covered by the charters, open requests, memory or anything recorded is not missing. If the \
+message holds a lasting decision nothing covers, reply with one line naming it. Otherwise reply exactly NONE.";
 
-/// The helper's verdict on one user turn: the unrecorded decision, if any.
-pub async fn unrecorded_decision(w: &Worker, user: &str, recorded: &[String]) -> Option<String> {
+/// The helper's verdict on one user turn: the unrecorded decision, if any. `state`: super's
+/// state block (charters, open requests), so what is on record already doesn't count.
+pub async fn unrecorded_decision(w: &Worker, user: &str, recorded: &[String], state: &str) -> Option<String> {
     let rec = match recorded.is_empty() {
         true => "(nothing)".to_string(),
         false => recorded.join("\n"),
     };
-    let text = helper_text(w, DECISION, format!("User's message:\n{user}\n\nRecorded:\n{rec}"))
-        .await
-        .ok()?;
+    let state = match state.trim().is_empty() {
+        true => "(not available)",
+        false => state,
+    };
+    let text = helper_text(
+        w,
+        DECISION,
+        format!("User's message:\n{user}\n\nRecorded during the reply:\n{rec}\n\nState block:\n{state}"),
+    )
+    .await
+    .ok()?;
     let line = text.lines().find(|l| !l.trim().is_empty())?.trim().to_string();
     (!line.eq_ignore_ascii_case("none") && !line.to_lowercase().starts_with("none")).then_some(line)
 }
@@ -240,12 +255,16 @@ fn recording(m: &Message) -> Vec<String> {
         .collect()
 }
 
+/// The state block of super's latest request (its context builder writes it).
+pub type Shown = Arc<std::sync::Mutex<String>>;
+
 /// After each run that took a user message, the helper model checks it for a decision
 /// super did not record; a miss wakes super with a one-line nudge. No helper: no check.
 pub fn decision_check(
     mut events: tokio::sync::broadcast::Receiver<AgentEvent>,
     helper: Option<Worker>,
     inform: Arc<dyn Inform>,
+    shown: Shown,
 ) {
     let Some(w) = helper else { return };
     tokio::spawn(async move {
@@ -273,7 +292,8 @@ pub fn decision_check(
                     if u.is_empty() {
                         continue;
                     }
-                    if let Some(d) = unrecorded_decision(&w, &u.join("\n\n"), &r).await {
+                    let state = shown.lock().unwrap().clone();
+                    if let Some(d) = unrecorded_decision(&w, &u.join("\n\n"), &r, &state).await {
                         inform.wake(nudge(&d));
                     }
                 }
@@ -337,7 +357,7 @@ mod tests {
     #[tokio::test]
     async fn the_decision_check_names_an_unrecorded_decision_and_passes_none() {
         let (w, f) = worker(&["Use port 8080 for T1", "NONE"]);
-        let d = unrecorded_decision(&w, "use port 8080 for T1", &[]).await;
+        let d = unrecorded_decision(&w, "use port 8080 for T1", &[], "").await;
         assert_eq!(d.as_deref(), Some("Use port 8080 for T1"));
         let sent = format!("{:?}", f.requests.lock().unwrap()[0].messages);
         assert!(
@@ -345,7 +365,32 @@ mod tests {
             "{sent}"
         );
         let rec = vec!["task {\"action\":\"note\"}".to_string()];
-        assert_eq!(unrecorded_decision(&w, "port 8080", &rec).await, None);
+        assert_eq!(unrecorded_decision(&w, "port 8080", &rec, "").await, None);
+    }
+
+    /// S5 (live test): the check nudged for "just this once" and for how super's tools work
+    /// inside. The helper sees super's state block (charters, open requests) and is told to
+    /// count only lasting decisions not recorded there.
+    #[tokio::test]
+    async fn the_decision_check_sees_the_state_block_and_skips_one_offs() {
+        let (w, f) = worker(&["NONE"]);
+        let state = "## Charters\n- T1-api: port 8080\n## Open requests\n- check logs tomorrow\n";
+        assert_eq!(
+            unrecorded_decision(&w, "just this once, skip the review", &[], state).await,
+            None
+        );
+        let reqs = f.requests.lock().unwrap();
+        let Message::System { text: system } = &reqs[0].messages[0] else {
+            panic!()
+        };
+        for rule in ["one-off", "already carried out", "internally", "charters", "memory"] {
+            assert!(system.contains(rule), "{rule}: {system}");
+        }
+        let user = format!("{:?}", reqs[0].messages[1]);
+        assert!(
+            user.contains("T1-api: port 8080") && user.contains("check logs tomorrow"),
+            "{user}"
+        );
     }
 
     struct Wakes(std::sync::Mutex<Vec<String>>);
@@ -363,7 +408,7 @@ mod tests {
         let (tx, rx) = tokio::sync::broadcast::channel(16);
         let (w, f) = worker(&["Never deploy on Fridays"]);
         let wakes = Arc::new(Wakes(Default::default()));
-        decision_check(rx, Some(w), wakes.clone());
+        decision_check(rx, Some(w), wakes.clone(), Default::default());
         // A run with no user message (a wake): no check.
         tx.send(AgentEvent::AgentEnd {
             stop: novacode_types::StopReason::Stop,
@@ -388,7 +433,7 @@ mod tests {
         assert_eq!(f.requests.lock().unwrap().len(), 1, "only the user turn is checked");
         // No helper: nothing runs.
         let (_tx, rx) = tokio::sync::broadcast::channel::<AgentEvent>(1);
-        decision_check(rx, None, wakes);
+        decision_check(rx, None, wakes, Default::default());
     }
 
     #[test]

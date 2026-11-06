@@ -296,10 +296,14 @@ returns the user's answer."
             let mut say = self.frame(&a, novacode_core::session::now_ms());
             let typed = a.kind == "question" && say.choices.is_empty();
             let note = |say: &Say| {
-                if let Err(e) = self
-                    .sup
-                    .edit(|b| b.note_say(&id, &say.kind, &say.tasks, &say.status, typed))
-                {
+                // A card's question is kept with its row: a restarted super opens it again.
+                let kept = (a.kind == "question" && !typed).then(|| card(say));
+                if let Err(e) = self.sup.edit(|b| {
+                    b.note_say(&id, &say.kind, &say.tasks, &say.status, typed);
+                    if let Some(n) = b.needs.iter_mut().find(|n| n.id == id) {
+                        n.card = kept;
+                    }
+                }) {
                     tracing::warn!(%e, "super: Needs you not saved");
                 }
             };

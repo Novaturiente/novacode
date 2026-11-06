@@ -1543,6 +1543,8 @@ impl Ctx {
         let mut super_ref: Option<std::sync::Weak<superagent::task::Super>> = None;
         // What started super's current run: set by its context builder, read by `say`.
         let say_trigger: superagent::say::Trigger = Default::default();
+        // Super's latest state block: set by its context builder, read by the decision check.
+        let shown: superagent::context::Shown = Default::default();
         if is_super {
             use superagent::task;
             let home = self.paths.home();
@@ -1970,7 +1972,12 @@ impl Ctx {
                         s.checked();
                     }
                 });
-                agent = agent.with_context_builder(superagent::context::builder(dir, on_ok, say_trigger.clone()));
+                agent = agent.with_context_builder(superagent::context::builder(
+                    dir,
+                    on_ok,
+                    say_trigger.clone(),
+                    shown.clone(),
+                ));
             }
             // Named for the session list (L4.18); not scripts, pipelines or subagents.
             if self.cli.print.is_none() && !self.cli.rpc {
@@ -1987,7 +1994,7 @@ impl Ctx {
             agent = agent.adopt(c);
         }
         if let Some((helper, inform)) = decision_check {
-            superagent::context::decision_check(agent.subscribe(), Some(helper), inform);
+            superagent::context::decision_check(agent.subscribe(), Some(helper), inform, shown);
         }
         if let Some((id, proof)) = task {
             // Saved after the agent wrote a new session's system prompt (an entry before it
@@ -2921,29 +2928,20 @@ async fn super_launch(paths: &Paths) -> anyhow::Result<ExitCode> {
     let root = novacode_base::platform::canonicalize(std::env::current_dir()?)?;
     let home = paths.home().to_path_buf();
     entry::check_root(&home, &root)?;
-    let id = match entry::running(&home, &root, |id| serve::find_live(paths, id).is_ok()) {
-        Some(id) => id,
-        None => {
-            // Not through spawn_bg: its NOVACODE_BG_CHILD would reach every task super starts,
-            // and it reports a super that lost the lock race as a failed start.
-            let mut c = std::process::Command::new(live_path(std::env::current_exe()?));
-            c.args(std::env::args_os().skip(1))
-                .arg("--super-serve")
-                .current_dir(&root)
-                .env_remove("NOVACODE_BG_CHILD")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            detach(&mut c);
-            let mut child = c.spawn()?;
-            std::thread::spawn(move || child.wait());
-            let (p, r) = (paths.clone(), root.clone());
-            tokio::task::spawn_blocking(move || {
-                entry::wait(p.home(), &r, std::time::Duration::from_secs(10), |id| {
-                    serve::find_live(&p, id).is_ok()
-                })
-            })
-            .await??
+    // A super that `novacode stop` just reached is still live while it shuts down: wait for
+    // it to exit (and free the folder's lock), then start a new one.
+    let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let id = loop {
+        let id = super_find_or_start(paths, &root).await?;
+        if !serve::closing(paths, &id).await {
+            break id;
+        }
+        eprintln!("super agent {id} is shutting down; waiting for it to exit (up to 30 s)");
+        while serve::find_live(paths, &id).is_ok() || entry::locked(&home, &root) {
+            if std::time::Instant::now() >= gone_by {
+                bail!("super agent {id} is still shutting down after 30 s; try again when it is gone");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     };
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -2955,6 +2953,39 @@ async fn super_launch(paths: &Paths) -> anyhow::Result<ExitCode> {
     let trusted = trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &root, false);
     let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&root)), trusted);
     serve::attach_loop(paths, &id, || tui_base(paths, &settings), false).await
+}
+
+/// The running super's session for `root`, or a new detached super's once it is up.
+async fn super_find_or_start(paths: &Paths, root: &Path) -> anyhow::Result<String> {
+    use superagent::entry;
+    let (home, root) = (paths.home().to_path_buf(), root.to_path_buf());
+    Ok(
+        match entry::running(&home, &root, |id| serve::find_live(paths, id).is_ok()) {
+            Some(id) => id,
+            None => {
+                // Not through spawn_bg: its NOVACODE_BG_CHILD would reach every task super starts,
+                // and it reports a super that lost the lock race as a failed start.
+                let mut c = std::process::Command::new(live_path(std::env::current_exe()?));
+                c.args(std::env::args_os().skip(1))
+                    .arg("--super-serve")
+                    .current_dir(&root)
+                    .env_remove("NOVACODE_BG_CHILD")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                detach(&mut c);
+                let mut child = c.spawn()?;
+                std::thread::spawn(move || child.wait());
+                let (p, r) = (paths.clone(), root.clone());
+                tokio::task::spawn_blocking(move || {
+                    entry::wait(p.home(), &r, std::time::Duration::from_secs(10), |id| {
+                        serve::find_live(&p, id).is_ok()
+                    })
+                })
+                .await??
+            }
+        },
+    )
 }
 
 fn spawn_bg() -> anyhow::Result<ExitCode> {

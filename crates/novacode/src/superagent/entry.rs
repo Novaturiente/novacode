@@ -19,6 +19,11 @@ fn lock_path(dir: &Path) -> PathBuf {
     dir.join("super")
 }
 
+/// Whether a super (maybe one still shutting down) holds `root`'s lock now.
+pub fn locked(home: &Path, root: &Path) -> bool {
+    held(&dir(home, root))
+}
+
 /// Whether a super holds this folder's lock now.
 fn held(dir: &Path) -> bool {
     matches!(try_lock(&lock_path(dir)), Ok(None))

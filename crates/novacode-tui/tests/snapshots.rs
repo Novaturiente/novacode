@@ -139,6 +139,7 @@ fn the_new_since_divider_marks_the_first_unseen_message() {
     assert!(c1 < div && div < c2 && c2 < c3, "{s}");
     // Live: focused, no divider; unfocused, before the first block of that time away.
     let (mut a, _rx) = app(vec![Message::user("go")]);
+    a.on_event(Event::FocusGained);
     for m in say_msgs("c1", "update", 1) {
         a.on_agent(AgentEvent::Message(m));
     }
@@ -160,6 +161,29 @@ fn the_new_since_divider_marks_the_first_unseen_message() {
     let s = screen(&mut a, 100, 40);
     assert_eq!(s.matches("new since you last looked").count(), 1);
     assert!(s.find("new since").unwrap() > s.find("body c3").unwrap(), "{s}");
+}
+
+/// S1 (live test): a terminal never reports focus until it changes, so a window opened or
+/// reconnected in an unfocused tmux window got no FocusLost and never drew the divider.
+/// Until the user shows they are there (focus in, a key, a click), the window counts as away.
+#[test]
+fn a_window_counts_as_away_until_the_user_shows_up() {
+    let (mut a, _rx) = app(vec![Message::user("go")]);
+    for m in say_msgs("c1", "update", 1) {
+        a.on_agent(AgentEvent::Message(m));
+    }
+    let s = screen(&mut a, 100, 40);
+    assert!(
+        s.find("new since").is_some_and(|d| d < s.find("body c1").unwrap()),
+        "{s}"
+    );
+    // A key press shows the user is looking: no divider for what comes next.
+    let (mut a, _rx) = app(vec![Message::user("go")]);
+    a.on_event(Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
+    for m in say_msgs("c1", "update", 1) {
+        a.on_agent(AgentEvent::Message(m));
+    }
+    assert!(!screen(&mut a, 100, 40).contains("new since"));
 }
 
 /// L10.9: open questions and warnings head the Tasks tab as Needs you; `d` dismisses one

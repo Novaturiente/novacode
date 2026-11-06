@@ -11,7 +11,7 @@ novacode --super
 
 The folder you start in is the super agent's **root**. Tasks can only run in that folder or its subfolders, so starting in `~/Projects` gives it every project below it.
 
-The super agent runs in the background. `novacode --super` starts it if it isn't running and opens a window on it. Closing the window doesn't stop it; run `novacode --super` in the same folder again to reattach. Without a terminal (in a script), `novacode --super` prints the super agent's session id instead of opening a window. `novacode stop <session>` ends it. `-m <model>` picks the super agent's model; without it, the super agent uses your default `model` setting. Other session flags (`--bg`, `-c`, `-r`, `--trust`, `-w`, …) can't be combined with `--super`.
+The super agent runs in the background. `novacode --super` starts it if it isn't running and opens a window on it. Closing the window doesn't stop it; run `novacode --super` in the same folder again to reattach. Without a terminal (in a script), `novacode --super` prints the super agent's session id instead of opening a window. `novacode stop <session>` ends it. Run right after a stop, `novacode --super` waits (up to 30 seconds, saying so) for the old super agent to finish shutting down, then starts a new one, instead of attaching to the one that is ending. `-m <model>` picks the super agent's model; without it, the super agent uses your default `model` setting. Other session flags (`--bg`, `-c`, `-r`, `--trust`, `-w`, …) can't be combined with `--super`.
 
 There is one super agent per root, held by a lock file (`super.lock` in its folder, see [The board](#the-board)). Two launches at the same time give one super agent and both attach to it. You can't start one inside, or above, the root of a running one.
 
@@ -34,7 +34,7 @@ A task's **charter** is kept on its board row and written only by novacode: the 
 
 Your **open requests** are things you asked for that are not tasks (yet). The super agent keeps them on its `todo` list, and its open items appear in the state block.
 
-The super agent's rule is that no decision lives only in the chat: a decision about a task goes on its charter with `task note`, a lasting preference goes to `memory`, and a request that is not a task yet goes on `todo`. After each of your messages, the helper model checks whether it held a decision the super agent didn't record; if so, the super agent is woken with a one-line reminder to record it. With `memory.enabled: false` this check is off.
+The super agent's rule is that no decision lives only in the chat: a decision about a task goes on its charter with `task note`, a lasting preference goes to `memory`, and a request that is not a task yet goes on `todo`. After each of your messages, the helper model checks whether it held a decision the super agent didn't record; if so, the super agent is woken with a one-line reminder to record it. Only lasting decisions count (a task's scope or limits, a preference, a rule) that its state block (charters, open requests), memory or what it just recorded doesn't already cover; one-off requests ("just this once"), instructions it already carried out, and how its own tools work inside are not decisions. With `memory.enabled: false` this check is off.
 
 Two guards keep tasks on what you asked for:
 
@@ -47,7 +47,7 @@ While at least one task is `running`, the super agent is woken every `super.watc
 
 For the check, the state block has a **Health** line per running task, written by novacode from the task's events: how long ago its last event came, which tool is running and for how long, how many tool calls in a row failed, how many times in a row it made the same call, how many of its cards wait for your answer and since when, and how long ago its last progress report came.
 
-- **All fine:** the super agent answers only `OK`. That turn is hidden from your window and left out of the super agent's own chat window; the time of the check goes on the board (`board.md` shows "Last health check").
+- **All fine:** the super agent answers only `OK`. That turn is hidden from your window and left out of the super agent's own chat window; the time of the check goes on the board (`board.md` shows "Last health check"). The super window shows no `cache miss` notices: its context is rebuilt for every request by design (misses are still logged in `~/.novacode/logs/cache-misses.jsonl`).
 - **A problem:** the super agent first asks the task (`task send` with `question: true`). Then it may send instructions, stop the task, resume it or start a replacement task without asking you. It never merges, closes, changes scope or deletes without your card, it always tells you what it found and did, and when anything is unclear it asks you first.
 
 **Progress reports.** Tasks are told to call `report` with `state: progress` at each milestone: what is done, what is next, and a count or percentage when known. When a task has worked for `super.watch.progressMinutes` (default 20) without one, novacode asks it for one at its next tool boundary; the task is not interrupted, and nothing is sent while it waits on your answer. Progress reports never wake the super agent; they show on the board and in the state block with their age.
@@ -67,9 +67,9 @@ The super agent's plain text is never shown as it is. If it ends a turn with pla
 
 The confirmation cards novacode makes itself (merge, close, scope change, accept, resume after a restart) also start with the task's status line.
 
-**New since you last looked.** In an attach window (the super window is one), a `━━ new since you last looked ━━` line sits before the first message that arrived while the terminal was unfocused. When you attach again later, it sits before the first message newer than the last time one of your windows on that session lost focus or closed (kept in `~/.novacode/seen/<session>`). This needs a terminal that reports focus (in tmux: `set -g focus-events on`); without focus reports, only reattaching places it.
+**New since you last looked.** In an attach window (the super window is one), a `━━ new since you last looked ━━` line sits before the first message that arrived while the terminal was unfocused. When you attach again later, it sits before the first message newer than the last time one of your windows on that session lost focus or closed (kept in `~/.novacode/seen/<session>`). This needs a terminal that reports focus (in tmux: `set -g focus-events on`); without focus reports, only reattaching places it. A terminal reports focus only when it changes, so a window counts as unfocused from the moment it opens until it gains focus or you press a key, click or paste.
 
-**Needs you.** Open questions and warnings are listed at the top of the Tasks tab under **Needs you**, and are kept on the board, so they survive a restart. A question leaves the list when you answer its card (a question you answer by typing leaves with the super agent's next `REPLY`); a warning leaves when the super agent sends an `UPDATE` or `DONE` about one of the same tasks. Press `d` on a row (with the panel focused) to dismiss it yourself.
+**Needs you.** Open questions and warnings are listed at the top of the Tasks tab under **Needs you**, and are kept on the board, so they survive a restart. A question leaves the list when you answer its card (a question you answer by typing leaves with the super agent's next `REPLY`); a warning leaves when the super agent sends an `UPDATE` or `DONE` about one of the same tasks. Press `d` on a row (with the panel focused) to dismiss it yourself. The super agent sees the list in its state block. A question whose card was open when the super agent stopped opens its card again after the restart (once a window is open); your answer takes it off the list and is passed to the super agent.
 
 ## How it works
 
@@ -153,7 +153,7 @@ A task whose turn ends on a model error, or that stops without reporting, shows 
 
 Ask the super agent in plain words, for example "stop T3", "tell T5 to also update the docs", "close T2". It can:
 
-- **stop** a task: the run ends and its queued messages are dropped, but the session stays; a later message continues it, including a goal it was working toward (pressing Esc in an attached task window still keeps queued messages, as today). Stopping a queued task takes it out of the queue; stopping a task under review stops the review. A `blocked` task isn't running, so stopping it is refused with a hint to close it or send it more work;
+- **stop** a task: the run ends and its queued messages are dropped, but the session stays; a later message continues it, including a goal it was working toward (pressing Esc in an attached task window still keeps queued messages, as today). Stopping a queued task takes it out of the queue; stopping a task under review stops the review. A `blocked` task isn't running, so stopping it is refused with a hint to close it or send it more work. A task that doesn't answer the stop within 15 seconds (a frozen process) has its process ended (SIGTERM, then SIGKILL after 5 seconds; a suspended process is resumed first so it can end), and the super agent is told;
 - **read** a task's final message, also while the task is still running;
 - **send** a follow-up to any task (the review of that task sees it as part of your request);
 - **note** a decision of yours on a task's charter (`task note`), and change a task's request, criteria or scope only after your OK on a card (`task scope`), see [Its context over days](#its-context-over-days);

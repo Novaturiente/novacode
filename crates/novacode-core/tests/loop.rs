@@ -688,6 +688,17 @@ async fn prompt_changes_are_appended_deltas() {
 /// reported once, with its cause, in the transcript and in logs/cache-misses.jsonl.
 #[tokio::test]
 async fn cache_miss_is_named_and_logged() {
+    cache_miss_run(false).await;
+}
+
+/// S2 (live test): a window whose context is rebuilt on every request (super) misses the
+/// cache by design; the miss is logged but shows no notice there.
+#[tokio::test]
+async fn cache_miss_shows_no_notice_with_a_context_builder() {
+    cache_miss_run(true).await;
+}
+
+async fn cache_miss_run(rebuilt: bool) {
     let work = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let reply = |read, write| FauxReply::Message {
@@ -703,14 +714,24 @@ async fn cache_miss_is_named_and_logged() {
     // Turn 2 reads the whole cached prompt; turn 3 reads nothing.
     let faux = Faux::new([reply(0, 20_000), reply(20_010, 50), reply(0, 20_100)]);
     let store = Store::create(&Paths::new(home.path()), work.path(), false);
-    let agent = Agent::new(
+    let mut agent = Agent::new(
         Arc::new(faux),
         vec![],
         store,
         cfg(work.path(), home.path()),
         Arc::new(LocalEnv),
     );
+    if rebuilt {
+        agent = agent.with_context_builder(novacode_core::context_window::Builder {
+            budget: 6000,
+            state: Arc::new(|_: &Store| "BOARD".to_string()),
+            quiet: None,
+            plain: None,
+        });
+    }
     let (_agent, events) = drive(agent, &["one", "two", "three"]).await;
+    let log = std::fs::read_to_string(home.path().join("logs/cache-misses.jsonl")).unwrap();
+    assert!(log.contains("\"lost\":"), "{log}");
     let notices: Vec<&String> = events
         .iter()
         .filter_map(|e| match e {
@@ -718,6 +739,10 @@ async fn cache_miss_is_named_and_logged() {
             _ => None,
         })
         .collect();
+    if rebuilt {
+        assert!(notices.is_empty(), "{notices:?}");
+        return;
+    }
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(
         notices[0].starts_with("cache miss: 20060 prompt tokens")

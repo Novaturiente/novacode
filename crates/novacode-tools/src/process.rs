@@ -249,6 +249,36 @@ pub fn stop_inside(_dir: &Path) -> usize {
     0
 }
 
+/// End a process group that stopped answering (a frozen super task): SIGCONT first, so a
+/// stopped process can die, then SIGTERM, up to `grace` to exit, then SIGKILL.
+#[cfg(unix)]
+pub fn end_group(pid: u32, grace: Duration) {
+    use nix::sys::signal::{Signal, killpg};
+    let pg = nix::unistd::Pid::from_raw(pid as i32);
+    let _ = killpg(pg, Signal::SIGCONT);
+    let _ = killpg(pg, Signal::SIGTERM);
+    // A dead child of this process stays a zombie until reaped: that counts as gone.
+    let running = || {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or_else(
+            |_| cfg!(not(target_os = "linux")) && nix::sys::signal::kill(pg, None).is_ok(),
+            |s| {
+                s.rsplit_once(')')
+                    .is_some_and(|(_, r)| !r.trim_start().starts_with('Z'))
+            },
+        )
+    };
+    let until = std::time::Instant::now() + grace;
+    while running() && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = killpg(pg, Signal::SIGKILL);
+}
+
+#[cfg(windows)]
+pub fn end_group(pid: u32, _grace: Duration) {
+    kill_group_hard(pid);
+}
+
 /// SIGKILL a process group at once (MCP servers on shutdown).
 pub fn kill_group_now(pid: u32) {
     kill_group_hard(pid);
