@@ -99,6 +99,19 @@ fn held_note(held: bool) -> &'static str {
     }
 }
 
+/// A work task whose work is fully done, which code closes (L10.9): a read task that is
+/// ready, or a write task whose merge landed (not only a PR opened) with its after steps
+/// done or none.
+pub(super) fn finished(t: &Task) -> bool {
+    use super::board::{AfterState, Landed};
+    t.kind == Kind::Work
+        && t.state == State::Ready
+        && match t.write || t.landed.is_some() {
+            false => true,
+            true => t.landed == Some(Landed::Merged) && (t.after.is_empty() || t.after_state == AfterState::Done),
+        }
+}
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Args {
@@ -115,6 +128,7 @@ struct Args {
     ty: Option<String>,
     criteria: Vec<String>,
     after: Vec<String>,
+    replaces: Option<String>,
     #[serde(deserialize_with = "super::board::points")]
     scope: Vec<String>,
     skills: Vec<String>,
@@ -638,6 +652,20 @@ impl Super {
             return Err("give 1 to 5 checkable acceptance `criteria`".into());
         }
         check_scope(&a.scope)?;
+        let replaced = match a.replaces.as_deref() {
+            Some(name) => {
+                let old = self.find(name)?;
+                if old.state == State::Merging {
+                    return Err(format!(
+                        "{} is merging: wait for the merge result before replacing it",
+                        old.label
+                    ));
+                }
+                self.check(&old.id, Event::Close)?;
+                Some(old)
+            }
+            None => None,
+        };
         let folder = self.in_root(a.folder.as_deref().ok_or("`folder` is missing")?)?;
         // Tiers of super's current provider, unless a model is named (L10.9 "Models").
         let own = self.current_model();
@@ -685,6 +713,7 @@ impl Super {
             state: State::Queued,
             started: now,
             updated: now,
+            notes: replaced.iter().map(|o| format!("replaces {}", o.label)).collect(),
             ..Task::default()
         };
         let (id, label) = self.edit(|b| {
@@ -696,6 +725,19 @@ impl Super {
             b.tasks.push(row);
             (id, label)
         })?;
+        // The replaced task closes without a card; unmerged work keeps its worktree (L10.9).
+        let closed = match &replaced {
+            Some(o) => {
+                let o = self.row(&o.id)?;
+                let remove = Self::merged(&o) == Some(true);
+                Some(
+                    self.close_now(&o, remove, false)
+                        .await
+                        .unwrap_or_else(|e| format!("{} was not closed: {e}", o.label)),
+                )
+            }
+            None => None,
+        };
         let notes = self.pump().await;
         let t = self.row(&id)?;
         let mut out = match t.state {
@@ -733,6 +775,9 @@ impl Super {
         }
         if let Some(n) = notice {
             out += &format!("\nNote: {n}.");
+        }
+        if let Some(c) = closed {
+            out += &format!("\nReplaced: {c}");
         }
         Ok(out)
     }
@@ -1652,7 +1697,12 @@ impl Super {
         if n.effects.contains(&super::board::Effect::StopReview) {
             self.stop_review(reviewer).await;
         }
-        Ok(format!("{} is ready.", t.label))
+        let mut out = format!("{} is ready.", t.label);
+        // A read task's answer reached super with its report: finished (L10.9).
+        if let Some(closed) = self.auto_close(&t.id).await {
+            out += &format!(" {closed}");
+        }
+        Ok(out)
     }
 
     async fn send(&self, t: &Task, message: &str) -> Result<String, String> {
@@ -1838,8 +1888,37 @@ impl Super {
             Some(p) if p == close_rm => true,
             _ => return Ok(format!("The user declined: {} stays open.", t.label)),
         };
+        let mut out = self.close_now(t, remove, false).await?;
+        for n in self.pump().await {
+            out += &format!("\n{n}");
+        }
+        Ok(out)
+    }
+
+    /// Code closes `id` when its work is [`finished`] (L10.9), as `task close` without the
+    /// card: the worktree goes only when its branch is merged into its base.
+    pub(super) async fn auto_close(&self, id: &str) -> Option<String> {
+        let t = self.row(id).ok().filter(finished)?;
+        let remove = Self::merged(&t) == Some(true);
+        let mut out = match self.close_now(&t, remove, true).await {
+            Ok(out) => format!("Code closed {}: its work is finished. {out}", t.label),
+            Err(e) => format!("Code didn't close {}: {e}", t.label),
+        };
+        for n in self.pump().await {
+            out += &format!("\n{n}");
+        }
+        Some(out)
+    }
+
+    /// Close `t` without a card: stop its review and process, archive its row, and remove
+    /// its worktree when `remove` (the session file stays). `only_finished`: refused unless
+    /// the row is still [`finished`] when it applies.
+    async fn close_now(&self, t: &Task, remove: bool, only_finished: bool) -> Result<String, String> {
         // The review running now, not the one seen before the card.
         let (n, reviewer) = self.edit(|b| {
+            if only_finished && !b.task(&t.id).is_some_and(finished) {
+                return Err(format!("{} changed since its work finished", t.label));
+            }
             let r = reviewer(b, &t.id);
             b.apply(&t.id, Event::Close).map(|n| (n, r))
         })??;
@@ -1878,9 +1957,6 @@ impl Super {
                 (true, Err(e)) => out += &format!(" Worktree not removed: {e}."),
                 _ => out += &format!(" Worktree {} kept (not merged).", w.display()),
             }
-        }
-        for n in self.pump().await {
-            out += &format!("\n{n}");
         }
         Ok(out)
     }
@@ -2248,7 +2324,7 @@ impl Tool for TaskTool {
         "task"
     }
     fn description(&self) -> &str {
-        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], after?[], scope?[], skills?[], goal?} (`after`: steps that run only once the merge lands, such as deploy and live checks; never put them in criteria: the review judges only the criteria, then after the merge code sends the after steps to the task, which reports done with their proof); info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task, pr?} (each asks the user on a card; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task with commits past its base, not merging or ready, ships without an approved review after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked because it kept ending without a report, or that reported `blocked`: code takes its commit and changed files from its worktree's HEAD when it has no `done`, refused when nothing is committed, and the review uses a round); note {task, note} (keeps a user decision about the task on its charter, which you see with every message); scope {task, request? | criteria? | scope?[]} (changes the brief, criteria or scope only after the user's OK on a card, which shows only what changes; scope is short points, at most 8 of at most 25 words each; code then updates the charter and tells the task); model {task | all, provider | model} (only when the user asks to switch models: each task moves to the matching tier on that provider, or to that model, after one card listing each task's old and new model; a task blocked by a provider limit is told to continue); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
+        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], after?[], replaces?, scope?[], skills?[], goal?} (`after`: steps that run only once the merge lands, such as deploy and live checks; never put them in criteria: the review judges only the criteria, then after the merge code sends the after steps to the task, which reports done with their proof; `replaces`: the task this one succeeds, which code closes without a card); info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task, pr?} (each asks the user on a card; code itself closes a ready read task, and a write task once its merge landed and its after steps are done; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task with commits past its base, not merging or ready, ships without an approved review after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked because it kept ending without a report, or that reported `blocked`: code takes its commit and changed files from its worktree's HEAD when it has no `done`, refused when nothing is committed, and the review uses a round); note {task, note} (keeps a user decision about the task on its charter, which you see with every message); scope {task, request? | criteria? | scope?[]} (changes the brief, criteria or scope only after the user's OK on a card, which shows only what changes; scope is short points, at most 8 of at most 25 words each; code then updates the charter and tells the task); model {task | all, provider | model} (only when the user asks to switch models: each task moves to the matching tier on that provider, or to that model, after one card listing each task's old and new model; a task blocked by a provider limit is told to continue); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
     }
     fn schema(&self) -> Value {
         let s = |d: &str| json!({ "type": "string", "description": d });
@@ -2267,6 +2343,7 @@ impl Tool for TaskTool {
                 "type": { "type": "string", "enum": ["bugfix", "change", "question"], "description": "spawn: question needs write false; bugfix and change need write true. Default change." },
                 "criteria": { "type": "array", "items": { "type": "string" }, "description": "spawn: 1-5 checkable acceptance criteria. scope: the new criteria." },
                 "after": { "type": "array", "items": { "type": "string" }, "description": "spawn: steps that run only after the merge lands (deploy, live checks), not judged by the review; code sends them to the task once merged (a charter limit such as \"stop before deploy\" asks the user first)." },
+                "replaces": s("spawn: the task this one succeeds (a retry or recovery); once the new task exists, code closes the old one without a card (its worktree stays if it has unmerged work). Refused while the old one is merging."),
                 "scope": { "type": "array", "items": { "type": "string" }, "description": "spawn and scope: the areas the change should touch, as short points (at most 8, each at most 25 words), e.g. [\"src/parser/ only\", \"no API changes\"]. scope: the whole new list." },
                 "skills": { "type": "array", "items": { "type": "string" }, "description": "spawn: skills the task should use." },
                 "goal": { "type": "boolean", "description": "spawn: open-ended work; the task keeps going until the criteria hold." },
@@ -3909,8 +3986,51 @@ pub(super) mod tests {
             .unwrap()
             .unwrap();
         run(&fx, json!({"action": "accept", "task": "T1-q"})).await.unwrap();
-        assert_eq!(state(&fx, "T1-q"), State::Ready);
+        assert_eq!(state(&fx, "T1-q"), State::Archived);
         assert!(fx.asker.asked.lock().unwrap().is_empty());
+    }
+
+    /// L10.9: a read task super accepts after its answer is finished: code closes it, no card.
+    #[tokio::test]
+    async fn accept_of_a_read_task_closes_it() {
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "q", false)).await.unwrap();
+        set_state(&fx, "T1-q", State::Reviewing);
+        let out = run(&fx, json!({"action": "accept", "task": "T1-q"})).await.unwrap();
+        assert!(out.contains("Code closed T1-q"), "{out}");
+        assert_eq!(state(&fx, "T1-q"), State::Archived);
+        assert!(!fx.launcher.alive("s1"), "its process stopped");
+        assert!(fx.asker.asked.lock().unwrap().is_empty(), "no card");
+    }
+
+    /// L10.9: `replaces` closes the old task without a card; unmerged work keeps its worktree.
+    #[tokio::test]
+    async fn spawn_replaces_closes_the_old_task_without_a_card() {
+        let fx = fixture(5, &[]);
+        let app = repo(&fx.root, "app");
+        run(&fx, spawn_args("app", "old", true)).await.unwrap();
+        let wt = app.join(".worktrees/T1-old");
+        std::fs::write(wt.join("new"), "y").unwrap();
+        sh(&wt, &["add", "new"]);
+        sh(&wt, &["commit", "-qm", "work"]);
+        let mut a = spawn_args("app", "new", true);
+        a["replaces"] = json!("T1-old");
+        let out = run(&fx, a).await.unwrap();
+        assert!(out.contains("Closed T1-old") && out.contains("kept"), "{out}");
+        assert_eq!(state(&fx, "T1-old"), State::Archived);
+        assert!(!fx.launcher.alive("s1"));
+        assert!(wt.exists(), "unmerged work keeps its worktree");
+        assert!(fx.asker.asked.lock().unwrap().is_empty(), "no card");
+        let notes = fx.sup.row("T2-new").unwrap().notes;
+        assert!(notes.contains(&"replaces T1-old".to_string()), "{notes:?}");
+        // A merging task can't be replaced.
+        set_state(&fx, "T2-new", State::Merging);
+        let mut a = spawn_args("app", "third", true);
+        a["replaces"] = json!("T2-new");
+        let e = run(&fx, a).await.unwrap_err();
+        assert!(e.contains("merging"), "{e}");
+        assert!(fx.sup.row("T3-third").is_err(), "nothing spawned");
     }
 
     #[tokio::test]
@@ -3918,9 +4038,7 @@ pub(super) mod tests {
         let fx = fixture(5, &[]);
         std::fs::create_dir(fx.root.join("p")).unwrap();
         run(&fx, spawn_args("p", "q", false)).await.unwrap();
-        set_state(&fx, "T1-q", State::Reviewing);
-        run(&fx, json!({"action": "accept", "task": "T1-q"})).await.unwrap();
-        assert_eq!(state(&fx, "T1-q"), State::Ready);
+        set_state(&fx, "T1-q", State::Ready);
         // A doubted approval: back to reviewing, no round used.
         run(&fx, json!({"action": "review", "task": "T1-q"})).await.unwrap();
         let t = fx.sup.row("T1-q").unwrap();
@@ -4419,7 +4537,8 @@ pub(super) mod tests {
             })
             .unwrap();
         fx.sup.accept(&seen).await.unwrap();
-        assert_eq!(state(&fx, "T1-q"), State::Ready);
+        // Ready, then closed: a read task's accept finishes it (L10.9).
+        assert_eq!(state(&fx, "T1-q"), State::Archived);
         assert_eq!(state(&fx, "T3-review-q"), State::Archived, "the review is stopped");
     }
 
