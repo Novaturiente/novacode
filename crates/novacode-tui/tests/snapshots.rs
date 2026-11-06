@@ -13,6 +13,11 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 fn app(history: Vec<Message>) -> (App, mpsc::UnboundedReceiver<Cmd>) {
+    app_at(history, None)
+}
+
+/// `attached`: the session id of an attach window.
+fn app_at(history: Vec<Message>, attached: Option<&str>) -> (App, mpsc::UnboundedReceiver<Cmd>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let init = Init {
         model: "claude/opus".into(),
@@ -32,7 +37,7 @@ fn app(history: Vec<Message>) -> (App, mpsc::UnboundedReceiver<Cmd>) {
         compactions: 0,
         commands: vec![],
         draft: String::new(),
-        attached: false,
+        attached: attached.map(String::from),
         statusline: Default::default(),
         panel_only: false,
         panel_auto: false,
@@ -42,6 +47,55 @@ fn app(history: Vec<Message>) -> (App, mpsc::UnboundedReceiver<Cmd>) {
         procs: Vec::new(),
     };
     (App::new(init, tx), rx)
+}
+
+/// L9 `/kill`: in a session's own window it is refused with a pointer to `/quit`.
+#[test]
+fn kill_is_refused_in_the_sessions_own_window() {
+    let (mut a, mut rx) = app(vec![]);
+    typ(&mut a, "/kill");
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(rx.try_recv().is_err());
+    assert_eq!(a.exit, None);
+    let s = screen(&mut a, 120, 12);
+    assert!(
+        s.contains("/kill works in attached windows") && s.contains("/quit"),
+        "{s}"
+    );
+}
+
+/// L9 `/kill` in an attached window: a card names the session; no sends nothing, yes
+/// sends `Kill`.
+#[test]
+fn kill_asks_then_ends_the_attached_session() {
+    let (mut a, mut rx) = app_at(vec![], Some("01abcdef0123456789"));
+    typ(&mut a, "/kill");
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    let s = screen(&mut a, 120, 16);
+    assert!(s.contains("End session 01abcdef0123?"), "{s}");
+    assert!(rx.try_recv().is_err(), "nothing before the answer");
+    // Cancel (the second choice) keeps it.
+    key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(rx.try_recv().is_err(), "cancel sends nothing");
+    typ(&mut a, "/kill");
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(rx.try_recv().unwrap(), Cmd::Kill);
+}
+
+/// L9 `/kill` in super's window (a board came in) names super's root and says tasks keep running.
+#[test]
+fn kill_in_supers_window_names_the_root() {
+    let (mut a, _rx) = app_at(vec![], Some("01abcdef0123456789"));
+    a.on_ui(UiEvent::Board {
+        tasks: vec![],
+        needs: vec![],
+    });
+    typ(&mut a, "/kill");
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    let s = screen(&mut a, 120, 16);
+    assert!(s.contains("End super for /home/u/proj? Tasks keep running."), "{s}");
 }
 
 /// L9.19: an idle compaction shows in the activity line while it runs, then
@@ -800,7 +854,7 @@ fn file_completion_in_a_real_folder() {
             compactions: 0,
             commands: vec![],
             draft: String::new(),
-            attached: false,
+            attached: None,
             statusline: Default::default(),
             panel_only: false,
             panel_auto: false,

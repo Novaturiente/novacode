@@ -702,7 +702,8 @@ impl Host {
                     text,
                 });
             }
-            Cmd::Quit => {}
+            // `/kill` is an attached window's; its own window refuses it.
+            Cmd::Kill | Cmd::Quit => {}
         }
     }
 

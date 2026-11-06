@@ -73,8 +73,16 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "re-read settings, keys, theme, skills, extensions, MCP servers and context files",
     ),
     ("/restart", "restart novacode (a new build) and resume this session"),
+    (
+        "/kill",
+        "attached window: end the session it shows, after a card (super: tasks keep running)",
+    ),
     ("/quit", "quit"),
 ];
+
+/// The id of `/kill`'s confirmation card, made by the window itself (no host asked).
+const KILL_ASK: u64 = u64::MAX;
+const KILL_YES: &str = "End it";
 
 /// What the UI knows at start.
 pub struct Init {
@@ -107,8 +115,9 @@ pub struct Init {
     pub commands: Vec<(String, String)>,
     /// Editor text to start with (a prompt taken back by `/rewind` or `/tree`).
     pub draft: String,
-    /// An `attach` window (L8.13): commands that swap the session stay with its own window.
-    pub attached: bool,
+    /// An `attach` window (L8.13): the session it shows. Commands that swap the session
+    /// stay with its own window; `/kill` works only here.
+    pub attached: Option<String>,
     /// `ui.statusline` (L9.12).
     pub statusline: crate::statusline::Config,
     /// Only the side panel, full screen: the tmux panel pane (L9.18).
@@ -190,6 +199,8 @@ pub enum Cmd {
         width: u16,
         height: u16,
     },
+    /// `/kill` in an attached window (L9): end the session it shows, like `novacode stop`.
+    Kill,
     Quit,
 }
 
@@ -601,7 +612,7 @@ impl App {
 
     /// The user stops the turn: queued follow-ups come back to the editor instead of starting (L3.7).
     fn abort(&mut self) {
-        if !self.init.attached && self.pending.iter().any(|(_, steer)| !steer) {
+        if self.init.attached.is_none() && self.pending.iter().any(|(_, steer)| !steer) {
             self.send(Cmd::TakeFollowUps);
         }
         self.send(Cmd::Abort);
@@ -1175,7 +1186,7 @@ impl App {
         self.panel.tick();
         // Live output while the Processes tab is on screen (the ticker runs only then or while busy).
         let popup = matches!(self.overlay, Some(Overlay::Procs(_)));
-        if (popup || self.panel.procs_shown()) && !self.init.attached {
+        if (popup || self.panel.procs_shown()) && self.init.attached.is_none() {
             self.send(Cmd::Processes);
         }
         before != self.panel.visible || (self.panel.visible && self.busy) || popup
@@ -1295,6 +1306,12 @@ impl App {
                     }
                 }
                 None => self.tr.notice("questions dismissed", true),
+            }
+            if form.req.id == KILL_ASK {
+                if replies.is_some_and(|r| r.iter().any(|r| r.chosen.iter().any(|c| c == KILL_YES))) {
+                    self.send(Cmd::Kill);
+                }
+                return;
             }
             let _ = form.req.reply.send(replies);
             return;
@@ -1488,12 +1505,12 @@ impl App {
                     .notice("nothing to paste (no wl-paste/xclip, or an empty clipboard)", true),
             },
             Some(A::ExternalEditor) => self.external_editor = true,
-            Some(A::Dequeue) if self.init.attached => self.flash("Alt+Up works in the session's own window"),
+            Some(A::Dequeue) if self.init.attached.is_some() => self.flash("Alt+Up works in the session's own window"),
             Some(A::Dequeue) => match self.pending.last() {
                 Some((_, steer)) => self.send(Cmd::Dequeue(*steer)),
                 None => self.flash("nothing queued"),
             },
-            Some(A::Reload) if self.init.attached => self.flash("reload works in the session's own window"),
+            Some(A::Reload) if self.init.attached.is_some() => self.flash("reload works in the session's own window"),
             Some(A::Reload) => self.reload(),
             Some(A::HistorySearch) => self.editor.search_history(),
             Some(A::FollowUp) => {
@@ -1746,6 +1763,40 @@ impl App {
         }
     }
 
+    /// `/kill` (L9): a card naming the attached session; yes sends [`Cmd::Kill`].
+    fn ask_kill(&mut self) {
+        let Some(id) = &self.init.attached else {
+            self.tr.notice(
+                "/kill works in attached windows; in the session's own window use /quit",
+                false,
+            );
+            return;
+        };
+        let question = match self.board {
+            Some(_) => format!("End super for {}? Tasks keep running.", self.init.cwd),
+            None => format!("End session {}?", &id[..id.len().min(12)]),
+        };
+        let choice = |label: &str| novacode_types::Choice {
+            label: label.into(),
+            description: None,
+            preview: None,
+            recommended: false,
+        };
+        let (reply, _) = tokio::sync::oneshot::channel();
+        let mut form = crate::ask::AskForm::new(crate::ask::AskReq {
+            id: KILL_ASK,
+            questions: vec![novacode_types::Question {
+                question,
+                header: Some("Kill".into()),
+                options: vec![choice(KILL_YES), choice("Cancel")],
+                multi: false,
+            }],
+            reply,
+        });
+        form.edit_key = self.keymap.keys(A::ExternalEditor);
+        self.asks.push_back(form);
+    }
+
     fn copy_reply(&mut self) {
         match self.tr.last_reply() {
             Some(t) => {
@@ -1760,7 +1811,7 @@ impl App {
         let mut words = text.trim().splitn(2, char::is_whitespace);
         let (cmd, arg) = (words.next().unwrap_or(""), words.next().map(str::trim).unwrap_or(""));
         if COMMANDS.iter().any(|(c, _)| *c == cmd) || cmd == "/exit" || cmd == "/help" {
-            if self.init.attached
+            if self.init.attached.is_some()
                 && matches!(
                     cmd,
                     "/resume" | "/new" | "/tree" | "/rewind" | "/fork" | "/clone" | "/reload" | "/restart" | "/login"
@@ -1775,6 +1826,7 @@ impl App {
             }
             match cmd {
                 "/quit" | "/exit" => self.exit = Some(Exit::Quit),
+                "/kill" => self.ask_kill(),
                 "/model" if !arg.is_empty() => self.set_model(arg),
                 "/model" => self.list_models(),
                 "/thinking" if !arg.is_empty() => self.set_thinking(arg),

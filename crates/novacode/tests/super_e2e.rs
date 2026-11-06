@@ -268,6 +268,54 @@ fn relaunch_right_after_stop_starts_a_new_super() {
     }
 }
 
+/// L9 `/kill`: after `novacode stop` the next super resumes the same session; after a
+/// `/kill` (its window marks the super folder `fresh`, then stops it) a new session starts,
+/// and the board stays.
+#[test]
+fn super_resumes_after_stop_and_starts_fresh_after_kill() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let (home, root, scripts) = (base.join("home"), base.join("projects"), base.join("scripts"));
+    for d in [&home, &root, &scripts] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let settings = json!({"memory": {"enabled": false}, "notifications": {"enabled": false}});
+    std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
+    script(&scripts, "super", &tell("hi"));
+    let first = start_super(&home, &root, &scripts);
+    let mut cleanup = Cleanup(home.clone(), first.clone());
+    let super_dir = std::fs::read_dir(home.join("super"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    until("the board is saved", || super_dir.join("board.json").exists());
+    // A session is written with its first message: give super one.
+    let run: Value = serde_json::from_str(&std::fs::read_to_string(run_file(&home, &first)).unwrap()).unwrap();
+    let mut sock = UnixStream::connect(run["socket"].as_str().unwrap()).unwrap();
+    sock.write_all(format!("{}\n", json!({"type": "prompt", "text": "hello"})).as_bytes())
+        .unwrap();
+    let saved = || {
+        std::fs::read_dir(home.join("sessions"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|d| d.path().join(format!("{first}.jsonl")).exists())
+    };
+    until("super's session is saved", saved);
+    drop(sock);
+    novacode(&home).args(["stop", &first]).output().unwrap();
+    let again = start_super(&home, &root, &scripts);
+    assert_eq!(again, first, "a stop resumes the same session");
+    std::fs::write(super_dir.join("fresh"), "").unwrap();
+    novacode(&home).args(["stop", &again]).output().unwrap();
+    let fresh = start_super(&home, &root, &scripts);
+    cleanup.1 = fresh.clone();
+    assert_ne!(fresh, first, "after /kill a new session starts");
+    assert!(super_dir.join("board.json").exists() && !super_dir.join("fresh").exists());
+}
+
 #[test]
 fn super_runs_a_write_task_through_review_merge_and_close() {
     let dir = tempfile::tempdir().unwrap();

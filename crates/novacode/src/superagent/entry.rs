@@ -2,7 +2,8 @@
 //!
 //! `<home>/super/<root-hash>/` holds `root` (the canonical root path, which catches hash
 //! collisions and lets nested roots be found), `super.lock` (held by the running super) and
-//! `session` (its session id, written once its socket is up).
+//! `session` (its session id, written once its socket is up). A claim moves an old
+//! `session` to `last`, which the new super resumes, unless `/kill` left `fresh` (L9).
 
 use anyhow::bail;
 use novacode_base::storage::{FileLock, try_lock};
@@ -83,7 +84,7 @@ fn check_nested(home: &Path, root: &Path) -> anyhow::Result<()> {
 /// The detached super takes the root's lock. `None`: another super holds it.
 /// `root` is written before the root is checked again (a nested launch may have raced
 /// it): of two nested claims at once, the later check sees the other. A `session` left
-/// by an earlier super is removed.
+/// by an earlier super becomes `last` ([`last_session`]); after `/kill` it is removed.
 pub fn claim(home: &Path, root: &Path) -> anyhow::Result<Option<FileLock>> {
     let d = dir(home, root);
     let Some(lock) = try_lock(&lock_path(&d))? else {
@@ -92,11 +93,41 @@ pub fn claim(home: &Path, root: &Path) -> anyhow::Result<Option<FileLock>> {
     check_collision(home, root)?;
     std::fs::write(d.join("root"), root.as_os_str().as_encoded_bytes())?;
     check_nested(home, root)?;
-    match std::fs::remove_file(d.join("session")) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-        _ => {}
+    let fresh = d.join("fresh").exists();
+    for f in ["last", "fresh"] {
+        gone(std::fs::remove_file(d.join(f)))?;
+    }
+    match fresh {
+        true => gone(std::fs::remove_file(d.join("session")))?,
+        false => gone(std::fs::rename(d.join("session"), d.join("last")))?,
     }
     Ok(Some(lock))
+}
+
+fn gone(r: std::io::Result<()>) -> std::io::Result<()> {
+    match r {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// The session of the super before this one, to resume (`novacode stop` keeps it).
+pub fn last_session(home: &Path, root: &Path) -> Option<String> {
+    let id = std::fs::read_to_string(dir(home, root).join("last")).ok()?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// `/kill` of a super's window (L9): the next super for its root starts a new session.
+/// `false`: `session` is no super's.
+pub fn mark_fresh(home: &Path, session: &str) -> bool {
+    std::fs::read_dir(home.join("super"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .find(|d| std::fs::read_to_string(d.join("session")).is_ok_and(|s| s.trim() == session))
+        .is_some_and(|d| std::fs::write(d.join("fresh"), "").is_ok())
 }
 
 /// Super writes its session id once its socket is up.
@@ -193,6 +224,25 @@ mod tests {
             running(&home, &root, |_| false).is_none(),
             "a dead session is not running"
         );
+    }
+
+    /// L9 `/kill`: a new super resumes the last one's session after `novacode stop`;
+    /// after `/kill` (marked fresh) it starts a new one.
+    #[test]
+    fn a_claim_resumes_the_last_session_unless_it_was_killed() {
+        let (t, home) = setup();
+        let (stopped, killed) = (t.path().join("stopped"), t.path().join("killed"));
+        for (root, id) in [(&stopped, "s-1"), (&killed, "k-1")] {
+            std::fs::create_dir_all(dir(&home, root)).unwrap();
+            write_session(&home, root, id).unwrap();
+        }
+        assert!(mark_fresh(&home, "k-1"));
+        assert!(!mark_fresh(&home, "nobody"));
+        let _a = claim(&home, &stopped).unwrap().unwrap();
+        let _b = claim(&home, &killed).unwrap().unwrap();
+        assert_eq!(last_session(&home, &stopped).as_deref(), Some("s-1"));
+        assert_eq!(last_session(&home, &killed), None);
+        assert!(!dir(&home, &killed).join("fresh").exists(), "the mark is used up");
     }
 
     #[test]

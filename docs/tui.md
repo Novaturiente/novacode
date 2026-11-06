@@ -168,7 +168,8 @@ Type `/` to see the list. A line that is only `/something` unknown to novacode i
 | `/keys` (or `/help`) | Show the key bindings. |
 | `/reload` | Re-read settings, keys, theme, skills, extensions, MCP servers and context files. During a turn it waits for the turn to end (`Esc` ends it sooner); the same goes for `Alt+Shift+R`. The session stays as it is: its folder (a worktree too), background processes, running subagents, the mode (plan mode…), "allow for this session" answers and which files were read. |
 | `/restart` | Restart novacode (for example after a rebuild) and resume this session. |
-| `/quit` (or `/exit`) | Quit. |
+| `/kill` | Attached windows only (`novacode attach`, super's window, task panes): after a confirmation card, end the session the window shows, like `novacode stop`, and close the window. In super's window it ends super only; tasks keep running, and the next `novacode --super` starts a new super session. In a session's own window use `/quit`. |
+| `/quit` (or `/exit`) | Quit. In an attached window it only closes the window; the session keeps running. |
 
 Session commands are explained in [sessions](sessions.md).
 

@@ -1003,7 +1003,11 @@ async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         };
         cli.bg = Some(String::new());
-        cli.resume = cli.super_resume.take();
+        // The last super's session continues, unless `/kill` ended it (L9) or it is gone.
+        let here = std::env::current_dir()?;
+        cli.resume = cli.super_resume.take().or_else(|| {
+            superagent::entry::last_session(paths.home(), &root).filter(|id| session::find(&paths, &here, id).is_ok())
+        });
         Some(lock)
     } else {
         None
@@ -3171,7 +3175,7 @@ async fn interactive_loop(mut ctx: Ctx, mut store: Store, mut model: String) -> 
             compactions: state.compactions,
             commands,
             draft: std::mem::take(&mut draft),
-            attached: false,
+            attached: None,
             statusline: base.statusline,
             panel_only: false,
             // The tmux pane has the panel; the window keeps its full width.

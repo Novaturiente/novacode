@@ -687,6 +687,8 @@ pub async fn attach(
         }
     });
     let approvals = req_tx.clone();
+    let killed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (killed_tx, home, kill_id) = (killed.clone(), paths.home().to_path_buf(), id.clone());
     let mut last = state.clone();
     let bye: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
     let bye_seen = bye.clone();
@@ -883,6 +885,12 @@ pub async fn attach(
                 | Cmd::LoginCancel
                 | Cmd::FileStats(_)
                 | Cmd::OpenFile(_) => continue,
+                // `/kill` (L9): end the session like `novacode stop`; a super's next start is a new session.
+                Cmd::Kill => {
+                    killed_tx.store(true, std::sync::atomic::Ordering::Relaxed);
+                    crate::superagent::entry::mark_fresh(&home, &kill_id);
+                    ClientCmd::Shutdown
+                }
                 Cmd::Quit => break,
             };
             let id = matches!(cmd, ClientCmd::GetContext | ClientCmd::Export { .. }).then(|| "ui".to_string());
@@ -910,7 +918,7 @@ pub async fn attach(
         compactions: state.compactions,
         commands: vec![],
         draft: String::new(),
-        attached: true,
+        attached: Some(id.clone()),
         statusline: base.statusline,
         panel_only,
         panel_auto: base.panel_auto,
@@ -932,6 +940,9 @@ pub async fn attach(
     match bye.lock().unwrap().take() {
         // The owner is rebuilding it: the caller reconnects (None).
         Some(reason) if reason == RELOADING => return Ok(None),
+        _ if killed.load(std::sync::atomic::Ordering::Relaxed) => {
+            eprintln!("ended session {} (/kill)", &id[..id.len().min(13)])
+        }
         Some(reason) => eprintln!("the session is over: {reason}"),
         None => eprintln!(
             "detached; the session keeps running (novacode attach {})",
