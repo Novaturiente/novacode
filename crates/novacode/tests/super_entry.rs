@@ -151,7 +151,11 @@ fn super_session_sees_exactly_its_tools_and_no_project_files() {
     let report = report.unwrap();
     let mut tools = rows(&report, "tools");
     tools.sort();
-    assert_eq!(tools, ["agent", "ask_user", "memory", "task", "todo"], "{report}");
+    assert_eq!(
+        tools,
+        ["agent", "ask_user", "history_search", "memory", "task", "todo"],
+        "{report}"
+    );
     let sections = rows(&report, "system prompt");
     assert!(sections.contains(&"preamble".to_string()), "{report}");
     for absent in ["project_context", "skills"] {

@@ -136,6 +136,9 @@ pub struct Agent {
     extensions: Option<Arc<crate::extensions::Extensions>>,
     /// Claude Code plugin hooks (L7.14) and the state they need.
     plugins: Option<Plugins>,
+    /// Super's rebuilt context (L10.9): each request is built from the projection; the
+    /// session file is unchanged. `None` = the projection is sent as is.
+    context: Option<crate::context_window::Builder>,
 }
 
 struct Plugins {
@@ -457,6 +460,7 @@ impl Agent {
             hooks: Arc::default(),
             extensions: None,
             plugins: None,
+            context: None,
             pending_cp: None,
             cwd_gone: false,
         };
@@ -815,6 +819,13 @@ impl Agent {
 
     /// Compaction instructions of this session (after `with_memory`), made when a
     /// compaction runs (super's carry its board then).
+    /// Rebuild every request with `b` (super, L10.9). Auto-compaction is off: the request
+    /// no longer grows with the session.
+    pub fn with_context_builder(mut self, b: crate::context_window::Builder) -> Self {
+        self.context = Some(b);
+        self
+    }
+
     pub fn with_compaction_guide_fn(mut self, f: Arc<dyn Fn() -> String + Send + Sync>) -> Self {
         if let Some(m) = self.memory.as_mut() {
             m.guide = Some(f);
@@ -977,7 +988,7 @@ impl Agent {
     async fn after_settle(&mut self) {
         self.collect_notes(false).await;
         let Some(m) = self.memory.as_ref() else { return };
-        if self.context_tokens() >= m.settings.compact_at {
+        if self.context.is_none() && self.context_tokens() >= m.settings.compact_at {
             self.compact("the context reached the compaction threshold").await;
             return;
         }
@@ -996,7 +1007,7 @@ impl Agent {
         } else {
             u64::MAX
         };
-        if self.context_tokens() >= at {
+        if self.context.is_none() && self.context_tokens() >= at {
             self.compact("the context reached the compaction threshold").await;
         } else {
             self.start_observer();
@@ -1934,7 +1945,10 @@ impl Agent {
         let mut compacted = false;
         loop {
             let route = format!("{}/{}", self.cfg.provider, self.cfg.model);
-            let messages = self.store.projection();
+            let messages = match &self.context {
+                Some(b) => b.build(&self.store, self.store.projection()),
+                None => self.store.projection(),
+            };
             // Never ask for more output than the window has room for (L2.21), with 4096
             // spare for the estimate's error (pi's margin).
             let room = self

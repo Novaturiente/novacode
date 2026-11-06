@@ -4,6 +4,7 @@
 //! its model sees, its compaction instructions and the `super.*` settings.
 
 pub mod board;
+pub mod context;
 pub mod entry;
 pub mod inbox;
 pub mod link;
@@ -45,7 +46,14 @@ Never use `ask_user` to confirm a merge or a close (not \"Merge them now?\", not
 confirm twice. When the user asked for it, or to offer it, call `task merge` / `task close` directly; the user \
 answers on its card. `ask_user` is for real choices only (which option, which approach, missing facts). \
 When the user said to close a task after its merge, call `task close` as soon as the merge result arrives.
-- Act only on the user's requests.";
+- Act only on the user's requests.
+- You see only the newest part of your chat; a state block written by code (the board, each task's charter, \
+the open requests) comes with every message, and is the truth. For older chat, use `history_search`.
+- No decision may live only in chat: record it when the user makes it. A decision about a task (an answer, a \
+limit such as \"stop before deploy\") goes on its charter with `task note`; a lasting preference goes to `memory`; \
+a request that is not a task yet goes on `todo` (your open requests).
+- A change to a task's brief, criteria or scope goes through `task scope`: the user approves it on a card, then \
+code updates the charter and tells the task. A `task send` never changes the criteria.";
 
 /// Follows the global `AGENTS.md`: what of it doesn't apply to super.
 const OVERRIDES: &str = "The instructions above were written for a coding session. Where a rule needs a tool you \
@@ -68,7 +76,7 @@ pub fn compaction_guide(dir: std::path::PathBuf) -> impl Fn() -> String + Send +
 }
 
 /// The tools super's model sees (before `super.tools`).
-pub const TOOLS: [&str; 5] = ["task", "ask_user", "memory", "todo", "agent"];
+pub const TOOLS: [&str; 6] = ["task", "ask_user", "memory", "todo", "agent", "history_search"];
 
 /// Super's prompt: its own, the global `AGENTS.md` of novacode's `home`, then the
 /// overrides. No project `AGENTS.md` and no skills.
@@ -219,6 +227,20 @@ mod tests {
         assert!(PROMPT.contains("`ask_user` is for real choices only"));
     }
 
+    #[test]
+    fn decisions_are_recorded_off_chat_and_scope_changes_go_through_a_card() {
+        for rule in [
+            "No decision may live only in chat",
+            "`task note`",
+            "goes to `memory`",
+            "goes on `todo`",
+            "`history_search`",
+            "goes through `task scope`",
+        ] {
+            assert!(PROMPT.contains(rule), "{rule}");
+        }
+    }
+
     /// B9: super shows the base branch with the criteria, from `task info`.
     #[test]
     fn criteria_are_shown_with_the_base_branch_from_task_info() {
@@ -253,11 +275,25 @@ mod tests {
     }
 
     #[test]
-    fn tools_are_super_s_five_plus_super_tools() {
+    fn tools_are_super_s_six_plus_super_tools() {
         let (_d, s) = settings("{}");
-        assert_eq!(tools(&s), ["task", "ask_user", "memory", "todo", "agent"]);
+        assert_eq!(
+            tools(&s),
+            ["task", "ask_user", "memory", "todo", "agent", "history_search"]
+        );
         let (_d, s) = settings(r#"{"super": {"tools": ["web_search", "todo"]}}"#);
-        assert_eq!(tools(&s), ["task", "ask_user", "memory", "todo", "agent", "web_search"]);
+        assert_eq!(
+            tools(&s),
+            [
+                "task",
+                "ask_user",
+                "memory",
+                "todo",
+                "agent",
+                "history_search",
+                "web_search"
+            ]
+        );
     }
 
     #[test]

@@ -217,6 +217,11 @@ pub struct Held {
     pub text: String,
 }
 
+/// Chars of a task's charter notes before the oldest are summarised.
+pub const NOTES_CAP: usize = 3000;
+/// Chars of a summary row in the state block.
+const STATE_SUMMARY: usize = 400;
+
 /// Cards kept per row.
 pub const ASKED_KEPT: usize = 10;
 /// Chars of a card's text kept.
@@ -290,6 +295,11 @@ pub struct Task {
     /// Its relayed cards and their answers, as code saw them (the last [`ASKED_KEPT`]): the review brief carries them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub asked: Vec<Asked>,
+    /// The charter's decisions (L10.9 "Super's context over days"), written only by code:
+    /// relayed card answers and super's `task note`s, oldest first. Over [`NOTES_CAP`]
+    /// chars the oldest are summarised into one note, never dropped silently.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     /// The task's session id, once its process started.
     pub session: Option<String>,
     /// The folder its process runs in (absolute; in its worktree for a write task).
@@ -313,6 +323,34 @@ impl Task {
         self.asked.push(a);
         let extra = self.asked.len().saturating_sub(ASKED_KEPT);
         self.asked.drain(..extra);
+    }
+
+    /// Chars of its charter notes.
+    #[cfg(test)]
+    pub fn notes_len(&self) -> usize {
+        self.notes.iter().map(String::len).sum()
+    }
+
+    /// The charter: the brief and criteria word for word from spawn (or a scope card), the
+    /// scope, and the decisions recorded since.
+    pub fn charter(&self) -> String {
+        let mut s = format!("### {} charter\nBrief: {}\n", self.label, self.request.trim());
+        if !self.criteria.is_empty() {
+            s.push_str("Criteria:\n");
+            for (i, c) in self.criteria.iter().enumerate() {
+                s.push_str(&format!("{}. {c}\n", i + 1));
+            }
+        }
+        if let Some(scope) = &self.scope {
+            s.push_str(&format!("Scope: {scope}\n"));
+        }
+        if !self.notes.is_empty() {
+            s.push_str("Decisions and notes:\n");
+            for n in &self.notes {
+                s.push_str(&format!("- {n}\n"));
+            }
+        }
+        s
     }
 
     /// The state with its block reason or marks: `blocked: quota`, `ready (merged)`,
@@ -899,6 +937,53 @@ impl Board {
             .collect()
     }
 
+    /// Super's state block (L10.9), rendered fresh for every request: the rows not
+    /// archived (label, state, last report summary), each such work task's charter, and
+    /// the user's open requests (super's open `todo` items).
+    pub fn state_block(&self, open: &[String]) -> String {
+        let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
+        let rows: Vec<&Task> = self.tasks.iter().filter(|t| t.state != State::Archived).collect();
+        let mut s =
+            String::from("Written by code for this request; the board, not the chat, is the truth.\n\n## Board\n");
+        if rows.is_empty() {
+            s.push_str("(no tasks)\n");
+        } else {
+            s.push_str("| Task | State | Last report |\n|---|---|---|\n");
+        }
+        for t in &rows {
+            let summary: String = t.summary.as_deref().unwrap_or("").chars().take(STATE_SUMMARY).collect();
+            s.push_str(&format!(
+                "| {} | {} | {} |\n",
+                cell(&t.label),
+                cell(&t.state_text()),
+                cell(&summary)
+            ));
+        }
+        let archived = self.tasks.len() - rows.len();
+        if archived > 0 {
+            s.push_str(&format!(
+                "({archived} archived; `task list {{all: true}}` shows them)\n"
+            ));
+        }
+        let charters: Vec<String> = rows
+            .iter()
+            .filter(|t| t.kind == Kind::Work)
+            .map(|t| t.charter())
+            .collect();
+        if !charters.is_empty() {
+            s.push_str("\n## Charters\n");
+            s.push_str(&charters.join("\n"));
+        }
+        s.push_str("\n## Open requests\n");
+        if open.is_empty() {
+            s.push_str("(none)\n");
+        }
+        for o in open {
+            s.push_str(&format!("- {o}\n"));
+        }
+        s
+    }
+
     /// The board as a markdown table, archived rows last.
     pub fn render(&self) -> String {
         let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
@@ -957,6 +1042,36 @@ mod tests {
             branch: Some("worktree-T1-fix".into()),
             ..Task::default()
         }
+    }
+
+    #[test]
+    fn the_state_block_has_rows_charters_and_open_requests() {
+        let mut t = row(State::Running);
+        t.request = "fix the parser".into();
+        t.criteria = vec!["tabs parse".into()];
+        t.summary = Some("halfway".into());
+        t.notes = vec!["stop before deploy".into()];
+        let mut old = row(State::Archived);
+        old.label = "T0-old".into();
+        old.request = "OLD BRIEF".into();
+        let b = Board {
+            tasks: vec![t, old],
+            ..Default::default()
+        };
+        let s = b.state_block(&["look at the logs tomorrow".into()]);
+        assert!(s.contains("| T1-fix | running | halfway |"), "{s}");
+        assert!(
+            s.contains("### T1-fix charter\nBrief: fix the parser\nCriteria:\n1. tabs parse\n"),
+            "{s}"
+        );
+        assert!(
+            s.contains("- stop before deploy") && s.contains("- look at the logs tomorrow"),
+            "{s}"
+        );
+        assert!(!s.contains("OLD BRIEF") && s.contains("1 archived"), "{s}");
+        // An old board without notes still loads.
+        let t: Task = serde_json::from_str(r#"{"id":"T1","label":"T1-x"}"#).unwrap();
+        assert!(t.notes.is_empty());
     }
 
     fn report(state: ReportState) -> Event {

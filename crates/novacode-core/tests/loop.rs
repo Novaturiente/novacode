@@ -1076,6 +1076,94 @@ async fn long_run_compacts_between_model_calls() {
     }
 }
 
+/// L10.9 super: a context builder rebuilds every request (state block + newest chat in
+/// budget); the session file keeps everything, and auto-compaction never fires. Without
+/// a builder, the request is the projection, unchanged.
+#[tokio::test]
+async fn a_context_builder_rebuilds_requests_and_keeps_the_session_whole() {
+    use novacode_core::memory::{Settings, Worker};
+    use novacode_core::session::EntryKind;
+    let run = |builder: bool| async move {
+        let work = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let long = "y".repeat(3500);
+        let main = Faux::new((0..8).map(|i| FauxReply::text(&format!("r{i} {long}"))));
+        let reqs = main.requests.clone();
+        let store = Store::create(&Paths::new(home.path()), work.path(), false);
+        let mut agent = Agent::new(
+            Arc::new(main),
+            novacode_tools::builtins(false),
+            store,
+            cfg(work.path(), home.path()),
+            Arc::new(LocalEnv),
+        )
+        .with_memory(
+            Worker {
+                adapter: Arc::new(Faux::new((0..40).map(notes_reply))),
+                provider: "faux".into(),
+                model: "small".into(),
+            },
+            Settings {
+                observe_after: u64::MAX,
+                keep_recent: 1000,
+                compact_at: 3000,
+                chunk_tokens: 3000,
+                reflect_after: u64::MAX,
+                pool_target: u64::MAX,
+            },
+        );
+        if builder {
+            agent = agent.with_context_builder(novacode_core::context_window::Builder {
+                budget: 2500,
+                state: Arc::new(|_: &Store| "BOARD ROWS".to_string()),
+            });
+        }
+        let prompts: Vec<String> = (0..8).map(|i| format!("p{i}")).collect();
+        let prompts: Vec<&str> = prompts.iter().map(String::as_str).collect();
+        let (agent, _) = drive(agent, &prompts).await;
+        let reqs = reqs.lock().unwrap().clone();
+        (agent, reqs, home, work)
+    };
+    let (agent, reqs, _h, _w) = run(true).await;
+    let entries = agent.store.entries();
+    assert!(
+        !entries.iter().any(|e| matches!(e.kind, EntryKind::Compaction { .. })),
+        "super never auto-compacts"
+    );
+    assert_eq!(
+        agent
+            .store
+            .projection()
+            .iter()
+            .filter(|m| matches!(m, Message::User { .. }))
+            .count(),
+        8
+    );
+    let last = reqs.last().unwrap();
+    let text = format!("{:?}", last.messages);
+    assert!(
+        text.contains("BOARD ROWS") && text.contains("p7") && !text.contains("p0"),
+        "{text}"
+    );
+    let chat: u64 = last
+        .messages
+        .iter()
+        .skip(2)
+        .map(novacode_types::estimate::message)
+        .sum();
+    assert!(chat <= 2500, "{chat}");
+
+    // Without a builder: what is sent is the stored projection, byte for byte.
+    let (agent, reqs, _h, _w) = run(false).await;
+    let live = agent.store.projection();
+    let mut sent = reqs.last().unwrap().messages.clone();
+    sent.push(live.last().unwrap().clone());
+    assert_eq!(
+        serde_json::to_string(&live).unwrap(),
+        serde_json::to_string(&sent).unwrap()
+    );
+}
+
 /// When the observer can't run, the session model summarises the gap instead.
 #[tokio::test]
 async fn compaction_without_notes_falls_back() {

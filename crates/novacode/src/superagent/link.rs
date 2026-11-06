@@ -1227,6 +1227,7 @@ Address every finding, commit, re-run your checks and report `done` again.",
         let (asker, approver) = (self.asker.clone(), self.approver.clone());
         let card_id = card.id();
         let asked = asked_of(&card);
+        let asked_text = asked.text.clone();
         let t = tokio::spawn(async move {
             let l = format!("[{label}] ");
             let (cmd, said) =
@@ -1242,7 +1243,8 @@ Address every finding, commit, re-run your checks and report `done` again.",
             }
             if let Some(me) = me.upgrade() {
                 me.inform.note(format!("{label} asked {what}; you answered: {said}"));
-                me.record(&id2, card_id, said);
+                me.record(&id2, card_id, said.clone());
+                me.charter_answer(&id2, &asked_text, &said).await;
                 me.card_closed(&id2, card_id);
             }
         });
@@ -1304,6 +1306,14 @@ Address every finding, commit, re-run your checks and report `done` again.",
                 "was closed in the task while super was disconnected (answer unknown)",
             );
         }
+    }
+
+    /// A relayed card's answer is a user decision about the task: kept on its charter (L10.9).
+    async fn charter_answer(&self, id: &str, question: &str, answer: &str) {
+        let Some(sup) = self.sup.upgrade() else { return };
+        let _ = sup
+            .add_note(id, format!("Asked \"{question}\"; the user answered: {}", cut(answer)))
+            .await;
     }
 
     /// Note a relayed card's answer on the task's row, for its review (R25).
@@ -2739,6 +2749,23 @@ mod tests {
         );
         assert_eq!(last.options, ["8080", "3000"]);
         assert!(last.at > 0);
+        // L10.9: every relayed answer is also on the charter (kept within its cap, never just dropped).
+        fx.until("charter noted", |fx| {
+            fx.sup
+                .row("T1-x")
+                .unwrap()
+                .notes
+                .last()
+                .is_some_and(|n| n.ends_with("the user answered: 8012"))
+        })
+        .await;
+        let notes = fx.sup.row("T1-x").unwrap().notes;
+        assert!(
+            notes
+                .iter()
+                .all(|n| n.starts_with("Asked \"which port? x") || n.starts_with("[older notes trimmed")),
+            "{notes:?}"
+        );
     }
 
     #[tokio::test]

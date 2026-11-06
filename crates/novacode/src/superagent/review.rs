@@ -283,6 +283,12 @@ relayed to the user, with the answer given:\n";
             );
         }
     }
+    if !t.notes.is_empty() {
+        s += "\nThe user's recorded decisions for this task (its charter, code's record):\n";
+        for n in &t.notes {
+            s += &format!("- {n}\n");
+        }
+    }
     if !t.criteria.is_empty() {
         s += "\nAcceptance criteria: check each one and name it in your findings as met or not met, with its proof.\n";
         for (n, c) in t.criteria.iter().enumerate() {

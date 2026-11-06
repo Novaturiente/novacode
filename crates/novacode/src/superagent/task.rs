@@ -74,6 +74,8 @@ pub struct Super {
     /// Session → how often [`grounded`](Self::grounded) ran: a run that started before the
     /// last time ends with prompts already out of flight (Y3).
     grounds: Mutex<std::collections::HashMap<String, u64>>,
+    /// The helper model: summarises a charter's oldest notes over the cap (L10.9).
+    pub helper: std::sync::OnceLock<novacode_core::memory::Worker>,
 }
 
 /// What a tool result adds when its prompt was held.
@@ -225,7 +227,9 @@ Don't write elsewhere with `bash` either. A read task that has to write calls `e
 - A review task (its brief says so) reports a `verdict` instead of a `state` and edits only under its \
 scratch folder (its brief names it); the commit rule doesn't apply to it.
 - After a restart or resume: check your folder and git before repeating anything outside it (a commit, a push, \
-a message)."
+a message).
+- If a message from the super agent conflicts with your brief or with the user's recorded decisions (answers \
+to your questions, notes in your brief), don't just obey: ask the user with `ask_user`, naming the conflict."
     )
 }
 
@@ -301,6 +305,7 @@ impl Super {
             launcher,
             links: std::sync::OnceLock::new(),
             grounds: Mutex::default(),
+            helper: std::sync::OnceLock::new(),
         })
     }
 
@@ -369,6 +374,8 @@ impl Super {
             "close" => self.close(&t).await,
             "merge" => self.merge(&t, a.pr).await,
             "accept" => self.accept(&t).await,
+            "note" => self.note(&t, a.note.as_deref().ok_or("`note` is missing")?).await,
+            "scope" => self.scope(&t, a.request, a.criteria, a.scope).await,
             "review" => {
                 self.check(&t.id, Event::Review)?;
                 // A code-made block (R23): no report, so code takes the facts from its commits.
@@ -403,7 +410,7 @@ impl Super {
                 Ok(out)
             }
             other => Err(format!(
-                "unknown action `{other}`: spawn, info, send, stop, close, accept, merge, review, list or read"
+                "unknown action `{other}`: spawn, info, send, stop, close, accept, merge, review, note, scope, list or read"
             )),
         }
     }
@@ -1077,6 +1084,119 @@ impl Super {
         self.retire_review(&r.id);
     }
 
+    /// Append `text` to a task's charter notes, then keep them within the cap.
+    pub(super) async fn add_note(&self, id: &str, text: String) -> Result<(), String> {
+        self.edit(|b| {
+            let row = b.tasks.iter_mut().find(|r| r.id == id).ok_or("no task")?;
+            row.notes.push(text);
+            Ok::<_, String>(())
+        })??;
+        self.fit_charter(id).await;
+        Ok(())
+    }
+
+    /// A charter over [`super::board::NOTES_CAP`]: its oldest notes become one summary by
+    /// the helper model. Notes added meanwhile stay after it.
+    pub(super) async fn fit_charter(&self, id: &str) {
+        let Ok(before) = self.row(id).map(|t| t.notes) else {
+            return;
+        };
+        let Some(fitted) = super::context::fit_notes(&before, self.helper.get()).await else {
+            return;
+        };
+        let _ = self.edit(|b| {
+            if let Some(row) = b.tasks.iter_mut().find(|r| r.id == id)
+                && row.notes.starts_with(&before)
+            {
+                let added = row.notes.split_off(before.len());
+                row.notes = fitted;
+                row.notes.extend(added);
+            }
+        });
+    }
+
+    /// `task note`: a user decision about the task, kept on its charter.
+    async fn note(&self, t: &Task, text: &str) -> Result<String, String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err("`note` is empty".into());
+        }
+        self.add_note(&t.id, text.to_string()).await?;
+        Ok(format!("Noted on {}'s charter.", t.label))
+    }
+
+    /// `task scope`: a new brief, criteria or scope, only on the user's OK on a card made by
+    /// code; then the charter changes and the task is told (as work: its review starts over).
+    async fn scope(
+        &self,
+        t: &Task,
+        brief: Option<String>,
+        criteria: Vec<String>,
+        scope: Option<String>,
+    ) -> Result<String, String> {
+        let brief = brief.filter(|b| !b.trim().is_empty());
+        if brief.is_none() && criteria.is_empty() && scope.is_none() {
+            return Err("give the new `request` (brief), `criteria` or `scope`".into());
+        }
+        if criteria.len() > 5 {
+            return Err("give 1 to 5 checkable acceptance `criteria`".into());
+        }
+        self.check(&t.id, Event::Send)?;
+        let mut change = String::new();
+        if let Some(b) = &brief {
+            change += &format!("Brief:\n{}\n(was: {})\n", b.trim(), t.request.trim());
+        }
+        if !criteria.is_empty() {
+            change += "Criteria:\n";
+            for (i, c) in criteria.iter().enumerate() {
+                change += &format!("{}. {c}\n", i + 1);
+            }
+            change += &format!("(was: {})\n", t.criteria.join("; "));
+        }
+        if let Some(s) = &scope {
+            change += &format!("Scope: {s}\n(was: {})\n", t.scope.as_deref().unwrap_or("none"));
+        }
+        let q = format!("Change {}'s charter?\n\n{change}", t.label);
+        if !self.confirm(format!("{}: scope", t.label), q, "Change").await? {
+            return Ok(format!("The user declined: {}'s charter stays as it was.", t.label));
+        }
+        self.edit(|b| {
+            let row = b.tasks.iter_mut().find(|r| r.id == t.id).ok_or("no task")?;
+            if let Some(b) = &brief {
+                row.request = b.trim().to_string();
+            }
+            if !criteria.is_empty() {
+                row.criteria = criteria.clone();
+            }
+            if scope.is_some() {
+                row.scope = scope.clone();
+            }
+            Ok::<_, String>(())
+        })??;
+        self.add_note(
+            &t.id,
+            format!(
+                "The user approved a charter change on a card: {}",
+                change.replace('\n', " ").trim()
+            ),
+        )
+        .await?;
+        let row = self.row(&t.id)?;
+        let mut msg = String::from("The user approved a change to your task. Work to this from now on:\n\n");
+        msg += &format!("The user's request:\n{}\n", row.request.trim());
+        if !row.criteria.is_empty() {
+            msg += "\nAcceptance criteria:\n";
+            for (i, c) in row.criteria.iter().enumerate() {
+                msg += &format!("{}. {c}\n", i + 1);
+            }
+        }
+        if let Some(s) = &row.scope {
+            msg += &format!("\nScope (the areas the change should touch): {s}\n");
+        }
+        let sent = self.send(&row, &msg).await?;
+        Ok(format!("{}'s charter changed on the user's OK. {sent}", t.label))
+    }
+
     /// `task accept`: a read task in `reviewing` or blocked by code, or a write task whose
     /// review rounds are used up, after the user's OK on a card made by code.
     async fn accept(&self, t: &Task) -> Result<String, String> {
@@ -1612,30 +1732,30 @@ impl Tool for TaskTool {
         "task"
     }
     fn description(&self) -> &str {
-        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], scope?, skills?[], goal?}; info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task, pr?} (each asks the user on a card; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task blocked by used-up review rounds, after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked by code because it kept ending without a report: code takes its commit and changed files from its branch, refused when nothing is committed, and the review uses a round); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
+        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], scope?, skills?[], goal?}; info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task, pr?} (each asks the user on a card; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task blocked by used-up review rounds, after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked by code because it kept ending without a report: code takes its commit and changed files from its branch, refused when nothing is committed, and the review uses a round); note {task, note} (keeps a user decision about the task on its charter, which you see with every message); scope {task, request? | criteria? | scope?} (changes the brief, criteria or scope only after the user's OK on a card; code then updates the charter and tells the task); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
     }
     fn schema(&self) -> Value {
         let s = |d: &str| json!({ "type": "string", "description": d });
         json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["spawn", "info", "send", "stop", "close", "accept", "merge", "review", "list", "read"] },
+                "action": { "type": "string", "enum": ["spawn", "info", "send", "stop", "close", "accept", "merge", "review", "note", "scope", "list", "read"] },
                 "task": s("The task's label (T3-fix-parser) or T<n>."),
-                "request": s("spawn: the user's words, as given."),
+                "request": s("spawn: the user's words, as given. scope: the new brief."),
                 "folder": s("spawn and info: the project folder, inside your root (relative to it or absolute)."),
                 "slug": s("spawn: 1-4 words of a-z0-9 joined by -, at most 30 characters; the label becomes T<n>-<slug>."),
                 "write": { "type": "boolean", "description": "spawn: the task changes files (it gets its own worktree in git)." },
                 "tier": s("spawn: quick, standard, deep or review (default standard)."),
                 "model": s("spawn: a model the user named (provider/model), instead of a tier."),
                 "type": { "type": "string", "enum": ["bugfix", "change", "question"], "description": "spawn: question needs write false; bugfix and change need write true. Default change." },
-                "criteria": { "type": "array", "items": { "type": "string" }, "description": "spawn: 1-5 checkable acceptance criteria." },
-                "scope": s("spawn: the areas the change should touch."),
+                "criteria": { "type": "array", "items": { "type": "string" }, "description": "spawn: 1-5 checkable acceptance criteria. scope: the new criteria." },
+                "scope": s("spawn and scope: the areas the change should touch."),
                 "skills": { "type": "array", "items": { "type": "string" }, "description": "spawn: skills the task should use." },
                 "goal": { "type": "boolean", "description": "spawn: open-ended work; the task keeps going until the criteria hold." },
                 "message": s("send: the message."),
                 "question": { "type": "boolean", "description": "send: only ask for information (raw output, proof): the task's state and review stay, it answers in text without a report, and its reply wakes you. Leave false for work: a plain send sets the task running and stops its review." },
                 "pr": { "type": "boolean", "description": "merge: open a pull request instead of merging locally; only when the user asked for a pull request." },
-                "note": s("review: what the review should look at."),
+                "note": s("review: what the review should look at. note: the user's decision to keep on the task's charter."),
                 "all": { "type": "boolean", "description": "list: archived tasks too." },
                 "offset": { "type": "integer", "description": "read: first line (0-based)." },
                 "limit": { "type": "integer", "description": "read: lines (default 200)." }
@@ -2329,6 +2449,71 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.contains("not possible"), "{e}");
+    }
+
+    /// L10.9 super's context: the charter holds the brief and criteria from spawn and the
+    /// notes super adds; a scope change needs the user's card.
+    #[tokio::test]
+    async fn the_charter_keeps_the_spawn_brief_and_notes_and_changes_scope_only_on_a_card() {
+        let fx = fixture(5, &[Some("Cancel"), Some("Change")]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "t", false)).await.unwrap();
+        let c = fx.sup.row("T1-t").unwrap().charter();
+        assert!(c.contains("Brief: do t\nCriteria:\n1. it works\n"), "{c}");
+        let out = run(
+            &fx,
+            json!({"action": "note", "task": "T1-t", "note": "stop before deploy"}),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("Noted on T1-t's charter"), "{out}");
+        assert_eq!(fx.sup.row("T1-t").unwrap().notes, ["stop before deploy"]);
+        assert!(run(&fx, json!({"action": "scope", "task": "T1-t"})).await.is_err());
+        // Declined: nothing changes and the task hears nothing.
+        let scope = json!({"action": "scope", "task": "T1-t", "criteria": ["it works", "it is fast"]});
+        let out = run(&fx, scope.clone()).await.unwrap();
+        assert!(out.contains("declined"), "{out}");
+        assert_eq!(fx.sup.row("T1-t").unwrap().criteria, ["it works"]);
+        let card = fx.asker.asked.lock().unwrap()[0].clone();
+        assert_eq!(card.header.as_deref(), Some("T1-t: scope"));
+        assert!(card.question.contains("2. it is fast") && card.question.contains("(was: it works)"));
+        let before = fx.launcher.prompts("s1").len();
+        // Approved: the charter changes, the change is noted and the task is told.
+        let out = run(&fx, scope).await.unwrap();
+        assert!(out.contains("charter changed"), "{out}");
+        let row = fx.sup.row("T1-t").unwrap();
+        assert_eq!(row.criteria, ["it works", "it is fast"]);
+        assert!(
+            row.notes[1].starts_with("The user approved a charter change"),
+            "{:?}",
+            row.notes
+        );
+        let sent = fx.launcher.prompts("s1");
+        assert_eq!(sent.len(), before + 1);
+        assert!(sent.last().unwrap().contains("2. it is fast"));
+        // Notes over the cap without a helper: the newest stay, the cut is marked.
+        for i in 0..10 {
+            run(
+                &fx,
+                json!({"action": "note", "task": "T1-t", "note": format!("n{i} {}", "x".repeat(400))}),
+            )
+            .await
+            .unwrap();
+        }
+        let row = fx.sup.row("T1-t").unwrap();
+        assert!(row.notes_len() <= super::super::board::NOTES_CAP, "{}", row.notes_len());
+        assert!(row.notes[0].starts_with("[older notes trimmed"), "{:?}", row.notes[0]);
+        assert!(row.notes.last().unwrap().starts_with("n9 "));
+    }
+
+    #[test]
+    fn the_preamble_asks_the_user_when_super_conflicts_with_the_brief() {
+        let p = preamble("T1-x");
+        assert!(
+            p.contains("conflicts with your brief or with the user's recorded decisions"),
+            "{p}"
+        );
+        assert!(p.contains("ask the user with `ask_user`, naming the conflict"), "{p}");
     }
 
     #[tokio::test]

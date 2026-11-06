@@ -1537,6 +1537,8 @@ impl Ctx {
         if let Some(a) = asker.clone() {
             all.push(Arc::new(novacode_tools::ask::AskUser(a)));
         }
+        // Super's decision check (L10.9): the helper model and where its nudge goes.
+        let mut decision_check: Option<(novacode_core::memory::Worker, Arc<dyn superagent::link::Inform>)> = None;
         if is_super {
             use superagent::task;
             let home = self.paths.home();
@@ -1553,12 +1555,26 @@ impl Ctx {
             });
             let dir = superagent::entry::dir(home, &self.cwd);
             let sup = Arc::new(task::Super::new(&self.cwd, dir, cfg, asker.clone(), launcher)?);
+            // The helper model, as for the observer: none with `memory.enabled: false`.
+            let helper = match memory_on {
+                true => Some(self.helper(s.get("memory.model"), &route, adapter.clone()).await),
+                false => None,
+            };
+            if let Some(h) = helper.clone() {
+                let _ = sup.helper.set(h);
+            }
+            if let Some(path) = store.path() {
+                all.push(Arc::new(superagent::context::HistorySearch {
+                    file: path.to_path_buf(),
+                }));
+            }
             // Task links (L10.9): relay, code-made reports, inbox, wakes.
             if let Some(slot) = slot.clone() {
                 let inform = Arc::new(superagent::link::HubInform {
                     slot: slot.clone(),
                     desktop: s.get("notifications.enabled").unwrap_or(true),
                 });
+                decision_check = helper.map(|h| (h, inform.clone() as Arc<dyn superagent::link::Inform>));
                 superagent::feed_board(slot.clone(), &sup, self.paths.clone());
                 superagent::link::Links::start(&sup, Arc::new(slot.clone()), Arc::new(slot), inform);
             }
@@ -1934,7 +1950,9 @@ impl Ctx {
             }
             if is_super {
                 let dir = superagent::entry::dir(self.paths.home(), &self.cwd);
-                agent = agent.with_compaction_guide_fn(Arc::new(superagent::compaction_guide(dir)));
+                agent = agent.with_compaction_guide_fn(Arc::new(superagent::compaction_guide(dir.clone())));
+                // Rebuilt every request: state block + newest chat in 6k tokens (L10.9).
+                agent = agent.with_context_builder(superagent::context::builder(dir));
             }
             // Named for the session list (L4.18); not scripts, pipelines or subagents.
             if self.cli.print.is_none() && !self.cli.rpc {
@@ -1949,6 +1967,9 @@ impl Ctx {
         }
         if let Some(c) = carry {
             agent = agent.adopt(c);
+        }
+        if let Some((helper, inform)) = decision_check {
+            superagent::context::decision_check(agent.subscribe(), Some(helper), inform);
         }
         if let Some((id, proof)) = task {
             // Saved after the agent wrote a new session's system prompt (an entry before it
