@@ -1279,7 +1279,8 @@ pub fn lay_say(s: &novacode_types::Say, open: bool, width: usize, t: &Theme) -> 
                         vec![Span::styled(format!("{heading}:"), t.text.add_modifier(Modifier::BOLD))],
                         &mut lines,
                     );
-                    for l in markdown::render(content, width.saturating_sub(2).max(1), t, true) {
+                    let point = format!("- {}", content.trim());
+                    for l in markdown::render(&point, width.saturating_sub(2).max(1), t, true) {
                         let mut spans = bar.to_vec();
                         spans.extend(l.spans);
                         lines.push(Line::from(spans));
@@ -1917,31 +1918,31 @@ mod say_tests {
         let general = text.iter().position(|l| l == "│ General").unwrap();
         let paragraphs = [
             "│ What you requested:",
-            "│ Ship the change.",
+            "│ • Ship the change.",
             "│ Verified result:",
-            "│ Tests passed.",
+            "│ • Tests passed.",
             "│ Blocker 1:",
-            "│ Missing URL.",
+            "│ • Missing URL.",
             "│ Evidence:",
-            "│ Config is empty.",
+            "│ • Config is empty.",
             "│ Impact:",
-            "│ Cannot connect.",
+            "│ • Cannot connect.",
             "│ Blocker 2:",
-            "│ Missing token.",
+            "│ • Missing token.",
             "│ Evidence:",
-            "│ Auth failed.",
+            "│ • Auth failed.",
             "│ Impact:",
-            "│ Cannot publish.",
+            "│ • Cannot publish.",
             "│ Why your input is needed:",
-            "│ Only you own the credentials.",
+            "│ • Only you own the credentials.",
             "│ Recommendation:",
-            "│ Provide test credentials.",
+            "│ • Provide test credentials.",
             "│ Risk:",
-            "│ Publishing remains blocked.",
+            "│ • Publishing remains blocked.",
             "│ What stays unchanged:",
-            "│ Production stays untouched.",
+            "│ • Production stays untouched.",
             "│ Decision:",
-            "│ Supply credentials or wait.",
+            "│ • Supply credentials or wait.",
         ];
         assert_eq!(&text[first + 2..second], paragraphs);
         assert_eq!(&text[second + 2..general], paragraphs);
@@ -1957,12 +1958,12 @@ mod say_tests {
         assert!(
             general_text
                 .iter()
-                .any(|l| l == "│ Not applicable: this only chooses a priority.")
+                .any(|l| l == "│ • Not applicable: this only chooses a priority.")
         );
         assert!(
             general_text
                 .iter()
-                .any(|l| l == "│ Not applicable: no code changes are proposed.")
+                .any(|l| l == "│ • Not applicable: no code changes are proposed.")
         );
         for heading in [
             "What you requested:",

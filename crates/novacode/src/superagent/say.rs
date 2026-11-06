@@ -141,6 +141,19 @@ struct ArgChoice {
     action: Option<String>,
 }
 
+/// A question's free-text fields and each blocker field: at most this many words.
+const FIELD_WORDS: usize = 40;
+/// A question section: at most this many blockers.
+const MAX_BLOCKERS: usize = 5;
+
+/// `Err("<field>: N words, at most <max>")` when `text` is longer than `max` words.
+fn words(field: &str, text: &str, max: usize) -> Result<(), String> {
+    match text.split_whitespace().count() {
+        n if n > max => Err(format!("{field}: {n} words, at most {max}; write short points")),
+        _ => Ok(()),
+    }
+}
+
 /// The checks code makes on a `say` (each refusal goes back to the model).
 fn check(a: &Args, board: &Board) -> Result<(), String> {
     if !KINDS.contains(&a.kind.as_str()) {
@@ -221,6 +234,14 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
                         s.task
                     ));
                 }
+                words(&format!("{}: question.{field}", s.task), value, FIELD_WORDS)?;
+            }
+            if q.blockers.len() > MAX_BLOCKERS {
+                return Err(format!(
+                    "{}: question.blockers: {} blockers, at most {MAX_BLOCKERS}",
+                    s.task,
+                    q.blockers.len()
+                ));
             }
             if q.blockers.is_empty() {
                 return Err(format!(
@@ -236,6 +257,11 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
                             s.task
                         ));
                     }
+                    words(
+                        &format!("{}: question.blockers[{i}].{field}", s.task),
+                        value,
+                        FIELD_WORDS,
+                    )?;
                 }
             }
         }
@@ -259,6 +285,52 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Super's `ask_user`: the regular tool, refusing a question text over [`FIELD_WORDS`]
+/// words or an option description over 25. Other sessions keep the plain [`AskUser`].
+///
+/// [`AskUser`]: novacode_tools::ask::AskUser
+pub struct ShortAskUser(pub novacode_tools::ask::AskUser);
+
+const OPTION_WORDS: usize = 25;
+
+impl Tool for ShortAskUser {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn description(&self) -> &str {
+        "Ask the user one or more structured questions when a decision is theirs or the request is ambiguous: each with 2–6 short choices (mark one recommended), an optional description and preview per choice, and `multi` for several picks. The user can always type their own answer. Group related questions into one call. Short points: each question text at most 40 words, each option description at most 25 words; longer is refused."
+    }
+    fn schema(&self) -> Value {
+        self.0.schema()
+    }
+    fn sequential(&self) -> bool {
+        self.0.sequential()
+    }
+    fn large_output(&self) -> bool {
+        self.0.large_output()
+    }
+    fn execute<'a>(&'a self, args: Value, ctx: &'a ToolCtx) -> futures_util::future::BoxFuture<'a, ToolOutput> {
+        // Bad arguments go on to the inner tool, which reports them.
+        let qs: Vec<Question> = serde_json::from_value(args["questions"].clone()).unwrap_or_default();
+        for (i, q) in qs.iter().enumerate() {
+            let n = i + 1;
+            let short = words(&format!("question {n}"), &q.question, FIELD_WORDS).and_then(|_| {
+                q.options.iter().try_for_each(|o| {
+                    words(
+                        &format!("question {n} option {} description", o.label),
+                        o.description.as_deref().unwrap_or(""),
+                        OPTION_WORDS,
+                    )
+                })
+            });
+            if let Err(e) = short {
+                return Box::pin(async move { ToolOutput::error(e) });
+            }
+        }
+        self.0.execute(args, ctx)
+    }
 }
 
 /// `say`: super's only channel to the user.
@@ -346,7 +418,7 @@ pub fn card(s: &Say) -> Question {
         }
         if let Some(q) = &section.question {
             for (heading, content) in q.paragraphs() {
-                text.push_str(&format!("\n{heading}:\n{}\n", content.trim()));
+                text.push_str(&format!("\n{heading}:\n- {}\n", content.trim()));
             }
         } else {
             if !section.status.is_empty() {
@@ -375,7 +447,8 @@ impl Tool for SayTool {
     fn description(&self) -> &str {
         "Send the user a message: your only channel to them. Code shows it as a block with its kind, the time, what \
 started this run and a board status line for each task you name. A question with `choices` opens a card and \
-returns the user's answer."
+returns the user's answer. A question is short points: each question field and each blocker's issue, evidence and \
+impact at most 40 words, at most 5 blockers; longer is refused."
     }
     fn schema(&self) -> Value {
         json!({
@@ -387,10 +460,10 @@ returns the user's answer."
                     "task": { "type": "string", "description": "Exact board task label, or General." },
                     "status": { "type": "string", "description": "For non-question kinds: where this task stands and what led here. Required for warning." },
                     "body": { "type": "string", "description": "For non-question kinds: Markdown facts for this task only, then a concrete next action. Questions use question instead." },
-                    "question": { "type": "object", "description": "Required only for question, in every section. Ask the worker for missing facts first. State unknowns explicitly, never invent evidence or impact. For General, truthful not-applicable explanations are valid.", "properties": {
+                    "question": { "type": "object", "description": "Required only for question, in every section. Ask the worker for missing facts first. State unknowns explicitly, never invent evidence or impact. For General, truthful not-applicable explanations are valid. Each text field is one short point of at most 40 words, shown as a bullet under its heading.", "properties": {
                         "requested": { "type": "string", "minLength": 1, "description": "What the user requested, in plain language." },
                         "verified_result": { "type": "string", "minLength": 1, "description": "What is verified now, and what behaviour remains unproven. Do not treat deployment as proof that behaviour works." },
-                        "blockers": { "type": "array", "minItems": 1, "description": "Separate issues, one entry each. If none applies, explain why in an entry; do not invent a technical blocker.", "items": { "type": "object", "properties": {
+                        "blockers": { "type": "array", "minItems": 1, "maxItems": 5, "description": "Separate issues, one entry each (at most 5; issue, evidence and impact at most 40 words each). If none applies, explain why in an entry; do not invent a technical blocker.", "items": { "type": "object", "properties": {
                             "issue": { "type": "string", "minLength": 1, "description": "The exact blocker, or why blockers are not applicable." },
                             "evidence": { "type": "string", "minLength": 1, "description": "Exact failed command/error or observed result; explicitly say what is unknown if unavailable." },
                             "impact": { "type": "string", "minLength": 1, "description": "Effect on requested behaviour or users; explicitly unknown if not established." }
@@ -595,6 +668,78 @@ mod tests {
     }
 
     #[test]
+    fn question_fields_are_short_points() {
+        let b = board();
+        let words = |n: usize| vec!["word"; n].join(" ");
+        let mut v = question_args("T2-api");
+        v["sections"][0]["question"]["recommendation"] = json!(words(40));
+        v["sections"][0]["question"]["blockers"][1]["evidence"] = json!(words(40));
+        assert_eq!(check(&args(v.clone()), &b), Ok(()));
+        for field in [
+            "requested",
+            "verified_result",
+            "input_needed",
+            "recommendation",
+            "risk",
+            "unchanged",
+            "decision",
+        ] {
+            let mut v = v.clone();
+            v["sections"][0]["question"][field] = json!(words(63));
+            let e = check(&args(v), &b).unwrap_err();
+            assert!(e.contains(&format!("{field}: 63 words, at most 40")), "{e}");
+        }
+        for field in ["issue", "evidence", "impact"] {
+            let mut v = v.clone();
+            v["sections"][0]["question"]["blockers"][1][field] = json!(words(41));
+            let e = check(&args(v), &b).unwrap_err();
+            assert!(e.contains(&format!("blockers[1].{field}: 41 words, at most 40")), "{e}");
+        }
+        let blocker = v["sections"][0]["question"]["blockers"][0].clone();
+        v["sections"][0]["question"]["blockers"] = json!(vec![blocker; 6]);
+        let e = check(&args(v), &b).unwrap_err();
+        assert!(e.contains("6 blockers, at most 5"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn super_s_ask_user_is_short_but_a_normal_session_s_is_not() {
+        let d = tempfile::tempdir().unwrap();
+        let ctx = ctx(d.path());
+        let words = |n: usize| vec!["word"; n].join(" ");
+        let input = |q: usize, desc: usize| {
+            json!({"questions": [{"question": words(q), "options": [
+                {"label": "A", "description": words(desc)}, {"label": "B"}
+            ]}]})
+        };
+        let asker = || Arc::new(Answer(Mutex::default(), Some("A")));
+        let normal = novacode_tools::ask::AskUser(asker());
+        let short = ShortAskUser(novacode_tools::ask::AskUser(asker()));
+        assert_eq!(short.name(), "ask_user");
+        assert!(short.description().contains("at most 40 words"));
+        assert!(!short.execute(input(40, 25), &ctx).await.is_error);
+        let e = short.execute(input(41, 3), &ctx).await;
+        assert!(
+            e.is_error && text(&e).contains("question 1: 41 words, at most 40"),
+            "{}",
+            text(&e)
+        );
+        let e = short.execute(input(3, 26), &ctx).await;
+        assert!(
+            e.is_error && text(&e).contains("question 1 option A description: 26 words, at most 25"),
+            "{}",
+            text(&e)
+        );
+        assert!(!normal.execute(input(100, 100), &ctx).await.is_error);
+    }
+
+    fn text(o: &ToolOutput) -> String {
+        match &o.content[0] {
+            Block::Text { text, .. } => text.clone(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
     fn question_cards_keep_each_tasks_evidence_and_plan_permission_separate() {
         let mut b = board();
         b.tasks.push(Task {
@@ -618,7 +763,7 @@ mod tests {
         let q = card(&s);
         let first = q.question.find("T1-ui\n").unwrap();
         let second = q.question.find("T2-api\n").unwrap();
-        assert!(q.question[first..second].contains("Verified result:\nUI result verified by screenshot."));
+        assert!(q.question[first..second].contains("Verified result:\n- UI result verified by screenshot."));
         assert!(q.question[second..].contains("scripts/check.sh exited 101: test scoring::round_trip FAILED"));
         for heading in [
             "What you requested",
@@ -1099,7 +1244,7 @@ mod tests {
         let kept = saved.needs[0].card.as_ref().unwrap();
         assert!(
             kept.question
-                .contains("What stays unchanged:\nProduction and the current deployment remain unchanged.")
+                .contains("What stays unchanged:\n- Production and the current deployment remain unchanged.")
         );
         assert_eq!(kept.options[0].label, "Prepare plan only: Investigate");
     }

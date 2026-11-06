@@ -41,7 +41,9 @@ user should look now. Use `ask_user` only for several questions in one form.
 - Every question section requires `question`: `requested` (what the user asked for), `verified_result` (what \
 is proven and what behaviour is not), `blockers` (separate issues, each with exact `issue`, `evidence` and \
 `impact`), `input_needed` (why the user must decide), `recommendation`, its `risk`, what stays `unchanged`, \
-and the precise `decision`. Before escalating a task blocker, ask the worker for facts with `task send` and \
+and the precise `decision`. Write short points: each question field and each blocker's issue, evidence and \
+impact is at most 40 words, at most 5 blockers; code refuses longer. In `ask_user`: question text at most 40 words, \
+each option description at most 25 words. Before escalating a task blocker, ask the worker for facts with `task send` and \
 `question: true`: exact failed command/error, behaviour needing proof, user impact and proposed next action. \
 Never invent errors, evidence or impact: if still unavailable, explicitly say what is unknown. Deployment \
 is not proof that live behaviour works. For a General preference question, explain truthfully why technical \
@@ -411,6 +413,9 @@ mod tests {
             "what happened, where things stand (`status`), then what you did or what you need",
             "A question states what was requested and verified before asking",
             "A question is always its own `say` with kind `question`, never inside another kind",
+            "each question field and each blocker's issue, evidence and impact is at most 40 words",
+            "at most 5 blockers",
+            "`ask_user`: question text at most 40 words, each option description at most 25 words",
             "send one `say` per event",
         ] {
             assert!(PROMPT.contains(rule), "{rule}");

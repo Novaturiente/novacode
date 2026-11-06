@@ -1561,7 +1561,12 @@ impl Ctx {
         all.push(Arc::new(novacode_tools::worktree::EnterWorktree(worktree_copy(s))));
         all.push(Arc::new(novacode_tools::worktree::ExitWorktree(asker.clone())));
         if let Some(a) = asker.clone() {
-            all.push(Arc::new(novacode_tools::ask::AskUser(a)));
+            let ask = novacode_tools::ask::AskUser(a);
+            // Super's questions are short points (L10.9); other sessions' `ask_user` is unchanged.
+            match is_super {
+                true => all.push(Arc::new(superagent::say::ShortAskUser(ask))),
+                false => all.push(Arc::new(ask)),
+            }
         }
         // Super's decision check (L10.9): the helper model and where its nudge goes.
         let mut decision_check: Option<(novacode_core::memory::Worker, Arc<dyn superagent::link::Inform>)> = None;
