@@ -68,13 +68,33 @@ pub(super) const PROGRESS_NUDGE: &str = "[progress] Super asks for a progress up
 `state: progress` now (done so far, what's next, a count or percentage when you know one; at most 80 words), \
 then go on with your work. Don't stop for this.";
 
-/// The health-check wake.
-pub(super) fn health_check_text() -> String {
-    format!(
+/// What code's nudge after a health check that left stalled tasks alone starts with.
+pub(super) const STALL_NUDGE: &str = "[stall check]";
+
+/// The health-check wake; `stalled`: one line per stalled task.
+pub(super) fn health_check_text(stalled: &[String]) -> String {
+    let mut s = format!(
         "{HEALTH_CHECK} Timed health check of the running tasks. Judge each one from the Health section of the \
 state block (event age, running tool and its age, error streak, repeated calls, unanswered cards, last progress). \
 If all are fine, answer exactly `OK` and nothing else. If one looks stuck or wrong, follow your rules for a problem."
-    )
+    );
+    if !stalled.is_empty() {
+        s += "\n\nStalled (blocked, stopped or ready but not landed; no open question to the user; no action from \
+you since):\n";
+        for l in stalled {
+            s += &format!("- {l}\n");
+        }
+        s += &stall_rule();
+    }
+    s
+}
+
+/// What super must do about a stalled task.
+fn stall_rule() -> String {
+    "`OK` is not an answer while a task is stalled: take a concrete action on each (investigate with a scout, send \
+a fix, retry its review or merge, replace it with `replaces`, or ask the user one decision with your \
+recommendation). A report alone is not enough."
+        .into()
 }
 
 /// The prompt a question sends.
@@ -581,6 +601,10 @@ pub struct Links {
     kick: Arc<tokio::sync::Notify>,
     /// Since when a health check is counted (unix seconds); `None` while no task runs.
     check_from: Mutex<Option<u64>>,
+    /// Stalled task id → since when, as last listed in a check: a new stall wakes a check.
+    stall_seen: Mutex<HashMap<String, u64>>,
+    /// The last check that listed stalled tasks: when, and their ids (one nudge if left alone).
+    stall_check: Mutex<Option<(u64, Vec<String>)>>,
 }
 
 #[derive(Default)]
@@ -630,6 +654,8 @@ impl Links {
             inner: Mutex::default(),
             kick: Arc::default(),
             check_from: Mutex::default(),
+            stall_seen: Mutex::default(),
+            stall_check: Mutex::default(),
         });
         let _ = sup.links.set(links.clone());
         links.recover(sup);
@@ -870,30 +896,101 @@ impl Links {
         for n in sup.pump().await {
             self.inform.note(n);
         }
+        self.deploy_cards(&sup);
         self.health_check(&sup);
     }
 
-    /// Every `super.watch.everyMinutes` while a task runs, a health-check wake; none
+    /// Code's deploy card for each ready write task that needs one (L10.9), off the loop
+    /// since a card waits for the user.
+    fn deploy_cards(&self, sup: &Arc<Super>) {
+        for id in sup.deploy_due() {
+            let (me, sup) = (self.me.clone(), sup.clone());
+            tokio::spawn(async move {
+                let Some(out) = sup.deploy_card(&id).await else { return };
+                let Some(me) = me.upgrade() else { return };
+                // Merging: super hears with the merge result; else it acts now.
+                match sup.row(&id).is_ok_and(|t| t.state == State::Merging) {
+                    true => me.inform.note(out),
+                    false => me.inform.wake(out),
+                }
+            });
+        }
+    }
+
+    /// Every `super.watch.everyMinutes` while a task runs, and when a task newly stalls
+    /// (`super.watch.stallMinutes`), a health-check wake listing the stalled tasks; none
     /// while super works or a check still waits for it (they never stack).
     fn health_check(&self, sup: &Super) {
-        let every = sup.cfg().watch.every;
-        let running = {
-            let b = sup.board.lock().unwrap();
-            b.tasks.iter().any(|t| t.state == State::Running)
-        };
-        let mut from = self.check_from.lock().unwrap();
-        if every == 0 || !running {
-            *from = None;
-            return;
-        }
+        let w = sup.cfg().watch;
         let now = board::now();
-        let since = *from.get_or_insert(now);
-        if now.saturating_sub(since) < every || !self.inform.idle() {
+        let (running, stalled) = {
+            let b = sup.board.lock().unwrap();
+            let stalled: Vec<(String, u64, String)> = b
+                .stalled(now, w.stall)
+                .into_iter()
+                .map(|(t, s)| {
+                    let line = format!(
+                        "{}: {}, no action for {}",
+                        b.name(t),
+                        t.state_text(),
+                        board::age(now, now - s)
+                    );
+                    (t.id.clone(), now - s, line)
+                })
+                .collect();
+            (b.tasks.iter().any(|t| t.state == State::Running), stalled)
+        };
+        self.stall_nudge(sup);
+        let mut from = self.check_from.lock().unwrap();
+        let timed = match w.every == 0 || !running {
+            true => {
+                *from = None;
+                false
+            }
+            false => now.saturating_sub(*from.get_or_insert(now)) >= w.every,
+        };
+        let fresh = {
+            let seen = self.stall_seen.lock().unwrap();
+            stalled.iter().any(|(id, at, _)| seen.get(id) != Some(at))
+        };
+        if !(timed || fresh) || !self.inform.idle() {
             return;
         }
-        *from = Some(now);
+        if from.is_some() {
+            *from = Some(now);
+        }
         drop(from);
-        self.inform.wake(health_check_text());
+        *self.stall_seen.lock().unwrap() = stalled.iter().map(|(id, at, _)| (id.clone(), *at)).collect();
+        *self.stall_check.lock().unwrap() =
+            (!stalled.is_empty()).then(|| (now, stalled.iter().map(|s| s.0.clone()).collect()));
+        let lines: Vec<String> = stalled.into_iter().map(|s| s.2).collect();
+        self.inform.wake(health_check_text(&lines));
+    }
+
+    /// Once super is idle after a check that listed stalled tasks: one nudge naming those it
+    /// took no action on and that didn't change since.
+    fn stall_nudge(&self, sup: &Super) {
+        if !self.inform.idle() {
+            return;
+        }
+        let Some((at, ids)) = self.stall_check.lock().unwrap().take() else {
+            return;
+        };
+        let left: Vec<String> = {
+            let b = sup.board.lock().unwrap();
+            ids.iter()
+                .filter_map(|id| b.task(id))
+                .filter(|t| t.state != State::Archived && t.acted_at < at && t.updated < at)
+                .map(|t| b.name(t))
+                .collect()
+        };
+        if !left.is_empty() {
+            self.inform.wake(format!(
+                "{STALL_NUDGE} Your reply to the health check took no action on: {}. {}",
+                left.join(", "),
+                stall_rule()
+            ));
+        }
     }
 
     /// Task `id`'s activity facts, saved on its row (cards and progress stay as they are).
@@ -2814,7 +2911,12 @@ mod tests {
     /// `before` fills the board and the live sessions before the links start, as a
     /// board found by a restarted super.
     fn fixture_with(max_running: usize, before: impl FnOnce(&Super, &FakeLauncher)) -> Fx {
-        fixture_full(max_running, Default::default(), before)
+        // Rows made by tests have no times: no stalls unless a test asks for them.
+        let watch = super::super::Watch {
+            stall: 0,
+            ..Default::default()
+        };
+        fixture_full(max_running, watch, before)
     }
 
     fn fixture_full(max_running: usize, watch: super::super::Watch, before: impl FnOnce(&Super, &FakeLauncher)) -> Fx {
@@ -3042,7 +3144,11 @@ mod tests {
 
     #[tokio::test]
     async fn health_checks_wake_super_only_while_a_task_runs_and_super_is_idle() {
-        let watch = super::super::Watch { every: 1, progress: 0 };
+        let watch = super::super::Watch {
+            every: 1,
+            progress: 0,
+            stall: 0,
+        };
         let fx = fixture_full(5, watch, |_, _| {});
         tokio::time::sleep(Duration::from_millis(2500)).await;
         assert_eq!(health_wakes(&fx), 0, "no running task");
@@ -3062,9 +3168,81 @@ mod tests {
         assert!(md.contains("- Last health check: "), "{md}");
     }
 
+    #[test]
+    fn a_check_with_stalled_tasks_lists_them_and_is_no_silent_ok() {
+        let t = health_check_text(&["T1-x: blocked, no action for 20 min".into()]);
+        assert!(t.starts_with(HEALTH_CHECK), "{t}");
+        assert!(
+            t.contains("Stalled") && t.contains("- T1-x: blocked, no action for 20 min"),
+            "{t}"
+        );
+        assert!(t.contains("`OK` is not an answer"), "{t}");
+        assert!(!health_check_text(&[]).contains("Stalled"));
+    }
+
+    fn stalled_row(fx: &Fx, label: &str) {
+        let t = Task {
+            id: label.into(),
+            label: label.into(),
+            kind: Kind::Work,
+            state: State::Blocked,
+            updated: board::now() - 30,
+            request: "r".into(),
+            ..Task::default()
+        };
+        fx.sup.edit(|b| b.tasks.push(t)).unwrap();
+    }
+
+    fn stall_nudges(fx: &Fx) -> usize {
+        fx.said()
+            .iter()
+            .filter(|s| s.starts_with(&format!("wake: {STALL_NUDGE}")))
+            .count()
+    }
+
+    /// L10.9: a stalled task wakes a check before the timer is due (once), and a reply that
+    /// takes no action on it gets one nudge.
+    #[tokio::test]
+    async fn a_stalled_task_wakes_a_check_and_a_reply_without_action_is_nudged_once() {
+        let watch = super::super::Watch {
+            every: 3600,
+            progress: 0,
+            stall: 10,
+        };
+        let fx = fixture_full(5, watch, |_, _| {});
+        stalled_row(&fx, "T1-x");
+        fx.until("a check", |fx| health_wakes(fx) == 1).await;
+        let check = fx.said().into_iter().find(|s| s.starts_with("wake: [health")).unwrap();
+        assert!(check.contains("Stalled") && check.contains("T1-x: blocked"), "{check}");
+        fx.until("a nudge", |fx| stall_nudges(fx) == 1).await;
+        let nudge = fx.said().into_iter().find(|s| s.contains(STALL_NUDGE)).unwrap();
+        assert!(nudge.contains("T1-x"), "{nudge}");
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!((health_wakes(&fx), stall_nudges(&fx)), (1, 1), "once each");
+    }
+
+    #[tokio::test]
+    async fn an_action_on_a_stalled_task_after_the_check_needs_no_nudge() {
+        let watch = super::super::Watch {
+            every: 0,
+            progress: 0,
+            stall: 10,
+        };
+        let fx = fixture_full(5, watch, |_, _| {});
+        stalled_row(&fx, "T1-x");
+        fx.until("a check", |fx| health_wakes(fx) == 1).await;
+        fx.sup.edit(|b| b.tasks[0].acted_at = board::now()).unwrap();
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(stall_nudges(&fx), 0, "{:?}", fx.said());
+    }
+
     #[tokio::test]
     async fn a_task_working_past_the_interval_is_steered_for_progress() {
-        let watch = super::super::Watch { every: 0, progress: 1 };
+        let watch = super::super::Watch {
+            every: 0,
+            progress: 1,
+            stall: 0,
+        };
         let fx = fixture_full(5, watch, |_, _| {});
         let s = fx.task("T1-x", "faux/a", State::Running);
         let mut t = fx.end(&s).await;

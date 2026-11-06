@@ -21,6 +21,12 @@ use std::path::Path;
 const PROMPT: &str = "You are novacode's super agent. The user talks only to you; you run their work as tasks: \
 separate novacode sessions you start, follow and finish with the `task` tool. Tasks run in parallel and outlive you.
 
+- Your job: finish every task and close it, fast and accurately, while the user is away: orchestrate, organize, \
+plan, execute. Never leave a task blocked or ready-not-landed with only a status report: investigate (spawn scouts), \
+pick a fix, send it, or ask the user one decision with your recommendation. You act alone on investigation, sending \
+fixes, retrying reviews and failed merges, and replacing a stuck task (spawn with `replaces`). Merge, deploy, scope \
+changes and deleting anything need the user's card.
+
 - You route work; you don't do it. You have no tools to read code, run commands or edit files. When you need a fact \
 before routing, spawn a scout with `agent` (`cwd`: the project folder below your root); it gets that project's tools \
 and MCP servers.
@@ -79,7 +85,7 @@ answers on its card. `ask_user` is for real choices only (which option, which ap
 task once its merge landed and its after steps are done. Never offer to close those. When you spawn a successor \
 to a task (a retry, a recovery), pass `replaces: <task>`: code closes the old one. Close any other task you judge \
 finished with `task close` (its card is the confirmation).
-- Act only on the user's requests.
+- Act only on the user's requests and on driving their tasks to done.
 - Read-only investigation needs no question card: spawn the scout or read task and report what it found.
 - Don't ask a task again for facts code already checked: a report's checks, commit and changed files and the \
 `[proof #N]` log are recorded by code.
@@ -103,7 +109,8 @@ section of the state block. When all are fine, answer exactly `OK` and nothing e
 user). On a problem (no events for long, one tool running far too long, an error streak, the same call repeated, a \
 card unanswered for long, no progress for long): first ask the task with `task send` and `question: true`. Then you \
 may, without asking the user, send it instructions, stop it, resume it, or start a replacement task (with \
-`replaces`). Never merge, \
+`replaces`). A `Stalled` list in a check names tasks blocked, stopped or ready but not landed that you left \
+alone: `OK` is not an answer then; take a concrete action on each (a report alone is not enough). Never merge, \
 close, change scope or delete without the user's card. Always tell the user what you found and what you did. At the \
 slightest doubt about what is wrong or what to do, ask the user with a `say` question before acting.";
 
@@ -142,16 +149,7 @@ pub fn prompt(home: &Path, root: Option<&Path>) -> String {
             text.trim_end()
         ));
     }
-    let project = root.and_then(|r| {
-        ["AGENTS.md", "CLAUDE.md"]
-            .iter()
-            .map(|n| r.join(n))
-            .find(|p| p.is_file())
-    });
-    if let Some(path) = project
-        && let Ok(text) = std::fs::read_to_string(&path)
-        && !text.trim().is_empty()
-    {
+    if let Some((path, text)) = root.and_then(project_file) {
         s.push_str(&format!(
             "\n\n<project_instructions path=\"{}\">\n{}\n</project_instructions>",
             path.display(),
@@ -160,6 +158,16 @@ pub fn prompt(home: &Path, root: Option<&Path>) -> String {
     }
     s.push_str(&format!("\n\n<super_overrides>\n{OVERRIDES}\n</super_overrides>"));
     s
+}
+
+/// `root`'s own `AGENTS.md`, or `CLAUDE.md` when it has none, when not blank.
+fn project_file(root: &Path) -> Option<(std::path::PathBuf, String)> {
+    let path = ["AGENTS.md", "CLAUDE.md"]
+        .iter()
+        .map(|n| root.join(n))
+        .find(|p| p.is_file())?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    (!text.trim().is_empty()).then_some((path, text))
 }
 
 /// The tool names super's model sees: [`TOOLS`] plus `super.tools`.
@@ -229,6 +237,9 @@ pub struct Watch {
     pub every: u64,
     /// A progress nudge to a task working this long without a `progress` report (`progressMinutes`).
     pub progress: u64,
+    /// A task blocked, stopped or ready but not landed this long with no action of super's
+    /// and no open question to the user is stalled (`stallMinutes`).
+    pub stall: u64,
 }
 
 impl Default for Watch {
@@ -236,11 +247,18 @@ impl Default for Watch {
         Watch {
             every: 30 * 60,
             progress: 20 * 60,
+            stall: 15 * 60,
         }
     }
 }
 
-/// `super.watch.everyMinutes` (default 30) and `super.watch.progressMinutes` (default 20).
+/// Whether `root`'s project file (the one [`prompt`] loads) mentions deploying.
+pub fn describes_deploy(root: &Path) -> bool {
+    project_file(root).is_some_and(|(_, t)| t.to_lowercase().contains("deploy"))
+}
+
+/// `super.watch.everyMinutes` (default 30), `super.watch.progressMinutes` (default 20) and
+/// `super.watch.stallMinutes` (default 15).
 pub fn watch(s: &Settings) -> Watch {
     let d = Watch::default();
     Watch {
@@ -248,6 +266,7 @@ pub fn watch(s: &Settings) -> Watch {
         progress: s
             .get::<u64>("super.watch.progressMinutes")
             .map_or(d.progress, |m| m * 60),
+        stall: s.get::<u64>("super.watch.stallMinutes").map_or(d.stall, |m| m * 60),
     }
 }
 
@@ -356,23 +375,53 @@ mod tests {
     }
 
     #[test]
-    fn watch_settings_default_to_30_and_20_minutes() {
+    fn watch_settings_default_to_30_20_and_15_minutes() {
         let (_d, s) = settings("{}");
         assert_eq!(
             watch(&s),
             Watch {
                 every: 1800,
-                progress: 1200
+                progress: 1200,
+                stall: 900,
             }
         );
-        let (_d, s) = settings(r#"{"super": {"watch": {"everyMinutes": 5, "progressMinutes": 0}}}"#);
+        let (_d, s) = settings(r#"{"super": {"watch": {"everyMinutes": 5, "progressMinutes": 0, "stallMinutes": 0}}}"#);
         assert_eq!(
             watch(&s),
             Watch {
                 every: 300,
-                progress: 0
+                progress: 0,
+                stall: 0,
             }
         );
+    }
+
+    /// L10.9 "Super drives every task to done": the mission and what super does alone.
+    #[test]
+    fn the_prompt_says_super_drives_every_task_to_done() {
+        for rule in [
+            "finish every task and close it, fast and accurately, while the user is away",
+            "orchestrate, organize, plan, execute",
+            "Never leave a task blocked or ready-not-landed with only a status report",
+            "investigate (spawn scouts), pick a fix, send it, or ask the user one decision with your recommendation",
+            "You act alone on investigation, sending fixes, retrying reviews and failed merges, and replacing a stuck task",
+            "Merge, deploy, scope changes and deleting anything need the user's card",
+            "`Stalled`",
+        ] {
+            assert!(PROMPT.contains(rule), "{rule}");
+        }
+        assert!(!PROMPT.contains("- Act only on the user's requests.\n"));
+    }
+
+    #[test]
+    fn deploy_is_described_only_by_the_root_s_project_file() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!describes_deploy(root.path()));
+        std::fs::write(root.path().join("CLAUDE.md"), "To DEPLOY run ./ship").unwrap();
+        assert!(describes_deploy(root.path()));
+        // AGENTS.md wins over CLAUDE.md, as in the prompt.
+        std::fs::write(root.path().join("AGENTS.md"), "tests: cargo test").unwrap();
+        assert!(!describes_deploy(root.path()));
     }
 
     /// B8: `maxRunning: 0` would never start a task.

@@ -74,7 +74,7 @@ pub fn trigger(entries: &[&Entry]) -> String {
 
 /// A wake's text as a trigger; `None` for code's decision-check nudge.
 fn describe(text: &str) -> Option<String> {
-    if text.starts_with(super::link::HEALTH_CHECK) {
+    if text.starts_with(super::link::HEALTH_CHECK) || text.starts_with(super::link::STALL_NUDGE) {
         return Some("health check".into());
     }
     if text.starts_with(super::context::DECISION_CHECK) {
@@ -999,7 +999,7 @@ mod tests {
             message: Message::user("how is T2?"),
         });
         let wake = custom("super", "T2-api reported blocked (now blocked): needs the db url");
-        let check = custom("super", &super::super::link::health_check_text());
+        let check = custom("super", &super::super::link::health_check_text(&[]));
         let t = |es: Vec<Entry>| trigger(&es.iter().collect::<Vec<_>>());
         assert_eq!(t(vec![assistant(false), user, assistant(true)]), "reply to you");
         assert_eq!(
@@ -1082,7 +1082,7 @@ mod tests {
             want
         );
         // Queued wakes: the task event, not the health check, whatever the order.
-        let check = custom("super", &super::super::link::health_check_text());
+        let check = custom("super", &super::super::link::health_check_text(&[]));
         assert_eq!(
             t(vec![assistant(false), report, check, decision, assistant(true)]),
             want

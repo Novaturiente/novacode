@@ -64,7 +64,18 @@ pub trait Launcher: Send + Sync {
     fn link<'a>(&'a self, _session: &'a str) -> BoxFuture<'a, Result<super::link::Conn, String>> {
         Box::pin(async { Err("no task sockets".to_string()) })
     }
+    /// The open pull requests of the repo at `main`: `gh pr list --state open --json
+    /// number,headRefOid,url` output.
+    fn open_prs(&self, _main: &Path) -> Result<String, String> {
+        Err("no gh here".to_string())
+    }
 }
+
+/// The after step "Merge and deploy" on code's deploy card sets.
+pub const DEPLOY_STEP: &str = "Deploy per the project instructions, then verify the deployed revision and health";
+/// The deploy card's choices.
+const MERGE_DEPLOY: &str = "Merge and deploy";
+const MERGE_ONLY: &str = "Merge only";
 
 /// Super's side of its tasks: the board and everything that changes it.
 pub struct Super {
@@ -569,13 +580,32 @@ impl Super {
             return self.switch_models(task, a.provider, a.model).await;
         }
         let t = self.shown(self.find(a.task.as_deref().ok_or("`task` is missing")?)?);
+        let acts = matches!(
+            a.action.as_str(),
+            "send" | "review" | "merge" | "accept" | "scope" | "note" | "close"
+        );
+        let out = self.act(&t, a).await;
+        // Super's action on it (L10.9): a task with none for long is stalled.
+        if acts && out.is_ok() {
+            let _ = self.edit(|b| {
+                if let Some(r) = b.tasks.iter_mut().find(|r| r.id == t.id) {
+                    r.acted_at = super::board::now();
+                }
+            });
+        }
+        out
+    }
+
+    /// `task <action>` on task `t`.
+    async fn act(&self, t: &Task, a: Args) -> Result<String, String> {
+        let t = t.clone();
         match a.action.as_str() {
             "read" => self.read(&t, a.offset.unwrap_or(0), a.limit.unwrap_or(200)),
             "send" if a.question => self.ask(&t, a.message.as_deref().ok_or("`message` is missing")?).await,
             "send" => self.send(&t, a.message.as_deref().ok_or("`message` is missing")?).await,
             "stop" => self.stop(&t).await,
             "close" => self.close(&t).await,
-            "merge" => self.merge(&t, a.pr).await,
+            "merge" => self.merge(&t, a.pr, false).await,
             "accept" => self.accept(&t).await,
             "note" => self.note(&t, a.note.as_deref().ok_or("`note` is missing")?).await,
             "scope" => self.scope(&t, a.request, a.criteria, a.scope).await,
@@ -1961,8 +1991,8 @@ impl Super {
         Ok(out)
     }
 
-    async fn merge(&self, t: &Task, pr: bool) -> Result<String, String> {
-        self.check(&t.id, Event::Merge)?;
+    /// The merge card's question for `t`.
+    fn merge_question(t: &Task, pr: bool) -> String {
         let (main, branch) = (
             t.repo.clone().unwrap_or_default(),
             t.branch.clone().unwrap_or_else(|| "its branch".into()),
@@ -1989,7 +2019,46 @@ impl Super {
                 q += " Its charter holds them back, so you are asked first.";
             }
         }
-        if !self.confirm(format!("{}: merge", t.label), q, "Merge").await? {
+        q
+    }
+
+    /// The open pull request (number, url) whose head is `t`'s done commit, from `gh` in
+    /// its main checkout; `None` when there is none or `gh` fails.
+    fn open_pr(&self, t: &Task) -> Option<(u64, String)> {
+        let commit = t.done.as_ref()?.commit.clone()?;
+        let out = self.launcher.open_prs(t.repo.as_ref()?).ok()?;
+        let prs: Vec<Value> = serde_json::from_str(&out).ok()?;
+        prs.iter().find(|p| p["headRefOid"].as_str() == Some(&commit)).map(|p| {
+            (
+                p["number"].as_u64().unwrap_or_default(),
+                p["url"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+    }
+
+    /// `confirmed`: the user already chose to merge on another code-made card (deploy).
+    async fn merge(&self, t: &Task, pr: bool, confirmed: bool) -> Result<String, String> {
+        self.check(&t.id, Event::Merge)?;
+        if !confirmed && t.asking {
+            return Err(format!(
+                "{}'s deploy card is open; the user's choice there merges it",
+                t.label
+            ));
+        }
+        let (main, branch) = (
+            t.repo.clone().unwrap_or_default(),
+            t.branch.clone().unwrap_or_else(|| "its branch".into()),
+        );
+        let base = t
+            .base_branch
+            .clone()
+            .or(t.base_commit.clone())
+            .unwrap_or_else(|| "its base".into());
+        if !confirmed
+            && !self
+                .confirm(format!("{}: merge", t.label), Self::merge_question(t, pr), "Merge")
+                .await?
+        {
             return Ok(format!("The user declined: {} is not merged.", t.label));
         }
         self.edit(|b| {
@@ -2034,10 +2103,19 @@ impl Super {
 and report `merge: merged` once it is merged (`merge: pr-opened` only if it can't be merged yet, with the reason)"
                 .to_string(),
         };
+        // An open PR on exactly the task's commit is used, not opened again (L10.9).
+        let open = match pr {
+            true => match self.open_pr(t) {
+                Some((n, url)) => {
+                    format!("Then push it and use the open pull request #{n} ({url}) (do not open another)")
+                }
+                None => format!("Then push it and open a pull request against {base}"),
+            },
+            false => String::new(),
+        };
         let text = match pr {
             true => format!(
-                "The user approved merging. Rebase {branch} on {base}. {recheck} Then push it and open a pull \
-request against {base}, {pr_end}. If anything fails (a conflict, uncommitted changes to tracked \
+                "The user approved merging. Rebase {branch} on {base}. {recheck} {open}, {pr_end}. If anything fails (a conflict, uncommitted changes to tracked \
 files in the main checkout, a failed check), report `merge: failed` with the reason. Untracked files (build output, \
 caches) are not a reason to stop: git refuses by itself if the merge would overwrite one."
             ),
@@ -2053,6 +2131,83 @@ with the reason.",
         };
         let held = self.deliver(&t.id, text).await?;
         Ok(format!("{} is merging.{}", t.label, held_note(held)))
+    }
+
+    /// Write tasks that need code's deploy card now; each is marked `asking` (L10.9).
+    pub(super) fn deploy_due(&self) -> Vec<String> {
+        let due = |t: &Task| {
+            t.kind == Kind::Work
+                && t.write
+                && t.state == State::Ready
+                && t.repo.is_some()
+                && t.landed.is_none()
+                && t.after.is_empty()
+                && !t.deploy_decided
+                && !t.asking
+        };
+        if self.asker.is_none() || !self.board.lock().unwrap().tasks.iter().any(due) {
+            return vec![];
+        }
+        if !super::describes_deploy(&self.root) {
+            return vec![];
+        }
+        self.edit(|b| {
+            b.tasks
+                .iter_mut()
+                .filter(|t| due(t))
+                .map(|t| {
+                    t.asking = true;
+                    t.id.clone()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// Code's deploy card for ready `id`; either choice merges it (the card is the merge
+    /// confirmation). What happened, for super.
+    pub(super) async fn deploy_card(&self, id: &str) -> Option<String> {
+        let t = self.shown(self.row(id).ok()?);
+        let q = format!(
+            "{} is ready. Merge and deploy, or merge only? Either choice merges now. {} \
+             Merge and deploy then runs the after step: {DEPLOY_STEP}.",
+            t.label,
+            Self::merge_question(&t, t.pr)
+        );
+        let pick = self
+            .choose(format!("{}: deploy", t.label), q, &[MERGE_DEPLOY, MERGE_ONLY])
+            .await;
+        let deploy = match pick.ok().flatten().as_deref() {
+            Some(MERGE_DEPLOY) => Some(true),
+            Some(_) => Some(false),
+            None => None,
+        };
+        let note = match deploy {
+            Some(true) => "deploy decision: merge and deploy",
+            Some(false) => "deploy decision: merge only",
+            None => "deploy card closed without an answer",
+        };
+        let _ = self.edit(|b| {
+            if let Some(r) = b.tasks.iter_mut().find(|r| r.id == id) {
+                r.asking = false;
+                r.deploy_decided = true;
+                r.notes.push(note.into());
+                if deploy == Some(true) {
+                    r.after = vec![DEPLOY_STEP.into()];
+                }
+            }
+        });
+        if deploy.is_none() {
+            return Some(format!(
+                "{}'s deploy card was closed without an answer; it stays ready (not merged).",
+                t.label
+            ));
+        }
+        let t = self.shown(self.row(id).ok()?);
+        Some(match self.merge(&t, t.pr, true).await {
+            Ok(out) => out,
+            Err(e) => format!("{}'s merge didn't start: {e}", t.label),
+        })
     }
 
     /// The merge of `id` landed: send its after-merge steps as work, so it runs them and
@@ -2506,6 +2661,19 @@ impl Launcher for Procs {
         })
     }
 
+    fn open_prs(&self, main: &Path) -> Result<String, String> {
+        let o = std::process::Command::new("gh")
+            .args(["pr", "list", "--state", "open", "--json", "number,headRefOid,url"])
+            .current_dir(main)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("gh: {e}"))?;
+        match o.status.success() {
+            true => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
+            false => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        }
+    }
+
     fn link<'a>(&'a self, session: &'a str) -> BoxFuture<'a, Result<super::link::Conn, String>> {
         Box::pin(async move {
             let f = crate::serve::find_live(&self.paths, session).map_err(|e| e.to_string())?;
@@ -2544,6 +2712,8 @@ pub(super) mod tests {
         gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
         /// A failed send finds the process gone.
         dies_on_send: Mutex<bool>,
+        /// `open_prs` output; `None` fails like `gh` without a remote.
+        prs: Mutex<Option<String>>,
     }
 
     impl Launcher for FakeLauncher {
@@ -2593,6 +2763,13 @@ pub(super) mod tests {
                 self.alive.lock().unwrap().remove(session);
                 Ok(())
             })
+        }
+        fn open_prs(&self, _main: &Path) -> Result<String, String> {
+            self.prs
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| "no git remotes found".into())
         }
     }
 
@@ -3927,6 +4104,110 @@ pub(super) mod tests {
             text.contains("merge the pull request") && text.contains("report `merge: merged`"),
             "{text}"
         );
+    }
+
+    /// L10.9: a ready write task with no deploy decision gets one deploy card when the root's
+    /// project file describes a deploy; either choice merges without a second card.
+    #[tokio::test]
+    async fn a_ready_task_gets_one_deploy_card_that_also_confirms_the_merge() {
+        let fx = fixture(5, &[Some("Merge and deploy"), Some("Merge only")]);
+        repo(&fx.root, "app");
+        // Another repo: one merge per repo at a time.
+        repo(&fx.root, "app2");
+        run(&fx, spawn_args("app", "m", true)).await.unwrap();
+        run(&fx, spawn_args("app2", "n", true)).await.unwrap();
+        let mut a = spawn_args("app", "o", true);
+        a["after"] = json!(["ship it"]);
+        run(&fx, a).await.unwrap();
+        for id in ["T1-m", "T2-n", "T3-o"] {
+            set_state(&fx, id, State::Ready);
+        }
+        assert!(fx.sup.deploy_due().is_empty(), "no project file describes a deploy");
+        std::fs::write(fx.root.join("AGENTS.md"), "Deploy: run ./ship on the server.").unwrap();
+        // T3 has after steps already.
+        assert_eq!(fx.sup.deploy_due(), ["T1-m", "T2-n"]);
+        assert!(fx.sup.row("T1-m").unwrap().asking);
+        assert!(fx.sup.deploy_due().is_empty(), "one card at a time per task");
+
+        let out = fx.sup.deploy_card("T1-m").await.unwrap();
+        assert!(out.contains("T1-m is merging"), "{out}");
+        let q = fx.asker.asked.lock().unwrap()[0].clone();
+        assert!(q.question.contains("T1-m is ready."), "{q:?}");
+        let labels: Vec<&str> = q.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, ["Merge and deploy", "Merge only"]);
+        let t = fx.sup.row("T1-m").unwrap();
+        assert_eq!(t.state, State::Merging);
+        assert_eq!(t.after, [DEPLOY_STEP]);
+        assert!(t.deploy_decided && !t.asking);
+        assert!(t.notes.iter().any(|n| n.contains("merge and deploy")), "{:?}", t.notes);
+        assert_eq!(fx.asker.asked.lock().unwrap().len(), 1, "no second merge card");
+
+        fx.sup.deploy_card("T2-n").await.unwrap();
+        let t = fx.sup.row("T2-n").unwrap();
+        assert_eq!(t.state, State::Merging);
+        assert!(t.after.is_empty() && t.deploy_decided);
+        assert!(t.notes.iter().any(|n| n.contains("merge only")), "{:?}", t.notes);
+        assert_eq!(fx.asker.asked.lock().unwrap().len(), 2);
+        set_state(&fx, "T2-n", State::Ready);
+        assert!(fx.sup.deploy_due().is_empty(), "decided: never asked again");
+    }
+
+    /// L10.9: `task merge` with `pr` reuses an open PR whose head is the task's commit.
+    #[tokio::test]
+    async fn a_pr_merge_reuses_an_open_pr_on_the_task_s_commit() {
+        let fx = fixture(5, &[Some("Merge"), Some("Merge")]);
+        repo(&fx.root, "app");
+        run(&fx, spawn_args("app", "m", true)).await.unwrap();
+        fx.sup
+            .edit(|b| {
+                b.tasks[0].done = Some(super::super::board::Done {
+                    commit: Some("abc123".into()),
+                    ..Default::default()
+                });
+                b.tasks[0].state = State::Ready;
+            })
+            .unwrap();
+        *fx.launcher.prs.lock().unwrap() = Some(
+            r#"[{"number":3,"headRefOid":"fff","url":"https://g/pull/3"},{"number":7,"headRefOid":"abc123","url":"https://g/pull/7"}]"#
+                .into(),
+        );
+        run(&fx, json!({"action": "merge", "task": "T1-m", "pr": true}))
+            .await
+            .unwrap();
+        let text = fx.launcher.prompts("s1").last().unwrap().clone();
+        assert!(
+            text.contains("pull request #7 (https://g/pull/7)") && !text.contains("open a pull request"),
+            "{text}"
+        );
+        assert!(text.contains("report `merge: pr-opened`"), "{text}");
+        // No open PR on that commit (or `gh` failing): the task opens one.
+        fx.sup
+            .edit(|b| b.apply("T1-m", Event::MergeReport(MergeResult::Failed("x".into()))))
+            .unwrap()
+            .unwrap();
+        fx.sup.edit(|b| b.tasks[0].accepted = true).unwrap();
+        *fx.launcher.prs.lock().unwrap() = None;
+        run(&fx, json!({"action": "merge", "task": "T1-m", "pr": true}))
+            .await
+            .unwrap();
+        let text = fx.launcher.prompts("s1").last().unwrap().clone();
+        assert!(text.contains("open a pull request"), "{text}");
+    }
+
+    /// L10.9: super's actions on a task are timed on its row (stalled tasks have none).
+    #[tokio::test]
+    async fn super_s_actions_on_a_task_are_timed_on_its_row() {
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "q", false)).await.unwrap();
+        assert_eq!(fx.sup.row("T1-q").unwrap().acted_at, 0);
+        run(&fx, json!({"action": "list"})).await.unwrap();
+        run(&fx, json!({"action": "read", "task": "T1-q"})).await.ok();
+        assert_eq!(fx.sup.row("T1-q").unwrap().acted_at, 0, "reading is no action");
+        run(&fx, json!({"action": "note", "task": "T1-q", "note": "use port 1"}))
+            .await
+            .unwrap();
+        assert!(fx.sup.row("T1-q").unwrap().acted_at > 0);
     }
 
     /// Once merged, code sends the after steps; a charter limit asks first on a card.

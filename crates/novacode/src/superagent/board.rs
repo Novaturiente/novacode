@@ -251,7 +251,7 @@ pub struct Health {
 }
 
 /// `t` seconds before `now`, short: `40 s`, `12 min`, `3 h`.
-fn age(now: u64, t: u64) -> String {
+pub(super) fn age(now: u64, t: u64) -> String {
     let s = now.saturating_sub(t);
     match s {
         0..120 => format!("{s} s"),
@@ -435,6 +435,16 @@ pub struct Task {
     /// Unix seconds of its last report of any state; 0 = none yet.
     #[serde(skip_serializing_if = "is_default")]
     pub report_at: u64,
+    /// Unix seconds of super's last action on it (send, review, merge, accept, scope, note,
+    /// close, a `say` question naming it): a task with none for long is stalled.
+    #[serde(skip_serializing_if = "is_default")]
+    pub acted_at: u64,
+    /// The user chose on the deploy card (or dismissed it): it isn't asked again.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub deploy_decided: bool,
+    /// Code's deploy card is open now (not saved: a restart has no open card).
+    #[serde(skip)]
+    pub asking: bool,
     /// Unix seconds.
     pub started: u64,
     pub updated: u64,
@@ -1092,6 +1102,16 @@ impl Board {
             "reply" => self.needs.retain(|n| !n.typed),
             _ => {}
         }
+        if kind == "question" {
+            let ids: Vec<String> = tasks
+                .iter()
+                .filter_map(|l| self.by_label(l))
+                .map(|t| t.id.clone())
+                .collect();
+            for t in self.tasks.iter_mut().filter(|t| ids.contains(&t.id)) {
+                t.acted_at = now();
+            }
+        }
         if matches!(kind, "question" | "warning") {
             self.needs.push(Need {
                 id: id.into(),
@@ -1103,6 +1123,33 @@ impl Board {
                 card: None,
             });
         }
+    }
+
+    /// The stalled work tasks at `now` and for how long (L10.9): blocked, stopped, or ready
+    /// with no landed merge; no open question to the user about it (a `say` question, its
+    /// own relayed card, code's deploy card); no change and no action of super's on it for
+    /// `after` seconds (0 = off).
+    pub fn stalled(&self, now: u64, after: u64) -> Vec<(&Task, u64)> {
+        if after == 0 {
+            return vec![];
+        }
+        let asked = |t: &Task| {
+            self.needs
+                .iter()
+                .any(|n| n.kind == "question" && n.tasks.iter().any(|l| self.by_label(l).is_some_and(|r| r.id == t.id)))
+        };
+        self.tasks
+            .iter()
+            .filter(|t| t.kind == Kind::Work)
+            .filter(|t| match t.state {
+                State::Blocked | State::Stopped => true,
+                State::Ready => t.landed != Some(Landed::Merged),
+                _ => false,
+            })
+            .filter(|t| !t.asking && t.health.cards == 0 && !asked(t))
+            .map(|t| (t, now.saturating_sub(t.updated.max(t.acted_at))))
+            .filter(|(_, s)| *s >= after)
+            .collect()
     }
 
     /// Needs you for the windows' Tasks tab.
@@ -1456,6 +1503,63 @@ mod tests {
             branch: Some("worktree-T1-fix".into()),
             ..Task::default()
         }
+    }
+
+    #[test]
+    fn stalled_tasks_are_unfinished_with_no_question_and_no_action_for_long() {
+        let now = 10_000;
+        let at = |id: &str, state: State, updated: u64| Task {
+            id: id.into(),
+            label: id.into(),
+            kind: Kind::Work,
+            state,
+            updated,
+            ..Task::default()
+        };
+        let mut b = Board {
+            tasks: vec![
+                at("T1", State::Blocked, 1000),
+                at("T2", State::Stopped, 1000),
+                at("T3", State::Ready, 1000),
+                at("T4", State::Running, 1000),
+                at("T5", State::Blocked, now - 60),
+                at("T6", State::Ready, 1000),
+                at("T7", State::Blocked, 1000),
+                at("T8", State::Blocked, 1000),
+                at("T9", State::Ready, 1000),
+                at("T10", State::Blocked, 1000),
+            ],
+            ..Board::default()
+        };
+        b.tasks[5].landed = Some(Landed::Merged);
+        b.tasks[8].landed = Some(Landed::PrOpened);
+        b.tasks[6].acted_at = now - 60;
+        b.tasks[7].health.cards = 1;
+        b.tasks[9].asking = true;
+        b.note_say("q1", "question", &["T2".into()], "T2 needs a port", false);
+        let ids = |b: &Board, after| -> Vec<(String, u64)> {
+            b.stalled(now, after)
+                .into_iter()
+                .map(|(t, s)| (t.id.clone(), s))
+                .collect()
+        };
+        // T2 waits on the user's answer; T4 runs; T5 changed and T7 was acted on a minute
+        // ago; T6 landed; T8's own card and T10's deploy card are open.
+        assert_eq!(
+            ids(&b, 900),
+            [
+                ("T1".to_string(), 9000),
+                ("T3".to_string(), 9000),
+                ("T9".to_string(), 9000)
+            ]
+        );
+        assert!(ids(&b, 0).is_empty(), "0 = off");
+        // A `say` question naming a task is super's action on it.
+        b.drop_need("q1");
+        b.note_say("q2", "question", &["T1".into()], "T1?", false);
+        assert!(b.tasks[0].acted_at > 0);
+        assert!(b.tasks[1].acted_at > 0, "T2 was asked about too");
+        assert_eq!(ids(&b, 900), [("T3".to_string(), 9000), ("T9".to_string(), 9000)]);
     }
 
     #[test]

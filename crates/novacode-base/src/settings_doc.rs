@@ -276,6 +276,12 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "Super mode: a task that has worked this long without a `progress` report is asked for one at its next tool boundary (no interrupt); never while it waits on your answer. `0`: no nudges.",
     ),
     (
+        "super.watch.stallMinutes",
+        "number",
+        "15",
+        "Super mode: a task blocked, stopped or ready but not landed, with no open question to you and no action of super's on it for this long, is stalled: it wakes a health check that lists it, and super must act on it. `0`: no stall checks.",
+    ),
+    (
         "goal.audit",
         "bool",
         "true",
