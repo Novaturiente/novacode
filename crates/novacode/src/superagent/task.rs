@@ -115,7 +115,8 @@ struct Args {
     ty: Option<String>,
     criteria: Vec<String>,
     after: Vec<String>,
-    scope: Option<String>,
+    #[serde(deserialize_with = "super::board::points")]
+    scope: Vec<String>,
     skills: Vec<String>,
     goal: bool,
     message: Option<String>,
@@ -125,6 +126,67 @@ struct Args {
     all: bool,
     offset: Option<usize>,
     limit: Option<usize>,
+}
+
+/// `scope`: at most [`SCOPE_POINTS`] short points of at most [`SCOPE_WORDS`] words each.
+const SCOPE_POINTS: usize = 8;
+const SCOPE_WORDS: usize = 25;
+
+fn check_scope(scope: &[String]) -> Result<(), String> {
+    if scope.len() > SCOPE_POINTS {
+        return Err(format!(
+            "`scope` takes at most {SCOPE_POINTS} short points; got {}",
+            scope.len()
+        ));
+    }
+    if let Some((i, n)) = scope
+        .iter()
+        .map(|p| p.split_whitespace().count())
+        .enumerate()
+        .find(|(_, n)| *n > SCOPE_WORDS)
+    {
+        return Err(format!(
+            "each `scope` point is at most {SCOPE_WORDS} words; point {} has {n}",
+            i + 1
+        ));
+    }
+    Ok(())
+}
+
+/// A card's view of a list change: `Added:` and `Removed:` bullets and `Kept: N points`.
+fn list_change(old: &[String], new: &[String]) -> String {
+    let mut s = String::new();
+    let added: Vec<&String> = new.iter().filter(|p| !old.contains(p)).collect();
+    let removed: Vec<&String> = old.iter().filter(|p| !new.contains(p)).collect();
+    for (head, list) in [("Added", added), ("Removed", removed)] {
+        if !list.is_empty() {
+            s += &format!("{head}:\n");
+            for p in list {
+                s += &format!("- {p}\n");
+            }
+        }
+    }
+    let kept = new.iter().filter(|p| old.contains(p)).count();
+    s += &format!("Kept: {kept} point{}\n", if kept == 1 { "" } else { "s" });
+    s
+}
+
+/// `text` cut to its first `n` words, with `…` when cut.
+fn first_words(text: &str, n: usize) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    match words.len() > n {
+        true => format!("{}…", words[..n].join(" ")),
+        false => words.join(" "),
+    }
+}
+
+/// Scope points as bullets, after a heading line.
+fn scope_lines(scope: &[String]) -> String {
+    let mut s = String::from("\nScope (the areas the change should touch):\n");
+    for p in scope {
+        s += &format!("- {p}\n");
+    }
+    s
 }
 
 /// The label's slug: 1 to 4 words of `a-z0-9` joined by `-`, at most 30 characters.
@@ -276,8 +338,8 @@ fn brief(t: &Task) -> String {
         }
         s.push_str("Don't do them before: your `done` covers only the criteria.\n");
     }
-    if let Some(scope) = &t.scope {
-        s.push_str(&format!("\nScope (the areas the change should touch): {scope}\n"));
+    if !t.scope.is_empty() {
+        s.push_str(&scope_lines(&t.scope));
     }
     if !t.skills.is_empty() {
         s.push_str(&format!("\nUse these skills: {}\n", t.skills.join(", ")));
@@ -520,6 +582,7 @@ impl Super {
         if a.criteria.is_empty() || a.criteria.len() > 5 {
             return Err("give 1 to 5 checkable acceptance `criteria`".into());
         }
+        check_scope(&a.scope)?;
         let folder = self.in_root(a.folder.as_deref().ok_or("`folder` is missing")?)?;
         // Tiers of super's current provider, unless a model is named (L10.9 "Models").
         let own = self.current_model();
@@ -1425,29 +1488,27 @@ impl Super {
         t: &Task,
         brief: Option<String>,
         criteria: Vec<String>,
-        scope: Option<String>,
+        scope: Vec<String>,
     ) -> Result<String, String> {
         let brief = brief.filter(|b| !b.trim().is_empty());
-        if brief.is_none() && criteria.is_empty() && scope.is_none() {
+        if brief.is_none() && criteria.is_empty() && scope.is_empty() {
             return Err("give the new `request` (brief), `criteria` or `scope`".into());
         }
         if criteria.len() > 5 {
             return Err("give 1 to 5 checkable acceptance `criteria`".into());
         }
+        check_scope(&scope)?;
         self.check(&t.id, Event::Send)?;
+        // Only the change: the new brief with the old one cut short, list changes as bullets.
         let mut change = String::new();
         if let Some(b) = &brief {
-            change += &format!("Brief:\n{}\n(was: {})\n", b.trim(), t.request.trim());
+            change += &format!("Brief:\n{}\n(was: {})\n", b.trim(), first_words(&t.request, 30));
         }
         if !criteria.is_empty() {
-            change += "Criteria:\n";
-            for (i, c) in criteria.iter().enumerate() {
-                change += &format!("{}. {c}\n", i + 1);
-            }
-            change += &format!("(was: {})\n", t.criteria.join("; "));
+            change += &format!("Criteria:\n{}", list_change(&t.criteria, &criteria));
         }
-        if let Some(s) = &scope {
-            change += &format!("Scope: {s}\n(was: {})\n", t.scope.as_deref().unwrap_or("none"));
+        if !scope.is_empty() {
+            change += &format!("Scope:\n{}", list_change(&t.scope, &scope));
         }
         let q = format!("Change {}'s charter?\n\n{change}", t.label);
         if !self.confirm(format!("{}: scope", t.label), q, "Change").await? {
@@ -1461,7 +1522,7 @@ impl Super {
             if !criteria.is_empty() {
                 row.criteria = criteria.clone();
             }
-            if scope.is_some() {
+            if !scope.is_empty() {
                 row.scope = scope.clone();
             }
             Ok::<_, String>(())
@@ -1483,8 +1544,8 @@ impl Super {
                 msg += &format!("{}. {c}\n", i + 1);
             }
         }
-        if let Some(s) = &row.scope {
-            msg += &format!("\nScope (the areas the change should touch): {s}\n");
+        if !row.scope.is_empty() {
+            msg += &scope_lines(&row.scope);
         }
         let sent = self.send(&row, &msg).await?;
         Ok(format!("{}'s charter changed on the user's OK. {sent}", t.label))
@@ -2130,7 +2191,7 @@ impl Tool for TaskTool {
         "task"
     }
     fn description(&self) -> &str {
-        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], after?[], scope?, skills?[], goal?} (`after`: steps that run only once the merge lands, such as deploy and live checks; never put them in criteria: the review judges only the criteria, then after the merge code sends the after steps to the task, which reports done with their proof); info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task, pr?} (each asks the user on a card; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task with commits past its base, not merging or ready, ships without an approved review after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked because it kept ending without a report, or that reported `blocked`: code takes its commit and changed files from its worktree's HEAD when it has no `done`, refused when nothing is committed, and the review uses a round); note {task, note} (keeps a user decision about the task on its charter, which you see with every message); scope {task, request? | criteria? | scope?} (changes the brief, criteria or scope only after the user's OK on a card; code then updates the charter and tells the task); model {task | all, provider | model} (only when the user asks to switch models: each task moves to the matching tier on that provider, or to that model, after one card listing each task's old and new model; a task blocked by a provider limit is told to continue); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
+        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], after?[], scope?[], skills?[], goal?} (`after`: steps that run only once the merge lands, such as deploy and live checks; never put them in criteria: the review judges only the criteria, then after the merge code sends the after steps to the task, which reports done with their proof); info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task, pr?} (each asks the user on a card; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task with commits past its base, not merging or ready, ships without an approved review after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked because it kept ending without a report, or that reported `blocked`: code takes its commit and changed files from its worktree's HEAD when it has no `done`, refused when nothing is committed, and the review uses a round); note {task, note} (keeps a user decision about the task on its charter, which you see with every message); scope {task, request? | criteria? | scope?[]} (changes the brief, criteria or scope only after the user's OK on a card, which shows only what changes; scope is short points, at most 8 of at most 25 words each; code then updates the charter and tells the task); model {task | all, provider | model} (only when the user asks to switch models: each task moves to the matching tier on that provider, or to that model, after one card listing each task's old and new model; a task blocked by a provider limit is told to continue); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
     }
     fn schema(&self) -> Value {
         let s = |d: &str| json!({ "type": "string", "description": d });
@@ -2149,7 +2210,7 @@ impl Tool for TaskTool {
                 "type": { "type": "string", "enum": ["bugfix", "change", "question"], "description": "spawn: question needs write false; bugfix and change need write true. Default change." },
                 "criteria": { "type": "array", "items": { "type": "string" }, "description": "spawn: 1-5 checkable acceptance criteria. scope: the new criteria." },
                 "after": { "type": "array", "items": { "type": "string" }, "description": "spawn: steps that run only after the merge lands (deploy, live checks), not judged by the review; code sends them to the task once merged (a charter limit such as \"stop before deploy\" asks the user first)." },
-                "scope": s("spawn and scope: the areas the change should touch."),
+                "scope": { "type": "array", "items": { "type": "string" }, "description": "spawn and scope: the areas the change should touch, as short points (at most 8, each at most 25 words), e.g. [\"src/parser/ only\", \"no API changes\"]. scope: the whole new list." },
                 "skills": { "type": "array", "items": { "type": "string" }, "description": "spawn: skills the task should use." },
                 "goal": { "type": "boolean", "description": "spawn: open-ended work; the task keeps going until the criteria hold." },
                 "message": s("send: the message."),
@@ -3254,7 +3315,14 @@ pub(super) mod tests {
         assert_eq!(fx.sup.row("T1-t").unwrap().criteria, ["it works"]);
         let card = fx.asker.asked.lock().unwrap()[0].clone();
         assert_eq!(card.header.as_deref(), Some("T1-t: scope"));
-        assert!(card.question.contains("2. it is fast") && card.question.contains("(was: it works)"));
+        // Only the change, as bullets.
+        assert!(
+            card.question
+                .contains("Criteria:\nAdded:\n- it is fast\nKept: 1 point\n"),
+            "{}",
+            card.question
+        );
+        assert!(!card.question.contains("was:") && !card.question.contains("Removed:"));
         let before = fx.launcher.prompts("s1").len();
         // Approved: the charter changes, the change is noted and the task is told.
         let out = run(&fx, scope).await.unwrap();
@@ -3282,6 +3350,51 @@ pub(super) mod tests {
         assert!(row.notes_len() <= super::super::board::NOTES_CAP, "{}", row.notes_len());
         assert!(row.notes[0].starts_with("[older notes trimmed"), "{:?}", row.notes[0]);
         assert!(row.notes.last().unwrap().starts_with("n9 "));
+    }
+
+    /// L10.9: scope is at most 8 short points; a scope card shows only what changes, and
+    /// the old brief cut to 30 words.
+    #[tokio::test]
+    async fn scope_is_short_points_and_its_card_shows_only_the_change() {
+        let fx = fixture(5, &[Some("Change")]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        let mut a = spawn_args("p", "t", false);
+        a["scope"] = json!((0..9).map(|i| format!("p{i}")).collect::<Vec<_>>());
+        let e = run(&fx, a.clone()).await.unwrap_err();
+        assert!(e.contains("at most 8"), "{e}");
+        a["scope"] = json!(["ok", vec!["w"; 26].join(" ")]);
+        let e = run(&fx, a.clone()).await.unwrap_err();
+        assert!(e.contains("at most 25 words"), "{e}");
+        let long = (0..40).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        a["request"] = json!(long);
+        a["scope"] = json!(["src/", "tests/", "docs/"]);
+        run(&fx, a).await.unwrap();
+        assert_eq!(fx.sup.row("T1-t").unwrap().scope, ["src/", "tests/", "docs/"]);
+        let e = run(&fx, json!({"action": "scope", "task": "T1-t", "scope": vec!["x"; 9]}))
+            .await
+            .unwrap_err();
+        assert!(e.contains("at most 8"), "{e}");
+        let out = run(
+            &fx,
+            json!({"action": "scope", "task": "T1-t", "request": "do less", "scope": ["src/", "tests/", "bench/"]}),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("charter changed"), "{out}");
+        let q = fx.asker.asked.lock().unwrap()[0].question.clone();
+        let was: Vec<&str> = long.split(' ').take(30).collect();
+        assert!(
+            q.contains(&format!("Brief:\ndo less\n(was: {}…)\n", was.join(" "))),
+            "{q}"
+        );
+        assert!(
+            q.contains("Scope:\nAdded:\n- bench/\nRemoved:\n- docs/\nKept: 2 points\n"),
+            "{q}"
+        );
+        assert!(!q.contains("w35"), "{q}");
+        let row = fx.sup.row("T1-t").unwrap();
+        assert_eq!(row.scope, ["src/", "tests/", "bench/"]);
+        assert!(fx.launcher.prompts("s1").last().unwrap().contains("- bench/\n"));
     }
 
     #[test]

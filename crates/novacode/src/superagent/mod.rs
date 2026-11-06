@@ -91,7 +91,8 @@ the open requests) comes with every message, and is the truth. For older chat, u
 limit such as \"stop before deploy\") goes on its charter with `task note`; a lasting preference goes to `memory`; \
 a request that is not a task yet goes on `todo` (your open requests).
 - A change to a task's brief, criteria or scope goes through `task scope`: the user approves it on a card, then \
-code updates the charter and tells the task. A `task send` never changes the criteria.
+code updates the charter and tells the task. A `task send` never changes the criteria. A scope is a list of \
+short points (at most 8, each at most 25 words: where the change goes and its limits), never an essay.
 - A message starting with `[health check]` is a timed check of the running tasks. Judge each from the Health \
 section of the state block. When all are fine, answer exactly `OK` and nothing else (code hides that turn from the \
 user). On a problem (no events for long, one tool running far too long, an error streak, the same call repeated, a \
@@ -123,13 +124,30 @@ pub fn compaction_guide(dir: std::path::PathBuf) -> impl Fn() -> String + Send +
 /// The tools super's model sees (before `super.tools`).
 pub const TOOLS: [&str; 7] = ["task", "say", "ask_user", "memory", "todo", "agent", "history_search"];
 
-/// Super's prompt: its own, the global `AGENTS.md` of novacode's `home`, then the
-/// overrides. No project `AGENTS.md` and no skills.
-pub fn prompt(home: &Path) -> String {
+/// Super's prompt: its own, the global `AGENTS.md` of novacode's `home`, then `root`'s
+/// own `AGENTS.md` (or `CLAUDE.md` when it has none; no parent folders), then the
+/// overrides. `root` is `None` with `--no-context-files`. No skills.
+pub fn prompt(home: &Path, root: Option<&Path>) -> String {
     let mut s = String::from(PROMPT);
     if let Some((path, text)) = novacode_core::prompt::global_file(home) {
         s.push_str(&format!(
             "\n\n<global_instructions path=\"{}\">\n{}\n</global_instructions>",
+            path.display(),
+            text.trim_end()
+        ));
+    }
+    let project = root.and_then(|r| {
+        ["AGENTS.md", "CLAUDE.md"]
+            .iter()
+            .map(|n| r.join(n))
+            .find(|p| p.is_file())
+    });
+    if let Some(path) = project
+        && let Ok(text) = std::fs::read_to_string(&path)
+        && !text.trim().is_empty()
+    {
+        s.push_str(&format!(
+            "\n\n<project_instructions path=\"{}\">\n{}\n</project_instructions>",
             path.display(),
             text.trim_end()
         ));
@@ -246,20 +264,41 @@ mod tests {
     }
 
     #[test]
-    fn prompt_has_global_agents_md_and_overrides_but_no_project_file() {
+    fn prompt_has_global_agents_md_then_the_root_s_project_file_then_overrides() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("AGENTS.md"), "GLOBAL-RULE").unwrap();
-        let p = prompt(d.path());
-        let (own, global, over) = (
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "PROJECT-RULE").unwrap();
+        std::fs::write(root.path().join("CLAUDE.md"), "CLAUDE-RULE").unwrap();
+        let p = prompt(d.path(), Some(root.path()));
+        let (own, global, project, over) = (
             p.find("super agent").unwrap(),
             p.find("GLOBAL-RULE").unwrap(),
+            p.find("PROJECT-RULE").unwrap(),
             p.find("<super_overrides>").unwrap(),
         );
-        assert!(own < global && global < over, "{p}");
-        // No global file: own prompt and overrides only.
+        assert!(own < global && global < project && project < over, "{p}");
+        assert!(
+            p.contains(&format!("path=\"{}\"", root.path().join("AGENTS.md").display())),
+            "{p}"
+        );
+        // CLAUDE.md only when there is no AGENTS.md.
+        assert!(!p.contains("CLAUDE-RULE"), "{p}");
+        std::fs::remove_file(root.path().join("AGENTS.md")).unwrap();
+        let p = prompt(d.path(), Some(root.path()));
+        assert!(p.contains("CLAUDE-RULE") && !p.contains("PROJECT-RULE"), "{p}");
+        // Root only: a parent's file is not loaded.
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::write(parent.path().join("AGENTS.md"), "PARENT-RULE").unwrap();
+        let child = parent.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let p = prompt(d.path(), Some(&child));
+        assert!(!p.contains("PARENT-RULE") && !p.contains("project_instructions"), "{p}");
+        // `--no-context-files` (no root) and no global file: own prompt and overrides only.
         let empty = tempfile::tempdir().unwrap();
-        let p = prompt(empty.path());
-        assert!(!p.contains("global_instructions") && p.contains("<super_overrides>"));
+        let p = prompt(empty.path(), None);
+        assert!(!p.contains("global_instructions") && !p.contains("project_instructions"));
+        assert!(p.contains("<super_overrides>"));
     }
 
     #[test]
@@ -278,6 +317,7 @@ mod tests {
             "goes on `todo`",
             "`history_search`",
             "goes through `task scope`",
+            "A scope is a list of short points",
         ] {
             assert!(PROMPT.contains(rule), "{rule}");
         }

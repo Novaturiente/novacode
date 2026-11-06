@@ -364,7 +364,9 @@ pub struct Task {
     /// Where its [`after`](Self::after) steps stand.
     #[serde(skip_serializing_if = "is_default")]
     pub after_state: AfterState,
-    pub scope: Option<String>,
+    /// Short points: the areas the change should touch (an old board's string is one point).
+    #[serde(deserialize_with = "points", skip_serializing_if = "Vec::is_empty")]
+    pub scope: Vec<String>,
     pub state: State,
     pub block: Option<Block>,
     /// Last report's summary.
@@ -464,8 +466,11 @@ impl Task {
                 s.push_str(&format!("{}. {c}\n", i + 1));
             }
         }
-        if let Some(scope) = &self.scope {
-            s.push_str(&format!("Scope: {scope}\n"));
+        if !self.scope.is_empty() {
+            s.push_str("Scope:\n");
+            for p in &self.scope {
+                s.push_str(&format!("- {p}\n"));
+            }
         }
         if !self.notes.is_empty() {
             s.push_str("Decisions and notes:\n");
@@ -546,7 +551,7 @@ impl Task {
         self.notes
             .iter()
             .map(String::as_str)
-            .chain(self.scope.as_deref())
+            .chain(self.scope.iter().map(String::as_str))
             .find(|n| {
                 let n = n.to_lowercase().replace('’', "'");
                 LIMITS.iter().any(|l| n.contains(l))
@@ -984,6 +989,21 @@ pub struct Board {
 
 fn is_default<T: Default + PartialEq>(t: &T) -> bool {
     *t == T::default()
+}
+
+/// A list of points, from a list, one string (one point; an old board's scope) or null.
+pub fn points<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum P {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match Option::<P>::deserialize(d)? {
+        None => vec![],
+        Some(P::One(s)) => vec![s].into_iter().filter(|s| !s.trim().is_empty()).collect(),
+        Some(P::Many(v)) => v,
+    })
 }
 
 impl Board {
@@ -1613,8 +1633,26 @@ mod tests {
         t.notes = vec!["don't deploy on Fridays".into()];
         assert!(t.after_limit().is_some());
         t.notes.clear();
-        t.scope = Some("src/ only; do not deploy".into());
+        t.scope = vec!["src/ only".into(), "do not deploy".into()];
         assert!(t.after_limit().is_some());
+    }
+
+    /// Scope is a list of short points; an old board's string scope loads as one point,
+    /// and the charter shows the points as bullets.
+    #[test]
+    fn scope_is_points_and_an_old_string_scope_loads_as_one_point() {
+        let t: Task = serde_json::from_str(r#"{"id":"T1","label":"T1-x","scope":"src/ only"}"#).unwrap();
+        assert_eq!(t.scope, ["src/ only"]);
+        let t: Task = serde_json::from_str(r#"{"id":"T1","label":"T1-x","scope":null}"#).unwrap();
+        assert!(t.scope.is_empty());
+        let mut t: Task = serde_json::from_str(r#"{"id":"T1","label":"T1-x","scope":["src/","tests/"]}"#).unwrap();
+        assert_eq!(t.scope, ["src/", "tests/"]);
+        assert!(t.charter().contains("Scope:\n- src/\n- tests/\n"), "{}", t.charter());
+        let back: Task = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(back.scope, t.scope);
+        t.scope.clear();
+        assert!(!serde_json::to_string(&t).unwrap().contains("scope"));
+        assert!(!t.charter().contains("Scope"));
     }
 
     use State::*;

@@ -399,15 +399,6 @@ fn session_tools(arg: Option<&str>, def: Option<Vec<String>>) -> Option<Vec<Stri
     }
 }
 
-/// The packages whose Claude Code hooks a session runs: none in super, which has no
-/// skills or packages (L10.9); its tasks keep them.
-fn hook_packages(is_super: bool, home: &Path, cwd: &Path, trusted: bool) -> Vec<novacode_core::packages::Package> {
-    if is_super {
-        return vec![];
-    }
-    novacode_core::packages::enabled(home, cwd, trusted)
-}
-
 /// The sandbox of a session in `cwd` (L6.5): its project folders, the settings'
 /// extra places and the user's protected paths. At the lenient level without a
 /// `sandbox.mode` it only locks credentials (L6.9). A review task (`edit_rule` `review:`) may
@@ -1520,7 +1511,13 @@ impl Ctx {
                 skill_dirs: if is_super { vec![] } else { self.skill_dirs() },
                 tool_guidelines: vec![],
                 agent: if is_super {
-                    Some((superagent::prompt(self.paths.home()), true))
+                    Some((
+                        superagent::prompt(
+                            self.paths.home(),
+                            (!self.cli.no_context_files).then_some(self.cwd.as_path()),
+                        ),
+                        true,
+                    ))
                 } else if let Some(id) = task_id.as_ref().filter(|_| def.is_none()) {
                     // The task preamble: in the system prompt, so it stays cached.
                     Some((superagent::task::preamble(&id.task), false))
@@ -1748,7 +1745,8 @@ impl Ctx {
         // none inside a hook's own novacode (recursion guard).
         let plugin_hooks = (!novacode_core::hooks::disabled()).then(|| {
             Arc::new(novacode_core::plugin_hooks::PluginHooks::load(
-                &hook_packages(is_super, self.paths.home(), &self.cwd, self.trusted),
+                // Super runs them too; its context sends only each hook message's newest copy.
+                &novacode_core::packages::enabled(self.paths.home(), &self.cwd, self.trusted),
                 &self.cwd,
                 store.id(),
                 self.cli.agent.clone(),
@@ -3985,19 +3983,6 @@ mod tests {
             super::session_tools(Some("bash, read"), def),
             Some(vec!["bash".to_string(), "read".to_string()])
         );
-    }
-
-    #[test]
-    fn super_runs_no_package_hooks() {
-        let home = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(home.path().join("packages/cave")).unwrap();
-        let cwd = home.path();
-        assert_eq!(
-            super::hook_packages(false, home.path(), cwd, true).len(),
-            1,
-            "a task keeps them"
-        );
-        assert!(super::hook_packages(true, home.path(), cwd, true).is_empty());
     }
 
     #[test]

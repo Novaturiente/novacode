@@ -220,10 +220,10 @@ pub(super) fn record_baseline(sup: &Super, rv: &Task, field: &Value) {
 }
 
 /// Scope entries that look like paths (no spaces): a changed file matching none is marked.
-fn outside_scope(file: &str, scope: Option<&str>) -> bool {
+fn outside_scope(file: &str, scope: &[String]) -> bool {
     let items: Vec<&str> = scope
-        .unwrap_or("")
-        .split([',', ';'])
+        .iter()
+        .flat_map(|p| p.split([',', ';']))
         .map(|s| s.trim().trim_end_matches('/'))
         .filter(|s| !s.is_empty() && !s.contains(char::is_whitespace))
         .collect();
@@ -292,8 +292,11 @@ relayed to the user, with the answer given:\n";
             s += &format!("- {a}\n");
         }
     }
-    if let Some(scope) = &t.scope {
-        s += &format!("\nScope (the areas the change should touch): {scope}\n");
+    if !t.scope.is_empty() {
+        s += "\nScope (the areas the change should touch):\n";
+        for p in &t.scope {
+            s += &format!("- {p}\n");
+        }
     }
     let base = t.base_commit.as_deref();
     if let Some(commit) = &done.commit {
@@ -320,7 +323,7 @@ need) before any verdict.\n",
     if !done.files.is_empty() {
         s += "\nChanged files: justify or reject each one against the request; an unexplained file is a finding.\n";
         for f in &done.files {
-            let mark = if outside_scope(f, t.scope.as_deref()) {
+            let mark = if outside_scope(f, &t.scope) {
                 " (outside the scope)"
             } else {
                 ""

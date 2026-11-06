@@ -2,7 +2,7 @@
 //! carries the system prompt, a state block written by code and only the newest chat
 //! that fits a token budget. The session file keeps everything; only the request shrinks.
 
-use crate::session::Store;
+use crate::session::{EntryKind, Store};
 use novacode_types::{Block, Message, estimate};
 use std::sync::Arc;
 
@@ -43,8 +43,37 @@ pub struct Quiet {
 
 impl Builder {
     pub fn build(&self, store: &Store, messages: Vec<Message>) -> Vec<Message> {
-        rebuild(messages, self.budget, &(self.state)(store))
+        let hooks: std::collections::HashSet<String> = store
+            .branch()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::CustomMessage { kind, text, .. } if kind == "hook" => {
+                    Some(format!("<system-reminder>\n{text}\n</system-reminder>"))
+                }
+                _ => None,
+            })
+            .collect();
+        rebuild(newest_hook_copies(messages, &hooks), self.budget, &(self.state)(store))
     }
+}
+
+/// Package hooks (mode texts) add the same message at every wake: keep only the newest
+/// copy of each message in `hooks` (their `<system-reminder>` text), dropping older ones.
+fn newest_hook_copies(messages: Vec<Message>, hooks: &std::collections::HashSet<String>) -> Vec<Message> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<Message> = messages
+        .into_iter()
+        .rev()
+        .filter(|m| match m {
+            Message::User { content } => match content.as_slice() {
+                [Block::Text { text, .. }] if hooks.contains(text) => seen.insert(text.clone()),
+                _ => true,
+            },
+            _ => true,
+        })
+        .collect();
+    out.reverse();
+    out
 }
 
 /// System messages first (moved to the front, in order), then `state` as a user message,
@@ -222,6 +251,55 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(thoughts, ["current thought"]);
+    }
+
+    /// Package hooks (caveman, ponytail) add their mode text at every wake: only the
+    /// newest copy of each is sent; the session file keeps them all.
+    #[test]
+    fn only_the_newest_copy_of_each_hook_message_is_sent() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = novacode_base::paths::Paths::new(home.path());
+        let mut s = Store::create(&paths, home.path(), false);
+        let hook = |text: &str| EntryKind::CustomMessage {
+            kind: "hook".into(),
+            text: text.into(),
+            display: false,
+        };
+        s.append(hook("START-ONCE")).unwrap();
+        for i in 0..3 {
+            s.append(EntryKind::Message {
+                message: Message::user(format!("wake {i}")),
+            })
+            .unwrap();
+            s.append(hook("MODE-TEXT")).unwrap();
+            s.append(EntryKind::Message {
+                message: reply(vec![Block::text(format!("done {i}"))]),
+            })
+            .unwrap();
+        }
+        s.append(EntryKind::Message {
+            message: Message::user("wake 3"),
+        })
+        .unwrap();
+        s.append(hook("MODE-TEXT")).unwrap();
+        let b = Builder {
+            budget: 6000,
+            state: Arc::new(|_: &Store| "BOARD".into()),
+            quiet: None,
+            plain: None,
+        };
+        let t = texts(&b.build(&s, s.projection()));
+        let modes: Vec<usize> = (0..t.len()).filter(|&i| t[i].contains("MODE-TEXT")).collect();
+        assert_eq!(modes.len(), 1, "{t:?}");
+        assert_eq!(t[modes[0] - 1], "wake 3", "the newest copy stays: {t:?}");
+        assert_eq!(t.iter().filter(|x| x.contains("START-ONCE")).count(), 1, "{t:?}");
+        assert!(
+            t.iter().any(|x| x == "A:done 2") && t.iter().any(|x| x == "wake 0"),
+            "{t:?}"
+        );
+        // The session file stays whole.
+        let all = texts(&s.projection());
+        assert_eq!(all.iter().filter(|x| x.contains("MODE-TEXT")).count(), 4);
     }
 
     #[test]
