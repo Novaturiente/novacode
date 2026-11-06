@@ -2,6 +2,28 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.8.4] - 2026-11-07
+
+### Added
+
+- **Super drives tasks to done.** A task blocked, stopped, or ready but not merged for 15 minutes with no open question to you counts as stalled (`super.watch.stallMinutes`); super must act on it. Merge, deploy, scope changes and deletes still need your card.
+- **Deploy card at ready**: when the project instructions describe a deploy, a ready task asks once: Merge and deploy / Merge only.
+- **After-merge steps**: `task spawn` takes `after` steps (deploy, live checks). Reviews judge only the criteria; the steps run once the merge lands.
+- **Finished tasks close themselves**: answered read tasks, and write tasks whose merge landed and whose after steps are done. `task spawn` takes `replaces` to close the task it replaces.
+- **Task numbers start at T1 in each super session**; tasks from an earlier session show as `<sid4>·T16-slug`.
+- **Ship without review**: `task accept` ships a committed write task after one card.
+- Super loads its root folder's `AGENTS.md` (or `CLAUDE.md` when there is none) and runs package hooks such as caveman and ponytail, keeping only the newest copy of each hook message.
+
+### Changed
+
+- **Super's questions are short points**: each question field is at most 40 words, at most 5 blockers; super's `ask_user` question at most 40 words. Charter-change cards show only Added, Removed and Kept points.
+- `task merge` with a pull request reuses an open PR that already holds the task's exact commit.
+
+### Fixed
+
+- A queued review re-picks super's current model when its provider is on hold.
+- `task review` works on a task that reported `blocked` when it has commits; untracked files under `worktree.copy` folders no longer refuse `done`; the board follows a task's branch change.
+
 ## [0.8.3] - 2026-11-07
 
 ### Fixed
