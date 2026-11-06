@@ -114,6 +114,7 @@ struct Args {
     #[serde(rename = "type")]
     ty: Option<String>,
     criteria: Vec<String>,
+    after: Vec<String>,
     scope: Option<String>,
     skills: Vec<String>,
     goal: bool,
@@ -267,6 +268,13 @@ fn brief(t: &Task) -> String {
         for (i, c) in t.criteria.iter().enumerate() {
             s.push_str(&format!("{}. {c}\n", i + 1));
         }
+    }
+    if !t.after.is_empty() {
+        s.push_str("\nAfter-merge steps (they run only after the merge lands; code sends them to you then):\n");
+        for (i, c) in t.after.iter().enumerate() {
+            s.push_str(&format!("{}. {c}\n", i + 1));
+        }
+        s.push_str("Don't do them before: your `done` covers only the criteria.\n");
     }
     if let Some(scope) = &t.scope {
         s.push_str(&format!("\nScope (the areas the change should touch): {scope}\n"));
@@ -539,6 +547,7 @@ impl Super {
             token: new_token(),
             write,
             criteria: a.criteria,
+            after: a.after,
             scope: a.scope,
             request,
             skills: a.skills,
@@ -1676,7 +1685,7 @@ impl Super {
             .clone()
             .or(t.base_commit.clone())
             .unwrap_or_else(|| "its base".into());
-        let q = match pr {
+        let mut q = match pr {
             true => format!(
                 "Merge {}? Branch {branch} is rebased on {base}, pushed, and a pull request against {base} is opened.",
                 t.label
@@ -1687,6 +1696,12 @@ impl Super {
                 main.display()
             ),
         };
+        if !t.after.is_empty() {
+            q += &format!(" After the merge lands, its after steps run: {}.", t.after.join("; "));
+            if t.after_limit().is_some() {
+                q += " Its charter holds them back, so you are asked first.";
+            }
+        }
         if !self.confirm(format!("{}: merge", t.label), q, "Merge").await? {
             return Ok(format!("The user declined: {} is not merged.", t.label));
         }
@@ -1725,10 +1740,17 @@ impl Super {
             _ if pr => "If the rebase moved your branch, re-run your checks before you merge.".to_string(),
             _ => "Then re-run your checks.".to_string(),
         };
+        // With after-merge steps, the merge must land before they can run.
+        let pr_end = match t.after.is_empty() {
+            true => "then report `merge: pr-opened`".to_string(),
+            false => "then merge the pull request per the repo's normal flow (its required checks and approvals), \
+and report `merge: merged` once it is merged (`merge: pr-opened` only if it can't be merged yet, with the reason)"
+                .to_string(),
+        };
         let text = match pr {
             true => format!(
                 "The user approved merging. Rebase {branch} on {base}. {recheck} Then push it and open a pull \
-request against {base}, then report `merge: pr-opened`. If anything fails (a conflict, uncommitted changes to tracked \
+request against {base}, {pr_end}. If anything fails (a conflict, uncommitted changes to tracked \
 files in the main checkout, a failed check), report `merge: failed` with the reason. Untracked files (build output, \
 caches) are not a reason to stop: git refuses by itself if the merge would overwrite one."
             ),
@@ -1744,6 +1766,49 @@ with the reason.",
         };
         let held = self.deliver(&t.id, text).await?;
         Ok(format!("{} is merging.{}", t.label, held_note(held)))
+    }
+
+    /// The merge of `id` landed: send its after-merge steps as work, so it runs them and
+    /// reports `done` (no new review). A charter limit ("stop before deploy") asks the user
+    /// on a card first. `None` when it has none to run; else what happened, for super.
+    pub(super) async fn after_steps(&self, id: &str) -> Option<String> {
+        let t = self.row(id).ok()?;
+        self.check(id, Event::AfterSteps).ok()?;
+        let steps: String = t
+            .after
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("{}. {s}\n", i + 1))
+            .collect();
+        if let Some(limit) = t.after_limit() {
+            let q = format!(
+                "Run after steps for {}: {}? Its charter says: \"{limit}\".",
+                t.label,
+                t.after.join("; ")
+            );
+            match self.confirm(format!("{}: after steps", t.label), q, "Run").await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Some(format!(
+                        "The user declined running {}'s after steps; it stays {}.",
+                        t.label,
+                        t.state_text()
+                    ));
+                }
+                Err(e) => return Some(format!("{}'s after steps were not sent: {e}", t.label)),
+            }
+        }
+        if let Err(e) = self.edit(|b| b.apply(id, Event::AfterSteps)).and_then(|r| r) {
+            return Some(format!("{}'s after steps were not sent: {e}", t.label));
+        }
+        let text = format!(
+            "Your merge landed. Now run the after-merge steps:\n{steps}\nThen report `done` with `checks` citing the \
+proof of each step (no new review runs for them). If a step fails, report `blocked` or `failed` with the reason."
+        );
+        Some(match self.deliver(id, text).await {
+            Ok(held) => format!("Sent {}'s after steps (now running).{}", t.label, held_note(held)),
+            Err(e) => format!("{}'s after steps were not sent: {e}", t.label),
+        })
     }
 
     fn list(&self, all: bool) -> String {
@@ -1965,7 +2030,7 @@ impl Tool for TaskTool {
         "task"
     }
     fn description(&self) -> &str {
-        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], scope?, skills?[], goal?}; info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task, pr?} (each asks the user on a card; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task blocked by used-up review rounds, after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked by code because it kept ending without a report: code takes its commit and changed files from its branch, refused when nothing is committed, and the review uses a round); note {task, note} (keeps a user decision about the task on its charter, which you see with every message); scope {task, request? | criteria? | scope?} (changes the brief, criteria or scope only after the user's OK on a card; code then updates the charter and tells the task); model {task | all, provider | model} (only when the user asks to switch models: each task moves to the matching tier on that provider, or to that model, after one card listing each task's old and new model; a task blocked by a provider limit is told to continue); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
+        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], after?[], scope?, skills?[], goal?} (`after`: steps that run only once the merge lands, such as deploy and live checks; never put them in criteria: the review judges only the criteria, then after the merge code sends the after steps to the task, which reports done with their proof); info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task, pr?} (each asks the user on a card; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task blocked by used-up review rounds, after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked by code because it kept ending without a report: code takes its commit and changed files from its branch, refused when nothing is committed, and the review uses a round); note {task, note} (keeps a user decision about the task on its charter, which you see with every message); scope {task, request? | criteria? | scope?} (changes the brief, criteria or scope only after the user's OK on a card; code then updates the charter and tells the task); model {task | all, provider | model} (only when the user asks to switch models: each task moves to the matching tier on that provider, or to that model, after one card listing each task's old and new model; a task blocked by a provider limit is told to continue); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
     }
     fn schema(&self) -> Value {
         let s = |d: &str| json!({ "type": "string", "description": d });
@@ -1983,6 +2048,7 @@ impl Tool for TaskTool {
                 "provider": s("model: the provider to switch to; each task gets its matching tier there."),
                 "type": { "type": "string", "enum": ["bugfix", "change", "question"], "description": "spawn: question needs write false; bugfix and change need write true. Default change." },
                 "criteria": { "type": "array", "items": { "type": "string" }, "description": "spawn: 1-5 checkable acceptance criteria. scope: the new criteria." },
+                "after": { "type": "array", "items": { "type": "string" }, "description": "spawn: steps that run only after the merge lands (deploy, live checks), not judged by the review; code sends them to the task once merged (a charter limit such as \"stop before deploy\" asks the user first)." },
                 "scope": s("spawn and scope: the areas the change should touch."),
                 "skills": { "type": "array", "items": { "type": "string" }, "description": "spawn: skills the task should use." },
                 "goal": { "type": "boolean", "description": "spawn: open-ended work; the task keeps going until the criteria hold." },
@@ -3435,6 +3501,95 @@ pub(super) mod tests {
         assert!(!fx.sup.row("T1-m").unwrap().pr);
         let q = fx.asker.asked.lock().unwrap()[1].question.clone();
         assert!(q.contains("Merge T1-m?") && q.contains("worktree-T1-m"), "{q}");
+    }
+
+    /// L10.9 item 2: `after` steps are kept on the row, told to the task as not-yet work,
+    /// named on the merge card, and a PR merge with them goes as far as merging the PR.
+    #[tokio::test]
+    async fn after_steps_are_kept_briefed_as_later_and_named_on_the_merge_card() {
+        let fx = fixture(5, &[Some("Merge"), Some("Merge")]);
+        repo(&fx.root, "app");
+        let mut a = spawn_args("app", "m", true);
+        a["after"] = json!(["deploy with ./deploy.sh", "curl the live /health"]);
+        run(&fx, a).await.unwrap();
+        let t = fx.sup.row("T1-m").unwrap();
+        assert_eq!(t.after, ["deploy with ./deploy.sh", "curl the live /health"]);
+        assert_eq!(t.criteria, ["it works"]);
+        let brief = fx.launcher.prompts("s1")[0].clone();
+        assert!(
+            brief.contains("1. deploy with ./deploy.sh\n2. curl the live /health")
+                && brief.contains("only after the merge lands")
+                && brief.contains("Don't do them before"),
+            "{brief}"
+        );
+        set_state(&fx, "T1-m", State::Ready);
+        run(&fx, json!({"action": "merge", "task": "T1-m"})).await.unwrap();
+        let q = fx.asker.asked.lock().unwrap()[0].question.clone();
+        assert!(
+            q.contains("After the merge lands, its after steps run: deploy with ./deploy.sh; curl the live /health"),
+            "{q}"
+        );
+        // A pull request: the task merges it per the repo's flow, then reports merged.
+        fx.sup
+            .edit(|b| b.apply("T1-m", Event::MergeReport(MergeResult::Failed("x".into()))))
+            .unwrap()
+            .unwrap();
+        fx.sup.edit(|b| b.tasks[0].accepted = true).unwrap();
+        run(&fx, json!({"action": "merge", "task": "T1-m", "pr": true}))
+            .await
+            .unwrap();
+        let text = fx.launcher.prompts("s1").last().unwrap().clone();
+        assert!(
+            text.contains("merge the pull request") && text.contains("report `merge: merged`"),
+            "{text}"
+        );
+    }
+
+    /// Once merged, code sends the after steps; a charter limit asks first on a card.
+    #[tokio::test]
+    async fn after_steps_are_sent_once_merged_unless_the_charter_holds_them() {
+        let fx = fixture(5, &[Some("Cancel"), Some("Run")]);
+        repo(&fx.root, "app");
+        let mut a = spawn_args("app", "m", true);
+        a["after"] = json!(["deploy"]);
+        run(&fx, a.clone()).await.unwrap();
+        a["slug"] = json!("n");
+        run(&fx, a).await.unwrap();
+        // An old row with no after steps: nothing is sent.
+        run(&fx, spawn_args("app", "o", true)).await.unwrap();
+        for id in ["T1-m", "T2-n", "T3-o"] {
+            set_state(&fx, id, State::Merging);
+            fx.sup
+                .edit(|b| b.apply(id, Event::MergeReport(MergeResult::Merged)))
+                .unwrap()
+                .unwrap();
+        }
+        fx.sup
+            .edit(|b| b.tasks[1].notes.push("stop before deploy".into()))
+            .unwrap();
+        let before = fx.launcher.prompts("s3").len();
+        assert_eq!(fx.sup.after_steps("T3-o").await, None);
+        assert_eq!(fx.launcher.prompts("s3").len(), before);
+        assert_eq!(state(&fx, "T3-o"), State::Ready);
+
+        let out = fx.sup.after_steps("T1-m").await.unwrap();
+        assert!(out.contains("T1-m"), "{out}");
+        assert_eq!(state(&fx, "T1-m"), State::Running);
+        let text = fx.launcher.prompts("s1").last().unwrap().clone();
+        assert!(text.contains("1. deploy") && text.contains("report `done`"), "{text}");
+        assert!(fx.asker.asked.lock().unwrap().is_empty(), "no card without a limit");
+
+        // Held by the charter: a card first; Cancel keeps it ready, Run sends them.
+        let out = fx.sup.after_steps("T2-n").await.unwrap();
+        assert!(out.contains("declined"), "{out}");
+        assert_eq!(state(&fx, "T2-n"), State::Ready);
+        let q = fx.asker.asked.lock().unwrap()[0].question.clone();
+        assert!(
+            q.contains("Run after steps for T2-n: deploy?") && q.contains("stop before deploy"),
+            "{q}"
+        );
+        fx.sup.after_steps("T2-n").await.unwrap();
+        assert_eq!(state(&fx, "T2-n"), State::Running);
     }
 
     #[tokio::test]

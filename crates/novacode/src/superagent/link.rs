@@ -1296,7 +1296,9 @@ Address every finding, commit, re-run your checks and report `done` again.",
             if f.get("write").and_then(Value::as_bool) == Some(true) {
                 let _ = sup.became_write(&r.task, f.get("branch").and_then(Value::as_str));
             }
-            if self.apply_with(sup, &r.task, ev, &checks_text(f)).is_none()
+            let landed = ev == Event::MergeReport(MergeResult::Merged);
+            let applied = self.apply_with(sup, &r.task, ev, &checks_text(f));
+            if applied.is_none()
                 && let Some(old) = prior_done
             {
                 let _ = sup.edit(|b| {
@@ -1305,8 +1307,30 @@ Address every finding, commit, re-run your checks and report `done` again.",
                     }
                 });
             }
+            if landed && applied.is_some() {
+                self.after_landed(&r.task);
+            }
             self.applied(sup, p);
         }
+    }
+
+    /// `id`'s merge landed: code sends its after-merge steps (or asks on a card first when
+    /// its charter holds them back), off the inbox loop since a card waits for the user.
+    fn after_landed(&self, id: &str) {
+        let Some(sup) = self.sup.upgrade() else { return };
+        if sup.row(id).map_or(true, |t| t.after.is_empty()) {
+            return;
+        }
+        let (me, id) = (self.me.clone(), id.to_string());
+        tokio::spawn(async move {
+            let Some(out) = sup.after_steps(&id).await else { return };
+            let Some(me) = me.upgrade() else { return };
+            // Sent: super hears it with its next wake; declined or failed: super acts now.
+            match sup.row(&id).is_ok_and(|t| t.after_state == board::AfterState::Running) {
+                true => me.inform.note(out),
+                false => me.inform.wake(out),
+            }
+        });
     }
 
     /// Record a report as applied and delete its file.
@@ -1678,6 +1702,10 @@ fn wake_text(t: &board::Task, ev: &Event) -> String {
                     t.approved_commit.as_deref().unwrap_or_default()
                 );
             }
+            if *state == ReportState::Done && t.state == State::Ready && t.after_state == board::AfterState::Done {
+                s += "\nIts after-merge steps are done (no review runs for them). If the user already said to close \
+it after the merge, call `task close` now (its card is the confirmation); otherwise offer to close it.";
+            }
             if t.state == State::Reviewing && t.reviewer.is_none() {
                 s += "\nNo review runs for a read task: judge its answer now, with `task accept` or `task review`; \
 nothing else will wake you about it.";
@@ -1685,6 +1713,12 @@ nothing else will wake you about it.";
             s
         }
         Event::MergeReport(m) => match m {
+            MergeResult::Merged if !t.after.is_empty() => format!(
+                "{} merged (now {}). Its after steps follow: code sends them to it now, or asks the user on a card \
+first when its charter holds them back. Wait for its `done` on them before offering to close it.",
+                t.label,
+                t.state.name()
+            ),
             MergeResult::Merged => format!(
                 "{} merged (now {}). If the user already said to close it after the merge, call `task close` now (its \
 card is the confirmation); otherwise offer to close it.",
@@ -3580,6 +3614,55 @@ mod tests {
         );
         assert!(
             wakes.iter().any(|w| w.contains("T2-y opened a pull request")),
+            "{wakes:?}"
+        );
+    }
+
+    /// L10.9 item 2: once the merge landed, code sends the after steps; their `done` makes
+    /// the task ready with no new review.
+    #[tokio::test]
+    async fn a_merged_task_gets_its_after_steps_and_their_done_needs_no_review() {
+        let fx = fixture(5);
+        let a = fx.sup.root.join("a");
+        fx.merging_branch("T1-x", &a);
+        fx.sup.edit(|b| b.tasks[0].after = vec!["deploy it".into()]).unwrap();
+        write_report(&fx, "T1-x", 1, "tok", json!({"merge": "rebased", "summary": "rebased"}));
+        fx.links.kick();
+        fx.until("after steps running", |fx| fx.state("T1-x") == State::Running)
+            .await;
+        let t = fx.sup.row("T1-x").unwrap();
+        assert_eq!(t.landed, Some(board::Landed::Merged));
+        let sent = fx.launcher.sent.lock().unwrap().clone();
+        assert!(
+            sent.iter()
+                .any(|(s, c)| s == "s-T1-x"
+                    && matches!(c, ClientCmd::Prompt { text, .. } if text.contains("1. deploy it"))),
+            "{sent:?}"
+        );
+        let wakes: Vec<_> = fx.said().into_iter().filter(|l| l.starts_with("wake:")).collect();
+        assert!(
+            wakes
+                .iter()
+                .any(|w| w.contains("T1-x merged") && w.contains("after steps")),
+            "{wakes:?}"
+        );
+        write_report(
+            &fx,
+            "T1-x",
+            2,
+            "tok",
+            json!({"state": "done", "summary": "deployed", "write": true, "checks": []}),
+        );
+        fx.links.kick();
+        fx.until("ready", |fx| fx.state("T1-x") == State::Ready).await;
+        let t = fx.sup.row("T1-x").unwrap();
+        assert_eq!(t.state_text(), "ready (merged, after steps done)");
+        assert!(t.reviewer.is_none());
+        let wakes: Vec<_> = fx.said().into_iter().filter(|l| l.starts_with("wake:")).collect();
+        assert!(
+            wakes.iter().any(|w| w.contains("T1-x reported done")
+                && w.contains("after-merge steps are done")
+                && w.contains("task close")),
             "{wakes:?}"
         );
     }

@@ -150,6 +150,17 @@ impl Block {
     }
 }
 
+/// Where a task's after-merge steps stand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AfterState {
+    #[default]
+    NotRun,
+    /// Sent to the task once its merge landed; its next `done` needs no review.
+    Running,
+    Done,
+}
+
 /// How a `ready` task's work landed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -347,6 +358,12 @@ pub struct Task {
     /// Super's spawn flag, or the task entered a linked worktree.
     pub write: bool,
     pub criteria: Vec<String>,
+    /// Steps that run only once the merge landed (deploy, live checks): never judged by its review.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
+    /// Where its [`after`](Self::after) steps stand.
+    #[serde(skip_serializing_if = "is_default")]
+    pub after_state: AfterState,
     pub scope: Option<String>,
     pub state: State,
     pub block: Option<Block>,
@@ -441,6 +458,12 @@ impl Task {
                 s.push_str(&format!("{}. {c}\n", i + 1));
             }
         }
+        if !self.after.is_empty() {
+            s.push_str("After merge (run only once the merge lands; not judged by the review):\n");
+            for (i, c) in self.after.iter().enumerate() {
+                s.push_str(&format!("{}. {c}\n", i + 1));
+            }
+        }
         if let Some(scope) = &self.scope {
             s.push_str(&format!("Scope: {scope}\n"));
         }
@@ -472,6 +495,11 @@ impl Task {
             Some(Landed::PrOpened) => marks.push("PR opened"),
             None => {}
         }
+        match self.after_state {
+            AfterState::Running => marks.push("after steps"),
+            AfterState::Done => marks.push("after steps done"),
+            AfterState::NotRun => {}
+        }
         match marks.is_empty() {
             true => state.to_string(),
             false => format!("{state} ({})", marks.join(", ")),
@@ -501,6 +529,28 @@ impl Task {
             t => format!("last report {} ago", age(now, t)),
         });
         parts.join(" · ")
+    }
+
+    /// The charter note (or scope) that holds back its after steps, such as "stop before
+    /// deploy": code then asks the user on a card before sending them.
+    pub fn after_limit(&self) -> Option<&str> {
+        const LIMITS: [&str; 7] = [
+            "stop before",
+            "before deploy",
+            "don't deploy",
+            "do not deploy",
+            "no deploy",
+            "not deploy",
+            "without deploy",
+        ];
+        self.notes
+            .iter()
+            .map(String::as_str)
+            .chain(self.scope.as_deref())
+            .find(|n| {
+                let n = n.to_lowercase().replace('’', "'");
+                LIMITS.iter().any(|l| n.contains(l))
+            })
     }
 
     /// Its last `done` is on the commit an approved review already covered.
@@ -596,6 +646,8 @@ pub enum Event {
     Restart,
     /// `task close`, after the user confirmed on the card.
     Close,
+    /// Code sends a merged task its after-merge steps.
+    AfterSteps,
     /// Review task row: its verdict or crash was applied.
     Retire,
 }
@@ -721,6 +773,8 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
             (ReportState::Progress, s) if s.is_live() => go(s),
             (ReportState::Blocked, Running) => blocked(Block::new("reported blocked")),
             (ReportState::Failed, Running) => go(Failed),
+            // Its after-merge steps are not reviewed: the review judged the merged work.
+            (ReportState::Done, Running) if t.after_state == AfterState::Running => go(Ready),
             // Reviews are pinned to a commit: the approval of this exact commit still holds.
             (ReportState::Done, Running) if t.write && t.approval_covers_done() => go(Ready),
             (ReportState::Done, Running) if t.write => with(Reviewing, Effect::StartReview { uses_round: true }),
@@ -840,6 +894,11 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
             MergeResult::Failed(why) => blocked(Block::new(why.clone()).merge()),
         },
 
+        (Event::AfterSteps, Ready)
+            if t.landed == Some(Landed::Merged) && !t.after.is_empty() && t.after_state == AfterState::NotRun =>
+        {
+            go(Running)
+        }
         (Event::Send, Blocked | Failed | Stopped | Ready | Interrupted) => go(Running),
         (Event::Send, Reviewing) => stop_review(Running),
         (Event::Send, Running | WaitingYou | Merging | Queued) => go(from),
@@ -892,6 +951,7 @@ fn event_name(ev: &Event) -> &'static str {
         Event::Stop => "stop",
         Event::Restart => "a restart",
         Event::Close => "close",
+        Event::AfterSteps => "after-merge steps",
         Event::Retire => "retire",
     }
 }
@@ -1000,9 +1060,16 @@ impl Board {
                 t.question = None;
             }
         }
-        if n.to == State::Running {
+        // While its after-merge steps run, the work stays merged.
+        if ev == Event::AfterSteps {
+            t.after_state = AfterState::Running;
+        } else if n.to == State::Running && t.after_state != AfterState::Running {
             t.landed = None;
             t.accepted = false;
+            t.after_state = AfterState::NotRun;
+        }
+        if t.after_state == AfterState::Running && n.to == State::Ready {
+            t.after_state = AfterState::Done;
         }
         if ev == Event::Accept && n.from == State::Blocked && t.write {
             t.accepted = true;
@@ -1239,7 +1306,11 @@ impl Board {
                 cell(t.summary.as_deref().unwrap_or("")),
             ));
         }
-        if !self.merge_locks.is_empty() || !self.holds.is_empty() || self.last_check.is_some() {
+        let after = self
+            .tasks
+            .iter()
+            .any(|t| t.state != State::Archived && !t.after.is_empty());
+        if !self.merge_locks.is_empty() || !self.holds.is_empty() || self.last_check.is_some() || after {
             out.push('\n');
         }
         if let Some(c) = self.last_check {
@@ -1250,6 +1321,13 @@ impl Board {
         }
         for (repo, id) in &self.merge_locks {
             out.push_str(&format!("- Merge lock: {} held by {id}\n", repo.display()));
+        }
+        for t in self
+            .tasks
+            .iter()
+            .filter(|t| t.state != State::Archived && !t.after.is_empty())
+        {
+            out.push_str(&format!("- After merge, {}: {}\n", t.label, t.after.join("; ")));
         }
         for (provider, limit) in &self.holds {
             out.push_str(&format!("- On hold: {provider} ({})\n", limit.kind.label()));
@@ -1410,6 +1488,91 @@ mod tests {
 
     fn effects(t: &Task, ev: Event) -> Vec<Effect> {
         next(t, &ev, None).unwrap().effects
+    }
+
+    /// L10.9 item 2: after-merge steps (deploy) run once the merge landed; their `done`
+    /// needs no review and marks the row; a blocked step blocks as usual.
+    #[test]
+    fn after_steps_run_once_merged_and_their_done_needs_no_review() {
+        let mut t = row(Merging);
+        t.after = vec!["deploy to prod".into()];
+        let mut b = Board {
+            tasks: vec![t],
+            ..Default::default()
+        };
+        assert!(b.apply("T1", Event::AfterSteps).is_err(), "not before the merge landed");
+        b.apply("T1", Event::MergeReport(MergeResult::Merged)).unwrap();
+        assert_eq!(b.task("T1").unwrap().state_text(), "ready (merged)");
+        assert_eq!(b.apply("T1", Event::AfterSteps).unwrap().to, Running);
+        let t = b.task("T1").unwrap();
+        assert_eq!(t.landed, Some(Landed::Merged), "still merged while the steps run");
+        assert_eq!(t.state_text(), "running (merged, after steps)");
+        // A blocked step blocks; a send goes on with the steps, still merged.
+        b.apply("T1", report(ReportState::Blocked)).unwrap();
+        b.apply("T1", Event::Send).unwrap();
+        assert_eq!(b.task("T1").unwrap().landed, Some(Landed::Merged));
+        let n = b.apply("T1", report(ReportState::Done)).unwrap();
+        assert_eq!((n.to, n.effects), (Ready, vec![]), "no review of the after steps");
+        let t = b.task("T1").unwrap();
+        assert_eq!(t.state_text(), "ready (merged, after steps done)");
+        assert!(b.clone().apply("T1", Event::AfterSteps).is_err(), "they ran once");
+        // New work after them: unmerged again, and its done is reviewed.
+        b.apply("T1", Event::Send).unwrap();
+        let t = b.task("T1").unwrap();
+        assert_eq!((t.landed, t.after_state), (None, AfterState::NotRun));
+        assert!(matches!(
+            effects(t, report(ReportState::Done))[..],
+            [Effect::StartReview { .. }]
+        ));
+    }
+
+    /// An old board row has no `after`: the merge ends as before and nothing runs after it.
+    #[test]
+    fn an_old_row_without_after_steps_merges_as_before() {
+        let t: Task = serde_json::from_str(
+            r#"{"id":"T1","label":"T1-x","state":"merging","write":true,"repo":"/r","branch":"b"}"#,
+        )
+        .unwrap();
+        assert!(t.after.is_empty() && t.after_state == AfterState::NotRun);
+        let mut b = Board {
+            tasks: vec![t],
+            ..Default::default()
+        };
+        b.apply("T1", Event::MergeReport(MergeResult::Merged)).unwrap();
+        assert!(b.apply("T1", Event::AfterSteps).is_err());
+        assert_eq!(b.task("T1").unwrap().state_text(), "ready (merged)");
+        assert!(!b.render().contains("After merge") && !b.task("T1").unwrap().charter().contains("After merge"));
+        let json = serde_json::to_string(&b.tasks[0]).unwrap();
+        assert!(!json.contains("after"), "{json}");
+    }
+
+    #[test]
+    fn after_steps_show_in_the_charter_and_board_md_and_a_charter_limit_holds_them() {
+        let mut t = row(Ready);
+        t.after = vec!["deploy".into(), "check the live site".into()];
+        let c = t.charter();
+        assert!(
+            c.contains("After merge (run only once the merge lands; not judged by the review):\n1. deploy\n2. check the live site\n"),
+            "{c}"
+        );
+        let b = Board {
+            tasks: vec![t.clone()],
+            ..Default::default()
+        };
+        assert!(
+            b.render()
+                .contains("- After merge, T1-fix: deploy; check the live site"),
+            "{}",
+            b.render()
+        );
+        assert_eq!(t.after_limit(), None);
+        t.notes = vec!["user: use port 80".into(), "Stop before deploy, I'll do it".into()];
+        assert_eq!(t.after_limit(), Some("Stop before deploy, I'll do it"));
+        t.notes = vec!["don't deploy on Fridays".into()];
+        assert!(t.after_limit().is_some());
+        t.notes.clear();
+        t.scope = Some("src/ only; do not deploy".into());
+        assert!(t.after_limit().is_some());
     }
 
     use State::*;
