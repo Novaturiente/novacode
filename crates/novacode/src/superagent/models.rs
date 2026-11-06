@@ -38,9 +38,9 @@ const PRESETS: [(&str, [Preset; 3]); 3] = [
     (
         "antigravity",
         [
-            ("gemini-flash-lite", None),
             ("gemini-flash", Some("medium")),
             ("gemini-flash", Some("high")),
+            ("gemini", None), // Argon's catalog family.
         ],
     ),
 ];
@@ -220,7 +220,7 @@ impl Models {
         // Base id → its catalog entry and the ids offering it (itself or level variants).
         let mut bases: BTreeMap<String, (ModelInfo, Vec<String>)> = BTreeMap::new();
         for (id, info) in usable {
-            if let Some(info) = info.filter(|i| i.family.as_deref() == Some(family)) {
+            if let Some(info) = info.filter(|i| matches_family(provider, family, i)) {
                 bases
                     .entry(info.id.clone())
                     .or_insert_with(|| (info, vec![]))
@@ -259,7 +259,15 @@ impl Models {
         match PRESETS.iter().find(|(p, _)| *p == provider) {
             Some((_, tiers)) => {
                 let (family, level) = tiers[i];
-                self.newest(provider, family, level).map(|m| (m, None))
+                self.newest(provider, family, level)
+                    .or_else(|e| {
+                        if provider == "antigravity" && tier == "deep" {
+                            self.newest(provider, "gemini-flash", Some("high"))
+                        } else {
+                            Err(e)
+                        }
+                    })
+                    .map(|m| (m, None))
             }
             None => Ok((
                 own.to_string(),
@@ -311,14 +319,15 @@ impl Models {
         let Some((_, tiers)) = PRESETS.iter().find(|(x, _)| *x == p) else {
             return "standard";
         };
-        let family = info.and_then(|i| i.family);
         let level = level.map(|l| l.as_str().to_string()).or_else(|| {
             LEVELS
                 .iter()
                 .find(|l| id.ends_with(&format!("-{l}")))
                 .map(|l| l.to_string())
         });
-        let hits: Vec<usize> = (0..3).filter(|i| family.as_deref() == Some(tiers[*i].0)).collect();
+        let hits: Vec<usize> = (0..3)
+            .filter(|i| info.as_ref().is_some_and(|info| matches_family(p, tiers[*i].0, info)))
+            .collect();
         hits.iter()
             .find(|i| tiers[**i].1 == level.as_deref())
             .or(hits.first())
@@ -405,6 +414,14 @@ pub fn reviewer_tier(tier: Option<&str>) -> &'static str {
     }
 }
 
+/// Antigravity's deep preset requires Argon, not every model in the broad `gemini` family.
+fn matches_family(provider: &str, family: &str, info: &ModelInfo) -> bool {
+    info.family.as_deref() == Some(family)
+        && (provider != "antigravity"
+            || family != "gemini"
+            || (info.id.starts_with("gemini-") && strip_date(&info.id).ends_with("-argon")))
+}
+
 /// Newer first: release date, then not a `-latest` pointer, then undated, then the id.
 fn rank(i: &ModelInfo) -> (Option<String>, bool, bool, String) {
     (
@@ -439,6 +456,7 @@ pub(crate) mod tests {
         pub live: HashMap<String, Result<Vec<String>, String>>,
         pub fetches: Mutex<Vec<String>>,
         catalog: Catalog,
+        extra: Vec<ModelInfo>,
     }
 
     impl Fake {
@@ -449,6 +467,7 @@ pub(crate) mod tests {
                 live: HashMap::new(),
                 fetches: Mutex::default(),
                 catalog: Catalog::load(std::path::Path::new("/nonexistent"), None),
+                extra: vec![],
             }
         }
     }
@@ -462,7 +481,7 @@ pub(crate) mod tests {
                 "nowhere" => return None,
                 _ => return Some(vec![]),
             };
-            Some(self.catalog.models(id).cloned().collect())
+            Some(self.catalog.models(id).cloned().chain(self.extra.clone()).collect())
         }
         fn logged_in(&self, provider: &str) -> bool {
             self.logged.iter().any(|l| l == provider || l == "*")
@@ -573,20 +592,102 @@ pub(crate) mod tests {
         m.refresh("antigravity").await;
         assert_eq!(
             tier(&m, "antigravity", "quick").unwrap(),
-            "antigravity/gemini-3.5-flash-lite"
+            "antigravity/gemini-3.8-flash-medium"
         );
         assert_eq!(
             tier(&m, "antigravity", "standard").unwrap(),
-            "antigravity/gemini-3.8-flash-medium"
+            "antigravity/gemini-3.8-flash-high"
         );
         assert_eq!(
             tier(&m, "antigravity", "deep").unwrap(),
             "antigravity/gemini-3.8-flash-high"
         );
-        assert_eq!(m.tier_of("antigravity/gemini-3.8-flash-high"), "deep");
-        assert_eq!(m.tier_of("antigravity/gemini-3.8-flash-medium"), "standard");
+        assert_eq!(m.tier_of("antigravity/gemini-3.8-flash-high"), "standard");
+        assert_eq!(m.tier_of("antigravity/gemini-3.8-flash-medium"), "quick");
+        assert_eq!(m.tier_of("antigravity/gemini-3.8-flash:high"), "standard");
+        assert_eq!(m.tier_of("antigravity/gemini-3.8-flash:medium"), "quick");
+        assert_eq!(m.tier_of("antigravity/gemini-4-argon"), "deep");
         assert_eq!(m.tier_of("claude/claude-opus-5:high"), "deep");
         assert_eq!(m.tier_of("faux/script"), "standard");
+    }
+
+    #[tokio::test]
+    async fn antigravity_deep_excludes_other_gemini_family_members() {
+        for offered in [false, true] {
+            let mut f = Fake::new(&["antigravity"]);
+            let mut other = ModelInfo::unknown("gemini-5-other");
+            other.family = Some("gemini".into());
+            other.release = Some("2027-01-01".into());
+            f.extra.push(other);
+            let mut live = vec!["gemini-5-other".into(), "gemini-3.8-flash-high".into()];
+            if offered {
+                live.push("gemini-4-argon".into());
+            }
+            f.live.insert("antigravity".into(), Ok(live));
+            let m = models(f, Value::Null);
+            m.refresh("antigravity").await;
+            assert_eq!(m.tier_of("antigravity/gemini-5-other"), "standard");
+            assert_eq!(
+                tier(&m, "antigravity", "deep").unwrap(),
+                if offered {
+                    "antigravity/gemini-4-argon"
+                } else {
+                    "antigravity/gemini-3.8-flash-high"
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_argon_is_deep_only_when_usable() {
+        for denied in [false, true] {
+            let mut f = Fake::new(&["antigravity"]);
+            f.live.insert(
+                "antigravity".into(),
+                Ok(["gemini-4-argon", "gemini-3.8-flash"].map(String::from).to_vec()),
+            );
+            if denied {
+                f.deny.push("gemini-4-argon".into());
+            }
+            let m = models(f, Value::Null);
+            m.refresh("antigravity").await;
+            assert_eq!(
+                tier(&m, "antigravity", "quick").unwrap(),
+                "antigravity/gemini-3.8-flash:medium"
+            );
+            assert_eq!(
+                tier(&m, "antigravity", "standard").unwrap(),
+                "antigravity/gemini-3.8-flash:high"
+            );
+            assert_eq!(
+                tier(&m, "antigravity", "deep").unwrap(),
+                if denied {
+                    "antigravity/gemini-3.8-flash:high"
+                } else {
+                    "antigravity/gemini-4-argon"
+                }
+            );
+        }
+        let mut f = Fake::new(&["antigravity"]);
+        f.deny = vec!["gemini".into()];
+        assert!(tier(&models(f, Value::Null), "antigravity", "deep").is_err());
+        let m = models(Fake::new(&[]), Value::Null);
+        for t in TIERS {
+            assert_eq!(
+                tier(&m, "antigravity", t).unwrap_err(),
+                "`antigravity` is not logged in"
+            );
+        }
+        let m = models(
+            Fake::new(&[]),
+            serde_json::json!({
+                "deep": "faux/flat",
+                "antigravity": {"deep": "faux/per-provider"}
+            }),
+        );
+        assert_eq!(tier(&m, "antigravity", "deep").unwrap(), "faux/per-provider");
+        let m = models(Fake::new(&[]), serde_json::json!({"deep": "faux/flat"}));
+        assert_eq!(tier(&m, "antigravity", "deep").unwrap(), "faux/flat");
     }
 
     #[test]
@@ -624,7 +725,7 @@ pub(crate) mod tests {
         // claude held: the next one.
         let claude = |p: &str| p == "claude";
         let (_, model) = m.review("codex/gpt-6.1-sol", None, &claude, "x").unwrap();
-        assert_eq!(model, "antigravity/gemini-3.8-flash:high");
+        assert_eq!(model, "antigravity/gemini-4-argon");
         // No other usable provider: the task's own, top tier for a deep task.
         let m = models(Fake::new(&["claude"]), Value::Null);
         let (t, model) = m.review("claude/claude-opus-5-5", Some("deep"), &none, "x").unwrap();

@@ -171,15 +171,15 @@ The merge and close cards are made by novacode itself, not written by the super 
 
 The super agent picks a tier for each task: `quick`, `standard` or `deep`, weakest first. The tiers follow **the super agent's current provider**: switch the super agent with `/model` in its window, and new tasks run on the new provider.
 
-Each provider has a preset per tier, named by **model family**, not by a fixed model id:
+Each provider has a preset per tier, named by **model family**, not by a fixed model id. Gemini Argon uses the catalog family `gemini`, restricted to base IDs starting with `gemini-` and ending with `-argon`; other members of that family are not deep models:
 
 | Provider | `quick` | `standard` | `deep` |
 |---|---|---|---|
 | `claude` | `claude-haiku` | `claude-sonnet` | `claude-opus`, high |
 | `codex` | `gpt-luna` | `gpt-sol` | `gpt-astra`, high |
-| `antigravity` | `gemini-flash-lite` | `gemini-flash` medium | `gemini-flash` high |
+| `antigravity` | `gemini-flash` medium | `gemini-flash` high | Gemini Argon; else `gemini-flash` high |
 
-A family becomes its newest model (by its models.dev release date) that the provider's live model list offers, that is logged in and that `models.deny` doesn't block. The live list is fetched about once an hour; when it can't be fetched, the model catalog is used. Antigravity's ids carry the thinking level (`gemini-3.8-flash-high`), so `standard` and `deep` pick the `-medium` and `-high` variant.
+A family becomes its newest model (by its models.dev release date) that the provider's live model list offers, that is logged in and that `models.deny` doesn't block. The live list is fetched about once an hour; when it can't be fetched, the model catalog is used. Antigravity's ids can carry the thinking level (`gemini-3.8-flash-high`), so `quick` and `standard` pick the `-medium` and `-high` variants (or request that level on a plain id). `deep` uses Gemini Argon when usable in that list; otherwise it uses the newest usable Flash at high. Named Flash medium models classify as quick, Flash high as standard, and Argon as deep; a task explicitly assigned deep keeps that tier even when it uses the Flash fallback.
 
 The super agent's state block has a **Models** section: its provider, the model each tier is now, and the provider's usable models with their prices (USD per million tokens). The super agent may give a task another model from that list, or one you named; novacode refuses a model that doesn't exist, isn't logged in or is denied, and says why.
 
