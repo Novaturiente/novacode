@@ -1027,8 +1027,19 @@ impl Links {
             | Event::ProcessExit => changed,
             _ => false,
         };
+        // Finished work closes once super heard of it (L10.9); the result rides on its next wake.
+        let closes = wakes && changed && super::task::finished(&t);
+        if closes {
+            extra += &format!(
+                "\nIts work is finished: code closes {} now (no card); your next wake says how it went.",
+                t.label
+            );
+        }
         if wakes {
             self.inform.wake(format!("{}{extra}", wake_text(&t, &ev)));
+            if closes {
+                self.auto_close(id);
+            }
         } else if let Event::ReviewCrashed(why) = &ev {
             self.inform
                 .note(format!("{}'s review task crashed ({why}); one retry.{extra}", t.label));
@@ -1330,6 +1341,18 @@ Address every finding, commit, re-run your checks and report `done` again.",
             match sup.row(&id).is_ok_and(|t| t.after_state == board::AfterState::Running) {
                 true => me.inform.note(out),
                 false => me.inform.wake(out),
+            }
+        });
+    }
+
+    /// `id` is finished: code closes it off the inbox loop and tells super with its next wake.
+    fn auto_close(&self, id: &str) {
+        let Some(sup) = self.sup.upgrade() else { return };
+        let (me, id) = (self.me.clone(), id.to_string());
+        tokio::spawn(async move {
+            let Some(out) = sup.auto_close(&id).await else { return };
+            if let Some(me) = me.upgrade() {
+                me.inform.note(out);
             }
         });
     }
@@ -1704,8 +1727,7 @@ fn wake_text(t: &board::Task, ev: &Event) -> String {
                 );
             }
             if *state == ReportState::Done && t.state == State::Ready && t.after_state == board::AfterState::Done {
-                s += "\nIts after-merge steps are done (no review runs for them). If the user already said to close \
-it after the merge, call `task close` now (its card is the confirmation); otherwise offer to close it.";
+                s += "\nIts after-merge steps are done (no review runs for them).";
             }
             if t.state == State::Reviewing && t.reviewer.is_none() {
                 s += "\nNo review runs for a read task: judge its answer now, with `task accept` or `task review`; \
@@ -1716,16 +1738,11 @@ nothing else will wake you about it.";
         Event::MergeReport(m) => match m {
             MergeResult::Merged if !t.after.is_empty() => format!(
                 "{} merged (now {}). Its after steps follow: code sends them to it now, or asks the user on a card \
-first when its charter holds them back. Wait for its `done` on them before offering to close it.",
+first when its charter holds them back. Code closes it once its `done` on them arrives.",
                 t.label,
                 t.state.name()
             ),
-            MergeResult::Merged => format!(
-                "{} merged (now {}). If the user already said to close it after the merge, call `task close` now (its \
-card is the confirmation); otherwise offer to close it.",
-                t.label,
-                t.state.name()
-            ),
+            MergeResult::Merged => format!("{} merged (now {}).", t.label, t.state.name()),
             MergeResult::PrOpened => format!("{} opened a pull request (now {}).", t.label, t.state.name()),
             MergeResult::Failed(why) => format!("{} merge failed (now {}): {why}", t.label, t.state.name()),
         },
@@ -1757,6 +1774,10 @@ card is the confirmation); otherwise offer to close it.",
             t.label,
             t.state.name()
         ),
+        // A read task: finished, so code closes it (L10.9) and no second review follows.
+        Event::Verdict(board::Verdict::Approved) if super::task::finished(t) => {
+            format!("{}'s review approved it (now {}).", t.label, t.state.name())
+        }
         Event::Verdict(board::Verdict::Approved) => {
             let mut s = format!(
                 "{}'s review approved it (now {}). If its findings or checks don't support the approval, ask for a \
@@ -3578,7 +3599,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merge_reports_release_the_lock_and_a_merged_task_gets_the_close_offer() {
+    async fn merge_reports_release_the_lock_and_a_merged_task_closes_itself() {
         let fx = fixture(5);
         let (a, b) = (fx.sup.root.join("a"), fx.sup.root.join("b"));
         fx.merging_branch("T1-x", &a);
@@ -3593,10 +3614,35 @@ mod tests {
         );
         write_report(&fx, "T2-y", 1, "tok", json!({"merge": "pr-opened", "summary": "#12"}));
         fx.links.kick();
-        fx.until("both ready", |fx| {
-            fx.state("T1-x") == State::Ready && fx.state("T2-y") == State::Ready
+        // L10.9: a landed merge without after steps closes the task; a PR only opened doesn't.
+        fx.until("T1 closed, T2 ready", |fx| {
+            fx.state("T1-x") == State::Archived && fx.state("T2-y") == State::Ready
         })
         .await;
+        // Told to shut down; its process ends (the close waits for that before removing a worktree).
+        fx.until("shutdown sent", |fx| {
+            fx.launcher
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(s, c)| s == "s-T1-x" && matches!(c, ClientCmd::Shutdown))
+        })
+        .await;
+        fx.launcher.alive.lock().unwrap().remove("s-T1-x");
+        fx.until("closed note", |fx| {
+            fx.said()
+                .iter()
+                .any(|l| l.starts_with("note:") && l.contains("Code closed T1-x"))
+        })
+        .await;
+        let sent = fx.launcher.sent.lock().unwrap().clone();
+        assert!(
+            !sent
+                .iter()
+                .any(|(s, c)| s == "s-T2-y" && matches!(c, ClientCmd::Shutdown)),
+            "{sent:?}"
+        );
         assert_eq!(fx.locks(), 0);
         assert_eq!(
             git_head(&a, "HEAD"),
@@ -3610,11 +3656,13 @@ mod tests {
         assert!(
             wakes
                 .iter()
-                .any(|w| w.contains("T1-x merged") && w.contains("task close")),
+                .any(|w| w.contains("T1-x merged") && w.contains("code closes T1-x") && !w.contains("task close")),
             "{wakes:?}"
         );
         assert!(
-            wakes.iter().any(|w| w.contains("T2-y opened a pull request")),
+            wakes
+                .iter()
+                .any(|w| w.contains("T2-y opened a pull request") && !w.contains("code closes")),
             "{wakes:?}"
         );
     }
@@ -3655,15 +3703,17 @@ mod tests {
             json!({"state": "done", "summary": "deployed", "write": true, "checks": []}),
         );
         fx.links.kick();
-        fx.until("ready", |fx| fx.state("T1-x") == State::Ready).await;
+        // L10.9: merged and its after steps done: code closes it.
+        fx.until("closed", |fx| fx.state("T1-x") == State::Archived).await;
         let t = fx.sup.row("T1-x").unwrap();
-        assert_eq!(t.state_text(), "ready (merged, after steps done)");
+        assert_eq!(t.after_state, board::AfterState::Done);
         assert!(t.reviewer.is_none());
         let wakes: Vec<_> = fx.said().into_iter().filter(|l| l.starts_with("wake:")).collect();
         assert!(
-            wakes.iter().any(|w| w.contains("T1-x reported done")
+            wakes.iter().any(|w| w.contains("T1-x reported done (now ready)")
                 && w.contains("after-merge steps are done")
-                && w.contains("task close")),
+                && w.contains("code closes T1-x")
+                && !w.contains("task close")),
             "{wakes:?}"
         );
     }

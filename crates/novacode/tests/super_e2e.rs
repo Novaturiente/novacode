@@ -2,8 +2,8 @@
 //! model: super spawns a write task in a git repo; the task asks a question (relayed to
 //! super's window with its label), edits, commits and reports `done` citing its proof
 //! number; code starts its review task, which approves; super merges after the user's OK
-//! on the merge card, the task rebases and reports, code fast-forwards main, and super closes
-//! it after the close card.
+//! on the merge card, the task rebases and reports, code fast-forwards main, and code closes
+//! the merged task without a card.
 //!
 //! Each step that could race another waits for super to go idle: the user's answer to the
 //! relayed card and two gate files the scripted commands wait for are given only after
@@ -362,9 +362,8 @@ fn super_runs_a_write_task_through_review_merge_and_close() {
         // Wake: the review approved it.
         .chain([tool("task", json!({"action": "merge", "task": label}))])
         .chain(tell("merging"))
-        // Wake: T1 merged; close it.
-        .chain([tool("task", json!({"action": "close", "task": label}))])
-        .chain(tell("closed"))
+        // Wake: T1 merged; code closes it (L10.9).
+        .chain(tell("merged"))
         .collect::<Vec<_>>(),
     );
     let ask = json!({"questions": [{"question": "Which file name?", "options": [{"label": "note.txt"}, {"label": "other"}]}]});
@@ -439,7 +438,7 @@ fn super_runs_a_write_task_through_review_merge_and_close() {
     );
 
     // Super's turns, in order: the spawn, the wake on T1's done, the wake on the
-    // approval (merge), the wake on the merge (close).
+    // approval (merge), the wake on the merge (code closes the task).
     let mut ends = 0;
     let mut relayed: Option<Value> = None;
     let mut cards = Vec::new();
@@ -493,15 +492,19 @@ fn super_runs_a_write_task_through_review_merge_and_close() {
         "{cards:?}"
     );
     assert!(said.contains(&format!("{label} is merging")), "{said}");
-    assert!(said.contains(&format!("Closed {label}")), "{said}");
+    assert!(!cards.iter().any(|c| c.contains(": close")), "no close card: {cards:?}");
     // Super's messages are framed by code: the trigger of each run and the task's status.
     assert!(said.contains("\"trigger\":\"reply to you\""), "{said}");
     assert!(
         said.contains(&format!("\"trigger\":\"after {label} reported done\"")),
         "{said}"
     );
-    let t = task(&home, label);
-    assert_eq!(t["state"], "archived", "{t}");
+    // Code closes the merged task right after that wake.
+    let closed = Instant::now() + Duration::from_secs(30);
+    while task(&home, label)["state"] != "archived" || app.join(".worktrees").join(label).exists() {
+        assert!(Instant::now() < closed, "not closed: {}", board(&home));
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let rv = task(&home, review);
     assert_eq!(rv["state"], "archived", "{rv}");
     assert_eq!(rv["reviewer_of"], label, "{rv}");

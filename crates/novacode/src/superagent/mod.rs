@@ -74,8 +74,11 @@ the same turn as the merge.
 and `task close` open their own confirmation cards, and those cards are the confirmation: never ask in text first. \
 Never use `ask_user` to confirm a merge or a close (not \"Merge them now?\", not \"Close T1?\"): the user would \
 confirm twice. When the user asked for it, or to offer it, call `task merge` / `task close` directly; the user \
-answers on its card. `ask_user` is for real choices only (which option, which approach, missing facts). \
-When the user said to close a task after its merge, call `task close` as soon as the merge result arrives.
+answers on its card. `ask_user` is for real choices only (which option, which approach, missing facts).
+- Code closes finished tasks itself, without a card: a read task once it is ready (you saw its answer), a write \
+task once its merge landed and its after steps are done. Never offer to close those. When you spawn a successor \
+to a task (a retry, a recovery), pass `replaces: <task>`: code closes the old one. Close any other task you judge \
+finished with `task close` (its card is the confirmation).
 - Act only on the user's requests.
 - Read-only investigation needs no question card: spawn the scout or read task and report what it found.
 - Don't ask a task again for facts code already checked: a report's checks, commit and changed files and the \
@@ -99,7 +102,8 @@ short points (at most 8, each at most 25 words: where the change goes and its li
 section of the state block. When all are fine, answer exactly `OK` and nothing else (code hides that turn from the \
 user). On a problem (no events for long, one tool running far too long, an error streak, the same call repeated, a \
 card unanswered for long, no progress for long): first ask the task with `task send` and `question: true`. Then you \
-may, without asking the user, send it instructions, stop it, resume it, or start a replacement task. Never merge, \
+may, without asking the user, send it instructions, stop it, resume it, or start a replacement task (with \
+`replaces`). Never merge, \
 close, change scope or delete without the user's card. Always tell the user what you found and what you did. At the \
 slightest doubt about what is wrong or what to do, ask the user with a `say` question before acting.";
 
@@ -308,6 +312,10 @@ mod tests {
         assert!(PROMPT.contains("Never use `ask_user` to confirm a merge or a close"));
         assert!(PROMPT.contains("Use `pr: true` only when the user asked for a pull request"));
         assert!(PROMPT.contains("`ask_user` is for real choices only"));
+        // L10.9: code closes finished tasks; super names a successor's predecessor.
+        assert!(PROMPT.contains("Code closes finished tasks itself, without a card"));
+        assert!(PROMPT.contains("pass `replaces: <task>`"));
+        assert!(!PROMPT.contains("as soon as the merge result arrives"));
     }
 
     #[test]
