@@ -2,6 +2,17 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.8.2] - 2026-11-06
+
+### Changed
+
+- **Super messages group content by task subtitle**, with unrelated information under General. Questions require structured context explaining the request, verified result, blockers, impact, why input is needed, recommendation and decision. Choices distinguish planning from execution. Previously saved messages remain readable.
+- **Antigravity tiers:** quick uses Flash medium, standard uses Flash high, and deep uses Argon when available and allowed, otherwise Flash high. Explicit overrides still take precedence.
+
+### Fixed
+
+- **Long question choices remain readable** through the scrolling viewport. Number shortcuts cannot immediately submit a choice whose full text is not visible.
+
 ## [0.8.1] - 2026-11-06
 
 ### Added
