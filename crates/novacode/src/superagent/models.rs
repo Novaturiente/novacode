@@ -1,7 +1,7 @@
 //! Worker models (L10.9 "Models"): each tier is a model **family** per provider, resolved
 //! to the newest model of that family (models.dev `release_date`) that the provider offers,
-//! is logged in and not denied. Workers follow super's current provider; reviews run on
-//! another provider when one is usable.
+//! is logged in and not denied. Workers follow super's current provider; reviews use
+//! super's exact current model and thinking level.
 
 use futures_util::future::BoxFuture;
 use novacode_ai::catalog::{ModelInfo, strip_date};
@@ -100,7 +100,7 @@ impl Source for Real {
 }
 
 /// `super.tiers`: `<provider>.<tier>` overrides, and the old flat `<tier>` form, which
-/// overrides that tier on every provider (`review`: reviews of deep and named-model tasks).
+/// overrides that tier on every provider. Legacy `review` entries are parsed but unused.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Overrides {
     flat: BTreeMap<String, String>,
@@ -279,34 +279,11 @@ impl Models {
         }
     }
 
-    /// A review's tier and model: one tier above the task (`deep` at most), on another
-    /// logged-in provider that `held` doesn't hold, else on the task's own provider. The old
-    /// `super.tiers.review` still reviews deep and named-model tasks.
-    pub fn review(
-        &self,
-        task_model: &str,
-        task_tier: Option<&str>,
-        held: &dyn Fn(&str) -> bool,
-        own: &str,
-    ) -> Result<(String, String), String> {
-        let tier = reviewer_tier(task_tier);
-        if tier == "deep"
-            && !matches!(task_tier, Some("standard"))
-            && let Some(m) = self.overrides.flat.get("review")
-        {
-            return Ok(("review".into(), m.clone()));
-        }
-        let from = provider(task_model);
-        for (p, _) in PRESETS {
-            if p != from
-                && self.source.logged_in(p)
-                && !held(p)
-                && let Ok((m, _)) = self.resolve(p, tier, own)
-            {
-                return Ok((tier.into(), m));
-            }
-        }
-        self.resolve(from, tier, own).map(|(m, _)| (tier.into(), m))
+    /// Reviews use super's exact current model and thinking, never worker tier overrides.
+    /// Keep the same login and deny checks as named worker models.
+    pub fn review(&self, own: &str) -> Result<String, String> {
+        self.allowed(own)?;
+        Ok(own.to_string())
     }
 
     /// The tier a model is on: by its family in its provider's presets, else `standard`.
@@ -403,14 +380,6 @@ impl Models {
         }
         s.push('\n');
         s
-    }
-}
-
-/// The reviewer's tier: one above the task, `deep` at most (also for named models).
-pub fn reviewer_tier(tier: Option<&str>) -> &'static str {
-    match tier {
-        Some("quick") => "standard",
-        _ => "deep",
     }
 }
 
@@ -715,30 +684,37 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn reviews_run_one_tier_above_on_another_usable_provider() {
-        let m = models(Fake::new(&["claude", "codex", "antigravity"]), Value::Null);
-        let none = |_: &str| false;
-        let (t, model) = m.review("claude/claude-haiku-5-5", Some("quick"), &none, "x").unwrap();
-        assert_eq!((t.as_str(), model.as_str()), ("standard", "codex/gpt-6.1-sol"));
-        let (t, model) = m.review("codex/gpt-6.1-sol", Some("standard"), &none, "x").unwrap();
-        assert_eq!((t.as_str(), model.as_str()), ("deep", "claude/claude-opus-5-5:high"));
-        // claude held: the next one.
-        let claude = |p: &str| p == "claude";
-        let (_, model) = m.review("codex/gpt-6.1-sol", None, &claude, "x").unwrap();
-        assert_eq!(model, "antigravity/gemini-4-argon");
-        // No other usable provider: the task's own, top tier for a deep task.
-        let m = models(Fake::new(&["claude"]), Value::Null);
-        let (t, model) = m.review("claude/claude-opus-5-5", Some("deep"), &none, "x").unwrap();
-        assert_eq!((t.as_str(), model.as_str()), ("deep", "claude/claude-opus-5-5:high"));
-        let m = models(Fake::new(&["claude", "codex"]), Value::Null);
-        let codex = |p: &str| p == "codex";
-        let (_, model) = m
-            .review("claude/claude-sonnet-5-5", Some("standard"), &codex, "x")
-            .unwrap();
-        assert_eq!(model, "claude/claude-opus-5-5:high");
-        // The old flat `review` entry still reviews deep and named-model tasks.
-        let (t, model) = flat().review("faux/deep", Some("deep"), &none, "x").unwrap();
-        assert_eq!((t.as_str(), model.as_str()), ("review", "faux/review"));
+    fn reviews_follow_exact_current_model_and_ignore_worker_overrides() {
+        let m = models(
+            Fake::new(&["claude"]),
+            serde_json::json!({
+                "review": "codex/gpt-6-astra:high",
+                "deep": "codex/gpt-6-astra:high",
+                "claude": {"deep": "codex/gpt-6-astra:high"}
+            }),
+        );
+        for own in [
+            "claude/claude-sonnet-5:low",
+            "claude/claude-opus-5:medium",
+            "claude/claude-opus-5:off",
+        ] {
+            let model = m.review(own).unwrap();
+            assert_eq!(model, own);
+        }
+    }
+
+    #[test]
+    fn reviews_keep_auth_and_deny_validation_without_fallback() {
+        let mut f = Fake::new(&["claude"]);
+        f.deny.push("claude-opus".into());
+        let m = models(f, Value::Null);
+        assert!(
+            m.review("claude/claude-opus-5:high")
+                .unwrap_err()
+                .contains("models.deny")
+        );
+        assert!(m.review("codex/gpt-6.1-sol:low").unwrap_err().contains("not logged in"));
+        assert!(m.review("nowhere/model:off").unwrap_err().contains("unknown provider"));
     }
 
     #[tokio::test]

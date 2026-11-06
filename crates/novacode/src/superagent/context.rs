@@ -9,7 +9,7 @@ use novacode_core::context_window;
 use novacode_core::memory::Worker;
 use novacode_core::session::Store;
 use novacode_tools::{Tool, ToolCtx, ToolOutput};
-use novacode_types::{AgentEvent, Block, Message, StreamEvent};
+use novacode_types::{AgentEvent, Block, Message, StreamEvent, ThinkingLevel};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,8 +20,8 @@ pub const CHAT_BUDGET: u64 = 6000;
 /// Chars a history search returns.
 const HISTORY_CHARS: usize = 2000;
 
-/// Super's Models section, from the session's current (provider, model).
-pub type ModelsFn = Arc<dyn Fn(Option<(String, String)>) -> String + Send + Sync>;
+/// Super's Models section, from the session's current (provider, model) and thinking.
+pub type ModelsFn = Arc<dyn Fn(Option<(String, String)>, Option<ThinkingLevel>) -> String + Send + Sync>;
 
 /// Super's context builder: the board at `<dir>/board.json` and the session's open todo
 /// items as the state block, then the newest chat in [`CHAT_BUDGET`]. A health check
@@ -54,7 +54,7 @@ pub fn builder(
                 Ok(b) => b.state_block(&open),
                 Err(e) => format!("The board couldn't be read ({e}); call `task list`.\n"),
             };
-            block += &models(store.last_model());
+            block += &models(store.last_model(), store.last_thinking());
             *shown.lock().unwrap() = block.clone();
             block
         }),
@@ -454,8 +454,18 @@ mod tests {
                 model: "gpt-6.1-sol".into(),
             })
             .unwrap();
-        let models =
-            Arc::new(|last: Option<(String, String)>| format!("\n## Models\nYour provider: {}.\n", last.unwrap().0));
+        let models = Arc::new(|last: Option<(String, String)>, thinking: Option<ThinkingLevel>| {
+            format!(
+                "\n## Models\nYour provider: {}. Thinking: {}.\n",
+                last.unwrap().0,
+                thinking.unwrap().as_str()
+            )
+        });
+        store
+            .append(novacode_core::session::EntryKind::ThinkingChange {
+                level: ThinkingLevel::Low,
+            })
+            .unwrap();
         let b = builder(
             home.path().join("super"),
             Arc::new(|| {}),
@@ -465,7 +475,20 @@ mod tests {
         );
         let block = (b.state)(&store);
         assert!(block.contains("## Board"), "{block}");
-        assert!(block.ends_with("## Models\nYour provider: codex.\n"), "{block}");
+        assert!(
+            block.ends_with("## Models\nYour provider: codex. Thinking: low.\n"),
+            "{block}"
+        );
+        store
+            .append(novacode_core::session::EntryKind::ThinkingChange {
+                level: ThinkingLevel::High,
+            })
+            .unwrap();
+        let block = (b.state)(&store);
+        assert!(
+            block.ends_with("## Models\nYour provider: codex. Thinking: high.\n"),
+            "{block}"
+        );
     }
 
     #[test]

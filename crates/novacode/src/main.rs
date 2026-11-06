@@ -1581,6 +1581,7 @@ impl Ctx {
                 max_running: superagent::max_running(s),
                 models: Arc::new(superagent::models::Models::real(self.providers.clone(), s)),
                 model: route.spec(),
+                thinking: cfg.thinking,
                 worktree_copy: worktree_copy(s),
                 home: home.to_path_buf(),
                 watch: superagent::watch(s),
@@ -1607,6 +1608,7 @@ impl Ctx {
             }
             // Task links (L10.9): relay, code-made reports, inbox, wakes.
             if let Some(slot) = slot.clone() {
+                let _ = sup.hub.set(slot.clone());
                 let inform = Arc::new(superagent::link::HubInform {
                     slot: slot.clone(),
                     desktop: s.get("notifications.enabled").unwrap_or(true),
@@ -2005,12 +2007,12 @@ impl Ctx {
                 });
                 // The Models section follows super's current model (`/model` in its window).
                 let sup = super_ref.clone();
-                let models = Arc::new(move |last: Option<(String, String)>| {
+                let models = Arc::new(move |last: Option<(String, String)>, thinking: Option<ThinkingLevel>| {
                     let Some(s) = sup.as_ref().and_then(std::sync::Weak::upgrade) else {
                         return String::new();
                     };
-                    if let Some((p, m)) = last {
-                        s.set_model(format!("{p}/{m}"));
+                    if let (Some((p, m)), Some(thinking)) = (last, thinking) {
+                        s.set_current_model(format!("{p}/{m}"), thinking);
                     }
                     s.models_section()
                 });

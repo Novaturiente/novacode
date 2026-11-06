@@ -765,6 +765,18 @@ pub fn next(t: &Task, ev: &Event, lock_holder: Option<&str>) -> Result<Next, Str
         (Event::Review, Reviewing) if !t.write && !reviewing => {
             with(Reviewing, Effect::StartReview { uses_round: true })
         }
+        // The stable code-written prefix also recognizes review failures on existing boards.
+        // Retry the same evidence and round, but resolve a fresh reviewer in the caller.
+        (Event::Review, Blocked)
+            if t.done.is_some() && block_is(|b| !b.merge && b.reason.starts_with("its review can't start:")) =>
+        {
+            with(
+                Reviewing,
+                Effect::StartReview {
+                    uses_round: !t.review_free,
+                },
+            )
+        }
         // A write task that keeps ending without a report: the caller records its commits first (R23);
         // a head already approved needs no new review (R27).
         (Event::Review, Blocked) if t.write && block_is(|b| b.code_made) && t.approval_covers_done() => go(Ready),
@@ -1921,6 +1933,36 @@ mod tests {
             e,
             "T1-fix is not running (blocked): `task close` ends it, `task send` gives it more work"
         );
+    }
+
+    #[test]
+    fn explicit_review_retry_keeps_evidence_and_round_policy_on_existing_boards() {
+        for free in [false, true] {
+            let task = Task {
+                state: Blocked,
+                block: Some(Block::new("its review can't start: provider is not logged in")),
+                done: Some(Done {
+                    commit: Some("pinned".into()),
+                    ..Done::default()
+                }),
+                review_free: free,
+                review_rounds: 1,
+                ..row(Reviewing)
+            };
+            // Persisted rows predate this policy; no new marker is required to retry them.
+            let task: Task = serde_json::from_value(serde_json::to_value(task).unwrap()).unwrap();
+            let done = task.done.clone();
+            let mut board = Board {
+                tasks: vec![task],
+                ..Board::default()
+            };
+            let n = board.apply("T1", Event::Review).unwrap();
+            assert_eq!(n.effects, vec![Effect::StartReview { uses_round: !free }]);
+            let task = board.task("T1").unwrap();
+            assert_eq!(task.state, Reviewing);
+            assert_eq!(task.done, done);
+            assert_eq!((task.review_free, task.review_rounds), (free, 1));
+        }
     }
 
     #[test]

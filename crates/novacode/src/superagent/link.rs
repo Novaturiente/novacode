@@ -2755,6 +2755,7 @@ mod tests {
             max_running,
             models: Arc::new(super::super::models::tests::flat()),
             model: "faux/script".into(),
+            thinking: novacode_types::ThinkingLevel::Medium,
             worktree_copy: vec![],
             home: home.clone(),
             watch,

@@ -12,7 +12,7 @@ use futures_util::future::BoxFuture;
 use novacode_base::paths::Paths;
 use novacode_tools::ask::Asker;
 use novacode_tools::{Tool, ToolCtx, ToolOutput};
-use novacode_types::{Choice, Question};
+use novacode_types::{Choice, Question, ThinkingLevel};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -25,6 +25,7 @@ pub struct Config {
     pub models: Arc<super::models::Models>,
     /// Super's own model at start (`provider/model`); `/model` in its window changes it.
     pub model: String,
+    pub thinking: ThinkingLevel,
     /// `worktree.copy`.
     pub worktree_copy: Vec<String>,
     /// novacode's home: `trust.json` and the session files.
@@ -83,7 +84,9 @@ pub struct Super {
     /// The helper model: summarises a charter's oldest notes over the cap (L10.9).
     pub helper: std::sync::OnceLock<novacode_core::memory::Worker>,
     /// Super's current model (`provider/model`): tasks get tiers of its provider.
-    current: Mutex<String>,
+    current: Mutex<(String, ThinkingLevel)>,
+    /// Live session state, including idle model and thinking changes.
+    pub hub: std::sync::OnceLock<crate::hub::HubSlot>,
 }
 
 /// What a tool result adds when its prompt was held.
@@ -313,7 +316,8 @@ impl Super {
             root: novacode_base::platform::canonicalize(root)?,
             board: Mutex::new(board),
             dir,
-            current: Mutex::new(cfg.model.clone()),
+            current: Mutex::new((cfg.model.clone(), cfg.thinking)),
+            hub: std::sync::OnceLock::new(),
             cfg,
             asker,
             launcher,
@@ -332,14 +336,33 @@ impl Super {
         &self.cfg
     }
 
-    /// Super's current model (`provider/model`).
-    pub fn current_model(&self) -> String {
+    fn current_state(&self) -> (String, ThinkingLevel) {
+        if let Some(hub) = self
+            .hub
+            .get()
+            .and_then(|slot| slot.0.get())
+            .and_then(std::sync::Weak::upgrade)
+        {
+            let state = hub.state();
+            return (state.model, state.level);
+        }
         self.current.lock().unwrap().clone()
     }
 
-    /// Super's session moved to `spec` (`/model` in its window).
-    pub fn set_model(&self, spec: String) {
-        *self.current.lock().unwrap() = spec;
+    /// Super's current model (`provider/model`).
+    pub fn current_model(&self) -> String {
+        self.current_state().0
+    }
+
+    /// Reviews follow the exact live model and thinking, not worker tiers.
+    pub fn current_review_model(&self) -> String {
+        let (model, thinking) = self.current_state();
+        format!("{}:{}", novacode_ai::connect::split_level(&model).0, thinking.as_str())
+    }
+
+    /// Update the fallback before the live hub is available.
+    pub fn set_current_model(&self, spec: String, thinking: ThinkingLevel) {
+        *self.current.lock().unwrap() = (spec, thinking);
     }
 
     /// The state block's Models section; refreshes stale live lists in the background.
@@ -424,7 +447,9 @@ impl Super {
             "review" => {
                 self.check(&t.id, Event::Review)?;
                 // A code-made block (R23): no report, so code takes the facts from its commits.
-                let unreported = (t.state == State::Blocked).then(|| commits_done(&t)).transpose()?;
+                let unreported = (t.state == State::Blocked && t.block.as_ref().is_some_and(|b| b.code_made))
+                    .then(|| commits_done(&t))
+                    .transpose()?;
                 // Recorded first: an approved head goes to `ready` without a review (R27).
                 let n = self.edit(|b| {
                     let row = b.tasks.iter_mut().find(|r| r.id == t.id).ok_or("no task")?;
@@ -2327,10 +2352,94 @@ pub(super) mod tests {
             max_running,
             models: Arc::new(super::super::models::tests::flat()),
             model: "faux/script".into(),
+            thinking: ThinkingLevel::Medium,
             worktree_copy: vec!["AGENTS.md".into(), ".codegraph".into()],
             home: home.to_path_buf(),
             watch: Default::default(),
         }
+    }
+
+    #[test]
+    fn review_model_tracks_thinking_without_changing_worker_model() {
+        let fx = fixture(5, &[]);
+        assert_eq!(fx.sup.current_review_model(), "faux/script:medium");
+        fx.sup.set_current_model("faux/script:high".into(), ThinkingLevel::Low);
+        assert_eq!(fx.sup.current_review_model(), "faux/script:low");
+        fx.sup.set_current_model("faux/script".into(), ThinkingLevel::Off);
+        assert_eq!(fx.sup.current_review_model(), "faux/script:off");
+        assert_eq!(fx.sup.current_model(), "faux/script");
+        let slot = crate::hub::HubSlot::default();
+        assert!(fx.sup.hub.set(slot).is_ok());
+        assert_eq!(
+            fx.sup.current_review_model(),
+            "faux/script:off",
+            "an unset hub uses tracked state"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_model_tracks_live_hub_changes_despite_stale_fallback() {
+        let fx = fixture(5, &[]);
+        let cfg = novacode_core::agent::Config {
+            cwd: fx.root.clone(),
+            provider: "faux".into(),
+            model: "live".into(),
+            max_tokens: 1000,
+            cache: novacode_ai::adapter::CacheRetention::Short,
+            window_tokens: 200_000,
+            images: true,
+            reasoning: true,
+            thinking: ThinkingLevel::Low,
+            spill_dir: fx.home.join("spill"),
+            redactor: Default::default(),
+            prompt: novacode_core::prompt::Sources {
+                cwd: fx.root.clone(),
+                home: fx.home.clone(),
+                context_files: false,
+                skill_dirs: vec![],
+                tool_guidelines: vec![],
+                agent: None,
+                memory_index: None,
+                mode: None,
+            },
+            warm: false,
+            metrics: false,
+        };
+        let store = novacode_core::session::Store::create(&Paths::new(&fx.home), &fx.root, true);
+        let agent = novacode_core::agent::Agent::new(
+            Arc::new(novacode_ai::faux::Faux::new([])),
+            vec![],
+            store,
+            cfg,
+            Arc::new(novacode_tools::LocalEnv),
+        );
+        let (handle, task) = novacode_core::agent::spawn(agent);
+        let hub = crate::hub::Hub::start(
+            handle,
+            vec![],
+            crate::wire::State {
+                model: "faux/live".into(),
+                level: ThinkingLevel::Low,
+                ..Default::default()
+            },
+            None,
+        );
+        let slot = crate::hub::HubSlot::default();
+        slot.set(&hub);
+        assert!(fx.sup.hub.set(slot).is_ok());
+        assert_eq!(fx.sup.current_review_model(), "faux/live:low");
+
+        hub.update(false, |state| state.level = ThinkingLevel::High);
+        assert_eq!(fx.sup.current_review_model(), "faux/live:high");
+        hub.update(false, |state| state.model = "other/switched".into());
+        assert_eq!(fx.sup.current_review_model(), "other/switched:high");
+        assert_eq!(fx.sup.current_model(), "other/switched");
+        assert_eq!(
+            *fx.sup.current.lock().unwrap(),
+            ("faux/script".into(), ThinkingLevel::Medium),
+            "the fallback remains stale throughout the idle hub changes"
+        );
+        task.abort();
     }
 
     fn sh(dir: &Path, args: &[&str]) {
@@ -2686,7 +2795,8 @@ pub(super) mod tests {
         let out = run(&fx, a).await.unwrap();
         assert!(out.contains("claude/claude-haiku-5-5"), "{out}");
         // `/model` in super's window moved super to codex.
-        fx.sup.set_model("codex/gpt-6.1-sol".into());
+        fx.sup
+            .set_current_model("codex/gpt-6.1-sol".into(), ThinkingLevel::Medium);
         let mut a = spawn_args("p", "b", false);
         a["tier"] = json!("deep");
         run(&fx, a).await.unwrap();
@@ -3606,6 +3716,7 @@ pub(super) mod tests {
             max_running: 5,
             models: fx.sup.cfg.models.clone(),
             model: "faux/script".into(),
+            thinking: ThinkingLevel::Medium,
             worktree_copy: Vec::new(),
             home: fx.home.clone(),
             watch: Default::default(),

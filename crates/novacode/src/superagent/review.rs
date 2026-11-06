@@ -1,5 +1,5 @@
 //! Review tasks (L10.9 "Review"): every write task's `done` is judged by a review task
-//! on a stronger tier, in its own scratch worktree of the reported commit.
+//! on super's current model and thinking, in its own scratch worktree of the reported commit.
 //!
 //! - **Input:** reasoning-free. The review brief holds the user's request, the criteria,
 //!   the scope, the base, the pinned commit, the changed files and the recorded checks;
@@ -406,18 +406,13 @@ pub(super) fn remove_scratch(repo: Option<&Path>, scratch: &Path) {
 
 impl Super {
     /// Queue a review of `id`, which just moved to `reviewing` with `Effect::StartReview`:
-    /// a review row one tier up, on another usable provider when there is one
-    /// ([`super::models::Models::review`]), the reviewed row's `reviewer` set. When the
+    /// a review row on super's current model and thinking, the reviewed row's `reviewer`
+    /// set. Independent context and evidence gates remain the same. When the
     /// review's model can't be used the reviewed task goes to `blocked`; `Err` says why.
     pub(super) fn open_review(&self, id: &str, note: Option<&str>) -> Result<String, String> {
         let t = self.row(id)?;
-        let holds: Vec<String> = self.board.lock().unwrap().holds.keys().cloned().collect();
-        let held = |p: &str| holds.iter().any(|h| h == p);
-        let models = &self.cfg().models;
-        let picked = models
-            .review(&t.model, t.tier.as_deref(), &held, &self.current_model())
-            .and_then(|(tier, m)| models.allowed(&m).map(|()| (tier, m)));
-        let (tier, model) = match picked {
+        let picked = self.cfg().models.review(&self.current_review_model());
+        let model = match picked {
             Ok(m) => m,
             Err(e) => {
                 let why = format!("its review can't start: {e}");
@@ -440,7 +435,7 @@ impl Super {
             repo: t.repo.clone(),
             base_branch: t.base_branch.clone(),
             base_commit: t.base_commit.clone(),
-            tier: Some(tier),
+            tier: None,
             model,
             trusted: t.trusted,
             token: super::task::new_token(),
@@ -710,6 +705,7 @@ mod tests {
             max_running: 5,
             models: Arc::new(super::super::models::tests::flat_with(review_model)),
             model: "faux/script".into(),
+            thinking: novacode_types::ThinkingLevel::Medium,
             worktree_copy: vec!["AGENTS.md".into()],
             home: home.clone(),
             watch: Default::default(),
@@ -830,13 +826,30 @@ mod tests {
         sh(repo, &["worktree", "list", "--porcelain"])
     }
 
-    #[test]
-    fn reviewers_are_one_tier_stronger_and_deep_at_most() {
-        use super::super::models::reviewer_tier;
-        assert_eq!(reviewer_tier(Some("quick")), "standard");
-        assert_eq!(reviewer_tier(Some("standard")), "deep");
-        assert_eq!(reviewer_tier(Some("deep")), "deep");
-        assert_eq!(reviewer_tier(None), "deep", "a named model");
+    #[tokio::test]
+    async fn new_reviews_follow_model_and_thinking_changes_without_changing_work() {
+        use novacode_types::ThinkingLevel;
+        let fx = fixture("denied/legacy-review");
+        let wt = fx.spawn("fix", "deep", "change").await;
+        let commit = fx.commit(&wt, "src/a.rs");
+        let worker = fx.row("T1-fix").model;
+        fx.sup.set_current_model("faux/current".into(), ThinkingLevel::Low);
+        fx.done("T1-fix", &commit, &["src/a.rs"]);
+        let first = fx.review_of("T1-fix").await;
+        assert_eq!(first.model, "faux/current:low");
+        fx.sup.set_current_model("faux/current".into(), ThinkingLevel::High);
+        assert_eq!(fx.row(&first.id).model, "faux/current:low", "live reviews stay pinned");
+        fx.report(&first.id, json!({"verdict": "approved", "findings": []}));
+        fx.until("ready", |fx| fx.row("T1-fix").state == State::Ready).await;
+        fx.run(json!({"action": "review", "task": "T1-fix"})).await.unwrap();
+        let second = fx.review_of("T1-fix").await;
+        assert_eq!(second.model, "faux/current:high", "thinking-only change");
+        fx.report(&second.id, json!({"verdict": "approved", "findings": []}));
+        fx.until("ready", |fx| fx.row("T1-fix").state == State::Ready).await;
+        fx.sup.set_current_model("other/current".into(), ThinkingLevel::Off);
+        fx.run(json!({"action": "review", "task": "T1-fix"})).await.unwrap();
+        assert_eq!(fx.review_of("T1-fix").await.model, "other/current:off");
+        assert_eq!(fx.row("T1-fix").model, worker);
     }
 
     #[test]
@@ -873,7 +886,7 @@ mod tests {
         fx.done("T1-fix", &commit, &["src/parse.rs", "build.rs"]);
         let rv = fx.review_of("T1-fix").await;
         assert_eq!(rv.label, "T2-review-T1-fix");
-        assert_eq!((rv.kind, rv.model.as_str()), (Kind::Review, "faux/standard"));
+        assert_eq!((rv.kind, rv.model.as_str()), (Kind::Review, "faux/script:medium"));
         assert_eq!(fx.row("T1-fix").state, State::Reviewing);
         let e = fx.run(json!({"action": "accept", "task": "T1-fix"})).await.unwrap_err();
         assert!(e.contains("only through an approved review"), "{e}");
@@ -892,6 +905,10 @@ mod tests {
             scratch.display()
         );
         let start = fx.launcher.starts.lock().unwrap()[1].clone();
+        assert_eq!(
+            start.model, rv.model,
+            "the process receives the exact model and thinking"
+        );
         assert_eq!(start.cwd, scratch.join("work"));
         assert_eq!(sh(&start.cwd, &["rev-parse", "HEAD"]), commit);
         assert!(start.cwd.join("AGENTS.md").exists() && start.cwd.join("src/parse.rs").exists());
@@ -961,7 +978,7 @@ mod tests {
         let c1 = fx.commit(&wt, "src/a.rs");
         fx.done("T1-fix", &c1, &["src/a.rs"]);
         let rv = fx.review_of("T1-fix").await;
-        assert_eq!(rv.model, "faux/deep");
+        assert_eq!(rv.model, "faux/script:medium");
         let brief = fx.prompts("s2").remove(0);
         assert!(
             brief.contains("red then green")
@@ -1138,7 +1155,7 @@ mod tests {
         let c1 = fx.commit(&wt, "src/a.rs");
         fx.done("T1-fix", &c1, &["src/a.rs"]);
         let rv = fx.review_of("T1-fix").await;
-        assert_eq!(rv.model, "faux/review");
+        assert_eq!(rv.model, "faux/script:medium");
         let base = rv.base_commit.clone().unwrap();
         fx.report(
             &rv.id,
@@ -1253,9 +1270,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_review_on_a_denied_model_blocks_the_task() {
-        let fx = fixture("denied/fable");
+    async fn a_denied_review_blocks_until_explicit_retry_uses_current_super_model() {
+        let fx = fixture("faux/review");
         let wt = fx.spawn("fix", "deep", "change").await;
+        fx.sup
+            .set_current_model("denied/fable".into(), novacode_types::ThinkingLevel::Medium);
         let c = fx.commit(&wt, "src/a.rs");
         fx.done("T1-fix", &c, &["src/a.rs"]);
         fx.until("blocked", |fx| fx.row("T1-fix").state == State::Blocked).await;
@@ -1269,6 +1288,15 @@ mod tests {
                 .any(|l| l.starts_with("wake:") && l.contains("review can't start")),
             "{said:?}"
         );
+        let recorded = fx.row("T1-fix").done;
+        let summary = fx.row("T1-fix").summary;
+        fx.sup
+            .set_current_model("faux/recovered".into(), novacode_types::ThinkingLevel::Low);
+        assert_eq!(fx.row("T1-fix").state, State::Blocked, "no automatic restart");
+        fx.run(json!({"action": "review", "task": "T1-fix"})).await.unwrap();
+        assert_eq!(fx.review_of("T1-fix").await.model, "faux/recovered:low");
+        assert_eq!(fx.row("T1-fix").done, recorded);
+        assert_eq!(fx.row("T1-fix").summary, summary);
     }
 
     #[tokio::test]
@@ -1325,6 +1353,7 @@ mod tests {
             max_running: 1,
             models: Arc::new(super::super::models::tests::flat()),
             model: "faux/script".into(),
+            thinking: novacode_types::ThinkingLevel::Medium,
             worktree_copy: vec![],
             home: fx.sup.home().to_path_buf(),
             watch: Default::default(),

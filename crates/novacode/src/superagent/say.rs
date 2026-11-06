@@ -1047,7 +1047,7 @@ mod tests {
         let b = crate::superagent::context::builder(
             std::path::PathBuf::new(),
             Arc::new(|| {}),
-            Arc::new(|_| String::new()),
+            Arc::new(|_, _| String::new()),
             Default::default(),
             Default::default(),
         );
