@@ -2,6 +2,13 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.8.3] - 2026-11-07
+
+### Fixed
+
+- **Super reviews use super’s current model and thinking level**, rather than another provider or a tier override. Model and thinking changes apply to subsequent reviews; existing workers and running reviews are unchanged. Reviews blocked during startup can be explicitly retried using the current configuration.
+- **Super sessions keep the name `Super · <folder>`**, including resumed sessions. Automatic naming and `/name` cannot replace that fixed name; normal session naming is unchanged.
+
 ## [0.8.2] - 2026-11-06
 
 ### Changed
