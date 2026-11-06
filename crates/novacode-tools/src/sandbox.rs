@@ -163,7 +163,7 @@ const SECRET_NAMES: &[&str] = &[
     "DOCKER_HOST",
 ];
 /// novacode's login and trust files (plus `auth-*.json`).
-const NOVACODE_FILES: &[&str] = &["auth.json", "mcp-auth.json", "trust.json"];
+const NOVACODE_FILES: &[&str] = novacode_base::paths::LOGIN_FILES;
 
 pub struct Sandbox {
     mode: Mode,
@@ -306,12 +306,7 @@ impl Sandbox {
         // Parents first, so a bind inside another one isn't covered by it.
         write.sort_by_key(|p| p.components().count());
         // The whole ~/.novacode is not hidden (skills and settings are read from it), only its logins.
-        let mut cands: Vec<PathBuf> = c
-            .credential_dirs
-            .iter()
-            .filter(|d| *d != ".novacode")
-            .map(|d| c.home.join(d))
-            .collect();
+        let mut cands: Vec<PathBuf> = c.credential_dirs.iter().map(|d| c.home.join(d)).collect();
         cands.extend(NOVACODE_FILES.iter().map(|f| c.novacode_home.join(f)));
         if let Ok(rd) = std::fs::read_dir(&c.novacode_home) {
             let mut auth: Vec<PathBuf> = rd
@@ -437,10 +432,25 @@ impl Sandbox {
         let mut ro: Vec<PathBuf> = cands.iter().filter_map(|p| std::fs::canonicalize(p).ok()).collect();
         ro.sort();
         ro.dedup();
+        // Extra writable places inside the novacode folder (a review's scratch), opened again
+        // after the lock; never one holding its secrets (L10.9).
+        let nova = std::fs::canonicalize(&c.novacode_home).unwrap_or_else(|_| c.novacode_home.clone());
+        let mut write: Vec<PathBuf> = c
+            .allow_write
+            .iter()
+            .filter_map(|p| std::fs::canonicalize(expand(p, &c.home, &c.home)).ok())
+            .filter(|p| {
+                let first = p.strip_prefix(&nova).ok().and_then(|r| r.components().next());
+                first.is_some_and(|n| {
+                    !novacode_base::paths::is_secret_entry(&n.as_os_str().to_string_lossy(), |a, b| a == b)
+                })
+            })
+            .collect();
+        write.sort_by_key(|p| p.components().count());
         Sandbox {
             mode: c.mode,
             light: true,
-            write: Vec::new(),
+            write,
             pin: Vec::new(),
             git: None,
             symlink: None,
@@ -600,8 +610,12 @@ impl Sandbox {
         // A path deleted since the start is skipped: bwrap would fail on it, or
         // create it on the host as an empty file.
         let live = |p: &Path| p.symlink_metadata().is_ok();
-        for w in self.write.iter().filter(|p| live(p)) {
-            a.extend(["--bind".into(), w.clone().into(), w.clone().into()]);
+        let write = self.write.iter().filter(|p| live(p));
+        let write: Vec<OsString> = write
+            .flat_map(|w| ["--bind".into(), w.clone().into(), w.clone().into()])
+            .collect();
+        if !self.light {
+            a.extend(write.iter().cloned());
         }
         for g in self.pin.iter().filter(|p| live(p)) {
             a.extend(["--bind".into(), g.clone().into(), g.clone().into()]);
@@ -609,6 +623,10 @@ impl Sandbox {
         // After the writable ones, so they win inside them.
         for r in self.ro.iter().filter(|p| live(p)) {
             a.extend(["--ro-bind".into(), r.clone().into(), r.clone().into()]);
+        }
+        // Light: the writable places inside the locked novacode folder come after the lock.
+        if self.light {
+            a.extend(write);
         }
         // Last, so they win inside writable folders.
         for (h, dir) in self.hide.iter().filter(|(p, _)| live(p)) {
@@ -1193,7 +1211,7 @@ mod tests {
             tmpdir: None,
             allow_write: vec!["~/extra".into(), "~/missing".into()],
             deny_read: vec![".env.secret".into(), "~/nope".into()],
-            credential_dirs: vec![".ssh".into(), ".aws".into(), ".novacode".into()],
+            credential_dirs: vec![".ssh".into(), ".aws".into()],
             git_dirs: vec![proj.join(".git")],
             secret_env: vec!["My_Provider_Key".into()],
             histfile: Some(d.path().join("hist/zsh")),
@@ -1628,7 +1646,7 @@ mod tests {
             light: true,
             home: home.clone(),
             novacode_home: nc.clone(),
-            credential_dirs: vec![".ssh".into(), ".novacode".into()],
+            credential_dirs: vec![".ssh".into()],
             ..Config::default()
         }));
         let a = sb.args(&proj);

@@ -229,6 +229,8 @@ thing super reads; a turn that ends without one is reported as blocked.
 - At each milestone of longer work, call `report` with `state: progress`: what is done, what is next, and a \
 count or percentage when you know one (at most 80 words). Then go on; progress never ends your turn.
 - Your `ask_user` questions and approvals reach the user in super's window, labelled {label}.
+- When you need the user's approval or decision, call `ask_user` (or `report` `blocked` with a `question`); \
+never end a turn waiting for approval in plain text: nobody reads it.
 - Edit files only inside your own worktree (or, outside git, your folder): the edit tools refuse anywhere else. \
 Don't write elsewhere with `bash` either. A read task that has to write calls `enter_worktree` first.
 - Commit your work before you report `done`.
@@ -2628,6 +2630,18 @@ pub(super) mod tests {
             "{p}"
         );
         assert!(p.contains("ask the user with `ask_user`, naming the conflict"), "{p}");
+    }
+
+    /// Novahome findings: a task ended its turn with "waiting for your approval" in plain
+    /// text, which nobody reads.
+    #[test]
+    fn the_preamble_sends_approvals_through_ask_user() {
+        let p = preamble("T1-x");
+        assert!(
+            p.contains("When you need the user's approval or decision, call `ask_user` (or `report` `blocked` with a `question`)"),
+            "{p}"
+        );
+        assert!(p.contains("never end a turn waiting for approval in plain text"), "{p}");
     }
 
     #[tokio::test]

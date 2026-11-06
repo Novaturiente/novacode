@@ -1788,8 +1788,14 @@ mod tests {
                 "{f}"
             );
         }
-        // The bash rule still covers the whole folder.
-        assert!(denied(&check("bash", json!({"command": "rm -rf ~/.novacode/skills"}))));
+        // The bash rule covers the folder itself and its secrets (logins, settings, extensions, packages).
+        for c in [
+            "rm -rf ~/.novacode",
+            "rm -rf ~/.novacode/packages",
+            "rm ~/.novacode/settings.json",
+        ] {
+            assert!(denied(&check("bash", json!({"command": c}))), "{c}");
+        }
         // Settings (global or project) hold the permission rules: always the user's call, despite the allow rule.
         for path in ["~/.novacode/settings.json", ".novacode/settings.json"] {
             assert!(denied(&check("edit", json!({"path": path}))), "{path}");

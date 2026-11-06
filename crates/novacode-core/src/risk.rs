@@ -1544,7 +1544,7 @@ fn writes_or_runs(name: &str, args: &[String]) -> bool {
 
 /// An exact home or system folder (not a credential or user-protected path).
 fn is_exact_dir(p: &Path, ctx: &Ctx) -> bool {
-    same(p, ctx.home) || is_system(p)
+    same(p, ctx.home) || same(p, &ctx.home.join(".novacode")) || is_system(p)
 }
 
 /// Writing to `dest`: into an exact home or system folder (`into`, the file lands
@@ -2009,6 +2009,12 @@ fn mentions(code: &str, ctx: &Ctx) -> Option<String> {
         .chain(WINDOWS_CREDENTIAL_DIRS)
         .map(|d| (norm(d), format!("~/{d}")))
         .collect();
+    // shortcut: `auth-*.json` named in code is not seen; the sandbox hides it.
+    use novacode_base::paths::{CONFIG_ENTRIES, LOGIN_FILES};
+    under.extend(LOGIN_FILES.iter().chain(CONFIG_ENTRIES).map(|f| {
+        let d = format!(".novacode/{f}");
+        (norm(&d), format!("~/{d}"))
+    }));
     let mut outside = Vec::new();
     for extra in ctx.protected {
         let p = resolve(extra, ctx);
@@ -2239,15 +2245,14 @@ const SYSTEM_DIRS: &[&str] = &[
     "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/opt", "/proc", "/root", "/sbin", "/srv", "/sys",
     "/usr", "/var",
 ];
-const CREDENTIAL_DIRS: &[&str] = &[
-    ".ssh",
-    ".gnupg",
-    ".aws",
-    ".kube",
-    ".config/gcloud",
-    ".password-store",
-    ".novacode",
-];
+const CREDENTIAL_DIRS: &[&str] = &[".ssh", ".gnupg", ".aws", ".kube", ".config/gcloud", ".password-store"];
+
+/// `name`, a top-level entry of `~/.novacode` (in [`fold`]'s form), is one of its secrets:
+/// logins, trust, settings, extensions or packages. The rest (`run/`, `super/`,
+/// `sessions/`, logs, caches) follows the normal rules (L5).
+fn novacode_secret(name: &str) -> bool {
+    novacode_base::paths::is_secret_entry(name, |a, b| a == fold(Path::new(b)).to_string_lossy())
+}
 
 /// Windows' own credential stores under home, on top of [`CREDENTIAL_DIRS`].
 #[cfg(windows)]
@@ -2471,6 +2476,19 @@ fn protected(p: &Path, ctx: &Ctx) -> Option<String> {
                 return Some(format!("credentials in ~/{d}"));
             }
         }
+        let nova = fold(&home.join(".novacode")).into_owned();
+        if let Ok(rest) = fold(p).strip_prefix(&nova) {
+            match rest.components().next() {
+                None => return Some("novacode's folder ~/.novacode".into()),
+                Some(n) if novacode_secret(&n.as_os_str().to_string_lossy()) => {
+                    return Some(format!(
+                        "novacode's secrets in ~/.novacode/{}",
+                        n.as_os_str().to_string_lossy()
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
     }
     extra_protected(p, ctx)
 }
@@ -2621,6 +2639,51 @@ mod tests {
         if Path::new(r"C:\PROGRA~1").exists() {
             assert_eq!(lvl("rm -rf C:/PROGRA~1"), Catastrophic);
         }
+    }
+
+    /// Novahome findings (L5): in `~/.novacode` only the secrets are refused; run state,
+    /// super's folders and review scratch follow the normal rules.
+    #[test]
+    fn novacode_folder_protects_only_its_secrets() {
+        let protected = vec![];
+        let work = Path::new("/home/u/.novacode/super/h1/review/T2-ab/work");
+        let ctx = Ctx {
+            cwd: work,
+            home: Path::new("/home/u"),
+            protected: &protected,
+        };
+        let lvl = |c: &str| classify(c, &ctx).level;
+        for c in [
+            "rm ~/.novacode/run/claims/a1b2.json",
+            "rm -f /home/u/.novacode/run/claims/a1b2.json.bak",
+            "ln -s /home/u/proj/node_modules node_modules",
+            "mv /tmp/x ~/.novacode/super/h1/diff.patch",
+            "cp -a node_modules ./node_modules",
+            "rm -rf ~/.novacode/sessions/old",
+            "mkdir scratch",
+            "cp notes.txt ~/.novacode/",
+        ] {
+            assert_ne!(lvl(c), Catastrophic, "{c}: {:?}", classify(c, &ctx));
+        }
+        for c in [
+            "rm ~/.novacode/auth.json",
+            "rm ~/.novacode/auth-work.json",
+            "rm /home/u/.novacode/mcp-auth.json",
+            "echo '{}' > ~/.novacode/settings.json",
+            "cp x ~/.novacode/trust.json",
+            "rm -rf ~/.novacode/packages",
+            "rm -rf ~/.novacode/extensions/x.ts",
+            "mv ~/.novacode /tmp/n",
+            "rm -rf ~/.novacode",
+            "cp -r payload/auth.json ~/.novacode",
+        ] {
+            assert_eq!(lvl(c), Catastrophic, "{c}");
+        }
+        assert_eq!(
+            lvl("python3 -c \"open('/home/u/.novacode/settings.json','w')\""),
+            Shared
+        );
+        assert_eq!(lvl("python3 -c \"open('/home/u/.novacode/run/x')\""), Low);
     }
 
     fn level(cmd: &str) -> Level {

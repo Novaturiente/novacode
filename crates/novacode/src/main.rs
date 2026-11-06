@@ -88,7 +88,7 @@ struct Cli {
     /// Run as this subagent definition: its tools, role prompt and model.
     #[arg(long, hide = true)]
     agent: Option<String>,
-    /// A subagent's tools, comma-separated (set by its parent; default: its definition's).
+    /// A subagent's tools, comma-separated, `*` for all (set by its parent; default: its definition's).
     #[arg(long, hide = true)]
     tools: Option<String>,
     /// A subagent's MCP servers, comma-separated (default: its definition's, else none).
@@ -381,6 +381,31 @@ fn permissions(s: &Settings) -> Permissions {
             serde_json::from_value(v).unwrap_or_else(|e| hardened(&format!("`permissions` doesn't parse ({e})")))
         }
     }
+}
+
+/// The tools a session is built with: `--tools` (comma-separated; `*` is every tool, over
+/// the agent type's list: super's scouts, D2), else its agent type's; `None` is every tool.
+fn session_tools(arg: Option<&str>, def: Option<Vec<String>>) -> Option<Vec<String>> {
+    match arg {
+        Some("*") => None,
+        Some(a) => Some(
+            a.split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(String::from)
+                .collect(),
+        ),
+        None => def,
+    }
+}
+
+/// The packages whose Claude Code hooks a session runs: none in super, which has no
+/// skills or packages (L10.9); its tasks keep them.
+fn hook_packages(is_super: bool, home: &Path, cwd: &Path, trusted: bool) -> Vec<novacode_core::packages::Package> {
+    if is_super {
+        return vec![];
+    }
+    novacode_core::packages::enabled(home, cwd, trusted)
 }
 
 /// The sandbox of a session in `cwd` (L6.5): its project folders, the settings'
@@ -1448,7 +1473,7 @@ impl Ctx {
         };
         let allowed: Option<Vec<String>> = match is_super {
             true => Some(superagent::tools(s)),
-            false => self.cli.tools.as_ref().map(csv).or_else(|| def.as_ref()?.tools.clone()),
+            false => session_tools(self.cli.tools.as_deref(), def.as_ref().and_then(|d| d.tools.clone())),
         };
         let granted: Option<Vec<String>> = def
             .as_ref()
@@ -1716,7 +1741,7 @@ impl Ctx {
         // none inside a hook's own novacode (recursion guard).
         let plugin_hooks = (!novacode_core::hooks::disabled()).then(|| {
             Arc::new(novacode_core::plugin_hooks::PluginHooks::load(
-                &novacode_core::packages::enabled(self.paths.home(), &self.cwd, self.trusted),
+                &hook_packages(is_super, self.paths.home(), &self.cwd, self.trusted),
                 &self.cwd,
                 store.id(),
                 self.cli.agent.clone(),
@@ -3850,11 +3875,29 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_review_session_s_sandbox_can_write_its_whole_scratch_folder() {
+        review_scratch_writable(r#"{"sandbox": {"mode": "on"}}"#).await;
+    }
+
+    /// Novahome findings: at the lenient level (credentials only) all of `~/.novacode` was
+    /// read-only, the review scratch in it too ("mkdir: cannot create directory 'scratch':
+    /// Read-only file system").
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_lenient_review_session_can_write_its_scratch_in_the_novacode_folder() {
+        review_scratch_writable("{}").await;
+    }
+
+    /// A review's scratch under the novacode folder (`<home>/super/review/T2`): its sandbox
+    /// with `settings` adds the base checkout next to `work`, while the rest of the novacode
+    /// folder stays read-only.
+    #[cfg(target_os = "linux")]
+    async fn review_scratch_writable(settings: &str) {
         use std::path::Path;
         // Not under /tmp: that is writable anyway.
         let tmp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let (app, scratch) = (root.join("app"), root.join("super/review/T2"));
+        let nc = root.join("home");
+        let (app, scratch) = (root.join("app"), nc.join("super/review/T2"));
         let work = scratch.join("work");
         std::fs::create_dir_all(&app).unwrap();
         let git = |dir: &Path, args: &[&str]| {
@@ -3882,10 +3925,10 @@ mod tests {
             &["worktree", "add", "-q", "--detach", &work.to_string_lossy(), "HEAD"],
         );
         let file = root.join("settings.json");
-        std::fs::write(&file, r#"{"sandbox": {"mode": "on"}}"#).unwrap();
+        std::fs::write(&file, settings).unwrap();
         let s = novacode_base::settings::Settings::load(&file, None, false);
         let rule = super::EditRule::Review { dir: scratch.clone() };
-        let sb = super::session_sandbox(&s, &work, &root.join("home"), &super::permissions(&s), Some(&rule));
+        let sb = super::session_sandbox(&s, &work, &nc, &super::permissions(&s), Some(&rule));
         if !sb.available() {
             eprintln!("no bubblewrap here: skipped");
             return;
@@ -3898,6 +3941,42 @@ mod tests {
             .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert!(scratch.join("base/.git").exists());
+        let out = super::sbx::command(Some(&sb), "touch ../../../x", &work)
+            .unwrap()
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            !out.status.success() && !nc.join("x").exists(),
+            "the rest of the novacode folder stays read-only"
+        );
+    }
+
+    /// Novahome findings: super ran the packages' Claude Code hooks (caveman, ponytail mode
+    /// text, 28 messages); super has no skills or packages, tasks keep them.
+    /// D2: `--tools=*` (super's scouts) is every tool, over the agent type's own list.
+    #[test]
+    fn tools_star_lifts_the_agent_types_list() {
+        let def = Some(vec!["read".to_string()]);
+        assert_eq!(super::session_tools(Some("*"), def.clone()), None);
+        assert_eq!(super::session_tools(None, def.clone()), def);
+        assert_eq!(
+            super::session_tools(Some("bash, read"), def),
+            Some(vec!["bash".to_string(), "read".to_string()])
+        );
+    }
+
+    #[test]
+    fn super_runs_no_package_hooks() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("packages/cave")).unwrap();
+        let cwd = home.path();
+        assert_eq!(
+            super::hook_packages(false, home.path(), cwd, true).len(),
+            1,
+            "a task keeps them"
+        );
+        assert!(super::hook_packages(true, home.path(), cwd, true).is_empty());
     }
 
     #[test]

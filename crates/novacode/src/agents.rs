@@ -421,8 +421,10 @@ pub struct Claims {
 
 impl Claims {
     pub fn new(run_dir: &Path, me: &str, place: Place, cwd: &Path) -> Self {
+        let file = run_dir.join("claims").join(format!("{}.json", place.root(me)));
+        prune_stale(&file);
         Claims {
-            file: run_dir.join("claims").join(format!("{}.json", place.root(me))),
+            file,
             me: me.into(),
             title: std::env::var("NOVACODE_AGENT_TITLE").unwrap_or_else(|_| "main".into()),
             place,
@@ -506,6 +508,42 @@ impl Claims {
 
 fn alive(pid: u32) -> bool {
     novacode_tools::process::pid_alive(pid)
+}
+
+/// Remove the other trees' claim files (with `.bak` and `.lock`) whose holders all
+/// died: they only clear their own file, so a crashed tree's stayed forever. A file
+/// whose lock someone holds is left alone.
+fn prune_stale(own: &Path) {
+    let Some(dir) = own.parent() else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    // Each claim file once, also one left with only its `.bak` or `.lock`.
+    let mut files: Vec<PathBuf> = rd
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            let base = n.strip_suffix(".bak").or_else(|| n.strip_suffix(".lock")).unwrap_or(&n);
+            base.ends_with(".json").then(|| dir.join(base))
+        })
+        .collect();
+    files.sort();
+    files.dedup();
+    for f in files {
+        if f == own {
+            continue;
+        }
+        let Ok(Some(_lock)) = novacode_base::storage::try_lock(&f) else {
+            continue;
+        };
+        let all: Vec<Claim> = novacode_base::storage::read_json(&f).ok().flatten().unwrap_or_default();
+        if all.iter().any(|c| alive(c.pid)) {
+            continue;
+        }
+        let _ = std::fs::remove_file(novacode_base::storage::backup_path(&f));
+        let _ = std::fs::remove_file(&f);
+        let mut lock = f.into_os_string();
+        lock.push(".lock");
+        let _ = std::fs::remove_file(lock);
+    }
 }
 
 impl Handler for Claims {
@@ -965,6 +1003,8 @@ impl Supervisor {
                     .collect();
                 let mut def = def.clone();
                 def.mcp = servers.clone();
+                // D2: every tool a regular session in that folder has (a scout gets bash too).
+                def.tools = None;
                 (trusted, None, servers, std::borrow::Cow::Owned(def))
             }
             None => (
@@ -1175,9 +1215,11 @@ impl Supervisor {
         if no_context {
             cmd.arg("--no-context-files");
         }
-        if let Some(t) = &tools {
-            cmd.arg(format!("--tools={}", t.join(",")));
-        }
+        // No list: every tool, also over the agent type's own list (`*`).
+        match &tools {
+            Some(t) => cmd.arg(format!("--tools={}", t.join(","))),
+            None => cmd.arg("--tools=*"),
+        };
         cmd.arg(format!("--mcp={}", mcp.join(",")));
         if trusted {
             cmd.arg("--trust");
@@ -2022,7 +2064,12 @@ mod tests {
             out.contains("--mcp=globsrv,projsrv ") && out.contains(" --trust"),
             "the trusted project's servers and trust: {out}"
         );
-        assert!(out.contains("--tools=read,"), "the scout's own tools, uncapped: {out}");
+        // D2 (novahome findings): a regular session's whole tool set, bash included, not the
+        // scout type's read-only list.
+        assert!(
+            out.contains("--tools=* ") && !out.contains("--tools=read,"),
+            "every tool of a regular session: {out}"
+        );
         let out = sup.wait(vec![q], false, Duration::from_secs(20)).await;
         assert!(
             out.contains("--mcp=globsrv") && !out.contains("untrusted") && !out.contains("--trust"),
@@ -2561,5 +2608,39 @@ mod tests {
         let patch = json!({"patch": "*** Begin Patch\n*** Update File: f.rs\n@@\n-x\n+y\n*** End Patch"});
         assert!(b.check(&b.paths("apply_patch", &patch)).is_err());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Novahome findings: claim files of agent trees whose processes all died stayed in
+    /// `run/claims/` forever; a new session's claims prune them, with `.bak` and `.lock`,
+    /// unless someone holds their lock.
+    #[test]
+    fn stale_claims_of_dead_processes_are_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("claims");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let claim = |pid: u32| format!(r#"[{{"path":"/x","holder":"H","title":"t","pid":{pid}}}]"#);
+        for (name, pid) in [("dead", dead), ("live", std::process::id()), ("held", dead)] {
+            for ext in ["json", "json.bak", "json.lock"] {
+                std::fs::write(dir.join(format!("{name}.{ext}")), claim(pid)).unwrap();
+            }
+        }
+        let _held = novacode_base::storage::lock(&dir.join("held.json")).unwrap();
+        let _ = Claims::new(
+            tmp.path(),
+            "X",
+            Place {
+                depth: 0,
+                chain: vec![],
+            },
+            tmp.path(),
+        );
+        for ext in ["json", "json.bak", "json.lock"] {
+            assert!(!dir.join(format!("dead.{ext}")).exists(), "dead.{ext}");
+            assert!(dir.join(format!("live.{ext}")).exists(), "live.{ext}");
+            assert!(dir.join(format!("held.{ext}")).exists(), "held.{ext}");
+        }
     }
 }

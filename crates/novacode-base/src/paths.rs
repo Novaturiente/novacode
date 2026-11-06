@@ -2,6 +2,21 @@
 
 use std::path::{Path, PathBuf};
 
+/// novacode's login and trust files in its home folder (plus `auth-*.json`): the sandbox
+/// hides them, the risk rule refuses replacing them (L5).
+pub const LOGIN_FILES: &[&str] = &["auth.json", "mcp-auth.json", "trust.json"];
+/// The rest of novacode's home folder that only the user changes: what runs as them.
+pub const CONFIG_ENTRIES: &[&str] = &["settings.json", "extensions", "packages"];
+
+/// `name`, a top-level entry of novacode's home folder, is one of its secrets (logins,
+/// trust, settings, extensions, packages); `same` compares two names (case-folding on Windows).
+pub fn is_secret_entry(name: &str, same: impl Fn(&str, &str) -> bool) -> bool {
+    LOGIN_FILES.iter().chain(CONFIG_ENTRIES).any(|s| same(name, s))
+        || (name.len() >= 10
+            && name.get(..5).is_some_and(|h| same(h, "auth-"))
+            && name.get(name.len() - 5..).is_some_and(|t| same(t, ".json")))
+}
+
 /// Where novacode keeps its files. Tests build one over a temp dir instead of
 /// touching env vars, so they never see the real home (L0.9).
 #[derive(Debug, Clone)]
