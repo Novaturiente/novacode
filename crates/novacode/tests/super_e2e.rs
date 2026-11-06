@@ -54,12 +54,19 @@ fn board(home: &Path) -> Value {
     serde_json::from_str(&text).unwrap_or(Value::Null)
 }
 
+/// A row by its label, with or without the super session's `<sid4>-` (L10.9).
 fn task(home: &Path, label: &str) -> Value {
     board(home)["tasks"]
         .as_array()
         .into_iter()
         .flatten()
-        .find(|t| t["label"] == label)
+        .find(|t| {
+            t["label"] == label
+                || t["label"]
+                    .as_str()
+                    .and_then(|l| l.split_once('-'))
+                    .is_some_and(|(_, r)| r == label)
+        })
         .cloned()
         .unwrap_or(Value::Null)
 }
@@ -504,9 +511,12 @@ fn super_runs_a_write_task_through_review_merge_and_close() {
     assert_eq!(t["state"], "archived", "{t}");
     let rv = task(&home, review);
     assert_eq!(rv["state"], "archived", "{rv}");
-    assert_eq!(rv["reviewer_of"], label, "{rv}");
+    assert_eq!(rv["reviewer_of"], t["id"], "{rv}");
     // Merged into main in the main checkout; the merged worktree is gone.
     assert_eq!(std::fs::read_to_string(app.join("note.txt")).unwrap(), "hello\n");
     assert_eq!(git(&app, "branch --show-current"), "main");
-    assert!(!app.join(".worktrees").join(label).exists(), "worktree removed");
+    assert!(
+        !app.join(".worktrees").join(t["id"].as_str().unwrap()).exists(),
+        "worktree removed"
+    );
 }

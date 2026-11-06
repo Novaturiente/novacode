@@ -697,7 +697,7 @@ impl Links {
                         ));
                     }
                     if sup.row(&t.id).is_ok_and(|r| r.state == State::Interrupted) && n.from != n.to {
-                        interrupted.push((t.label.clone(), n.from == State::Merging));
+                        interrupted.push((sup.name_of(&t.id), n.from == State::Merging));
                     }
                 }
             }
@@ -997,7 +997,7 @@ impl Links {
         let t = if n.effects.iter().any(|e| matches!(e, board::Effect::StartReview { .. })) {
             match sup.open_review(id, None) {
                 Ok(review) => {
-                    extra += &format!("\nIts review task {review} starts.");
+                    extra += &format!("\nIts review task {} starts.", sup.name_of(&review));
                 }
                 Err(e) => extra += &format!("\nIt is blocked now: {e}"),
             }
@@ -1028,7 +1028,12 @@ impl Links {
             _ => false,
         };
         if wakes {
-            self.inform.wake(format!("{}{extra}", wake_text(&t, &ev)));
+            // Shown as the running super session names it (L10.9).
+            let shown = board::Task {
+                label: sup.name_of(&t.id),
+                ..t.clone()
+            };
+            self.inform.wake(format!("{}{extra}", wake_text(&shown, &ev)));
         } else if let Event::ReviewCrashed(why) = &ev {
             self.inform
                 .note(format!("{}'s review task crashed ({why}); one retry.{extra}", t.label));
@@ -1093,7 +1098,7 @@ impl Links {
                     t.last_prompt = None;
                 }
             });
-            let label = sup.row(id).map(|t| t.label).unwrap_or_else(|_| id.to_string());
+            let label = sup.name_of(id);
             self.inform.wake(format!("{label} replied: {r}"));
         }
     }
@@ -1444,7 +1449,7 @@ Address every finding, commit, re-run your checks and report `done` again.",
         let Some(writer) = g.links.get(id).map(|l| l.writer.clone()) else {
             return;
         };
-        let label = sup.row(id).map(|t| t.label).unwrap_or_else(|_| id.to_string());
+        let label = sup.name_of(id);
         let (me, id2, what) = (self.me.clone(), id.to_string(), card.what());
         let (asker, approver) = (self.asker.clone(), self.approver.clone());
         let card_id = card.id();
@@ -1474,7 +1479,7 @@ Address every finding, commit, re-run your checks and report `done` again.",
         drop(g);
         self.card_facts(id);
         self.apply(&sup, id, Event::CardOpened);
-        let label = sup.row(id).map(|t| t.label).unwrap_or_default();
+        let label = sup.name_of(id);
         self.inform
             .desktop(format!("{label} asks"), "its question waits in super's window".into());
     }
@@ -1504,7 +1509,7 @@ Address every finding, commit, re-run your checks and report `done` again.",
         h.abort();
         self.record(id, card_id, answer.into());
         if let Some(sup) = self.sup.upgrade() {
-            let label = sup.row(id).map(|t| t.label).unwrap_or_default();
+            let label = sup.name_of(id);
             self.inform.note(format!("{label}'s question {how}"));
         }
         self.card_closed(id, card_id);
@@ -1962,7 +1967,7 @@ async fn run_link(
                             }
                         }
                         CatchUp::Note => {
-                            let label = sup.row(&id).map(|t| t.label).unwrap_or_default();
+                            let label = sup.name_of(&id);
                             links.inform.note(format!(
                                 "{label}: a turn may have ended while super was disconnected, but the user also \
                                  typed in it, so no report was made; ask it with `task send` if needed"

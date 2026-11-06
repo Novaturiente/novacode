@@ -1594,6 +1594,8 @@ impl Ctx {
             });
             let dir = superagent::entry::dir(home, &self.cwd);
             let sup = Arc::new(task::Super::new(&self.cwd, dir, cfg, asker.clone(), launcher)?);
+            // Each super session numbers its tasks from T1 (L10.9).
+            sup.set_session(store.id());
             super_ref = Some(Arc::downgrade(&sup));
             // The helper model, as for the observer: none with `memory.enabled: false`.
             let helper = match memory_on {

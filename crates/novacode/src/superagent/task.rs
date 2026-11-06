@@ -469,18 +469,69 @@ impl Super {
             .ok_or_else(|| format!("no task {id}"))
     }
 
-    /// A task by its label, or by `T<n>`.
+    /// How super and the user see task `id` now ([`Board::name`]); `id` when it is gone.
+    pub(super) fn name_of(&self, id: &str) -> String {
+        let b = self.board.lock().unwrap();
+        b.task(id).map_or(id.to_string(), |t| b.name(t))
+    }
+
+    /// A copy of `t` labelled as super sees it, for messages only: never written back.
+    fn shown(&self, mut t: Task) -> Task {
+        t.label = self.board.lock().unwrap().name(&t);
+        t
+    }
+
+    /// Super session `id` runs now: its tasks number from T1 and carry its last 4 characters.
+    pub fn set_session(&self, id: &str) {
+        let sid = id[id.len().saturating_sub(4)..].to_string();
+        if let Err(e) = self.edit(|b| b.sid = sid) {
+            tracing::warn!(%e, "super: the session wasn't saved on the board");
+        }
+    }
+
+    /// A task by its id, label or shown name, or by `T<n>[-slug]` with an optional
+    /// `<sid4>·` / `<sid4>-` (`old·` for an older board's row): a bare number is the
+    /// current session's, else another session's when only one has it.
     fn find(&self, name: &str) -> Result<Task, String> {
         let b = self.board.lock().unwrap();
-        b.tasks
+        if let Some(t) = b
+            .tasks
             .iter()
-            .find(|t| t.label == name || t.id == name)
-            .or_else(|| {
-                let n = name.strip_prefix('T')?.parse::<u64>().ok()?;
-                b.tasks.iter().find(|t| number(&t.label) == n)
+            .find(|t| t.label == name || t.id == name || b.name(t) == name)
+        {
+            return Ok(t.clone());
+        }
+        let missing = || format!("no task {name}; `task list {{all: true}}` shows every task");
+        let (sid, rest) = match name.split_once('·').or_else(|| name.split_once('-')) {
+            Some((s, r)) if !s.starts_with('T') => (Some(s), r),
+            _ => (None, name),
+        };
+        let n = number(rest);
+        let hits: Vec<&Task> = b
+            .tasks
+            .iter()
+            .filter(|t| {
+                t.number() == n && n > 0 && (rest.parse::<u64>().is_ok() || !rest.contains('-') || t.short() == rest)
             })
-            .cloned()
-            .ok_or_else(|| format!("no task {name}; `task list {{all: true}}` shows every task"))
+            .filter(|t| match sid {
+                Some("old") => t.sid.is_empty(),
+                Some(s) => t.sid == s,
+                None => true,
+            })
+            .collect();
+        let current: Vec<&Task> = hits
+            .iter()
+            .copied()
+            .filter(|t| sid.is_none() && t.sid == b.sid)
+            .collect();
+        match (current.as_slice(), hits.as_slice()) {
+            ([t], _) | ([], [t]) => Ok((*t).clone()),
+            ([], []) => Err(missing()),
+            (_, many) => Err(format!(
+                "{name} names more than one task: {}; name one",
+                many.iter().map(|t| b.name(t)).collect::<Vec<_>>().join(", ")
+            )),
+        }
     }
 
     /// Whether `ev` is possible for `id` now, without changing anything.
@@ -503,7 +554,7 @@ impl Super {
             let task = a.task.as_deref().ok_or("`task` is missing: a task's label or `all`")?;
             return self.switch_models(task, a.provider, a.model).await;
         }
-        let t = self.find(a.task.as_deref().ok_or("`task` is missing")?)?;
+        let t = self.shown(self.find(a.task.as_deref().ok_or("`task` is missing")?)?);
         match a.action.as_str() {
             "read" => self.read(&t, a.offset.unwrap_or(0), a.limit.unwrap_or(200)),
             "send" if a.question => self.ask(&t, a.message.as_deref().ok_or("`message` is missing")?).await,
@@ -523,7 +574,7 @@ impl Super {
                     let on = git(wt, &["branch", "--show-current"]).ok();
                     self.adopt_branch(&t.id, on.as_deref().filter(|b| !b.is_empty())).await;
                 }
-                let t = self.row(&t.id)?;
+                let t = self.shown(self.row(&t.id)?);
                 let block = t
                     .block
                     .as_ref()
@@ -558,7 +609,11 @@ impl Super {
                     ));
                 }
                 let review = self.open_review(&t.id, a.note.as_deref())?;
-                let mut out = format!("{} is reviewing; its review task is {review}.", t.label);
+                let mut out = format!(
+                    "{} is reviewing; its review task is {}.",
+                    t.label,
+                    self.name_of(&review)
+                );
                 for n in self.pump().await {
                     out += &format!("\n{n}");
                 }
@@ -605,10 +660,7 @@ impl Super {
                 folder.display()
             ));
         }
-        let next_label = |b: &Board| {
-            let n = b.tasks.iter().map(|t| number(&t.label)).max().unwrap_or(0) + 1;
-            format!("T{n}-{slug}")
-        };
+        let next_label = |b: &Board| format!("T{}-{slug}", b.next_number());
         // The card names the label the task will likely get; the number is taken when
         // the row is added (a review may take one while the card is open).
         let shown = next_label(&self.board.lock().unwrap());
@@ -635,15 +687,17 @@ impl Super {
             updated: now,
             ..Task::default()
         };
-        let label = self.edit(|b| {
-            let label = next_label(b);
-            row.id = label.clone();
-            row.label = label.clone();
+        let (id, label) = self.edit(|b| {
+            let id = b.with_sid(&next_label(b));
+            row.id = id.clone();
+            row.label = id.clone();
+            row.sid = b.sid.clone();
+            let label = b.name(&row);
             b.tasks.push(row);
-            label
+            (id, label)
         })?;
         let notes = self.pump().await;
-        let t = self.row(&label)?;
+        let t = self.row(&id)?;
         let mut out = match t.state {
             State::Queued => {
                 let mut s = format!("{label} is queued: {}.", self.why_queued(&t));
@@ -671,7 +725,10 @@ impl Super {
                 s
             }
         };
-        for n in notes.into_iter().filter(|n| !n.starts_with(&label)) {
+        for n in notes
+            .into_iter()
+            .filter(|n| !n.starts_with(&label) && !n.starts_with(&id))
+        {
             out += &format!("\n{n}");
         }
         if let Some(n) = notice {
@@ -1926,7 +1983,7 @@ with the reason.",
     /// reports `done` (no new review). A charter limit ("stop before deploy") asks the user
     /// on a card first. `None` when it has none to run; else what happened, for super.
     pub(super) async fn after_steps(&self, id: &str) -> Option<String> {
-        let t = self.row(id).ok()?;
+        let t = self.shown(self.row(id).ok()?);
         self.check(id, Event::AfterSteps).ok()?;
         let steps: String = t
             .after
@@ -1989,7 +2046,7 @@ proof of each step (no new review runs for them). If a step fails, report `block
                 };
                 let mut line = format!(
                     "{} | {} | {state} | {} | {age}",
-                    t.label,
+                    b.name(t),
                     if repo.is_empty() { "." } else { &repo },
                     t.model
                 );
@@ -2179,7 +2236,7 @@ fn pick(b: &Board, max_running: usize) -> Option<String> {
         .filter(|t| t.state == State::Queued)
         .filter(|t| !b.holds.contains_key(provider(&t.model)))
         .filter(|t| folder_holder(b, t).is_none())
-        .min_by_key(|t| (t.kind != Kind::Review, t.started, number(&t.label)))
+        .min_by_key(|t| (t.kind != Kind::Review, t.started, t.number()))
         .map(|t| t.id.clone())
 }
 
@@ -4442,5 +4499,90 @@ pub(super) mod tests {
         assert!(fx.sup.board.lock().unwrap().tasks.is_empty());
         assert!(fx.asker.asked.lock().unwrap().is_empty());
         assert!(TaskTool(fx.sup.clone()).description().contains("info {folder}"));
+    }
+
+    fn older(id: &str, sid: &str) -> Task {
+        Task {
+            id: id.into(),
+            label: id.into(),
+            sid: sid.into(),
+            state: State::Archived,
+            ..Task::default()
+        }
+    }
+
+    /// Each super session numbers its tasks from T1; ids and disk names carry its sid4.
+    #[tokio::test]
+    async fn task_numbers_start_at_t1_per_super_session() {
+        let fx = fixture(5, &[]);
+        fx.sup
+            .edit(|b| b.tasks.extend([older("T16-old", ""), older("aaaa-T3-fix", "aaaa")]))
+            .unwrap();
+        fx.sup.set_session("019a0000-0000-7000-8000-00000000bb12");
+        let app = repo(&fx.root, "app");
+        let out = run(&fx, spawn_args("app", "fix-it", true)).await.unwrap();
+        assert!(out.contains("Started T1-fix-it"), "{out}");
+        let t = fx.sup.row("bb12-T1-fix-it").unwrap();
+        assert_eq!((t.label.as_str(), t.sid.as_str()), ("bb12-T1-fix-it", "bb12"));
+        assert_eq!(
+            t.worktree.as_deref(),
+            Some(app.join(".worktrees/bb12-T1-fix-it").as_path())
+        );
+        assert_eq!(t.branch.as_deref(), Some("worktree-bb12-T1-fix-it"));
+        let list = run(&fx, json!({"action": "list", "all": true})).await.unwrap();
+        assert!(
+            list.contains("\nT1-fix-it | ") || list.starts_with("T1-fix-it | "),
+            "{list}"
+        );
+        assert!(
+            list.contains("aaaa·T3-fix | ") && list.contains("old·T16-old | "),
+            "{list}"
+        );
+        let b = fx.sup.board.lock().unwrap().clone();
+        let block = b.state_block(&[]);
+        assert!(block.contains("| T1-fix-it |"), "{block}");
+        let rows = b.snapshot(|_| None);
+        assert_eq!(rows[0].label, "T1-fix-it");
+        // A restart of the same session keeps counting; the board knows its session.
+        assert_eq!(Board::load(&fx.sup.dir).unwrap().sid, "bb12");
+    }
+
+    /// `T1`, `T1-slug`, `<sid4>·T16`, `<sid4>-T16` and full ids resolve; a bare number
+    /// prefers the current session, else resolves when unambiguous.
+    #[test]
+    fn task_references_resolve_across_super_sessions() {
+        let fx = fixture(5, &[]);
+        fx.sup
+            .edit(|b| {
+                b.sid = "bb12".into();
+                b.tasks.extend([
+                    older("T16-old", ""),
+                    older("aaaa-T3-fix", "aaaa"),
+                    older("cccc-T3-fix", "cccc"),
+                    older("aaaa-T7-doc", "aaaa"),
+                    older("bb12-T1-new", "bb12"),
+                    older("aaaa-T1-new", "aaaa"),
+                ])
+            })
+            .unwrap();
+        let id = |n: &str| fx.sup.find(n).map(|t| t.id);
+        for (q, want) in [
+            ("T1", "bb12-T1-new"),
+            ("T1-new", "bb12-T1-new"),
+            ("bb12-T1-new", "bb12-T1-new"),
+            ("aaaa·T1", "aaaa-T1-new"),
+            ("aaaa-T1", "aaaa-T1-new"),
+            ("aaaa·T1-new", "aaaa-T1-new"),
+            ("T7", "aaaa-T7-doc"),
+            ("T16", "T16-old"),
+            ("old·T16", "T16-old"),
+            ("T16-old", "T16-old"),
+            ("cccc·T3-fix", "cccc-T3-fix"),
+        ] {
+            assert_eq!(id(q).as_deref(), Ok(want), "{q}");
+        }
+        let e = id("T3").unwrap_err();
+        assert!(e.contains("aaaa·T3-fix") && e.contains("cccc·T3-fix"), "{e}");
+        assert!(id("T9").unwrap_err().contains("no task T9"));
     }
 }

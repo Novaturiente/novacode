@@ -180,7 +180,7 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
         .filter(|l| *l != "General" && board.by_label(l).is_none())
         .collect();
     if !unknown.is_empty() {
-        let known: Vec<&str> = board.tasks.iter().map(|t| t.label.as_str()).collect();
+        let known: Vec<String> = board.tasks.iter().map(|t| board.name(t)).collect();
         return Err(format!(
             "unknown task label(s): {}; the board has: {}",
             unknown.join(", "),

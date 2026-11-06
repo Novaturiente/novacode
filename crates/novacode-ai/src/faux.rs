@@ -47,13 +47,20 @@ impl Faux {
     /// The hidden `faux/script` model (L10.9): replies from a JSON Lines file, one
     /// `{"text": ..., "tools": [{"name": ..., "args": {...}}]}` per reply, then empty stops.
     /// The file is `$NOVACODE_FAUX_SCRIPT_DIR/<label>.jsonl` (label: `$NOVACODE_TASK`, else
-    /// `super`), else `$NOVACODE_FAUX_SCRIPT`.
+    /// `super`; a task id's `<sid4>-` is dropped when only `T<n>-….jsonl` exists), else
+    /// `$NOVACODE_FAUX_SCRIPT`.
     pub fn from_env() -> Result<Self, String> {
         let var = |k| std::env::var(k).ok().filter(|v| !v.is_empty());
         let path = match (var("NOVACODE_FAUX_SCRIPT_DIR"), var("NOVACODE_FAUX_SCRIPT")) {
             (Some(dir), _) => {
                 let label = var("NOVACODE_TASK").unwrap_or_else(|| "super".into());
-                std::path::Path::new(&dir).join(format!("{label}.jsonl"))
+                let path = std::path::Path::new(&dir).join(format!("{label}.jsonl"));
+                match label.split_once('-') {
+                    Some((_, short)) if !path.exists() && short.starts_with('T') => {
+                        std::path::Path::new(&dir).join(format!("{short}.jsonl"))
+                    }
+                    _ => path,
+                }
             }
             (None, Some(file)) => file.into(),
             (None, None) => return Err("faux/script needs NOVACODE_FAUX_SCRIPT or NOVACODE_FAUX_SCRIPT_DIR".into()),

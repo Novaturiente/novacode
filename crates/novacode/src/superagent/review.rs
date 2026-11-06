@@ -429,15 +429,17 @@ impl Super {
                 return Err(why);
             }
         };
-        let label = {
+        let (label, sid) = {
             let b = self.board.lock().unwrap();
-            let n = b.tasks.iter().map(|t| super::task::number(&t.label)).max().unwrap_or(0) + 1;
-            format!("T{n}-review-{}", t.label)
+            // Its number counts in the running super session; the reviewed task as that session names it.
+            let of = if t.sid == b.sid { t.short() } else { &t.label };
+            (b.with_sid(&format!("T{}-review-{of}", b.next_number())), b.sid.clone())
         };
         let now = board::now();
         let mut rv = Task {
             id: label.clone(),
             label: label.clone(),
+            sid,
             kind: Kind::Review,
             ty: t.ty,
             folder: t.folder.clone(),

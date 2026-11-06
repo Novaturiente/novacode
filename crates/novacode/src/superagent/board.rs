@@ -338,7 +338,11 @@ pub const ASKED_TEXT: usize = 200;
 #[serde(default)]
 pub struct Task {
     pub id: String,
+    /// `<sid4>-T<n>-<slug>` (an older board's row: `T<n>-<slug>`); shown by [`name`](Self::name).
     pub label: String,
+    /// Last 4 characters of the super session that spawned it; empty on an older board's row.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub sid: String,
     pub kind: Kind,
     #[serde(rename = "type")]
     pub ty: TaskType,
@@ -437,6 +441,30 @@ pub struct Task {
 }
 
 impl Task {
+    /// Its label without its session: `T<n>-<slug>`.
+    pub fn short(&self) -> &str {
+        self.label
+            .strip_prefix(&self.sid)
+            .and_then(|r| r.strip_prefix('-'))
+            .filter(|_| !self.sid.is_empty())
+            .unwrap_or(&self.label)
+    }
+
+    /// `T<n>` of its label.
+    pub fn number(&self) -> u64 {
+        super::task::number(self.short())
+    }
+
+    /// How super and the panel show it while super session `cur` runs: `T1-slug` for that
+    /// session's tasks, `<sid4>·T16-slug` for another's, `old·T16-slug` for an older board's row.
+    pub fn name(&self, cur: &str) -> String {
+        match (self.sid.as_str(), self.sid == cur) {
+            (_, true) => self.short().to_string(),
+            ("", false) => format!("old·{}", self.label),
+            (sid, false) => format!("{sid}·{}", self.short()),
+        }
+    }
+
     /// Record a relayed card's answer, keeping the last [`ASKED_KEPT`].
     pub fn record_asked(&mut self, a: Asked) {
         self.asked.push(a);
@@ -974,6 +1002,9 @@ fn event_name(ev: &Event) -> &'static str {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Board {
+    /// Last 4 characters of the running super session's id: it numbers its tasks from T1.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub sid: String,
     pub tasks: Vec<Task>,
     /// Repo main checkout → task id holding its merge lock.
     pub merge_locks: BTreeMap<PathBuf, String>,
@@ -1011,14 +1042,44 @@ impl Board {
         self.tasks.iter().find(|t| t.id == id)
     }
 
-    /// The task labelled `label`.
-    pub fn by_label(&self, label: &str) -> Option<&Task> {
-        self.tasks.iter().find(|t| t.label == label)
+    /// The running super session's next task number: its rows (reviews too) count from T1.
+    pub fn next_number(&self) -> u64 {
+        self.tasks
+            .iter()
+            .filter(|t| t.sid == self.sid)
+            .map(Task::number)
+            .max()
+            .unwrap_or(0)
+            + 1
     }
 
-    /// [`Task::status_line`] of the task labelled `label`, now.
+    /// A new row's id and label: `<sid4>-T<n>-<slug>` (worktree and branch names follow it).
+    pub fn with_sid(&self, short: &str) -> String {
+        match self.sid.as_str() {
+            "" => short.to_string(),
+            s => format!("{s}-{short}"),
+        }
+    }
+
+    /// How super shows `t` now ([`Task::name`]).
+    pub fn name(&self, t: &Task) -> String {
+        t.name(&self.sid)
+    }
+
+    /// The task labelled `label`, or shown as `label` ([`name`](Self::name)).
+    pub fn by_label(&self, label: &str) -> Option<&Task> {
+        self.tasks.iter().find(|t| t.label == label || self.name(t) == label)
+    }
+
+    /// [`Task::status_line`] of the task labelled `label`, now, under its shown name.
     pub fn status_line(&self, label: &str) -> Option<String> {
-        self.by_label(label).map(|t| t.status_line(now()))
+        self.by_label(label).map(|t| {
+            let l = t.status_line(now());
+            match l.strip_prefix(&t.label) {
+                Some(rest) => format!("{}{rest}", self.name(t)),
+                None => l,
+            }
+        })
     }
 
     /// A `say` was sent: a `question` or `warning` joins Needs you; an `update` or `done`
@@ -1231,7 +1292,7 @@ impl Board {
                     .and_then(&live)
                     .unwrap_or_else(|| (t.model.clone(), t.tokens));
                 TaskRow {
-                    label: t.label.clone(),
+                    label: self.name(t),
                     repo: t.repo_name(),
                     state: t.state_text(),
                     model,
@@ -1262,7 +1323,7 @@ impl Board {
             let summary: String = t.summary.as_deref().unwrap_or("").chars().take(STATE_SUMMARY).collect();
             s.push_str(&format!(
                 "| {} | {} | {} |\n",
-                cell(&t.label),
+                cell(&self.name(t)),
                 cell(&t.state_text()),
                 cell(&summary)
             ));
@@ -1284,13 +1345,16 @@ impl Board {
                 s.push_str(&format!("Your last check that found all fine: {} ago.\n", age(now, c)));
             }
             for t in running {
-                s.push_str(&format!("- {}: {}\n", t.label, t.health.line(now)));
+                s.push_str(&format!("- {}: {}\n", self.name(t), t.health.line(now)));
             }
         }
         let charters: Vec<String> = rows
             .iter()
             .filter(|t| t.kind == Kind::Work)
-            .map(|t| t.charter())
+            .map(|t| {
+                let c = t.charter();
+                c.replacen(&format!("### {} ", t.label), &format!("### {} ", self.name(t)), 1)
+            })
             .collect();
         if !charters.is_empty() {
             s.push_str("\n## Charters\n");
@@ -1331,7 +1395,7 @@ impl Board {
             };
             out.push_str(&format!(
                 "| {} | {} | {kind} | {} | {} | {} |\n",
-                cell(&t.label),
+                cell(&self.name(t)),
                 cell(&t.repo_name()),
                 cell(&t.state_text()),
                 cell(&t.model),
@@ -1359,7 +1423,7 @@ impl Board {
             .iter()
             .filter(|t| t.state != State::Archived && !t.after.is_empty())
         {
-            out.push_str(&format!("- After merge, {}: {}\n", t.label, t.after.join("; ")));
+            out.push_str(&format!("- After merge, {}: {}\n", self.name(t), t.after.join("; ")));
         }
         for (provider, limit) in &self.holds {
             out.push_str(&format!("- On hold: {provider} ({})\n", limit.kind.label()));
@@ -2397,6 +2461,7 @@ mod tests {
     #[test]
     fn board_md_render() {
         let b = Board {
+            sid: String::new(),
             tasks: vec![
                 Task {
                     id: "T2".into(),

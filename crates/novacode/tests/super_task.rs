@@ -82,12 +82,19 @@ fn board(home: &Path) -> Value {
     serde_json::from_str(&std::fs::read_to_string(dir.join("board.json")).unwrap_or("{}".into())).unwrap()
 }
 
+/// A row by its label, with or without the super session's `<sid4>-` (L10.9).
 fn task(home: &Path, label: &str) -> Value {
     board(home)["tasks"]
         .as_array()
         .into_iter()
         .flatten()
-        .find(|t| t["label"] == label)
+        .find(|t| {
+            t["label"] == label
+                || t["label"]
+                    .as_str()
+                    .and_then(|l| l.split_once('-'))
+                    .is_some_and(|(_, r)| r == label)
+        })
         .cloned()
         .unwrap_or(Value::Null)
 }
@@ -187,7 +194,9 @@ fn super_spawns_a_task_after_the_trust_card_and_stops_it() {
     assert_eq!(t["trusted"], true);
     let session = t["session"].as_str().unwrap().to_string();
     cleanup.1.push(session.clone());
-    let wt = app.join(".worktrees/T1-note");
+    let id = t["id"].as_str().unwrap().to_string();
+    assert!(id.len() == 12 && id.ends_with("-T1-note"), "{id}");
+    let wt = app.join(".worktrees").join(&id);
     assert_eq!(t["worktree"], wt.to_str().unwrap());
     assert!(wt.join("AGENTS.md").exists());
 
@@ -199,7 +208,7 @@ fn super_spawns_a_task_after_the_trust_card_and_stops_it() {
         .split(|b| *b == 0)
         .map(|v| String::from_utf8_lossy(v).into_owned())
         .collect();
-    assert!(env.contains(&"NOVACODE_TASK=T1-note".to_string()), "{env:?}");
+    assert!(env.contains(&format!("NOVACODE_TASK={id}")), "{env:?}");
     assert!(env.contains(&format!("NOVACODE_EDIT_RULE=worktree:{}", wt.display())));
     assert!(!env.iter().any(|v| v.starts_with("NOVACODE_BG_CHILD=")));
     assert_eq!(run["state"]["cwd"], wt.to_str().unwrap());
@@ -232,7 +241,7 @@ fn super_spawns_a_task_after_the_trust_card_and_stops_it() {
         std::thread::sleep(Duration::from_millis(100));
     };
     assert!(msgs.contains("add a note") && msgs.contains("1. note exists"), "{msgs}");
-    assert!(msgs.contains("You are task T1-note"), "{msgs}");
+    assert!(msgs.contains(&format!("You are task {id}")), "{msgs}");
 
     c.send(json!({"id": "p2", "type": "prompt", "text": "stop it"}));
     loop {
