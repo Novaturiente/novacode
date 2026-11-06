@@ -282,6 +282,32 @@ impl Health {
     }
 }
 
+/// Chars of a report summary in a status line.
+pub const STATUS_SUMMARY: usize = 80;
+
+/// The first `N%` in `s`.
+fn percent(s: &str) -> Option<String> {
+    s.split(|c: char| !(c.is_ascii_digit() || c == '%'))
+        .find(|w| w.len() > 1 && w.ends_with('%') && w[..w.len() - 1].chars().all(|c| c.is_ascii_digit()))
+        .map(String::from)
+}
+
+/// An open question or warning super sent the user: the Needs you list (L10.9).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Need {
+    /// The `say` call's id.
+    pub id: String,
+    /// `question` or `warning`.
+    pub kind: String,
+    pub tasks: Vec<String>,
+    pub status: String,
+    /// Unix seconds.
+    pub at: u64,
+    /// A question with no card (one exact answer): super's next `reply` answers it.
+    pub typed: bool,
+}
+
 /// Chars of a task's charter notes before the oldest are summarised.
 pub const NOTES_CAP: usize = 3000;
 /// Chars of a summary row in the state block.
@@ -380,6 +406,9 @@ pub struct Task {
     /// What code saw of its work, for super's health checks.
     #[serde(skip_serializing_if = "is_default")]
     pub health: Health,
+    /// Unix seconds of its last report of any state; 0 = none yet.
+    #[serde(skip_serializing_if = "is_default")]
+    pub report_at: u64,
     /// Unix seconds.
     pub started: u64,
     pub updated: u64,
@@ -444,6 +473,31 @@ impl Task {
             true => state.to_string(),
             false => format!("{state} ({})", marks.join(", ")),
         }
+    }
+
+    /// One status line for the user (`say` blocks, code-made cards): label, state, a
+    /// percentage from the last report, its summary cut short, and the report's age.
+    pub fn status_line(&self, now: u64) -> String {
+        let mut parts = vec![self.label.clone(), self.state_text()];
+        if let Some(s) = self
+            .summary
+            .as_deref()
+            .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        {
+            if let Some(p) = percent(&s) {
+                parts.push(p);
+            }
+            let mut short: String = s.chars().take(STATUS_SUMMARY).collect();
+            if s.chars().count() > STATUS_SUMMARY {
+                short.push('…');
+            }
+            parts.push(short);
+        }
+        parts.push(match self.report_at {
+            0 => "no report yet".into(),
+            t => format!("last report {} ago", age(now, t)),
+        });
+        parts.join(" · ")
     }
 
     /// Its last `done` is on the commit an approved review already covered.
@@ -838,6 +892,9 @@ pub struct Board {
     /// Unix seconds of super's last health check that found everything fine.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_check: Option<u64>,
+    /// Open questions and warnings for the user (Needs you), oldest first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<Need>,
 }
 
 fn is_default<T: Default + PartialEq>(t: &T) -> bool {
@@ -847,6 +904,59 @@ fn is_default<T: Default + PartialEq>(t: &T) -> bool {
 impl Board {
     pub fn task(&self, id: &str) -> Option<&Task> {
         self.tasks.iter().find(|t| t.id == id)
+    }
+
+    /// The task labelled `label`.
+    pub fn by_label(&self, label: &str) -> Option<&Task> {
+        self.tasks.iter().find(|t| t.label == label)
+    }
+
+    /// [`Task::status_line`] of the task labelled `label`, now.
+    pub fn status_line(&self, label: &str) -> Option<String> {
+        self.by_label(label).map(|t| t.status_line(now()))
+    }
+
+    /// A `say` was sent: a `question` or `warning` joins Needs you; an `update` or `done`
+    /// resolves the warnings about any of its tasks; a `reply` answers typed questions.
+    pub fn note_say(&mut self, id: &str, kind: &str, tasks: &[String], status: &str, typed: bool) {
+        match kind {
+            "update" | "done" if !tasks.is_empty() => self
+                .needs
+                .retain(|n| n.kind != "warning" || !n.tasks.iter().any(|t| tasks.contains(t))),
+            "reply" => self.needs.retain(|n| !n.typed),
+            _ => {}
+        }
+        if matches!(kind, "question" | "warning") {
+            self.needs.push(Need {
+                id: id.into(),
+                kind: kind.into(),
+                tasks: tasks.to_vec(),
+                status: status.into(),
+                at: now(),
+                typed,
+            });
+        }
+    }
+
+    /// Needs you for the windows' Tasks tab.
+    pub fn needs_rows(&self) -> Vec<novacode_tui::panel::NeedRow> {
+        self.needs
+            .iter()
+            .map(|n| novacode_tui::panel::NeedRow {
+                id: n.id.clone(),
+                kind: n.kind.clone(),
+                tasks: n.tasks.clone(),
+                status: n.status.clone(),
+                at_ms: n.at * 1000,
+            })
+            .collect()
+    }
+
+    /// Take `id` off Needs you (its card was answered, or the user dismissed it).
+    pub fn drop_need(&mut self, id: &str) -> bool {
+        let n = self.needs.len();
+        self.needs.retain(|x| x.id != id);
+        self.needs.len() < n
     }
 
     /// Run `ev` through [`next`] and write the result to the row and the
@@ -905,6 +1015,7 @@ impl Board {
             } => {
                 t.summary = Some(summary.clone());
                 t.question = question.clone();
+                t.report_at = now();
                 if *state == ReportState::Progress {
                     t.health.progress_at = now();
                 }
@@ -1144,6 +1255,68 @@ mod tests {
             branch: Some("worktree-T1-fix".into()),
             ..Task::default()
         }
+    }
+
+    #[test]
+    fn a_status_line_is_built_from_the_board_row() {
+        let now = now();
+        let mut t = row(State::Running);
+        assert_eq!(t.status_line(now), "T1-fix · running · no report yet");
+        t.summary = Some("parser done, 40% of the tests pass\nnext: lexer".into());
+        t.report_at = now - 720;
+        assert_eq!(
+            t.status_line(now),
+            "T1-fix · running · 40% · parser done, 40% of the tests pass next: lexer · last report 12 min ago"
+        );
+        t.summary = Some("x".repeat(200));
+        let l = t.status_line(now);
+        assert!(l.contains(&format!("{}…", "x".repeat(STATUS_SUMMARY))), "{l}");
+        let b = Board {
+            tasks: vec![t],
+            ..Default::default()
+        };
+        assert!(b.status_line("T1-fix").unwrap().starts_with("T1-fix · running"));
+        assert_eq!(b.status_line("T9"), None);
+    }
+
+    #[test]
+    fn a_report_sets_the_report_time() {
+        let mut b = Board {
+            tasks: vec![row(State::Running)],
+            ..Default::default()
+        };
+        b.apply("T1", report(ReportState::Progress)).unwrap();
+        assert!(b.tasks[0].report_at >= now() - 1);
+    }
+
+    #[test]
+    fn needs_you_holds_questions_and_warnings_until_answered_resolved_or_dismissed() {
+        let mut b = Board::default();
+        let t = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        b.note_say("c1", "warning", &t(&["T1"]), "T1 stuck", false);
+        b.note_say("c2", "question", &t(&["T2"]), "T2 needs a port", false);
+        b.note_say("c3", "question", &t(&[]), "which name?", true);
+        b.note_say("c4", "note", &t(&["T1"]), "", false);
+        assert_eq!(
+            b.needs.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            ["c1", "c2", "c3"]
+        );
+        // An update on another task resolves nothing; one on T1 resolves its warning.
+        b.note_say("c5", "update", &t(&["T2"]), "", false);
+        assert_eq!(b.needs.len(), 3);
+        b.note_say("c6", "done", &t(&["T1"]), "", false);
+        assert_eq!(b.needs.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), ["c2", "c3"]);
+        // A card answered; a typed question answered by super's next reply.
+        assert!(b.drop_need("c2"));
+        b.note_say("c7", "reply", &t(&[]), "", false);
+        assert!(b.needs.is_empty());
+        // Dismissed by the user, and kept across a save.
+        b.note_say("c8", "warning", &t(&[]), "disk full", false);
+        let d = tempfile::tempdir().unwrap();
+        b.save(d.path()).unwrap();
+        let mut b = Board::load(d.path()).unwrap();
+        assert_eq!(b.needs[0].status, "disk full");
+        assert!(b.drop_need("c8") && !b.drop_need("c8"));
     }
 
     #[test]
@@ -1937,6 +2110,7 @@ mod tests {
             merge_locks: BTreeMap::from([(PathBuf::from("/root/proj"), "T1".to_string())]),
             holds: BTreeMap::from([("claude".to_string(), limit())]),
             last_check: None,
+            needs: vec![],
         };
         let want = "# Super board
 

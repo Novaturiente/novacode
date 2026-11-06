@@ -278,10 +278,18 @@ pub enum UiEvent {
     },
     /// Files tab: (path, +added, -removed) since the session started.
     FileStats(Vec<(String, u64, u64)>),
-    /// Super's board snapshot (L10.9): every task not archived, for the Tasks tab.
+    /// Super's board snapshot (L10.9): every task not archived, for the Tasks tab, and
+    /// the open questions and warnings (Needs you).
     /// Sent on connect and on change; older clients skip the unknown kind.
     Board {
         tasks: Vec<crate::panel::TaskRow>,
+        #[serde(default)]
+        needs: Vec<crate::panel::NeedRow>,
+    },
+    /// When this user's window last saw the session (an attach window, L10.9): the
+    /// "new since you last looked" divider goes before the first newer `say` block.
+    Seen {
+        ms: u64,
     },
     /// Open `path` in the editor; `base` holds its content from the session start, for a diff.
     OpenFile {
@@ -463,6 +471,9 @@ pub struct App {
     mcp: (usize, usize),
     task_started: Option<Instant>,
     started: Instant,
+    /// The terminal lost focus (L10.9): the first `say` block after that gets the
+    /// "new since you last looked" divider (`away.1`: placed already).
+    away: (bool, bool),
     #[cfg(feature = "images")]
     images: Option<crate::images::Images>,
 }
@@ -580,6 +591,7 @@ impl App {
             mcp: (0, 0),
             task_started: None,
             started: Instant::now(),
+            away: (false, false),
             #[cfg(feature = "images")]
             images: None,
         }
@@ -728,9 +740,13 @@ impl App {
             UiEvent::Dequeued { ok: false } => self.flash("too late: it already reached the model"),
             UiEvent::Procs { items } => self.panel.set_procs(items),
             UiEvent::FileStats(v) => self.panel.set_diffstat(v),
-            UiEvent::Board { tasks } => {
+            UiEvent::Board { tasks, needs } => {
                 self.board = Some(tasks.clone());
                 self.panel.set_tasks(tasks);
+                self.panel.set_needs(needs);
+            }
+            UiEvent::Seen { ms } => {
+                self.tr.mark_new_after(ms);
             }
             UiEvent::OpenFile { path, base } => self.open_file = Some((path, base)),
             UiEvent::Page { title, text } => {
@@ -849,12 +865,18 @@ impl App {
                     }
                 }
                 self.tr.on_message(&m);
+                if let Message::ToolResult { call_id, .. } = &m {
+                    self.mark_if_away(call_id);
+                }
             }
             AgentEvent::ToolStart { call } => {
                 self.tr.tool_start(&call.id);
                 self.activity = format!("running {}", call.name);
             }
-            AgentEvent::ToolUpdate { call_id, text } => self.tr.tool_update(&call_id, &text),
+            AgentEvent::ToolUpdate { call_id, text } => {
+                self.tr.tool_update(&call_id, &text);
+                self.mark_if_away(&call_id);
+            }
             AgentEvent::ToolEnd {
                 call_id,
                 is_error,
@@ -977,6 +999,22 @@ impl App {
         }
     }
 
+    /// A `say` block arrived while the terminal was unfocused: the divider goes before
+    /// the first one of this time away.
+    fn mark_if_away(&mut self, call_id: &str) {
+        if self.away != (true, false) {
+            return;
+        }
+        let is_say =
+            self.tr.turns.iter().rev().flat_map(|t| t.items.iter().rev()).any(
+                |i| matches!(i, crate::transcript::Item::Tool(t) if t.id == call_id && t.is_say() && t.say.is_some()),
+            );
+        if is_say {
+            self.tr.mark_new(call_id);
+            self.away.1 = true;
+        }
+    }
+
     /// An extension's UI op (L9 UI API).
     fn ui_op(&mut self, ext: &str, op: novacode_types::ui::UiOp) {
         use novacode_types::ui::UiOp;
@@ -1071,6 +1109,8 @@ impl App {
     fn panel_action(&mut self, a: crate::panel::PanelAction) {
         use crate::panel::PanelAction;
         match a {
+            // Needs you (L10.9): super's host takes it off the board; never a prompt.
+            PanelAction::Command(c) if c.starts_with("/dismiss ") => self.send(Cmd::Prompt(c)),
             PanelAction::Command(c) => self.submit(c, self.busy),
             PanelAction::OpenFile(p) => self.send(Cmd::OpenFile(p)),
             PanelAction::OpenProc(id) => self.open_procs(Some(id)),
@@ -1178,8 +1218,14 @@ impl App {
             Event::Mouse(m) => {
                 self.on_screen_mouse(m);
             }
-            Event::FocusGained => self.send(Cmd::Focus(true)),
-            Event::FocusLost => self.send(Cmd::Focus(false)),
+            Event::FocusGained => {
+                self.away.0 = false;
+                self.send(Cmd::Focus(true))
+            }
+            Event::FocusLost => {
+                self.away = (true, false);
+                self.send(Cmd::Focus(false))
+            }
             _ => {}
         }
     }

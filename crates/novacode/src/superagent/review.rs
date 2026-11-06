@@ -1061,7 +1061,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|q| q.starts_with("Accept T1-fix without an approved review?")),
+                .any(|q| q.starts_with("T1-fix · blocked")
+                    && q.contains("\n\nAccept T1-fix without an approved review?")),
             "{:?}",
             fx.cards.asked.lock().unwrap()
         );

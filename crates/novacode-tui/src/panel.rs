@@ -40,6 +40,19 @@ impl HostInfo {
     }
 }
 
+/// An open question or warning of super's (L10.9 Needs you), until answered, resolved
+/// or dismissed (`d` in the Tasks tab sends `/dismiss <id>`).
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct NeedRow {
+    pub id: String,
+    /// question or warning.
+    pub kind: String,
+    pub tasks: Vec<String>,
+    pub status: String,
+    pub at_ms: u64,
+}
+
 /// One task of super's board for the Tasks tab (L10.9 dashboard); the board
 /// snapshot is a list of these. Board fields plus live data from the task's run file.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
@@ -229,6 +242,9 @@ pub fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+
+/// Node ids of Needs you rows start with this.
+const NEED: &str = "need:";
 
 fn node(id: &str, label: impl Into<String>) -> Node {
     Node {
@@ -456,6 +472,36 @@ impl Panel {
         // The first rows put the tab on show (an empty Agent tab would show "(empty)").
         if !had {
             self.offer("tasks");
+        }
+    }
+
+    /// Super's open questions and warnings: the Needs you section on top of the Tasks tab.
+    pub fn set_needs(&mut self, rows: Vec<NeedRow>) {
+        let nodes = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let who = match r.tasks.is_empty() {
+                    true => String::new(),
+                    false => format!(" · {}", r.tasks.join(", ")),
+                };
+                let mut n = node(&format!("{NEED}{}", r.id), format!("{}{who}", r.kind));
+                n.status = Some(if r.kind == "warning" { "failed" } else { "waiting" }.into());
+                n.order = Some(i as f64);
+                n.time = Some(novacode_types::ui::Time {
+                    ms: None,
+                    since: Some(r.at_ms),
+                });
+                n.detail = vec![r.status, "d dismisses".into()];
+                n.actions.insert("d".into(), format!("/dismiss {}", r.id));
+                n
+            })
+            .collect();
+        if let Some(t) = self.tab("tasks") {
+            let s = t.source("needs");
+            s.title = Some("Needs you".into());
+            s.order = -1.0;
+            s.nodes = nodes;
         }
     }
 
@@ -1138,6 +1184,8 @@ impl Panel {
             // Without a selection this scrolls; render clamps it to the text.
             "down" | "j" if !self.interactive() => self.sel += 1,
             "down" | "j" => self.sel = (self.sel + 1).min(n.saturating_sub(1)),
+            // Enter on a Needs you row does nothing: only `d` dismisses it.
+            "enter" if sel_id.as_deref().is_some_and(|i| i.starts_with(NEED)) => {}
             k => {
                 let act = if k == "enter" {
                     sel_actions.get("enter").or(sel_actions.values().next())

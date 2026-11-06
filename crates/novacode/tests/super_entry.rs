@@ -153,7 +153,7 @@ fn super_session_sees_exactly_its_tools_and_no_project_files() {
     tools.sort();
     assert_eq!(
         tools,
-        ["agent", "ask_user", "history_search", "memory", "task", "todo"],
+        ["agent", "ask_user", "history_search", "memory", "say", "task", "todo"],
         "{report}"
     );
     let sections = rows(&report, "system prompt");

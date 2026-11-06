@@ -639,6 +639,13 @@ pub async fn attach(
     let id = state.session.clone();
     let (etx, erx) = mpsc::unbounded_channel();
     let (ui_tx, ui_rx) = mpsc::unbounded_channel();
+    // "New since you last looked" (L10.9): when this user's windows last saw the session.
+    let seen = seen_file(paths, &id);
+    if let Some(ms) = read_seen(&seen) {
+        let _ = ui_tx.send(UiEvent::Seen { ms });
+    }
+    let focused = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (seen_at_end, focused_at_end) = (seen.clone(), focused.clone());
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Cmd>();
     let (req_tx, mut req_rx) = mpsc::unbounded_channel::<Request>();
     tokio::spawn(async move {
@@ -827,9 +834,14 @@ pub async fn attach(
                     height,
                 },
                 // The session-swapping commands are refused by the attached TUI itself.
+                // Focus moving in or out: the user saw the session until now.
+                Cmd::Focus(f) => {
+                    focused.store(f, std::sync::atomic::Ordering::Relaxed);
+                    write_seen(&seen);
+                    continue;
+                }
                 Cmd::ListSessions
                 | Cmd::ListPrompts(_)
-                | Cmd::Focus(_)
                 | Cmd::Background
                 | Cmd::Processes
                 | Cmd::Dequeue(_)
@@ -877,6 +889,9 @@ pub async fn attach(
         procs: Vec::new(),
     };
     let ran = novacode_tui::run(init, erx, ui_rx, cmd_tx).await;
+    if focused_at_end.load(std::sync::atomic::Ordering::Relaxed) {
+        write_seen(&seen_at_end);
+    }
     // Closing the feed ends the sinks, which clear the pane options.
     reader.abort();
     if let Some(s) = sinks {
@@ -893,6 +908,23 @@ pub async fn attach(
         ),
     }
     Ok(Some(std::process::ExitCode::SUCCESS))
+}
+
+/// `<home>/seen/<session>`: Unix ms an attach window of this user last saw the session
+/// (it lost focus or closed). Read on attach for the "new since you last looked" divider.
+fn seen_file(paths: &Paths, session: &str) -> PathBuf {
+    paths.home().join("seen").join(session)
+}
+
+fn read_seen(f: &Path) -> Option<u64> {
+    std::fs::read_to_string(f).ok()?.trim().parse().ok()
+}
+
+fn write_seen(f: &Path) {
+    if let Some(dir) = f.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(f, novacode_core::session::now_ms().to_string());
 }
 
 /// `attach`/`panel`, reconnecting while the owner rebuilds the same session.

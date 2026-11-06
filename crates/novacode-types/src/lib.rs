@@ -796,6 +796,36 @@ pub struct Choice {
     pub recommended: bool,
 }
 
+/// One message super sent the user with its `say` tool (L10.9 "Structured messages"):
+/// everything the window draws, saved in the tool result's `details.say` so a
+/// reattached window draws it the same. Code fills the frame (time, trigger, task lines).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Say {
+    /// update, question, warning, done, note or reply.
+    pub kind: String,
+    /// normal or high.
+    pub priority: String,
+    /// Unix ms it was sent.
+    pub at_ms: u64,
+    /// Local `HH:MM` it was sent.
+    pub time: String,
+    /// What started the run that sent it: `after T2 reported blocked`, `health check`, `reply to you`.
+    pub trigger: String,
+    /// Task labels it is about.
+    pub tasks: Vec<String>,
+    /// One board status line per task, written by code.
+    pub lines: Vec<String>,
+    /// Where things stand.
+    pub status: String,
+    /// Markdown.
+    pub body: String,
+    pub choices: Vec<Choice>,
+    /// The user's answer on the question's card.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+}
+
 /// The user's answer to one [`Question`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Reply {

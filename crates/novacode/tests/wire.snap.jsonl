@@ -5,7 +5,7 @@
 {"type":"response","id":"1","command":"prompt","ok":true,"data":{"disposition":"started"}}
 {"type":"response","command":"set_model","ok":false,"error":"unknown model"}
 {"type":"ui","ui":{"kind":"notice","text":"n","error":false}}
-{"type":"ui","ui":{"kind":"board","tasks":[{"label":"T3-fix-parser","repo":"novacode","state":"blocked: quota","model":"claude/claude-sonnet-5-5","tokens":41200,"started_ms":1793000000000,"summary":"parser fixed; tests pass","session":"01def"},{"label":"T4-docs","repo":"site","state":"queued","model":"claude/claude-haiku-5-5","tokens":0,"started_ms":0}]}}
+{"type":"ui","ui":{"kind":"board","tasks":[{"label":"T3-fix-parser","repo":"novacode","state":"blocked: quota","model":"claude/claude-sonnet-5-5","tokens":41200,"started_ms":1793000000000,"summary":"parser fixed; tests pass","session":"01def"},{"label":"T4-docs","repo":"site","state":"queued","model":"claude/claude-haiku-5-5","tokens":0,"started_ms":0}],"needs":[{"id":"say-1793000000000","kind":"question","tasks":["T3-fix-parser"],"status":"blocked on the quota","at_ms":1793000000000}]}}
 {"type":"approve","id":3,"tool":"bash","detail":"rm -rf build","reason":"deletes files","rule":"Bash(rm:*)","risky":true}
 {"type":"approval_done","id":3}
 {"type":"ask","id":4,"questions":[{"question":"Which db?","header":"Database","options":[{"label":"SQLite","description":"zero setup","recommended":true}],"multi":false}]}

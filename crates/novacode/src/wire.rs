@@ -473,6 +473,13 @@ mod tests {
                             ..Default::default()
                         },
                     ],
+                    needs: vec![novacode_tui::panel::NeedRow {
+                        id: "say-1793000000000".into(),
+                        kind: "question".into(),
+                        tasks: vec!["T3-fix-parser".into()],
+                        status: "blocked on the quota".into(),
+                        at_ms: 1_793_000_000_000,
+                    }],
                 })
                 .unwrap(),
             },

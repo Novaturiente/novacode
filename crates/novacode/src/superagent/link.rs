@@ -704,12 +704,22 @@ impl Links {
         if interrupted.is_empty() {
             return;
         }
+        // Each task's board status line first (L10.9 "Structured messages").
+        let lines: String = {
+            let b = sup.board.lock().unwrap();
+            interrupted
+                .iter()
+                .filter_map(|(l, _)| b.status_line(l))
+                .map(|l| format!("{l}\n"))
+                .collect()
+        };
         let (sup, asker, me) = (sup.clone(), self.asker.clone(), self.me.clone());
         let t = tokio::spawn(async move {
             let q = novacode_types::Question {
-                question: "Super restarted and found these tasks' processes gone; they are interrupted. Which should \
-                           resume? Each first checks its folder and git before repeating anything outside it."
-                    .into(),
+                question: format!(
+                    "{lines}\nSuper restarted and found these tasks' processes gone; they are interrupted. Which \
+                     should resume? Each first checks its folder and git before repeating anything outside it."
+                ),
                 header: Some("Resume tasks".into()),
                 options: interrupted
                     .iter()
@@ -3663,6 +3673,11 @@ mod tests {
         let labels: Vec<&str> = q.options.iter().map(|o| o.label.as_str()).collect();
         assert_eq!(labels, ["T2-dead", "T3-wait", "T5-merge"]);
         assert!(q.multi);
+        assert!(
+            q.question.starts_with("T2-dead · interrupted · ") && q.question.contains("\nT5-merge · "),
+            "{}",
+            q.question
+        );
         let tx = fx.asker.waiting.lock().unwrap().remove(0);
         let reply = Reply {
             question: q.question.clone(),

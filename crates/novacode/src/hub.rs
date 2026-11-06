@@ -55,7 +55,12 @@ pub struct Hub {
     focused: std::sync::atomic::AtomicBool,
     /// Print mode: no window will ever answer, so approvals and questions are refused at once.
     pub unattended: std::sync::atomic::AtomicBool,
+    /// Super's `/dismiss <id>` (L10.9 Needs you): takes the row off its board; false when not there.
+    pub dismiss: std::sync::OnceLock<Dismiss>,
 }
+
+/// Takes a Needs you row off super's board by id; false when it isn't there.
+pub type Dismiss = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// Compactions on a session branch (L9.19): the hub state's `compactions` at start.
 pub fn compactions(branch: &[&novacode_core::session::Entry]) -> u32 {
@@ -104,6 +109,7 @@ impl Hub {
             changed: tokio::sync::watch::channel(state).0,
             focused: true.into(),
             unattended: false.into(),
+            dismiss: Default::default(),
         });
         let h = Arc::downgrade(&hub);
         tokio::spawn(async move {
@@ -306,8 +312,11 @@ impl Hub {
 
     /// Super's board changed (L10.9): every window's Tasks tab gets the new rows,
     /// and windows that connect later get the latest.
-    pub fn set_board(&self, tasks: Vec<novacode_tui::panel::TaskRow>) {
-        let Ok(ui) = serde_json::to_value(UiEvent::Board { tasks: tasks.clone() }) else {
+    pub fn set_board(&self, tasks: Vec<novacode_tui::panel::TaskRow>, needs: Vec<novacode_tui::panel::NeedRow>) {
+        let Ok(ui) = serde_json::to_value(UiEvent::Board {
+            tasks: tasks.clone(),
+            needs: needs.clone(),
+        }) else {
             return;
         };
         let mut g = self.inner.lock().unwrap();
@@ -315,7 +324,7 @@ impl Hub {
         g.clients.retain(|_, c| c.send(msg.clone()).is_ok());
         g.board = Some(msg);
         if let Some(l) = &g.local {
-            let _ = l.send(UiEvent::Board { tasks });
+            let _ = l.send(UiEvent::Board { tasks, needs });
         }
     }
 

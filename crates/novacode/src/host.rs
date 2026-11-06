@@ -261,6 +261,16 @@ impl Host {
                 let arg = t.trim().strip_prefix("/websearch").unwrap_or("").trim();
                 let _ = ui.send(websearch_command(&self.paths.settings(), arg));
             }
+            // Super's Needs you (L10.9): `d` on a row in the Tasks tab.
+            Cmd::Prompt(t) | Cmd::Steer(t) if t.split_whitespace().next() == Some("/dismiss") => {
+                let id = t.trim().strip_prefix("/dismiss").unwrap_or("").trim();
+                let (text, error) = match self.hub.dismiss.get() {
+                    Some(f) if f(id) => ("dismissed".to_string(), false),
+                    Some(_) => (format!("nothing to dismiss: {id}"), true),
+                    None => ("/dismiss works in a super window".to_string(), true),
+                };
+                let _ = ui.send(UiEvent::Notice { text, error });
+            }
             Cmd::Prompt(t) | Cmd::Steer(t) if t.trim() == "/debug" => {
                 let _ = ui.send(UiEvent::Page {
                     title: "Debug".into(),

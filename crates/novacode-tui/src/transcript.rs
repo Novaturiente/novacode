@@ -11,6 +11,8 @@ use serde_json::Value;
 use std::time::Instant;
 
 const OUTPUT_TAIL: usize = 4;
+/// The divider before the first of super's messages the user hasn't seen (L10.9).
+pub const NEW_SINCE: &str = "new since you last looked";
 const LIVE_CAP: usize = 64 * 1024;
 
 pub enum Item {
@@ -46,6 +48,15 @@ pub struct Tool {
     pub started: Option<Instant>,
     /// `details.ui` of the result: styled lines the tool asks to show instead of its output.
     pub ui: Option<Vec<novacode_types::ui::Line>>,
+    /// Super's `say` (L10.9): the framed block from the result (or the open question's update).
+    pub say: Option<Box<novacode_types::Say>>,
+}
+
+impl Tool {
+    /// A `say` that is drawn as a block (an error result shows as a tool call).
+    pub fn is_say(&self) -> bool {
+        self.name == "say" && !self.is_error
+    }
 }
 
 #[derive(Default)]
@@ -265,6 +276,57 @@ impl Transcript {
         });
     }
 
+    /// Put the one [`NEW_SINCE`] divider right before the tool call `id` (a `say` block),
+    /// taking it from where it was.
+    pub fn mark_new(&mut self, id: &str) {
+        let at = self.turns.iter().enumerate().find_map(|(ti, turn)| {
+            turn.items
+                .iter()
+                .position(|i| matches!(i, Item::Tool(t) if t.id == id))
+                .map(|ii| (ti, ii))
+        });
+        let Some((ti, mut ii)) = at else { return };
+        for (n, turn) in self.turns.iter_mut().enumerate() {
+            let before = turn.items.len();
+            let mut k = 0;
+            turn.items.retain(|i| {
+                let drop = matches!(i, Item::Divider { text, .. } if text == NEW_SINCE);
+                if drop && n == ti && k < ii {
+                    ii -= 1;
+                }
+                k += 1;
+                !drop
+            });
+            if turn.items.len() != before {
+                turn.touch();
+            }
+        }
+        let turn = &mut self.turns[ti];
+        turn.items.insert(
+            ii,
+            Item::Divider {
+                text: NEW_SINCE.into(),
+                error: false,
+            },
+        );
+        turn.touch();
+    }
+
+    /// The divider before the first `say` block sent after `seen_ms` (a reattach). False when none is newer.
+    pub fn mark_new_after(&mut self, seen_ms: u64) -> bool {
+        let first = self.turns.iter().flat_map(|t| &t.items).find_map(|i| match i {
+            Item::Tool(t) if t.say.as_ref().is_some_and(|s| s.at_ms > seen_ms) => Some(t.id.clone()),
+            _ => None,
+        });
+        match first {
+            Some(id) => {
+                self.mark_new(&id);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// A notice that stays in view when its turn folds (why a turn ended early).
     pub fn pinned_notice(&mut self, text: impl Into<String>) {
         self.turn().items.push(Item::Notice {
@@ -464,6 +526,7 @@ impl Transcript {
                         duration_ms: None,
                         started: None,
                         ui: None,
+                        say: None,
                     }));
                 }
                 if let Some(e) = &a.error_message {
@@ -493,6 +556,11 @@ impl Transcript {
                         .as_ref()
                         .and_then(|d| d.get("ui"))
                         .and_then(|v| serde_json::from_value(v.clone()).ok());
+                    if t.name == "say" {
+                        t.say = details
+                            .as_ref()
+                            .and_then(|d| serde_json::from_value(d["say"].clone()).ok());
+                    }
                 }
                 let imgs: Vec<Item> = images_of(content).collect();
                 if !imgs.is_empty() {
@@ -507,6 +575,13 @@ impl Transcript {
 
     pub fn tool_update(&mut self, id: &str, text: &str) {
         if let Some(t) = self.tool(id) {
+            // An open question's framed block, sent before its card.
+            if t.name == "say" {
+                if let Ok(v) = serde_json::from_str::<Value>(text) {
+                    t.say = serde_json::from_value(v["say"].clone()).ok();
+                }
+                return;
+            }
             t.output.push_str(text);
             if t.output.len() > LIVE_CAP {
                 let mut cut = t.output.len() - LIVE_CAP;
@@ -722,7 +797,8 @@ fn lay_turn(
             && turn.items[..idx]
                 .iter()
                 .all(|i| matches!(i, Item::User(_) | Item::Image(_)));
-        let text = matches!(item, Item::Assistant(b) if b.iter().any(|(k, _)| *k == BlockKind::Text));
+        let text = matches!(item, Item::Assistant(b) if b.iter().any(|(k, _)| *k == BlockKind::Text))
+            || matches!(item, Item::Tool(tool) if tool.is_say());
         !matches!(
             item,
             Item::User(_) | Item::Notice { folds: false, .. } | Item::Divider { .. }
@@ -1094,7 +1170,125 @@ const BODY_ROWS: usize = 10;
 /// Cap for Ctrl+O's full view, so a huge output can't stall layout.
 const FULL_ROWS: usize = 2000;
 
+/// The colour of a `say` kind.
+fn kind_style(kind: &str, t: &Theme) -> ratatui::style::Style {
+    match kind {
+        "question" => t.warn,
+        "warning" => t.error,
+        "done" => t.ok,
+        "note" => t.thinking,
+        "reply" => t.heading,
+        _ => t.accent,
+    }
+}
+
+/// The `say` block's content: from the frame, else (a call still being written) its arguments.
+fn say_of(tool: &Tool) -> novacode_types::Say {
+    if let Some(s) = &tool.say {
+        return (**s).clone();
+    }
+    let a = &tool.args;
+    let s = |k: &str| a.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+    novacode_types::Say {
+        kind: s("kind"),
+        priority: s("priority"),
+        tasks: serde_json::from_value(a["tasks"].clone()).unwrap_or_default(),
+        status: s("status"),
+        body: s("body"),
+        choices: serde_json::from_value(a["choices"].clone()).unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
+/// Super's message as a framed block (L10.9): badge, time and trigger; one board status
+/// line per task; where things stand; the body; the choices and the answer.
+/// `open`: a question whose card waits for the user.
+pub fn lay_say(s: &novacode_types::Say, open: bool, width: usize, t: &Theme) -> Vec<Line<'static>> {
+    use ratatui::style::Modifier;
+    let ks = kind_style(&s.kind, t);
+    let high = s.priority == "high";
+    let badge = match high {
+        true => ks.add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        false => ks.add_modifier(Modifier::BOLD),
+    };
+    let mut head = vec![
+        Span::styled("╭ ", ks),
+        Span::styled(format!(" {} ", s.kind.to_uppercase()), badge),
+    ];
+    if high {
+        head.push(Span::styled(" HIGH", t.error.add_modifier(Modifier::BOLD)));
+    }
+    let mut meta: Vec<&str> = Vec::new();
+    if !s.time.is_empty() {
+        meta.push(&s.time);
+    }
+    if !s.trigger.is_empty() {
+        meta.push(&s.trigger);
+    }
+    if !meta.is_empty() {
+        head.push(Span::styled(format!(" · {}", sanitize(&meta.join(" · "))), t.dim));
+    }
+    let bar = [Span::styled("│ ", ks)];
+    let mut lines = vec![Line::default(), wrap::truncate(head, width)];
+    let row = |spans: Vec<Span<'static>>, lines: &mut Vec<Line<'static>>| {
+        lines.extend(wrap::wrap(spans, width, &bar, &bar));
+    };
+    // Labels named without a status line (a call still being written): the labels alone.
+    if s.lines.is_empty() && !s.tasks.is_empty() {
+        row(vec![Span::styled(sanitize(&s.tasks.join(", ")), t.dim)], &mut lines);
+    }
+    for l in &s.lines {
+        row(vec![Span::styled(sanitize(l), t.text)], &mut lines);
+    }
+    if !s.status.is_empty() {
+        row(
+            vec![
+                Span::styled("Where things stand: ", t.text.add_modifier(Modifier::BOLD)),
+                Span::styled(sanitize(&s.status), t.text),
+            ],
+            &mut lines,
+        );
+    }
+    if !s.body.is_empty() {
+        if !s.lines.is_empty() || !s.status.is_empty() {
+            lines.push(Line::from(bar.to_vec()));
+        }
+        for l in markdown::render(&s.body, width.saturating_sub(2).max(1), t, true) {
+            let mut spans = bar.to_vec();
+            spans.extend(l.spans);
+            lines.push(Line::from(spans));
+        }
+    }
+    for (i, c) in s.choices.iter().enumerate() {
+        let mut spans = vec![Span::styled(format!("{}. {}", i + 1, sanitize(&c.label)), ks)];
+        if let Some(d) = &c.description {
+            spans.push(Span::styled(format!(" — {}", sanitize(d)), t.dim));
+        }
+        row(spans, &mut lines);
+    }
+    if let Some(a) = &s.answer {
+        row(
+            vec![
+                Span::styled("✓ you answered: ", t.ok),
+                Span::styled(sanitize(a), t.text),
+            ],
+            &mut lines,
+        );
+    } else if open {
+        row(
+            vec![Span::styled("waiting for your answer on its card", t.dim)],
+            &mut lines,
+        );
+    }
+    lines.push(Line::styled("╰─", ks));
+    lines
+}
+
 fn lay_tool(tool: &Tool, width: usize, t: &Theme, (full, hint): (bool, &str)) -> Vec<Line<'static>> {
+    if tool.is_say() {
+        let open = !tool.done && tool.say.as_ref().is_some_and(|s| !s.choices.is_empty());
+        return lay_say(&say_of(tool), open, width, t);
+    }
     let (dot, st) = match (tool.done, tool.is_error) {
         (false, _) => (tool.started.map_or("◌", spin_frame), t.warn),
         (true, false) => ("●", t.ok),
@@ -1497,6 +1691,168 @@ mod reminder_tests {
             Some("[schedule s1 fired] ping")
         );
         assert_eq!(reminder_line("fix the <system-reminder> bug"), None);
+    }
+}
+
+#[cfg(test)]
+mod say_tests {
+    use super::*;
+    use novacode_types::{AssistantMessage, Choice, Say, StopReason, ToolCall};
+    use serde_json::json;
+
+    fn plain(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn say(kind: &str) -> Say {
+        Say {
+            kind: kind.into(),
+            priority: "normal".into(),
+            at_ms: 1,
+            time: "14:05".into(),
+            trigger: "after T2-api reported blocked".into(),
+            tasks: vec!["T2-api".into()],
+            lines: vec!["T2-api · blocked · needs the db url · last report 3 min ago".into()],
+            status: "T2-api waits for the db url".into(),
+            body: "It asked for **DATABASE_URL**.".into(),
+            choices: vec![],
+            answer: None,
+        }
+    }
+
+    #[test]
+    fn each_kind_draws_a_framed_block_with_its_own_colour() {
+        let t = Theme::default();
+        for kind in ["update", "warning", "done", "note", "reply"] {
+            let lines = lay_say(&say(kind), false, 80, &t);
+            assert_eq!(
+                plain(&lines),
+                [
+                    String::new(),
+                    format!("╭  {}  · 14:05 · after T2-api reported blocked", kind.to_uppercase()),
+                    "│ T2-api · blocked · needs the db url · last report 3 min ago".into(),
+                    "│ Where things stand: T2-api waits for the db url".into(),
+                    "│".into(),
+                    "│ It asked for DATABASE_URL.".into(),
+                    "╰─".into(),
+                ],
+                "{kind}"
+            );
+            assert_eq!(lines[1].spans[1].style.fg, kind_style(kind, &t).fg, "{kind}");
+        }
+        let colours: std::collections::HashSet<_> = ["update", "question", "warning", "done", "note", "reply"]
+            .iter()
+            .map(|k| format!("{:?}", kind_style(k, &t)))
+            .collect();
+        assert_eq!(colours.len(), 6, "one colour per kind");
+        // A question: its choices, then the answer once given; high priority stands out.
+        let mut q = say("question");
+        q.priority = "high".into();
+        q.choices = vec![Choice {
+            label: "Wait".into(),
+            description: Some("keep it blocked".into()),
+            preview: None,
+            recommended: false,
+        }];
+        let open = plain(&lay_say(&q, true, 80, &t));
+        assert_eq!(open[1], "╭  QUESTION  HIGH · 14:05 · after T2-api reported blocked");
+        assert_eq!(
+            &open[6..],
+            [
+                "│ 1. Wait — keep it blocked",
+                "│ waiting for your answer on its card",
+                "╰─"
+            ]
+        );
+        let lines = lay_say(&q, true, 80, &t);
+        assert!(
+            lines[1].spans[1]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        q.answer = Some("Wait".into());
+        let done = plain(&lay_say(&q, false, 80, &t));
+        assert_eq!(&done[7..], ["│ ✓ you answered: Wait", "╰─"]);
+    }
+
+    fn call(args: serde_json::Value) -> Message {
+        Message::Assistant(AssistantMessage {
+            content: vec![Block::ToolCall(ToolCall {
+                id: "c1".into(),
+                name: "say".into(),
+                arguments: args,
+                arguments_error: None,
+                replay: None,
+            })],
+            stop: StopReason::ToolUse,
+            usage: Default::default(),
+            provider: "f".into(),
+            model: "m".into(),
+            response_id: None,
+            error_message: None,
+            thinking_level: None,
+        })
+    }
+
+    #[test]
+    fn a_reattached_window_draws_the_same_block_and_it_never_folds() {
+        let t = Theme::default();
+        let s = say("warning");
+        let args = json!({"kind": "warning", "tasks": ["T2-api"], "status": s.status, "body": s.body});
+        let result = Message::ToolResult {
+            call_id: "c1".into(),
+            tool_name: "say".into(),
+            content: vec![Block::text("Shown to the user.")],
+            is_error: false,
+            details: Some(json!({"say": s, "need": "say-1"})),
+        };
+        // Live: the call, its progress update, the result, then the turn settles.
+        let mut live = Transcript::default();
+        live.on_message(&Message::user("status?"));
+        live.on_message(&call(args.clone()));
+        live.tool_start("c1");
+        live.tool_update("c1", &serde_json::to_string(&json!({"say": s})).unwrap());
+        live.on_message(&result);
+        live.tool_end("c1", false, 5);
+        live.settle();
+        // Replay from history.
+        let mut replay = Transcript::default();
+        for m in [Message::user("status?"), call(args), result] {
+            replay.on_message(&m);
+        }
+        replay.settle();
+        let a = plain(&live.layout(70, &t).lines);
+        let b = plain(&replay.layout(70, &t).lines);
+        assert_eq!(a, b);
+        assert!(
+            a.iter().any(|l| l.contains("WARNING")) && !a.iter().any(|l| l.contains("tool call")),
+            "{a:?}"
+        );
+        // A refused call shows as a tool call, folded with the steps.
+        let mut bad = Transcript::default();
+        bad.on_message(&Message::user("x"));
+        bad.on_message(&call(json!({"kind": "warning"})));
+        bad.on_message(&Message::ToolResult {
+            call_id: "c1".into(),
+            tool_name: "say".into(),
+            content: vec![Block::text("a warning needs `status`")],
+            is_error: true,
+            details: None,
+        });
+        bad.settle();
+        let lines = plain(&bad.layout(70, &t).lines);
+        assert!(lines.iter().any(|l| l.contains("1 tool call")), "{lines:?}");
     }
 }
 

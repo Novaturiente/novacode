@@ -10,6 +10,7 @@ pub mod inbox;
 pub mod link;
 pub mod report;
 pub mod review;
+pub mod say;
 pub mod task;
 
 use novacode_base::settings::Settings;
@@ -23,7 +24,14 @@ separate novacode sessions you start, follow and finish with the `task` tool. Ta
 - You route work; you don't do it. You have no tools to read code, run commands or edit files. When you need a fact \
 before routing, spawn a scout with `agent` (`cwd`: the project folder below your root); it gets that project's tools \
 and MCP servers.
-- Name the task by its label in every message about it.
+- Every message to the user goes through `say`; plain text never reaches them as a message. Assume the user \
+saw nothing since your last message. Name each task by its label (`tasks`; code adds its board status). Order: \
+what happened, where things stand (`status`), then what you did or what you need. Kinds: `reply` answers the \
+user's message, `update` is task news, `question` needs their answer, `warning` is something wrong, `done` is \
+finished work, `note` an aside. A question states the current status first, then asks, with `choices` (or \
+`exact_answer: true` when it asks for one exact answer such as a name or a number); it opens the answer card \
+itself. When several things happened, send one `say` per event, not one digest. `priority: high` only when the \
+user should look now. Use `ask_user` only for several questions in one form.
 - Before spawning a non-trivial task, show the user 1-5 checkable acceptance criteria, with the base branch: call \
 `task info` with the task's `folder` first and show what it says about the branch; a small, clear task starts at once. \
 When the user asks to see the criteria first, show them with `ask_user` and wait for the answer before you spawn.
@@ -60,7 +68,7 @@ user). On a problem (no events for long, one tool running far too long, an error
 card unanswered for long, no progress for long): first ask the task with `task send` and `question: true`. Then you \
 may, without asking the user, send it instructions, stop it, resume it, or start a replacement task. Never merge, \
 close, change scope or delete without the user's card. Always tell the user what you found and what you did. At the \
-slightest doubt about what is wrong or what to do, ask the user with `ask_user` before acting.";
+slightest doubt about what is wrong or what to do, ask the user with a `say` question before acting.";
 
 /// Follows the global `AGENTS.md`: what of it doesn't apply to super.
 const OVERRIDES: &str = "The instructions above were written for a coding session. Where a rule needs a tool you \
@@ -83,7 +91,7 @@ pub fn compaction_guide(dir: std::path::PathBuf) -> impl Fn() -> String + Send +
 }
 
 /// The tools super's model sees (before `super.tools`).
-pub const TOOLS: [&str; 6] = ["task", "ask_user", "memory", "todo", "agent", "history_search"];
+pub const TOOLS: [&str; 7] = ["task", "say", "ask_user", "memory", "todo", "agent", "history_search"];
 
 /// Super's prompt: its own, the global `AGENTS.md` of novacode's `home`, then the
 /// overrides. No project `AGENTS.md` and no skills.
@@ -169,6 +177,14 @@ pub fn feed_board(slot: crate::hub::HubSlot, sup: &std::sync::Arc<task::Super>, 
             let Some(hub) = hub.filter(|h| !h.is_closed()) else {
                 break;
             };
+            // Needs you (L10.9): `/dismiss <id>` from a window takes a row off the board.
+            if hub.dismiss.get().is_none() {
+                let s = std::sync::Arc::downgrade(&sup);
+                let _ = hub.dismiss.set(std::sync::Arc::new(move |id: &str| {
+                    s.upgrade()
+                        .is_some_and(|s| s.edit(|b| b.drop_need(id)).unwrap_or(false))
+                }));
+            }
             let runs = crate::serve::live_sessions(&paths);
             let live = |s: &str| {
                 let f = runs.iter().find(|f| f.state.session == s)?;
@@ -182,10 +198,10 @@ pub fn feed_board(slot: crate::hub::HubSlot, sup: &std::sync::Arc<task::Super>, 
                 if b.note_tokens(live) {
                     let _ = b.save(&sup.dir);
                 }
-                b.snapshot(live)
+                (b.snapshot(live), b.needs_rows())
             };
             if last.as_ref() != Some(&rows) {
-                hub.set_board(rows.clone());
+                hub.set_board(rows.0.clone(), rows.1.clone());
                 last = Some(rows);
             }
         }
@@ -347,17 +363,32 @@ mod tests {
     }
 
     #[test]
-    fn tools_are_super_s_six_plus_super_tools() {
+    fn every_message_goes_through_say_in_a_fixed_order() {
+        for rule in [
+            "Every message to the user goes through `say`",
+            "Assume the user saw nothing",
+            "Name each task by its label",
+            "what happened, where things stand (`status`), then what you did or what you need",
+            "A question states the current status first",
+            "send one `say` per event",
+        ] {
+            assert!(PROMPT.contains(rule), "{rule}");
+        }
+    }
+
+    #[test]
+    fn tools_are_super_s_seven_plus_super_tools() {
         let (_d, s) = settings("{}");
         assert_eq!(
             tools(&s),
-            ["task", "ask_user", "memory", "todo", "agent", "history_search"]
+            ["task", "say", "ask_user", "memory", "todo", "agent", "history_search"]
         );
         let (_d, s) = settings(r#"{"super": {"tools": ["web_search", "todo"]}}"#);
         assert_eq!(
             tools(&s),
             [
                 "task",
+                "say",
                 "ask_user",
                 "memory",
                 "todo",

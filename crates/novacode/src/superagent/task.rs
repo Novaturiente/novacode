@@ -1344,6 +1344,12 @@ impl Super {
     /// A card made by code: the choice the user picked, `None` when dismissed.
     async fn choose(&self, header: String, question: String, choices: &[&str]) -> Result<Option<String>, String> {
         let asker = self.asker.as_ref().ok_or("no window to confirm in")?;
+        // The task's board status line first (L10.9 "Structured messages"): headers are `<label>: <what>`.
+        let label = header.split(": ").next().unwrap_or_default();
+        let question = match self.board.lock().unwrap().status_line(label) {
+            Some(l) => format!("{l}\n\n{question}"),
+            None => question,
+        };
         let q = Question {
             question,
             header: Some(header),
@@ -1922,7 +1928,7 @@ impl Launcher for Procs {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use novacode_types::Reply;
     use std::collections::{HashSet, VecDeque};
@@ -1931,7 +1937,7 @@ mod tests {
     type Log = Arc<Mutex<Vec<String>>>;
 
     #[derive(Default)]
-    struct FakeLauncher {
+    pub(in crate::superagent) struct FakeLauncher {
         log: Log,
         starts: Mutex<Vec<Start>>,
         sent: Mutex<Vec<(String, ClientCmd)>>,
@@ -2094,7 +2100,7 @@ mod tests {
         .unwrap()
     }
 
-    fn test_cfg(home: &Path, max_running: usize) -> Config {
+    pub(in crate::superagent) fn test_cfg(home: &Path, max_running: usize) -> Config {
         let tiers = ["quick", "standard", "deep", "review"]
             .iter()
             .map(|n| {
@@ -2741,6 +2747,11 @@ mod tests {
         assert!(fx.launcher.alive("s1"));
         let q = fx.asker.asked.lock().unwrap()[0].question.clone();
         assert!(q.contains("worktree-T1-keep is NOT merged into main"), "{q}");
+        // A code-made card opens with the task's board status line.
+        assert!(
+            q.starts_with("T1-keep · running · no report yet\n\nClose T1-keep?"),
+            "{q}"
+        );
         // Confirmed: archived, process ended, unmerged worktree kept.
         run(&fx, json!({"action": "close", "task": "T1-keep"})).await.unwrap();
         assert_eq!(state(&fx, "T1-keep"), State::Archived);

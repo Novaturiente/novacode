@@ -17,6 +17,18 @@ pub struct Builder {
     pub state: StateFn,
     /// Silent checks (super's health checks): see [`Quiet`].
     pub quiet: Option<Quiet>,
+    /// Plain final text is not the user's channel: see [`Plain`].
+    pub plain: Option<Plain>,
+}
+
+/// A run that ends with plain text (other than a silent check's `OK`) gets `nudge` once,
+/// to resend it through `tool`; plain text again becomes a call of `tool` with
+/// `args(text)`, run by code (its thinking stays), and the run ends.
+#[derive(Clone)]
+pub struct Plain {
+    pub tool: String,
+    pub nudge: String,
+    pub args: Arc<dyn Fn(&str) -> serde_json::Value + Send + Sync>,
 }
 
 /// A reply of exactly `OK` (no tool calls) to a wake note starting with `marker` is

@@ -23,14 +23,26 @@ const HISTORY_CHARS: usize = 2000;
 /// Super's context builder: the board at `<dir>/board.json` and the session's open todo
 /// items as the state block, then the newest chat in [`CHAT_BUDGET`]. A health check
 /// answered with exactly `OK` is hidden and left out; `on_ok` runs then (records the check).
-pub fn builder(dir: PathBuf, on_ok: Arc<dyn Fn() + Send + Sync>) -> context_window::Builder {
+/// Plain final text gets one nudge to use `say`, then is sent as a `note`. Each request
+/// also sets `trigger`: what started the current run, for `say`'s frame.
+pub fn builder(
+    dir: PathBuf,
+    on_ok: Arc<dyn Fn() + Send + Sync>,
+    trigger: super::say::Trigger,
+) -> context_window::Builder {
     context_window::Builder {
         budget: CHAT_BUDGET,
         quiet: Some(context_window::Quiet {
             marker: super::link::HEALTH_CHECK.into(),
             on_ok,
         }),
+        plain: Some(context_window::Plain {
+            tool: "say".into(),
+            nudge: super::say::NUDGE.into(),
+            args: Arc::new(|text: &str| json!({ "kind": "note", "body": text })),
+        }),
         state: Arc::new(move |store: &Store| {
+            *trigger.lock().unwrap() = super::say::trigger(&store.branch());
             let open = open_requests(store);
             match Board::load(&dir) {
                 Ok(b) => b.state_block(&open),

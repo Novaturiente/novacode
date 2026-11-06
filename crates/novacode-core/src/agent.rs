@@ -1697,6 +1697,8 @@ impl Agent {
         // no prompt and no tool call.
         let mut quiet_note: Option<String> = None;
         let mut plain = true;
+        // `context_window::Plain`: this run was a marked check; its plain-text nudge went out.
+        let (mut checked, mut plain_nudged, mut said) = (false, false, false);
         let stop = loop {
             let queued = self.take_queued(steering_only);
             let mut added = queued.is_empty();
@@ -1789,6 +1791,7 @@ impl Agent {
                 });
                 if check {
                     quiet_note = Some(id);
+                    checked = true;
                 }
             }
             steering_only = true;
@@ -1815,6 +1818,34 @@ impl Agent {
             let text = msg.text();
             let quiet = plain && calls.is_empty() && stop == StopReason::Stop && text.trim() == "OK";
             plain &= calls.is_empty();
+            let plain_cfg = self.context.as_ref().and_then(|c| c.plain.clone());
+            said |= plain_cfg
+                .as_ref()
+                .is_some_and(|p| calls.iter().any(|c| c.name == p.tool));
+            let plain_text = plain_cfg.is_some()
+                && calls.is_empty()
+                && stop == StopReason::Stop
+                && has_text
+                && !(checked && text.trim() == "OK");
+            if let Some(p) = plain_cfg.filter(|_| plain_text && plain_nudged) {
+                // Plain text after the nudge: code sends it through the tool.
+                self.emit(AgentEvent::Stream(StreamEvent::RetryRollback));
+                let mut msg = msg;
+                msg.content.retain(|b| !matches!(b, Block::Text { .. }));
+                let call = ToolCall {
+                    id: format!("{}-plain-{}", p.tool, crate::session::now_ms()),
+                    name: p.tool.clone(),
+                    arguments: (p.args)(text.trim()),
+                    arguments_error: None,
+                    replay: None,
+                };
+                msg.content.push(Block::ToolCall(call.clone()));
+                self.add(EntryKind::Message {
+                    message: Message::Assistant(msg),
+                });
+                self.run_tools(vec![call], &cancel).await;
+                break stop;
+            }
             match quiet_note.take().filter(|_| quiet) {
                 Some(note) => self.hide_ok(msg, note),
                 None => {
@@ -1862,7 +1893,7 @@ impl Agent {
                 Some(Nudge::CutOff)
             } else if Recovery::looks_like_text_tool_call(&text) {
                 Some(Nudge::TextToolCall)
-            } else if !has_text && after_tools {
+            } else if !has_text && after_tools && !said {
                 Some(Nudge::EmptyAfterTools)
             } else {
                 None
@@ -1876,6 +1907,15 @@ impl Agent {
                     n.text().into()
                 };
                 self.nudge(&say);
+                continue;
+            }
+            if plain_text && !std::mem::replace(&mut plain_nudged, true) {
+                let n = self
+                    .context
+                    .as_ref()
+                    .and_then(|c| c.plain.as_ref())
+                    .map(|p| p.nudge.clone());
+                self.nudge(&n.unwrap_or_default());
                 continue;
             }
             if !self.shared.queues.lock().unwrap().follow_up.is_empty() {

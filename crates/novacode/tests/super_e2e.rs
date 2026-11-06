@@ -101,6 +101,11 @@ fn say(text: &str) -> Value {
     json!({"text": text})
 }
 
+/// Super's message to the user (its `say` tool), then the empty reply that ends its turn.
+fn tell(text: &str) -> [Value; 2] {
+    [tool("say", json!({"kind": "update", "body": text})), json!({})]
+}
+
 /// Waits (at most 30 s) until `ok` holds.
 fn until(what: &str, ok: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -159,7 +164,8 @@ fn restart_recovery_card_waits_for_a_late_window() {
                 json!({"action": "spawn", "request": "add note.txt", "folder": "app", "slug": "note",
                        "write": true, "tier": "quick", "criteria": ["note.txt exists"]}),
             ),
-            say("spawned"),
+            tell("spawned")[0].clone(),
+            tell("spawned")[1].clone(),
         ],
     );
     // The task works until it is stopped.
@@ -250,22 +256,22 @@ fn super_runs_a_write_task_through_review_merge_and_close() {
     script(
         &scripts,
         "super",
-        &[
-            tool(
-                "task",
-                json!({"action": "spawn", "request": "add note.txt", "folder": "app", "slug": "note",
+        &[tool(
+            "task",
+            json!({"action": "spawn", "request": "add note.txt", "folder": "app", "slug": "note",
                        "write": true, "tier": "quick", "criteria": ["note.txt exists on main"]}),
-            ),
-            say("spawned"),
-            // Wake: T1 reported done, its review starts.
-            say("waiting for the review"),
-            // Wake: the review approved it.
-            tool("task", json!({"action": "merge", "task": label})),
-            say("merging"),
-            // Wake: T1 merged; close it.
-            tool("task", json!({"action": "close", "task": label})),
-            say("closed"),
-        ],
+        )]
+        .into_iter()
+        .chain(tell("spawned"))
+        // Wake: T1 reported done, its review starts.
+        .chain(tell("waiting for the review"))
+        // Wake: the review approved it.
+        .chain([tool("task", json!({"action": "merge", "task": label}))])
+        .chain(tell("merging"))
+        // Wake: T1 merged; close it.
+        .chain([tool("task", json!({"action": "close", "task": label}))])
+        .chain(tell("closed"))
+        .collect::<Vec<_>>(),
     );
     let ask = json!({"questions": [{"question": "Which file name?", "options": [{"label": "note.txt"}, {"label": "other"}]}]});
     script(
@@ -394,6 +400,12 @@ fn super_runs_a_write_task_through_review_merge_and_close() {
     );
     assert!(said.contains(&format!("{label} is merging")), "{said}");
     assert!(said.contains(&format!("Closed {label}")), "{said}");
+    // Super's messages are framed by code: the trigger of each run and the task's status.
+    assert!(said.contains("\"trigger\":\"reply to you\""), "{said}");
+    assert!(
+        said.contains(&format!("\"trigger\":\"after {label} reported done\"")),
+        "{said}"
+    );
     let t = task(&home, label);
     assert_eq!(t["state"], "archived", "{t}");
     let rv = task(&home, review);

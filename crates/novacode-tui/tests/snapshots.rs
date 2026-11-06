@@ -76,6 +76,132 @@ fn compaction_shows_while_running_then_leaves_a_divider() {
     assert!(line.chars().count() >= 97 && line.ends_with('━'), "{line}");
 }
 
+fn say_msgs(id: &str, kind: &str, at_ms: u64) -> [Message; 2] {
+    let say = Say {
+        kind: kind.into(),
+        priority: "normal".into(),
+        at_ms,
+        time: "14:05".into(),
+        trigger: "health check".into(),
+        body: format!("body {id}"),
+        ..Default::default()
+    };
+    [
+        Message::Assistant(AssistantMessage {
+            content: vec![Block::ToolCall(ToolCall {
+                id: id.into(),
+                name: "say".into(),
+                arguments: json!({"kind": kind, "body": format!("body {id}")}),
+                arguments_error: None,
+                replay: None,
+            })],
+            stop: StopReason::ToolUse,
+            usage: Default::default(),
+            provider: "f".into(),
+            model: "m".into(),
+            response_id: None,
+            error_message: None,
+            thinking_level: None,
+        }),
+        Message::ToolResult {
+            call_id: id.into(),
+            tool_name: "say".into(),
+            content: vec![Block::text("Shown to the user.")],
+            is_error: false,
+            details: Some(json!({ "say": say })),
+        },
+    ]
+}
+
+/// L10.9: the "new since you last looked" divider goes before the first `say` block that
+/// came while the terminal was unfocused, and on attach before the first one newer than
+/// the last time this user's window saw the session. There is only one.
+#[test]
+fn the_new_since_divider_marks_the_first_unseen_message() {
+    let order = |s: &str| {
+        let at = |p: &str| s.find(p).unwrap_or_else(|| panic!("{p} missing:\n{s}"));
+        (
+            at("body c1"),
+            at("new since you last looked"),
+            at("body c2"),
+            at("body c3"),
+        )
+    };
+    // Reattach: c1 seen, c2 and c3 are new.
+    let mut history = vec![Message::user("go")];
+    history.extend(say_msgs("c1", "update", 1000));
+    history.extend(say_msgs("c2", "warning", 3000));
+    history.extend(say_msgs("c3", "done", 4000));
+    let (mut a, _rx) = app(history);
+    a.on_ui(UiEvent::Seen { ms: 2000 });
+    let s = screen(&mut a, 100, 40);
+    let (c1, div, c2, c3) = order(&s);
+    assert!(c1 < div && div < c2 && c2 < c3, "{s}");
+    // Live: focused, no divider; unfocused, before the first block of that time away.
+    let (mut a, _rx) = app(vec![Message::user("go")]);
+    for m in say_msgs("c1", "update", 1) {
+        a.on_agent(AgentEvent::Message(m));
+    }
+    assert!(!screen(&mut a, 100, 40).contains("new since"));
+    a.on_event(Event::FocusLost);
+    for m in say_msgs("c2", "update", 2).into_iter().chain(say_msgs("c3", "note", 3)) {
+        a.on_agent(AgentEvent::Message(m));
+    }
+    a.on_event(Event::FocusGained);
+    let s = screen(&mut a, 100, 40);
+    let (c1, div, c2, c3) = order(&s);
+    assert!(c1 < div && div < c2 && c2 < c3, "{s}");
+    assert_eq!(s.matches("new since you last looked").count(), 1);
+    // Away again: the divider moves to the new first unseen block.
+    a.on_event(Event::FocusLost);
+    for m in say_msgs("c4", "update", 4) {
+        a.on_agent(AgentEvent::Message(m));
+    }
+    let s = screen(&mut a, 100, 40);
+    assert_eq!(s.matches("new since you last looked").count(), 1);
+    assert!(s.find("new since").unwrap() > s.find("body c3").unwrap(), "{s}");
+}
+
+/// L10.9: open questions and warnings head the Tasks tab as Needs you; `d` dismisses one
+/// through the host (`/dismiss <id>`), Enter does nothing there.
+#[test]
+fn needs_you_heads_the_tasks_tab_and_d_dismisses() {
+    let (mut a, mut rx) = app(vec![]);
+    a.on_ui(UiEvent::Board {
+        tasks: vec![novacode_tui::panel::TaskRow {
+            label: "T2-api".into(),
+            state: "blocked".into(),
+            ..Default::default()
+        }],
+        needs: vec![novacode_tui::panel::NeedRow {
+            id: "say-1".into(),
+            kind: "warning".into(),
+            tasks: vec!["T2-api".into()],
+            status: "T2-api is stuck on the db url".into(),
+            at_ms: 1,
+        }],
+    });
+    a.panel.visible = true;
+    a.panel.show_tab("tasks");
+    a.panel.focused = true;
+    let s = screen(&mut a, 120, 30);
+    let (needs, warn, task) = (
+        s.find("NEEDS YOU").unwrap_or_else(|| panic!("{s}")),
+        s.find("warning · T2-api").unwrap_or_else(|| panic!("{s}")),
+        s.rfind("T2-api").unwrap(),
+    );
+    assert!(needs < warn && warn < task, "{s}");
+    while rx.try_recv().is_ok() {}
+    a.on_event(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert!(rx.try_recv().is_err(), "Enter dismisses nothing");
+    a.on_event(Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)));
+    let mut sent = vec![];
+    while let Ok(c) = rx.try_recv() {
+        sent.push(c);
+    }
+    assert!(sent.contains(&Cmd::Prompt("/dismiss say-1".into())), "{sent:?}");
+}
+
 fn screen(app: &mut App, w: u16, h: u16) -> String {
     let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
     t.draw(|f| app.draw(f)).unwrap();

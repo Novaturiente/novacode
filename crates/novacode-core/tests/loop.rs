@@ -1111,6 +1111,7 @@ async fn an_ok_reply_to_a_marked_check_is_hidden_and_left_out_of_the_context() {
                 o.fetch_add(1, Ordering::SeqCst);
             }),
         }),
+        plain: None,
     });
     let (h, task) = agent::spawn(agent);
     let mut rx = h.subscribe();
@@ -1182,6 +1183,133 @@ async fn an_ok_reply_to_a_marked_check_is_hidden_and_left_out_of_the_context() {
     );
 }
 
+/// L10.9 super's `say`: a run ending in plain text gets one nudge; plain text again is sent
+/// through the tool by code (thinking kept). A check's `OK` stays hidden and un-nudged, and
+/// an empty reply after a tool call gets no nudge.
+#[tokio::test]
+async fn plain_text_is_nudged_once_then_sent_as_a_note_and_a_check_ok_stays_quiet() {
+    use novacode_core::context_window::{Builder, Plain, Quiet};
+    use std::sync::Mutex;
+    struct Rec(Arc<Mutex<Vec<Value>>>);
+    impl novacode_tools::Tool for Rec {
+        fn name(&self) -> &str {
+            "say"
+        }
+        fn description(&self) -> &str {
+            "say"
+        }
+        fn schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn read_only(&self) -> bool {
+            true
+        }
+        fn execute<'a>(
+            &'a self,
+            args: Value,
+            _: &'a novacode_tools::ToolCtx,
+        ) -> futures_util::future::BoxFuture<'a, novacode_tools::ToolOutput> {
+            self.0.lock().unwrap().push(args);
+            Box::pin(async { novacode_tools::ToolOutput::text("shown") })
+        }
+    }
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let said = Arc::new(Mutex::new(Vec::new()));
+    let msg = |blocks: Vec<Block>| FauxReply::Message {
+        blocks,
+        stop: StopReason::Stop,
+        usage: Usage::default(),
+    };
+    let say_call = Block::ToolCall(ToolCall {
+        id: "c1".into(),
+        name: "say".into(),
+        arguments: json!({"kind": "update", "body": "x"}),
+        arguments_error: None,
+        replay: None,
+    });
+    let main = Faux::new([
+        msg(vec![Block::text("plain one")]),
+        msg(vec![
+            Block::Thinking {
+                text: "hmm".into(),
+                replay: None,
+            },
+            Block::text("plain two"),
+        ]),
+        FauxReply::text("OK"),
+        msg(vec![say_call]),
+        FauxReply::text(""),
+    ]);
+    let reqs = main.requests.clone();
+    let mut tools = novacode_tools::builtins(false);
+    tools.push(Arc::new(Rec(said.clone())));
+    let agent = Agent::new(
+        Arc::new(main),
+        tools,
+        Store::create(&Paths::new(home.path()), work.path(), false),
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_context_builder(Builder {
+        budget: 6000,
+        state: Arc::new(|_: &Store| "BOARD".to_string()),
+        quiet: Some(Quiet {
+            marker: "[health check]".into(),
+            on_ok: Arc::new(|| {}),
+        }),
+        plain: Some(Plain {
+            tool: "say".into(),
+            nudge: "[say] resend it with say".into(),
+            args: Arc::new(|t: &str| json!({"kind": "note", "body": t})),
+        }),
+    });
+    let (h, task) = agent::spawn(agent);
+    let mut rx = h.subscribe();
+    let settled = async |rx: &mut tokio::sync::broadcast::Receiver<AgentEvent>| loop {
+        if matches!(rx.recv().await.unwrap(), AgentEvent::Settled) {
+            break;
+        }
+    };
+    h.prompt("status?");
+    settled(&mut rx).await;
+    assert_eq!(*said.lock().unwrap(), [json!({"kind": "note", "body": "plain two"})]);
+    assert_eq!(reqs.lock().unwrap().len(), 2, "one nudge, then code sends it");
+    let nudged = format!("{:?}", reqs.lock().unwrap()[1].messages);
+    assert!(nudged.contains("[say] resend it with say"), "{nudged}");
+    h.remind_as("super", "[health check] go", true);
+    settled(&mut rx).await;
+    h.remind_as("super", "T1 reported done", true);
+    settled(&mut rx).await;
+    h.shutdown();
+    let agent = task.await.unwrap();
+    assert_eq!(
+        reqs.lock().unwrap().len(),
+        5,
+        "no nudge after the OK or the empty reply"
+    );
+    assert_eq!(said.lock().unwrap().len(), 2);
+    // The note's message keeps its thinking and carries the call instead of the text.
+    let note = agent
+        .store
+        .transcript()
+        .into_iter()
+        .find_map(|m| match m {
+            Message::Assistant(a) if a.tool_calls().any(|c| c.id.starts_with("say-plain-")) => Some(a),
+            _ => None,
+        })
+        .unwrap();
+    assert!(matches!(&note.content[0], Block::Thinking { text, .. } if text == "hmm"));
+    assert!(note.text().is_empty());
+    let results = agent
+        .store
+        .transcript()
+        .iter()
+        .filter(|m| matches!(m, Message::ToolResult { tool_name, .. } if tool_name == "say"))
+        .count();
+    assert_eq!(results, 2);
+}
+
 /// L10.9 super: a context builder rebuilds every request (state block + newest chat in
 /// budget); the session file keeps everything, and auto-compaction never fires. Without
 /// a builder, the request is the projection, unchanged.
@@ -1223,6 +1351,7 @@ async fn a_context_builder_rebuilds_requests_and_keeps_the_session_whole() {
                 budget: 2500,
                 state: Arc::new(|_: &Store| "BOARD ROWS".to_string()),
                 quiet: None,
+                plain: None,
             });
         }
         let prompts: Vec<String> = (0..8).map(|i| format!("p{i}")).collect();

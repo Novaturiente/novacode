@@ -1541,6 +1541,8 @@ impl Ctx {
         let mut decision_check: Option<(novacode_core::memory::Worker, Arc<dyn superagent::link::Inform>)> = None;
         // Super itself, for the context builder's health-check callback.
         let mut super_ref: Option<std::sync::Weak<superagent::task::Super>> = None;
+        // What started super's current run: set by its context builder, read by `say`.
+        let say_trigger: superagent::say::Trigger = Default::default();
         if is_super {
             use superagent::task;
             let home = self.paths.home();
@@ -1582,6 +1584,11 @@ impl Ctx {
                 superagent::feed_board(slot.clone(), &sup, self.paths.clone());
                 superagent::link::Links::start(&sup, Arc::new(slot.clone()), Arc::new(slot), inform);
             }
+            all.push(Arc::new(superagent::say::SayTool {
+                sup: sup.clone(),
+                asker: asker.clone(),
+                trigger: say_trigger.clone(),
+            }));
             all.push(Arc::new(task::TaskTool(sup)));
         }
         all.push(Arc::new(novacode_tools::todo::Todo::new(
@@ -1963,7 +1970,7 @@ impl Ctx {
                         s.checked();
                     }
                 });
-                agent = agent.with_context_builder(superagent::context::builder(dir, on_ok));
+                agent = agent.with_context_builder(superagent::context::builder(dir, on_ok, say_trigger.clone()));
             }
             // Named for the session list (L4.18); not scripts, pipelines or subagents.
             if self.cli.print.is_none() && !self.cli.rpc {

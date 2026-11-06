@@ -52,6 +52,25 @@ For the check, the state block has a **Health** line per running task, written b
 
 **Progress reports.** Tasks are told to call `report` with `state: progress` at each milestone: what is done, what is next, and a count or percentage when known. When a task has worked for `super.watch.progressMinutes` (default 20) without one, novacode asks it for one at its next tool boundary; the task is not interrupted, and nothing is sent while it waits on your answer. Progress reports never wake the super agent; they show on the board and in the state block with their age.
 
+### Messages to you
+
+The super agent sends every message to you with its `say` tool, and novacode draws each one as its own framed block, so you can tell what is new and what kind of message it is even after hours away.
+
+- **Kind:** a coloured badge: `UPDATE` (task news), `QUESTION` (it needs your answer), `WARNING` (something is wrong), `DONE` (work finished), `NOTE` (an aside) or `REPLY` (its answer to your message). A high-priority message carries a reversed badge and `HIGH`.
+- **Time and trigger:** the local time it was sent, and what started that turn: `reply to you`, `health check`, or the event, like `after T2-api reported blocked`. Novacode works the trigger out itself.
+- **Task status lines:** one line per task the message names, written by novacode from the board, not by the model: label, state, a percentage and the summary of its last report, and how long ago that report came.
+- **Where things stand**, then the message itself, then the choices of a question and, once you answered, your answer.
+
+Novacode checks every message before it is shown: a question or a warning must say where things stand, task labels must be on the board, and a question needs choices unless it asks for one exact answer (a name, a number). A question with choices also opens an answer card; the card's label names the tasks and its text starts with the same status lines. When several things happened, you get one block per event, not one summary.
+
+If the super agent ends a turn with plain text instead of a message, novacode asks it once to resend it through `say`; plain text again is shown as a `NOTE` block. The `OK` of a health check that found everything fine stays hidden.
+
+The confirmation cards novacode makes itself (merge, close, scope change, accept, resume after a restart) also start with the task's status line.
+
+**New since you last looked.** In an attach window (the super window is one), a `━━ new since you last looked ━━` line sits before the first message that arrived while the terminal was unfocused. When you attach again later, it sits before the first message newer than the last time one of your windows on that session lost focus or closed (kept in `~/.novacode/seen/<session>`). This needs a terminal that reports focus (in tmux: `set -g focus-events on`); without focus reports, only reattaching places it.
+
+**Needs you.** Open questions and warnings are listed at the top of the Tasks tab under **Needs you**, and are kept on the board, so they survive a restart. A question leaves the list when you answer its card (a question you answer by typing leaves with the super agent's next `REPLY`); a warning leaves when the super agent sends an `UPDATE` or `DONE` about one of the same tasks. Press `d` on a row (with the panel focused) to dismiss it yourself.
+
 ## How it works
 
 - You describe a task. The super agent writes 1–5 **acceptance criteria**: checkable statements of what "done" means. For a non-trivial task it shows them to you first, with the branch the task's worktree would start from; if you ask to see them first, it asks you on a form and waits for your answer before it starts the task.
@@ -60,7 +79,7 @@ For the check, the state block has a **Health** line per running task, written b
 - Tasks are regular sessions in their project: they load the project's `AGENTS.md`, skills and MCP servers (for example codegraph) and follow your normal permissions. If a project isn't trusted yet, the super agent asks you once before its first task there.
 - Untracked project files listed in `worktree.copy` (by default `AGENTS.md`, `CLAUDE.md`, `.mcp.json`, `.codegraph/`, `.claude/`, `.novacode/`) are copied into each new worktree, so a gitignored `AGENTS.md` isn't lost. Codegraph's `daemon.*` lock files and sockets are never copied, so codegraph starts its own daemon for the worktree, and a folder holding its own git repo is never copied. Only `.codegraph/` is tool state: nothing in it counts as the task's changes, and it is deleted with the worktree. In any other copied folder (such as `.novacode/` or `.claude/`), the copies left unchanged don't count, but a file the task adds or edits there is work and keeps the worktree. A copied file counts as the task's change once the task edits or commits it, and is then kept; an unchanged copy never counts.
 - The super agent doesn't read code or task transcripts. It only gets each task's short reports, which keeps its own context small, even after days.
-- Every message about a task names its label.
+- Every message about a task names its label and carries its board status line.
 
 ## Questions and approvals
 

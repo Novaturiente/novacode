@@ -128,11 +128,15 @@ fn super_spawns_a_task_after_the_trust_card_and_stops_it() {
         "write": true, "model": "faux/script", "criteria": ["note exists"]
     }});
     let stop = json!({"name": "task", "args": {"action": "stop", "task": "T1-note"}});
+    // Super's messages go through `say`; an empty reply ends its turn.
+    let say = |t: &str| json!({"tools": [{"name": "say", "args": {"kind": "update", "body": t}}]});
     let lines = [
         json!({"text": "spawning", "tools": [spawn]}),
-        json!({"text": "spawned"}),
+        say("spawned"),
+        json!({}),
         json!({"text": "stopping", "tools": [stop]}),
-        json!({"text": "stopped"}),
+        say("stopped"),
+        json!({}),
     ];
     let script: String = lines.iter().map(|l| format!("{l}\n")).collect();
     std::fs::write(scripts.join("super.jsonl"), script).unwrap();
