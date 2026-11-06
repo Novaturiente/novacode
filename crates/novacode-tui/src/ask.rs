@@ -267,12 +267,15 @@ impl AskForm {
             }
         };
         // The question on its own, then each choice: label on one line, its description under it.
-        out.extend(wrap::wrap(
-            vec![Span::styled(q.question.clone(), t.text.add_modifier(Modifier::BOLD))],
-            w,
-            &[],
-            &[],
-        ));
+        // Line by line: a question's own line breaks (super's status lines) are kept.
+        for l in q.question.lines() {
+            out.extend(wrap::wrap(
+                vec![Span::styled(l.to_string(), t.text.add_modifier(Modifier::BOLD))],
+                w,
+                &[],
+                &[],
+            ));
+        }
         gap(&mut out);
         let sel = self.sel[self.q];
         for (i, o) in q.options.iter().enumerate() {
@@ -417,6 +420,32 @@ mod tests {
             k,
             crate::keys::Keymap::default().lookup(&k, &[crate::keys::Scope::Editor]),
         )
+    }
+
+    #[test]
+    fn question_line_breaks_are_kept() {
+        let (tx, _rx) = oneshot::channel();
+        let f = AskForm::new(AskReq {
+            id: 1,
+            questions: vec![Question {
+                question: "T1 · ready\nWhere things stand: ok\n\nStart T2?".into(),
+                header: None,
+                options: vec![],
+                multi: false,
+            }],
+            reply: tx,
+        });
+        let text: Vec<String> = f
+            .lines(60, &Theme::default(), true)
+            .0
+            .iter()
+            .map(crate::wrap::plain)
+            .collect();
+        assert_eq!(
+            &text[..4],
+            ["T1 · ready", "Where things stand: ok", "", "Start T2?"],
+            "{text:?}"
+        );
     }
 
     #[test]
