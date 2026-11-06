@@ -41,6 +41,17 @@ Two guards keep tasks on what you asked for:
 - **Scope changes need your OK.** To change a task's request, criteria or scope, the super agent calls `task scope`, which opens a card made by novacode showing the new and the old values. Only when you pick "Change" does novacode update the charter, note the change, and send the task the new brief and criteria (as new work, so its review starts over). A plain message to a task never changes its criteria, and reviews judge against the charter.
 - **Tasks check conflicting orders.** A task is told that when a message from the super agent conflicts with its brief or with your recorded decisions, it asks you (on a card relayed to the super window) and names the conflict, rather than just obeying.
 
+### Health checks and progress
+
+While at least one task is `running`, the super agent is woken every `super.watch.everyMinutes` (default 30) for a **health check**. No task running means no check, and a check never comes while the super agent is working or while an earlier check still waits for it.
+
+For the check, the state block has a **Health** line per running task, written by novacode from the task's events: how long ago its last event came, which tool is running and for how long, how many tool calls in a row failed, how many times in a row it made the same call, how many of its cards wait for your answer and since when, and how long ago its last progress report came.
+
+- **All fine:** the super agent answers only `OK`. That turn is hidden from your window and left out of the super agent's own chat window; the time of the check goes on the board (`board.md` shows "Last health check").
+- **A problem:** the super agent first asks the task (`task send` with `question: true`). Then it may send instructions, stop the task, resume it or start a replacement task without asking you. It never merges, closes, changes scope or deletes without your card, it always tells you what it found and did, and when anything is unclear it asks you first.
+
+**Progress reports.** Tasks are told to call `report` with `state: progress` at each milestone: what is done, what is next, and a count or percentage when known. When a task has worked for `super.watch.progressMinutes` (default 20) without one, novacode asks it for one at its next tool boundary; the task is not interrupted, and nothing is sent while it waits on your answer. Progress reports never wake the super agent; they show on the board and in the state block with their age.
+
 ## How it works
 
 - You describe a task. The super agent writes 1–5 **acceptance criteria**: checkable statements of what "done" means. For a non-trivial task it shows them to you first, with the branch the task's worktree would start from; if you ask to see them first, it asks you on a form and waits for your answer before it starts the task.

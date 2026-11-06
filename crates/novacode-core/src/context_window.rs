@@ -15,6 +15,18 @@ pub struct Builder {
     /// Tokens of chat resent, the current turn included.
     pub budget: u64,
     pub state: StateFn,
+    /// Silent checks (super's health checks): see [`Quiet`].
+    pub quiet: Option<Quiet>,
+}
+
+/// A reply of exactly `OK` (no tool calls) to a wake note starting with `marker` is
+/// hidden: its streamed text is rolled back, no message event goes to the windows, and
+/// both the note and the reply are left out of later requests and of the transcript (the
+/// session file keeps them). `on_ok` runs after each one.
+#[derive(Clone)]
+pub struct Quiet {
+    pub marker: String,
+    pub on_ok: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl Builder {

@@ -1539,6 +1539,8 @@ impl Ctx {
         }
         // Super's decision check (L10.9): the helper model and where its nudge goes.
         let mut decision_check: Option<(novacode_core::memory::Worker, Arc<dyn superagent::link::Inform>)> = None;
+        // Super itself, for the context builder's health-check callback.
+        let mut super_ref: Option<std::sync::Weak<superagent::task::Super>> = None;
         if is_super {
             use superagent::task;
             let home = self.paths.home();
@@ -1547,6 +1549,7 @@ impl Ctx {
                 tiers: superagent::tiers(s),
                 worktree_copy: worktree_copy(s),
                 home: home.to_path_buf(),
+                watch: superagent::watch(s),
                 allow: models::spawn_check(self.providers.clone()),
             };
             let launcher = Arc::new(task::Procs {
@@ -1555,6 +1558,7 @@ impl Ctx {
             });
             let dir = superagent::entry::dir(home, &self.cwd);
             let sup = Arc::new(task::Super::new(&self.cwd, dir, cfg, asker.clone(), launcher)?);
+            super_ref = Some(Arc::downgrade(&sup));
             // The helper model, as for the observer: none with `memory.enabled: false`.
             let helper = match memory_on {
                 true => Some(self.helper(s.get("memory.model"), &route, adapter.clone()).await),
@@ -1952,7 +1956,14 @@ impl Ctx {
                 let dir = superagent::entry::dir(self.paths.home(), &self.cwd);
                 agent = agent.with_compaction_guide_fn(Arc::new(superagent::compaction_guide(dir.clone())));
                 // Rebuilt every request: state block + newest chat in 6k tokens (L10.9).
-                agent = agent.with_context_builder(superagent::context::builder(dir));
+                // A health check answered `OK` is recorded on the board.
+                let sup = super_ref.clone();
+                let on_ok = Arc::new(move || {
+                    if let Some(s) = sup.as_ref().and_then(std::sync::Weak::upgrade) {
+                        s.checked();
+                    }
+                });
+                agent = agent.with_context_builder(superagent::context::builder(dir, on_ok));
             }
             // Named for the session list (L4.18); not scripts, pipelines or subagents.
             if self.cli.print.is_none() && !self.cli.rpc {

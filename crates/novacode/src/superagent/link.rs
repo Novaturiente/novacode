@@ -58,6 +58,25 @@ pub(super) const SUPER_QUESTION_ID: &str = "super-question";
 pub(super) const QUESTION_PREFIX: &str = "Super asks a question (answer in text in this turn; change nothing, \
 commit nothing and don't call `report`: no report is needed):\n\n";
 
+/// What a health-check wake starts with (L10.9 "Health checks and progress"); a check
+/// super answers with exactly `OK` is hidden from the user and from super's chat window.
+pub const HEALTH_CHECK: &str = "[health check]";
+/// The request id of code's progress nudges (a steer): not super's prompt, no report needed.
+pub(super) const PROGRESS_ID: &str = "super-progress";
+/// What a progress nudge says.
+pub(super) const PROGRESS_NUDGE: &str = "[progress] Super asks for a progress update: call `report` with \
+`state: progress` now (done so far, what's next, a count or percentage when you know one; at most 80 words), \
+then go on with your work. Don't stop for this.";
+
+/// The health-check wake.
+pub(super) fn health_check_text() -> String {
+    format!(
+        "{HEALTH_CHECK} Timed health check of the running tasks. Judge each one from the Health section of the \
+state block (event age, running tool and its age, error streak, repeated calls, unanswered cards, last progress). \
+If all are fine, answer exactly `OK` and nothing else. If one looks stuck or wrong, follow your rules for a problem."
+    )
+}
+
 /// The prompt a question sends.
 pub(super) fn question_prompt(message: &str) -> String {
     format!("{QUESTION_PREFIX}{message}")
@@ -76,6 +95,10 @@ pub trait Inform: Send + Sync {
     /// Super's session is ending: a card copy that closes now got no answer from the user.
     fn closing(&self) -> bool {
         false
+    }
+    /// Super is not working and no health check waits for it: a check may wake it.
+    fn idle(&self) -> bool {
+        true
     }
 }
 
@@ -96,6 +119,8 @@ enum Run {
 }
 
 fn run_of(prompts: &[Option<String>]) -> Run {
+    // Code's progress nudges are no one's prompt.
+    let prompts: Vec<&Option<String>> = prompts.iter().filter(|p| p.as_deref() != Some(PROGRESS_ID)).collect();
     if prompts.is_empty() {
         Run::Internal
     } else if prompts.iter().all(|p| p.as_deref() == Some(SUPER_QUESTION_ID)) {
@@ -209,6 +234,18 @@ pub struct Watcher {
     noted: Option<(String, usize)>,
     /// The provider of the task's model (`provider/model`), for holds.
     pub provider: String,
+    /// Health facts seen (the activity part; cards and progress are kept on the row).
+    health: board::Health,
+    /// The facts last saved on the row.
+    saved: board::Health,
+    /// Running tool calls: id → (name, start).
+    calls: HashMap<String, (String, u64)>,
+    /// The last call's name and arguments.
+    last_call: Option<String>,
+    /// When the current run started.
+    run_start: u64,
+    /// The last progress nudge.
+    nudged: u64,
 }
 
 impl Watcher {
@@ -247,8 +284,62 @@ impl Watcher {
         self.processes = s.processes.iter().cloned().collect();
     }
 
+    /// Health facts from one event seen at `now` (unix seconds).
+    fn track(&mut self, ev: &AgentEvent, now: u64) {
+        let h = &mut self.health;
+        h.last_event = now;
+        match ev {
+            AgentEvent::AgentStart => self.run_start = now,
+            AgentEvent::AgentEnd { .. } => self.calls.clear(),
+            AgentEvent::ToolStart { call } => {
+                let key = format!("{} {}", call.name, call.arguments);
+                h.repeats = match self.last_call.as_ref() == Some(&key) {
+                    true => h.repeats + 1,
+                    false => 1,
+                };
+                self.last_call = Some(key);
+                self.calls.insert(call.id.clone(), (call.name.clone(), now));
+            }
+            AgentEvent::ToolEnd { call_id, is_error, .. } => {
+                self.calls.remove(call_id);
+                h.errors = if *is_error { h.errors + 1 } else { 0 };
+            }
+            _ => {}
+        }
+        let oldest = self.calls.values().min_by_key(|(_, since)| *since);
+        (h.tool, h.tool_since) = match oldest {
+            Some((name, since)) => (Some(name.clone()), *since),
+            None => (None, 0),
+        };
+    }
+
+    /// The health facts to save on the row, when they changed (an event-age change only
+    /// every 30 s, so a busy task doesn't write the board every second).
+    fn health_to_save(&mut self) -> Option<board::Health> {
+        let mut same = self.health.clone();
+        same.last_event = self.saved.last_event;
+        if same == self.saved && self.health.last_event < self.saved.last_event + 30 {
+            return None;
+        }
+        self.saved = self.health.clone();
+        Some(self.health.clone())
+    }
+
+    /// A progress nudge is due at `now`: task `t` has run a turn for `every` seconds (0 = off)
+    /// since its last progress report, the run's start and the last nudge, and isn't
+    /// waiting on a card.
+    fn progress_due(&self, now: u64, every: u64, t: &board::Task) -> bool {
+        let since = t.health.progress_at.max(self.run_start).max(self.nudged);
+        every > 0
+            && self.running
+            && t.kind == board::Kind::Work
+            && t.state == State::Running
+            && now.saturating_sub(since) >= every
+    }
+
     /// One event of the task. `goal` is read at turn ends.
     pub fn event(&mut self, ev: &AgentEvent, goal: impl FnOnce() -> Goal) -> Option<Event> {
+        self.track(ev, board::now());
         match ev {
             AgentEvent::AgentStart => {
                 self.running = true;
@@ -436,7 +527,11 @@ impl Watcher {
             return CatchUp::Nothing;
         };
         let after = &history[i + 1..];
-        if after.iter().any(|m| user_text(m).is_some()) {
+        // Code's progress nudges are not another prompt.
+        if after
+            .iter()
+            .any(|m| user_text(m).is_some_and(|t| !t.starts_with(PROGRESS_NUDGE)))
+        {
             let key = (hash.to_string(), after.len());
             if self.noted.as_ref() == Some(&key) {
                 return CatchUp::Nothing;
@@ -484,6 +579,8 @@ pub struct Links {
     me: Weak<Links>,
     inner: Mutex<Inner>,
     kick: Arc<tokio::sync::Notify>,
+    /// Since when a health check is counted (unix seconds); `None` while no task runs.
+    check_from: Mutex<Option<u64>>,
 }
 
 #[derive(Default)]
@@ -532,6 +629,7 @@ impl Links {
             me: me.clone(),
             inner: Mutex::default(),
             kick: Arc::default(),
+            check_from: Mutex::default(),
         });
         let _ = sup.links.set(links.clone());
         links.recover(sup);
@@ -720,6 +818,64 @@ impl Links {
         for n in sup.pump().await {
             self.inform.note(n);
         }
+        self.health_check(&sup);
+    }
+
+    /// Every `super.watch.everyMinutes` while a task runs, a health-check wake; none
+    /// while super works or a check still waits for it (they never stack).
+    fn health_check(&self, sup: &Super) {
+        let every = sup.cfg().watch.every;
+        let running = {
+            let b = sup.board.lock().unwrap();
+            b.tasks.iter().any(|t| t.state == State::Running)
+        };
+        let mut from = self.check_from.lock().unwrap();
+        if every == 0 || !running {
+            *from = None;
+            return;
+        }
+        let now = board::now();
+        let since = *from.get_or_insert(now);
+        if now.saturating_sub(since) < every || !self.inform.idle() {
+            return;
+        }
+        *from = Some(now);
+        drop(from);
+        self.inform.wake(health_check_text());
+    }
+
+    /// Task `id`'s activity facts, saved on its row (cards and progress stay as they are).
+    fn save_health(&self, sup: &Super, id: &str, h: board::Health) {
+        let _ = sup.edit(|b| {
+            if let Some(t) = b.tasks.iter_mut().find(|t| t.id == id) {
+                t.health = board::Health {
+                    cards: t.health.cards,
+                    card_since: t.health.card_since,
+                    progress_at: t.health.progress_at,
+                    ..h
+                };
+            }
+        });
+    }
+
+    /// Task `id`'s unanswered relayed cards and the oldest one's age, on its row.
+    fn card_facts(&self, id: &str) {
+        let Some(sup) = self.sup.upgrade() else { return };
+        let (n, oldest) = {
+            let g = self.inner.lock().unwrap();
+            let open: Vec<u64> = g
+                .cards
+                .iter()
+                .filter(|((t, _), _)| t == id)
+                .map(|(_, (_, a))| a.at)
+                .collect();
+            (open.len() as u32, open.into_iter().min().unwrap_or(0))
+        };
+        let _ = sup.edit(|b| {
+            if let Some(t) = b.tasks.iter_mut().find(|t| t.id == id) {
+                (t.health.cards, t.health.card_since) = (n, oldest);
+            }
+        });
     }
 
     /// Link `id`'s session (a task just started, or found live). A link to an older
@@ -1201,6 +1357,7 @@ Address every finding, commit, re-run your checks and report `done` again.",
             }
         }
         drop(g);
+        self.card_facts(id);
         sup.grounded(session);
         // A resumed task runs a new session; only its current one counts.
         if sup.row(id).ok().and_then(|t| t.session).as_deref() != Some(session) {
@@ -1250,6 +1407,7 @@ Address every finding, commit, re-run your checks and report `done` again.",
         });
         g.cards.insert(key, (t.abort_handle(), asked));
         drop(g);
+        self.card_facts(id);
         self.apply(&sup, id, Event::CardOpened);
         let label = sup.row(id).map(|t| t.label).unwrap_or_default();
         self.inform
@@ -1343,6 +1501,7 @@ Address every finding, commit, re-run your checks and report `done` again.",
         g.cards.remove(&(id.to_string(), card_id));
         let open = g.cards.keys().any(|(t, _)| t == id);
         drop(g);
+        self.card_facts(id);
         if !open && let Some(sup) = self.sup.upgrade() {
             self.apply(&sup, id, Event::LastCardAnswered);
         }
@@ -1374,6 +1533,8 @@ fn asked_of(card: &Card) -> board::Asked {
         kind: kind.into(),
         text: cut(&card.what()),
         options,
+        // When it opened, until its answer is recorded.
+        at: board::now(),
         ..board::Asked::default()
     }
 }
@@ -1682,6 +1843,23 @@ async fn run_link(
                     if let Some(ev) = watcher.goal(Goal::read(sup.home(), &session)) {
                         links.apply(&sup, &id, ev);
                     }
+                    if let Some(h) = watcher.health_to_save() {
+                        links.save_health(&sup, &id, h);
+                    }
+                    // A task working long without a progress report is steered (no interrupt) to send one.
+                    let now = board::now();
+                    if let Ok(t) = sup.row(&id)
+                        && watcher.progress_due(now, sup.cfg().watch.progress, &t)
+                        && let Some(w) = writer.lock().await.as_mut()
+                    {
+                        watcher.nudged = now;
+                        let req = Request {
+                            id: Some(PROGRESS_ID.into()),
+                            cmd: ClientCmd::Steer { text: PROGRESS_NUDGE.into() },
+                        };
+                        let _ = w.write_all(line(&req).as_bytes()).await;
+                        let _ = w.flush().await;
+                    }
                     continue;
                 }
             };
@@ -1818,6 +1996,13 @@ impl Inform for HubInform {
         if self.desktop {
             tokio::spawn(crate::activity::desktop(title, body));
         }
+    }
+    fn idle(&self) -> bool {
+        // Not started yet: no check.
+        let Some(h) = self.slot.0.get().and_then(|w| w.upgrade()) else {
+            return false;
+        };
+        !h.state().busy && !h.handle.pending_reminder(HEALTH_CHECK)
     }
     fn closing(&self) -> bool {
         // Not started yet is not closing.
@@ -2472,10 +2657,17 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct Said(Log, Arc<std::sync::atomic::AtomicBool>);
+    struct Said(
+        Log,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<std::sync::atomic::AtomicBool>,
+    );
     impl Inform for Said {
         fn closing(&self) -> bool {
             self.1.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn idle(&self) -> bool {
+            !self.2.load(std::sync::atomic::Ordering::Relaxed)
         }
         fn wake(&self, t: String) {
             self.0.lock().unwrap().push(format!("wake: {t}"));
@@ -2499,6 +2691,8 @@ mod tests {
         asker: Arc<FakeAsker>,
         log: Log,
         closing: Arc<std::sync::atomic::AtomicBool>,
+        /// Super is busy: no health check now.
+        busy: Arc<std::sync::atomic::AtomicBool>,
     }
 
     fn fixture(max_running: usize) -> Fx {
@@ -2508,6 +2702,10 @@ mod tests {
     /// `before` fills the board and the live sessions before the links start, as a
     /// board found by a restarted super.
     fn fixture_with(max_running: usize, before: impl FnOnce(&Super, &FakeLauncher)) -> Fx {
+        fixture_full(max_running, Default::default(), before)
+    }
+
+    fn fixture_full(max_running: usize, watch: super::super::Watch, before: impl FnOnce(&Super, &FakeLauncher)) -> Fx {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().canonicalize().unwrap();
         let (root, home) = (base.join("root"), base.join("home"));
@@ -2525,6 +2723,7 @@ mod tests {
             )],
             worktree_copy: vec![],
             home: home.clone(),
+            watch,
             allow: Arc::new(|_: &str| Ok(())),
         };
         let sup =
@@ -2532,7 +2731,8 @@ mod tests {
         before(&sup, &launcher);
         let log = Log::default();
         let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let said = Said(log.clone(), closing.clone());
+        let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let said = Said(log.clone(), closing.clone(), busy.clone());
         let links = Links::start(&sup, asker.clone(), Arc::new(Allow), Arc::new(said));
         Fx {
             _tmp: tmp,
@@ -2542,6 +2742,7 @@ mod tests {
             asker,
             log,
             closing,
+            busy,
         }
     }
 
@@ -2601,6 +2802,159 @@ mod tests {
             }
             panic!("never: {what}; said {:?}", self.said());
         }
+    }
+
+    fn tool_start(id: &str, name: &str, args: Value) -> AgentEvent {
+        AgentEvent::ToolStart {
+            call: novacode_types::ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: args,
+                arguments_error: None,
+                replay: None,
+            },
+        }
+    }
+
+    fn tool_end(id: &str, is_error: bool) -> AgentEvent {
+        AgentEvent::ToolEnd {
+            call_id: id.into(),
+            is_error,
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn health_facts_track_event_age_the_running_tool_errors_and_repeated_calls() {
+        let mut w = Watcher::new("faux");
+        w.track(&AgentEvent::AgentStart, 100);
+        assert_eq!(w.health.last_event, 100);
+        for (i, at) in [(1, 110), (2, 120), (3, 130)] {
+            let id = format!("c{i}");
+            w.track(
+                &tool_start(&id, "bash", serde_json::json!({"command": "cargo test"})),
+                at,
+            );
+            if i < 3 {
+                w.track(&tool_end(&id, true), at + 5);
+            }
+        }
+        assert_eq!(w.health.repeats, 3);
+        assert_eq!(w.health.errors, 2);
+        assert_eq!((w.health.tool.as_deref(), w.health.tool_since), (Some("bash"), 130));
+        assert_eq!(w.health.last_event, 130);
+        // A parallel call started later: the oldest running one is shown.
+        w.track(&tool_start("c4", "read", serde_json::json!({"path": "a"})), 140);
+        assert_eq!((w.health.tool.as_deref(), w.health.repeats), (Some("bash"), 1));
+        w.track(&tool_end("c3", false), 150);
+        assert_eq!((w.health.tool.as_deref(), w.health.tool_since), (Some("read"), 140));
+        assert_eq!(w.health.errors, 0, "a success ends the streak");
+        w.track(&end(&[Some(SUPER_ID)], StopReason::Stop), 160);
+        assert_eq!(w.health.tool, None, "nothing runs after the run ended");
+    }
+
+    #[test]
+    fn a_progress_nudge_is_due_after_the_interval_while_running_once_per_interval() {
+        let mut w = Watcher::new("faux");
+        let mut t = Task {
+            kind: Kind::Work,
+            state: State::Running,
+            ..Task::default()
+        };
+        assert!(!w.progress_due(5000, 1200, &t), "no run going");
+        w.track(&AgentEvent::AgentStart, 1000);
+        w.running = true;
+        assert!(!w.progress_due(2199, 1200, &t));
+        assert!(w.progress_due(2200, 1200, &t));
+        assert!(!w.progress_due(2200, 0, &t), "0 = off");
+        w.nudged = 2200;
+        assert!(!w.progress_due(3000, 1200, &t), "once per interval");
+        t.health.progress_at = 3000;
+        assert!(
+            !w.progress_due(3500, 1200, &t),
+            "a progress report restarts the interval"
+        );
+        assert!(w.progress_due(4200, 1200, &t));
+        t.state = State::WaitingYou;
+        assert!(!w.progress_due(9000, 1200, &t), "not while waiting on a card");
+    }
+
+    #[test]
+    fn a_progress_nudge_never_counts_as_a_prompt_of_the_run() {
+        let p = |ids: &[Option<&str>]| run_of(&ids.iter().map(|i| i.map(String::from)).collect::<Vec<_>>());
+        assert_eq!(p(&[Some(SUPER_ID), Some(PROGRESS_ID)]), Run::Super);
+        assert_eq!(p(&[Some(PROGRESS_ID)]), Run::Internal);
+        assert_eq!(p(&[None, Some(PROGRESS_ID)]), Run::User);
+    }
+
+    fn health_wakes(fx: &Fx) -> usize {
+        fx.said()
+            .iter()
+            .filter(|s| s.starts_with(&format!("wake: {HEALTH_CHECK}")))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn health_checks_wake_super_only_while_a_task_runs_and_super_is_idle() {
+        let watch = super::super::Watch { every: 1, progress: 0 };
+        let fx = fixture_full(5, watch, |_, _| {});
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(health_wakes(&fx), 0, "no running task");
+        fx.task("T1-x", "faux/a", State::Ready);
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(health_wakes(&fx), 0, "no running task");
+        fx.busy.store(true, std::sync::atomic::Ordering::Relaxed);
+        fx.sup.edit(|b| b.tasks[0].state = State::Running).unwrap();
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(health_wakes(&fx), 0, "super is busy");
+        fx.busy.store(false, std::sync::atomic::Ordering::Relaxed);
+        fx.until("a health check", |fx| health_wakes(fx) == 1).await;
+        // Super's `OK` (the context builder's callback) records the check on the board.
+        fx.sup.checked();
+        assert!(fx.sup.board.lock().unwrap().last_check.is_some());
+        let md = std::fs::read_to_string(fx.sup.dir.join("board.md")).unwrap();
+        assert!(md.contains("- Last health check: "), "{md}");
+    }
+
+    #[tokio::test]
+    async fn a_task_working_past_the_interval_is_steered_for_progress() {
+        let watch = super::super::Watch { every: 0, progress: 1 };
+        let fx = fixture_full(5, watch, |_, _| {});
+        let s = fx.task("T1-x", "faux/a", State::Running);
+        let mut t = fx.end(&s).await;
+        t.catch_up(false, vec![], vec![]).await;
+        // Idle: no nudge.
+        let quiet = tokio::time::timeout(Duration::from_millis(2500), t.lines.next_line()).await;
+        assert!(quiet.is_err(), "{quiet:?}");
+        t.event(AgentEvent::AgentStart).await;
+        let r = t.cmd().await;
+        assert_eq!(r.id.as_deref(), Some(PROGRESS_ID));
+        assert!(
+            matches!(&r.cmd, ClientCmd::Steer { text } if text == PROGRESS_NUDGE),
+            "{r:?}"
+        );
+        // Progress never wakes super.
+        assert_eq!(fx.said().iter().filter(|s| s.starts_with("wake:")).count(), 0);
+    }
+
+    #[tokio::test]
+    async fn unanswered_cards_and_tool_facts_reach_the_board_row() {
+        let fx = fixture(5);
+        let s = fx.task("T1-x", "faux/a", State::Running);
+        let mut t = fx.end(&s).await;
+        t.catch_up(false, vec![], vec![ask(7)]).await;
+        fx.until("card counted", |fx| fx.sup.row("T1-x").unwrap().health.cards == 1)
+            .await;
+        assert!(fx.sup.row("T1-x").unwrap().health.card_since >= board::now() - 2);
+        t.event(AgentEvent::AgentStart).await;
+        t.event(tool_start("c1", "bash", serde_json::json!({}))).await;
+        fx.until("tool saved", |fx| {
+            fx.sup.row("T1-x").unwrap().health.tool.as_deref() == Some("bash")
+        })
+        .await;
+        t.put(ServerMsg::AskDone { id: 7 }).await;
+        fx.until("card gone", |fx| fx.sup.row("T1-x").unwrap().health.cards == 0)
+            .await;
     }
 
     fn ask(id: u64) -> ServerMsg {

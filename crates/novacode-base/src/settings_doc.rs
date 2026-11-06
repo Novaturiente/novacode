@@ -264,6 +264,18 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "Extra tools super's model sees besides `task`, `ask_user`, `memory`, `todo` and `agent`. Scouts and tasks it starts get the regular tool set either way.",
     ),
     (
+        "super.watch.everyMinutes",
+        "number",
+        "30",
+        "Super mode: while a task runs, super gets a health-check wake this often and judges the tasks from code's health facts; a check that finds all fine is hidden from your window. Skipped while super works. `0`: no checks.",
+    ),
+    (
+        "super.watch.progressMinutes",
+        "number",
+        "20",
+        "Super mode: a task that has worked this long without a `progress` report is asked for one at its next tool boundary (no interrupt); never while it waits on your answer. `0`: no nudges.",
+    ),
+    (
         "goal.audit",
         "bool",
         "true",

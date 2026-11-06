@@ -1516,6 +1516,11 @@ impl Agent {
     }
 
     fn add(&mut self, kind: EntryKind) -> String {
+        self.add_as(kind, true)
+    }
+
+    /// [`add`](Self::add); `emit: false` stores a message without telling the windows.
+    fn add_as(&mut self, kind: EntryKind, emit: bool) -> String {
         if let EntryKind::Message {
             message: Message::Assistant(a),
         } = &kind
@@ -1524,8 +1529,7 @@ impl Agent {
             self.usage_stale = false;
         }
         let ev = match &kind {
-            EntryKind::Message { message } => Some(message.clone()),
-            EntryKind::CustomMessage { .. } => None,
+            EntryKind::Message { message } if emit => Some(message.clone()),
             _ => None,
         };
         let id = match self.store.append(kind) {
@@ -1689,9 +1693,14 @@ impl Agent {
         let mut refused = false;
         // Wire prompts this run took, for `AgentEnd` (L10.9).
         let mut prompts = Vec::new();
+        // A silent check (`context_window::Quiet`): its note's entry, while the run had
+        // no prompt and no tool call.
+        let mut quiet_note: Option<String> = None;
+        let mut plain = true;
         let stop = loop {
             let queued = self.take_queued(steering_only);
             let mut added = queued.is_empty();
+            plain &= queued.is_empty();
             for Queued { content, wire } in queued {
                 prompts.extend(wire);
                 // A user message ends an activated skill's turn rules (L5.25).
@@ -1766,12 +1775,21 @@ impl Agent {
                 q.wake = false;
                 q.reminders.drain(..).collect()
             };
+            let marker = self
+                .context
+                .as_ref()
+                .and_then(|c| c.quiet.as_ref())
+                .map(|q| q.marker.clone());
             for (kind, text) in notes {
-                self.add(EntryKind::CustomMessage {
+                let check = marker.as_deref().is_some_and(|m| text.starts_with(m));
+                let id = self.add(EntryKind::CustomMessage {
                     kind,
                     text,
                     display: false,
                 });
+                if check {
+                    quiet_note = Some(id);
+                }
             }
             steering_only = true;
             // L4.16: no model call while the session file is missing entries.
@@ -1795,9 +1813,16 @@ impl Agent {
             let stop = msg.stop.clone();
             let has_text = !msg.text().trim().is_empty();
             let text = msg.text();
-            self.add(EntryKind::Message {
-                message: Message::Assistant(msg),
-            });
+            let quiet = plain && calls.is_empty() && stop == StopReason::Stop && text.trim() == "OK";
+            plain &= calls.is_empty();
+            match quiet_note.take().filter(|_| quiet) {
+                Some(note) => self.hide_ok(msg, note),
+                None => {
+                    self.add(EntryKind::Message {
+                        message: Message::Assistant(msg),
+                    });
+                }
+            }
             // L4.16: and no tool runs either.
             if !calls.is_empty() && !self.saved() {
                 self.skip_calls(&calls, "Not run: the session could not be saved.");
@@ -2082,6 +2107,24 @@ impl Agent {
                 _ = tokio::time::sleep(delay) => {}
                 _ = cancel.cancelled() => return failed(&self.cfg, ErrorKind::Aborted, "aborted during retry wait"),
             }
+        }
+    }
+
+    /// A silent check's `OK` (`context_window::Quiet`): kept on record, hidden from the
+    /// windows and the model together with its note.
+    fn hide_ok(&mut self, m: AssistantMessage, note: String) {
+        self.emit(AgentEvent::Stream(StreamEvent::RetryRollback));
+        let id = self.add_as(
+            EntryKind::Message {
+                message: Message::Assistant(m),
+            },
+            false,
+        );
+        for target in [note, id] {
+            self.add(EntryKind::ContextEdit { target, replace: None });
+        }
+        if let Some(q) = self.context.as_ref().and_then(|c| c.quiet.as_ref()) {
+            (q.on_ok)();
         }
     }
 
@@ -2473,6 +2516,12 @@ impl SessionHandle {
     /// A saved hidden note of `kind` (e.g. `agent` for subagent reports).
     pub fn remind_as(&self, kind: &str, text: impl Into<String>, wake: bool) {
         self.shared.remind(kind, text.into(), wake);
+    }
+
+    /// A note starting with `prefix` is queued and not yet given to the model.
+    pub fn pending_reminder(&self, prefix: &str) -> bool {
+        let q = self.shared.queues.lock().unwrap();
+        q.reminders.iter().any(|(_, t)| t.starts_with(prefix))
     }
 
     /// Show an event in every window (UI ops, notices); never stored.

@@ -740,6 +740,7 @@ mod tests {
             tiers,
             worktree_copy: vec!["AGENTS.md".into()],
             home: home.clone(),
+            watch: Default::default(),
             allow: Arc::new(|m: &str| match m.starts_with("denied/") {
                 true => Err(format!("{m} is denied by models.deny")),
                 false => Ok(()),
@@ -1356,6 +1357,7 @@ mod tests {
             tiers: vec![],
             worktree_copy: vec![],
             home: fx.sup.home().to_path_buf(),
+            watch: Default::default(),
             allow: Arc::new(|_: &str| Ok(())),
         };
         let again = Super::new(&fx.sup.root, fx.sup.dir.clone(), cfg, None, fx.launcher.clone()).unwrap();

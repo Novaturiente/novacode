@@ -1076,6 +1076,112 @@ async fn long_run_compacts_between_model_calls() {
     }
 }
 
+/// L10.9 super health checks: a reply of exactly `OK` right after a marked wake is hidden
+/// from the windows (rolled back, no message event), left out of later requests with its
+/// wake, and reported to the builder's callback. Other `OK`s and other check replies stay.
+#[tokio::test]
+async fn an_ok_reply_to_a_marked_check_is_hidden_and_left_out_of_the_context() {
+    use novacode_core::context_window::{Builder, Quiet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let main = Faux::new([
+        FauxReply::text("OK"),
+        FauxReply::text("OK"),
+        FauxReply::text("T1 looks stuck"),
+        FauxReply::text("done"),
+    ]);
+    let reqs = main.requests.clone();
+    let store = Store::create(&Paths::new(home.path()), work.path(), false);
+    let oks = Arc::new(AtomicUsize::new(0));
+    let o = oks.clone();
+    let agent = Agent::new(
+        Arc::new(main),
+        novacode_tools::builtins(false),
+        store,
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_context_builder(Builder {
+        budget: 6000,
+        state: Arc::new(|_: &Store| "BOARD".to_string()),
+        quiet: Some(Quiet {
+            marker: "[health check]".into(),
+            on_ok: Arc::new(move || {
+                o.fetch_add(1, Ordering::SeqCst);
+            }),
+        }),
+    });
+    let (h, task) = agent::spawn(agent);
+    let mut rx = h.subscribe();
+    async fn settled(rx: &mut tokio::sync::broadcast::Receiver<AgentEvent>) -> Vec<AgentEvent> {
+        let mut evs = Vec::new();
+        loop {
+            let ev = rx.recv().await.unwrap();
+            let done = matches!(ev, AgentEvent::Settled);
+            evs.push(ev);
+            if done {
+                return evs;
+            }
+        }
+    }
+    let wake = |text: &str| h.remind_as("super", text, true);
+    let replies = |evs: &[AgentEvent]| {
+        evs.iter()
+            .filter_map(|e| match e {
+                AgentEvent::Message(Message::Assistant(a)) => Some(a.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    wake("[health check] first");
+    let evs = settled(&mut rx).await;
+    assert!(replies(&evs).is_empty(), "{evs:?}");
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, AgentEvent::Stream(novacode_types::StreamEvent::RetryRollback)))
+    );
+    assert_eq!(oks.load(Ordering::SeqCst), 1);
+    // An `OK` to another wake is a normal reply.
+    wake("T2 reported done");
+    let evs = settled(&mut rx).await;
+    assert_eq!(replies(&evs), ["OK"]);
+    // A check that finds a problem is shown.
+    wake("[health check] second");
+    let evs = settled(&mut rx).await;
+    assert_eq!(replies(&evs), ["T1 looks stuck"]);
+    assert_eq!(oks.load(Ordering::SeqCst), 1);
+    h.prompt("next");
+    settled(&mut rx).await;
+    h.shutdown();
+    let agent = task.await.unwrap();
+    let sent = format!("{:?}", reqs.lock().unwrap().last().unwrap().messages);
+    assert!(!sent.contains("first"), "{sent}");
+    assert!(
+        sent.contains("T2 reported done") && sent.contains("T1 looks stuck"),
+        "{sent}"
+    );
+    let oks_kept = agent
+        .store
+        .transcript()
+        .iter()
+        .filter(|m| matches!(m, Message::Assistant(a) if a.text() == "OK"))
+        .count();
+    assert_eq!(oks_kept, 1, "the hidden OK stays out of a reattached window");
+    // The session file keeps both.
+    assert_eq!(
+        agent
+            .store
+            .entries()
+            .iter()
+            .filter(|e| matches!(&e.kind, novacode_core::session::EntryKind::Message {
+                message: Message::Assistant(a)
+            } if a.text() == "OK"))
+            .count(),
+        2
+    );
+}
+
 /// L10.9 super: a context builder rebuilds every request (state block + newest chat in
 /// budget); the session file keeps everything, and auto-compaction never fires. Without
 /// a builder, the request is the projection, unchanged.
@@ -1116,6 +1222,7 @@ async fn a_context_builder_rebuilds_requests_and_keeps_the_session_whole() {
             agent = agent.with_context_builder(novacode_core::context_window::Builder {
                 budget: 2500,
                 state: Arc::new(|_: &Store| "BOARD ROWS".to_string()),
+                quiet: None,
             });
         }
         let prompts: Vec<String> = (0..8).map(|i| format!("p{i}")).collect();

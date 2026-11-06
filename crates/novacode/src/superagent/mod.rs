@@ -53,7 +53,14 @@ the open requests) comes with every message, and is the truth. For older chat, u
 limit such as \"stop before deploy\") goes on its charter with `task note`; a lasting preference goes to `memory`; \
 a request that is not a task yet goes on `todo` (your open requests).
 - A change to a task's brief, criteria or scope goes through `task scope`: the user approves it on a card, then \
-code updates the charter and tells the task. A `task send` never changes the criteria.";
+code updates the charter and tells the task. A `task send` never changes the criteria.
+- A message starting with `[health check]` is a timed check of the running tasks. Judge each from the Health \
+section of the state block. When all are fine, answer exactly `OK` and nothing else (code hides that turn from the \
+user). On a problem (no events for long, one tool running far too long, an error streak, the same call repeated, a \
+card unanswered for long, no progress for long): first ask the task with `task send` and `question: true`. Then you \
+may, without asking the user, send it instructions, stop it, resume it, or start a replacement task. Never merge, \
+close, change scope or delete without the user's card. Always tell the user what you found and what you did. At the \
+slightest doubt about what is wrong or what to do, ask the user with `ask_user` before acting.";
 
 /// Follows the global `AGENTS.md`: what of it doesn't apply to super.
 const OVERRIDES: &str = "The instructions above were written for a coding session. Where a rule needs a tool you \
@@ -185,6 +192,35 @@ pub fn feed_board(slot: crate::hub::HubSlot, sup: &std::sync::Arc<task::Super>, 
     });
 }
 
+/// `super.watch.*` (L10.9 "Health checks and progress"), in seconds; 0 = off.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Watch {
+    /// A health-check wake this often while a task runs (`everyMinutes`).
+    pub every: u64,
+    /// A progress nudge to a task working this long without a `progress` report (`progressMinutes`).
+    pub progress: u64,
+}
+
+impl Default for Watch {
+    fn default() -> Self {
+        Watch {
+            every: 30 * 60,
+            progress: 20 * 60,
+        }
+    }
+}
+
+/// `super.watch.everyMinutes` (default 30) and `super.watch.progressMinutes` (default 20).
+pub fn watch(s: &Settings) -> Watch {
+    let d = Watch::default();
+    Watch {
+        every: s.get::<u64>("super.watch.everyMinutes").map_or(d.every, |m| m * 60),
+        progress: s
+            .get::<u64>("super.watch.progressMinutes")
+            .map_or(d.progress, |m| m * 60),
+    }
+}
+
 /// `super.maxRunning`: tasks in `running` at once; more wait as `queued`. At least 1:
 /// 0 would never start a task.
 pub fn max_running(s: &Settings) -> usize {
@@ -241,10 +277,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn health_checks_answer_ok_when_fine_and_ask_the_task_first_on_a_problem() {
+        for rule in [
+            "`[health check]`",
+            "answer exactly `OK` and nothing else",
+            "first ask the task with `task send` and `question: true`",
+            "send it instructions, stop it, resume it, or start a replacement task",
+            "Never merge, close, change scope or delete without the user's card",
+            "Always tell the user what you found and what you did",
+            "slightest doubt",
+        ] {
+            assert!(PROMPT.contains(rule), "{rule}");
+        }
+        assert!(link::HEALTH_CHECK == "[health check]");
+    }
+
     /// B9: super shows the base branch with the criteria, from `task info`.
     #[test]
     fn criteria_are_shown_with_the_base_branch_from_task_info() {
         assert!(PROMPT.contains("`task info` with the task's `folder`"), "{PROMPT}");
+    }
+
+    #[test]
+    fn watch_settings_default_to_30_and_20_minutes() {
+        let (_d, s) = settings("{}");
+        assert_eq!(
+            watch(&s),
+            Watch {
+                every: 1800,
+                progress: 1200
+            }
+        );
+        let (_d, s) = settings(r#"{"super": {"watch": {"everyMinutes": 5, "progressMinutes": 0}}}"#);
+        assert_eq!(
+            watch(&s),
+            Watch {
+                every: 300,
+                progress: 0
+            }
+        );
     }
 
     /// B8: `maxRunning: 0` would never start a task.

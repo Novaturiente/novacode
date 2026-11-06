@@ -50,6 +50,8 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `super.maxRunning` | number | 5 | Super mode (docs/super.md): tasks running at once, review tasks included; a new `task spawn` over the limit waits as `queued`. Messages to existing tasks never wait. At least 1: `0` counts as 1. |
 | `super.tiers` | object | `quick` `claude/claude-haiku-5-5`, `standard` `claude/claude-sonnet-5-5`, `deep` `claude/claude-opus-5-5:high`, `review` `codex/gpt-6.1-sol:high` | Super mode task models, weakest to strongest: `<tier>: {model, note}`, `note` saying when super should use it. An entry replaces that tier's default; a review runs one tier above its task. |
 | `super.tools` | list | [] | Extra tools super's model sees besides `task`, `ask_user`, `memory`, `todo` and `agent`. Scouts and tasks it starts get the regular tool set either way. |
+| `super.watch.everyMinutes` | number | 30 | Super mode: while a task runs, super gets a health-check wake this often and judges the tasks from code's health facts; a check that finds all fine is hidden from your window. Skipped while super works. `0`: no checks. |
+| `super.watch.progressMinutes` | number | 20 | Super mode: a task that has worked this long without a `progress` report is asked for one at its next tool boundary (no interrupt); never while it waits on your answer. `0`: no nudges. |
 | `goal.audit` | bool | true | `/goal` completion is checked by the `auditor` subagent before it counts. |
 | `goal.auditModel` | string | the session's model | Model of the goal auditor (`provider/model[:level]`). |
 | `goal.maxRuns` | number | 30 | Automatic continuations of a goal before it pauses (per start or `/goal resume`). |

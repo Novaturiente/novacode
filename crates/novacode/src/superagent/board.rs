@@ -217,6 +217,71 @@ pub struct Held {
     pub text: String,
 }
 
+/// What super's code saw of a task's work, for super's health checks (L10.9 "Health
+/// checks and progress"): written from the task's socket events, shown in the state block.
+/// Unix seconds; 0 = never.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Health {
+    /// The task's last socket event.
+    pub last_event: u64,
+    /// The tool running longest now, and since when.
+    pub tool: Option<String>,
+    pub tool_since: u64,
+    /// Tool calls in a row that ended in an error.
+    pub errors: u32,
+    /// How many times in a row the same tool call (name and arguments) ran.
+    pub repeats: u32,
+    /// Relayed cards not answered yet, and when the oldest opened.
+    pub cards: u32,
+    pub card_since: u64,
+    /// Its last `progress` report.
+    pub progress_at: u64,
+}
+
+/// `t` seconds before `now`, short: `40 s`, `12 min`, `3 h`.
+fn age(now: u64, t: u64) -> String {
+    let s = now.saturating_sub(t);
+    match s {
+        0..120 => format!("{s} s"),
+        120..7200 => format!("{} min", s / 60),
+        _ => format!("{} h", s / 3600),
+    }
+}
+
+impl Health {
+    /// One line of facts for the state block.
+    pub fn line(&self, now: u64) -> String {
+        let mut parts = vec![match self.last_event {
+            0 => "no event seen yet".to_string(),
+            t => format!("last event {} ago", age(now, t)),
+        }];
+        parts.push(match &self.tool {
+            Some(tool) => format!("running `{tool}` for {}", age(now, self.tool_since)),
+            None => "no tool running".into(),
+        });
+        if self.errors > 0 {
+            parts.push(format!("{} tool errors in a row", self.errors));
+        }
+        if self.repeats > 1 {
+            parts.push(format!("the same call {} times in a row", self.repeats));
+        }
+        if self.cards > 0 {
+            let s = if self.cards == 1 { "" } else { "s" };
+            parts.push(format!(
+                "{} unanswered card{s}, oldest {}",
+                self.cards,
+                age(now, self.card_since)
+            ));
+        }
+        parts.push(match self.progress_at {
+            0 => "no progress report yet".into(),
+            t => format!("last progress {} ago", age(now, t)),
+        });
+        parts.join("; ")
+    }
+}
+
 /// Chars of a task's charter notes before the oldest are summarised.
 pub const NOTES_CAP: usize = 3000;
 /// Chars of a summary row in the state block.
@@ -312,6 +377,9 @@ pub struct Task {
     pub flight: Option<Flight>,
     /// Session tokens last seen in its run file: the Tasks tab shows them once it's gone.
     pub tokens: u64,
+    /// What code saw of its work, for super's health checks.
+    #[serde(skip_serializing_if = "is_default")]
+    pub health: Health,
     /// Unix seconds.
     pub started: u64,
     pub updated: u64,
@@ -767,6 +835,13 @@ pub struct Board {
     pub merge_locks: BTreeMap<PathBuf, String>,
     /// Provider → the limit holding it.
     pub holds: BTreeMap<String, Limit>,
+    /// Unix seconds of super's last health check that found everything fine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_check: Option<u64>,
+}
+
+fn is_default<T: Default + PartialEq>(t: &T) -> bool {
+    *t == T::default()
 }
 
 impl Board {
@@ -823,9 +898,16 @@ impl Board {
         }
         let mut release = n.effects.contains(&Effect::CheckMergeLeft);
         match &ev {
-            Event::Report { summary, question, .. } => {
+            Event::Report {
+                state,
+                summary,
+                question,
+            } => {
                 t.summary = Some(summary.clone());
                 t.question = question.clone();
+                if *state == ReportState::Progress {
+                    t.health.progress_at = now();
+                }
             }
             Event::ReviewCrashed(_) => t.review_crashes += 1,
             Event::Verdict(v) => {
@@ -965,6 +1047,20 @@ impl Board {
                 "({archived} archived; `task list {{all: true}}` shows them)\n"
             ));
         }
+        let running: Vec<&&Task> = rows
+            .iter()
+            .filter(|t| matches!(t.state, State::Running | State::WaitingYou))
+            .collect();
+        if !running.is_empty() {
+            let now = now();
+            s.push_str("\n## Health (running tasks)\n");
+            if let Some(c) = self.last_check {
+                s.push_str(&format!("Your last check that found all fine: {} ago.\n", age(now, c)));
+            }
+            for t in running {
+                s.push_str(&format!("- {}: {}\n", t.label, t.health.line(now)));
+            }
+        }
         let charters: Vec<String> = rows
             .iter()
             .filter(|t| t.kind == Kind::Work)
@@ -1005,8 +1101,14 @@ impl Board {
                 cell(t.summary.as_deref().unwrap_or("")),
             ));
         }
-        if !self.merge_locks.is_empty() || !self.holds.is_empty() {
+        if !self.merge_locks.is_empty() || !self.holds.is_empty() || self.last_check.is_some() {
             out.push('\n');
+        }
+        if let Some(c) = self.last_check {
+            out.push_str(&format!(
+                "- Last health check: {}Z (all fine)\n",
+                novacode_core::memory::utc_minute(c * 1000)
+            ));
         }
         for (repo, id) in &self.merge_locks {
             out.push_str(&format!("- Merge lock: {} held by {id}\n", repo.display()));
@@ -1834,6 +1936,7 @@ mod tests {
             ],
             merge_locks: BTreeMap::from([(PathBuf::from("/root/proj"), "T1".to_string())]),
             holds: BTreeMap::from([("claude".to_string(), limit())]),
+            last_check: None,
         };
         let want = "# Super board
 
@@ -1847,6 +1950,66 @@ mod tests {
 - On hold: claude (quota)
 ";
         assert_eq!(b.render(), want);
+    }
+
+    #[test]
+    fn the_state_block_shows_health_facts_for_running_tasks_and_board_md_the_last_check() {
+        let now = now();
+        let mut t = row(State::Running);
+        t.summary = Some("3 of 5 files done".into());
+        t.health = Health {
+            last_event: now - 120,
+            tool: Some("bash".into()),
+            tool_since: now - 900,
+            errors: 3,
+            repeats: 4,
+            cards: 1,
+            card_since: now - 600,
+            progress_at: now - 1500,
+        };
+        let mut idle = row(State::Ready);
+        idle.label = "T2-done".into();
+        idle.health.errors = 9;
+        let mut b = Board {
+            tasks: vec![t, idle],
+            ..Default::default()
+        };
+        let s = b.state_block(&[]);
+        assert!(
+            s.contains(
+                "- T1-fix: last event 2 min ago; running `bash` for 15 min; 3 tool errors in a row; the same \
+                 call 4 times in a row; 1 unanswered card, oldest 10 min; last progress 25 min ago"
+            ),
+            "{s}"
+        );
+        assert!(!s.contains("T2-done: last event"), "only running tasks: {s}");
+        // No tool, no progress yet.
+        b.tasks[0].health = Health {
+            last_event: now,
+            ..Health::default()
+        };
+        let s = b.state_block(&[]);
+        assert!(
+            s.contains("- T1-fix: last event 0 s ago; no tool running; no progress report yet"),
+            "{s}"
+        );
+        assert!(!b.render().contains("Last health check"));
+        b.last_check = Some(1_800_000_000);
+        assert!(
+            b.render().contains("- Last health check: 2027-01-15 08:00Z (all fine)"),
+            "{}",
+            b.render()
+        );
+        // An old board without health facts still loads.
+        let t: Task = serde_json::from_str(r#"{"id":"T1","label":"T1-x"}"#).unwrap();
+        assert_eq!(t.health, Health::default());
+    }
+
+    #[test]
+    fn a_progress_report_records_its_time() {
+        let mut b = board(&[("T1", Running)]);
+        b.apply("T1", report(ReportState::Progress)).unwrap();
+        assert!(b.tasks[0].health.progress_at >= now() - 1);
     }
 
     #[test]

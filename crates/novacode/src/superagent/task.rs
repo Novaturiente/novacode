@@ -29,6 +29,8 @@ pub struct Config {
     pub home: PathBuf,
     /// `models.deny` and model resolution.
     pub allow: crate::agents::ModelCheck,
+    /// `super.watch.*`: health checks and progress nudges.
+    pub watch: super::Watch,
 }
 
 /// How a task process starts.
@@ -220,6 +222,8 @@ not to you; your first message is your brief, with the user's request and its ac
 - Call `report` when you are done, blocked or failed: `done` with `checks` (the `[proof #N]` numbers of the \
 checks that prove each criterion), `blocked` with a `question` when you need the user. Reports are the only \
 thing super reads; a turn that ends without one is reported as blocked.
+- At each milestone of longer work, call `report` with `state: progress`: what is done, what is next, and a \
+count or percentage when you know one (at most 80 words). Then go on; progress never ends your turn.
 - Your `ask_user` questions and approvals reach the user in super's window, labelled {label}.
 - Edit files only inside your own worktree (or, outside git, your folder): the edit tools refuse anywhere else. \
 Don't write elsewhere with `bash` either. A read task that has to write calls `enter_worktree` first.
@@ -324,6 +328,13 @@ impl Super {
         let r = f(&mut b);
         b.save(&self.dir).map_err(|e| format!("couldn't save the board: {e}"))?;
         Ok(r)
+    }
+
+    /// A health check found everything fine: its time goes on the board.
+    pub fn checked(&self) {
+        if let Err(e) = self.edit(|b| b.last_check = Some(super::board::now())) {
+            tracing::warn!(%e, "super: the health check time wasn't saved");
+        }
     }
 
     pub(super) fn row(&self, id: &str) -> Result<Task, String> {
@@ -2101,6 +2112,7 @@ mod tests {
             tiers,
             worktree_copy: vec!["AGENTS.md".into(), ".codegraph".into()],
             home: home.to_path_buf(),
+            watch: Default::default(),
             allow: Arc::new(|m: &str| match m.starts_with("denied/") {
                 true => Err(format!("{m} is denied by models.deny")),
                 false => Ok(()),
@@ -2504,6 +2516,19 @@ mod tests {
         assert!(row.notes_len() <= super::super::board::NOTES_CAP, "{}", row.notes_len());
         assert!(row.notes[0].starts_with("[older notes trimmed"), "{:?}", row.notes[0]);
         assert!(row.notes.last().unwrap().starts_with("n9 "));
+    }
+
+    #[test]
+    fn the_preamble_asks_for_progress_at_milestones() {
+        let p = preamble("T1-x");
+        assert!(
+            p.contains("At each milestone of longer work, call `report` with `state: progress`"),
+            "{p}"
+        );
+        assert!(
+            p.contains("a count or percentage") && p.contains("at most 80 words"),
+            "{p}"
+        );
     }
 
     #[test]
@@ -3112,6 +3137,7 @@ mod tests {
             tiers: Vec::new(),
             worktree_copy: Vec::new(),
             home: fx.home.clone(),
+            watch: Default::default(),
             allow: fx.sup.cfg.allow.clone(),
         };
         let _again = Super::new(&fx.root, fx.sup.dir.clone(), cfg, None, fx.launcher.clone()).unwrap();

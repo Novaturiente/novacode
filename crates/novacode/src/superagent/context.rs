@@ -21,10 +21,15 @@ pub const CHAT_BUDGET: u64 = 6000;
 const HISTORY_CHARS: usize = 2000;
 
 /// Super's context builder: the board at `<dir>/board.json` and the session's open todo
-/// items as the state block, then the newest chat in [`CHAT_BUDGET`].
-pub fn builder(dir: PathBuf) -> context_window::Builder {
+/// items as the state block, then the newest chat in [`CHAT_BUDGET`]. A health check
+/// answered with exactly `OK` is hidden and left out; `on_ok` runs then (records the check).
+pub fn builder(dir: PathBuf, on_ok: Arc<dyn Fn() + Send + Sync>) -> context_window::Builder {
     context_window::Builder {
         budget: CHAT_BUDGET,
+        quiet: Some(context_window::Quiet {
+            marker: super::link::HEALTH_CHECK.into(),
+            on_ok,
+        }),
         state: Arc::new(move |store: &Store| {
             let open = open_requests(store);
             match Board::load(&dir) {
