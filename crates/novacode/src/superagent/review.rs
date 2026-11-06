@@ -21,15 +21,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-/// The reviewer's tier: one stronger; the `review` tier for `deep`, `review` and user-named models.
-pub fn reviewer_tier(tier: Option<&str>) -> &'static str {
-    match tier {
-        Some("quick") => "standard",
-        Some("standard") => "deep",
-        _ => "review",
-    }
-}
-
 /// The review's scratch folder key: its label plus a piece of its token, so two supers
 /// (or two test runs) with the same labels never share a scratch folder.
 pub fn scratch_id(rv: &Task) -> String {
@@ -415,20 +406,18 @@ pub(super) fn remove_scratch(repo: Option<&Path>, scratch: &Path) {
 
 impl Super {
     /// Queue a review of `id`, which just moved to `reviewing` with `Effect::StartReview`:
-    /// a review row on the next tier, the reviewed row's `reviewer` set. When the
+    /// a review row one tier up, on another usable provider when there is one
+    /// ([`super::models::Models::review`]), the reviewed row's `reviewer` set. When the
     /// review's model can't be used the reviewed task goes to `blocked`; `Err` says why.
     pub(super) fn open_review(&self, id: &str, note: Option<&str>) -> Result<String, String> {
         let t = self.row(id)?;
-        let tier = reviewer_tier(t.tier.as_deref());
-        let model = self
-            .cfg()
-            .tiers
-            .iter()
-            .find(|(n, _)| n == tier)
-            .map(|(_, t)| t.model.clone())
-            .ok_or_else(|| format!("no tier `{tier}`"))
-            .and_then(|m| (self.cfg().allow)(&m).map(|()| m));
-        let model = match model {
+        let holds: Vec<String> = self.board.lock().unwrap().holds.keys().cloned().collect();
+        let held = |p: &str| holds.iter().any(|h| h == p);
+        let models = &self.cfg().models;
+        let picked = models
+            .review(&t.model, t.tier.as_deref(), &held, &self.current_model())
+            .and_then(|(tier, m)| models.allowed(&m).map(|()| (tier, m)));
+        let (tier, model) = match picked {
             Ok(m) => m,
             Err(e) => {
                 let why = format!("its review can't start: {e}");
@@ -451,7 +440,7 @@ impl Super {
             repo: t.repo.clone(),
             base_branch: t.base_branch.clone(),
             base_commit: t.base_commit.clone(),
-            tier: Some(tier.into()),
+            tier: Some(tier),
             model,
             trusted: t.trusted,
             token: super::task::new_token(),
@@ -583,7 +572,6 @@ impl Super {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::superagent::Tier;
     use crate::superagent::link::{Inform, Links};
     use crate::superagent::task::{Config, Launcher, Start};
     use futures_util::future::BoxFuture;
@@ -718,33 +706,13 @@ mod tests {
         sh(&app, &["add", "."]);
         sh(&app, &["commit", "-qm", "init"]);
         std::fs::write(app.join("AGENTS.md"), "rules").unwrap();
-        let tiers = ["quick", "standard", "deep", "review"]
-            .iter()
-            .map(|n| {
-                let model = if *n == "review" {
-                    review_model.to_string()
-                } else {
-                    format!("faux/{n}")
-                };
-                (
-                    n.to_string(),
-                    Tier {
-                        model,
-                        note: String::new(),
-                    },
-                )
-            })
-            .collect();
         let cfg = Config {
             max_running: 5,
-            tiers,
+            models: Arc::new(super::super::models::tests::flat_with(review_model)),
+            model: "faux/script".into(),
             worktree_copy: vec!["AGENTS.md".into()],
             home: home.clone(),
             watch: Default::default(),
-            allow: Arc::new(|m: &str| match m.starts_with("denied/") {
-                true => Err(format!("{m} is denied by models.deny")),
-                false => Ok(()),
-            }),
         };
         let launcher = Arc::new(FakeLauncher::default());
         let cards = Arc::new(Pick::default());
@@ -863,12 +831,12 @@ mod tests {
     }
 
     #[test]
-    fn reviewers_are_one_tier_stronger_and_the_review_tier_takes_the_rest() {
+    fn reviewers_are_one_tier_stronger_and_deep_at_most() {
+        use super::super::models::reviewer_tier;
         assert_eq!(reviewer_tier(Some("quick")), "standard");
         assert_eq!(reviewer_tier(Some("standard")), "deep");
-        assert_eq!(reviewer_tier(Some("deep")), "review");
-        assert_eq!(reviewer_tier(Some("review")), "review");
-        assert_eq!(reviewer_tier(None), "review", "a model the user named");
+        assert_eq!(reviewer_tier(Some("deep")), "deep");
+        assert_eq!(reviewer_tier(None), "deep", "a named model");
     }
 
     #[test]
@@ -1355,11 +1323,11 @@ mod tests {
             .unwrap();
         let cfg = Config {
             max_running: 1,
-            tiers: vec![],
+            models: Arc::new(super::super::models::tests::flat()),
+            model: "faux/script".into(),
             worktree_copy: vec![],
             home: fx.sup.home().to_path_buf(),
             watch: Default::default(),
-            allow: Arc::new(|_: &str| Ok(())),
         };
         let again = Super::new(&fx.sup.root, fx.sup.dir.clone(), cfg, None, fx.launcher.clone()).unwrap();
         drop(again);

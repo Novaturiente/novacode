@@ -6,7 +6,6 @@
 //! Task processes are detached `novacode --bg` sessions started through a
 //! [`Launcher`]; [`Procs`] is the real one. They outlive super.
 
-use super::Tier;
 use super::board::{Board, Event, Flight, Held, Kind, MergeResult, State, Task, TaskType};
 use crate::wire::{ClientCmd, Request, ServerMsg, line};
 use futures_util::future::BoxFuture;
@@ -22,13 +21,14 @@ use std::sync::{Arc, Mutex};
 /// What `super.*` and the session give the tool.
 pub struct Config {
     pub max_running: usize,
-    pub tiers: Vec<(String, Tier)>,
+    /// Task models: tiers per provider (`super.tiers`), `models.deny`, logins, live lists.
+    pub models: Arc<super::models::Models>,
+    /// Super's own model at start (`provider/model`); `/model` in its window changes it.
+    pub model: String,
     /// `worktree.copy`.
     pub worktree_copy: Vec<String>,
     /// novacode's home: `trust.json` and the session files.
     pub home: PathBuf,
-    /// `models.deny` and model resolution.
-    pub allow: crate::agents::ModelCheck,
     /// `super.watch.*`: health checks and progress nudges.
     pub watch: super::Watch,
 }
@@ -82,6 +82,8 @@ pub struct Super {
     grounds: Mutex<std::collections::HashMap<String, u64>>,
     /// The helper model: summarises a charter's oldest notes over the cap (L10.9).
     pub helper: std::sync::OnceLock<novacode_core::memory::Worker>,
+    /// Super's current model (`provider/model`): tasks get tiers of its provider.
+    current: Mutex<String>,
 }
 
 /// What a tool result adds when its prompt was held.
@@ -105,6 +107,7 @@ struct Args {
     write: Option<bool>,
     tier: Option<String>,
     model: Option<String>,
+    provider: Option<String>,
     #[serde(rename = "type")]
     ty: Option<String>,
     criteria: Vec<String>,
@@ -310,6 +313,7 @@ impl Super {
             root: novacode_base::platform::canonicalize(root)?,
             board: Mutex::new(board),
             dir,
+            current: Mutex::new(cfg.model.clone()),
             cfg,
             asker,
             launcher,
@@ -326,6 +330,26 @@ impl Super {
 
     pub(super) fn cfg(&self) -> &Config {
         &self.cfg
+    }
+
+    /// Super's current model (`provider/model`).
+    pub fn current_model(&self) -> String {
+        self.current.lock().unwrap().clone()
+    }
+
+    /// Super's session moved to `spec` (`/model` in its window).
+    pub fn set_model(&self, spec: String) {
+        *self.current.lock().unwrap() = spec;
+    }
+
+    /// The state block's Models section; refreshes stale live lists in the background.
+    pub fn models_section(&self) -> String {
+        let own = self.current_model();
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let (m, p) = (self.cfg.models.clone(), super::models::provider(&own).to_string());
+            tokio::spawn(async move { m.refresh(&p).await });
+        }
+        self.cfg.models.section(&own)
     }
 
     /// Change the board and save it.
@@ -382,6 +406,10 @@ impl Super {
         if a.action == "info" {
             return self.info(a.folder.as_deref().ok_or("`folder` is missing")?);
         }
+        if a.action == "model" {
+            let task = a.task.as_deref().ok_or("`task` is missing: a task's label or `all`")?;
+            return self.switch_models(task, a.provider, a.model).await;
+        }
         let t = self.find(a.task.as_deref().ok_or("`task` is missing")?)?;
         match a.action.as_str() {
             "read" => self.read(&t, a.offset.unwrap_or(0), a.limit.unwrap_or(200)),
@@ -427,7 +455,7 @@ impl Super {
                 Ok(out)
             }
             other => Err(format!(
-                "unknown action `{other}`: spawn, info, send, stop, close, accept, merge, review, note, scope, list or read"
+                "unknown action `{other}`: spawn, info, send, stop, close, accept, merge, review, note, scope, model, list or read"
             )),
         }
     }
@@ -445,19 +473,19 @@ impl Super {
             return Err("give 1 to 5 checkable acceptance `criteria`".into());
         }
         let folder = self.in_root(a.folder.as_deref().ok_or("`folder` is missing")?)?;
-        let (tier, model) = match (a.tier, a.model) {
+        // Tiers of super's current provider, unless a model is named (L10.9 "Models").
+        let own = self.current_model();
+        self.cfg.models.warm(&own).await;
+        let (tier, model, notice) = match (a.tier, a.model) {
             (Some(_), Some(_)) => return Err("give `tier` or `model`, not both".into()),
-            (None, Some(m)) => (None, m),
+            (None, Some(m)) => (None, m, None),
             (tier, None) => {
                 let name = tier.unwrap_or_else(|| "standard".into());
-                let t = self.cfg.tiers.iter().find(|(n, _)| *n == name).ok_or_else(|| {
-                    let names: Vec<&str> = self.cfg.tiers.iter().map(|(n, _)| n.as_str()).collect();
-                    format!("no tier `{name}`: {}", names.join(", "))
-                })?;
-                (Some(name), t.1.model.clone())
+                let (m, n) = self.cfg.models.resolve(super::models::provider(&own), &name, &own)?;
+                (Some(name), m, n)
             }
         };
-        (self.cfg.allow)(&model)?;
+        self.cfg.models.check(&model).await?;
         let repo = repo_of(&folder);
         if write && repo.is_none() && in_git(&folder) {
             return Err(format!(
@@ -534,7 +562,151 @@ impl Super {
         for n in notes.into_iter().filter(|n| !n.starts_with(&label)) {
             out += &format!("\n{n}");
         }
+        if let Some(n) = notice {
+            out += &format!("\nNote: {n}.");
+        }
         Ok(out)
+    }
+
+    /// Whether `task model` may switch `t`: a work task, queued or with a live session.
+    fn switchable(&self, t: &Task) -> Result<(), String> {
+        if t.kind == Kind::Review {
+            return Err(format!("{} is a review task: its model stays", t.label));
+        }
+        if t.state == State::Archived {
+            return Err(format!("{} is archived", t.label));
+        }
+        match &t.session {
+            None if t.state == State::Queued => Ok(()),
+            Some(s) if self.launcher.alive(s) => Ok(()),
+            _ => Err(format!(
+                "{} has no live session ({}): a resumed session keeps its own model",
+                t.label,
+                t.state.name()
+            )),
+        }
+    }
+
+    /// `task model {task | all, provider | model}`: each task moves to the matching tier on
+    /// `provider` (or to `model`) after one card listing every change; a running task gets
+    /// the new model at once, a task blocked by a provider limit is told to continue.
+    async fn switch_models(
+        &self,
+        task: &str,
+        provider: Option<String>,
+        model: Option<String>,
+    ) -> Result<String, String> {
+        let models = self.cfg.models.clone();
+        match (&provider, &model) {
+            (Some(_), Some(_)) => return Err("give `provider` or `model`, not both".into()),
+            (None, None) => return Err("give the `provider` (or `model`) to switch to".into()),
+            (Some(p), None) => models.refresh(p).await,
+            (None, Some(m)) => models.check(m).await?,
+        }
+        let rows: Vec<Task> = match task {
+            "all" => {
+                let b = self.board.lock().unwrap().clone();
+                b.tasks
+                    .into_iter()
+                    .filter(|t| t.kind == Kind::Work && t.state != State::Archived)
+                    .collect()
+            }
+            name => vec![self.find(name)?],
+        };
+        if let [t] = rows.as_slice() {
+            self.switchable(t)?;
+        }
+        let own = self.current_model();
+        let (mut changes, mut skipped) = (Vec::new(), Vec::new());
+        for t in rows {
+            if let Err(e) = self.switchable(&t) {
+                skipped.push(e);
+                continue;
+            }
+            let new = match (&provider, &model) {
+                (_, Some(m)) => Ok(m.clone()),
+                (Some(p), None) => {
+                    let tier = t
+                        .tier
+                        .clone()
+                        .filter(|x| super::models::TIERS.contains(&x.as_str()))
+                        .unwrap_or_else(|| models.tier_of(&t.model).to_string());
+                    models.resolve(p, &tier, &own).map(|(m, _)| m)
+                }
+                (None, None) => unreachable!("checked above"),
+            };
+            let new = match new {
+                Ok(m) if m == t.model => continue,
+                Ok(m) => match models.check(&m).await {
+                    Ok(()) => m,
+                    Err(e) => {
+                        skipped.push(format!("{}: {e}", t.label));
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    skipped.push(format!("{}: {e}", t.label));
+                    continue;
+                }
+            };
+            changes.push((t, new));
+        }
+        let skipped_text = match skipped.is_empty() {
+            true => String::new(),
+            false => format!("\nNot switched: {}.", skipped.join("; ")),
+        };
+        if changes.is_empty() {
+            return Err(format!(
+                "nothing to switch: every task is already on that model.{skipped_text}"
+            ));
+        }
+        let mut q = String::from("Switch these tasks to new models? A switched task loses its prompt cache.\n\n");
+        for (t, new) in &changes {
+            q += &format!("- {}: {} → {new}\n", t.label, t.model);
+        }
+        q += &skipped_text;
+        let header = match changes.as_slice() {
+            [(t, _)] => format!("{}: model", t.label),
+            _ => "Switch models".to_string(),
+        };
+        if !self.confirm(header, q, "Switch").await? {
+            return Ok("The user declined: every task keeps its model.".into());
+        }
+        let mut out = Vec::new();
+        for (t, new) in changes {
+            let Ok(t) = self.row(&t.id) else { continue };
+            if let Some(s) = t.session.as_deref().filter(|s| self.launcher.alive(s))
+                && let Err(e) = self.launcher.send(s, ClientCmd::SetModel { model: new.clone() }).await
+            {
+                out.push(format!(
+                    "{}: the switch failed ({e}); it stays on {}.",
+                    t.label, t.model
+                ));
+                continue;
+            }
+            // A task blocked by a provider limit continues on its new model.
+            let cleared = self.edit(|b| {
+                if let Some(row) = b.tasks.iter_mut().find(|r| r.id == t.id) {
+                    row.model = new.clone();
+                }
+                b.apply(&t.id, Event::LimitCleared).is_ok()
+            })?;
+            let mut line = format!("{}: {} → {new}.", t.label, t.model);
+            if cleared {
+                let msg = format!("continue: you now run on {new}; the provider limit no longer applies");
+                match self.deliver(&t.id, msg).await {
+                    Ok(_) => line += " It was blocked by a provider limit and is told to continue.",
+                    Err(e) => line += &format!(" Telling it to continue failed: {e}"),
+                }
+            }
+            out.push(line);
+        }
+        let mut s = format!("Switched on the user's OK:\n{}", out.join("\n"));
+        s += &skipped_text;
+        for n in self.pump().await {
+            s += &format!("\n{n}");
+        }
+        Ok(s)
     }
 
     /// `task info {folder}`, read-only: what a task there would get (git or not, the branch
@@ -1768,21 +1940,22 @@ impl Tool for TaskTool {
         "task"
     }
     fn description(&self) -> &str {
-        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], scope?, skills?[], goal?}; info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task, pr?} (each asks the user on a card; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task blocked by used-up review rounds, after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked by code because it kept ending without a report: code takes its commit and changed files from its branch, refused when nothing is committed, and the review uses a round); note {task, note} (keeps a user decision about the task on its charter, which you see with every message); scope {task, request? | criteria? | scope?} (changes the brief, criteria or scope only after the user's OK on a card; code then updates the charter and tells the task); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
+        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], scope?, skills?[], goal?}; info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task, pr?} (each asks the user on a card; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task blocked by used-up review rounds, after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked by code because it kept ending without a report: code takes its commit and changed files from its branch, refused when nothing is committed, and the review uses a round); note {task, note} (keeps a user decision about the task on its charter, which you see with every message); scope {task, request? | criteria? | scope?} (changes the brief, criteria or scope only after the user's OK on a card; code then updates the charter and tells the task); model {task | all, provider | model} (only when the user asks to switch models: each task moves to the matching tier on that provider, or to that model, after one card listing each task's old and new model; a task blocked by a provider limit is told to continue); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
     }
     fn schema(&self) -> Value {
         let s = |d: &str| json!({ "type": "string", "description": d });
         json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["spawn", "info", "send", "stop", "close", "accept", "merge", "review", "note", "scope", "list", "read"] },
-                "task": s("The task's label (T3-fix-parser) or T<n>."),
+                "action": { "type": "string", "enum": ["spawn", "info", "send", "stop", "close", "accept", "merge", "review", "note", "scope", "model", "list", "read"] },
+                "task": s("The task's label (T3-fix-parser) or T<n>; model: also `all`."),
                 "request": s("spawn: the user's words, as given. scope: the new brief."),
                 "folder": s("spawn and info: the project folder, inside your root (relative to it or absolute)."),
                 "slug": s("spawn: 1-4 words of a-z0-9 joined by -, at most 30 characters; the label becomes T<n>-<slug>."),
                 "write": { "type": "boolean", "description": "spawn: the task changes files (it gets its own worktree in git)." },
-                "tier": s("spawn: quick, standard, deep or review (default standard)."),
-                "model": s("spawn: a model the user named (provider/model), instead of a tier."),
+                "tier": s("spawn: quick, standard or deep, on your own provider (default standard)."),
+                "model": s("spawn: instead of a tier, a model from the Models section or one the user named (provider/model[:level]). model: the model to switch to."),
+                "provider": s("model: the provider to switch to; each task gets its matching tier there."),
                 "type": { "type": "string", "enum": ["bugfix", "change", "question"], "description": "spawn: question needs write false; bugfix and change need write true. Default change." },
                 "criteria": { "type": "array", "items": { "type": "string" }, "description": "spawn: 1-5 checkable acceptance criteria. scope: the new criteria." },
                 "scope": s("spawn and scope: the areas the change should touch."),
@@ -2096,6 +2269,10 @@ pub(super) mod tests {
     }
 
     fn fixture(max_running: usize, answers: &[Option<&'static str>]) -> Fx {
+        fixture_cfg(answers, |home| test_cfg(home, max_running))
+    }
+
+    fn fixture_cfg(answers: &[Option<&'static str>], cfg: impl FnOnce(&Path) -> Config) -> Fx {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().canonicalize().unwrap();
         let (root, home) = (base.join("root"), base.join("home"));
@@ -2116,7 +2293,7 @@ pub(super) mod tests {
             Super::new(
                 &root,
                 home.join("super/x"),
-                test_cfg(&home, max_running),
+                cfg(&home),
                 Some(asker.clone()),
                 launcher.clone(),
             )
@@ -2146,28 +2323,13 @@ pub(super) mod tests {
     }
 
     pub(in crate::superagent) fn test_cfg(home: &Path, max_running: usize) -> Config {
-        let tiers = ["quick", "standard", "deep", "review"]
-            .iter()
-            .map(|n| {
-                (
-                    n.to_string(),
-                    Tier {
-                        model: format!("faux/{n}"),
-                        note: String::new(),
-                    },
-                )
-            })
-            .collect();
         Config {
             max_running,
-            tiers,
+            models: Arc::new(super::super::models::tests::flat()),
+            model: "faux/script".into(),
             worktree_copy: vec!["AGENTS.md".into(), ".codegraph".into()],
             home: home.to_path_buf(),
             watch: Default::default(),
-            allow: Arc::new(|m: &str| match m.starts_with("denied/") {
-                true => Err(format!("{m} is denied by models.deny")),
-                false => Ok(()),
-            }),
         }
     }
 
@@ -2486,6 +2648,206 @@ pub(super) mod tests {
         set_state(&fx, "T2-work", State::Stopped);
         fx.sup.pump().await;
         assert_eq!(state(&fx, "T3-held"), State::Queued, "its provider is on hold");
+    }
+
+    /// Super on claude with claude and codex logged in, presets only (no overrides).
+    fn on_presets(answers: &[Option<&'static str>]) -> Fx {
+        use super::super::models::{Models, Overrides, tests::Fake};
+        let fx = fixture_cfg(answers, |home| Config {
+            models: Arc::new(Models::new(
+                Arc::new(Fake::new(&["claude", "codex"])),
+                Overrides::default(),
+            )),
+            model: "claude/claude-sonnet-5-5".into(),
+            ..test_cfg(home, 5)
+        });
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        fx
+    }
+
+    fn sent_models(fx: &Fx) -> Vec<(String, String)> {
+        fx.launcher
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(s, c)| match c {
+                ClientCmd::SetModel { model } => Some((s.clone(), model.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn spawn_uses_super_s_current_provider_and_checks_named_models() {
+        let fx = on_presets(&[]);
+        let mut a = spawn_args("p", "a", false);
+        a["tier"] = json!("quick");
+        let out = run(&fx, a).await.unwrap();
+        assert!(out.contains("claude/claude-haiku-5-5"), "{out}");
+        // `/model` in super's window moved super to codex.
+        fx.sup.set_model("codex/gpt-6.1-sol".into());
+        let mut a = spawn_args("p", "b", false);
+        a["tier"] = json!("deep");
+        run(&fx, a).await.unwrap();
+        run(&fx, spawn_args("p", "c", false)).await.unwrap();
+        let models: Vec<String> = fx
+            .launcher
+            .starts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.model.clone())
+            .collect();
+        assert_eq!(
+            models,
+            ["claude/claude-haiku-5-5", "codex/gpt-6-astra:high", "codex/gpt-6.1-sol"]
+        );
+        // A named model is checked: offered, logged in, not denied.
+        let mut a = spawn_args("p", "d", false);
+        a["model"] = json!("claude/claude-opus-4-8:high");
+        run(&fx, a).await.unwrap();
+        for (m, why) in [
+            ("claude/claude-nope", "has no model `claude-nope`"),
+            ("antigravity/gemini-3.8-flash-high", "not logged in"),
+            ("nowhere/x", "unknown provider"),
+        ] {
+            let mut a = spawn_args("p", "e", false);
+            a["model"] = json!(m);
+            let e = run(&fx, a).await.unwrap_err();
+            assert!(e.contains(why), "{m}: {e}");
+        }
+        assert_eq!(fx.sup.board.lock().unwrap().tasks.len(), 4);
+        let s = fx.sup.models_section();
+        assert!(
+            s.contains("Your provider: codex") && s.contains("- deep: gpt-6-astra:high"),
+            "{s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_model_switches_after_one_card_and_continues_a_limit_blocked_task() {
+        use super::super::board::{Block, Limit, LimitKind};
+        let fx = on_presets(&[Some("Switch")]);
+        let mut a = spawn_args("p", "a", false);
+        a["tier"] = json!("quick");
+        run(&fx, a).await.unwrap();
+        run(&fx, spawn_args("p", "b", false)).await.unwrap();
+        fx.sup
+            .edit(|b| {
+                let limit = Limit {
+                    kind: LimitKind::Quota,
+                    provider: "claude".into(),
+                    reset_at: None,
+                };
+                b.holds.insert("claude".into(), limit.clone());
+                let t = b.tasks.iter_mut().find(|t| t.id == "T2-b").unwrap();
+                t.state = State::Blocked;
+                t.block = Some(Block {
+                    reason: "claude quota".into(),
+                    limit: Some(limit),
+                    code_made: true,
+                    merge: false,
+                });
+            })
+            .unwrap();
+        let out = run(&fx, json!({"action": "model", "task": "all", "provider": "codex"}))
+            .await
+            .unwrap();
+        let q = fx.asker.asked.lock().unwrap()[0].question.clone();
+        assert!(
+            q.contains("- T1-a: claude/claude-haiku-5-5 → codex/gpt-6-luna")
+                && q.contains("- T2-b: claude/claude-sonnet-5-5 → codex/gpt-6.1-sol"),
+            "{q}"
+        );
+        assert_eq!(fx.asker.asked.lock().unwrap().len(), 1, "one card");
+        assert_eq!(
+            sent_models(&fx),
+            [
+                ("s1".to_string(), "codex/gpt-6-luna".to_string()),
+                ("s2".to_string(), "codex/gpt-6.1-sol".to_string())
+            ]
+        );
+        let (t1, t2) = (fx.sup.row("T1-a").unwrap(), fx.sup.row("T2-b").unwrap());
+        assert_eq!(
+            (t1.model.as_str(), t2.model.as_str()),
+            ("codex/gpt-6-luna", "codex/gpt-6.1-sol")
+        );
+        assert_eq!(t2.state, State::Running, "{out}");
+        let p = fx.launcher.prompts("s2");
+        assert!(
+            p.last().unwrap().contains("continue: you now run on codex/gpt-6.1-sol"),
+            "{p:?}"
+        );
+        assert!(out.contains("told to continue"), "{out}");
+        // Nothing left to switch.
+        let e = run(&fx, json!({"action": "model", "task": "T1-a", "provider": "codex"}))
+            .await
+            .unwrap_err();
+        assert!(e.contains("nothing to switch"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn task_model_changes_nothing_when_declined_and_refuses_reviews_archived_and_dead_tasks() {
+        let fx = on_presets(&[Some("Cancel")]);
+        run(&fx, spawn_args("p", "a", false)).await.unwrap();
+        let out = run(
+            &fx,
+            json!({"action": "model", "task": "T1", "model": "codex/gpt-6-sol"}),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("declined"), "{out}");
+        assert!(sent_models(&fx).is_empty());
+        assert_eq!(fx.sup.row("T1-a").unwrap().model, "claude/claude-sonnet-5-5");
+        let e = run(
+            &fx,
+            json!({"action": "model", "task": "T1", "model": "codex/x", "provider": "codex"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("not both"), "{e}");
+        let e = run(&fx, json!({"action": "model", "task": "T1", "model": "antigravity/x"}))
+            .await
+            .unwrap_err();
+        assert!(e.contains("not logged in"), "{e}");
+        fx.sup
+            .edit(|b| {
+                b.tasks.push(Task {
+                    id: "T2-review-T1-a".into(),
+                    label: "T2-review-T1-a".into(),
+                    kind: Kind::Review,
+                    model: "codex/gpt-6-sol".into(),
+                    state: State::Running,
+                    session: Some("s1".into()),
+                    ..Task::default()
+                });
+                b.tasks.push(Task {
+                    id: "T3-old".into(),
+                    label: "T3-old".into(),
+                    state: State::Archived,
+                    ..Task::default()
+                });
+                b.tasks.push(Task {
+                    id: "T4-gone".into(),
+                    label: "T4-gone".into(),
+                    state: State::Stopped,
+                    session: Some("dead".into()),
+                    ..Task::default()
+                });
+            })
+            .unwrap();
+        for (task, why) in [
+            ("T2-review-T1-a", "is a review task"),
+            ("T3-old", "is archived"),
+            ("T4-gone", "has no live session (stopped)"),
+        ] {
+            let e = run(&fx, json!({"action": "model", "task": task, "provider": "codex"}))
+                .await
+                .unwrap_err();
+            assert!(e.contains(why), "{task}: {e}");
+        }
+        assert_eq!(fx.asker.asked.lock().unwrap().len(), 1, "no card for a refusal");
     }
 
     #[tokio::test]
@@ -3242,11 +3604,11 @@ pub(super) mod tests {
         assert_eq!(novacode_base::git::pinned(&app), None);
         let cfg = Config {
             max_running: 5,
-            tiers: Vec::new(),
+            models: fx.sup.cfg.models.clone(),
+            model: "faux/script".into(),
             worktree_copy: Vec::new(),
             home: fx.home.clone(),
             watch: Default::default(),
-            allow: fx.sup.cfg.allow.clone(),
         };
         let _again = Super::new(&fx.root, fx.sup.dir.clone(), cfg, None, fx.launcher.clone()).unwrap();
         assert_eq!(novacode_base::git::pinned(&app), Some(app.join(".git")));

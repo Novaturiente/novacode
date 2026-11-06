@@ -1579,11 +1579,11 @@ impl Ctx {
             let home = self.paths.home();
             let cfg = task::Config {
                 max_running: superagent::max_running(s),
-                tiers: superagent::tiers(s),
+                models: Arc::new(superagent::models::Models::real(self.providers.clone(), s)),
+                model: route.spec(),
                 worktree_copy: worktree_copy(s),
                 home: home.to_path_buf(),
                 watch: superagent::watch(s),
-                allow: models::spawn_check(self.providers.clone()),
             };
             let launcher = Arc::new(task::Procs {
                 exe: live_path(std::env::current_exe()?),
@@ -2001,9 +2001,21 @@ impl Ctx {
                         s.checked();
                     }
                 });
+                // The Models section follows super's current model (`/model` in its window).
+                let sup = super_ref.clone();
+                let models = Arc::new(move |last: Option<(String, String)>| {
+                    let Some(s) = sup.as_ref().and_then(std::sync::Weak::upgrade) else {
+                        return String::new();
+                    };
+                    if let Some((p, m)) = last {
+                        s.set_model(format!("{p}/{m}"));
+                    }
+                    s.models_section()
+                });
                 agent = agent.with_context_builder(superagent::context::builder(
                     dir,
                     on_ok,
+                    models,
                     say_trigger.clone(),
                     shown.clone(),
                 ));

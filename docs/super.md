@@ -166,16 +166,29 @@ The merge and close cards are made by novacode itself, not written by the super 
 
 ## Models
 
-The super agent picks a model tier for each task (`super.tiers`):
+The super agent picks a tier for each task: `quick`, `standard` or `deep`, weakest first. The tiers follow **the super agent's current provider**: switch the super agent with `/model` in its window, and new tasks run on the new provider.
 
-| Tier | Default model |
-|---|---|
-| `quick` | `claude/claude-haiku-5-5` |
-| `standard` | `claude/claude-sonnet-5-5` |
-| `deep` | `claude/claude-opus-5-5:high` |
-| `review` | `codex/gpt-6.1-sol:high` |
+Each provider has a preset per tier, named by **model family**, not by a fixed model id:
 
-The tiers go from weakest to strongest: `quick`, `standard`, `deep`, `review`. You can name a model when you ask for a task. Reviewers run one tier above the task; a task on the `review` tier or on a model you named is reviewed by the `review` tier. A task keeps its model; for steps on other models it uses its own subagents.
+| Provider | `quick` | `standard` | `deep` |
+|---|---|---|---|
+| `claude` | `claude-haiku` | `claude-sonnet` | `claude-opus`, high |
+| `codex` | `gpt-luna` | `gpt-sol` | `gpt-astra`, high |
+| `antigravity` | `gemini-flash-lite` | `gemini-flash` medium | `gemini-flash` high |
+
+A family becomes its newest model (by its models.dev release date) that the provider's live model list offers, that is logged in and that `models.deny` doesn't block. The live list is fetched about once an hour; when it can't be fetched, the model catalog is used. Antigravity's ids carry the thinking level (`gemini-3.8-flash-high`), so `standard` and `deep` pick the `-medium` and `-high` variant.
+
+The super agent's state block has a **Models** section: its provider, the model each tier is now, and the provider's usable models with their prices (USD per million tokens). The super agent may give a task another model from that list, or one you named; novacode refuses a model that doesn't exist, isn't logged in or is denied, and says why.
+
+**Overrides** (`super.tiers`, see [config](config.md)):
+
+- `"super": {"tiers": {"claude": {"deep": "claude/claude-opus-5-5:xhigh"}}}` replaces one tier on one provider.
+- The older form `"super": {"tiers": {"quick": {"model": "…"}}}` still works and replaces that tier on every provider; `review` in that form still sets the reviewer of deep tasks and of named models.
+- On a provider without presets (an API key provider, for example) and without overrides, every tier uses the super agent's own model, and the Models section says so.
+
+**Reviews** run one tier above the task (`deep` at most) on **another provider** than the task's, when one is logged in and not held by a quota or rate limit (the first of `claude`, `codex`, `antigravity`), so a second model family checks the work. Otherwise they run on the task's own provider.
+
+**Switching tasks to another provider.** When a provider's quota runs out, ask the super agent to move tasks elsewhere, for example "move all tasks to codex". It calls `task model` with one task or `all` and a provider (or a model): each task gets the matching tier there. One card made by novacode lists every task with its old and new model; only after you confirm does it switch. A running task changes model at once (its prompt cache starts over); a task blocked by a provider limit is told to continue on its new model; a queued one starts on it. Review tasks, archived tasks and tasks without a live session (a resumed session keeps its own model) are refused, with the reason. The super agent switches models only when you ask.
 
 `models.deny` lists models that are never used by any session, subagent or judge, for example `["claude-fable*"]`.
 

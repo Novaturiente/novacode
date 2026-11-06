@@ -8,13 +8,13 @@ pub mod context;
 pub mod entry;
 pub mod inbox;
 pub mod link;
+pub mod models;
 pub mod report;
 pub mod review;
 pub mod say;
 pub mod task;
 
 use novacode_base::settings::Settings;
-use serde::Deserialize;
 use std::path::Path;
 
 /// Super's own prompt; it replaces the coding preamble.
@@ -56,6 +56,10 @@ confirm twice. When the user asked for it, or to offer it, call `task merge` / `
 answers on its card. `ask_user` is for real choices only (which option, which approach, missing facts). \
 When the user said to close a task after its merge, call `task close` as soon as the merge result arrives.
 - Act only on the user's requests.
+- Each task runs on a tier (`quick`, `standard`, `deep`) of your own provider; the Models section of the state \
+block shows the model of each tier and the usable models with prices. Pick the tier per task; pass `model` on spawn \
+only when a task needs another listed model or the user named one. Switch tasks to another provider or model \
+(`task model`) only when the user asks to switch models.
 - You see only the newest part of your chat; a state block written by code (the board, each task's charter, \
 the open requests) comes with every message, and is the truth. For older chat, use `history_search`.
 - No decision may live only in chat: record it when the user makes it. A decision about a task (an answer, a \
@@ -118,46 +122,6 @@ pub fn tools(s: &Settings) -> Vec<String> {
         }
     }
     out
-}
-
-/// A model tier for tasks (`super.tiers.<name>`).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct Tier {
-    pub model: String,
-    /// When to use it, for super's model.
-    #[serde(default)]
-    pub note: String,
-}
-
-/// The tiers, weakest to strongest, with the shipped full model ids (user answer r3 Q12).
-const TIERS: [(&str, &str, &str); 4] = [
-    ("quick", "claude/claude-haiku-5-5", "small, clear changes and lookups"),
-    ("standard", "claude/claude-sonnet-5-5", "most tasks"),
-    (
-        "deep",
-        "claude/claude-opus-5-5:high",
-        "hard bugs, design and wide changes",
-    ),
-    (
-        "review",
-        "codex/gpt-6.1-sol:high",
-        "reviews of deep tasks and of user-named models",
-    ),
-];
-
-/// `super.tiers`, weakest first: each shipped tier, replaced by the user's entry of that name.
-pub fn tiers(s: &Settings) -> Vec<(String, Tier)> {
-    let user: std::collections::BTreeMap<String, Tier> = s.get("super.tiers").unwrap_or_default();
-    TIERS
-        .iter()
-        .map(|(name, model, note)| {
-            let t = user.get(*name).cloned().unwrap_or_else(|| Tier {
-                model: model.to_string(),
-                note: note.to_string(),
-            });
-            (name.to_string(), t)
-        })
-        .collect()
 }
 
 /// The board snapshot feed (L10.9 dashboard): every 2 s, super's board plus each
@@ -402,26 +366,29 @@ mod tests {
     }
 
     #[test]
-    fn tier_defaults_are_full_ids_that_resolve_and_user_entries_replace_them() {
+    fn max_running_defaults_to_5_and_super_tiers_overrides_parse_from_settings() {
         let (_d, s) = settings("{}");
-        let t = tiers(&s);
-        let names: Vec<&str> = t.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, ["quick", "standard", "deep", "review"]);
         assert_eq!(max_running(&s), 5);
-        let p = novacode_ai::connect::Providers::load(Path::new("/nonexistent"), &Settings::default());
-        for (name, tier) in &t {
-            let r = p.resolve(&tier.model).unwrap_or_else(|e| panic!("{name}: {e}"));
-            let profile = p.profile(&r.provider).unwrap();
-            assert!(
-                p.catalog.get(profile.catalog_id(), &r.model).is_some(),
-                "{name}: `{}` is not in the bundled catalog",
-                tier.model
-            );
-        }
-        let (_d, s) = settings(r#"{"super": {"maxRunning": 2, "tiers": {"quick": {"model": "faux/script"}}}}"#);
-        let t = tiers(&s);
-        assert_eq!(t[0].1.model, "faux/script");
-        assert_eq!(t[1].1.model, "claude/claude-sonnet-5-5");
+        let (_d, s) = settings(
+            r#"{"super": {"maxRunning": 2, "tiers": {"quick": {"model": "faux/script"}, "codex": {"deep": "codex/gpt-6-sol"}}}}"#,
+        );
+        let o = models::Overrides::from_settings(&s);
+        assert_eq!(
+            o,
+            models::Overrides::parse(
+                &serde_json::json!({"quick": "faux/script", "codex": {"deep": {"model": "codex/gpt-6-sol"}}})
+            )
+        );
         assert_eq!(max_running(&s), 2);
+    }
+
+    #[test]
+    fn model_switches_happen_only_when_the_user_asks() {
+        for rule in [
+            "the Models section",
+            "(`task model`) only when the user asks to switch models",
+        ] {
+            assert!(PROMPT.contains(rule), "{rule}");
+        }
     }
 }

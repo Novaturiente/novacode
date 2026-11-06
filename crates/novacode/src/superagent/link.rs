@@ -2068,7 +2068,6 @@ mod tests {
             "{line}"
         );
     }
-    use crate::superagent::Tier;
     use crate::superagent::board::{Kind, Task};
     use crate::superagent::task::{Config, Launcher, Start};
     use futures_util::future::BoxFuture;
@@ -2754,17 +2753,11 @@ mod tests {
         let asker = Arc::new(FakeAsker::default());
         let cfg = Config {
             max_running,
-            tiers: vec![(
-                "standard".into(),
-                Tier {
-                    model: "faux/s".into(),
-                    note: String::new(),
-                },
-            )],
+            models: Arc::new(super::super::models::tests::flat()),
+            model: "faux/script".into(),
             worktree_copy: vec![],
             home: home.clone(),
             watch,
-            allow: Arc::new(|_: &str| Ok(())),
         };
         let sup =
             Arc::new(Super::new(&root, home.join("super/x"), cfg, Some(asker.clone()), launcher.clone()).unwrap());

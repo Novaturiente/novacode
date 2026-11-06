@@ -20,14 +20,19 @@ pub const CHAT_BUDGET: u64 = 6000;
 /// Chars a history search returns.
 const HISTORY_CHARS: usize = 2000;
 
+/// Super's Models section, from the session's current (provider, model).
+pub type ModelsFn = Arc<dyn Fn(Option<(String, String)>) -> String + Send + Sync>;
+
 /// Super's context builder: the board at `<dir>/board.json` and the session's open todo
 /// items as the state block, then the newest chat in [`CHAT_BUDGET`]. A health check
 /// answered with exactly `OK` is hidden and left out; `on_ok` runs then (records the check).
 /// Plain final text gets one nudge to use `say`, then is sent as a `note`. Each request
-/// also sets `trigger`: what started the current run, for `say`'s frame.
+/// also sets `trigger`: what started the current run, for `say`'s frame. `models` gets the
+/// session's current model and returns the Models section, which ends the state block.
 pub fn builder(
     dir: PathBuf,
     on_ok: Arc<dyn Fn() + Send + Sync>,
+    models: ModelsFn,
     trigger: super::say::Trigger,
     shown: Shown,
 ) -> context_window::Builder {
@@ -45,10 +50,11 @@ pub fn builder(
         state: Arc::new(move |store: &Store| {
             *trigger.lock().unwrap() = super::say::trigger(&store.branch());
             let open = open_requests(store);
-            let block = match Board::load(&dir) {
+            let mut block = match Board::load(&dir) {
                 Ok(b) => b.state_block(&open),
                 Err(e) => format!("The board couldn't be read ({e}); call `task list`.\n"),
             };
+            block += &models(store.last_model());
             *shown.lock().unwrap() = block.clone();
             block
         }),
@@ -434,6 +440,32 @@ mod tests {
         // No helper: nothing runs.
         let (_tx, rx) = tokio::sync::broadcast::channel::<AgentEvent>(1);
         decision_check(rx, None, wakes, Default::default());
+    }
+
+    /// The state block ends with the Models section, made for the session's current model.
+    #[test]
+    fn the_state_block_ends_with_the_models_section_of_the_current_model() {
+        let home = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let mut store = Store::create(&novacode_base::paths::Paths::new(home.path()), work.path(), false);
+        store
+            .append(novacode_core::session::EntryKind::ModelChange {
+                provider: "codex".into(),
+                model: "gpt-6.1-sol".into(),
+            })
+            .unwrap();
+        let models =
+            Arc::new(|last: Option<(String, String)>| format!("\n## Models\nYour provider: {}.\n", last.unwrap().0));
+        let b = builder(
+            home.path().join("super"),
+            Arc::new(|| {}),
+            models,
+            Default::default(),
+            Default::default(),
+        );
+        let block = (b.state)(&store);
+        assert!(block.contains("## Board"), "{block}");
+        assert!(block.ends_with("## Models\nYour provider: codex.\n"), "{block}");
     }
 
     #[test]

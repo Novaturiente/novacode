@@ -254,8 +254,8 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
     (
         "super.tiers",
         "object",
-        "`quick` `claude/claude-haiku-5-5`, `standard` `claude/claude-sonnet-5-5`, `deep` `claude/claude-opus-5-5:high`, `review` `codex/gpt-6.1-sol:high`",
-        "Super mode task models, weakest to strongest: `<tier>: {model, note}`, `note` saying when super should use it. An entry replaces that tier's default; a review runs one tier above its task.",
+        "presets by model family: `claude` haiku/sonnet/opus (high); `codex` gpt-luna/gpt-sol/gpt-astra (high); `antigravity` gemini-flash-lite/gemini-flash medium/gemini-flash high",
+        "Super mode task models (docs/super.md#models). Tiers `quick`, `standard`, `deep` follow super's current provider; each preset is the newest model of a family that the provider offers, is logged in and not denied. `<provider>: {<tier>: \"provider/model[:level]\"}` overrides a tier on that provider. The older `<tier>: {model, note}` form overrides that tier on every provider, and `review: {model}` sets the reviewer of deep tasks and of named models. On a provider without presets or overrides, every tier uses super's own model.",
     ),
     (
         "super.tools",
