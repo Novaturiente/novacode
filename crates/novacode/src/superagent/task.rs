@@ -2662,12 +2662,26 @@ impl Launcher for Procs {
     }
 
     fn open_prs(&self, main: &Path) -> Result<String, String> {
-        let o = std::process::Command::new("gh")
+        let mut child = std::process::Command::new("gh")
             .args(["pr", "list", "--state", "open", "--json", "number,headRefOid,url"])
             .current_dir(main)
+            .env("GH_PROMPT_DISABLED", "1")
             .stdin(std::process::Stdio::null())
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .map_err(|e| format!("gh: {e}"))?;
+        // A hung network call must not hold the merge: give up after 20 s.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while child.try_wait().map_err(|e| format!("gh: {e}"))?.is_none() {
+            if std::time::Instant::now() > until {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("gh: no answer in 20 s".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let o = child.wait_with_output().map_err(|e| format!("gh: {e}"))?;
         match o.status.success() {
             true => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
             false => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
