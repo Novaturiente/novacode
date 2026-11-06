@@ -2,6 +2,13 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.8.1] - 2026-11-06
+
+### Added
+
+- **`/kill`** in an attached window (a super window, a task pane, `novacode attach`) ends that session after a confirmation card. After `/kill` in super's window, tasks keep running and the next `novacode --super` starts a fresh super session with the board kept; after `novacode stop` it resumes the same session. `/quit` still only closes the window.
+- **Super's worker models follow its provider.** Tier presets name model families (claude: haiku, sonnet, opus; codex: gpt-luna, gpt-sol, gpt-astra; antigravity: gemini-flash-lite, gemini-flash medium and high) and resolve to the newest model of each family the provider offers, you're logged in to and isn't denied. Reviews run one tier up on another provider when one is available. A new `task model` action switches one or all tasks to another provider, only when you ask, after one card listing the changes. `super.tiers.<provider>.<tier>` overrides a preset; the old flat `super.tiers.<tier>` still works. See [super mode](docs/super.md).
+
 ## [0.8.0] - 2026-11-06
 
 ### Added
