@@ -109,6 +109,28 @@ pub struct Limit {
     /// Unix seconds, when the error carried one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_at: Option<u64>,
+    /// Unix seconds the hold started (its last limit hit); none on an old board's hold,
+    /// which counts as started long ago.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<u64>,
+}
+
+/// The longest a rate limit holds its provider, whatever its reset time says: a task
+/// that hits it again holds the provider again.
+pub const RATE_LIMIT_HOLD_MAX: u64 = 60 * 60;
+
+impl Limit {
+    /// When the hold lifts by time: the reset time, and for a rate limit at most
+    /// [`RATE_LIMIT_HOLD_MAX`] after it started.
+    pub fn lifts_at(&self) -> Option<u64> {
+        match self.kind {
+            LimitKind::Quota => self.reset_at,
+            LimitKind::RateLimit => {
+                let cap = self.since.unwrap_or(0) + RATE_LIMIT_HOLD_MAX;
+                Some(self.reset_at.map_or(cap, |r| r.min(cap)))
+            }
+        }
+    }
 }
 
 /// Why a task is `blocked`.
@@ -1677,7 +1699,33 @@ mod tests {
             kind: LimitKind::Quota,
             provider: "claude".into(),
             reset_at: None,
+            since: None,
         }
+    }
+
+    #[test]
+    fn a_rate_limit_hold_lifts_at_most_an_hour_after_it_started_and_an_old_one_at_once() {
+        let rl = |reset_at, since| Limit {
+            kind: LimitKind::RateLimit,
+            reset_at,
+            since,
+            ..limit()
+        };
+        assert_eq!(rl(Some(5000), Some(1000)).lifts_at(), Some(1000 + RATE_LIMIT_HOLD_MAX));
+        assert_eq!(rl(Some(1500), Some(1000)).lifts_at(), Some(1500));
+        assert_eq!(rl(None, Some(1000)).lifts_at(), Some(1000 + RATE_LIMIT_HOLD_MAX));
+        // An old board's hold (no start): due now.
+        let old: Limit =
+            serde_json::from_str(r#"{"kind":"rate-limit","provider":"claude","reset_at":1794239999}"#).unwrap();
+        assert_eq!(old.since, None);
+        assert!(old.lifts_at().unwrap() <= now());
+        // A quota hold keeps its reset time.
+        let q = Limit {
+            reset_at: Some(1794239999),
+            since: Some(1000),
+            ..limit()
+        };
+        assert_eq!(q.lifts_at(), Some(1794239999));
     }
 
     fn to(t: &Task, ev: Event) -> State {

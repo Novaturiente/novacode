@@ -3435,6 +3435,7 @@ pub(super) mod tests {
                         kind: super::super::board::LimitKind::Quota,
                         provider: "held".into(),
                         reset_at: None,
+                        since: None,
                     },
                 );
                 b.tasks.push(Task {
@@ -3472,6 +3473,7 @@ pub(super) mod tests {
                         kind: super::super::board::LimitKind::Quota,
                         provider: "held".into(),
                         reset_at: None,
+                        since: None,
                     },
                 );
                 for (id, session) in [("T8-review-x", Some("s8")), ("T9-review-y", None)] {
@@ -3588,6 +3590,7 @@ pub(super) mod tests {
                     kind: LimitKind::Quota,
                     provider: "claude".into(),
                     reset_at: None,
+                    since: None,
                 };
                 b.holds.insert("claude".into(), limit.clone());
                 let t = b.tasks.iter_mut().find(|t| t.id == "T2-b").unwrap();

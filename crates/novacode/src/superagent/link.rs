@@ -122,6 +122,11 @@ pub trait Inform: Send + Sync {
     }
     /// End super's session so it runs the binary on disk again as the same session.
     fn restart(&self) {}
+    /// The provider of super's model and super's token total, which grows with each
+    /// model reply that came through; `None` before its session starts.
+    fn served(&self) -> Option<(String, u64)> {
+        None
+    }
 }
 
 /// How much of a task's last message a code-made report carries.
@@ -486,6 +491,7 @@ impl Watcher {
                 kind,
                 provider: self.provider.clone(),
                 reset_at,
+                since: None,
             }))
         };
         match stop {
@@ -612,6 +618,10 @@ pub struct Links {
     /// Provider → its quota state (L10.9): the card, the user's Wait, and the tasks whose
     /// quota block already woke super. Kept until a task on it gets past the limit.
     quota: Mutex<HashMap<String, Quota>>,
+    /// Provider → when a model request on it last went through: a hold older than that lifts.
+    works: Mutex<HashMap<String, u64>>,
+    /// Super's token total at the last pass: when it grows, super's provider works.
+    served: Mutex<Option<u64>>,
 }
 
 /// One provider's quota, as code's quota card sees it.
@@ -676,6 +686,8 @@ impl Links {
             stall_check: Mutex::default(),
             exe: Mutex::new(super::upgrade::ExeWatch::current()),
             quota: Mutex::default(),
+            works: Mutex::default(),
+            served: Mutex::default(),
         });
         let _ = sup.links.set(links.clone());
         links.recover(sup);
@@ -896,6 +908,12 @@ impl Links {
         let Some(sup) = self.sup.upgrade() else { return };
         self.apply_inbox(&sup).await;
         self.branch_moves(&sup);
+        if let Some((provider, total)) = self.inform.served() {
+            let last = self.served.lock().unwrap().replace(total);
+            if last.is_some_and(|l| total > l) {
+                self.works(&provider);
+            }
+        }
         self.lift_holds(&sup).await;
         let rows: Vec<(String, String)> = {
             let b = sup.board.lock().unwrap();
@@ -1227,6 +1245,7 @@ impl Links {
         // No reset time known: the hold ends after a fixed wait.
         let _ = sup.edit(|b| {
             let h = b.holds.entry(limit.provider.clone()).or_insert_with(|| limit.clone());
+            h.since = Some(board::now());
             if h.reset_at.is_none() {
                 h.reset_at = Some(board::now() + HOLD_WITHOUT_RESET);
             }
@@ -1581,14 +1600,24 @@ Address every finding, commit, re-run your checks and report `done` again.",
         }
     }
 
-    /// Lift the holds whose time came, and resend to the tasks they blocked.
+    /// A model request on `provider` just went through: its hold, if older, lifts at the next pass.
+    fn works(&self, provider: &str) {
+        self.works.lock().unwrap().insert(provider.to_string(), board::now());
+        self.kick();
+    }
+
+    /// Lift the holds whose time came or whose provider worked since they started, and
+    /// resend to the tasks they blocked.
     async fn lift_holds(&self, sup: &Super) {
         let now = board::now();
+        let works = self.works.lock().unwrap().clone();
         let due: Vec<String> = {
             let b = sup.board.lock().unwrap();
             b.holds
                 .iter()
-                .filter(|(_, l)| l.reset_at.is_some_and(|r| r <= now))
+                .filter(|(p, l)| {
+                    l.lifts_at().is_some_and(|r| r <= now) || works.get(*p).is_some_and(|w| *w > l.since.unwrap_or(0))
+                })
                 .map(|(p, _)| p.clone())
                 .collect()
         };
@@ -1907,7 +1936,7 @@ fn blocked_on(t: &board::Task, provider: &str) -> bool {
 
 fn until(sup: &Super, provider: &str) -> String {
     let b = sup.board.lock().unwrap();
-    match b.holds.get(provider).and_then(|l| l.reset_at) {
+    match b.holds.get(provider).and_then(|l| l.lifts_at()) {
         Some(at) => format!(
             " for about {} more minutes",
             at.saturating_sub(board::now()).div_ceil(60)
@@ -2226,6 +2255,14 @@ async fn run_link(
                         links.kick();
                     }
                     links.replied(&sup, &id, &mut watcher);
+                    // A turn that ended on a model reply: its provider works.
+                    if let AgentEvent::AgentEnd {
+                        stop: StopReason::Stop | StopReason::ToolUse,
+                        ..
+                    } = &event
+                    {
+                        links.works(&watcher.provider);
+                    }
                     // Held prompts of the other kind go once this run took all of super's (R24).
                     if let AgentEvent::AgentEnd { prompts, .. } = &event
                         && !stale
@@ -2312,6 +2349,12 @@ impl Inform for HubInform {
         // A running scout dies with super's process: wait for it too.
         let scouts = self.agents.get().map_or(0, |a| a.pending());
         !h.state().busy && !h.handle.pending_reminder(HEALTH_CHECK) && scouts == 0
+    }
+    fn served(&self) -> Option<(String, u64)> {
+        let s = self.slot.0.get()?.upgrade()?.state();
+        let t = &s.tokens;
+        let total = t.input + t.output + t.cache_read + t.cache_write;
+        Some((super::models::provider(&s.model).to_string(), total))
     }
     fn restart(&self) {
         super::upgrade::request();
@@ -2552,7 +2595,8 @@ mod tests {
             Some(Event::TurnLimit(Limit {
                 kind: LimitKind::Quota,
                 provider: "claude".into(),
-                reset_at: None
+                reset_at: None,
+                since: None
             }))
         );
         // The reset time comes from the retries when the end has none.
@@ -2704,6 +2748,7 @@ mod tests {
                 kind: board::LimitKind::Quota,
                 provider: "faux".into(),
                 reset_at: None,
+                since: None,
             }),
             Event::MergeReport(MergeResult::Failed("dirty".into())),
         ] {
@@ -2976,8 +3021,13 @@ mod tests {
         Log,
         Arc<std::sync::atomic::AtomicBool>,
         Arc<std::sync::atomic::AtomicBool>,
+        Served,
     );
+    type Served = Arc<Mutex<Option<(String, u64)>>>;
     impl Inform for Said {
+        fn served(&self) -> Option<(String, u64)> {
+            self.3.lock().unwrap().clone()
+        }
         fn closing(&self) -> bool {
             self.1.load(std::sync::atomic::Ordering::Relaxed)
         }
@@ -3011,6 +3061,8 @@ mod tests {
         closing: Arc<std::sync::atomic::AtomicBool>,
         /// Super is busy: no health check now.
         busy: Arc<std::sync::atomic::AtomicBool>,
+        /// What super's session says it was served.
+        served: Served,
     }
 
     fn fixture(max_running: usize) -> Fx {
@@ -3060,7 +3112,8 @@ mod tests {
         let log = Log::default();
         let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let said = Said(log.clone(), closing.clone(), busy.clone());
+        let served = Served::default();
+        let said = Said(log.clone(), closing.clone(), busy.clone(), served.clone());
         let links = Links::start(
             &sup,
             pending.asker(asker.clone()),
@@ -3076,6 +3129,7 @@ mod tests {
             log,
             closing,
             busy,
+            served,
         }
     }
 
@@ -4752,6 +4806,93 @@ mod tests {
         clear_hold(&fx, "claude");
         fx.until("resent", |fx| sent_cleared(fx, &s)).await;
         assert!(fx.sup.row("T2-rev").unwrap().block.is_none());
+    }
+
+    /// `provider` held by a limit that started 10 s ago and resets in a day.
+    fn hold(fx: &Fx, provider: &str, kind: LimitKind) {
+        let l = Limit {
+            kind,
+            provider: provider.into(),
+            reset_at: Some(board::now() + 86_400),
+            since: Some(board::now() - 10),
+        };
+        fx.sup.edit(|b| b.holds.insert(provider.into(), l)).unwrap();
+    }
+
+    fn queued(fx: &Fx, id: &str, model: &str) {
+        let t = Task {
+            id: id.into(),
+            label: id.into(),
+            model: model.into(),
+            state: State::Queued,
+            request: "r".into(),
+            ..Task::default()
+        };
+        fx.sup.edit(|b| b.tasks.push(t)).unwrap();
+    }
+
+    fn held(fx: &Fx, provider: &str) -> bool {
+        fx.sup.board.lock().unwrap().holds.contains_key(provider)
+    }
+
+    #[tokio::test]
+    async fn a_hold_lifts_once_a_task_on_its_provider_ends_a_turn_without_a_limit() {
+        let fx = fixture(5);
+        let s = fx.task("T1-x", "claude/a", State::Running);
+        hold(&fx, "claude", LimitKind::Quota);
+        queued(&fx, "T2-y", "claude/b");
+        let mut t = fx.end(&s).await;
+        t.catch_up(true, vec![], vec![]).await;
+        fx.links.kick();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(fx.state("T2-y"), State::Queued, "held");
+        t.event(AgentEvent::AgentStart).await;
+        t.event(says("working")).await;
+        t.event(end(SUPER, StopReason::Stop)).await;
+        fx.until("T2 runs", |fx| fx.state("T2-y") == State::Running).await;
+        assert!(!held(&fx, "claude"));
+    }
+
+    #[tokio::test]
+    async fn super_s_own_successful_request_lifts_the_hold_on_its_provider() {
+        let fx = fixture(5);
+        *fx.served.lock().unwrap() = Some(("claude".into(), 100));
+        hold(&fx, "claude", LimitKind::Quota);
+        queued(&fx, "T2-y", "claude/b");
+        fx.links.kick();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The first look is no new request; one on another provider lifts nothing.
+        *fx.served.lock().unwrap() = Some(("codex".into(), 200));
+        fx.links.kick();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(fx.state("T2-y"), State::Queued, "held");
+        *fx.served.lock().unwrap() = Some(("claude".into(), 300));
+        fx.links.kick();
+        fx.until("T2 runs", |fx| fx.state("T2-y") == State::Running).await;
+        assert!(!held(&fx, "claude"));
+    }
+
+    #[tokio::test]
+    async fn an_old_rate_limit_hold_lifts_at_start_a_new_one_and_a_quota_hold_stay() {
+        let fx = fixture_with(5, |sup, _| {
+            let l = |kind, provider: &str, since| Limit {
+                kind,
+                provider: provider.into(),
+                reset_at: Some(board::now() + 86_400),
+                since,
+            };
+            sup.edit(|b| {
+                b.holds.insert("claude".into(), l(LimitKind::RateLimit, "claude", None));
+                b.holds.insert(
+                    "codex".into(),
+                    l(LimitKind::RateLimit, "codex", Some(board::now() - 60)),
+                );
+                b.holds.insert("gem".into(), l(LimitKind::Quota, "gem", None));
+            })
+            .unwrap();
+        });
+        fx.until("claude lifted", |fx| !held(fx, "claude")).await;
+        assert!(held(&fx, "codex") && held(&fx, "gem"));
     }
 
     #[tokio::test]
