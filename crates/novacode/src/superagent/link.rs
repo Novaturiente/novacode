@@ -2264,6 +2264,8 @@ pub struct HubInform {
     pub slot: crate::hub::HubSlot,
     /// `notifications.enabled`.
     pub desktop: bool,
+    /// Super's own subagents; set once they exist.
+    pub agents: Arc<std::sync::OnceLock<Arc<crate::agents::Supervisor>>>,
 }
 
 impl HubInform {
@@ -2307,7 +2309,9 @@ impl Inform for HubInform {
         let Some(h) = self.slot.0.get().and_then(|w| w.upgrade()) else {
             return false;
         };
-        !h.state().busy && !h.handle.pending_reminder(HEALTH_CHECK)
+        // A running scout dies with super's process: wait for it too.
+        let scouts = self.agents.get().map_or(0, |a| a.pending());
+        !h.state().busy && !h.handle.pending_reminder(HEALTH_CHECK) && scouts == 0
     }
     fn restart(&self) {
         super::upgrade::request();

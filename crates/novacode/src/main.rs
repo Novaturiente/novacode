@@ -1581,6 +1581,8 @@ impl Ctx {
         let mut decision_check: Option<(novacode_core::memory::Worker, Arc<dyn superagent::link::Inform>)> = None;
         // Super itself, for the context builder's health-check callback.
         let mut super_ref: Option<std::sync::Weak<superagent::task::Super>> = None;
+        // Super's own subagents (scouts, reviewers it asked for): a self-restart waits for them.
+        let super_agents: Arc<std::sync::OnceLock<Arc<agents::Supervisor>>> = Default::default();
         // What started super's current run: set by its context builder, read by `say`.
         let say_trigger: superagent::say::Trigger = Default::default();
         // Super's latest state block: set by its context builder, read by the decision check.
@@ -1628,6 +1630,7 @@ impl Ctx {
                 let inform = Arc::new(superagent::link::HubInform {
                     slot: slot.clone(),
                     desktop: s.get("notifications.enabled").unwrap_or(true),
+                    agents: super_agents.clone(),
                 });
                 decision_check = helper.map(|h| (h, inform.clone() as Arc<dyn superagent::link::Inform>));
                 superagent::feed_board(slot.clone(), &sup, self.paths.clone());
@@ -1756,6 +1759,7 @@ impl Ctx {
                 None => agents::Supervisor::new(setup),
             };
             *self.sup.lock().unwrap() = Some(sup.clone());
+            let _ = super_agents.set(sup.clone());
             // Goals (/goal): audited by the `auditor` subagent.
             let g = goals::Goals::new(
                 self.paths.home().join("goals").join(format!("{}.json", store.id())),

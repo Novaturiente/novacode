@@ -20,6 +20,17 @@ pub const NUDGE: &str = "[say] Your last reply was plain text, which the user do
 again with `say` (pick the kind; use sections with task labels or General; questions need structured question context, other kinds say per task done, next, needs_you). If you meant \
 nothing for the user, reply with nothing.";
 
+/// The note code makes from super's plain text after the nudge: cut to the word limit and
+/// marked `detail`, so the say checks never drop it (the full text stays in the session).
+pub fn plain_note(text: &str) -> Value {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let body = match words.len() > 50 {
+        true => format!("{} … (cut; ask for the rest)", words[..50].join(" ")),
+        false => text.to_string(),
+    };
+    serde_json::json!({ "kind": "note", "detail": true, "sections": [{"task": "General", "body": body}] })
+}
+
 /// The trigger of super's current run, set by the context builder at each model call.
 pub type Trigger = Arc<Mutex<String>>;
 
@@ -646,6 +657,14 @@ mod tests {
 
     fn args(v: Value) -> Args {
         serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn super_s_plain_text_always_reaches_the_user() {
+        // Code turns plain text into a note; the say limits must never drop it.
+        let long = format!("commit 2fc5e1e124fd passed {}", "word ".repeat(100));
+        let a = args(plain_note(&long));
+        assert_eq!(check(&a, &Board::default()), Ok(()));
     }
 
     fn question_section(task: &str) -> Value {
