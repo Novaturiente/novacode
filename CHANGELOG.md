@@ -2,6 +2,18 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.8.5] - 2026-11-07
+
+### Added
+
+- **Super restarts itself after an upgrade**: when the novacode binary changes, super waits until it is idle (no run, no scout) and resumes the same session on the new version. Tasks keep running.
+- **Unanswered questions are re-asked** every 30 minutes (`super.watch.remindMinutes`) with a desktop notification, without waking super's model.
+- **Quota switch card**: when a task or its review hits a provider quota, one card asks at once to move them to another logged-in provider (Switch / Wait). Repeated quota wakes stop.
+
+### Changed
+
+- **Super speaks plainly**: each task gets Done / Next / Needs you, at most 60 words per message; commit SHAs, process ids and PIDs only when you ask for details. Plain-text fallback is cut to fit, never dropped.
+
 ## [0.8.4] - 2026-11-07
 
 ### Added
