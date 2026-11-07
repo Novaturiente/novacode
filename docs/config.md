@@ -53,6 +53,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `super.watch.everyMinutes` | number | 30 | Super mode: while a task runs, super gets a health-check wake this often and judges the tasks from code's health facts; a check that finds all fine is hidden from your window. Skipped while super works. `0`: no checks. |
 | `super.watch.progressMinutes` | number | 20 | Super mode: a task that has worked this long without a `progress` report is asked for one at its next tool boundary (no interrupt); never while it waits on your answer. `0`: no nudges. |
 | `super.watch.stallMinutes` | number | 15 | Super mode: a task blocked, stopped or ready but not landed, with no open question to you and no action of super's on it for this long, is stalled: it wakes a health check that lists it, and super must act on it. `0`: no stall checks. |
+| `super.watch.remindMinutes` | number | 30 | Super mode: a card waiting for your answer (a question, an approval, a card novacode made) is asked again this often, with a desktop notification and a short reminder naming the task and the decision, until you answer or dismiss it. Super's model is not woken. `0`: no reminders. |
 | `goal.audit` | bool | true | `/goal` completion is checked by the `auditor` subagent before it counts. |
 | `goal.auditModel` | string | the session's model | Model of the goal auditor (`provider/model[:level]`). |
 | `goal.maxRuns` | number | 30 | Automatic continuations of a goal before it pauses (per start or `/goal resume`). |

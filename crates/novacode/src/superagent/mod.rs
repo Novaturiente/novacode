@@ -9,10 +9,12 @@ pub mod entry;
 pub mod inbox;
 pub mod link;
 pub mod models;
+pub mod remind;
 pub mod report;
 pub mod review;
 pub mod say;
 pub mod task;
+pub mod upgrade;
 
 use novacode_base::settings::Settings;
 use std::path::Path;
@@ -240,6 +242,8 @@ pub struct Watch {
     /// A task blocked, stopped or ready but not landed this long with no action of super's
     /// and no open question to the user is stalled (`stallMinutes`).
     pub stall: u64,
+    /// An unanswered card to the user is re-asked this often (`remindMinutes`).
+    pub remind: u64,
 }
 
 impl Default for Watch {
@@ -248,6 +252,7 @@ impl Default for Watch {
             every: 30 * 60,
             progress: 20 * 60,
             stall: 15 * 60,
+            remind: 30 * 60,
         }
     }
 }
@@ -267,6 +272,7 @@ pub fn watch(s: &Settings) -> Watch {
             .get::<u64>("super.watch.progressMinutes")
             .map_or(d.progress, |m| m * 60),
         stall: s.get::<u64>("super.watch.stallMinutes").map_or(d.stall, |m| m * 60),
+        remind: s.get::<u64>("super.watch.remindMinutes").map_or(d.remind, |m| m * 60),
     }
 }
 
@@ -383,15 +389,19 @@ mod tests {
                 every: 1800,
                 progress: 1200,
                 stall: 900,
+                remind: 1800,
             }
         );
-        let (_d, s) = settings(r#"{"super": {"watch": {"everyMinutes": 5, "progressMinutes": 0, "stallMinutes": 0}}}"#);
+        let (_d, s) = settings(
+            r#"{"super": {"watch": {"everyMinutes": 5, "progressMinutes": 0, "stallMinutes": 0, "remindMinutes": 0}}}"#,
+        );
         assert_eq!(
             watch(&s),
             Watch {
                 every: 300,
                 progress: 0,
                 stall: 0,
+                remind: 0,
             }
         );
     }

@@ -282,6 +282,12 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "Super mode: a task blocked, stopped or ready but not landed, with no open question to you and no action of super's on it for this long, is stalled: it wakes a health check that lists it, and super must act on it. `0`: no stall checks.",
     ),
     (
+        "super.watch.remindMinutes",
+        "number",
+        "30",
+        "Super mode: a card waiting for your answer (a question, an approval, a card novacode made) is asked again this often, with a desktop notification and a short reminder naming the task and the decision, until you answer or dismiss it. Super's model is not woken. `0`: no reminders.",
+    ),
+    (
         "goal.audit",
         "bool",
         "true",
