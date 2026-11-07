@@ -95,7 +95,7 @@ fn describe(text: &str) -> Option<String> {
 
 /// Local `HH:MM` now.
 // shortcut: asks `date` for the local zone (no tz crate), as `schedule` does; UTC when it fails.
-fn local_time(ms: u64) -> String {
+pub(super) fn local_time(ms: u64) -> String {
     let out = std::process::Command::new("date")
         .args(["-d", &format!("@{}", ms / 1000), "+%H:%M"])
         .output();

@@ -118,6 +118,9 @@ struct Cli {
     /// `/restart` of the detached super: resume this session (`-r` is refused with `--super`).
     #[arg(long, hide = true, requires = "super_serve")]
     super_resume: Option<String>,
+    /// The detached super restarted itself after its binary was upgraded (L10.9).
+    #[arg(long, hide = true, requires = "super_serve")]
+    super_upgraded: bool,
     /// API key for the model's provider, for this run only (ahead of saved and env keys).
     #[arg(long, value_name = "KEY")]
     api_key: Option<String>,
@@ -1425,6 +1428,12 @@ impl Ctx {
         let s = &self.settings;
         // Super mode (L10.9): its own prompt and tools, no project files, skills or MCP.
         let is_super = self.cli.super_serve;
+        // Super's cards are re-asked while they wait (L10.9).
+        let reminders = is_super.then(Arc::<superagent::remind::Pending>::default);
+        let asker = match &reminders {
+            Some(r) => asker.map(|a| r.asker(a)),
+            None => asker,
+        };
         let perms = permissions(s);
         // Lenient (L6.9): no judge.
         let judge_spec = match perms.security {
@@ -1593,7 +1602,10 @@ impl Ctx {
                 paths: self.paths.clone(),
             });
             let dir = superagent::entry::dir(home, &self.cwd);
-            let sup = Arc::new(task::Super::new(&self.cwd, dir, cfg, asker.clone(), launcher)?);
+            let reminders = reminders.clone().unwrap_or_default();
+            let sup = Arc::new(
+                task::Super::new(&self.cwd, dir, cfg, asker.clone(), launcher)?.with_reminders(reminders.clone()),
+            );
             // Each super session numbers its tasks from T1 (L10.9).
             sup.set_session(store.id());
             super_ref = Some(Arc::downgrade(&sup));
@@ -1619,7 +1631,20 @@ impl Ctx {
                 });
                 decision_check = helper.map(|h| (h, inform.clone() as Arc<dyn superagent::link::Inform>));
                 superagent::feed_board(slot.clone(), &sup, self.paths.clone());
-                superagent::link::Links::start(&sup, Arc::new(slot.clone()), Arc::new(slot), inform);
+                if self.cli.super_upgraded {
+                    let text = format!(
+                        "novacode was upgraded to {}; super restarted",
+                        env!("CARGO_PKG_VERSION")
+                    );
+                    superagent::link::Inform::notice(inform.as_ref(), text.clone());
+                    superagent::link::Inform::note(inform.as_ref(), text);
+                }
+                superagent::link::Links::start(
+                    &sup,
+                    reminders.asker(Arc::new(slot.clone())),
+                    reminders.approver(Arc::new(slot)),
+                    inform,
+                );
             }
             all.push(Arc::new(superagent::say::SayTool {
                 sup: sup.clone(),
@@ -2840,9 +2865,16 @@ async fn serve_headless(ctx: &Ctx, store: Store, model: String) -> anyhow::Resul
     if let Some(sup) = sup {
         sup.stop_all().await;
     }
-    live.end("session ended").await;
+    // Super restarts on its upgraded binary (L10.9): its windows reconnect to the same session.
+    let upgraded = ctx.cli.super_serve && superagent::upgrade::requested();
+    let id = host.id.clone();
+    live.end(if upgraded { serve::RELOADING } else { "session ended" })
+        .await;
     // Let the last lines (and the bye) reach RPC clients.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    if upgraded {
+        return Err(restart_with(&id, &["--super-upgraded"]));
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -2858,7 +2890,13 @@ fn live_path(exe: std::path::PathBuf) -> std::path::PathBuf {
 }
 
 fn restart(id: &str) -> anyhow::Error {
-    let args = restart_args(std::env::args().skip(1), id);
+    restart_with(id, &[])
+}
+
+/// [`restart`], with `extra` arguments.
+fn restart_with(id: &str, extra: &[&str]) -> anyhow::Error {
+    let mut args = restart_args(std::env::args().skip(1), id);
+    args.extend(extra.iter().map(|a| a.to_string()));
     let exe = match std::env::current_exe() {
         Ok(e) => live_path(e),
         Err(e) => return e.into(),
@@ -2897,6 +2935,7 @@ fn restart_args(own: impl Iterator<Item = String>, id: &str) -> Vec<String> {
             s if s.starts_with("--worktree=") || s.starts_with("-w") && s.len() > 2 => {}
             s if s.starts_with("--resume=") || s.starts_with("--super-resume=") => {}
             "--super-resume" => skip = true,
+            "--super-upgraded" => {}
             _ => args.push(a),
         }
     }

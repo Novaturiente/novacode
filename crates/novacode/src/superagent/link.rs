@@ -120,6 +120,8 @@ pub trait Inform: Send + Sync {
     fn idle(&self) -> bool {
         true
     }
+    /// End super's session so it runs the binary on disk again as the same session.
+    fn restart(&self) {}
 }
 
 /// How much of a task's last message a code-made report carries.
@@ -605,6 +607,22 @@ pub struct Links {
     stall_seen: Mutex<HashMap<String, u64>>,
     /// The last check that listed stalled tasks: when, and their ids (one nudge if left alone).
     stall_check: Mutex<Option<(u64, Vec<String>)>>,
+    /// Super's binary as it started: a new install restarts super once it is idle.
+    pub(super) exe: Mutex<Option<super::upgrade::ExeWatch>>,
+    /// Provider → its quota state (L10.9): the card, the user's Wait, and the tasks whose
+    /// quota block already woke super. Kept until a task on it gets past the limit.
+    quota: Mutex<HashMap<String, Quota>>,
+}
+
+/// One provider's quota, as code's quota card sees it.
+#[derive(Default)]
+struct Quota {
+    /// Its card is open.
+    card: bool,
+    /// The user chose Wait: no more cards for this hold.
+    waited: bool,
+    /// Tasks whose quota block woke super: a repeated block doesn't wake it again.
+    woke: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -656,6 +674,8 @@ impl Links {
             check_from: Mutex::default(),
             stall_seen: Mutex::default(),
             stall_check: Mutex::default(),
+            exe: Mutex::new(super::upgrade::ExeWatch::current()),
+            quota: Mutex::default(),
         });
         let _ = sup.links.set(links.clone());
         links.recover(sup);
@@ -898,6 +918,29 @@ impl Links {
         }
         self.deploy_cards(&sup);
         self.health_check(&sup);
+        self.remind(&sup);
+        self.upgraded();
+    }
+
+    /// Re-ask each card left unanswered `super.watch.remindMinutes`: a desktop notification
+    /// and a notice in the user's windows; super's model is not woken.
+    fn remind(&self, sup: &Super) {
+        for line in sup.reminders.due(board::now(), sup.cfg().watch.remind) {
+            self.inform
+                .desktop("Still waiting for your answer".into(), line.clone());
+            self.inform.notice(line);
+        }
+    }
+
+    /// Super's binary changed on disk (an upgrade) and super is idle: restart it, once per change.
+    fn upgraded(&self) {
+        let mut g = self.exe.lock().unwrap();
+        let Some(w) = g.as_mut() else { return };
+        let now = super::upgrade::ident(&w.path);
+        if w.due(now, self.inform.idle()) {
+            tracing::info!(exe = %w.path.display(), "super: the binary changed; restarting");
+            self.inform.restart();
+        }
     }
 
     /// Code's deploy card for each ready write task that needs one (L10.9), off the loop
@@ -1137,6 +1180,23 @@ impl Links {
             _ => false,
         };
         // Finished work closes once super heard of it (L10.9); the result rides on its next wake.
+        // A repeated quota block of a task whose first block woke super doesn't wake it again;
+        // any other wake of a task on that provider means the limit is behind it.
+        let wakes = wakes && {
+            let mut q = self.quota.lock().unwrap();
+            match &ev {
+                Event::TurnLimit(l) if l.kind == LimitKind::Quota => {
+                    q.entry(l.provider.clone()).or_default().woke.insert(id.to_string())
+                }
+                _ => {
+                    let p = super::models::provider(&t.model);
+                    if q.get(p).is_some_and(|x| !x.card) {
+                        q.remove(p);
+                    }
+                    true
+                }
+            }
+        };
         let closes = wakes && changed && super::task::finished(&t);
         if closes {
             extra += &format!(
@@ -1179,6 +1239,41 @@ impl Links {
                 until(sup, &limit.provider)
             ));
         }
+        if limit.kind == LimitKind::Quota {
+            self.quota_card(limit);
+        }
+    }
+
+    /// Code's quota card for `limit`'s provider, unless one is open or the user chose Wait
+    /// for this hold; off the loop since it waits for the user.
+    fn quota_card(&self, limit: &Limit) {
+        {
+            let mut q = self.quota.lock().unwrap();
+            let e = q.entry(limit.provider.clone()).or_default();
+            if e.card || e.waited {
+                return;
+            }
+            e.card = true;
+        }
+        let (me, sup, limit) = (self.me.clone(), self.sup.clone(), limit.clone());
+        let t = tokio::spawn(async move {
+            let Some(sup) = sup.upgrade() else { return };
+            let answer = sup.quota_card(&limit.provider, limit.reset_at).await;
+            let Some(me) = me.upgrade() else { return };
+            if let Some(e) = me.quota.lock().unwrap().get_mut(&limit.provider) {
+                e.card = false;
+                e.waited = answer == super::task::QuotaAnswer::Waited;
+            }
+            match answer {
+                super::task::QuotaAnswer::None => {}
+                super::task::QuotaAnswer::Waited => me.inform.note(format!(
+                    "{} is out of quota; the user chose to wait: its tasks continue when it clears.",
+                    limit.provider
+                )),
+                super::task::QuotaAnswer::Switched(out) => me.inform.note(out),
+            }
+        });
+        self.inner.lock().unwrap().tasks.push(t.abort_handle());
     }
 
     /// A review task's turn hit a provider limit: no crash. The provider is held; the review
@@ -2214,6 +2309,13 @@ impl Inform for HubInform {
         };
         !h.state().busy && !h.handle.pending_reminder(HEALTH_CHECK)
     }
+    fn restart(&self) {
+        super::upgrade::request();
+        self.handle(|h| {
+            h.abort();
+            h.shutdown();
+        });
+    }
     fn closing(&self) -> bool {
         // Not started yet is not closing.
         self.slot
@@ -2890,6 +2992,9 @@ mod tests {
         fn desktop(&self, title: String, _: String) {
             self.0.lock().unwrap().push(format!("desktop: {title}"));
         }
+        fn restart(&self) {
+            self.0.lock().unwrap().push("restart".into());
+        }
     }
 
     struct Fx {
@@ -2935,14 +3040,29 @@ mod tests {
             home: home.clone(),
             watch,
         };
-        let sup =
-            Arc::new(Super::new(&root, home.join("super/x"), cfg, Some(asker.clone()), launcher.clone()).unwrap());
+        let pending = Arc::new(super::super::remind::Pending::default());
+        let sup = Arc::new(
+            Super::new(
+                &root,
+                home.join("super/x"),
+                cfg,
+                Some(pending.asker(asker.clone())),
+                launcher.clone(),
+            )
+            .unwrap()
+            .with_reminders(pending.clone()),
+        );
         before(&sup, &launcher);
         let log = Log::default();
         let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let said = Said(log.clone(), closing.clone(), busy.clone());
-        let links = Links::start(&sup, asker.clone(), Arc::new(Allow), Arc::new(said));
+        let links = Links::start(
+            &sup,
+            pending.asker(asker.clone()),
+            pending.approver(Arc::new(Allow)),
+            Arc::new(said),
+        );
         Fx {
             _tmp: tmp,
             sup,
@@ -3148,6 +3268,7 @@ mod tests {
             every: 1,
             progress: 0,
             stall: 0,
+            remind: 0,
         };
         let fx = fixture_full(5, watch, |_, _| {});
         tokio::time::sleep(Duration::from_millis(2500)).await;
@@ -3208,6 +3329,7 @@ mod tests {
             every: 3600,
             progress: 0,
             stall: 10,
+            remind: 0,
         };
         let fx = fixture_full(5, watch, |_, _| {});
         stalled_row(&fx, "T1-x");
@@ -3227,6 +3349,7 @@ mod tests {
             every: 0,
             progress: 0,
             stall: 10,
+            remind: 0,
         };
         let fx = fixture_full(5, watch, |_, _| {});
         stalled_row(&fx, "T1-x");
@@ -3242,6 +3365,7 @@ mod tests {
             every: 0,
             progress: 1,
             stall: 0,
+            remind: 0,
         };
         let fx = fixture_full(5, watch, |_, _| {});
         let s = fx.task("T1-x", "faux/a", State::Running);
@@ -4661,5 +4785,151 @@ mod tests {
             .await;
         assert_eq!(fx.state("T1-x"), State::Running);
         assert_eq!(fx.launcher.starts.lock().unwrap().len(), 1);
+    }
+
+    fn reminders(fx: &Fx) -> usize {
+        fx.said()
+            .iter()
+            .filter(|l| *l == "notice: T1-x: still waiting for your answer: which db?")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_card_is_re_asked_every_interval_without_waking_super() {
+        let watch = super::super::Watch {
+            stall: 0,
+            remind: 1,
+            ..Default::default()
+        };
+        let fx = fixture_full(5, watch, |_, _| {});
+        let s = fx.task("T1-x", "faux/a", State::Running);
+        let mut t = fx.end(&s).await;
+        t.catch_up(false, vec![], vec![ask(7)]).await;
+        fx.until("asked", |fx| fx.asker.waiting.lock().unwrap().len() == 1)
+            .await;
+        fx.until("re-asked", |fx| reminders(fx) == 1).await;
+        assert!(fx.said().iter().any(|l| l == "desktop: Still waiting for your answer"));
+        let tx = fx.asker.waiting.lock().unwrap().remove(0);
+        tx.send(None).unwrap();
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(reminders(&fx) <= 2, "none after the card closed: {:?}", fx.said());
+        let n = reminders(&fx);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(reminders(&fx), n);
+        assert!(wakes(&fx).is_empty(), "re-asks never wake super");
+    }
+
+    fn answer(fx: &Fx, choice: &str) {
+        let tx = fx.asker.waiting.lock().unwrap().remove(0);
+        let reply = Reply {
+            question: String::new(),
+            chosen: vec![choice.into()],
+            text: None,
+            preview: None,
+        };
+        tx.send(Some(vec![reply])).unwrap();
+    }
+
+    fn set_model_sent(fx: &Fx, session: &str, model: &str) -> bool {
+        fx.launcher
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(s, c)| s == session && matches!(c, ClientCmd::SetModel { model: m } if m == model))
+    }
+
+    #[tokio::test]
+    async fn a_quota_block_asks_at_once_to_switch_provider_and_switch_moves_the_tasks() {
+        // One slot: the review waits behind T1, then behind the hold.
+        let fx = fixture(1);
+        // Super runs on the held provider too, so its queued review stays held there.
+        fx.sup
+            .set_current_model("claude/opus".into(), novacode_types::ThinkingLevel::High);
+        let s = fx.task("T1-x", "claude/a", State::Running);
+        // Its review, queued behind the hold.
+        fx.task("T2-y", "faux/a", State::Reviewing);
+        let rv = Task {
+            id: "T3-rev".into(),
+            label: "T3-rev".into(),
+            kind: Kind::Review,
+            reviewer_of: Some("T2-y".into()),
+            model: "claude/opus".into(),
+            state: State::Queued,
+            request: "r".into(),
+            ..Task::default()
+        };
+        fx.sup
+            .edit(|b| {
+                b.tasks.push(rv);
+                b.tasks[1].reviewer = Some("T3-rev".into());
+            })
+            .unwrap();
+        let mut t = fx.end(&s).await;
+        t.catch_up(true, vec![], vec![]).await;
+        t.event(AgentEvent::AgentStart).await;
+        t.event(end(SUPER, QUOTA)).await;
+        fx.until("asked", |fx| fx.asker.waiting.lock().unwrap().len() == 1)
+            .await;
+        let q = fx.asker.asked.lock().unwrap()[0].clone();
+        assert!(q.question.contains("claude is out until "), "{}", q.question);
+        assert!(q.question.contains("Move T1-x, T3-rev to codex?"), "{}", q.question);
+        let labels: Vec<&str> = q.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, ["Switch", "Wait"]);
+        answer(&fx, "Switch");
+        fx.until("switched", |fx| set_model_sent(fx, &s, "faux/standard")).await;
+        fx.until("continues", |fx| fx.state("T1-x") == State::Running).await;
+        fx.until("review moved", |fx| {
+            fx.sup.row("T3-rev").unwrap().model != "claude/opus"
+        })
+        .await;
+        // Off super's provider a review takes that provider's deep tier.
+        assert_eq!(fx.sup.row("T3-rev").unwrap().model, "faux/deep");
+    }
+
+    #[tokio::test]
+    async fn wait_asks_no_more_for_the_hold_and_a_repeated_quota_block_wakes_super_once() {
+        let fx = fixture(5);
+        let s = fx.task("T1-x", "claude/a", State::Running);
+        let mut t = fx.end(&s).await;
+        t.catch_up(true, vec![], vec![]).await;
+        t.event(AgentEvent::AgentStart).await;
+        t.event(end(SUPER, QUOTA)).await;
+        fx.until("asked", |fx| fx.asker.waiting.lock().unwrap().len() == 1)
+            .await;
+        answer(&fx, "Wait");
+        fx.until("noted", |fx| fx.said().iter().any(|l| l.contains("chose to wait")))
+            .await;
+        // The fixed wait ends, code resends, the quota is still out.
+        clear_hold(&fx, "claude");
+        fx.until("resent", |fx| sent_cleared(fx, &s)).await;
+        fx.until("running", |fx| fx.state("T1-x") == State::Running).await;
+        t.event(AgentEvent::AgentStart).await;
+        t.event(end(SUPER, QUOTA)).await;
+        fx.until("blocked again", |fx| fx.state("T1-x") == State::Blocked).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(fx.asker.asked.lock().unwrap().len(), 1, "no second card");
+        let quota_wakes = wakes(&fx).iter().filter(|w| w.contains("of provider claude")).count();
+        assert_eq!(quota_wakes, 1, "{:?}", fx.said());
+    }
+
+    #[tokio::test]
+    async fn a_changed_binary_restarts_super_once_it_is_idle() {
+        let fx = fixture(5);
+        let d = tempfile::tempdir().unwrap();
+        let exe = d.path().join("novacode");
+        std::fs::write(&exe, "v1").unwrap();
+        let seen = super::super::upgrade::ident(&exe);
+        *fx.links.exe.lock().unwrap() = Some(super::super::upgrade::ExeWatch::new(exe.clone(), seen, false));
+        fx.busy.store(true, std::sync::atomic::Ordering::Relaxed);
+        std::fs::remove_file(&exe).unwrap();
+        std::fs::write(&exe, "v2 new").unwrap();
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(!fx.said().contains(&"restart".to_string()), "not while super works");
+        fx.busy.store(false, std::sync::atomic::Ordering::Relaxed);
+        fx.until("restarted", |fx| fx.said().contains(&"restart".to_string()))
+            .await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(fx.said().iter().filter(|l| *l == "restart").count(), 1);
     }
 }

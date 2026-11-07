@@ -98,6 +98,35 @@ pub struct Super {
     current: Mutex<(String, ThinkingLevel)>,
     /// Live session state, including idle model and thinking changes.
     pub hub: std::sync::OnceLock<crate::hub::HubSlot>,
+    /// The cards open for the user, re-asked by the links' tick (L10.9).
+    pub reminders: Arc<super::remind::Pending>,
+}
+
+/// The user's answer to code's quota card.
+#[derive(Debug, PartialEq)]
+pub(super) enum QuotaAnswer {
+    /// No card: no other provider to move to, nothing to move, or no answer.
+    None,
+    Waited,
+    /// Switched: what code did.
+    Switched(String),
+}
+
+/// A task or review waiting on `provider`'s quota: a blocked task or a live review whose
+/// turn hit it, or a review queued on it that never started.
+fn quota_blocked(t: &Task, provider: &str) -> bool {
+    let limit = t
+        .block
+        .as_ref()
+        .and_then(|b| b.limit.as_ref())
+        .is_some_and(|l| l.provider == provider);
+    match t.kind {
+        Kind::Work => t.state == State::Blocked && limit && !t.block.as_ref().is_some_and(|b| b.merge),
+        Kind::Review => {
+            (t.state.is_live() && limit)
+                || (t.state == State::Queued && t.session.is_none() && super::models::provider(&t.model) == provider)
+        }
+    }
 }
 
 /// What a tool result adds when its prompt was held.
@@ -419,7 +448,14 @@ impl Super {
             links: std::sync::OnceLock::new(),
             grounds: Mutex::default(),
             helper: std::sync::OnceLock::new(),
+            reminders: Arc::default(),
         })
+    }
+
+    /// `reminders` track the cards its asker opens (it wraps the asker given to [`Self::new`]).
+    pub fn with_reminders(mut self, reminders: Arc<super::remind::Pending>) -> Self {
+        self.reminders = reminders;
+        self
     }
 
     /// novacode's home (goal files, session files).
@@ -860,6 +896,46 @@ impl Super {
         if let [t] = rows.as_slice() {
             self.switchable(t)?;
         }
+        let (changes, skipped) = self.plan_switch(rows, provider.as_deref(), model.as_deref()).await;
+        let skipped_text = match skipped.is_empty() {
+            true => String::new(),
+            false => format!("\nNot switched: {}.", skipped.join("; ")),
+        };
+        if changes.is_empty() {
+            return Err(format!(
+                "nothing to switch: every task is already on that model.{skipped_text}"
+            ));
+        }
+        let mut q = String::from("Switch these tasks to new models? A switched task loses its prompt cache.\n\n");
+        for (t, new) in &changes {
+            q += &format!("- {}: {} → {new}\n", t.label, t.model);
+        }
+        q += &skipped_text;
+        let header = match changes.as_slice() {
+            [(t, _)] => format!("{}: model", t.label),
+            _ => "Switch models".to_string(),
+        };
+        if !self.confirm(header, q, "Switch").await? {
+            return Ok("The user declined: every task keeps its model.".into());
+        }
+        let out = self.apply_switch(changes).await;
+        let mut s = format!("Switched on the user's OK:\n{}", out.join("\n"));
+        s += &skipped_text;
+        for n in self.pump().await {
+            s += &format!("\n{n}");
+        }
+        Ok(s)
+    }
+
+    /// Each of `rows`' new model on `provider` (its tier there) or `model`, and why the
+    /// others are not switched.
+    async fn plan_switch(
+        &self,
+        rows: Vec<Task>,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> (Vec<(Task, String)>, Vec<String>) {
+        let models = self.cfg.models.clone();
         let own = self.current_model();
         let (mut changes, mut skipped) = (Vec::new(), Vec::new());
         for t in rows {
@@ -867,8 +943,8 @@ impl Super {
                 skipped.push(e);
                 continue;
             }
-            let new = match (&provider, &model) {
-                (_, Some(m)) => Ok(m.clone()),
+            let new = match (provider, model) {
+                (_, Some(m)) => Ok(m.to_string()),
                 (Some(p), None) => {
                     let tier = t
                         .tier
@@ -895,27 +971,12 @@ impl Super {
             };
             changes.push((t, new));
         }
-        let skipped_text = match skipped.is_empty() {
-            true => String::new(),
-            false => format!("\nNot switched: {}.", skipped.join("; ")),
-        };
-        if changes.is_empty() {
-            return Err(format!(
-                "nothing to switch: every task is already on that model.{skipped_text}"
-            ));
-        }
-        let mut q = String::from("Switch these tasks to new models? A switched task loses its prompt cache.\n\n");
-        for (t, new) in &changes {
-            q += &format!("- {}: {} → {new}\n", t.label, t.model);
-        }
-        q += &skipped_text;
-        let header = match changes.as_slice() {
-            [(t, _)] => format!("{}: model", t.label),
-            _ => "Switch models".to_string(),
-        };
-        if !self.confirm(header, q, "Switch").await? {
-            return Ok("The user declined: every task keeps its model.".into());
-        }
+        (changes, skipped)
+    }
+
+    /// Switch each task to its new model: a running one at once, one blocked by a provider
+    /// limit is told to continue. One line per task.
+    async fn apply_switch(&self, changes: Vec<(Task, String)>) -> Vec<String> {
         let mut out = Vec::new();
         for (t, new) in changes {
             let Ok(t) = self.row(&t.id) else { continue };
@@ -934,7 +995,14 @@ impl Super {
                     row.model = new.clone();
                 }
                 b.apply(&t.id, Event::LimitCleared).is_ok()
-            })?;
+            });
+            let cleared = match cleared {
+                Ok(c) => c,
+                Err(e) => {
+                    out.push(format!("{}: the switch wasn't saved: {e}", t.label));
+                    continue;
+                }
+            };
             let mut line = format!("{}: {} → {new}.", t.label, t.model);
             if cleared {
                 let msg = format!("continue: you now run on {new}; the provider limit no longer applies");
@@ -945,12 +1013,94 @@ impl Super {
             }
             out.push(line);
         }
-        let mut s = format!("Switched on the user's OK:\n{}", out.join("\n"));
-        s += &skipped_text;
-        for n in self.pump().await {
-            s += &format!("\n{n}");
+        out
+    }
+
+    /// Code's quota card (L10.9): `held` is out of quota (until `reset`, when known). When
+    /// another provider is logged in and not held, one card asks to move the tasks and
+    /// reviews it blocks there: "Switch" switches them as `task model` does and continues
+    /// them, "Wait" leaves them waiting.
+    pub(super) async fn quota_card(&self, held: &str, reset: Option<u64>) -> QuotaAnswer {
+        let own = self.current_model();
+        let (other, rows) = {
+            let b = self.board.lock().unwrap();
+            let other = self
+                .cfg
+                .models
+                .switch_targets(&own, held)
+                .into_iter()
+                .find(|p| !b.holds.contains_key(p));
+            let rows: Vec<Task> = b.tasks.iter().filter(|t| quota_blocked(t, held)).cloned().collect();
+            (other, rows)
+        };
+        let Some(other) = other.filter(|_| !rows.is_empty()) else {
+            return QuotaAnswer::None;
+        };
+        let names: Vec<String> = rows.iter().map(|t| self.name_of(&t.id)).collect();
+        let until = reset.map_or("unknown".to_string(), |at| super::say::local_time(at * 1000));
+        let header = match names.as_slice() {
+            [one] => format!("{one}: quota"),
+            _ => "Quota".to_string(),
+        };
+        let q = format!("{held} is out until {until}. Move {} to {other}?", names.join(", "));
+        match self.choose(header, q, &["Switch", "Wait"]).await {
+            Ok(Some(c)) if c == "Switch" => {}
+            Ok(Some(_)) => return QuotaAnswer::Waited,
+            _ => return QuotaAnswer::None,
         }
-        Ok(s)
+        let (work, reviews): (Vec<Task>, Vec<Task>) = rows.into_iter().partition(|t| t.kind == Kind::Work);
+        let (changes, skipped) = self.plan_switch(work, Some(&other), None).await;
+        let mut out = self.apply_switch(changes).await;
+        out.extend(skipped.into_iter().map(|s| format!("Not switched: {s}")));
+        for rv in reviews {
+            out.push(self.move_review(&rv, &other, &own).await);
+        }
+        for n in self.pump().await {
+            out.push(n);
+        }
+        QuotaAnswer::Switched(format!(
+            "{held} is out of quota; on the user's OK code moved its tasks to {other}:\n{}",
+            out.join("\n")
+        ))
+    }
+
+    /// A review held by a quota re-picks its model on `other`: super's current model when
+    /// super runs there, else that provider's `deep` tier. A live one switches and continues.
+    async fn move_review(&self, rv: &Task, other: &str, own: &str) -> String {
+        let models = self.cfg.models.clone();
+        let new = match provider(own) == other {
+            true => models.review(own),
+            false => models.resolve(other, "deep", own).map(|(m, _)| m),
+        };
+        let new = match new {
+            Ok(m) => match models.check(&m).await {
+                Ok(()) => m,
+                Err(e) => return format!("{}: not switched: {e}", rv.label),
+            },
+            Err(e) => return format!("{}: not switched: {e}", rv.label),
+        };
+        let live = rv.session.as_deref().filter(|s| self.launcher.alive(s));
+        if let Some(s) = live
+            && let Err(e) = self.launcher.send(s, ClientCmd::SetModel { model: new.clone() }).await
+        {
+            return format!("{}: the switch failed ({e}); it stays on {}.", rv.label, rv.model);
+        }
+        let _ = self.edit(|b| {
+            if let Some(row) = b.tasks.iter_mut().find(|r| r.id == rv.id) {
+                row.model = new.clone();
+                if live.is_some() {
+                    row.block = None;
+                }
+            }
+        });
+        let mut line = format!("{}: {} → {new}.", rv.label, rv.model);
+        if live.is_some() {
+            let msg = format!("continue: you now run on {new}; the provider limit no longer applies");
+            if let Err(e) = self.deliver(&rv.id, msg).await {
+                line += &format!(" Telling it to continue failed: {e}");
+            }
+        }
+        line
     }
 
     /// `task info {folder}`, read-only: what a task there would get (git or not, the branch

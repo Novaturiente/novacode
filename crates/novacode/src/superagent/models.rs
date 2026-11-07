@@ -191,6 +191,17 @@ impl Models {
         futures_util::future::join_all(ps.into_iter().map(|p| self.refresh(p))).await;
     }
 
+    /// Where tasks of `held` may move: super's provider (`own`'s), then each preset
+    /// provider, logged in and other than `held`.
+    pub fn switch_targets(&self, own: &str, held: &str) -> Vec<String> {
+        let mut ps = vec![provider(own)];
+        ps.extend(PRESETS.iter().map(|(p, _)| *p).filter(|p| *p != provider(own)));
+        ps.into_iter()
+            .filter(|p| *p != held && self.source.logged_in(p))
+            .map(String::from)
+            .collect()
+    }
+
     /// The provider's usable models (logged in, not denied): its live list when fetched,
     /// else its catalog; each with the catalog entry of its base id.
     pub fn usable(&self, provider: &str) -> Vec<(String, Option<ModelInfo>)> {
