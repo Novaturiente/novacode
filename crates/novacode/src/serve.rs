@@ -278,8 +278,7 @@ async fn dispatch(
             Ok(Value::Null)
         }
         ClientCmd::Shutdown => {
-            hub.handle.abort();
-            hub.handle.shutdown();
+            hub.stop();
             Ok(Value::Null)
         }
         ClientCmd::ExtKey {

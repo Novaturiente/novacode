@@ -12,6 +12,22 @@ use std::sync::Arc;
 /// Whoever can answer: the host's windows and RPC clients.
 pub trait Asker: Send + Sync {
     fn ask(&self, questions: Vec<Question>) -> BoxFuture<'_, Option<Vec<Reply>>>;
+
+    /// [`Asker::ask`] that gives up as dismissed (`None`) when `cancel` fires (abort,
+    /// `novacode stop`, SIGTERM): the dropped wait closes the card in every window.
+    /// A tool waiting on a card must use this, or the run never ends and stop hangs.
+    fn ask_until<'a>(
+        &'a self,
+        questions: Vec<Question>,
+        cancel: &'a tokio_util::sync::CancellationToken,
+    ) -> BoxFuture<'a, Option<Vec<Reply>>> {
+        Box::pin(async move {
+            tokio::select! {
+                r = self.ask(questions) => r,
+                _ = cancel.cancelled() => None,
+            }
+        })
+    }
 }
 
 pub struct AskUser(pub Arc<dyn Asker>);
@@ -61,7 +77,7 @@ impl Tool for AskUser {
     fn large_output(&self) -> bool {
         false
     }
-    fn execute<'a>(&'a self, args: Value, _ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput> {
+    fn execute<'a>(&'a self, args: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
             let a: Args = match parse(args) {
                 Ok(a) => a,
@@ -70,11 +86,14 @@ impl Tool for AskUser {
             if a.questions.is_empty() {
                 return ToolOutput::error("`questions` is empty");
             }
-            match self.0.ask(a.questions).await {
+            match self.0.ask_until(a.questions, &ctx.cancel).await {
                 Some(r) => ToolOutput {
                     details: Some(json!({ "replies": r })),
                     ..ToolOutput::text(render(&r))
                 },
+                None if ctx.cancel.is_cancelled() => {
+                    ToolOutput::error("Cancelled: the run was stopped before the user answered.")
+                }
                 None => ToolOutput::text(
                     "The user dismissed the questions without answering. Ask in chat, or go on with your best judgement and say what you assumed.",
                 ),
@@ -112,5 +131,27 @@ mod tests {
         assert_eq!(text(&o), "Q: Which db?\nA: Postgres; with pgvector");
         let o = AskUser(Arc::new(Fixed(None))).execute(args, &ctx(d.path())).await;
         assert!(!o.is_error && text(&o).contains("dismissed"));
+    }
+
+    /// An abort ends the wait on a card nobody answers (stop used to hang here).
+    #[tokio::test]
+    async fn abort_ends_an_unanswered_card() {
+        struct Never;
+        impl Asker for Never {
+            fn ask(&self, _: Vec<Question>) -> BoxFuture<'_, Option<Vec<Reply>>> {
+                Box::pin(std::future::pending())
+            }
+        }
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(d.path());
+        c.cancel.cancel();
+        let args = json!({"questions": [{"question": "Which?", "options": [{"label": "a"}, {"label": "b"}]}]});
+        let o = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            AskUser(Arc::new(Never)).execute(args, &c),
+        )
+        .await
+        .expect("the cancelled ask still waits");
+        assert!(o.is_error && text(&o).contains("Cancelled"));
     }
 }

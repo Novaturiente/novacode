@@ -329,6 +329,64 @@ fn super_resumes_after_stop_and_starts_fresh_after_kill() {
     assert!(super_dir.join("board.json").exists() && !super_dir.join("fresh").exists());
 }
 
+/// Live bug (0.8.5): super waiting on its own question card ignored `novacode stop` and
+/// SIGTERM; only SIGKILL ended it. Both end it within a few seconds.
+#[test]
+fn stop_and_sigterm_end_super_waiting_on_a_card() {
+    for by_signal in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let (home, root, scripts) = (base.join("home"), base.join("projects"), base.join("scripts"));
+        for d in [&home, &root, &scripts] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let settings = json!({"memory": {"enabled": false}, "notifications": {"enabled": false}});
+        std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
+        let ask = json!({"questions": [{"question": "Which one?", "options": [{"label": "a"}, {"label": "b"}]}]});
+        script(&scripts, "super", &[tool("ask_user", ask), say("answered")]);
+        let sup = start_super(&home, &root, &scripts);
+        let _cleanup = Cleanup(home.clone(), sup.clone());
+        let run: Value = serde_json::from_str(&std::fs::read_to_string(run_file(&home, &sup)).unwrap()).unwrap();
+        let pid = run["pid"].as_u64().unwrap();
+        let sock = UnixStream::connect(run["socket"].as_str().unwrap()).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let mut conn = BufReader::new(sock);
+        let prompt = json!({"type": "prompt", "text": "pick"});
+        conn.get_mut().write_all(format!("{prompt}\n").as_bytes()).unwrap();
+        loop {
+            let mut l = String::new();
+            conn.read_line(&mut l).unwrap();
+            assert!(!l.is_empty(), "super closed the connection");
+            if serde_json::from_str::<Value>(&l).unwrap()["type"] == "ask" {
+                break;
+            }
+        }
+        if by_signal {
+            Command::new("kill").args(["-TERM", &pid.to_string()]).status().unwrap();
+        } else {
+            novacode(&home).args(["stop", &sup]).output().unwrap();
+        }
+        // Gone: no process, or a zombie not reaped yet.
+        let gone = || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |s| {
+                s.rsplit_once(')').is_some_and(|(_, r)| r.trim_start().starts_with('Z'))
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !gone() {
+            if Instant::now() > deadline {
+                let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).status();
+                panic!(
+                    "super waiting on a card ignored {}",
+                    if by_signal { "SIGTERM" } else { "stop" }
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!run_file(&home, &sup).exists(), "the run file is removed");
+    }
+}
+
 #[test]
 fn super_runs_a_write_task_through_review_merge_and_close() {
     let dir = tempfile::tempdir().unwrap();

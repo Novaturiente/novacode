@@ -118,7 +118,7 @@ impl Tool for EnterPlanMode {
     fn large_output(&self) -> bool {
         false
     }
-    fn execute<'a>(&'a self, args: Value, _ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput> {
+    fn execute<'a>(&'a self, args: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
             if self.modes.active().as_deref() == Some("plan") {
                 return ToolOutput::text("Plan mode is already on.");
@@ -133,7 +133,7 @@ impl Tool for EnterPlanMode {
                 ],
                 multi: false,
             };
-            match self.asker.ask(vec![q]).await {
+            match self.asker.ask_until(vec![q], &ctx.cancel).await {
                 Some(r) if r[0].chosen.first().is_some_and(|c| c == "Plan first") => match self.modes.set(Some("plan"))
                 {
                     Ok(()) => ToolOutput::text(format!("Plan mode is on. {PLAN_PROMPT}")),
@@ -171,7 +171,7 @@ impl Tool for PlanComplete {
     fn large_output(&self) -> bool {
         false
     }
-    fn execute<'a>(&'a self, args: Value, _ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput> {
+    fn execute<'a>(&'a self, args: Value, ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
             if self.modes.active().as_deref() != Some("plan") {
                 return ToolOutput::error("Plan mode is off; there's nothing to approve. Just do the work.");
@@ -191,7 +191,7 @@ impl Tool for PlanComplete {
                     .map(|p| format!("\n\nThe user edited the plan in their editor. This is the plan now:\n\n{p}"))
                     .unwrap_or_default()
             };
-            match self.asker.ask(vec![q]).await {
+            match self.asker.ask_until(vec![q], &ctx.cancel).await {
                 Some(r) if r[0].chosen.first().is_some_and(|c| c == "Approve") => {
                     let _ = self.modes.set(None);
                     let note = r[0]

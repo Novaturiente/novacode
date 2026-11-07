@@ -678,7 +678,7 @@ impl Tool for ExitWorktree {
                         ],
                         multi: false,
                     };
-                    match asker.ask(vec![q]).await {
+                    match asker.ask_until(vec![q], &ctx.cancel).await {
                         None => return ToolOutput::text("The user cancelled: still in the worktree."),
                         Some(r) => r
                             .first()

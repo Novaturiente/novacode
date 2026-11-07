@@ -44,6 +44,8 @@ struct Inner {
     /// Super's latest board snapshot (L10.9), for late windows.
     board: Option<ServerMsg>,
     closed: bool,
+    /// [`Hub::stop`] ran: cards close unanswered, new ones too.
+    stopping: bool,
 }
 
 pub struct Hub {
@@ -103,6 +105,7 @@ impl Hub {
                 local,
                 board: None,
                 closed: false,
+                stopping: false,
             }),
             handle,
             next_approval: 1.into(),
@@ -336,6 +339,25 @@ impl Hub {
         self.inner.lock().unwrap().closed
     }
 
+    /// End the session (`novacode stop`, SIGTERM): abort the run, end after it, and close
+    /// every open card unanswered, also ones opened from now on. A card that waits holds
+    /// the run, so without this the session never ends.
+    pub fn stop(&self) {
+        let (approvals, asks): (Vec<u64>, Vec<u64>) = {
+            let mut g = self.inner.lock().unwrap();
+            g.stopping = true;
+            (g.approvals.keys().copied().collect(), g.asks.keys().copied().collect())
+        };
+        self.handle.abort();
+        self.handle.shutdown();
+        for id in approvals {
+            self.answer(id, Answer::Deny(None));
+        }
+        for id in asks {
+            self.answer_ask(id, None);
+        }
+    }
+
     pub fn state(&self) -> State {
         self.inner.lock().unwrap().state.clone()
     }
@@ -420,6 +442,9 @@ impl Hub {
         let (tx, rx) = oneshot::channel();
         {
             let mut g = self.inner.lock().unwrap();
+            if g.stopping {
+                return Answer::Deny(None);
+            }
             g.clients.retain(|_, c| c.send(msg.clone()).is_ok());
             if let Some(l) = &g.local {
                 let (ltx, lrx) = oneshot::channel();
@@ -492,6 +517,9 @@ impl Hub {
         let (tx, rx) = oneshot::channel();
         {
             let mut g = self.inner.lock().unwrap();
+            if g.stopping {
+                return None;
+            }
             g.clients.retain(|_, c| c.send(msg.clone()).is_ok());
             if let Some(l) = &g.local {
                 let (ltx, lrx) = oneshot::channel();
