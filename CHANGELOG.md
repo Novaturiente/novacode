@@ -2,6 +2,13 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.8.6] - 2026-11-08
+
+### Fixed
+
+- **Super's provider holds lift when the provider works again**: a task, a review or super itself completing a request on that provider lifts the hold; rate-limit holds last at most one hour; holds saved by older versions lift at start. Quota holds still wait for their reset time.
+- **`novacode stop` and SIGTERM end a session waiting on a card**: open cards close unanswered and the session ends promptly. Aborting a run also closes an open `ask_user` card.
+
 ## [0.8.5] - 2026-11-07
 
 ### Added
