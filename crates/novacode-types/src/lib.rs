@@ -837,8 +837,19 @@ pub struct SaySection {
     pub task: String,
     /// Board status supplied by code; empty for General.
     pub line: String,
+    /// Older messages only: where things stand.
     pub status: String,
+    /// Optional extra Markdown (older messages: the whole content).
     pub body: String,
+    /// What finished.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub done: String,
+    /// What happens next, and who does it.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub next: String,
+    /// The one thing the user must do; empty when nothing.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub needs_you: String,
     /// Required for new questions; absent in older persisted sections.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub question: Option<SayQuestion>,

@@ -1270,8 +1270,24 @@ pub fn lay_say(s: &novacode_types::Say, open: bool, width: usize, t: &Theme) -> 
                 )],
                 &mut lines,
             );
-            if !section.line.is_empty() {
+            let plain = [
+                ("Done: ", &section.done),
+                ("Next: ", &section.next),
+                ("Needs you: ", &section.needs_you),
+            ];
+            // Plain messages (Done / Next / Needs you) skip the board line; older ones keep it.
+            let new = plain.iter().any(|(_, v)| !v.is_empty());
+            if !section.line.is_empty() && !new {
                 row(vec![Span::styled(sanitize(&section.line), t.text)], &mut lines);
+            }
+            for (label, value) in plain.iter().filter(|(_, v)| !v.is_empty()) {
+                row(
+                    vec![
+                        Span::styled(*label, t.text.add_modifier(Modifier::BOLD)),
+                        Span::styled(sanitize(value), t.text),
+                    ],
+                    &mut lines,
+                );
             }
             if let Some(question) = &section.question {
                 for (heading, content) in question.paragraphs() {
@@ -1822,6 +1838,38 @@ mod say_tests {
                 "{title} must be bold"
             );
         }
+    }
+
+    #[test]
+    fn task_sections_render_done_next_and_needs_you_plainly() {
+        let s: Say = serde_json::from_value(json!({
+            "kind": "done", "time": "14:05", "trigger": "reports",
+            "sections": [
+                {"task": "T1-ui", "line": "T1-ui · ready", "done": "The login page is fixed.",
+                 "next": "I merge it after review.", "needs_you": ""},
+                {"task": "T2-api", "line": "T2-api · blocked", "done": "Nothing new.",
+                 "next": "It waits for you.", "needs_you": "Send the database address."},
+                {"task": "General", "body": "Nothing else runs."}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            plain(&lay_say(&s, false, 100, &Theme::default())),
+            [
+                "",
+                "╭  DONE  · 14:05 · reports",
+                "│ T1-ui",
+                "│ Done: The login page is fixed.",
+                "│ Next: I merge it after review.",
+                "│ T2-api",
+                "│ Done: Nothing new.",
+                "│ Next: It waits for you.",
+                "│ Needs you: Send the database address.",
+                "│ General",
+                "│ Nothing else runs.",
+                "╰─",
+            ]
+        );
     }
 
     #[test]

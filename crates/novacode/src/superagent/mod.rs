@@ -31,13 +31,16 @@ changes and deleting anything need the user's card.
 before routing, spawn a scout with `agent` (`cwd`: the project folder below your root); it gets that project's tools \
 and MCP servers.
 - Every message to the user goes through `say`; plain text never reaches them as a message. Assume the user \
-saw nothing since your last message and has not watched the task sessions. For every kind, explain jargon \
+saw nothing since your last message. Assume the user has not read the task sessions: give the complete picture, briefly. \
+Write plain everyday words; explain jargon \
 in plain language, distinguish verified facts from unknowns, and give a concrete next action. Every `say` has \
-`sections`: one per task, with its exact board label in `task`. Non-question kinds use their own `status` and \
-`body`; questions use structured `question` context instead. Code adds that task's subtitle and board status inside its section. Put \
-unrelated facts in a section with `task: General`, even when there are no tasks. Never mix one task's facts \
-into another section or combine their status at the top. Warnings need a status in every section. For other \
-non-question messages: what happened, where things stand (`status`), then what you did or what you need. Kinds: `reply` answers the \
+`sections`: one per task, with its exact board label in `task`. Non-question kinds give each task \
+`done` (what finished), `next` (what happens next and who does it), `needs_you` (the one thing the user must do; \
+leave it out when nothing), each one short sentence; questions use structured `question` context instead. Put \
+unrelated facts in a section with `task: General` (`body`), even when there are no tasks. Never mix one task's facts \
+into another section. Keep it to at most 60 words per message; code refuses longer. Write \
+no commit SHAs, process ids, PIDs or test counts: say \"the fix is merged\", \"the tests pass\". \
+Set `detail: true` only when the user's latest message asked for those details. Kinds: `reply` answers the \
 user's message, `update` is task news, `question` needs their answer, `warning` is something wrong, `done` is \
 finished work, `note` an aside. A question states what was requested and verified before asking, with `choices` (or \
 `exact_answer: true` when it asks for one exact answer such as a name or a number); it opens the answer card \
@@ -459,15 +462,12 @@ mod tests {
             "Every `say` has `sections`: one per task, with its exact board label",
             "questions use structured `question` context instead",
             "unrelated facts in a section with `task: General`",
-            "Warnings need a status in every section",
-            "has not watched the task sessions",
             "explain jargon",
             "distinguish verified facts from unknowns",
             "give a concrete next action",
             "ask the worker for facts",
             "Never invent errors, evidence or impact",
             "Approval to plan is not permission to execute",
-            "what happened, where things stand (`status`), then what you did or what you need",
             "A question states what was requested and verified before asking",
             "A question is always its own `say` with kind `question`, never inside another kind",
             "each question field and each blocker's issue, evidence and impact is at most 40 words",
@@ -477,6 +477,23 @@ mod tests {
         ] {
             assert!(PROMPT.contains(rule), "{rule}");
         }
+    }
+
+    /// L10.9 "plain messages": per task Done / Next / Needs you, no ids unless asked.
+    #[test]
+    fn super_speaks_plainly() {
+        for rule in [
+            "plain everyday words",
+            "Assume the user has not read the task sessions",
+            "the complete picture, briefly",
+            "`done` (what finished), `next` (what happens next and who does it), `needs_you`",
+            "at most 60 words per message",
+            "no commit SHAs, process ids, PIDs or test counts",
+            "Set `detail: true` only when the user's latest message asked for those details",
+        ] {
+            assert!(PROMPT.contains(rule), "{rule}");
+        }
+        assert!(!PROMPT.contains("(`status`)"));
     }
 
     #[test]

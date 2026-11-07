@@ -17,7 +17,7 @@ pub const KINDS: [&str; 6] = ["update", "question", "warning", "done", "note", "
 
 /// What the code's plain-text nudge starts with (one per run, then a note block).
 pub const NUDGE: &str = "[say] Your last reply was plain text, which the user doesn't get as a message. Send it \
-again with `say` (pick the kind; use sections with task labels or General; questions need structured question context, warnings need status). If you meant \
+again with `say` (pick the kind; use sections with task labels or General; questions need structured question context, other kinds say per task done, next, needs_you). If you meant \
 nothing for the user, reply with nothing.";
 
 /// The trigger of super's current run, set by the context builder at each model call.
@@ -119,6 +119,8 @@ struct Args {
     choices: Vec<ArgChoice>,
     #[serde(default)]
     exact_answer: bool,
+    #[serde(default)]
+    detail: bool,
 }
 
 #[derive(Deserialize)]
@@ -128,6 +130,12 @@ struct ArgSection {
     status: String,
     #[serde(default)]
     body: String,
+    #[serde(default)]
+    done: String,
+    #[serde(default)]
+    next: String,
+    #[serde(default)]
+    needs_you: String,
     #[serde(default)]
     question: Option<SayQuestion>,
 }
@@ -166,12 +174,6 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
     }
     if a.sections.is_empty() {
         return Err("`sections` must not be empty".into());
-    }
-    if a.kind == "warning" && a.sections.iter().any(|s| s.status.trim().is_empty()) {
-        return Err(format!(
-            "a {} needs `status`: what is true now and what led here",
-            a.kind
-        ));
     }
     let unknown: Vec<&str> = a
         .sections
@@ -275,16 +277,66 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
         }
     } else {
         if a.sections.iter().any(|s| s.question.is_some()) {
-            return Err("only a question has structured `question` context; other kinds use status/body".into());
+            return Err(
+                "only a question has structured `question` context; other kinds use done/next/needs_you".into(),
+            );
         }
-        if a.sections
-            .iter()
-            .any(|s| s.body.trim().is_empty() && s.status.trim().is_empty())
+        for s in &a.sections {
+            let empty = |t: &str| t.trim().is_empty();
+            if !empty(&s.status) {
+                return Err(format!(
+                    "{}: `status` is gone; write done, next, needs_you (each a short plain sentence)",
+                    s.task
+                ));
+            }
+            if s.task == "General" {
+                if empty(&s.done) && empty(&s.body) {
+                    return Err("General needs `done` or `body`".into());
+                }
+            } else if empty(&s.done) {
+                return Err(format!("{} needs `done`: what finished, in plain words", s.task));
+            } else if empty(&s.next) {
+                return Err(format!("{} needs `next`: what happens next and who does it", s.task));
+            }
+        }
+        let texts = || {
+            a.sections
+                .iter()
+                .flat_map(|s| [&s.done, &s.next, &s.needs_you, &s.body])
+        };
+        let n: usize = texts().map(|t| t.split_whitespace().count()).sum();
+        if n > MESSAGE_WORDS {
+            return Err(format!(
+                "message: {n} words, at most {MESSAGE_WORDS}; keep the complete picture in fewer plain words"
+            ));
+        }
+        if !a.detail
+            && let Some(t) = texts().find_map(|t| technical(t))
         {
-            return Err("`body` is empty".into());
+            return Err(format!(
+                "`{t}` is a commit SHA, process id or PID; use plain words (\"the fix is merged\"), and set `detail: true` only when the user's latest message asked for these details"
+            ));
         }
     }
     Ok(())
+}
+
+/// A whole non-question message: at most this many words across its sections.
+const MESSAGE_WORDS: usize = 60;
+
+/// The first token in `text` that only a technical reader wants: a commit SHA (7-40
+/// lowercase hex chars with a digit and a letter), a `proc_<n>` id, or `PID`.
+fn technical(text: &str) -> Option<&str> {
+    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').find(|t| {
+        let sha = (7..=40).contains(&t.len())
+            && t.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            && t.bytes().any(|b| b.is_ascii_digit())
+            && t.bytes().any(|b| b.is_ascii_alphabetic());
+        let proc = t
+            .strip_prefix("proc_")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        sha || proc || t.eq_ignore_ascii_case("pid") || t.eq_ignore_ascii_case("pids")
+    })
 }
 
 /// Super's `ask_user`: the regular tool, refusing a question text over [`FIELD_WORDS`]
@@ -363,6 +415,9 @@ fn frame(a: &Args, board: &Board, at_ms: u64, trigger: &str) -> Say {
                 line: board.status_line(&s.task).unwrap_or_default(),
                 status: s.status.trim().to_string(),
                 body: s.body.trim().to_string(),
+                done: s.done.trim().to_string(),
+                next: s.next.trim().to_string(),
+                needs_you: s.needs_you.trim().to_string(),
                 question: s.question.clone(),
             })
             .collect(),
@@ -447,7 +502,8 @@ impl Tool for SayTool {
     fn description(&self) -> &str {
         "Send the user a message: your only channel to them. Code shows it as a block with its kind, the time, what \
 started this run and a board status line for each task you name. A question with `choices` opens a card and \
-returns the user's answer. A question is short points: each question field and each blocker's issue, evidence and \
+returns the user's answer. Other kinds say per task `done`, `next` and `needs_you` in plain words, at most 60 words \
+per message. A question is short points: each question field and each blocker's issue, evidence and \
 impact at most 40 words, at most 5 blockers; longer is refused."
     }
     fn schema(&self) -> Value {
@@ -458,8 +514,10 @@ impact at most 40 words, at most 5 blockers; longer is refused."
                 "priority": { "type": "string", "enum": ["normal", "high"], "description": "high only when the user should look now. Default normal." },
                 "sections": { "type": "array", "minItems": 1, "description": "One subsection per task, with only its facts. Use General for unrelated content. Do not repeat labels.", "items": { "type": "object", "properties": {
                     "task": { "type": "string", "description": "Exact board task label, or General." },
-                    "status": { "type": "string", "description": "For non-question kinds: where this task stands and what led here. Required for warning." },
-                    "body": { "type": "string", "description": "For non-question kinds: Markdown facts for this task only, then a concrete next action. Questions use question instead." },
+                    "done": { "type": "string", "description": "Non-question kinds, required for a task: what finished, one short plain sentence." },
+                    "next": { "type": "string", "description": "Non-question kinds, required for a task: what happens next and who does it (you, the task, the user)." },
+                    "needs_you": { "type": "string", "description": "Non-question kinds: the one thing the user must do; leave out when nothing." },
+                    "body": { "type": "string", "description": "Non-question kinds, optional: a short Markdown extra; for General, the content when there is no task. All text of a message: at most 60 words." },
                     "question": { "type": "object", "description": "Required only for question, in every section. Ask the worker for missing facts first. State unknowns explicitly, never invent evidence or impact. For General, truthful not-applicable explanations are valid. Each text field is one short point of at most 40 words, shown as a bullet under its heading.", "properties": {
                         "requested": { "type": "string", "minLength": 1, "description": "What the user requested, in plain language." },
                         "verified_result": { "type": "string", "minLength": 1, "description": "What is verified now, and what behaviour remains unproven. Do not treat deployment as proof that behaviour works." },
@@ -479,7 +537,8 @@ impact at most 40 words, at most 5 blockers; longer is refused."
                     "label": { "type": "string" }, "description": { "type": "string" },
                     "action": { "type": "string", "enum": ["answer", "plan", "execute"], "description": "answer: information/preference/no changes; plan: prepare a plan only; execute: make the specified changes. Code labels plan/execute explicitly. Never label permission to execute as answer." }
                 }, "required": ["label", "action"] }, "description": "Only for kind question: its answers (2-6); the user can also type their own. Distinguish preparing a plan from executing changes." },
-                "exact_answer": { "type": "boolean", "description": "A question without choices: question.decision asks for one exact answer (a name, number or path) the user types." }
+                "exact_answer": { "type": "boolean", "description": "A question without choices: question.decision asks for one exact answer (a name, number or path) the user types." },
+                "detail": { "type": "boolean", "description": "Allow commit SHAs, process ids and PIDs. Set it only when the user's latest message asked for those details." }
             },
             "required": ["kind", "sections"]
         })
@@ -513,10 +572,11 @@ impact at most 40 words, at most 5 blockers; longer is refused."
                         .sections
                         .iter()
                         .filter_map(|s| {
-                            let status = s
-                                .question
-                                .as_ref()
-                                .map_or(s.status.as_str(), |q| q.verified_result.as_str());
+                            let status = match &s.question {
+                                Some(q) => q.verified_result.as_str(),
+                                None if !s.needs_you.is_empty() => s.needs_you.as_str(),
+                                None => s.done.as_str(),
+                            };
                             (!status.trim().is_empty()).then(|| format!("{}: {}", s.task, status.trim()))
                         })
                         .collect::<Vec<_>>()
@@ -838,8 +898,8 @@ mod tests {
             ..Default::default()
         });
         let a = args(json!({"kind": "update", "sections": [
-            {"task": "T1-ui", "status": "UI ready", "body": "UI facts"},
-            {"task": "T2-api", "status": "API blocked", "body": "API facts"},
+            {"task": "T1-ui", "done": "UI ready", "next": "Review starts", "body": "UI facts"},
+            {"task": "T2-api", "done": "API blocked", "next": "I wait", "body": "API facts"},
             {"task": "General", "body": "Unrelated facts"}
         ]}));
         assert_eq!(check(&a, &b), Ok(()));
@@ -877,11 +937,7 @@ mod tests {
             no(json!({"kind":"question","exact_answer":true,"sections":[{"task":"General"}]}))
                 .contains("needs structured `question` context")
         );
-        assert!(
-            no(json!({"kind":"warning","sections":[{"task":"General","status":"","body":"x"}]}))
-                .contains("a warning needs `status`")
-        );
-        let e = no(json!({"kind":"update","sections":[{"task":"T9","status":"","body":"x"}]}));
+        let e = no(json!({"kind":"update","sections":[{"task":"T9","done":"x","next":"y"}]}));
         assert!(e.contains("unknown task label(s): T9") && e.contains("T2-api"), "{e}");
         assert!(
             no(json!({"kind":"question","sections":[{"task":"General","status":"s","body":"Port?"}]}))
@@ -889,7 +945,7 @@ mod tests {
         );
         assert!(
             no(json!({"kind":"note","sections":[{"task":"General","status":"","body":" "}]}))
-                .contains("`body` is empty")
+                .contains("General needs `done` or `body`")
         );
         assert!(no(json!({"kind": "note", "sections": []})).contains("must not be empty"));
         assert!(
@@ -914,7 +970,7 @@ mod tests {
         for ok in [
             question_args("General"),
             typed,
-            json!({"kind":"update","sections":[{"task":"T2-api","status":"","body":"x"}]}),
+            json!({"kind":"update","sections":[{"task":"T2-api","done":"x","next":"y"}]}),
         ] {
             assert_eq!(check(&args(ok.clone()), &b), Ok(()), "{ok}");
         }
@@ -923,7 +979,7 @@ mod tests {
     #[test]
     fn the_frame_carries_board_status_lines_time_and_trigger() {
         let a = args(
-            json!({"kind":"warning","priority":"high","sections":[{"task":"T2-api","status":"blocked","body":"**x**"}]}),
+            json!({"kind":"warning","priority":"high","sections":[{"task":"T2-api","done":"Nothing new","next":"It waits","needs_you":"Send the db url"}]}),
         );
         let s = frame(&a, &board(), 1_700_000_000_000, "after T2-api reported blocked");
         assert_eq!(s.sections.len(), 1);
@@ -946,9 +1002,93 @@ mod tests {
             ..s
         });
         assert_eq!(q.header.as_deref(), Some("T2-api: question"));
-        assert!(
-            q.question.starts_with("T2-api\nT2-api · blocked") && q.question.contains("Where things stand: blocked")
+        assert!(q.question.starts_with("T2-api\nT2-api · blocked"), "{}", q.question);
+    }
+
+    #[test]
+    fn task_sections_say_done_next_and_needs_you() {
+        let b = board();
+        let no = |v: Value| check(&args(v), &b).unwrap_err();
+        let ok = json!({"kind": "done", "sections": [
+            {"task": "T2-api", "done": "The login fix is merged.", "next": "I deploy it.", "needs_you": ""},
+            {"task": "General", "body": "Nothing else is running."}
+        ]});
+        assert_eq!(check(&args(ok.clone()), &b), Ok(()));
+        let s = frame(&args(ok), &b, 0, "reply to you");
+        assert_eq!(
+            (
+                s.sections[0].done.as_str(),
+                s.sections[0].next.as_str(),
+                s.sections[0].needs_you.as_str()
+            ),
+            ("The login fix is merged.", "I deploy it.", "")
         );
+        for kind in ["update", "warning", "done", "note", "reply"] {
+            let e = no(json!({"kind": kind, "sections": [{"task": "T2-api", "next": "I wait."}]}));
+            assert!(e.contains("T2-api needs `done`"), "{e}");
+            let e = no(json!({"kind": kind, "sections": [{"task": "T2-api", "done": "Built."}]}));
+            assert!(e.contains("T2-api needs `next`"), "{e}");
+        }
+        let e =
+            no(json!({"kind": "update", "sections": [{"task": "T2-api", "status": "s", "done": "d", "next": "n"}]}));
+        assert!(
+            e.contains("`status` is gone") && e.contains("done, next, needs_you"),
+            "{e}"
+        );
+        let e = no(json!({"kind": "note", "sections": [{"task": "General"}]}));
+        assert!(e.contains("General needs `done` or `body`"), "{e}");
+    }
+
+    #[test]
+    fn a_message_is_at_most_60_words() {
+        let b = board();
+        let words = |n: usize| vec!["word"; n].join(" ");
+        let msg = |done: usize, body: usize| {
+            args(json!({"kind": "update", "sections": [
+                {"task": "T2-api", "done": words(done), "next": "I wait.", "needs_you": "Send it."},
+                {"task": "General", "body": words(body)}
+            ]}))
+        };
+        assert_eq!(check(&msg(30, 26), &b), Ok(()));
+        let e = check(&msg(30, 27), &b).unwrap_err();
+        assert!(e.contains("message: 61 words, at most 60"), "{e}");
+        // Questions keep their own per-field caps.
+        let mut q = question_args("T2-api");
+        q["sections"][0]["question"]["recommendation"] = json!(words(40));
+        assert_eq!(check(&args(q), &b), Ok(()));
+    }
+
+    #[test]
+    fn shas_process_ids_and_pids_need_the_detail_flag() {
+        let b = board();
+        let msg = |text: &str, detail: bool| {
+            args(json!({"kind": "update", "detail": detail, "sections": [
+                {"task": "T2-api", "done": "Merged.", "next": text}
+            ]}))
+        };
+        for bad in [
+            "Commit 3f9a2c1 landed.",
+            "See 0123456789abcdef0123456789abcdef01234567.",
+            "proc_12 still runs",
+            "Its PID is 4412.",
+            "killed (pid 4412)",
+        ] {
+            let e = check(&msg(bad, false), &b).unwrap_err();
+            assert!(e.contains("plain words") && e.contains("`detail: true`"), "{bad}: {e}");
+            assert_eq!(check(&msg(bad, true), &b), Ok(()), "{bad}");
+        }
+        for fine in [
+            "Deploy at 21:50 on 2026-11-07.",
+            "The decade-old cafe feed was added.",
+            "Ask about 1234567 rows.",
+            "The rapid process ended.",
+        ] {
+            assert_eq!(check(&msg(fine, false), &b), Ok(()), "{fine}");
+        }
+        // A question may cite a commit as evidence.
+        let mut q = question_args("T2-api");
+        q["sections"][0]["question"]["blockers"][0]["evidence"] = json!("Commit 3f9a2c1 fails.");
+        assert_eq!(check(&args(q), &b), Ok(()));
     }
 
     fn entry(kind: EntryKind) -> Entry {
@@ -1164,15 +1304,17 @@ mod tests {
         // Answered: off Needs you.
         assert!(t.sup.board.lock().unwrap().needs.is_empty());
         // A warning stays there until an update on its task.
-        t.execute(
-            json!({"kind":"warning","sections":[{"task":"T2-api","status":"s","body":"b"}]}),
-            &ctx,
-        )
-        .await;
+        let o = t
+            .execute(
+                json!({"kind":"warning","sections":[{"task":"T2-api","done":"d","next":"n","needs_you":"s"}]}),
+                &ctx,
+            )
+            .await;
+        assert!(!o.is_error, "{}", text(&o));
         assert_eq!(t.sup.board.lock().unwrap().needs.len(), 1);
         assert_eq!(t.sup.board.lock().unwrap().needs[0].status, "T2-api: s");
         t.execute(
-            json!({"kind":"update","sections":[{"task":"T2-api","status":"","body":"fixed"}]}),
+            json!({"kind":"update","sections":[{"task":"T2-api","done":"fixed","next":"review"}]}),
             &ctx,
         )
         .await;
@@ -1180,7 +1322,7 @@ mod tests {
         // A refusal is an error result.
         let o = t
             .execute(
-                json!({"kind":"warning","sections":[{"task":"General","status":"","body":"b"}]}),
+                json!({"kind":"warning","sections":[{"task":"T2-api","done":"d"}]}),
                 &ctx,
             )
             .await;
