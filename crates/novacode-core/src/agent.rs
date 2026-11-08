@@ -116,6 +116,9 @@ pub struct Agent {
     save_error: bool,
     /// Kept replies carry usage from before a compaction: estimate the context instead.
     usage_stale: bool,
+    /// The context size right after the last compaction: when that was still past the
+    /// threshold, auto-compaction waits until the context grows past it by [`COMPACT_REGROW_PCT`].
+    compacted_to: Option<u64>,
     /// Where file checkpoints go (L4.15); `None` = off.
     checkpoints: Option<crate::checkpoint::Repo>,
     /// The run's snapshot, taken while the model thinks; awaited before any tool runs.
@@ -282,6 +285,11 @@ struct ExtView {
 }
 
 /// What `/btw` may run: tools that can't change anything.
+/// After a compaction that left the context past the threshold (a prompt too big to
+/// compact away), auto-compaction waits until the context grew by this share of the
+/// window: compacting again could not shrink it and would rewrite the cache each call.
+const COMPACT_REGROW_PCT: u64 = 10;
+
 const SIDE_TOOLS: [&str; 4] = ["read", "grep", "find", "ls"];
 /// Tool rounds per side question before it must answer.
 const SIDE_ROUNDS: usize = 5;
@@ -456,6 +464,7 @@ impl Agent {
             compacted,
             save_error: false,
             usage_stale: compacted,
+            compacted_to: None,
             checkpoints: None,
             processes: None,
             deferred: Vec::new(),
@@ -770,7 +779,8 @@ impl Agent {
         let Some(task) = self.pending_cp.take() else { return };
         match task.await {
             Ok(Ok((tree, skipped))) => {
-                self.add(EntryKind::Checkpoint { tree, skipped });
+                let kind = crate::checkpoint::entry(&self.store.branch(), tree, skipped);
+                self.add(kind);
             }
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "checkpoint");
@@ -1016,7 +1026,7 @@ impl Agent {
     async fn after_settle(&mut self) {
         self.collect_notes(false).await;
         let Some(m) = self.memory.as_ref() else { return };
-        if self.context.is_none() && self.context_tokens() >= m.settings.compact_at {
+        if self.compact_due(m.settings.compact_at) {
             self.compact("the context reached the compaction threshold").await;
             return;
         }
@@ -1035,11 +1045,25 @@ impl Agent {
         } else {
             u64::MAX
         };
-        if self.context.is_none() && self.context_tokens() >= at {
+        if self.compact_due(at) {
             self.compact("the context reached the compaction threshold").await;
         } else {
             self.start_observer();
         }
+    }
+
+    /// Auto-compaction is due at threshold `at`, unless the last compaction already left
+    /// the context past `at` and it hasn't grown by [`COMPACT_REGROW_PCT`] of the window since.
+    fn compact_due(&self, at: u64) -> bool {
+        if self.context.is_some() {
+            return false;
+        }
+        let t = self.context_tokens();
+        let regrow = self.cfg.window_tokens * COMPACT_REGROW_PCT / 100;
+        t >= at
+            && self
+                .compacted_to
+                .is_none_or(|c| c < at || t >= c.saturating_add(regrow))
     }
 
     /// Start the observer once enough new conversation built up since its last notes.
@@ -1247,6 +1271,7 @@ impl Agent {
         // What plugins said at session start went with the compacted part.
         self.plugin_context("compact").await;
         let tokens_after = self.context_tokens();
+        self.compacted_to = Some(tokens_after);
         self.emit(AgentEvent::Compacted {
             tokens_before,
             tokens_after,

@@ -1164,6 +1164,58 @@ async fn long_run_compacts_between_model_calls() {
     }
 }
 
+/// L4.5 revision (novahome T19): a first prompt too big to compact away keeps the context
+/// over `compact_at` after compacting; the run compacts once, not after every tool call.
+#[tokio::test]
+async fn context_that_cannot_shrink_compacts_once() {
+    use novacode_core::memory::{Settings, Worker};
+    use novacode_core::session::EntryKind;
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let bash = |i: usize| {
+        let cmd = format!("echo out{i}; head -c 4000 /dev/zero | tr '\\0' x");
+        FauxReply::Message {
+            blocks: vec![call(&format!("b{i}"), "bash", json!({ "command": cmd }))],
+            stop: StopReason::ToolUse,
+            usage: Usage::default(),
+        }
+    };
+    let mut replies: Vec<FauxReply> = (0..12).map(bash).collect();
+    replies.push(FauxReply::text("done"));
+    let agent = Agent::new(
+        Arc::new(Faux::new(replies)),
+        novacode_tools::builtins(false),
+        Store::create(&Paths::new(home.path()), work.path(), false),
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_memory(
+        Worker {
+            adapter: Arc::new(Faux::new((0..200).map(notes_reply))),
+            provider: "faux".into(),
+            model: "small".into(),
+        },
+        Settings {
+            observe_after: 2000,
+            keep_recent: 2500,
+            compact_at: 7000,
+            chunk_tokens: 3000,
+            reflect_after: u64::MAX,
+            pool_target: u64::MAX,
+        },
+    );
+    // ~50k tokens: the split turn's prompt stays word for word in the summary.
+    let brief = format!("review this {}", "word ".repeat(40_000));
+    let (agent, _) = drive(agent, &[&brief]).await;
+    let n = agent
+        .store
+        .entries()
+        .iter()
+        .filter(|e| matches!(e.kind, EntryKind::Compaction { .. }))
+        .count();
+    assert_eq!(n, 1, "compactions");
+}
+
 /// L10.9 super health checks: a reply of exactly `OK` right after a marked wake is hidden
 /// from the windows (rolled back, no message event), left out of later requests with its
 /// wake, and reported to the builder's callback. Other `OK`s and other check replies stay.

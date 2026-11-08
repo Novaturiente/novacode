@@ -275,6 +275,40 @@ pub struct Rewound {
     pub skipped: Vec<String>,
 }
 
+/// The skipped list of the checkpoint at `path[i]`: its own, or when marked
+/// `skipped_same`, that of the last earlier checkpoint that lists one.
+pub fn skipped_at(path: &[&crate::session::Entry], i: usize) -> Vec<String> {
+    use crate::session::EntryKind;
+    path[..=i]
+        .iter()
+        .rev()
+        .find_map(|e| match &e.kind {
+            EntryKind::Checkpoint {
+                skipped,
+                skipped_same: false,
+                ..
+            } => Some(skipped.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The checkpoint entry to append after `path`: a skipped list equal to the
+/// previous checkpoint's is only marked, not repeated (one session had 849 × 68 KB).
+pub fn entry(path: &[&crate::session::Entry], tree: String, skipped: Vec<String>) -> crate::session::EntryKind {
+    use crate::session::EntryKind;
+    let prev = path
+        .iter()
+        .rposition(|e| matches!(e.kind, EntryKind::Checkpoint { .. }))
+        .map(|i| skipped_at(path, i));
+    let same = !skipped.is_empty() && prev.as_ref() == Some(&skipped);
+    EntryKind::Checkpoint {
+        tree,
+        skipped: if same { Vec::new() } else { skipped },
+        skipped_same: same,
+    }
+}
+
 /// Files back to how they were before `prompt` (an entry id on the branch).
 pub fn rewind(store: &crate::session::Store, repo: &Repo, prompt: &str) -> Result<Rewound, String> {
     use crate::session::EntryKind;
@@ -283,14 +317,15 @@ pub fn rewind(store: &crate::session::Store, repo: &Repo, prompt: &str) -> Resul
         .iter()
         .position(|e| e.id == prompt)
         .ok_or("that prompt isn't on this branch")?;
-    let (ci, tree, skipped) = path[i..]
+    let (ci, tree) = path[i..]
         .iter()
         .enumerate()
         .find_map(|(k, e)| match &e.kind {
-            EntryKind::Checkpoint { tree, skipped } => Some((i + k, tree.clone(), skipped.clone())),
+            EntryKind::Checkpoint { tree, .. } => Some((i + k, tree.clone())),
             _ => None,
         })
         .ok_or("no file checkpoint for that prompt")?;
+    let skipped = skipped_at(&path, ci);
     if !exists(repo, &tree) {
         return Err(
             "that checkpoint's snapshot is gone: git gc prunes unreferenced snapshots after about two weeks".into(),
@@ -405,6 +440,7 @@ mod tests {
             kind: crate::session::EntryKind::Checkpoint {
                 tree: tree.clone(),
                 skipped: vec![],
+                skipped_same: false,
             },
         };
         let sd = tempfile::tempdir().unwrap();
@@ -434,6 +470,58 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "two\n");
         assert!(root.join("new.txt").exists() && !root.join("notes.txt").exists());
         assert!(exists(&repo, &tree) && !exists(&repo, "0000000000000000000000000000000000000000"));
+    }
+
+    /// A checkpoint writes its skipped list only when it changed; rewind still lists it.
+    #[test]
+    fn skipped_list_is_written_only_when_it_changes() {
+        use crate::session::EntryKind;
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(root.join("big.bin"), vec![0u8; (MAX_UNTRACKED + 1) as usize]).unwrap();
+        let repo = resolve(root, root).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut store = crate::session::Store::create(&novacode_base::paths::Paths::new(home.path()), root, true);
+        let mut ids = Vec::new();
+        let mut lines = Vec::new();
+        for _ in 0..3 {
+            let (tree, skipped) = snapshot(&repo, &[]).unwrap();
+            let kind = entry(&store.branch(), tree, skipped);
+            lines.push(serde_json::to_string(&kind).unwrap());
+            ids.push(store.append(kind).unwrap());
+        }
+        // The first one lists it, in the old format; the repeats only mark it unchanged.
+        assert!(
+            lines[0].contains("big.bin") && !lines[0].contains("skipped_same"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            !lines[1].contains("big.bin") && !lines[2].contains("big.bin"),
+            "{}",
+            lines[1]
+        );
+        assert!(matches!(
+            &store.branch()[2].kind,
+            EntryKind::Checkpoint { skipped_same: true, .. }
+        ));
+        assert_eq!(rewind(&store, &repo, &ids[2]).unwrap().skipped, ["big.bin"]);
+        // The list changes: written again.
+        std::fs::remove_file(root.join("big.bin")).unwrap();
+        let (tree, skipped) = snapshot(&repo, &[]).unwrap();
+        let kind = entry(&store.branch(), tree, skipped);
+        assert!(matches!(&kind, EntryKind::Checkpoint { skipped, skipped_same: false, .. } if skipped.is_empty()));
+        let last = store.append(kind).unwrap();
+        assert!(rewind(&store, &repo, &last).unwrap().skipped.is_empty());
     }
 
     #[test]

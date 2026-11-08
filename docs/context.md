@@ -111,6 +111,8 @@ Compaction runs by itself in three cases:
 - In the middle of a turn, between two model calls, at the same `memory.compactAtTokens` threshold (at most 95% of the window). This is off when `compactAtTokens` is at or above the window.
 - When the provider rejects a request as too long: novacode compacts and retries once. If nothing can be compacted, you get "the context is too long and nothing could be compacted".
 
+Sometimes a compaction can't bring the context under the threshold, for example when the turn's prompt is very large (it is copied into the summary). Then the first two cases wait until the context has grown by 10% of the window past its size right after that compaction, instead of compacting again after every model call. `/compact` and the too-long retry still run.
+
 You can also run it by hand:
 
 ```

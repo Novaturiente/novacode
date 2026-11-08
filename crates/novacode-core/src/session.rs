@@ -115,6 +115,10 @@ pub enum EntryKind {
         /// Untracked files too big to snapshot.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         skipped: Vec<String>,
+        /// `skipped` is the same as the previous checkpoint's and left out (L4.15):
+        /// see [`checkpoint::skipped_at`](crate::checkpoint::skipped_at).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        skipped_same: bool,
     },
     /// Outside git: a file's content before novacode first changed it (`None` =
     /// it didn't exist), as a blob in the shadow store (L4.15). Not sent.
