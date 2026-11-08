@@ -1357,6 +1357,8 @@ mod tests {
             let mut s = Store::create(&paths, cwd, false);
             s.append(msg(first)).unwrap();
             s.append(reply("ok")).unwrap();
+            // Written now: a later write (on drop) would reset the age set below.
+            s.flush().unwrap();
             s
         };
         let age = |s: &Store, days: u64| {
