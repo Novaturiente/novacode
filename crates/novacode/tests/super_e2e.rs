@@ -145,6 +145,16 @@ fn run_file(home: &Path, session: &str) -> PathBuf {
     home.join("run").join(format!("{session}.json"))
 }
 
+/// A session's saved file, as text (wakes are saved there, not sent as message events).
+fn session_text(home: &Path, session: &str) -> String {
+    std::fs::read_dir(home.join("sessions"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .find_map(|d| std::fs::read_to_string(d.path().join(format!("{session}.jsonl"))).ok())
+        .unwrap_or_default()
+}
+
 /// L10.9 R10: super restarted without a window finds its task's process gone; the
 /// "Resume tasks" card waits until a window connects later, and answering it resumes the task.
 #[test]
@@ -387,6 +397,83 @@ fn stop_and_sigterm_end_super_waiting_on_a_card() {
     }
 }
 
+/// L10.9 (live: super's run waited 10.6 h on its own question): super's question card
+/// ends its turn without an answer, a later message runs super while the card is open, and
+/// the user's answer arrives as a wake.
+#[test]
+fn super_s_question_card_never_blocks_its_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let (home, root, scripts) = (base.join("home"), base.join("projects"), base.join("scripts"));
+    for d in [&home, &root, &scripts] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let settings = json!({"memory": {"enabled": false}, "notifications": {"enabled": false}});
+    std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
+    let question = json!({"kind": "question", "sections": [{"task": "General", "question": {
+        "requested": "A name.", "verified_result": "None chosen.",
+        "blockers": [{"issue": "Not applicable.", "evidence": "None.", "impact": "None."}],
+        "input_needed": "Your taste.", "recommendation": "Atlas.", "risk": "None.",
+        "unchanged": "Everything.", "decision": "Which name?"
+    }}], "choices": [{"label": "Atlas", "action": "answer"}, {"label": "Orion", "action": "answer"}]});
+    let lines: Vec<Value> = [tool("say", question), json!({})]
+        .into_iter()
+        .chain(tell("still here"))
+        .chain(tell("got the name"))
+        .collect();
+    script(&scripts, "super", &lines);
+    let sup = start_super(&home, &root, &scripts);
+    let _cleanup = Cleanup(home.clone(), sup.clone());
+    let run: Value = serde_json::from_str(&std::fs::read_to_string(run_file(&home, &sup)).unwrap()).unwrap();
+    let sock = UnixStream::connect(run["socket"].as_str().unwrap()).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut conn = BufReader::new(sock);
+    let send = |conn: &mut BufReader<UnixStream>, v: Value| {
+        conn.get_mut().write_all(format!("{v}\n").as_bytes()).unwrap();
+    };
+    send(&mut conn, json!({"id": "p1", "type": "prompt", "text": "name it"}));
+    let (mut ends, mut card) = (0, None::<Value>);
+    while ends < 3 {
+        let mut l = String::new();
+        conn.read_line(&mut l)
+            .unwrap_or_else(|e| panic!("{e} after {ends} turns; card open: {}", card.is_some()));
+        assert!(!l.is_empty(), "super closed the connection");
+        let m: Value = serde_json::from_str(&l).unwrap();
+        match m["type"].as_str() {
+            Some("ask") => card = Some(m),
+            Some("event") if m["event"]["type"] == "agent_end" => {
+                ends += 1;
+                match ends {
+                    // The question's turn ended with the card still open: another message runs super.
+                    1 => {
+                        assert!(card.is_some(), "no card");
+                        send(
+                            &mut conn,
+                            json!({"id": "p2", "type": "prompt", "text": "anything new?"}),
+                        );
+                    }
+                    // Now the user answers.
+                    2 => {
+                        let m = card.take().unwrap();
+                        let q = &m["questions"][0];
+                        send(
+                            &mut conn,
+                            json!({"type": "answer", "ask": m["id"], "replies": [{"question": q["question"], "chosen": ["Orion"]}]}),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    let woken = session_text(&home, &sup);
+    assert!(
+        woken.contains("The user answered General: Q: Which name? A: Orion"),
+        "the answer's wake: {woken}"
+    );
+}
+
 #[test]
 fn super_runs_a_write_task_through_review_merge_and_close() {
     let dir = tempfile::tempdir().unwrap();
@@ -426,6 +513,8 @@ fn super_runs_a_write_task_through_review_merge_and_close() {
         .chain(tell("waiting for the review"))
         // Wake: the review approved it.
         .chain([tool("task", json!({"action": "merge", "task": label}))])
+        .chain(tell("asked to merge"))
+        // Wake: the user answered the merge card; the merge started.
         .chain(tell("merging"))
         // Wake: T1 merged; code closes it (L10.9).
         .chain(tell("merged"))
@@ -503,13 +592,15 @@ fn super_runs_a_write_task_through_review_merge_and_close() {
     );
 
     // Super's turns, in order: the spawn, the wake on T1's done, the wake on the
-    // approval (merge), the wake on the merge (code closes the task).
+    // approval (merge: its card returns at once), the wake on the merge card's answer,
+    // the wake on the merge (code closes the task).
     let mut ends = 0;
     let mut relayed: Option<Value> = None;
+    let mut merge_card: Option<Value> = None;
     let mut cards = Vec::new();
     let mut said = String::new();
     let deadline = Instant::now() + Duration::from_secs(120);
-    while ends < 4 {
+    while ends < 5 {
         assert!(
             Instant::now() < deadline,
             "stuck after {ends} turns; cards {cards:?}; board {}",
@@ -525,7 +616,8 @@ fn super_runs_a_write_task_through_review_merge_and_close() {
                 let q = &m["questions"][0];
                 cards.push(format!("{} | {}", q["header"], q["question"]));
                 match q["header"].as_str() {
-                    Some(h) if h == format!("{label}: merge") => answer(&mut conn, &m, "Merge"),
+                    // Answered once super's merge turn ended without it (L10.9).
+                    Some(h) if h == format!("{label}: merge") => merge_card = Some(m.clone()),
                     Some(h) if h == format!("{label}: close") => answer(&mut conn, &m, "Close"),
                     _ if ends >= 1 => answer(&mut conn, &m, "note.txt"),
                     // The task's own question: answered once super's spawn turn ended.
@@ -543,7 +635,11 @@ fn super_runs_a_write_task_through_review_merge_and_close() {
                         }
                     }
                     2 => std::fs::write(&review_gate, "").unwrap(),
-                    3 => std::fs::write(&merge_gate, "").unwrap(),
+                    3 => {
+                        let m = merge_card.take().expect("the merge card is open after super's turn");
+                        answer(&mut conn, &m, "Merge");
+                    }
+                    4 => std::fs::write(&merge_gate, "").unwrap(),
                     _ => {}
                 }
             }
@@ -556,7 +652,12 @@ fn super_runs_a_write_task_through_review_merge_and_close() {
         cards.iter().any(|c| c.contains(&format!("[{label}] Which file name?"))),
         "{cards:?}"
     );
-    assert!(said.contains(&format!("{label} is merging")), "{said}");
+    // The merge card's answer and its outcome woke super.
+    let woken = session_text(&home, &sup);
+    assert!(
+        woken.contains(&format!("The user answered {label}: Q: ")) && woken.contains(&format!("{label} is merging")),
+        "{woken}"
+    );
     assert!(!cards.iter().any(|c| c.contains(": close")), "no close card: {cards:?}");
     // Super's messages are framed by code: the trigger of each run and the task's status.
     assert!(said.contains("\"trigger\":\"reply to you\""), "{said}");

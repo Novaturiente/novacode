@@ -7,6 +7,7 @@ pub mod board;
 pub mod context;
 pub mod entry;
 pub mod inbox;
+pub mod later;
 pub mod link;
 pub mod models;
 pub mod remind;
@@ -40,7 +41,7 @@ in plain language, distinguish verified facts from unknowns, and give a concrete
 `done` (what finished), `next` (what happens next and who does it), `needs_you` (the one thing the user must do; \
 leave it out when nothing), each one short sentence; questions use structured `question` context instead. Put \
 unrelated facts in a section with `task: General` (`body`), even when there are no tasks. Never mix one task's facts \
-into another section. Keep it to at most 60 words per message; code refuses longer. Write \
+into another section. Keep each section (General included) to at most 40 words; code refuses longer. Write \
 no commit SHAs, process ids, PIDs or test counts: say \"the fix is merged\", \"the tests pass\". \
 Set `detail: true` only when the user's latest message asked for those details. Kinds: `reply` answers the \
 user's message, `update` is task news, `question` needs their answer, `warning` is something wrong, `done` is \
@@ -65,7 +66,11 @@ Approval to plan is not permission to execute. After plan approval, prepare and 
 permission before execution. Keep scope/production changes behind their existing approval gates.
 - Before spawning a non-trivial task, show the user 1-5 checkable acceptance criteria, with the base branch: call \
 `task info` with the task's `folder` first and show what it says about the branch; a small, clear task starts at once. \
-When the user asks to see the criteria first, show them with `ask_user` and wait for the answer before you spawn.
+When the user asks to see the criteria first, show them with `ask_user` and spawn only after their answer arrives.
+- Your cards never block your run: a `say` question, `ask_user` and the cards code opens from `task` (merge, close, \
+scope, accept, model, trust) return at once with \"Asked the user\". The answer arrives later as a wake (\"The user \
+answered <task>: Q: ... A: ...\"), with the outcome of a `task` action. Don't wait or poll for it: drive the other \
+tasks, or end your turn.
 - A task is done only on proof. Read every report's checks critically (which commands ran, whether they cover the \
 change, whether the results support the claim) and ask the task for more proof when it is weak; never accept a \
 task's own word. Every write task is reviewed by a review task before it is ready.
@@ -503,7 +508,8 @@ mod tests {
             "Assume the user has not read the task sessions",
             "the complete picture, briefly",
             "`done` (what finished), `next` (what happens next and who does it), `needs_you`",
-            "at most 60 words per message",
+            "Keep each section (General included) to at most 40 words",
+            "Your cards never block your run",
             "no commit SHAs, process ids, PIDs or test counts",
             "Set `detail: true` only when the user's latest message asked for those details",
         ] {

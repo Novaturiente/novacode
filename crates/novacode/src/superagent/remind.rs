@@ -110,7 +110,7 @@ fn labelled(s: &str) -> (Option<String>, &str) {
 /// A card's task and its one decision: the label of a relayed card (`[T1-x] …`), else the
 /// header's `<label>: …` part, else the header; the decision is a `say` question's
 /// `Decision:` field, else the question's last paragraph; at most 15 words.
-fn describe(q: &Question) -> (String, String) {
+pub(super) fn describe(q: &Question) -> (String, String) {
     let (label, text) = labelled(&q.question);
     let header = q.header.as_deref().unwrap_or_default();
     let task = label

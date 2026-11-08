@@ -1569,13 +1569,9 @@ impl Ctx {
         }));
         all.push(Arc::new(novacode_tools::worktree::EnterWorktree(worktree_copy(s))));
         all.push(Arc::new(novacode_tools::worktree::ExitWorktree(asker.clone())));
-        if let Some(a) = asker.clone() {
-            let ask = novacode_tools::ask::AskUser(a);
-            // Super's questions are short points (L10.9); other sessions' `ask_user` is unchanged.
-            match is_super {
-                true => all.push(Arc::new(superagent::say::ShortAskUser(ask))),
-                false => all.push(Arc::new(ask)),
-            }
+        // Super's `ask_user` is its own (below); other sessions' is unchanged.
+        if let Some(a) = asker.clone().filter(|_| !is_super) {
+            all.push(Arc::new(novacode_tools::ask::AskUser(a)));
         }
         // Super's decision check (L10.9): the helper model and where its nudge goes.
         let mut decision_check: Option<(novacode_core::memory::Worker, Arc<dyn superagent::link::Inform>)> = None;
@@ -1654,6 +1650,13 @@ impl Ctx {
                 asker: asker.clone(),
                 trigger: say_trigger.clone(),
             }));
+            // Super's questions are short points and never block its run (L10.9).
+            if let Some(a) = asker.clone() {
+                all.push(Arc::new(superagent::say::ShortAskUser {
+                    ask: novacode_tools::ask::AskUser(a),
+                    sup: sup.clone(),
+                }));
+            }
             all.push(Arc::new(task::TaskTool(sup)));
         }
         all.push(Arc::new(novacode_tools::todo::Todo::new(

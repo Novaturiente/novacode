@@ -903,6 +903,16 @@ impl Links {
         self.inform.wake(text);
     }
 
+    /// One line for super's next wake.
+    pub(super) fn note(&self, text: String) {
+        self.inform.note(text);
+    }
+
+    /// Super's session is ending: a card closing now got no answer.
+    pub(super) fn closing(&self) -> bool {
+        self.inform.closing()
+    }
+
     /// One pass: inbox, holds, links of live tasks not linked yet, then the queue.
     async fn tick(&self) {
         let Some(sup) = self.sup.upgrade() else { return };
@@ -3381,6 +3391,111 @@ mod tests {
             fx.said().iter().any(|s| s.starts_with("wake:") && s.contains("8080"))
         })
         .await;
+    }
+
+    fn tool_ctx(dir: &std::path::Path) -> novacode_tools::ToolCtx {
+        novacode_tools::ToolCtx {
+            cwd: dir.to_path_buf(),
+            env: Arc::new(novacode_tools::LocalEnv),
+            cancel: Default::default(),
+            updates: None,
+            files: Default::default(),
+            session_id: "s".into(),
+            processes: None,
+            native_tools: false,
+            nested: None,
+            script: false,
+        }
+    }
+
+    /// The oldest open card gets `pick`.
+    async fn pick(fx: &Fx, pick: &str) {
+        fx.until("a card waits", |fx| !fx.asker.waiting.lock().unwrap().is_empty())
+            .await;
+        let tx = fx.asker.waiting.lock().unwrap().remove(0);
+        let _ = tx.send(Some(vec![Reply {
+            question: String::new(),
+            chosen: vec![pick.into()],
+            text: None,
+            preview: None,
+        }]));
+    }
+
+    fn text_of(o: &novacode_tools::ToolOutput) -> String {
+        match &o.content[0] {
+            Block::Text { text, .. } => text.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// L10.9 (live: super waited 10.6 h on a card): super's `say` question, its `ask_user`
+    /// and code's confirm cards from `task` return at once; the answer wakes super later.
+    #[tokio::test]
+    async fn super_s_cards_never_block_its_run() {
+        use novacode_tools::Tool;
+        let fx = fixture(5);
+        fx.task("T1-x", "faux/a", State::Blocked);
+        let ctx = tool_ctx(fx._tmp.path());
+        let soon = Duration::from_secs(5);
+        let say = super::super::say::SayTool {
+            sup: fx.sup.clone(),
+            asker: Some(fx.asker.clone()),
+            trigger: Default::default(),
+        };
+        let q = json!({"kind": "question", "sections": [{"task": "T1-x", "question": {
+            "requested": "r", "verified_result": "v",
+            "blockers": [{"issue": "i", "evidence": "e", "impact": "m"}],
+            "input_needed": "n", "recommendation": "w", "risk": "k", "unchanged": "u",
+            "decision": "Retry T1-x now?"
+        }}], "choices": [{"label": "Retry", "action": "execute"}, {"label": "Wait", "action": "answer"}]});
+        let o = tokio::time::timeout(soon, say.execute(q, &ctx))
+            .await
+            .expect("say waited for the answer");
+        assert!(text_of(&o).contains("the answer arrives as a wake"), "{}", text_of(&o));
+        assert_eq!(fx.sup.board.lock().unwrap().needs.len(), 1, "on Needs you while open");
+        pick(&fx, "Wait").await;
+        fx.until("say's answer wakes super", |fx| {
+            fx.said()
+                .contains(&"wake: The user answered T1-x: Q: Retry T1-x now? A: Wait".to_string())
+        })
+        .await;
+        assert!(fx.sup.board.lock().unwrap().needs.is_empty(), "answered: off Needs you");
+
+        let ask = super::super::say::ShortAskUser {
+            ask: novacode_tools::ask::AskUser(fx.asker.clone()),
+            sup: fx.sup.clone(),
+        };
+        let input =
+            json!({"questions": [{"question": "Which port?", "options": [{"label": "8080"}, {"label": "9090"}]}]});
+        let o = tokio::time::timeout(soon, ask.execute(input, &ctx))
+            .await
+            .expect("ask_user waited for the answer");
+        assert!(text_of(&o).contains("the answer arrives as a wake"), "{}", text_of(&o));
+        pick(&fx, "9090").await;
+        fx.until("ask_user's answer wakes super", |fx| {
+            fx.said()
+                .contains(&"wake: The user answered General: Q: Which port? A: 9090".to_string())
+        })
+        .await;
+
+        // Code's own card from `task close`: the outcome is applied when answered.
+        let task = super::super::task::TaskTool(fx.sup.clone());
+        let o = tokio::time::timeout(soon, task.execute(json!({"action": "close", "task": "T1-x"}), &ctx))
+            .await
+            .expect("task close waited for the answer");
+        assert!(text_of(&o).contains("the answer arrives as a wake"), "{}", text_of(&o));
+        assert_ne!(fx.state("T1-x"), State::Archived);
+        pick(&fx, "Close").await;
+        fx.until("closed, and super woken with it", |fx| {
+            fx.said()
+                .iter()
+                .any(|s| s.starts_with("wake: The user answered T1-x: Q: Close T1-x?") && s.contains("A: Close"))
+        })
+        .await;
+        assert_eq!(fx.state("T1-x"), State::Archived);
+        // A refusal before any card still comes back in the call.
+        let o = task.execute(json!({"action": "close", "task": "T9"}), &ctx).await;
+        assert!(o.is_error);
     }
 
     #[tokio::test]

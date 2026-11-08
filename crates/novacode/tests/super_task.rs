@@ -137,8 +137,11 @@ fn super_spawns_a_task_after_the_trust_card_and_stops_it() {
     let stop = json!({"name": "task", "args": {"action": "stop", "task": "T1-note"}});
     // Super's messages go through `say`; an empty reply ends its turn.
     let say = |t: &str| json!({"tools": [{"name": "say", "args": {"kind": "update", "sections": [{"task": "General", "body": t}]}}]});
+    // The trust card returns at once (L10.9): the answer and the started task arrive as a wake.
     let lines = [
         json!({"text": "spawning", "tools": [spawn]}),
+        say("asked"),
+        json!({}),
         say("spawned"),
         json!({}),
         json!({"text": "stopping", "tools": [stop]}),
@@ -164,9 +167,9 @@ fn super_spawns_a_task_after_the_trust_card_and_stops_it() {
 
     let mut c = Conn::open(&home, &sup);
     c.send(json!({"id": "p1", "type": "prompt", "text": "go"}));
-    let mut asked = false;
-    let mut results = String::new();
-    loop {
+    let mut card: Option<Value> = None;
+    let mut ends = 0;
+    while ends < 2 {
         let m = c.next();
         match m["type"].as_str() {
             Some("ask") => {
@@ -175,19 +178,33 @@ fn super_spawns_a_task_after_the_trust_card_and_stops_it() {
                 assert!(!app.join(".worktrees").exists());
                 let q = &m["questions"][0];
                 assert!(q["question"].as_str().unwrap().contains("branches from main"), "{q}");
-                c.send(json!({"type": "answer", "ask": m["id"], "replies": [
-                    {"question": q["question"], "chosen": ["Trust for this task only"]}
-                ]}));
-                asked = true;
+                card = Some(m);
             }
             Some("approve") => panic!("unexpected approval card: {m}"),
-            Some("event") if m["event"]["type"] == "message" => results.push_str(&m["event"].to_string()),
-            Some("event") if m["event"]["type"] == "agent_end" => break,
+            Some("event") if m["event"]["type"] == "agent_end" => {
+                ends += 1;
+                // Super's turn ended with the card open; the user answers now.
+                if ends == 1 {
+                    let m = card.take().expect("the trust card was shown");
+                    let q = &m["questions"][0];
+                    c.send(json!({"type": "answer", "ask": m["id"], "replies": [
+                        {"question": q["question"], "chosen": ["Trust for this task only"]}
+                    ]}));
+                }
+            }
             _ => {}
         }
     }
-    assert!(asked, "the trust card was shown");
-    assert!(results.contains("Started T1-note"), "{results}");
+    let woken = std::fs::read_dir(home.join("sessions"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .find_map(|d| std::fs::read_to_string(d.path().join(format!("{sup}.jsonl"))).ok())
+        .unwrap_or_default();
+    assert!(
+        woken.contains("The user answered T1-note: Q: ") && woken.contains("Started T1-note"),
+        "{woken}"
+    );
 
     let t = task(&home, "T1-note");
     assert_eq!(t["state"], "running", "{t}");

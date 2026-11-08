@@ -24,8 +24,10 @@ nothing for the user, reply with nothing.";
 /// marked `detail`, so the say checks never drop it (the full text stays in the session).
 pub fn plain_note(text: &str) -> Value {
     let words: Vec<&str> = text.split_whitespace().collect();
-    let body = match words.len() > 50 {
-        true => format!("{} … (cut; ask for the rest)", words[..50].join(" ")),
+    // The cut mark is 6 words: the note stays within the section limit.
+    let keep = SECTION_WORDS - 6;
+    let body = match words.len() > keep {
+        true => format!("{} … (cut; ask for the rest)", words[..keep].join(" ")),
         false => text.to_string(),
     };
     serde_json::json!({ "kind": "note", "detail": true, "sections": [{"task": "General", "body": body}] })
@@ -315,11 +317,17 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
                 .iter()
                 .flat_map(|s| [&s.done, &s.next, &s.needs_you, &s.body])
         };
-        let n: usize = texts().map(|t| t.split_whitespace().count()).sum();
-        if n > MESSAGE_WORDS {
-            return Err(format!(
-                "message: {n} words, at most {MESSAGE_WORDS}; keep the complete picture in fewer plain words"
-            ));
+        for s in &a.sections {
+            let n: usize = [&s.done, &s.next, &s.needs_you, &s.body]
+                .iter()
+                .map(|t| t.split_whitespace().count())
+                .sum();
+            if n > SECTION_WORDS {
+                return Err(format!(
+                    "{}: {n} words, at most {SECTION_WORDS} per task; keep the complete picture in fewer plain words",
+                    s.task
+                ));
+            }
         }
         if !a.detail
             && let Some(t) = texts().find_map(|t| technical(t))
@@ -332,8 +340,8 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
     Ok(())
 }
 
-/// A whole non-question message: at most this many words across its sections.
-const MESSAGE_WORDS: usize = 60;
+/// A non-question message: at most this many words in each task section (General included).
+const SECTION_WORDS: usize = 40;
 
 /// The first token in `text` that only a technical reader wants: a commit SHA (7-40
 /// lowercase hex chars with a digit and a letter), a `proc_<n>` id, or `PID`.
@@ -354,25 +362,28 @@ fn technical(text: &str) -> Option<&str> {
 /// words or an option description over 25. Other sessions keep the plain [`AskUser`].
 ///
 /// [`AskUser`]: novacode_tools::ask::AskUser
-pub struct ShortAskUser(pub novacode_tools::ask::AskUser);
+pub struct ShortAskUser {
+    pub ask: novacode_tools::ask::AskUser,
+    pub sup: Arc<Super>,
+}
 
 const OPTION_WORDS: usize = 25;
 
 impl Tool for ShortAskUser {
     fn name(&self) -> &str {
-        self.0.name()
+        self.ask.name()
     }
     fn description(&self) -> &str {
-        "Ask the user one or more structured questions when a decision is theirs or the request is ambiguous: each with 2–6 short choices (mark one recommended), an optional description and preview per choice, and `multi` for several picks. The user can always type their own answer. Group related questions into one call. Short points: each question text at most 40 words, each option description at most 25 words; longer is refused."
+        "Ask the user one or more structured questions when a decision is theirs or the request is ambiguous: each with 2–6 short choices (mark one recommended), an optional description and preview per choice, and `multi` for several picks. The user can always type their own answer. Group related questions into one call. Short points: each question text at most 40 words, each option description at most 25 words; longer is refused. It returns at once; the answer arrives later as a wake (\"The user answered ...\")."
     }
     fn schema(&self) -> Value {
-        self.0.schema()
+        self.ask.schema()
     }
     fn sequential(&self) -> bool {
-        self.0.sequential()
+        self.ask.sequential()
     }
     fn large_output(&self) -> bool {
-        self.0.large_output()
+        self.ask.large_output()
     }
     fn execute<'a>(&'a self, args: Value, ctx: &'a ToolCtx) -> futures_util::future::BoxFuture<'a, ToolOutput> {
         // Bad arguments go on to the inner tool, which reports them.
@@ -392,7 +403,19 @@ impl Tool for ShortAskUser {
                 return Box::pin(async move { ToolOutput::error(e) });
             }
         }
-        self.0.execute(args, ctx)
+        if qs.is_empty() {
+            // Bad or empty arguments: the inner tool reports them.
+            return self.ask.execute(args, ctx);
+        }
+        // Never blocks super's run (L10.9): the answer arrives as a wake.
+        let (asker, sup) = (self.ask.0.clone(), self.sup.clone());
+        tokio::spawn(async move {
+            match asker.ask(qs.clone()).await {
+                Some(r) => super::later::wake(&sup, super::later::answered(&qs, &r)),
+                None => super::later::note(&sup, super::later::dismissed(&qs)),
+            }
+        });
+        Box::pin(async move { ToolOutput::text(super::later::ASKED) })
     }
 }
 
@@ -513,8 +536,9 @@ impl Tool for SayTool {
     fn description(&self) -> &str {
         "Send the user a message: your only channel to them. Code shows it as a block with its kind, the time, what \
 started this run and a board status line for each task you name. A question with `choices` opens a card and \
-returns the user's answer. Other kinds say per task `done`, `next` and `needs_you` in plain words, at most 60 words \
-per message. A question is short points: each question field and each blocker's issue, evidence and \
+returns at once; the user's answer arrives later as a wake (\"The user answered ...\"), so never wait for it. Other \
+kinds say per task `done`, `next` and `needs_you` in plain words, at most 40 words per task section (General \
+included). A question is short points: each question field and each blocker's issue, evidence and \
 impact at most 40 words, at most 5 blockers; longer is refused."
     }
     fn schema(&self) -> Value {
@@ -528,7 +552,7 @@ impact at most 40 words, at most 5 blockers; longer is refused."
                     "done": { "type": "string", "description": "Non-question kinds, required for a task: what finished, one short plain sentence." },
                     "next": { "type": "string", "description": "Non-question kinds, required for a task: what happens next and who does it (you, the task, the user)." },
                     "needs_you": { "type": "string", "description": "Non-question kinds: the one thing the user must do; leave out when nothing." },
-                    "body": { "type": "string", "description": "Non-question kinds, optional: a short Markdown extra; for General, the content when there is no task. All text of a message: at most 60 words." },
+                    "body": { "type": "string", "description": "Non-question kinds, optional: a short Markdown extra; for General, the content when there is no task. All text of one section: at most 40 words." },
                     "question": { "type": "object", "description": "Required only for question, in every section. Ask the worker for missing facts first. State unknowns explicitly, never invent evidence or impact. For General, truthful not-applicable explanations are valid. Each text field is one short point of at most 40 words, shown as a bullet under its heading.", "properties": {
                         "requested": { "type": "string", "minLength": 1, "description": "What the user requested, in plain language." },
                         "verified_result": { "type": "string", "minLength": 1, "description": "What is verified now, and what behaviour remains unproven. Do not treat deployment as proof that behaviour works." },
@@ -563,7 +587,7 @@ impact at most 40 words, at most 5 blockers; longer is refused."
     fn read_only(&self) -> bool {
         true
     }
-    fn execute<'a>(&'a self, args: Value, ctx: &'a ToolCtx) -> futures_util::future::BoxFuture<'a, ToolOutput> {
+    fn execute<'a>(&'a self, args: Value, _ctx: &'a ToolCtx) -> futures_util::future::BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
             let a: Args = match serde_json::from_value(args) {
                 Ok(a) => a,
@@ -573,7 +597,7 @@ impact at most 40 words, at most 5 blockers; longer is refused."
                 return ToolOutput::error(e);
             }
             let id = format!("say-{}", novacode_core::session::now_ms());
-            let mut say = self.frame(&a, novacode_core::session::now_ms());
+            let say = self.frame(&a, novacode_core::session::now_ms());
             let typed = a.kind == "question" && say.choices.is_empty();
             let note = |say: &Say| {
                 // A card's question is kept with its row: a restarted super opens it again.
@@ -603,29 +627,29 @@ impact at most 40 words, at most 5 blockers; longer is refused."
             note(&say);
             let mut text = "Shown to the user.".to_string();
             if a.kind == "question" && !say.choices.is_empty() {
-                // While the card is open, the window draws the framed block from this update.
-                ctx.update(serde_json::to_string(&json!({ "say": say })).unwrap_or_default());
-                match self.asker.as_ref() {
+                match self.asker.clone() {
                     None => text = "Shown to the user; no window can show its card, so ask again later.".into(),
-                    Some(asker) => match asker.ask(vec![card(&say)]).await {
-                        Some(r) => {
-                            let answer = novacode_tools::ask::render(&r);
-                            say.answer = Some(
-                                answer
-                                    .lines()
-                                    .filter_map(|l| l.strip_prefix("A: "))
-                                    .collect::<Vec<_>>()
-                                    .join("; "),
-                            );
-                            let _ = self.sup.edit(|b| b.drop_need(&id));
-                            text = format!("The user answered.\n{answer}");
-                        }
-                        None => {
-                            text = "The user closed the card without answering; it stays on their Needs you list. \
-Don't ask again at once."
-                                .into()
-                        }
-                    },
+                    // Never blocks super's run (L10.9): the answer arrives as a wake.
+                    Some(asker) => {
+                        let (q, sup, id) = (card(&say), self.sup.clone(), id.clone());
+                        tokio::spawn(async move {
+                            let qs = vec![q];
+                            match asker.ask(qs.clone()).await {
+                                Some(r) => {
+                                    let _ = sup.edit(|b| b.drop_need(&id));
+                                    super::later::wake(&sup, super::later::answered(&qs, &r));
+                                }
+                                None => super::later::note(
+                                    &sup,
+                                    format!(
+                                        "{}; it stays on their Needs you list. Don't ask again at once.",
+                                        super::later::dismissed(&qs)
+                                    ),
+                                ),
+                            }
+                        });
+                        text = super::later::ASKED.into();
+                    }
                 }
             }
             ToolOutput {
@@ -792,7 +816,11 @@ mod tests {
         };
         let asker = || Arc::new(Answer(Mutex::default(), Some("A")));
         let normal = novacode_tools::ask::AskUser(asker());
-        let short = ShortAskUser(novacode_tools::ask::AskUser(asker()));
+        let (said, _, _dir) = tool(None).await;
+        let short = ShortAskUser {
+            ask: novacode_tools::ask::AskUser(asker()),
+            sup: said.sup.clone(),
+        };
         assert_eq!(short.name(), "ask_user");
         assert!(short.description().contains("at most 40 words"));
         assert!(!short.execute(input(40, 25), &ctx).await.is_error);
@@ -1059,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn a_message_is_at_most_60_words() {
+    fn each_task_section_is_at_most_40_words() {
         let b = board();
         let words = |n: usize| vec!["word"; n].join(" ");
         let msg = |done: usize, body: usize| {
@@ -1068,9 +1096,12 @@ mod tests {
                 {"task": "General", "body": words(body)}
             ]}))
         };
-        assert_eq!(check(&msg(30, 26), &b), Ok(()));
-        let e = check(&msg(30, 27), &b).unwrap_err();
-        assert!(e.contains("message: 61 words, at most 60"), "{e}");
+        // 40 per section: 80 in the whole message is fine.
+        assert_eq!(check(&msg(36, 40), &b), Ok(()));
+        let e = check(&msg(37, 3), &b).unwrap_err();
+        assert!(e.contains("T2-api: 41 words, at most 40 per task"), "{e}");
+        let e = check(&msg(3, 41), &b).unwrap_err();
+        assert!(e.contains("General: 41 words, at most 40 per task"), "{e}");
         // Questions keep their own per-field caps.
         let mut q = question_args("T2-api");
         q["sections"][0]["question"]["recommendation"] = json!(words(40));
@@ -1307,21 +1338,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_question_with_choices_opens_a_card_and_returns_the_answer() {
+    async fn a_question_with_choices_opens_a_card_and_returns_at_once() {
         let (t, asker, d) = tool(Some("Wait")).await;
         let ctx = ctx(d.path());
         let mut input = question_args("T2-api");
         input["choices"] = json!([{"label": "Wait", "action": "answer"}, {"label": "Prepare a fix", "action": "plan"}]);
         let o = t.execute(input, &ctx).await;
         assert!(!o.is_error);
+        assert_eq!(text(&o), super::super::later::ASKED);
+        let say: Say = serde_json::from_value(o.details.unwrap()["say"].clone()).unwrap();
+        assert_eq!(say.trigger, "reply to you");
+        // Answered (off the run): off Needs you.
+        for _ in 0..200 {
+            if t.sup.board.lock().unwrap().needs.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(t.sup.board.lock().unwrap().needs.is_empty());
         let q = asker.0.lock().unwrap()[0].clone();
         assert_eq!(q.header.as_deref(), Some("T2-api: question"));
         assert_eq!(q.options.len(), 2);
-        let say: Say = serde_json::from_value(o.details.unwrap()["say"].clone()).unwrap();
-        assert_eq!(say.answer.as_deref(), Some("Wait"));
-        assert_eq!(say.trigger, "reply to you");
-        // Answered: off Needs you.
-        assert!(t.sup.board.lock().unwrap().needs.is_empty());
         // A warning stays there until an update on its task.
         let o = t
             .execute(
@@ -1394,11 +1431,8 @@ mod tests {
         let (t, _, d) = tool(None).await;
         let ctx = ctx(d.path());
         let o = t.execute(question_args("General"), &ctx).await;
-        let text = match &o.content[0] {
-            Block::Text { text, .. } => text.clone(),
-            _ => String::new(),
-        };
-        assert!(text.contains("closed the card"), "{text}");
+        assert_eq!(text(&o), super::super::later::ASKED);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let saved = Board::load(&t.sup.dir).unwrap();
         assert_eq!(saved.needs.len(), 1);
         assert!(saved.needs[0].status.starts_with("General: Deployment succeeded"));
