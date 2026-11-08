@@ -2,6 +2,23 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.8.7] - 2026-11-08
+
+### Added
+
+- **Super works in parallel**: task briefs use the project's changed-only check and keep the full suite for integration; `task merge {tasks: [...]}` runs a merge train (one full check for several ready tasks, then all merge); each task process gets a CPU share (`CARGO_BUILD_JOBS`, `MAKEFLAGS`, `VITEST_MAX_*`, `NOVACODE_CPU_SHARE`).
+- **Task holds**: `task hold` / `task resume`. Super never asks about a task you paused; stall checks skip held tasks.
+
+### Changed
+
+- **Super's cards never block its run**: questions and confirm cards return at once and your answer arrives as a wake, so super keeps driving other tasks. One open card per task action.
+- Super's message limit is 40 words per task section instead of 60 per message.
+- No todo reminder and no `agent wait` in super; checkpoint temp files live under novacode's home instead of /tmp.
+
+### Fixed
+
+- The after-steps deploy limit also reads the task's request and criteria ("no push", "stop before push").
+
 ## [0.8.6] - 2026-11-08
 
 ### Fixed
