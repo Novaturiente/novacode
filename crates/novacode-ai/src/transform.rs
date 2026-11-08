@@ -6,7 +6,7 @@
 //! - Thinking from another provider or model is dropped; so is replay data.
 //! - Tool-call ids are rewritten when the target's id rules need it.
 //! - Every tool call gets a result (a stand-in if none was stored).
-//! - Images become a placeholder for text-only models.
+//! - Images become a placeholder for text-only models, and all but the newest few for every model.
 
 use novacode_types::{Block, Message, StopReason, ToolCall};
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,6 +24,10 @@ pub struct Target<'a> {
 /// Only a call novacode stopped during (crash, kill, power loss) has no stored result (L4.17).
 pub const NO_RESULT: &str = "No result: novacode stopped while this tool ran, so it may have partly run. Check its effects before running it again.";
 pub const IMAGE_OMITTED: &str = "(image omitted: model does not support images)";
+/// How many images (the newest, across the request) are sent; each older one
+/// is re-sent with every request otherwise (L5).
+pub const KEEP_IMAGES: usize = 4;
+pub const OLD_IMAGE: &str = "[older image omitted to save context; read the file again to see it]";
 
 pub fn for_target(messages: &[Message], t: &Target) -> Vec<Message> {
     let mut ids: BTreeMap<String, String> = BTreeMap::new();
@@ -131,7 +135,38 @@ pub fn for_target(messages: &[Message], t: &Target) -> Vec<Message> {
         }
     }
     close(&mut out, &mut pending, &mut answered, &mut held);
+    drop_old_images(&mut out);
     out
+}
+
+/// Only the newest [`KEEP_IMAGES`] images are sent. The cut moves only when
+/// a new image arrives, so the cached prefix changes once per image.
+fn drop_old_images(out: &mut [Message]) {
+    let contents = || {
+        out.iter().filter_map(|m| match m {
+            Message::User { content } | Message::ToolResult { content, .. } => Some(content),
+            _ => None,
+        })
+    };
+    let total = contents()
+        .flatten()
+        .filter(|b| matches!(b, Block::Image { .. }))
+        .count();
+    let mut old = total.saturating_sub(KEEP_IMAGES);
+    for m in out.iter_mut() {
+        if old == 0 {
+            return;
+        }
+        let (Message::User { content } | Message::ToolResult { content, .. }) = m else {
+            continue;
+        };
+        for b in content.iter_mut() {
+            if old > 0 && matches!(b, Block::Image { .. }) {
+                *b = Block::text(OLD_IMAGE);
+                old -= 1;
+            }
+        }
+    }
 }
 
 fn images(content: &[Block], allowed: bool) -> Vec<Block> {
@@ -330,6 +365,42 @@ mod tests {
             normalize_id: Some(safe_id),
         };
         assert_eq!(for_target(&msgs, &t), msgs);
+    }
+
+    #[test]
+    fn only_the_newest_images_are_sent() {
+        let img = || Block::Image {
+            mime_type: "image/png".into(),
+            data: "AA".into(),
+        };
+        let mut msgs = vec![Message::User {
+            content: vec![Block::text("look"), img()],
+        }];
+        for i in 0..KEEP_IMAGES {
+            let id = format!("c{i}");
+            msgs.push(asst("openai", "gpt-5", StopReason::ToolUse, vec![call(&id)]));
+            msgs.push(result(&id));
+        }
+        let t = Target {
+            provider: "openai",
+            model: "gpt-5",
+            images: true,
+            normalize_id: None,
+        };
+        let out = for_target(&msgs, &t);
+        let Message::User { content } = &out[0] else { panic!() };
+        assert_eq!(content[1], Block::text(OLD_IMAGE), "the oldest image is replaced");
+        let kept: usize = out
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolResult { content, .. } => Some(content),
+                _ => None,
+            })
+            .flatten()
+            .filter(|b| matches!(b, Block::Image { .. }))
+            .count();
+        assert_eq!(kept, KEEP_IMAGES);
+        assert_eq!(&out[1..], &msgs[1..], "the newest images are untouched");
     }
 
     #[test]

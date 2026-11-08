@@ -27,7 +27,7 @@ impl Tool for Read {
         "read"
     }
     fn description(&self) -> &str {
-        "Read a file. Text output is cut at 2000 lines or 50KB; use offset/limit to page. Images are returned as images (converted and shrunk to fit when needed)."
+        "Read a file. Text output is cut at 2000 lines or 50KB; use offset/limit to page. Images are returned as images (converted and shrunk to fit when needed; only the newest few stay visible)."
     }
     fn schema(&self) -> Value {
         schema_for::<Args>()

@@ -59,7 +59,7 @@ Two limits protect the context window:
 | `offset` | First line, 1-based. |
 | `limit` | Max lines (capped at 2000). |
 
-Lines longer than 2000 characters are clipped with `… [line clipped at 2000 chars; use grep or bash \`cut -c\` to see the rest]`, since `offset` can't reach the rest of a line. Files over 64 MiB are refused before loading; use `grep`, or `sed -n 'a,bp' file` through `bash`. A read is also cut at 50 KB. When more is left, the result says which `offset` to continue with. An `offset` past the end is an error. Images come back as images, converted and shrunk to fit if needed. Binary files (a NUL byte near the start) are refused. A directory is an error: use `ls`.
+Lines longer than 2000 characters are clipped with `… [line clipped at 2000 chars; use grep or bash \`cut -c\` to see the rest]`, since `offset` can't reach the rest of a line. Files over 64 MiB are refused before loading; use `grep`, or `sed -n 'a,bp' file` through `bash`. A read is also cut at 50 KB. When more is left, the result says which `offset` to continue with. An `offset` past the end is an error. Images come back as images, converted and shrunk to fit if needed: the long side is at most 1568 px, and an opaque image such as a screenshot is sent as JPEG when that is under half the size of the PNG. Only the newest 4 images in the conversation are sent to the model; older ones are replaced by a short note in the request (the session file keeps them), so read the file again to see one. Binary files (a NUL byte near the start) are refused. A directory is an error: use `ls`.
 
 ### write
 
