@@ -2,6 +2,12 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.8.9] - 2026-11-08
+
+### Fixed
+
+- **Super's board no longer rewrites itself in full many times a minute** (one host saw 86 GB written in 21 hours). Token counts and health times are saved at most once a minute with other changes; review briefs over 2000 characters live in their own files; done facts keep at most 200 changed paths; archived rows keep only their label, state, short request and summary; board.json is compact JSON. Old boards load as before and shrink on their first save.
+
 ## [0.8.8] - 2026-11-08
 
 ### Changed
