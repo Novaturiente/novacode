@@ -212,6 +212,9 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
             a.kind
         ));
     }
+    if a.kind == "question" {
+        board.user_paused(a.sections.iter().map(|s| s.task.as_str()))?;
+    }
     if a.kind == "question" && a.choices.is_empty() && !a.exact_answer {
         return Err(
             "a question needs `choices`, or `exact_answer: true` when its decision asks for one exact answer (a name, a number, a path)"

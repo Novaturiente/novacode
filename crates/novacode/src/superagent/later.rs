@@ -99,6 +99,28 @@ impl Asker for Seen {
     }
 }
 
+/// The `task` calls (action and task) whose card is open now: a second call for the same one
+/// is refused until the first is answered, as a blocked run once made impossible.
+static OPEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The key of a `task` call: its action and task(s).
+pub fn key(args: &serde_json::Value) -> String {
+    format!("{} {} {}", args["action"], args["task"], args["tasks"])
+}
+
+fn claim(key: &str) -> bool {
+    let mut open = OPEN.lock().unwrap();
+    if open.iter().any(|k| k.as_str() == key) {
+        return false;
+    }
+    open.push(key.to_string());
+    true
+}
+
+fn release(key: &str) {
+    OPEN.lock().unwrap().retain(|k| k != key);
+}
+
 /// Aborts the work when the call is dropped before its card opened.
 struct Abort(Option<tokio::task::AbortHandle>);
 
@@ -115,8 +137,12 @@ impl Drop for Abort {
 /// goes on off super's run; when it ends, super is woken with the answer and the outcome.
 pub async fn detach(
     sup: &Arc<Super>,
+    key: String,
     work: impl Future<Output = Result<String, String>> + Send + 'static,
 ) -> Result<String, String> {
+    if OPEN.lock().unwrap().contains(&key) {
+        return Err("its card for this is open already; the answer arrives as a wake".into());
+    }
     let cards = Arc::new(Cards::default());
     let mut h = tokio::spawn(CARDS.scope(cards.clone(), work));
     let mut guard = Abort(Some(h.abort_handle()));
@@ -125,9 +151,13 @@ pub async fn detach(
         _ = cards.opened.notified() => {}
     }
     guard.0 = None;
+    let claimed = claim(&key);
     let sup = Arc::downgrade(sup);
     tokio::spawn(async move {
         let out = h.await.unwrap_or_else(|e| Err(format!("the task call ended: {e}")));
+        if claimed {
+            release(&key);
+        }
         let Some(sup) = sup.upgrade() else { return };
         let mut lines: Vec<String> = cards
             .asked

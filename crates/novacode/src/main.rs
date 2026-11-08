@@ -2033,6 +2033,8 @@ impl Ctx {
             if is_super {
                 let root = self.cwd.file_name().unwrap_or(self.cwd.as_os_str()).to_string_lossy();
                 agent = agent.with_fixed_name(format!("Super · {root}"));
+                // Its todo is the user's open requests, already in its state block (L10.9).
+                agent = agent.without_todo_notes();
                 let dir = superagent::entry::dir(self.paths.home(), &self.cwd);
                 agent = agent.with_compaction_guide_fn(Arc::new(superagent::compaction_guide(dir.clone())));
                 // Rebuilt every request: state block + newest chat in 6k tokens (L10.9).

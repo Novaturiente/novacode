@@ -217,6 +217,10 @@ struct Args {
     /// merge: a train of two or more ready tasks in one repo, in merge order.
     tasks: Vec<String>,
     note: Option<String>,
+    /// hold: why the task waits.
+    reason: Option<String>,
+    /// hold: the user paused it.
+    user: bool,
     all: bool,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -665,11 +669,26 @@ impl Super {
             return self.merge_train(&a.tasks, a.pr).await;
         }
         let t = self.shown(self.find(a.task.as_deref().ok_or("`task` is missing")?)?);
+        // A task the user paused hears nothing from super (L10.9).
+        if a.action == "send" && t.hold.as_ref().is_some_and(|h| h.user) {
+            return Err(super::board::paused(&t.label));
+        }
         let acts = matches!(
             a.action.as_str(),
-            "send" | "review" | "merge" | "accept" | "scope" | "note" | "close"
+            "send" | "review" | "merge" | "accept" | "scope" | "note" | "close" | "hold" | "resume"
         );
+        // Super's own hold ends when it sends the task work.
+        let work = a.action == "send" && !a.question;
         let out = self.act(&t, a).await;
+        if work && out.is_ok() {
+            let _ = self.edit(|b| {
+                if let Some(r) = b.tasks.iter_mut().find(|r| r.id == t.id)
+                    && r.hold.as_ref().is_some_and(|h| !h.user)
+                {
+                    r.hold = None;
+                }
+            });
+        }
         // Super's action on it (L10.9): a task with none for long is stalled.
         if acts && out.is_ok() {
             let _ = self.edit(|b| {
@@ -693,6 +712,8 @@ impl Super {
             "merge" => self.merge(&t, a.pr, false).await,
             "accept" => self.accept(&t).await,
             "note" => self.note(&t, a.note.as_deref().ok_or("`note` is missing")?).await,
+            "hold" => self.hold(&t, a.reason, a.user),
+            "resume" => self.resume(&t),
             "scope" => self.scope(&t, a.request, a.criteria, a.scope).await,
             "review" => {
                 self.check(&t.id, Event::Review)?;
@@ -1823,6 +1844,46 @@ impl Super {
         Ok(format!("Noted on {}'s charter.", t.label))
     }
 
+    /// `task hold` (L10.9): the user paused the task (`user`), or super keeps it waiting on
+    /// purpose; stall checks and health nags skip it.
+    fn hold(&self, t: &Task, reason: Option<String>, user: bool) -> Result<String, String> {
+        let reason = reason
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .ok_or("`reason` is missing: why the task waits")?;
+        if t.state == State::Archived {
+            return Err(format!("{} is closed", t.label));
+        }
+        let hold = super::board::Hold {
+            reason,
+            user,
+            at: super::board::now(),
+        };
+        let shown = self.edit(|b| {
+            let row = b.tasks.iter_mut().find(|r| r.id == t.id)?;
+            row.hold = Some(hold);
+            row.hold_text()
+        })?;
+        let ends = match user {
+            true => "only `task resume`, when the user asks, ends it; until then don't ask about it or message it",
+            false => "it ends when the task reports or you send it work",
+        };
+        Ok(format!(
+            "{} {}; stall checks skip it; {ends}.",
+            t.label,
+            shown.unwrap_or_default()
+        ))
+    }
+
+    /// `task resume`: ends a hold.
+    fn resume(&self, t: &Task) -> Result<String, String> {
+        let was = self.edit(|b| b.tasks.iter_mut().find(|r| r.id == t.id).and_then(|r| r.hold.take()))?;
+        match was {
+            Some(_) => Ok(format!("{} is no longer held; drive it to done.", t.label)),
+            None => Err(format!("{} is not held", t.label)),
+        }
+    }
+
     /// `task scope`: a new brief, criteria or scope, only on the user's OK on a card made by
     /// code; then the charter changes and the task is told (as work: its review starts over).
     async fn scope(
@@ -2824,14 +2885,14 @@ impl Tool for TaskTool {
         "task"
     }
     fn description(&self) -> &str {
-        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], after?[], replaces?, scope?[], skills?[], goal?} (`after`: steps that run only once the merge lands, such as deploy and live checks; never put them in criteria: the review judges only the criteria, then after the merge code sends the after steps to the task, which reports done with their proof; `replaces`: the task this one succeeds, which code closes without a card); info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task | tasks[], pr?} (each asks the user on a card, which returns at once: the answer and the outcome arrive as a wake; `tasks`: a merge train of two or more ready write tasks in one repo, in order, on one card; code itself closes a ready read task, and a write task once its merge landed and its after steps are done; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task with commits past its base, not merging or ready, ships without an approved review after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked because it kept ending without a report, or that reported `blocked`: code takes its commit and changed files from its worktree's HEAD when it has no `done`, refused when nothing is committed, and the review uses a round); note {task, note} (keeps a user decision about the task on its charter, which you see with every message); scope {task, request? | criteria? | scope?[]} (changes the brief, criteria or scope only after the user's OK on a card, which shows only what changes; scope is short points, at most 8 of at most 25 words each; code then updates the charter and tells the task); model {task | all, provider | model} (only when the user asks to switch models: each task moves to the matching tier on that provider, or to that model, after one card listing each task's old and new model; a task blocked by a provider limit is told to continue); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
+        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], after?[], replaces?, scope?[], skills?[], goal?} (`after`: steps that run only once the merge lands, such as deploy and live checks; never put them in criteria: the review judges only the criteria, then after the merge code sends the after steps to the task, which reports done with their proof; `replaces`: the task this one succeeds, which code closes without a card); info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task | tasks[], pr?} (each asks the user on a card, which returns at once: the answer and the outcome arrive as a wake; `tasks`: a merge train of two or more ready write tasks in one repo, in order, on one card; code itself closes a ready read task, and a write task once its merge landed and its after steps are done; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task with commits past its base, not merging or ready, ships without an approved review after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked because it kept ending without a report, or that reported `blocked`: code takes its commit and changed files from its worktree's HEAD when it has no `done`, refused when nothing is committed, and the review uses a round); note {task, note} (keeps a user decision about the task on its charter, which you see with every message); hold {task, reason, user?} (`user: true` when the user paused the task: you may not ask about it or message it until `resume`; false when you keep it waiting on purpose, which ends when it reports or you send it work; stall checks skip held tasks; a task blocked for another reason is not a hold); resume {task} (ends a hold; a user's hold only when the user asked); scope {task, request? | criteria? | scope?[]} (changes the brief, criteria or scope only after the user's OK on a card, which shows only what changes; scope is short points, at most 8 of at most 25 words each; code then updates the charter and tells the task); model {task | all, provider | model} (only when the user asks to switch models: each task moves to the matching tier on that provider, or to that model, after one card listing each task's old and new model; a task blocked by a provider limit is told to continue); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
     }
     fn schema(&self) -> Value {
         let s = |d: &str| json!({ "type": "string", "description": d });
         json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["spawn", "info", "send", "stop", "close", "accept", "merge", "review", "note", "scope", "model", "list", "read"] },
+                "action": { "type": "string", "enum": ["spawn", "info", "send", "stop", "close", "accept", "merge", "review", "note", "hold", "resume", "scope", "model", "list", "read"] },
                 "task": s("The task's label (T3-fix-parser) or T<n>; model: also `all`."),
                 "request": s("spawn: the user's words, as given. scope: the new brief."),
                 "folder": s("spawn and info: the project folder, inside your root (relative to it or absolute)."),
@@ -2852,6 +2913,8 @@ impl Tool for TaskTool {
                 "pr": { "type": "boolean", "description": "merge: open a pull request instead of merging locally; only when the user asked for a pull request." },
                 "tasks": { "type": "array", "items": { "type": "string" }, "description": "merge: instead of `task`, two or more ready write tasks in one repo, in merge order: a merge train (one card, one integration branch, one full check, one merge)." },
                 "note": s("review: what the review should look at. note: the user's decision to keep on the task's charter."),
+                "reason": s("hold: why the task waits, in a few words."),
+                "user": { "type": "boolean", "description": "hold: true when the user paused the task; false when you keep it waiting on purpose." },
                 "all": { "type": "boolean", "description": "list: archived tasks too." },
                 "offset": { "type": "integer", "description": "read: first line (0-based)." },
                 "limit": { "type": "integer", "description": "read: lines (default 200)." }
@@ -2868,7 +2931,8 @@ impl Tool for TaskTool {
     fn execute<'a>(&'a self, args: Value, _ctx: &'a ToolCtx) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
             let sup = self.0.clone();
-            match super::later::detach(&self.0, async move { sup.run(args).await }).await {
+            let key = super::later::key(&args);
+            match super::later::detach(&self.0, key, async move { sup.run(args).await }).await {
                 Ok(text) => ToolOutput::text(text),
                 Err(e) => ToolOutput::error(e),
             }
@@ -3963,6 +4027,56 @@ pub(super) mod tests {
             .await
             .unwrap_err();
         assert!(e.contains("not possible"), "{e}");
+    }
+
+    /// L10.9 holds: a user's hold refuses super's messages to the task until `resume`;
+    /// super's own hold clears when it sends the task work.
+    #[tokio::test]
+    async fn a_user_hold_refuses_sends_until_resumed_and_super_hold_clears_on_work() {
+        let fx = fixture(5, &[]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "t", false)).await.unwrap();
+        set_state(&fx, "T1-t", State::Blocked);
+        assert!(
+            run(&fx, json!({"action": "hold", "task": "T1-t"}))
+                .await
+                .unwrap_err()
+                .contains("reason")
+        );
+        let out = run(
+            &fx,
+            json!({"action": "hold", "task": "T1-t", "reason": "user is away", "user": true}),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("paused by you: user is away"), "{out}");
+        for q in [false, true] {
+            let e = run(
+                &fx,
+                json!({"action": "send", "task": "T1-t", "message": "go", "question": q}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(e, "the user paused T1-t; only the user resumes it");
+        }
+        assert!(fx.sup.row("T1-t").unwrap().hold.unwrap().user);
+        run(&fx, json!({"action": "resume", "task": "T1-t"})).await.unwrap();
+        assert_eq!(fx.sup.row("T1-t").unwrap().hold, None);
+        assert!(
+            run(&fx, json!({"action": "resume", "task": "T1-t"}))
+                .await
+                .unwrap_err()
+                .contains("not held")
+        );
+        // Super's own hold ends when it sends the task work.
+        run(&fx, json!({"action": "hold", "task": "T1-t", "reason": "waits for T2"}))
+            .await
+            .unwrap();
+        assert!(!fx.sup.row("T1-t").unwrap().hold.unwrap().user);
+        run(&fx, json!({"action": "send", "task": "T1-t", "message": "go on"}))
+            .await
+            .unwrap();
+        assert_eq!(fx.sup.row("T1-t").unwrap().hold, None);
     }
 
     /// L10.9 super's context: the charter holds the brief and criteria from spawn and the

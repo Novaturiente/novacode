@@ -1051,7 +1051,7 @@ impl Links {
             let b = sup.board.lock().unwrap();
             ids.iter()
                 .filter_map(|id| b.task(id))
-                .filter(|t| t.state != State::Archived && t.acted_at < at && t.updated < at)
+                .filter(|t| t.state != State::Archived && t.hold.is_none() && t.acted_at < at && t.updated < at)
                 .map(|t| b.name(t))
                 .collect()
         };
@@ -3485,6 +3485,13 @@ mod tests {
             .expect("task close waited for the answer");
         assert!(text_of(&o).contains("the answer arrives as a wake"), "{}", text_of(&o));
         assert_ne!(fx.state("T1-x"), State::Archived);
+        // The same call again while its card is open: refused, no second card.
+        let again = task.execute(json!({"action": "close", "task": "T1-x"}), &ctx).await;
+        assert!(
+            again.is_error && text_of(&again).contains("open already"),
+            "{}",
+            text_of(&again)
+        );
         pick(&fx, "Close").await;
         fx.until("closed, and super woken with it", |fx| {
             fx.said()

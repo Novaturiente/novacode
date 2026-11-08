@@ -3058,3 +3058,42 @@ async fn abort_dropping_queued_drops_a_steer_too() {
 async fn plain_abort_keeps_the_queued_prompt() {
     assert_eq!(runs_after_abort(false, false).await, 2);
 }
+
+/// An open todo list left alone for many replies is shown again (L5.12), but never in a
+/// session built `without_todo_notes` (super, L10.9).
+#[tokio::test]
+async fn todo_notes_come_back_unless_turned_off() {
+    async fn notes(off: bool) -> bool {
+        let work = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut replies = vec![
+            tools_reply(vec![call("c1", "todo", json!({"set": ["a", "b"], "start": 1}))]),
+            FauxReply::text("ok"),
+        ];
+        replies.extend((0..14).map(|_| FauxReply::text("r")));
+        let faux = Faux::new(replies);
+        let store = Store::create(&Paths::new(home.path()), work.path(), false);
+        let mut tools = novacode_tools::builtins(false);
+        tools.push(Arc::new(novacode_tools::todo::Todo::new(vec![])));
+        let mut agent = Agent::new(
+            Arc::new(faux.clone()),
+            tools,
+            store,
+            cfg(work.path(), home.path()),
+            Arc::new(LocalEnv),
+        );
+        if off {
+            agent = agent.without_todo_notes();
+        }
+        let prompts: Vec<String> = (0..15).map(|i| format!("p{i}")).collect();
+        let prompts: Vec<&str> = prompts.iter().map(String::as_str).collect();
+        drive(agent, &prompts).await;
+        let reqs = faux.requests.lock().unwrap().clone();
+        assert!(reqs.len() >= 15, "{}", reqs.len());
+        reqs.iter().any(|r| {
+            r.messages.iter().any(|m| matches!(m, Message::User { content } if content.iter().any(|b| matches!(b, Block::Text { text, .. } if text.contains("todo list was last updated")))))
+        })
+    }
+    assert!(notes(false).await, "the note comes back by default");
+    assert!(!notes(true).await, "no note when turned off");
+}

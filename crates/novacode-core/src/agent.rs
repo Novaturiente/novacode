@@ -141,6 +141,8 @@ pub struct Agent {
     context: Option<crate::context_window::Builder>,
     /// Super's root-based name, never replaced by manual or automatic naming.
     fixed_name: Option<String>,
+    /// Show a stale open todo list again (L5.12); off in super (L10.9).
+    todo_notes: bool,
 }
 
 struct Plugins {
@@ -464,6 +466,7 @@ impl Agent {
             plugins: None,
             context: None,
             fixed_name: None,
+            todo_notes: true,
             pending_cp: None,
             cwd_gone: false,
         };
@@ -849,6 +852,12 @@ impl Agent {
             });
         }
         self.fixed_name = Some(name);
+        self
+    }
+
+    /// No stale-todo notes (super, L10.9: its todo holds the user's open requests, shown in its state block).
+    pub fn without_todo_notes(mut self) -> Self {
+        self.todo_notes = false;
         self
     }
 
@@ -1778,7 +1787,8 @@ impl Agent {
             }
             self.flush_ext_state();
             // An open todo list the model stopped updating (L5.12): show it again.
-            if let Some((items, ago)) = self.store.todo()
+            if self.todo_notes
+                && let Some((items, ago)) = self.store.todo()
                 && ago >= novacode_tools::todo::STALE_AFTER
                 && self.store.todo_notes() < novacode_tools::todo::MAX_STALE_NOTES
                 && items.iter().any(|i| {

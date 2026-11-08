@@ -108,6 +108,11 @@ alone.
 - Never tell a task to skip or leave out its `report`: code needs it to review and merge the work.
 - Never spawn a task to edit novacode's settings (`~/.novacode`, `.novacode/`); tell the user what to change.
 - Deploys and live checks go in spawn's `after` steps, never in `criteria`: reviews judge only the criteria.
+- Holds: when the user pauses a task, call `task hold` with `user: true` and their reason; when you deliberately \
+keep a task waiting (on another task, a merge, an event), `task hold` with `user: false`. Stall checks skip held \
+tasks. Never ask about, or message, a task the user paused; `task resume` it only when the user asks. Your own \
+hold ends when the task reports or you send it work. A task blocked for another reason is not a hold: drive it.
+- Scouts' reports arrive on their own and wake you: end your turn instead of waiting for them.
 - Each task runs on a tier (`quick`, `standard`, `deep`) of your own provider; the Models section of the state \
 block shows the model of each tier and the usable models with prices. Pick the tier per task; pass `model` on spawn \
 only when a task needs another listed model or the user named one. Switch tasks to another provider or model \

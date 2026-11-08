@@ -363,6 +363,23 @@ pub struct Train {
     pub tasks: Vec<String>,
 }
 
+/// The refusal of super's question or message about a task the user paused.
+pub fn paused(name: &str) -> String {
+    format!("the user paused {name}; only the user resumes it")
+}
+
+/// A task held on purpose (L10.9 `task hold`): stall checks and health nags skip it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Hold {
+    pub reason: String,
+    /// The user paused it: super may not ask about it or message it; only `task resume`
+    /// (when the user asked) ends it. Else super's own hold, which ends when the task
+    /// reports or super sends it work.
+    pub user: bool,
+    /// Unix seconds.
+    pub at: u64,
+}
+
 /// One board row: only what super owns. Live data (busy, current model,
 /// tokens) comes from the task's run file and socket.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -483,6 +500,9 @@ pub struct Task {
     /// `task merge` needs no card.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub merge_approved: bool,
+    /// `task hold`: the user paused it, or super keeps it waiting on purpose (L10.9).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold: Option<Hold>,
     /// Unix seconds.
     pub started: u64,
     pub updated: u64,
@@ -612,10 +632,13 @@ impl Task {
         parts.join(" · ")
     }
 
-    /// The charter note (or scope) that holds back its after steps, such as "stop before
-    /// deploy": code then asks the user on a card before sending them.
+    /// The charter note, scope point, brief or criterion that holds back its after steps,
+    /// such as "stop before deploy" or "no push": code then asks the user on a card before
+    /// sending them.
     pub fn after_limit(&self) -> Option<&str> {
-        const LIMITS: [&str; 7] = [
+        const LIMITS: [&str; 9] = [
+            "no push",
+            "stop before push",
             "stop before",
             "before deploy",
             "don't deploy",
@@ -628,10 +651,20 @@ impl Task {
             .iter()
             .map(String::as_str)
             .chain(self.scope.iter().map(String::as_str))
+            .chain(std::iter::once(self.request.as_str()))
+            .chain(self.criteria.iter().map(String::as_str))
             .find(|n| {
                 let n = n.to_lowercase().replace('’', "'");
                 LIMITS.iter().any(|l| n.contains(l))
             })
+    }
+
+    /// `held: <reason>`, or `paused by you: <reason>` for the user's hold.
+    pub fn hold_text(&self) -> Option<String> {
+        self.hold.as_ref().map(|h| match h.user {
+            true => format!("paused by you: {}", h.reason),
+            false => format!("held: {}", h.reason),
+        })
     }
 
     /// Its last `done` is on the commit an approved review already covered.
@@ -1115,6 +1148,19 @@ impl Board {
     }
 
     /// The task labelled `label`, or shown as `label` ([`name`](Self::name)).
+    /// Refuses when one of `labels` names a task the user paused (L10.9): super may not
+    /// ask about it or message it; only the user resumes it.
+    pub fn user_paused<'a>(&self, labels: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+        match labels
+            .into_iter()
+            .filter_map(|l| self.by_label(l))
+            .find(|t| t.hold.as_ref().is_some_and(|h| h.user))
+        {
+            Some(t) => Err(paused(&self.name(t))),
+            None => Ok(()),
+        }
+    }
+
     pub fn by_label(&self, label: &str) -> Option<&Task> {
         self.tasks.iter().find(|t| t.label == label || self.name(t) == label)
     }
@@ -1178,7 +1224,7 @@ impl Board {
         };
         self.tasks
             .iter()
-            .filter(|t| t.kind == Kind::Work)
+            .filter(|t| t.kind == Kind::Work && t.hold.is_none())
             .filter(|t| match t.state {
                 State::Blocked | State::Stopped => true,
                 State::Ready => t.landed != Some(Landed::Merged),
@@ -1229,6 +1275,10 @@ impl Board {
 
         let t = &mut self.tasks[i];
         t.state = n.to;
+        // Super's own hold lasts until the task reports; the user's until they resume it.
+        if matches!(ev, Event::Report { .. }) && t.hold.as_ref().is_some_and(|h| !h.user) {
+            t.hold = None;
+        }
         // A report replaces a provisional block even when the state stays `blocked`.
         if n.from != n.to || matches!(ev, Event::Report { .. }) && n.block.is_some() {
             t.block = n.block.clone();
@@ -1406,10 +1456,14 @@ impl Board {
         }
         for t in &rows {
             let summary: String = t.summary.as_deref().unwrap_or("").chars().take(STATE_SUMMARY).collect();
+            let state = match t.hold_text() {
+                Some(h) => format!("{} · {h}", t.state_text()),
+                None => t.state_text(),
+            };
             s.push_str(&format!(
                 "| {} | {} | {} |\n",
                 cell(&self.name(t)),
-                cell(&t.state_text()),
+                cell(&state),
                 cell(&summary)
             ));
         }
@@ -1421,7 +1475,7 @@ impl Board {
         }
         let running: Vec<&&Task> = rows
             .iter()
-            .filter(|t| matches!(t.state, State::Running | State::WaitingYou))
+            .filter(|t| matches!(t.state, State::Running | State::WaitingYou) && t.hold.is_none())
             .collect();
         if !running.is_empty() {
             let now = now();
@@ -1702,6 +1756,68 @@ mod tests {
         assert!(t.notes.is_empty());
     }
 
+    /// L10.9 holds: a held task is not stalled and has no Health line; the state block
+    /// names the hold; a report or super's work clears super's hold, never the user's.
+    #[test]
+    fn held_tasks_are_not_stalled_and_the_state_block_names_the_hold() {
+        let now = 10_000;
+        let at = |id: &str, state: State| Task {
+            id: id.into(),
+            label: format!("{id}-x"),
+            kind: Kind::Work,
+            state,
+            updated: 1000,
+            ..Task::default()
+        };
+        let mut b = Board {
+            tasks: vec![
+                at("T1", State::Blocked),
+                at("T2", State::Stopped),
+                at("T3", State::Blocked),
+                at("T4", State::Running),
+            ],
+            ..Board::default()
+        };
+        b.tasks[0].hold = Some(Hold {
+            reason: "waits for T3's merge".into(),
+            user: false,
+            at: 1,
+        });
+        b.tasks[1].hold = Some(Hold {
+            reason: "user is away".into(),
+            user: true,
+            at: 1,
+        });
+        b.tasks[3].hold = Some(Hold {
+            reason: "later".into(),
+            user: false,
+            at: 1,
+        });
+        let ids: Vec<&str> = b.stalled(now, 900).into_iter().map(|(t, _)| t.id.as_str()).collect();
+        assert_eq!(ids, ["T3"]);
+        let s = b.state_block(&[]);
+        assert!(s.contains("| T1-x | blocked · held: waits for T3's merge |"), "{s}");
+        assert!(s.contains("| T2-x | stopped · paused by you: user is away |"), "{s}");
+        assert!(!s.contains("## Health"), "a held task gets no health line: {s}");
+        // Only the user resumes a task they paused.
+        assert!(b.user_paused(["T1-x", "General"]).is_ok());
+        assert_eq!(
+            b.user_paused(["T3-x", "T2-x"]).unwrap_err(),
+            "the user paused T2-x; only the user resumes it"
+        );
+        // A report clears super's hold, not the user's.
+        b.tasks[0].state = State::Running;
+        b.tasks[1].state = State::Running;
+        b.apply("T1", report(ReportState::Blocked)).unwrap();
+        assert_eq!(b.task("T1").unwrap().hold, None);
+        b.apply("T2", report(ReportState::Blocked)).unwrap();
+        assert!(b.task("T2").unwrap().hold.is_some());
+        // An old row has no hold, and none is saved.
+        let t: Task = serde_json::from_str(r#"{"id":"T1","label":"T1-x"}"#).unwrap();
+        assert_eq!(t.hold, None);
+        assert!(!serde_json::to_string(&t).unwrap().contains("hold"));
+    }
+
     fn report(state: ReportState) -> Event {
         Event::Report {
             state,
@@ -1866,6 +1982,15 @@ mod tests {
         assert!(t.after_limit().is_some());
         t.notes.clear();
         t.scope = vec!["src/ only".into(), "do not deploy".into()];
+        assert!(t.after_limit().is_some());
+        // The brief and criteria count too (novahome T2: "no push, no deploy").
+        t.scope.clear();
+        t.request = "Fix the parser; no push, no deploy.".into();
+        assert_eq!(t.after_limit(), Some("Fix the parser; no push, no deploy."));
+        t.request = "Fix the parser".into();
+        t.criteria = vec!["tests pass".into(), "stop before push".into()];
+        assert_eq!(t.after_limit(), Some("stop before push"));
+        t.criteria = vec!["no push to main".into()];
         assert!(t.after_limit().is_some());
     }
 
