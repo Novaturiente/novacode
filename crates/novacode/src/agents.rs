@@ -1690,7 +1690,13 @@ struct SpawnArgs {
 pub struct AgentTool {
     pub sup: Arc<Supervisor>,
     description: String,
+    /// Has `wait`; super's has none (L10.9): its reports arrive on their own and wake it.
+    waits: bool,
 }
+
+/// Super's answer to `agent wait`.
+const SUPER_NO_WAIT: &str =
+    "super has no `agent wait`: reports arrive on their own and wake you; end your turn instead";
 
 impl AgentTool {
     pub fn new(sup: Arc<Supervisor>) -> Self {
@@ -1729,13 +1735,20 @@ impl AgentTool {
                 "A subagent sees only its type's tools (in brackets below).".to_string(),
             )
         };
+        // Super (the only one with a root) never blocks on its scouts.
+        let waits = cfg.root.is_none();
+        let wait = match waits {
+            true => "wait {ids?, any?, timeout?} (blocks until reports arrive, default all, 600 s); ",
+            false => "",
+        };
         AgentTool {
+            waits,
             description: format!(
                 "Run subagents: separate novacode sessions that work in the background and report back.\n\
                  Actions: spawn {{task, title?, agent?, model?, cwd?, after?: [ids], notify?: wake|next|quiet, worktree?{pick}}} → id; \
                  list; status {{id}}; log {{id, limit?}}; read {{id, offset?, limit?}} (full report); \
                  send {{id, message}} (steers a running agent, resumes a finished one); \
-                 wait {{ids?, any?, timeout?}} (blocks until reports arrive, default all, 600 s); stop {{id}}.\n\
+                 {wait}stop {{id}}.\n\
                  Reports arrive by themselves (notify wake starts a turn); don't poll. \
                  A subagent's edit/write claims the file: other agents, you included, are refused on it (you claim none; bash isn't checked).\n{tools}\nAgents:\n{}",
                 agents.join("\n")
@@ -1753,10 +1766,14 @@ impl Tool for AgentTool {
         &self.description
     }
     fn schema(&self) -> Value {
+        let mut actions = vec!["spawn", "list", "status", "log", "read", "send", "wait", "stop"];
+        if !self.waits {
+            actions.retain(|a| *a != "wait");
+        }
         json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["spawn", "list", "status", "log", "read", "send", "wait", "stop"]},
+                "action": {"type": "string", "enum": actions},
                 "id": {"type": "string", "description": "Agent id (a1, a2…)."},
                 "ids": {"type": "array", "items": {"type": "string"}},
                 "task": {"type": "string", "description": "spawn: complete, self-contained instructions."},
@@ -1865,6 +1882,7 @@ impl Tool for AgentTool {
                         Err(e) => ToolOutput::error(e),
                     }
                 }
+                "wait" if !self.waits => ToolOutput::error(SUPER_NO_WAIT),
                 "wait" => {
                     let ids: Vec<String> = args["ids"]
                         .as_array()
@@ -2252,6 +2270,43 @@ mod tests {
         let out = sup.wait(vec![], false, Duration::from_secs(20)).await;
         assert_eq!(out.matches("exited before it finished").count(), 3, "{out}");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// L10.9: super's `agent` tool has no `wait`: reports arrive on their own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn super_has_no_agent_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            cwd: tmp.path().to_path_buf(),
+            env: Arc::new(novacode_tools::LocalEnv),
+            cancel: Default::default(),
+            updates: None,
+            files: Default::default(),
+            session_id: "s".into(),
+            processes: None,
+            native_tools: false,
+            nested: None,
+            script: false,
+        };
+        let normal = AgentTool::new(Supervisor::new(test_setup(tmp.path(), "/bin/false".into())));
+        assert!(
+            normal.schema()["properties"]["action"]["enum"]
+                .to_string()
+                .contains("wait")
+        );
+        let mut setup = test_setup(tmp.path(), "/bin/false".into());
+        setup.root = Some(tmp.path().to_path_buf());
+        let sup = AgentTool::new(Supervisor::new(setup));
+        assert!(
+            !sup.schema()["properties"]["action"]["enum"]
+                .to_string()
+                .contains("wait")
+        );
+        assert!(!sup.description().contains("wait {"), "{}", sup.description());
+        let out = sup.execute(json!({"action": "wait"}), &ctx).await;
+        let text = serde_json::to_string(&out.content).unwrap();
+        assert!(out.is_error && text.contains("reports arrive on their own"), "{text}");
     }
 
     #[cfg(unix)]

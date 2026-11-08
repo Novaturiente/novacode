@@ -1041,7 +1041,7 @@ impl Links {
             let b = sup.board.lock().unwrap();
             ids.iter()
                 .filter_map(|id| b.task(id))
-                .filter(|t| t.state != State::Archived && t.acted_at < at && t.updated < at)
+                .filter(|t| t.state != State::Archived && t.hold.is_none() && t.acted_at < at && t.updated < at)
                 .map(|t| b.name(t))
                 .collect()
         };

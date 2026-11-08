@@ -25,6 +25,9 @@ pub struct Repo {
     pub root: PathBuf,
     /// `Some` = shadow store outside git (pre-images only).
     pub shadow: Option<PathBuf>,
+    /// Where temporary index files go: `<home>/tmp/`, not the system temp folder
+    /// (a full /tmp failed every checkpoint).
+    pub tmp: PathBuf,
 }
 
 fn git(repo: &Repo, args: &[&str], index: Option<&Path>) -> Result<String, String> {
@@ -66,7 +69,11 @@ pub fn resolve(cwd: &Path, home: &Path) -> Option<Repo> {
         .filter(|o| o.status.success())
         .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
     if let Some(root) = top {
-        return Some(Repo { root, shadow: None });
+        return Some(Repo {
+            root,
+            shadow: None,
+            tmp: home.join("tmp"),
+        });
     }
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in cwd.as_os_str().as_encoded_bytes() {
@@ -86,21 +93,23 @@ pub fn resolve(cwd: &Path, home: &Path) -> Option<Repo> {
     Some(Repo {
         root: cwd.to_path_buf(),
         shadow: Some(dir),
+        tmp: home.join("tmp"),
     })
 }
 
-/// A temporary index file, removed on drop.
+/// A temporary index file under the repo's [`tmp`](Repo::tmp), removed on drop.
 struct TempIndex(PathBuf);
 
 impl TempIndex {
-    fn fresh() -> Self {
+    fn fresh(repo: &Repo) -> Self {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self(std::env::temp_dir().join(format!("novacode-index-{}-{n}", std::process::id())))
+        let _ = std::fs::create_dir_all(&repo.tmp);
+        Self(repo.tmp.join(format!("novacode-index-{}-{n}", std::process::id())))
     }
 
     fn new(repo: &Repo) -> Self {
-        let t = Self::fresh();
+        let t = Self::fresh(repo);
         let p = t.0.clone();
         // Seeding from the real index lets git reuse its stat cache instead of rehashing every file.
         if repo.shadow.is_none()
@@ -135,7 +144,18 @@ pub fn snapshot(repo: &Repo, paths: &[String]) -> Snapshot {
         }
     } else {
         git(repo, &["add", "-u"], i)?;
-        let out = git(repo, &["ls-files", "-z", "-o", "--exclude-standard"], i)?;
+        // Novacode's home may sit inside the repo (a dotfiles repo at `~`): skip its own temp indexes.
+        let out = git(
+            repo,
+            &[
+                "ls-files",
+                "-z",
+                "-o",
+                "--exclude-standard",
+                "--exclude=novacode-index-*",
+            ],
+            i,
+        )?;
         let mut small = Vec::new();
         for p in out.split('\0').filter(|p| !p.is_empty()) {
             match std::fs::metadata(repo.root.join(p)) {
@@ -189,7 +209,7 @@ pub fn pre_image(repo: &Repo, path: &str) -> Result<Option<String>, String> {
 
 /// `tree` with some paths set to a blob or removed (`None`).
 pub fn with_patches(repo: &Repo, tree: &str, patches: &[(String, Option<String>)]) -> Result<String, String> {
-    let idx = TempIndex::fresh();
+    let idx = TempIndex::fresh(repo);
     let i = Some(idx.0.as_path());
     git(repo, &["read-tree", tree], i)?;
     for (p, blob) in patches {
@@ -233,7 +253,7 @@ pub fn apply(repo: &Repo, target: &str, tracked: &[String]) -> Result<(String, u
         }
     }
     if !write.is_empty() {
-        let idx = TempIndex::fresh();
+        let idx = TempIndex::fresh(repo);
         let i = Some(idx.0.as_path());
         git(repo, &["read-tree", target], i)?;
         for batch in write.chunks(200) {
@@ -452,6 +472,35 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Temp index files live under novacode's home (`<home>/tmp/`, made when missing),
+    /// not in the system temp folder, and are removed after use.
+    #[test]
+    fn temp_indexes_live_under_the_home_and_are_removed() {
+        let d = tempfile::tempdir().unwrap();
+        let (home, root) = (d.path().join("h"), d.path().join("r"));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        let repo = resolve(&root, &home).unwrap();
+        let idx = TempIndex::new(&repo);
+        assert!(idx.0.starts_with(home.join("tmp")), "{}", idx.0.display());
+        assert!(home.join("tmp").is_dir());
+        let p = idx.0.clone();
+        std::fs::write(&p, "x").unwrap();
+        drop(idx);
+        assert!(!p.exists());
+        snapshot(&repo, &[]).unwrap();
+        assert_eq!(std::fs::read_dir(home.join("tmp")).unwrap().count(), 0);
     }
 
     #[test]
