@@ -852,9 +852,11 @@ impl Links {
             let (sup, asker, me) = (Arc::downgrade(sup), self.asker.clone(), self.me.clone());
             let t = tokio::spawn(async move {
                 let header = q.header.clone().unwrap_or_default();
-                let Some(r) = asker.ask(vec![q]).await else { return };
+                let qs = vec![q];
+                let Some(r) = asker.ask(qs.clone()).await else { return };
                 let Some(sup) = sup.upgrade() else { return };
                 let _ = sup.edit(|b| b.drop_need(&id));
+                super::later::keep_general(&sup, &qs, &r, false);
                 if let Some(me) = me.upgrade() {
                     me.inform.wake(format!(
                         "The user answered your question from before super's restart ({header}):\n{}",
@@ -3442,7 +3444,7 @@ mod tests {
             asker: Some(fx.asker.clone()),
             trigger: Default::default(),
         };
-        let q = json!({"kind": "question", "sections": [{"task": "T1-x", "question": {
+        let q = json!({"kind": "question", "gate": "unclear", "sections": [{"task": "T1-x", "question": {
             "requested": "r", "verified_result": "v",
             "blockers": [{"issue": "i", "evidence": "e", "impact": "m"}],
             "input_needed": "n", "recommendation": "w", "risk": "k", "unchanged": "u",
@@ -3465,8 +3467,7 @@ mod tests {
             ask: novacode_tools::ask::AskUser(fx.asker.clone()),
             sup: fx.sup.clone(),
         };
-        let input =
-            json!({"questions": [{"question": "Which port?", "options": [{"label": "8080"}, {"label": "9090"}]}]});
+        let input = json!({"gate": "unclear", "questions": [{"question": "Which port?", "options": [{"label": "8080"}, {"label": "9090"}]}]});
         let o = tokio::time::timeout(soon, ask.execute(input, &ctx))
             .await
             .expect("ask_user waited for the answer");

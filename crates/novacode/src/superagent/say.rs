@@ -13,6 +13,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
+/// What a question may ask about (L10.9 "Super asks only for gated steps").
+pub const GATES: [&str; 7] = ["merge", "deploy", "production", "delete", "cost", "scope", "unclear"];
+
 pub const KINDS: [&str; 6] = ["update", "question", "warning", "done", "note", "reply"];
 
 /// What the code's plain-text nudge starts with (one per run, then a note block).
@@ -127,6 +130,9 @@ struct Args {
     kind: String,
     #[serde(default)]
     priority: Option<String>,
+    /// A question's gate: one of [`GATES`].
+    #[serde(default)]
+    gate: Option<String>,
     sections: Vec<ArgSection>,
     #[serde(default)]
     choices: Vec<ArgChoice>,
@@ -149,6 +155,8 @@ struct ArgSection {
     next: String,
     #[serde(default)]
     needs_you: String,
+    #[serde(default)]
+    decided: Vec<String>,
     #[serde(default)]
     question: Option<SayQuestion>,
 }
@@ -173,6 +181,44 @@ fn words(field: &str, text: &str, max: usize) -> Result<(), String> {
         n if n > max => Err(format!("{field}: {n} words, at most {max}; write short points")),
         _ => Ok(()),
     }
+}
+
+/// `Err` unless `gate` names one of [`GATES`]: super decides everything else itself.
+fn gated(gate: Option<&str>) -> Result<(), String> {
+    match gate {
+        Some(g) if GATES.contains(&g) => Ok(()),
+        _ => Err(format!(
+            "decide it yourself and tell the user under 'Decided for you'; ask only for: {} \
+             (set `gate` to one of them)",
+            GATE_LIST
+        )),
+    }
+}
+
+/// The gates in plain words, as the refusal and the prompt name them.
+const GATE_LIST: &str = "merge, deploy (push included), production (production data or schema), delete, cost (money or legal), \
+scope (changing a task's scope or criteria), unclear (a request with no sensible default)";
+
+/// `s` as lowercase words, for comparing two decisions.
+fn norm(s: &str) -> String {
+    s.lines()
+        .next()
+        .unwrap_or_default()
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The decisions of the cards open on Needs you, normalized.
+fn open_decisions(board: &Board) -> Vec<String> {
+    board
+        .needs
+        .iter()
+        .filter_map(|n| n.card.as_ref())
+        .flat_map(|c| c.question.split("Decision:\n- ").skip(1).map(norm).collect::<Vec<_>>())
+        .collect()
 }
 
 /// The checks code makes on a `say` (each refusal goes back to the model).
@@ -206,6 +252,9 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
             }
         ));
     }
+    if a.kind != "question" && a.gate.is_some() {
+        return Err("only a question has a `gate`; send this without it".into());
+    }
     if a.kind != "question" && !a.choices.is_empty() {
         return Err(format!(
             "only a question has `choices`; send this {} without them, then the question as its own `say` with kind question",
@@ -230,6 +279,12 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
             if !s.status.trim().is_empty() || !s.body.trim().is_empty() {
                 return Err(format!(
                     "{}: question sections use structured question context, not status/body",
+                    s.task
+                ));
+            }
+            if !s.decided.is_empty() {
+                return Err(format!(
+                    "{}: `decided` belongs in an update or reply, not a question",
                     s.task
                 ));
             }
@@ -291,6 +346,18 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
                 "each question choice needs `action`: answer, plan (prepare only), or execute (make changes)".into(),
             );
         }
+        gated(a.gate.as_deref())?;
+        let open = open_decisions(board);
+        if let Some(s) = a
+            .sections
+            .iter()
+            .find(|s| s.question.as_ref().is_some_and(|q| open.contains(&norm(&q.decision))))
+        {
+            return Err(format!(
+                "{}: that question is open already; its card waits for the user's answer, so don't ask it again",
+                s.task
+            ));
+        }
     } else {
         if a.sections.iter().any(|s| s.question.is_some()) {
             return Err(
@@ -318,11 +385,12 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
         let texts = || {
             a.sections
                 .iter()
-                .flat_map(|s| [&s.done, &s.next, &s.needs_you, &s.body])
+                .flat_map(|s| [&s.done, &s.next, &s.needs_you, &s.body].into_iter().chain(&s.decided))
         };
         for s in &a.sections {
             let n: usize = [&s.done, &s.next, &s.needs_you, &s.body]
-                .iter()
+                .into_iter()
+                .chain(&s.decided)
                 .map(|t| t.split_whitespace().count())
                 .sum();
             if n > SECTION_WORDS {
@@ -342,6 +410,11 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// The `gate` field's help, in both tools' schemas.
+const GATE_HELP: &str = "Required for a question: what makes it the user's call. merge; deploy (push included); production \
+(production data or schema); delete; cost (money or legal); scope (changing a task's scope or criteria); unclear (a \
+request with no sensible default). Anything else: decide yourself and list it under `decided`.";
 
 /// A non-question message: at most this many words in each task section (General included).
 const SECTION_WORDS: usize = 40;
@@ -377,10 +450,17 @@ impl Tool for ShortAskUser {
         self.ask.name()
     }
     fn description(&self) -> &str {
-        "Ask the user one or more structured questions when a decision is theirs or the request is ambiguous: each with 2–6 short choices (mark one recommended), an optional description and preview per choice, and `multi` for several picks. The user can always type their own answer. Group related questions into one call. Short points: each question text at most 40 words, each option description at most 25 words; longer is refused. It returns at once; the answer arrives later as a wake (\"The user answered ...\")."
+        "Ask the user one or more structured questions, only for a gated step: `gate` names it (merge, deploy, production, delete, cost, scope or unclear); without one it is refused, so decide yourself and list it under `decided`. Each question has 2–6 short choices (mark one recommended), an optional description and preview per choice, and `multi` for several picks. The user can always type their own answer. Group related questions into one call. Short points: each question text at most 40 words, each option description at most 25 words; longer is refused. It returns at once; the answer arrives later as a wake (\"The user answered ...\"), and code keeps it on the General charter."
     }
     fn schema(&self) -> Value {
-        self.ask.schema()
+        let mut s = self.ask.schema();
+        s["properties"]["gate"] = json!({ "type": "string", "enum": GATES, "description": GATE_HELP });
+        if let Some(r) = s["required"].as_array_mut() {
+            r.push(json!("gate"));
+        } else {
+            s["required"] = json!(["gate"]);
+        }
+        s
     }
     fn sequential(&self) -> bool {
         self.ask.sequential()
@@ -389,6 +469,9 @@ impl Tool for ShortAskUser {
         self.ask.large_output()
     }
     fn execute<'a>(&'a self, args: Value, ctx: &'a ToolCtx) -> futures_util::future::BoxFuture<'a, ToolOutput> {
+        if let Err(e) = gated(args["gate"].as_str()) {
+            return Box::pin(async move { ToolOutput::error(e) });
+        }
         // Bad arguments go on to the inner tool, which reports them.
         let qs: Vec<Question> = serde_json::from_value(args["questions"].clone()).unwrap_or_default();
         for (i, q) in qs.iter().enumerate() {
@@ -414,7 +497,10 @@ impl Tool for ShortAskUser {
         let (asker, sup) = (self.ask.0.clone(), self.sup.clone());
         tokio::spawn(async move {
             match asker.ask(qs.clone()).await {
-                Some(r) => super::later::wake(&sup, super::later::answered(&qs, &r)),
+                Some(r) => {
+                    super::later::keep_general(&sup, &qs, &r, true);
+                    super::later::wake(&sup, super::later::answered(&qs, &r))
+                }
                 None => super::later::note(&sup, super::later::dismissed(&qs)),
             }
         });
@@ -455,6 +541,12 @@ fn frame(a: &Args, board: &Board, at_ms: u64, trigger: &str) -> Say {
                 done: s.done.trim().to_string(),
                 next: s.next.trim().to_string(),
                 needs_you: s.needs_you.trim().to_string(),
+                decided: s
+                    .decided
+                    .iter()
+                    .map(|d| d.trim().to_string())
+                    .filter(|d| !d.is_empty())
+                    .collect(),
                 question: s.question.clone(),
             })
             .collect(),
@@ -539,9 +631,12 @@ impl Tool for SayTool {
     fn description(&self) -> &str {
         "Send the user a message: your only channel to them. Code shows it as a block with its kind, the time, what \
 started this run and a board status line for each task you name. A question with `choices` opens a card and \
-returns at once; the user's answer arrives later as a wake (\"The user answered ...\"), so never wait for it. Other \
-kinds say per task `done`, `next` and `needs_you` in plain words, at most 40 words per task section (General \
-included). A question is short points: each question field and each blocker's issue, evidence and \
+returns at once; the user's answer arrives later as a wake (\"The user answered ...\"), so never wait for it; code \
+keeps a General answer on the General charter. Ask only for a gated step: a question names its `gate` (merge, \
+deploy, production, delete, cost, scope or unclear) and is refused without one, or when its decision is open on \
+a card already; decide anything else yourself and list it under `decided` in your next update or reply. Other \
+kinds say per task `done`, `next` and `needs_you` in plain words, plus optional `decided` points, at most 40 words \
+per task section (General included). A question is short points: each question field and each blocker's issue, evidence and \
 impact at most 40 words, at most 5 blockers; longer is refused."
     }
     fn schema(&self) -> Value {
@@ -550,11 +645,13 @@ impact at most 40 words, at most 5 blockers; longer is refused."
             "properties": {
                 "kind": { "type": "string", "enum": KINDS, "description": "update (task news), question (you need the user's answer), warning (something is wrong), done (work finished), note (an aside), reply (answer to the user's message)." },
                 "priority": { "type": "string", "enum": ["normal", "high"], "description": "high only when the user should look now. Default normal." },
+                "gate": { "type": "string", "enum": GATES, "description": GATE_HELP },
                 "sections": { "type": "array", "minItems": 1, "description": "One subsection per task, with only its facts. Use General for unrelated content. Do not repeat labels.", "items": { "type": "object", "properties": {
                     "task": { "type": "string", "description": "Exact board task label, or General." },
                     "done": { "type": "string", "description": "Non-question kinds, required for a task: what finished, one short plain sentence." },
                     "next": { "type": "string", "description": "Non-question kinds, required for a task: what happens next and who does it (you, the task, the user)." },
                     "needs_you": { "type": "string", "description": "Non-question kinds: the one thing the user must do; leave out when nothing." },
+                    "decided": { "type": "array", "items": { "type": "string" }, "description": "Non-question kinds: what you decided yourself instead of asking, short points the user can undo; shown as 'Decided for you'. Counted in the section's 40 words." },
                     "body": { "type": "string", "description": "Non-question kinds, optional: a short Markdown extra; for General, the content when there is no task. All text of one section: at most 40 words." },
                     "question": { "type": "object", "description": "Required only for question, in every section. Ask the worker for missing facts first. State unknowns explicitly, never invent evidence or impact. For General, truthful not-applicable explanations are valid. Each text field is one short point of at most 40 words, shown as a bullet under its heading.", "properties": {
                         "requested": { "type": "string", "minLength": 1, "description": "What the user requested, in plain language." },
@@ -640,6 +737,7 @@ impact at most 40 words, at most 5 blockers; longer is refused."
                             match asker.ask(qs.clone()).await {
                                 Some(r) => {
                                     let _ = sup.edit(|b| b.drop_need(&id));
+                                    super::later::keep_general(&sup, &qs, &r, false);
                                     super::later::wake(&sup, super::later::answered(&qs, &r));
                                 }
                                 None => super::later::note(
@@ -711,7 +809,7 @@ mod tests {
     }
 
     fn question_args(task: &str) -> Value {
-        json!({"kind": "question", "sections": [question_section(task)], "choices": [
+        json!({"kind": "question", "gate": "scope", "sections": [question_section(task)], "choices": [
             {"label": "Investigate", "action": "plan"}, {"label": "Keep blocked", "action": "answer"}
         ]})
     }
@@ -773,6 +871,119 @@ mod tests {
         }
     }
 
+    /// L10.9 "Super asks only for gated steps": a question names its gate, else super decides.
+    #[test]
+    fn a_question_names_its_gate_or_super_decides_itself() {
+        let b = board();
+        let mut v = question_args("T2-api");
+        v.as_object_mut().unwrap().remove("gate");
+        let e = check(&args(v.clone()), &b).unwrap_err();
+        assert!(
+            e.contains("decide it yourself and tell the user under 'Decided for you'; ask only for: merge"),
+            "{e}"
+        );
+        v["gate"] = json!("nice to know");
+        assert!(check(&args(v.clone()), &b).unwrap_err().contains("decide it yourself"));
+        for g in GATES {
+            v["gate"] = json!(g);
+            assert_eq!(check(&args(v.clone()), &b), Ok(()), "{g}");
+        }
+        // Other kinds carry no gate.
+        let e = check(
+            &args(
+                json!({"kind": "update", "gate": "merge", "sections": [{"task": "T2-api", "done": "d", "next": "n"}]}),
+            ),
+            &b,
+        )
+        .unwrap_err();
+        assert!(e.contains("only a question has a `gate`"), "{e}");
+    }
+
+    #[test]
+    fn decided_points_show_and_count_in_the_section_limit() {
+        let b = board();
+        let words = |n: usize| vec!["word"; n].join(" ");
+        let ok = args(json!({"kind": "update", "sections": [
+            {"task": "T2-api", "done": "Fixed.", "next": "Review.", "decided": ["Used port 8080", " "]}
+        ]}));
+        assert_eq!(check(&ok, &b), Ok(()));
+        let s = frame(&ok, &b, 0, "reply to you");
+        assert_eq!(s.sections[0].decided, ["Used port 8080"]);
+        let long = args(json!({"kind": "reply", "sections": [
+            {"task": "General", "body": words(30), "decided": [words(5), words(6)]}
+        ]}));
+        let e = check(&long, &b).unwrap_err();
+        assert!(e.contains("General: 41 words, at most 40"), "{e}");
+        let mut q = question_args("T2-api");
+        q["sections"][0]["decided"] = json!(["x"]);
+        assert!(check(&args(q), &b).unwrap_err().contains("`decided`"));
+    }
+
+    #[test]
+    fn a_question_open_already_is_refused() {
+        let mut b = board();
+        let a = args(question_args("T2-api"));
+        b.note_say("say-1", "question", &["T2-api".into()], "s", false);
+        b.needs[0].card = Some(card(&frame(&a, &b, 0, "reply to you")));
+        let mut v = question_args("General");
+        v["sections"][0]["question"]["decision"] =
+            json!("May I  prepare the investigation plan, without changing production");
+        let e = check(&args(v.clone()), &b).unwrap_err();
+        assert!(e.contains("that question is open already"), "{e}");
+        v["sections"][0]["question"]["decision"] = json!("May I deploy it?");
+        assert_eq!(check(&args(v), &b), Ok(()));
+    }
+
+    /// A General answer is kept by code on the board's General charter, so the next state
+    /// block carries it (it no longer falls out of super's rebuilt context).
+    #[tokio::test]
+    async fn a_general_answer_shows_in_the_next_state_block() {
+        let (t, _, d) = tool(Some("Investigate")).await;
+        let c = ctx(d.path());
+        assert!(!t.execute(question_args("General"), &c).await.is_error);
+        for _ in 0..200 {
+            if !t.sup.board.lock().unwrap().general.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let block = Board::load(&t.sup.dir).unwrap().state_block(&[]);
+        assert!(
+            block.contains("## General decisions\n- Q: May I prepare the investigation plan without changing production? A: Investigate"),
+            "{block}"
+        );
+        // A task's question is not General: it stays off.
+        let (t, _, d) = tool(Some("Wait")).await;
+        assert!(!t.execute(question_args("T2-api"), &ctx(d.path())).await.is_error);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(t.sup.board.lock().unwrap().general.is_empty());
+    }
+
+    #[tokio::test]
+    async fn super_s_ask_user_names_its_gate_and_its_answers_are_kept() {
+        let d = tempfile::tempdir().unwrap();
+        let ctx = ctx(d.path());
+        let (said, _, _dir) = tool(None).await;
+        let short = ShortAskUser {
+            ask: novacode_tools::ask::AskUser(Arc::new(Answer(Mutex::default(), Some("A")))),
+            sup: said.sup.clone(),
+        };
+        assert!(short.schema()["properties"]["gate"].is_object());
+        let input = json!({"questions": [{"question": "Which port?", "options": [{"label": "A"}, {"label": "B"}]}]});
+        let e = short.execute(input.clone(), &ctx).await;
+        assert!(e.is_error && text(&e).contains("decide it yourself"), "{}", text(&e));
+        let mut gated = input;
+        gated["gate"] = json!("unclear");
+        assert!(!short.execute(gated, &ctx).await.is_error);
+        for _ in 0..200 {
+            if !said.sup.board.lock().unwrap().general.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(said.sup.board.lock().unwrap().general, ["Q: Which port? A: A"]);
+    }
+
     #[test]
     fn question_fields_are_short_points() {
         let b = board();
@@ -813,7 +1024,7 @@ mod tests {
         let ctx = ctx(d.path());
         let words = |n: usize| vec!["word"; n].join(" ");
         let input = |q: usize, desc: usize| {
-            json!({"questions": [{"question": words(q), "options": [
+            json!({"gate": "unclear", "questions": [{"question": words(q), "options": [
                 {"label": "A", "description": words(desc)}, {"label": "B"}
             ]}]})
         };

@@ -850,6 +850,9 @@ pub struct SaySection {
     /// The one thing the user must do; empty when nothing.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub needs_you: String,
+    /// What super decided itself (L10.9), short points the user can undo.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub decided: Vec<String>,
     /// Required for new questions; absent in older persisted sections.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub question: Option<SayQuestion>,

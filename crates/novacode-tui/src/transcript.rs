@@ -1270,10 +1270,12 @@ pub fn lay_say(s: &novacode_types::Say, open: bool, width: usize, t: &Theme) -> 
                 )],
                 &mut lines,
             );
+            let decided = section.decided.join("; ");
             let plain = [
                 ("Done: ", &section.done),
                 ("Next: ", &section.next),
                 ("Needs you: ", &section.needs_you),
+                ("Decided for you: ", &decided),
             ];
             // Plain messages (Done / Next / Needs you) skip the board line; older ones keep it.
             let new = plain.iter().any(|(_, v)| !v.is_empty());
@@ -1848,7 +1850,8 @@ mod say_tests {
                 {"task": "T1-ui", "line": "T1-ui · ready", "done": "The login page is fixed.",
                  "next": "I merge it after review.", "needs_you": ""},
                 {"task": "T2-api", "line": "T2-api · blocked", "done": "Nothing new.",
-                 "next": "It waits for you.", "needs_you": "Send the database address."},
+                 "next": "It waits for you.", "needs_you": "Send the database address.",
+                 "decided": ["Used port 8080", "Kept the old schema"]},
                 {"task": "General", "body": "Nothing else runs."}
             ]
         }))
@@ -1865,6 +1868,7 @@ mod say_tests {
                 "│ Done: Nothing new.",
                 "│ Next: It waits for you.",
                 "│ Needs you: Send the database address.",
+                "│ Decided for you: Used port 8080; Kept the old schema",
                 "│ General",
                 "│ Nothing else runs.",
                 "╰─",

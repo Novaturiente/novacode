@@ -64,9 +64,17 @@ Each choice has `action`: `answer` for information/preference/no changes, `plan`
 `execute` to make the specified changes. Make the choice label and description say exactly what is allowed. \
 Approval to plan is not permission to execute. After plan approval, prepare and present it; obtain separate \
 permission before execution. Keep scope/production changes behind their existing approval gates.
-- Before spawning a non-trivial task, show the user 1-5 checkable acceptance criteria, with the base branch: call \
-`task info` with the task's `folder` first and show what it says about the branch; a small, clear task starts at once. \
-When the user asks to see the criteria first, show them with `ask_user` and spawn only after their answer arrives.
+- Ask the user only for a gated step, and name it in the question's `gate`: merge, deploy (push included), \
+production (production data or schema), delete, cost (money or legal), \
+scope (changing a task's scope or criteria), unclear (a request with no sensible default). Anything else: \
+pick your recommendation, act at once, and list it under `decided` in your next `update` or `reply` (shown as \
+\"Decided for you\"); the user can undo it. Code refuses a question without a gate, and one whose decision is \
+already open on a card.
+- A task starts at once: put its criteria and base branch in the start `update` (call \
+`task info` with the task's `folder` first for the branch); the user changes them later through `task scope`. \
+Only a task touching production data, schema or deploy gets a criteria card first: a `say` question with gate \
+`production` or `deploy`, and you spawn after its answer arrives. When the user asks to see the criteria first, \
+show them with a question (gate `scope`) and spawn only after their answer arrives.
 - Your cards never block your run: a `say` question, `ask_user` and the cards code opens from `task` (merge, close, \
 scope, accept, model, trust) return at once with \"Asked the user\". The answer arrives later as a wake (\"The user \
 answered <task>: Q: ... A: ...\"), with the outcome of a `task` action. Don't wait or poll for it: drive the other \
@@ -90,7 +98,7 @@ the same turn as the merge.
 and `task close` open their own confirmation cards, and those cards are the confirmation: never ask in text first. \
 Never use `ask_user` to confirm a merge or a close (not \"Merge them now?\", not \"Close T1?\"): the user would \
 confirm twice. When the user asked for it, or to offer it, call `task merge` / `task close` directly; the user \
-answers on its card. `ask_user` is for real choices only (which option, which approach, missing facts).
+answers on its card. `ask_user` is for real choices only (which option, which approach, missing facts), on a gated step.
 - Code closes finished tasks itself, without a card: a read task once it is ready (you saw its answer), a write \
 task once its merge landed and its after steps are done. Never offer to close those. When you spawn a successor \
 to a task (a retry, a recovery), pass `replaces: <task>`: code closes the old one. Close any other task you judge \
@@ -120,7 +128,9 @@ only when a task needs another listed model or the user named one. Switch tasks 
 - You see only the newest part of your chat; a state block written by code (the board, each task's charter, \
 the open requests) comes with every message, and is the truth. For older chat, use `history_search`.
 - No decision may live only in chat: record it when the user makes it. A decision about a task (an answer, a \
-limit such as \"stop before deploy\") goes on its charter with `task note`; a lasting preference goes to `memory`; \
+limit such as \"stop before deploy\") goes on its charter with `task note`; a General answer or decision goes on \
+the General charter (the state block's General decisions) with `task note` with task `General` (code keeps your \
+General card answers there itself), so you never ask it again; a lasting preference goes to `memory`; \
 a request that is not a task yet goes on `todo` (your open requests).
 - A change to a task's brief, criteria or scope goes through `task scope`: the user approves it on a card, then \
 code updates the charter and tells the task. A `task send` never changes the criteria. A scope is a list of \
@@ -133,7 +143,8 @@ may, without asking the user, send it instructions, stop it, resume it, or start
 `replaces`). A `Stalled` list in a check names tasks blocked, stopped or ready but not landed that you left \
 alone: `OK` is not an answer then; take a concrete action on each (a report alone is not enough). Never merge, \
 close, change scope or delete without the user's card. Always tell the user what you found and what you did. At the \
-slightest doubt about what is wrong or what to do, ask the user with a `say` question before acting.";
+slightest doubt about what is wrong or what to do, with no sensible default, ask the user with a `say` question \
+(gate `unclear`) before acting.";
 
 /// Follows the global `AGENTS.md`: what of it doesn't apply to super.
 const OVERRIDES: &str = "The instructions above were written for a coding session. Where a rule needs a tool you \
@@ -393,10 +404,33 @@ mod tests {
         assert!(link::HEALTH_CHECK == "[health check]");
     }
 
-    /// B9: super shows the base branch with the criteria, from `task info`.
+    /// B9: super shows the base branch with the criteria, from `task info`. L10.9: a task
+    /// starts at once with its criteria in the start update; only a gated task gets a card.
     #[test]
     fn criteria_are_shown_with_the_base_branch_from_task_info() {
-        assert!(PROMPT.contains("`task info` with the task's `folder`"), "{PROMPT}");
+        for rule in [
+            "`task info` with the task's `folder`",
+            "A task starts at once: put its criteria and base branch in the start `update`",
+            "Only a task touching production data, schema or deploy gets a criteria card first",
+        ] {
+            assert!(PROMPT.contains(rule), "{rule}");
+        }
+        assert!(!PROMPT.contains("Before spawning a non-trivial task, show the user"));
+    }
+
+    /// L10.9 "Super asks only for gated steps".
+    #[test]
+    fn super_asks_only_for_gated_steps_and_lists_what_it_decided() {
+        for rule in [
+            "Ask the user only for a gated step",
+            "merge, deploy (push included), production (production data or schema), delete, cost (money or legal), \
+scope (changing a task's scope or criteria), unclear",
+            "pick your recommendation, act at once, and list it under `decided`",
+            "the user can undo it",
+            "`task note` with task `General`",
+        ] {
+            assert!(PROMPT.contains(rule), "{rule}");
+        }
     }
 
     #[test]

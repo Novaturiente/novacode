@@ -25,6 +25,23 @@ pub fn answered(qs: &[Question], replies: &[Reply]) -> String {
     format!("The user answered {who}: {}", qa.join("; "))
 }
 
+/// Keep the user's answers on the board's General charter (L10.9), so super never asks
+/// them again: each General card's (`all`: every card's, as for super's `ask_user`).
+pub fn keep_general(sup: &Super, qs: &[Question], replies: &[Reply], all: bool) {
+    let notes: Vec<String> = qs
+        .iter()
+        .zip(replies)
+        .filter(|(q, _)| all || who(q) == "General")
+        .map(|(q, r)| format!("Q: {} A: {}", decision(q), answer(r)))
+        .collect();
+    if notes.is_empty() {
+        return;
+    }
+    if let Err(e) = sup.edit(|b| notes.into_iter().for_each(|n| b.note_general(n))) {
+        tracing::warn!(%e, "super: General answer not saved");
+    }
+}
+
 /// The line for a card closed without an answer.
 pub fn dismissed(qs: &[Question]) -> String {
     let who = qs.first().map(who).unwrap_or_else(|| "General".into());

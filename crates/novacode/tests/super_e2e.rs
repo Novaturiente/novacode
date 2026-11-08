@@ -352,7 +352,7 @@ fn stop_and_sigterm_end_super_waiting_on_a_card() {
         }
         let settings = json!({"memory": {"enabled": false}, "notifications": {"enabled": false}});
         std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
-        let ask = json!({"questions": [{"question": "Which one?", "options": [{"label": "a"}, {"label": "b"}]}]});
+        let ask = json!({"gate": "unclear", "questions": [{"question": "Which one?", "options": [{"label": "a"}, {"label": "b"}]}]});
         script(&scripts, "super", &[tool("ask_user", ask), say("answered")]);
         let sup = start_super(&home, &root, &scripts);
         let _cleanup = Cleanup(home.clone(), sup.clone());
@@ -410,7 +410,7 @@ fn super_s_question_card_never_blocks_its_run() {
     }
     let settings = json!({"memory": {"enabled": false}, "notifications": {"enabled": false}});
     std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
-    let question = json!({"kind": "question", "sections": [{"task": "General", "question": {
+    let question = json!({"kind": "question", "gate": "unclear", "sections": [{"task": "General", "question": {
         "requested": "A name.", "verified_result": "None chosen.",
         "blockers": [{"issue": "Not applicable.", "evidence": "None.", "impact": "None."}],
         "input_needed": "Your taste.", "recommendation": "Atlas.", "risk": "None.",

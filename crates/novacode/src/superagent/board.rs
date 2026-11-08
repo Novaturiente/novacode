@@ -1097,7 +1097,14 @@ pub struct Board {
     /// Open questions and warnings for the user (Needs you), oldest first.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub needs: Vec<Need>,
+    /// The General charter (L10.9): the user's answers to General questions and super's
+    /// `task note`s on General, written only by code, the newest [`GENERAL_KEPT`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub general: Vec<String>,
 }
+
+/// General charter points kept.
+pub const GENERAL_KEPT: usize = 30;
 
 fn is_default<T: Default + PartialEq>(t: &T) -> bool {
     *t == T::default()
@@ -1251,6 +1258,17 @@ impl Board {
     }
 
     /// Take `id` off Needs you (its card was answered, or the user dismissed it).
+    /// Keep `text` on the General charter, dropping the oldest past [`GENERAL_KEPT`].
+    pub fn note_general(&mut self, text: String) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        self.general.push(text.to_string());
+        let extra = self.general.len().saturating_sub(GENERAL_KEPT);
+        self.general.drain(..extra);
+    }
+
     pub fn drop_need(&mut self, id: &str) -> bool {
         let n = self.needs.len();
         self.needs.retain(|x| x.id != id);
@@ -1498,6 +1516,13 @@ impl Board {
         if !charters.is_empty() {
             s.push_str("\n## Charters\n");
             s.push_str(&charters.join("\n"));
+        }
+        // The General charter: answers to General questions, kept so super never asks again.
+        if !self.general.is_empty() {
+            s.push_str("\n## General decisions\n");
+            for g in &self.general {
+                s.push_str(&format!("- {}\n", cell(g)));
+            }
         }
         s.push_str("\n## Open requests\n");
         if open.is_empty() {
@@ -1754,6 +1779,30 @@ mod tests {
         // An old board without notes still loads.
         let t: Task = serde_json::from_str(r#"{"id":"T1","label":"T1-x"}"#).unwrap();
         assert!(t.notes.is_empty());
+    }
+
+    /// L10.9: General answers and notes stay on the board (newest kept) and in the state block.
+    #[test]
+    fn general_decisions_are_kept_newest_and_shown_in_the_state_block() {
+        let mut b = Board::default();
+        assert!(!b.state_block(&[]).contains("General decisions"));
+        for i in 0..GENERAL_KEPT + 2 {
+            b.note_general(format!("n{i}"));
+        }
+        b.note_general("  ".into());
+        assert_eq!(b.general.len(), GENERAL_KEPT);
+        assert_eq!(b.general[0], "n2");
+        let s = b.state_block(&[]);
+        assert!(s.contains("## General decisions\n- n2\n"), "{s}");
+        let saved: Board = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+        assert_eq!(saved.general, b.general);
+        // An old board without them still loads.
+        assert!(
+            serde_json::from_str::<Board>(r#"{"tasks":[],"merge_locks":{},"holds":{}}"#)
+                .unwrap()
+                .general
+                .is_empty()
+        );
     }
 
     /// L10.9 holds: a held task is not stalled and has no Health line; the state block
@@ -2789,6 +2838,7 @@ mod tests {
             holds: BTreeMap::from([("claude".to_string(), limit())]),
             last_check: None,
             needs: vec![],
+            general: vec![],
         };
         let want = "# Super board
 

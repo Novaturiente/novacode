@@ -668,6 +668,15 @@ impl Super {
         if a.action == "merge" && !a.tasks.is_empty() {
             return self.merge_train(&a.tasks, a.pr).await;
         }
+        // General's charter is the board's own (L10.9): no task row.
+        if a.action == "note" && a.task.as_deref() == Some("General") {
+            let text = a.note.as_deref().ok_or("`note` is missing")?.trim().to_string();
+            if text.is_empty() {
+                return Err("`note` is empty".into());
+            }
+            self.edit(|b| b.note_general(text))?;
+            return Ok("Noted on the General charter.".into());
+        }
         let t = self.shown(self.find(a.task.as_deref().ok_or("`task` is missing")?)?);
         // A task the user paused hears nothing from super (L10.9).
         if a.action == "send" && t.hold.as_ref().is_some_and(|h| h.user) {
@@ -2885,7 +2894,7 @@ impl Tool for TaskTool {
         "task"
     }
     fn description(&self) -> &str {
-        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], after?[], replaces?, scope?[], skills?[], goal?} (`after`: steps that run only once the merge lands, such as deploy and live checks; never put them in criteria: the review judges only the criteria, then after the merge code sends the after steps to the task, which reports done with their proof; `replaces`: the task this one succeeds, which code closes without a card); info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task | tasks[], pr?} (each asks the user on a card, which returns at once: the answer and the outcome arrive as a wake; `tasks`: a merge train of two or more ready write tasks in one repo, in order, on one card; code itself closes a ready read task, and a write task once its merge landed and its after steps are done; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task with commits past its base, not merging or ready, ships without an approved review after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked because it kept ending without a report, or that reported `blocked`: code takes its commit and changed files from its worktree's HEAD when it has no `done`, refused when nothing is committed, and the review uses a round); note {task, note} (keeps a user decision about the task on its charter, which you see with every message); hold {task, reason, user?} (`user: true` when the user paused the task: you may not ask about it or message it until `resume`; false when you keep it waiting on purpose, which ends when it reports or you send it work; stall checks skip held tasks; a task blocked for another reason is not a hold); resume {task} (ends a hold; a user's hold only when the user asked); scope {task, request? | criteria? | scope?[]} (changes the brief, criteria or scope only after the user's OK on a card, which shows only what changes; scope is short points, at most 8 of at most 25 words each; code then updates the charter and tells the task); model {task | all, provider | model} (only when the user asks to switch models: each task moves to the matching tier on that provider, or to that model, after one card listing each task's old and new model; a task blocked by a provider limit is told to continue); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
+        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], after?[], replaces?, scope?[], skills?[], goal?} (`after`: steps that run only once the merge lands, such as deploy and live checks; never put them in criteria: the review judges only the criteria, then after the merge code sends the after steps to the task, which reports done with their proof; `replaces`: the task this one succeeds, which code closes without a card); info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria in the task's start update); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task | tasks[], pr?} (each asks the user on a card, which returns at once: the answer and the outcome arrive as a wake; `tasks`: a merge train of two or more ready write tasks in one repo, in order, on one card; code itself closes a ready read task, and a write task once its merge landed and its after steps are done; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task with commits past its base, not merging or ready, ships without an approved review after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked because it kept ending without a report, or that reported `blocked`: code takes its commit and changed files from its worktree's HEAD when it has no `done`, refused when nothing is committed, and the review uses a round); note {task, note} (keeps a user decision about the task on its charter, which you see with every message; task `General` keeps it on the board's General charter); hold {task, reason, user?} (`user: true` when the user paused the task: you may not ask about it or message it until `resume`; false when you keep it waiting on purpose, which ends when it reports or you send it work; stall checks skip held tasks; a task blocked for another reason is not a hold); resume {task} (ends a hold; a user's hold only when the user asked); scope {task, request? | criteria? | scope?[]} (changes the brief, criteria or scope only after the user's OK on a card, which shows only what changes; scope is short points, at most 8 of at most 25 words each; code then updates the charter and tells the task); model {task | all, provider | model} (only when the user asks to switch models: each task moves to the matching tier on that provider, or to that model, after one card listing each task's old and new model; a task blocked by a provider limit is told to continue); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
     }
     fn schema(&self) -> Value {
         let s = |d: &str| json!({ "type": "string", "description": d });
@@ -2893,7 +2902,7 @@ impl Tool for TaskTool {
             "type": "object",
             "properties": {
                 "action": { "type": "string", "enum": ["spawn", "info", "send", "stop", "close", "accept", "merge", "review", "note", "hold", "resume", "scope", "model", "list", "read"] },
-                "task": s("The task's label (T3-fix-parser) or T<n>; model: also `all`."),
+                "task": s("The task's label (T3-fix-parser) or T<n>; model: also `all`; note: also `General`."),
                 "request": s("spawn: the user's words, as given. scope: the new brief."),
                 "folder": s("spawn and info: the project folder, inside your root (relative to it or absolute)."),
                 "slug": s("spawn: 1-4 words of a-z0-9 joined by -, at most 30 characters; the label becomes T<n>-<slug>."),
@@ -4096,6 +4105,15 @@ pub(super) mod tests {
         .unwrap();
         assert!(out.contains("Noted on T1-t's charter"), "{out}");
         assert_eq!(fx.sup.row("T1-t").unwrap().notes, ["stop before deploy"]);
+        // General: the board's own charter.
+        let out = run(
+            &fx,
+            json!({"action": "note", "task": "General", "note": "teachers mark by hand"}),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("Noted on the General charter"), "{out}");
+        assert_eq!(fx.sup.board.lock().unwrap().general, ["teachers mark by hand"]);
         assert!(run(&fx, json!({"action": "scope", "task": "T1-t"})).await.is_err());
         // Declined: nothing changes and the task hears nothing.
         let scope = json!({"action": "scope", "task": "T1-t", "criteria": ["it works", "it is fast"]});
