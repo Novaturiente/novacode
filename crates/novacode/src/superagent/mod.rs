@@ -248,11 +248,10 @@ pub fn feed_board(slot: crate::hub::HubSlot, sup: &std::sync::Arc<task::Super>, 
                     f.state.tokens.prompt_total() + f.state.tokens.output,
                 ))
             };
+            // Tokens change on every request: they stay in memory, saved at most once a minute.
+            sup.note_tokens(live);
             let rows = {
-                let mut b = sup.board.lock().unwrap();
-                if b.note_tokens(live) {
-                    let _ = b.save(&sup.dir);
-                }
+                let b = sup.board.lock().unwrap();
                 (b.snapshot(live), b.needs_rows())
             };
             if last.as_ref() != Some(&rows) {

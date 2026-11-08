@@ -136,7 +136,7 @@ The super agent can tell a task to use named skills.
 
 The super agent keeps a board of all tasks in its folder, `~/.novacode/super/<root-hash>/`:
 
-- `board.json`: the machine copy, written only by novacode.
+- `board.json`: the machine copy, written only by novacode. It is kept small because it is rewritten on every change: a review's brief longer than 2000 characters is kept whole in `briefs/<task id>.md` (removed once the review is archived) and the row keeps its start; a `done` row keeps the first 200 changed files and their count; an archived row keeps only its label, state, a short request and summary; task token counts and health facts are saved with the next change, or at most once a minute. An older, larger board shrinks on its first save.
 - `board.md`: a readable copy.
 - `board.json.bak`: the previous copy; a damaged `board.json` is restored from it.
 - `inbox/`: reports tasks write for the super agent to apply (bad or unknown ones go to `inbox/rejected/`; a file that can't be read or moved is skipped, not the whole inbox).

@@ -138,7 +138,13 @@ pub struct Super {
     pub hub: std::sync::OnceLock<crate::hub::HubSlot>,
     /// The cards open for the user, re-asked by the links' tick (L10.9).
     pub reminders: Arc<super::remind::Pending>,
+    /// When the board was last saved, and whether volatile facts (tokens, health) changed
+    /// since: those are saved with the next change, or by [`touch`](Self::touch) once a minute.
+    saved: Mutex<(Option<std::time::Instant>, bool)>,
 }
+
+/// The most often [`Super::touch`] writes the board.
+const VOLATILE_SAVE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A task or review waiting on `provider`'s quota: a blocked task (a merging one too) or a
 /// live review whose turn hit it, or a review queued on it that never started.
@@ -406,7 +412,7 @@ to your questions, notes in your brief), don't just obey: ask the user with `ask
 /// (made by [`Super::open_review`]) in `request`.
 fn brief(t: &Task) -> String {
     if t.kind == Kind::Review {
-        return t.request.clone();
+        return t.full_request();
     }
     let mut s = format!(
         "Task {}: {} ({} task).\n\nThe user's request:\n{}\n",
@@ -469,7 +475,9 @@ impl Super {
         launcher: Arc<dyn Launcher>,
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
-        let board = Board::load(&dir)?;
+        let mut board = Board::load(&dir)?;
+        // An old board shrinks on its first save.
+        board.compact(&dir);
         super::review::sweep_scratch(&dir, &board);
         // A restarted super pins its tasks' repos again (nested repos included).
         for main in board.tasks.iter().filter_map(|t| t.repo.as_deref()) {
@@ -489,6 +497,7 @@ impl Super {
             grounds: Mutex::default(),
             helper: std::sync::OnceLock::new(),
             reminders: Arc::default(),
+            saved: Mutex::default(),
         })
     }
 
@@ -550,8 +559,36 @@ impl Super {
     pub(super) fn edit<R>(&self, f: impl FnOnce(&mut Board) -> R) -> Result<R, String> {
         let mut b = self.board.lock().unwrap();
         let r = f(&mut b);
-        b.save(&self.dir).map_err(|e| format!("couldn't save the board: {e}"))?;
+        self.save(&mut b).map_err(|e| format!("couldn't save the board: {e}"))?;
         Ok(r)
+    }
+
+    /// Compact and save `b` (the locked board).
+    fn save(&self, b: &mut Board) -> std::io::Result<()> {
+        b.compact(&self.dir);
+        b.save(&self.dir)?;
+        *self.saved.lock().unwrap() = (Some(std::time::Instant::now()), false);
+        Ok(())
+    }
+
+    /// Change volatile facts (tokens, health) in memory; `f` returns whether any changed.
+    /// They are saved with the next real change, or here at most once a minute.
+    pub(super) fn touch(&self, f: impl FnOnce(&mut Board) -> bool) {
+        let mut b = self.board.lock().unwrap();
+        let changed = f(&mut b);
+        let due = {
+            let mut s = self.saved.lock().unwrap();
+            s.1 |= changed;
+            s.1 && s.0.is_none_or(|at| at.elapsed() >= VOLATILE_SAVE)
+        };
+        if due && let Err(e) = self.save(&mut b) {
+            tracing::warn!(%e, "super: couldn't save the board");
+        }
+    }
+
+    /// Note each task's tokens from its run file (`live(session)`) on its row ([`touch`](Self::touch)).
+    pub fn note_tokens(&self, live: impl Fn(&str) -> Option<(String, u64)>) {
+        self.touch(|b| b.note_tokens(live));
     }
 
     /// A health check found everything fine: its time goes on the board.
@@ -1324,7 +1361,7 @@ impl Super {
                 let mut b = self.board.lock().unwrap();
                 pick(&b, self.cfg.max_running).map(|id| {
                     b.apply(&id, Event::SlotFree)?;
-                    b.save(&self.dir).map_err(|e| format!("couldn't save the board: {e}"))?;
+                    self.save(&mut b).map_err(|e| format!("couldn't save the board: {e}"))?;
                     Ok::<_, String>(id)
                 })
             };
@@ -1575,7 +1612,7 @@ impl Super {
                 row.base_branch = base_branch;
                 row.base_commit = base_commit;
                 if let Some(d) = row.done.as_mut().filter(|_| !files.is_empty()) {
-                    d.files = files;
+                    d.set_files(files);
                 }
             }
         })
@@ -1657,7 +1694,7 @@ impl Super {
             row.flight = None;
         }
         if row.flight != before
-            && let Err(e) = b.save(&self.dir)
+            && let Err(e) = self.save(&mut b)
         {
             tracing::warn!(session, %e, "super: couldn't save the board");
         }
@@ -3308,6 +3345,32 @@ pub(super) mod tests {
             asker,
             log,
         }
+    }
+
+    /// Tokens change on every request: a token update alone doesn't write board.json;
+    /// the next real change saves it.
+    #[test]
+    fn a_token_update_alone_does_not_write_the_board() {
+        let fx = fixture(5, &[]);
+        fx.sup
+            .edit(|b| {
+                b.tasks.push(Task {
+                    id: "T1-x".into(),
+                    label: "T1-x".into(),
+                    session: Some("s1".into()),
+                    ..Task::default()
+                })
+            })
+            .unwrap();
+        let file = fx.sup.dir.join("board.json");
+        std::fs::remove_file(&file).unwrap();
+        for n in 1..=50 {
+            fx.sup.note_tokens(|_| Some(("m".into(), n)));
+        }
+        assert!(!file.exists(), "tokens alone wrote the board");
+        assert_eq!(fx.sup.row("T1-x").unwrap().tokens, 50, "kept in memory");
+        fx.sup.edit(|b| b.last_check = Some(1)).unwrap();
+        assert_eq!(Board::load(&fx.sup.dir).unwrap().task("T1-x").unwrap().tokens, 50);
     }
 
     /// The fixture's super after a restart: the same board, a fresh process.

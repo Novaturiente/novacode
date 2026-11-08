@@ -330,6 +330,12 @@ need) before any verdict.\n",
             };
             s += &format!("- {f}{mark}\n");
         }
+        if done.files_total > done.files.len() {
+            s += &format!(
+                "- …and {} more files, not listed here: see the diff\n",
+                done.files_total - done.files.len()
+            );
+        }
     }
     if !done.checks.is_empty() {
         s += "\nRecorded checks: each check the task cited, as code recorded it when it ran (command, exit code, \
@@ -921,6 +927,37 @@ mod tests {
             json!({"verdict": "approved", "findings": ["Criterion 1: met, #3 passes"]}),
         );
         fx.until("ready", |fx| fx.row("T1-fix").state == State::Ready).await;
+    }
+
+    /// A large review brief goes to its own file: board.json stays small, the review gets
+    /// it whole; a done row keeps at most 200 changed files and their count.
+    #[tokio::test]
+    async fn a_large_review_brief_stays_off_the_board_but_is_sent_whole() {
+        let fx = fixture("faux/review");
+        let wt = fx.spawn("fix", "quick", "change").await;
+        let commit = fx.commit(&wt, "src/a.rs");
+        let files: Vec<String> = (0..300)
+            .map(|i| format!("src/a/rather/long/path/file_{i}.rs"))
+            .collect();
+        let refs: Vec<&str> = files.iter().map(String::as_str).collect();
+        fx.done("T1-fix", &commit, &refs);
+        let rv = fx.review_of("T1-fix").await;
+        let done = fx.row("T1-fix").done.unwrap();
+        assert_eq!((done.files.len(), done.files_total), (200, 300));
+        let brief = fx.prompts("s2").remove(0);
+        assert!(brief.contains("- src/a/rather/long/path/file_199.rs"), "{brief}");
+        assert!(
+            brief.contains("…and 100 more files") && brief.contains("Recorded checks"),
+            "{brief}"
+        );
+        assert_eq!(rv.full_request(), brief);
+        assert!(rv.request.len() < 2100 && rv.brief_file.as_ref().is_some_and(|p| p.exists()));
+        let json = std::fs::read_to_string(fx.sup.dir.join("board.json")).unwrap();
+        eprintln!("board.json: {} bytes, brief: {} bytes", json.len(), brief.len());
+        assert!(!json.contains("Recorded checks"), "the whole brief is on the board");
+        let file = rv.brief_file.unwrap();
+        fx.report(&rv.id, json!({"verdict": "approved", "findings": ["Criterion 1: met"]}));
+        fx.until("brief removed", |_| !file.exists()).await;
     }
 
     #[tokio::test]

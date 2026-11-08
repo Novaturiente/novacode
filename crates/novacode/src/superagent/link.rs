@@ -1067,16 +1067,19 @@ impl Links {
     }
 
     /// Task `id`'s activity facts, saved on its row (cards and progress stay as they are).
+    /// In memory: health facts are volatile ([`Super::touch`]).
     fn save_health(&self, sup: &Super, id: &str, h: board::Health) {
-        let _ = sup.edit(|b| {
-            if let Some(t) = b.tasks.iter_mut().find(|t| t.id == id) {
-                t.health = board::Health {
-                    cards: t.health.cards,
-                    card_since: t.health.card_since,
-                    progress_at: t.health.progress_at,
-                    ..h
-                };
-            }
+        sup.touch(|b| {
+            let Some(t) = b.tasks.iter_mut().find(|t| t.id == id) else {
+                return false;
+            };
+            t.health = board::Health {
+                cards: t.health.cards,
+                card_since: t.health.card_since,
+                progress_at: t.health.progress_at,
+                ..h
+            };
+            true
         });
     }
 
@@ -1988,13 +1991,14 @@ fn done_facts(f: &serde_json::Map<String, Value>) -> board::Done {
             line
         })
         .collect();
-    board::Done {
+    let mut done = board::Done {
         commit: f.get("commit").and_then(Value::as_str).map(String::from),
-        files: strings("files_changed"),
         checks,
         artifacts: strings("artifacts"),
-        from_commits: false,
-    }
+        ..board::Done::default()
+    };
+    done.set_files(strings("files_changed"));
+    done
 }
 
 /// A task blocked by `provider`'s limit, or a review task whose turn hit it.

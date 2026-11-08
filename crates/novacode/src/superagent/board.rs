@@ -197,7 +197,11 @@ pub enum Landed {
 pub struct Done {
     /// The reported (pinned) commit; `None` outside git.
     pub commit: Option<String>,
+    /// The first [`FILES_KEPT`] changed files.
     pub files: Vec<String>,
+    /// How many files changed, when more than [`files`](Self::files) lists.
+    #[serde(skip_serializing_if = "is_default")]
+    pub files_total: usize,
     /// One entry per check: its recorded command, folder, exit code and whether it ran
     /// before the last edit, then the end of its recorded output when there is any.
     pub checks: Vec<String>,
@@ -206,6 +210,24 @@ pub struct Done {
     /// Built by code from the branch's commits: the task sent no report and no proof (R23).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub from_commits: bool,
+}
+
+/// Changed files kept on a `done` row; the rest only counted.
+pub const FILES_KEPT: usize = 200;
+
+impl Done {
+    /// Keep the first [`FILES_KEPT`] of `files` and count them all.
+    pub fn set_files(&mut self, files: Vec<String>) {
+        self.files = files;
+        self.cap_files();
+    }
+
+    fn cap_files(&mut self) {
+        if self.files.len() > FILES_KEPT {
+            self.files_total = self.files_total.max(self.files.len());
+            self.files.truncate(FILES_KEPT);
+        }
+    }
 }
 
 /// A task's card super's code relayed, with its answer (L10.9 R25).
@@ -448,7 +470,11 @@ pub struct Task {
     /// A write task the user accepted on a card after its review rounds ran out.
     pub accepted: bool,
     /// The user's words, sent in the brief (kept so a queued task can start later).
+    /// A long review brief is in [`brief_file`](Self::brief_file); this keeps its start.
     pub request: String,
+    /// A review's whole brief, when longer than [`REQUEST_KEPT`] ([`Board::compact`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brief_file: Option<PathBuf>,
     /// Skills the brief names.
     pub skills: Vec<String>,
     /// `task spawn {goal: true}`: an open-ended task.
@@ -509,6 +535,14 @@ pub struct Task {
 }
 
 impl Task {
+    /// [`request`](Self::request) in full: a long review brief is read from its file.
+    pub fn full_request(&self) -> String {
+        self.brief_file
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_else(|| self.request.clone())
+    }
+
     /// Its label without its session: `T<n>-<slug>`.
     pub fn short(&self) -> &str {
         self.label
@@ -1105,6 +1139,15 @@ pub struct Board {
 
 /// General charter points kept.
 pub const GENERAL_KEPT: usize = 30;
+/// Chars of a review brief kept on its row; the whole brief goes to its own file.
+pub const REQUEST_KEPT: usize = 2000;
+/// Chars of an archived row's request and summary kept.
+const ARCHIVED_KEPT: usize = 300;
+
+/// The first `n` chars of `s`.
+fn cut(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
 
 fn is_default<T: Default + PartialEq>(t: &T) -> bool {
     *t == T::default()
@@ -1409,9 +1452,58 @@ impl Board {
         Ok(novacode_base::storage::read_json(&dir.join("board.json"))?.unwrap_or_default())
     }
 
-    /// Write `board.json` atomically, then the readable `board.md`.
+    /// Keep the board small (it is rewritten on every change): a long review brief moves
+    /// to `<dir>/briefs/<id>.md`, changed files are capped, and an archived row keeps only
+    /// its label, state, short request and summary (its brief file goes). An old board
+    /// shrinks on its first save.
+    pub fn compact(&mut self, dir: &Path) {
+        for t in &mut self.tasks {
+            if let Some(d) = t.done.as_mut() {
+                d.cap_files();
+            }
+            if t.state == State::Archived {
+                if let Some(p) = t.brief_file.take() {
+                    let _ = std::fs::remove_file(p);
+                }
+                if t.request.chars().count() > ARCHIVED_KEPT {
+                    t.request = cut(&t.request, ARCHIVED_KEPT) + "…";
+                }
+                if let Some(s) = t.summary.as_mut().filter(|s| s.chars().count() > ARCHIVED_KEPT) {
+                    *s = cut(s, ARCHIVED_KEPT) + "…";
+                }
+                t.done = t.done.take().map(|d| Done {
+                    commit: d.commit,
+                    ..Done::default()
+                });
+                t.follow_ups.clear();
+                t.asked.clear();
+                t.notes.clear();
+                t.pending.clear();
+                t.applied.clear();
+                t.flight = None;
+                t.health = Health::default();
+            } else if t.kind == Kind::Review && t.brief_file.is_none() && t.request.len() > REQUEST_KEPT {
+                let path = dir.join("briefs").join(format!("{}.md", t.id));
+                let written = std::fs::create_dir_all(dir.join("briefs"))
+                    .and_then(|_| write_atomic_no_backup(&path, t.request.as_bytes(), Durability::Durable));
+                match written {
+                    Ok(()) => {
+                        t.request = format!(
+                            "{}…\n(the whole brief: {})",
+                            cut(&t.request, REQUEST_KEPT),
+                            path.display()
+                        );
+                        t.brief_file = Some(path);
+                    }
+                    Err(e) => tracing::warn!(task = %t.id, %e, "super: the review brief stays on the board"),
+                }
+            }
+        }
+    }
+
+    /// Write `board.json` (compact JSON) atomically, then the readable `board.md`.
     pub fn save(&self, dir: &Path) -> io::Result<()> {
-        let json = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
+        let json = serde_json::to_vec(self).map_err(io::Error::other)?;
         write_atomic(&dir.join("board.json"), &json, Durability::Durable)?;
         write_atomic_no_backup(&dir.join("board.md"), self.render().as_bytes(), Durability::Fast)
     }
@@ -2771,6 +2863,61 @@ mod tests {
         b.apply("T1", Event::Verdict(Verdict::Approved)).unwrap();
         assert_eq!(b.task("T1").unwrap().review_rounds, 2);
         assert!(b.apply("T9", Event::Send).is_err());
+    }
+
+    /// An old board (pretty JSON, whole review briefs, archived rows with full history)
+    /// loads and shrinks on its first save; the live review's brief stays readable in full.
+    #[test]
+    fn an_old_large_board_shrinks_on_its_first_save() {
+        let d = tempfile::tempdir().unwrap();
+        let big = |tag: &str| format!("{tag} ") + &"diff line of the review brief\n".repeat(4000);
+        let mut old = row(State::Archived);
+        old.id = "T0-old".into();
+        old.label = "T0-old".into();
+        old.summary = Some("merged the parser fix".into());
+        old.request = big("OLD");
+        old.follow_ups = vec![big("FOLLOW")];
+        old.done = Some(Done {
+            commit: Some("c0".into()),
+            files: (0..5000).map(|i| format!("src/some/long/path/file_{i}.rs")).collect(),
+            ..Done::default()
+        });
+        let mut rv = row(State::Running);
+        rv.id = "T2-review-T1-fix".into();
+        rv.label = rv.id.clone();
+        rv.kind = Kind::Review;
+        rv.request = big("BRIEF");
+        let mut b = Board {
+            tasks: vec![old, rv],
+            ..Default::default()
+        };
+        std::fs::write(d.path().join("board.json"), serde_json::to_vec_pretty(&b).unwrap()).unwrap();
+        let before = std::fs::metadata(d.path().join("board.json")).unwrap().len();
+
+        let mut loaded = Board::load(d.path()).unwrap();
+        assert_eq!(loaded, b, "an old board loads unchanged");
+        loaded.compact(d.path());
+        loaded.save(d.path()).unwrap();
+        let after = std::fs::metadata(d.path().join("board.json")).unwrap().len();
+        eprintln!("board.json: {before} bytes before, {after} after");
+        assert!(after < 10_000, "{before} -> {after} bytes");
+
+        let again = Board::load(d.path()).unwrap();
+        let rv = again.task("T2-review-T1-fix").unwrap();
+        assert_eq!(rv.full_request(), b.tasks[1].request, "the whole brief, from its file");
+        let old = again.task("T0-old").unwrap();
+        assert_eq!(
+            (old.label.as_str(), old.state, old.summary.as_deref()),
+            ("T0-old", State::Archived, Some("merged the parser fix"))
+        );
+        assert!(old.follow_ups.is_empty() && old.done.as_ref().unwrap().files.is_empty());
+
+        // Archived, the review's brief file goes too.
+        b = again;
+        b.tasks[1].state = State::Archived;
+        let file = b.tasks[1].brief_file.clone().unwrap();
+        b.compact(d.path());
+        assert!(!file.exists() && b.tasks[1].brief_file.is_none());
     }
 
     #[test]
