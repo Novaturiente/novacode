@@ -2,6 +2,19 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.8.8] - 2026-11-08
+
+### Changed
+
+- **Super asks only for gated steps**: merge, push or deploy; production data or schema; deleting; money or legal; scope changes; or a request with no sensible default. Everything else it decides, acts on, and lists under "Decided for you" in its update.
+- The criteria card before a task starts stays only for tasks touching production data, schema or deploy; other tasks start at once with their criteria in the start update.
+- A task blocked by a provider's quota moves to the same tier on another logged-in provider with room, instead of asking.
+
+### Fixed
+
+- Answers to General questions are kept on a General charter in super's state, so super no longer asks them again.
+- A question identical to an open one is refused.
+
 ## [0.8.7] - 2026-11-08
 
 ### Added
