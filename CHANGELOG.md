@@ -2,6 +2,23 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.8.10] - 2026-11-09
+
+### Added
+
+- **Session cleanup**: `sessions.cleanupDays` (default 14, 0 = off). Once a day at start, subagent and super review sessions older than that are deleted; user, super, task and live sessions are kept.
+- **Close summary**: before super closes a write task, the task writes what was implemented, how the project changes, features added or removed and the release or deploy impact; super shows it and saves it under `summaries/`.
+
+### Changed
+
+- Images are at most 1568 px on the long side; opaque screenshots use JPEG when it is under half the PNG size. Only the newest 4 images are sent to the model; older ones become a short note.
+- Super review briefs carry `git diff --stat` and the commands for the full diff, capped at 40 KB; review verdicts may be 2000 characters; length limits are stated in the `report` and `say` schemas.
+
+### Fixed
+
+- Compaction no longer repeats after every turn when it cannot bring the context under the threshold.
+- A checkpoint writes its skipped-files list only when it changes.
+
 ## [0.8.9] - 2026-11-08
 
 ### Fixed
