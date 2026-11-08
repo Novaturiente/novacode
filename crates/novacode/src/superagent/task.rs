@@ -140,18 +140,8 @@ pub struct Super {
     pub reminders: Arc<super::remind::Pending>,
 }
 
-/// The user's answer to code's quota card.
-#[derive(Debug, PartialEq)]
-pub(super) enum QuotaAnswer {
-    /// No card: no other provider to move to, nothing to move, or no answer.
-    None,
-    Waited,
-    /// Switched: what code did.
-    Switched(String),
-}
-
-/// A task or review waiting on `provider`'s quota: a blocked task or a live review whose
-/// turn hit it, or a review queued on it that never started.
+/// A task or review waiting on `provider`'s quota: a blocked task (a merging one too) or a
+/// live review whose turn hit it, or a review queued on it that never started.
 fn quota_blocked(t: &Task, provider: &str) -> bool {
     let limit = t
         .block
@@ -159,7 +149,7 @@ fn quota_blocked(t: &Task, provider: &str) -> bool {
         .and_then(|b| b.limit.as_ref())
         .is_some_and(|l| l.provider == provider);
     match t.kind {
-        Kind::Work => t.state == State::Blocked && limit && !t.block.as_ref().is_some_and(|b| b.merge),
+        Kind::Work => t.state == State::Blocked && limit,
         Kind::Review => {
             (t.state.is_live() && limit)
                 || (t.state == State::Queued && t.session.is_none() && super::models::provider(&t.model) == provider)
@@ -1095,52 +1085,65 @@ impl Super {
         out
     }
 
-    /// Code's quota card (L10.9): `held` is out of quota (until `reset`, when known). When
-    /// another provider is logged in and not held, one card asks to move the tasks and
-    /// reviews it blocks there: "Switch" switches them as `task model` does and continues
-    /// them, "Wait" leaves them waiting.
-    pub(super) async fn quota_card(&self, held: &str, reset: Option<u64>) -> QuotaAnswer {
+    /// Code's quota switch (L10.9): `held` is out of quota. The tasks and reviews it blocks
+    /// move, without a card, to the same tier on the first other provider that is logged in,
+    /// has usable models and is not on hold, as `task model` does: a blocked task is told to
+    /// continue, a merging one waits for `task merge`. One line per task for super; none
+    /// when there is nowhere to move them (they wait for the reset).
+    pub(super) async fn quota_switch(&self, held: &str) -> Vec<String> {
         let own = self.current_model();
-        let (other, rows) = {
+        let models = self.cfg.models.clone();
+        let (holds, rows) = {
             let b = self.board.lock().unwrap();
-            let other = self
-                .cfg
-                .models
-                .switch_targets(&own, held)
-                .into_iter()
-                .find(|p| !b.holds.contains_key(p));
+            let holds: std::collections::HashSet<String> = b.holds.keys().cloned().collect();
             let rows: Vec<Task> = b.tasks.iter().filter(|t| quota_blocked(t, held)).cloned().collect();
-            (other, rows)
+            (holds, rows)
         };
+        let other = models
+            .switch_targets(&own, held)
+            .into_iter()
+            .find(|p| !holds.contains(p) && !models.usable(p).is_empty());
         let Some(other) = other.filter(|_| !rows.is_empty()) else {
-            return QuotaAnswer::None;
+            return vec![];
         };
-        let names: Vec<String> = rows.iter().map(|t| self.name_of(&t.id)).collect();
-        let until = reset.map_or("unknown".to_string(), |at| super::say::local_time(at * 1000));
-        let header = match names.as_slice() {
-            [one] => format!("{one}: quota"),
-            _ => "Quota".to_string(),
-        };
-        let q = format!("{held} is out until {until}. Move {} to {other}?", names.join(", "));
-        match self.choose(header, q, &["Switch", "Wait"]).await {
-            Ok(Some(c)) if c == "Switch" => {}
-            Ok(Some(_)) => return QuotaAnswer::Waited,
-            _ => return QuotaAnswer::None,
-        }
+        let moved =
+            |name: String, old: &str, new: &str| format!("Moved {name} from {old} to {new}: {held} is out of quota.");
         let (work, reviews): (Vec<Task>, Vec<Task>) = rows.into_iter().partition(|t| t.kind == Kind::Work);
         let (changes, skipped) = self.plan_switch(work, Some(&other), None).await;
-        let mut out = self.apply_switch(changes).await;
-        out.extend(skipped.into_iter().map(|s| format!("Not switched: {s}")));
+        let mut out = Vec::new();
+        for (t, new) in changes {
+            let merge = t.block.as_ref().is_some_and(|b| b.merge);
+            let lines = self.apply_switch(vec![(t.clone(), new.clone())]).await;
+            if self.row(&t.id).is_ok_and(|r| r.model == new) {
+                let mut line = moved(self.name_of(&t.id), &t.model, &new);
+                if merge {
+                    // The limit is behind it: a later clear of `held` doesn't concern it.
+                    let _ = self.edit(|b| {
+                        if let Some(bl) = b.tasks.iter_mut().find(|r| r.id == t.id).and_then(|r| r.block.as_mut()) {
+                            bl.limit = None;
+                        }
+                    });
+                    line += " Its merge stopped and the merge lock is released: call `task merge` to retry it.";
+                }
+                out.push(line);
+            }
+            out.extend(lines.into_iter().filter(|l| l.contains("failed")));
+        }
+        out.extend(skipped.into_iter().map(|s| format!("Not moved off {held}: {s}")));
         for rv in reviews {
-            out.push(self.move_review(&rv, &other, &own).await);
+            let line = self.move_review(&rv, &other, &own).await;
+            match self.row(&rv.id) {
+                Ok(r) if r.model != rv.model => {
+                    out.push(moved(self.name_of(&rv.id), &rv.model, &r.model));
+                    if line.contains("failed") {
+                        out.push(line);
+                    }
+                }
+                _ => out.push(line),
+            }
         }
-        for n in self.pump().await {
-            out.push(n);
-        }
-        QuotaAnswer::Switched(format!(
-            "{held} is out of quota; on the user's OK code moved its tasks to {other}:\n{}",
-            out.join("\n")
-        ))
+        out.extend(self.pump().await);
+        out
     }
 
     /// A review held by a quota re-picks its model on `other`: super's current model when

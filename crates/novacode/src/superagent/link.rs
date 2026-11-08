@@ -615,8 +615,8 @@ pub struct Links {
     stall_check: Mutex<Option<(u64, Vec<String>)>>,
     /// Super's binary as it started: a new install restarts super once it is idle.
     pub(super) exe: Mutex<Option<super::upgrade::ExeWatch>>,
-    /// Provider → its quota state (L10.9): the card, the user's Wait, and the tasks whose
-    /// quota block already woke super. Kept until a task on it gets past the limit.
+    /// Provider → its quota state (L10.9): a switch under way, and the tasks whose quota
+    /// block already woke super. Kept until a task on it gets past the limit.
     quota: Mutex<HashMap<String, Quota>>,
     /// Provider → when a model request on it last went through: a hold older than that lifts.
     works: Mutex<HashMap<String, u64>>,
@@ -624,13 +624,13 @@ pub struct Links {
     served: Mutex<Option<u64>>,
 }
 
-/// One provider's quota, as code's quota card sees it.
+/// One provider's quota, as code's quota switch sees it.
 #[derive(Default)]
 struct Quota {
-    /// Its card is open.
-    card: bool,
-    /// The user chose Wait: no more cards for this hold.
-    waited: bool,
+    /// Code is moving its tasks to another provider.
+    switching: bool,
+    /// Another task was blocked meanwhile: switch once more.
+    again: bool,
     /// Tasks whose quota block woke super: a repeated block doesn't wake it again.
     woke: HashSet<String>,
 }
@@ -1220,7 +1220,7 @@ impl Links {
                 }
                 _ => {
                     let p = super::models::provider(&t.model);
-                    if q.get(p).is_some_and(|x| !x.card) {
+                    if q.get(p).is_some_and(|x| !x.switching) {
                         q.remove(p);
                     }
                     true
@@ -1271,37 +1271,38 @@ impl Links {
             ));
         }
         if limit.kind == LimitKind::Quota {
-            self.quota_card(limit);
+            self.quota_switch(&limit.provider);
         }
     }
 
-    /// Code's quota card for `limit`'s provider, unless one is open or the user chose Wait
-    /// for this hold; off the loop since it waits for the user.
-    fn quota_card(&self, limit: &Limit) {
+    /// Code moves the tasks `provider`'s quota blocks to another provider (L10.9) and wakes
+    /// super with what it did; off the loop since it checks models. One switch per provider
+    /// at a time: a block during it runs it once more after.
+    fn quota_switch(&self, provider: &str) {
         {
             let mut q = self.quota.lock().unwrap();
-            let e = q.entry(limit.provider.clone()).or_default();
-            if e.card || e.waited {
+            let e = q.entry(provider.to_string()).or_default();
+            if e.switching {
+                e.again = true;
                 return;
             }
-            e.card = true;
+            e.switching = true;
         }
-        let (me, sup, limit) = (self.me.clone(), self.sup.clone(), limit.clone());
+        let (me, sup, provider) = (self.me.clone(), self.sup.clone(), provider.to_string());
         let t = tokio::spawn(async move {
-            let Some(sup) = sup.upgrade() else { return };
-            let answer = sup.quota_card(&limit.provider, limit.reset_at).await;
-            let Some(me) = me.upgrade() else { return };
-            if let Some(e) = me.quota.lock().unwrap().get_mut(&limit.provider) {
-                e.card = false;
-                e.waited = answer == super::task::QuotaAnswer::Waited;
-            }
-            match answer {
-                super::task::QuotaAnswer::None => {}
-                super::task::QuotaAnswer::Waited => me.inform.note(format!(
-                    "{} is out of quota; the user chose to wait: its tasks continue when it clears.",
-                    limit.provider
-                )),
-                super::task::QuotaAnswer::Switched(out) => me.inform.note(out),
+            loop {
+                let Some(sup) = sup.upgrade() else { return };
+                let out = sup.quota_switch(&provider).await;
+                let Some(me) = me.upgrade() else { return };
+                if !out.is_empty() {
+                    me.inform.wake(out.join("\n"));
+                }
+                let mut q = me.quota.lock().unwrap();
+                let Some(e) = q.get_mut(&provider) else { return };
+                if !std::mem::take(&mut e.again) {
+                    e.switching = false;
+                    return;
+                }
             }
         });
         self.inner.lock().unwrap().tasks.push(t.abort_handle());
@@ -3988,6 +3989,8 @@ mod tests {
     #[tokio::test]
     async fn a_quota_blocks_the_task_holds_only_its_provider_and_is_resent_when_it_clears() {
         let fx = fixture(5);
+        // Nowhere to move it.
+        hold_others(&fx, "claude");
         let s = fx.task("T1-x", "claude/a", State::Running);
         let mut t = fx.end(&s).await;
         t.catch_up(true, vec![], vec![]).await;
@@ -4006,6 +4009,7 @@ mod tests {
                 .count()
                 == 1
         );
+        fx.sup.edit(|b| b.holds.remove("codex")).unwrap();
 
         // Queued work: the held provider waits, another starts.
         for (id, model) in [("T2-y", "claude/b"), ("T3-z", "codex/c")] {
@@ -4030,7 +4034,7 @@ mod tests {
         fx.links.kick();
         fx.until("T1 running", |fx| fx.state("T1-x") == State::Running).await;
         fx.until("T2 runs", |fx| fx.state("T2-y") == State::Running).await;
-        assert!(fx.sup.board.lock().unwrap().holds.is_empty());
+        assert!(!fx.sup.board.lock().unwrap().holds.contains_key("claude"));
         let sent = fx.launcher.sent.lock().unwrap().clone();
         assert!(
             sent.iter()
@@ -4718,6 +4722,8 @@ mod tests {
     async fn a_merging_task_blocked_by_a_limit_stays_blocked_when_it_clears_and_super_is_woken() {
         // A3 (audit r5): its merge lock is gone, so code must not resend "continue".
         let fx = fixture(5);
+        // Nowhere to move it.
+        hold_others(&fx, "faux");
         let repo = fx.sup.root.join("a");
         git_repo(&repo);
         let s = fx.merging("T1-x", &repo);
@@ -5079,6 +5085,8 @@ mod tests {
     async fn a_review_task_s_limit_holds_its_provider_and_resends_to_it_when_it_clears() {
         // A9 (audit r5): a limit is no crash of the review.
         let fx = fixture(5);
+        // Nowhere to move it.
+        hold_others(&fx, "claude");
         fx.task("T1-x", "faux/a", State::Reviewing);
         let s = fx.task("T2-rev", "claude/a", State::Running);
         fx.sup
@@ -5261,17 +5269,6 @@ mod tests {
         assert!(wakes(&fx).is_empty(), "re-asks never wake super");
     }
 
-    fn answer(fx: &Fx, choice: &str) {
-        let tx = fx.asker.waiting.lock().unwrap().remove(0);
-        let reply = Reply {
-            question: String::new(),
-            chosen: vec![choice.into()],
-            text: None,
-            preview: None,
-        };
-        tx.send(Some(vec![reply])).unwrap();
-    }
-
     fn set_model_sent(fx: &Fx, session: &str, model: &str) -> bool {
         fx.launcher
             .sent
@@ -5281,8 +5278,17 @@ mod tests {
             .any(|(s, c)| s == session && matches!(c, ClientCmd::SetModel { model: m } if m == model))
     }
 
+    /// Every provider a quota-blocked task could move to is on hold, but `except`.
+    fn hold_others(fx: &Fx, except: &str) {
+        for p in ["faux", "claude", "codex", "antigravity"] {
+            if p != except {
+                hold(fx, p, LimitKind::Quota);
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn a_quota_block_asks_at_once_to_switch_provider_and_switch_moves_the_tasks() {
+    async fn a_quota_block_moves_the_tasks_to_another_provider_without_asking() {
         // One slot: the review waits behind T1, then behind the hold.
         let fx = fixture(1);
         // Super runs on the held provider too, so its queued review stays held there.
@@ -5311,14 +5317,6 @@ mod tests {
         t.catch_up(true, vec![], vec![]).await;
         t.event(AgentEvent::AgentStart).await;
         t.event(end(SUPER, QUOTA)).await;
-        fx.until("asked", |fx| fx.asker.waiting.lock().unwrap().len() == 1)
-            .await;
-        let q = fx.asker.asked.lock().unwrap()[0].clone();
-        assert!(q.question.contains("claude is out until "), "{}", q.question);
-        assert!(q.question.contains("Move T1-x, T3-rev to codex?"), "{}", q.question);
-        let labels: Vec<&str> = q.options.iter().map(|o| o.label.as_str()).collect();
-        assert_eq!(labels, ["Switch", "Wait"]);
-        answer(&fx, "Switch");
         fx.until("switched", |fx| set_model_sent(fx, &s, "faux/standard")).await;
         fx.until("continues", |fx| fx.state("T1-x") == State::Running).await;
         fx.until("review moved", |fx| {
@@ -5327,21 +5325,59 @@ mod tests {
         .await;
         // Off super's provider a review takes that provider's deep tier.
         assert_eq!(fx.sup.row("T3-rev").unwrap().model, "faux/deep");
+        // Super hears it in one line per task, for its "Decided for you".
+        fx.until("told", |fx| {
+            wakes(fx)
+                .iter()
+                .any(|w| w.contains("Moved T1-x from claude/a to faux/standard: claude is out of quota"))
+        })
+        .await;
+        assert!(
+            wakes(&fx)
+                .iter()
+                .any(|w| w.contains("Moved T3-rev from claude/opus to faux/deep")),
+            "{:?}",
+            fx.said()
+        );
+        assert!(fx.asker.asked.lock().unwrap().is_empty(), "no card");
     }
 
     #[tokio::test]
-    async fn wait_asks_no_more_for_the_hold_and_a_repeated_quota_block_wakes_super_once() {
+    async fn a_merging_task_blocked_by_quota_moves_and_waits_for_a_merge_retry() {
         let fx = fixture(5);
+        let repo = fx.sup.root.join("a");
+        git_repo(&repo);
+        let s = fx.merging("T1-x", &repo);
+        let mut t = fx.end(&s).await;
+        t.catch_up(true, vec![], vec![]).await;
+        t.event(AgentEvent::AgentStart).await;
+        t.event(end(SUPER, QUOTA)).await;
+        fx.until("told", |fx| {
+            wakes(fx).iter().any(|w| w.contains("Moved T1-x from faux/a to "))
+        })
+        .await;
+        let w = wakes(&fx).into_iter().find(|w| w.contains("Moved T1-x")).unwrap();
+        assert!(w.contains("`task merge`"), "{w}");
+        let row = fx.sup.row("T1-x").unwrap();
+        assert_ne!(row.model, "faux/a");
+        assert!(set_model_sent(&fx, &s, &row.model));
+        assert_eq!(row.state, State::Blocked);
+        assert!(row.block.unwrap().limit.is_none(), "not woken again by a later clear");
+        assert!(!sent_cleared(&fx, &s));
+    }
+
+    #[tokio::test]
+    async fn a_quota_block_with_no_other_provider_waits_and_wakes_super_once() {
+        let fx = fixture(5);
+        hold_others(&fx, "claude");
         let s = fx.task("T1-x", "claude/a", State::Running);
         let mut t = fx.end(&s).await;
         t.catch_up(true, vec![], vec![]).await;
         t.event(AgentEvent::AgentStart).await;
         t.event(end(SUPER, QUOTA)).await;
-        fx.until("asked", |fx| fx.asker.waiting.lock().unwrap().len() == 1)
-            .await;
-        answer(&fx, "Wait");
-        fx.until("noted", |fx| fx.said().iter().any(|l| l.contains("chose to wait")))
-            .await;
+        fx.until("blocked", |fx| fx.state("T1-x") == State::Blocked).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(fx.sup.row("T1-x").unwrap().model, "claude/a");
         // The fixed wait ends, code resends, the quota is still out.
         clear_hold(&fx, "claude");
         fx.until("resent", |fx| sent_cleared(fx, &s)).await;
@@ -5350,7 +5386,8 @@ mod tests {
         t.event(end(SUPER, QUOTA)).await;
         fx.until("blocked again", |fx| fx.state("T1-x") == State::Blocked).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(fx.asker.asked.lock().unwrap().len(), 1, "no second card");
+        assert!(fx.asker.asked.lock().unwrap().is_empty(), "no card");
+        assert!(!fx.said().iter().any(|l| l.contains("Moved T1-x")), "{:?}", fx.said());
         let quota_wakes = wakes(&fx).iter().filter(|w| w.contains("of provider claude")).count();
         assert_eq!(quota_wakes, 1, "{:?}", fx.said());
     }
