@@ -230,6 +230,38 @@ fn outside_scope(file: &str, scope: &[String]) -> bool {
     !items.is_empty() && !items.iter().any(|i| file.contains(i))
 }
 
+/// The most diff facts (changed files, `git diff --stat`) a review brief carries inline,
+/// in bytes (L10.9): a 968 KB brief made its review compact 23 times. The reviewer runs
+/// `git diff` itself for the rest.
+const DIFF_INLINE: usize = 40_000;
+
+/// `lines` that fit in `budget` bytes, each with a newline; the rest becomes one note
+/// naming `cmd`. `keep_last`: the last line (the stat's summary) always stays.
+fn capped(lines: &[&str], budget: usize, keep_last: bool, cmd: &str) -> String {
+    let (body, last) = match (keep_last, lines.split_last()) {
+        (true, Some((last, rest))) => (rest, Some(*last)),
+        _ => (lines, None),
+    };
+    let mut out = String::new();
+    let mut kept = 0;
+    for l in body {
+        if out.len() + l.len() + 1 > budget {
+            break;
+        }
+        out += l;
+        out.push('\n');
+        kept += 1;
+    }
+    if kept < body.len() {
+        out += &format!("…{} more lines cut: run {cmd}\n", body.len() - kept);
+    }
+    if let Some(l) = last {
+        out += l;
+        out.push('\n');
+    }
+    out
+}
+
 /// What the review brief is built from, besides the reviewed row.
 struct BriefIn<'a> {
     label: &'a str,
@@ -239,6 +271,8 @@ struct BriefIn<'a> {
     /// A read task's answer (its final message).
     answer: Option<String>,
     baseline: Option<(PathBuf, Baseline)>,
+    /// `git diff --stat` of the reviewed commit against its base.
+    stat: Option<String>,
 }
 
 /// The review task's first prompt: facts only, never the task's summary or claims.
@@ -320,19 +354,46 @@ need) before any verdict.\n",
             t.label
         );
     }
+    // The diff stays out of the brief: its stat and the files are capped, the commands show the rest.
+    let range = match (base, &done.commit) {
+        (Some(b), Some(c)) => Some(format!("{b}...{c}")),
+        _ => None,
+    };
+    let stat_cmd = match &range {
+        Some(r) => format!("`git diff --stat {r}`"),
+        None => "`git diff --stat` against its base".to_string(),
+    };
+    if let Some(r) = &range {
+        s += &format!(
+            "\nThe diff is not in this brief: run `git diff {r}` in {} to read the changes \
+(add `-- <path>` for one file), and {stat_cmd} for every changed file.\n",
+            i.cwd.display()
+        );
+    }
+    if let Some(stat) = i.stat.as_deref().filter(|x| !x.trim().is_empty()) {
+        s += "\nDiff stat (`git diff --stat`):\n";
+        let lines: Vec<&str> = stat.lines().collect();
+        s += &capped(&lines, DIFF_INLINE / 2, true, &stat_cmd);
+    }
     if !done.files.is_empty() {
         s += "\nChanged files: justify or reject each one against the request; an unexplained file is a finding.\n";
-        for f in &done.files {
-            let mark = if outside_scope(f, &t.scope) {
-                " (outside the scope)"
-            } else {
-                ""
-            };
-            s += &format!("- {f}{mark}\n");
-        }
+        let lines: Vec<String> = done
+            .files
+            .iter()
+            .map(|f| {
+                let mark = if outside_scope(f, &t.scope) {
+                    " (outside the scope)"
+                } else {
+                    ""
+                };
+                format!("- {f}{mark}")
+            })
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        s += &capped(&refs, DIFF_INLINE / 2, false, &stat_cmd);
         if done.files_total > done.files.len() {
             s += &format!(
-                "- …and {} more files, not listed here: see the diff\n",
+                "- …and {} more files, not listed here: run {stat_cmd}\n",
                 done.files_total - done.files.len()
             );
         }
@@ -396,7 +457,7 @@ also not with bash. Report with `report`: `verdict` approved | needs-proof | rej
 (for needs-proof, concrete proof requests such as a test for a named case or a browser check with a screenshot; \
 you may name skills for the fix, such as tdd or diagnosing-bugs). `approved` is refused unless the findings name \
 every acceptance criterion by number, one short line each, such as \"Criterion 1: met, `cargo test` passes\"; \
-several lines may share a finding (1000 characters in all). A criterion that is not met, for any reason, \
+several lines may share a finding (2000 characters in all). A criterion that is not met, for any reason, \
 means `rejected` or `needs-proof`, never `approved`; super asks the user when a criterion can't be met.\n",
         i.scratch.display()
     );
@@ -475,6 +536,12 @@ impl Super {
             _ => None,
         };
         let answer = (!t.write).then(|| self.read(&t, 0, 400).ok()).flatten();
+        let stat = match (&t.repo, &t.base_commit, t.done.as_ref().and_then(|d| d.commit.as_ref())) {
+            (Some(repo), Some(base), Some(c)) => {
+                super::task::git(repo, &["diff", "--stat=160", &format!("{base}...{c}")]).ok()
+            }
+            _ => None,
+        };
         rv.request = brief(
             &t,
             &BriefIn {
@@ -484,6 +551,7 @@ impl Super {
                 note,
                 answer,
                 baseline,
+                stat,
             },
         );
         self.edit(|b| {
@@ -958,6 +1026,43 @@ mod tests {
         let file = rv.brief_file.unwrap();
         fx.report(&rv.id, json!({"verdict": "approved", "findings": ["Criterion 1: met"]}));
         fx.until("brief removed", |_| !file.exists()).await;
+    }
+
+    /// L10.9: a 968 KB brief made its review compact 23 times. The diff facts inline are
+    /// capped (`git diff --stat` always, its summary line kept), and the reviewer gets the
+    /// exact commands to see the whole diff itself.
+    #[tokio::test]
+    async fn a_large_diff_is_capped_in_the_brief_with_its_stat_and_the_commands_for_the_rest() {
+        let fx = fixture("faux/review");
+        let wt = fx.spawn("fix", "quick", "change").await;
+        let dir = format!("src/{}", "deeply_nested_folder_name/".repeat(9));
+        let files: Vec<String> = (0..400).map(|i| format!("{dir}file_{i}.rs")).collect();
+        for f in &files {
+            let p = wt.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "fn x() {}\n".repeat(50)).unwrap();
+        }
+        sh(&wt, &["add", "-A"]);
+        sh(&wt, &["commit", "-qm", "big"]);
+        let commit = sh(&wt, &["rev-parse", "HEAD"]);
+        let refs: Vec<&str> = files.iter().map(String::as_str).collect();
+        fx.done("T1-fix", &commit, &refs);
+        fx.review_of("T1-fix").await;
+        let brief = fx.prompts("s2").remove(0);
+        let base = fx.row("T1-fix").base_commit.unwrap();
+        assert!(brief.len() < 48_000, "brief is {} bytes", brief.len());
+        // 400 files, and the copied AGENTS.md that `add -A` took.
+        assert!(brief.contains("401 files changed"), "the stat's summary line: {brief}");
+        assert!(
+            brief.contains("file_0.rs") && brief.contains("more lines cut"),
+            "{brief}"
+        );
+        for cmd in [
+            format!("`git diff --stat {base}...{commit}`"),
+            format!("`git diff {base}...{commit}`"),
+        ] {
+            assert!(brief.contains(&cmd), "{cmd} in {brief}");
+        }
     }
 
     #[tokio::test]

@@ -646,7 +646,7 @@ impact at most 40 words, at most 5 blockers; longer is refused."
                 "kind": { "type": "string", "enum": KINDS, "description": "update (task news), question (you need the user's answer), warning (something is wrong), done (work finished), note (an aside), reply (answer to the user's message)." },
                 "priority": { "type": "string", "enum": ["normal", "high"], "description": "high only when the user should look now. Default normal." },
                 "gate": { "type": "string", "enum": GATES, "description": GATE_HELP },
-                "sections": { "type": "array", "minItems": 1, "description": "One subsection per task, with only its facts. Use General for unrelated content. Do not repeat labels.", "items": { "type": "object", "properties": {
+                "sections": { "type": "array", "minItems": 1, "description": "One subsection per task, with only its facts. Use General for unrelated content. Do not repeat labels. Outside questions: at most 40 words per task section (done, next, needs_you, decided and body together; longer is refused).", "items": { "type": "object", "properties": {
                     "task": { "type": "string", "description": "Exact board task label, or General." },
                     "done": { "type": "string", "description": "Non-question kinds, required for a task: what finished, one short plain sentence." },
                     "next": { "type": "string", "description": "Non-question kinds, required for a task: what happens next and who does it (you, the task, the user)." },
@@ -957,6 +957,17 @@ mod tests {
         assert!(!t.execute(question_args("T2-api"), &ctx(d.path())).await.is_error);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(t.sup.board.lock().unwrap().general.is_empty());
+    }
+
+    /// L10.9: the section limit the check enforces is in the schema the model reads.
+    #[tokio::test]
+    async fn the_schema_states_the_40_words_per_task_section() {
+        let (t, _, _d) = tool(None).await;
+        let d = t.schema()["properties"]["sections"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(d.contains("at most 40 words per task section"), "{d}");
     }
 
     #[tokio::test]

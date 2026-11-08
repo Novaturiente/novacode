@@ -475,6 +475,9 @@ pub struct Task {
     /// A review's whole brief, when longer than [`REQUEST_KEPT`] ([`Board::compact`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub brief_file: Option<PathBuf>,
+    /// Its close summary's file (`summaries/<label>.md`), asked when the write task closed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_summary: Option<PathBuf>,
     /// Skills the brief names.
     pub skills: Vec<String>,
     /// `task spawn {goal: true}`: an open-ended task.
@@ -1649,13 +1652,17 @@ impl Board {
                 Kind::Work => "work",
                 Kind::Review => "review",
             };
+            let mut summary = t.summary.clone().unwrap_or_default();
+            if let Some(p) = &t.close_summary {
+                summary += &format!(" (close summary: {})", p.display());
+            }
             out.push_str(&format!(
                 "| {} | {} | {kind} | {} | {} | {} |\n",
                 cell(&self.name(t)),
                 cell(&t.repo_name()),
                 cell(&t.state_text()),
                 cell(&t.model),
-                cell(t.summary.as_deref().unwrap_or("")),
+                cell(summary.trim()),
             ));
         }
         let after = self
