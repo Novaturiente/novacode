@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 /// The longest `summary` a report may carry.
 pub const MAX_WORDS: usize = 80;
 /// The longest verdict plus findings of a review report.
-pub const MAX_VERDICT_CHARS: usize = 1000;
+pub const MAX_VERDICT_CHARS: usize = 2000;
 pub const MAX_FINDINGS: usize = 5;
 
 /// The `ext` of the session entry that saves the task's identity.
@@ -453,10 +453,10 @@ struct Args {
     /// Proof numbers from the `[proof #N]` marks (e.g. "#4"), plus files a check produced and URLs.
     #[serde(default)]
     checks: Vec<String>,
-    /// Review task: at most 5 findings or proof requests (with the verdict, 1000 characters at most).
+    /// Review task: at most 5 findings or proof requests (with the verdict, 2000 characters at most).
     #[serde(default)]
     findings: Vec<String>,
-    /// Review task: base-commit check results, outside the 1000-character cap.
+    /// Review task: base-commit check results, outside the 2000-character cap.
     baseline: Option<Value>,
 }
 
@@ -843,13 +843,13 @@ impl Tool for ReportTool {
             "type": "object",
             "properties": {
                 "state": { "type": "string", "enum": ["progress", "done", "blocked", "failed"], "description": "Work task: how it went." },
-                "verdict": { "type": "string", "enum": ["approved", "needs-proof", "rejected"], "description": "Review task, instead of `state`." },
+                "verdict": { "type": "string", "enum": ["approved", "needs-proof", "rejected"], "description": "Review task, instead of `state`. Verdict and findings together: at most 2000 characters." },
                 "merge": { "type": "string", "enum": ["rebased", "merged", "pr-opened", "failed"], "description": "Merging task, instead of `state`." },
-                "summary": { "type": "string", "description": "At most 80 words; for `merge`, the one-line reason." },
+                "summary": { "type": "string", "description": "Work task: at most 80 words (longer is refused); for `merge`, the one-line reason." },
                 "question": { "type": "string", "description": "Only with `state: blocked`: what you need answered." },
                 "checks": { "type": "array", "items": { "type": "string" }, "description": "Proof numbers from the `[proof #N]` marks on your bash and process results (e.g. \"#4\"); `done` on a write task needs at least one check that ran after your last edit and has exited, and a check from before it (such as the failing run of red-then-green) is allowed but marked `before the last edit`. Plus files a check produced (screenshots, logs) and URLs; never source files, commands or results: those go in `summary`." },
-                "findings": { "type": "array", "items": { "type": "string" }, "description": "Review task: at most 5 findings or proof requests (with the verdict, 1000 characters at most). `approved` must name every acceptance criterion by number, one short line each, like \"Criterion 1: met, #3 passes\"; a criterion that is not met means `rejected` or `needs-proof`, never `approved`." },
-                "baseline": { "type": "object", "description": "Review task: base-commit check results, outside the 1000-character cap: {\"checks\": [{\"folder\", \"command\", \"exit_codes\": [first run, re-run], \"failing\": [test names]}]}." }
+                "findings": { "type": "array", "items": { "type": "string" }, "description": "Review task: at most 5 findings or proof requests; with the verdict, at most 2000 characters in all (longer is refused). `approved` must name every acceptance criterion by number, one short line per criterion, like \"Criterion 1: met, #3 passes\"; a criterion that is not met means `rejected` or `needs-proof`, never `approved`." },
+                "baseline": { "type": "object", "description": "Review task: base-commit check results, outside the 2000-character cap: {\"checks\": [{\"folder\", \"command\", \"exit_codes\": [first run, re-run], \"failing\": [test names]}]}." }
             }
         })
     }
@@ -1252,6 +1252,23 @@ mod tests {
         assert!(long.ends_with("xxx\n") || long.ends_with("xxx"), "the end is kept");
     }
 
+    /// L10.9: the limits the checks enforce are in the schema the model reads.
+    #[tokio::test]
+    async fn the_schema_states_the_length_limits() {
+        let f = Fixture::new(false, Task::default());
+        let s = f.tool.schema();
+        let d = |k: &str| s["properties"][k]["description"].as_str().unwrap().to_string();
+        assert!(d("summary").contains("at most 80 words"), "{}", d("summary"));
+        for k in ["verdict", "findings"] {
+            assert!(d(k).contains("2000 characters"), "{k}: {}", d(k));
+        }
+        assert!(
+            d("findings").contains("one short line per criterion"),
+            "{}",
+            d("findings")
+        );
+    }
+
     #[tokio::test]
     async fn summary_over_80_words_is_refused() {
         let f = Fixture::new(false, Task::default());
@@ -1567,10 +1584,14 @@ mod tests {
             &review.report(json!({"verdict": "rejected", "findings": six})).await,
             "at most 5",
         );
-        let long = vec!["x".repeat(400); 3];
+        // L10.9: 2000 characters (1000 was refused 16 times on novahome).
+        let fits = vec!["x".repeat(600); 3];
+        let r = report(&review.report(json!({"verdict": "rejected", "findings": fits})).await);
+        assert_eq!(r["verdict"], json!("rejected"));
+        let long = vec!["x".repeat(700); 3];
         refused(
             &review.report(json!({"verdict": "rejected", "findings": long})).await,
-            "at most 1000",
+            "at most 2000",
         );
 
         // A merging write task with uncommitted changes and no checks.

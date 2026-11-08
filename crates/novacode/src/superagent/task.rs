@@ -141,7 +141,20 @@ pub struct Super {
     /// When the board was last saved, and whether volatile facts (tokens, health) changed
     /// since: those are saved with the next change, or by [`touch`](Self::touch) once a minute.
     saved: Mutex<(Option<std::time::Instant>, bool)>,
+    /// Close summaries waiting for their task's reply (L10.9): task id → where it goes.
+    summaries: Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<String>>>,
 }
+
+/// What a write task is asked before it closes (L10.9 close summary).
+const CLOSE_SUMMARY: &str = "Your task is closing; this session stops after this answer. Write the user a close \
+summary in plain everyday words, at most 250 words, under these headings: Implemented; How the project changes; \
+Features added or removed; Release/deploy impact (write \"none\" under a heading when nothing applies).";
+
+/// How long a close waits for the task's close summary.
+const SUMMARY_WAIT: std::time::Duration = match cfg!(test) {
+    true => std::time::Duration::from_millis(300),
+    false => std::time::Duration::from_secs(300),
+};
 
 /// The most often [`Super::touch`] writes the board.
 const VOLATILE_SAVE: std::time::Duration = std::time::Duration::from_secs(60);
@@ -498,6 +511,7 @@ impl Super {
             helper: std::sync::OnceLock::new(),
             reminders: Arc::default(),
             saved: Mutex::default(),
+            summaries: Mutex::default(),
         })
     }
 
@@ -2242,11 +2256,81 @@ impl Super {
             Some(p) if p == close_rm => true,
             _ => return Ok(format!("The user declined: {} stays open.", t.label)),
         };
+        let summary = self.close_summary(t).await;
         let mut out = self.close_now(t, remove, false).await?;
+        if let Some(s) = summary {
+            out += &format!(" {s}");
+        }
         for n in self.pump().await {
             out += &format!("\n{n}");
         }
         Ok(out)
+    }
+
+    /// Before a write task closes (L10.9): ask it (a question run) for a close summary, save
+    /// it to `summaries/<label>.md`, show it to the user and name its path on the row. Review
+    /// and read tasks get none (a read task's answer is its result). The line for super;
+    /// a task that can't answer in [`SUMMARY_WAIT`] doesn't hold up its close.
+    pub(super) async fn close_summary(&self, t: &Task) -> Option<String> {
+        if t.kind == Kind::Review || !t.write {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.summaries.lock().unwrap().insert(t.id.clone(), tx);
+        let got = match self.ask(t, CLOSE_SUMMARY).await {
+            Err(e) => Err(e),
+            Ok(_) => match tokio::time::timeout(SUMMARY_WAIT, rx).await {
+                Ok(Ok(r)) if !r.starts_with("(no ") => Ok(r),
+                Ok(Ok(r)) => Err(r),
+                _ => Err(format!("no answer within {} s", SUMMARY_WAIT.as_secs())),
+            },
+        };
+        self.summaries.lock().unwrap().remove(&t.id);
+        let reply = match got {
+            Ok(r) => r,
+            Err(why) => return Some(format!("No close summary for {}: {why}.", t.label)),
+        };
+        // The reply is cut for super's wake; the task's final message is whole.
+        let text = match reply.ends_with('…') {
+            true => self.row(&t.id).and_then(|r| self.read(&r, 0, 400)).unwrap_or(reply),
+            false => reply,
+        };
+        let dir = self.dir.join("summaries");
+        let path = dir.join(format!("{}.md", t.label));
+        let body = format!("# Close summary: {}\n\n{}\n", t.label, text.trim());
+        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &body)) {
+            return Some(format!("{}'s close summary was not saved: {e}.", t.label));
+        }
+        let _ = self.edit(|b| {
+            if let Some(r) = b.tasks.iter_mut().find(|r| r.id == t.id) {
+                r.close_summary = Some(path.clone());
+            }
+        });
+        if let Some(l) = self.links.get() {
+            l.notice(format!(
+                "{} close summary ({}):\n{}",
+                t.label,
+                path.display(),
+                text.trim()
+            ));
+        }
+        Some(format!(
+            "{}'s close summary is saved in {} and shown to the user.",
+            t.label,
+            path.display()
+        ))
+    }
+
+    /// A question run of `id` ended with `reply`: true when a close summary waited for it
+    /// (then super isn't woken with it).
+    pub(super) fn summary_reply(&self, id: &str, reply: &str) -> bool {
+        match self.summaries.lock().unwrap().remove(id) {
+            Some(tx) => {
+                let _ = tx.send(reply.to_string());
+                true
+            }
+            None => false,
+        }
     }
 
     /// Code closes `id` when its work is [`finished`] (L10.9), as `task close` without the
@@ -2254,10 +2338,14 @@ impl Super {
     pub(super) async fn auto_close(&self, id: &str) -> Option<String> {
         let t = self.row(id).ok().filter(finished)?;
         let remove = Self::merged(&t) == Some(true);
+        let summary = self.close_summary(&t).await;
         let mut out = match self.close_now(&t, remove, true).await {
             Ok(out) => format!("Code closed {}: its work is finished. {out}", t.label),
             Err(e) => format!("Code didn't close {}: {e}", t.label),
         };
+        if let Some(s) = summary {
+            out += &format!(" {s}");
+        }
         for n in self.pump().await {
             out += &format!("\n{n}");
         }
@@ -4522,6 +4610,44 @@ pub(super) mod tests {
         let q = fx.asker.asked.lock().unwrap()[2].question.clone();
         assert!(q.contains("is merged into main"), "{q}");
         assert!(!wt2.exists(), "{out}");
+    }
+
+    /// L10.9 close summary: review and read tasks get none (a read task's answer is its
+    /// result); a write task whose session can't answer gets none and super is told why.
+    #[tokio::test]
+    async fn review_and_read_tasks_close_without_a_close_summary() {
+        let fx = fixture(5, &[Some("Close"), Some("Close")]);
+        std::fs::create_dir(fx.root.join("p")).unwrap();
+        run(&fx, spawn_args("p", "q", false)).await.unwrap();
+        let out = run(&fx, json!({"action": "close", "task": "T1-q"})).await.unwrap();
+        assert_eq!(state(&fx, "T1-q"), State::Archived, "{out}");
+        assert!(!out.contains("close summary"), "{out}");
+        let review = Task {
+            kind: Kind::Review,
+            write: true,
+            label: "T2-review-T1-q".into(),
+            session: Some("s1".into()),
+            ..Task::default()
+        };
+        assert_eq!(fx.sup.close_summary(&review).await, None);
+        assert!(
+            !fx.launcher.prompts("s1").iter().any(|p| p.contains("close summary")),
+            "{:?}",
+            fx.launcher.prompts("s1")
+        );
+        assert!(!fx.sup.dir.join("summaries").exists());
+        // A write task still queued has no session to answer: closed, and super is told.
+        let q = Task {
+            id: "T3-w".into(),
+            label: "T3-w".into(),
+            write: true,
+            state: State::Queued,
+            ..Task::default()
+        };
+        fx.sup.edit(|b| b.tasks.push(q)).unwrap();
+        let out = run(&fx, json!({"action": "close", "task": "T3-w"})).await.unwrap();
+        assert_eq!(state(&fx, "T3-w"), State::Archived, "{out}");
+        assert!(out.contains("No close summary for T3-w"), "{out}");
     }
 
     #[tokio::test]

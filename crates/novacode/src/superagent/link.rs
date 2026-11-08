@@ -910,6 +910,11 @@ impl Links {
         self.inform.note(text);
     }
 
+    /// A notice in the user's windows only (a close summary).
+    pub(super) fn notice(&self, text: String) {
+        self.inform.notice(text);
+    }
+
     /// Super's session is ending: a card closing now got no answer.
     pub(super) fn closing(&self) -> bool {
         self.inform.closing()
@@ -1348,6 +1353,10 @@ impl Links {
                     t.last_prompt = None;
                 }
             });
+            // A close summary code asked for goes to the close, not to super.
+            if sup.summary_reply(id, &r) {
+                return;
+            }
             let label = sup.name_of(id);
             self.inform.wake(format!("{label} replied: {r}"));
         }
@@ -5058,6 +5067,75 @@ mod tests {
             w[0].contains("T1-x reported done (now reviewing): fixed more") && w[0].contains("Its review task"),
             "{w:?}"
         );
+    }
+
+    /// L10.9 close summary: before code closes a finished write task it asks the task for a
+    /// close summary (a question run), saves it under `summaries/`, shows it to the user,
+    /// names its path on the row and in super's note, and only then stops the task.
+    #[tokio::test]
+    async fn a_merged_write_task_gives_a_close_summary_before_it_closes() {
+        let fx = fixture(5);
+        let a = fx.sup.root.join("a");
+        fx.merging_branch("T1-x", &a);
+        fx.sup
+            .edit(|b| b.tasks.iter_mut().find(|t| t.id == "T1-x").unwrap().write = true)
+            .unwrap();
+        let mut t = fx.end("s-T1-x").await;
+        t.catch_up(false, vec![], vec![]).await;
+        write_report(
+            &fx,
+            "T1-x",
+            1,
+            "tok",
+            json!({"merge": "rebased", "summary": "rebased on main"}),
+        );
+        fx.links.kick();
+        let asked = |fx: &Fx| {
+            fx.launcher.sent.lock().unwrap().iter().any(|(s, c)| {
+                s == "s-T1-x"
+                    && matches!(c, ClientCmd::Prompt { text, .. }
+                        if text.starts_with(QUESTION_PREFIX) && text.contains("close summary"))
+            })
+        };
+        fx.until("summary asked", asked).await;
+        let shut = |fx: &Fx| {
+            fx.launcher
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(s, c)| s == "s-T1-x" && matches!(c, ClientCmd::Shutdown))
+        };
+        assert!(!shut(&fx), "stopped before its summary");
+        let text = "## Implemented\nT1-x.txt added.\n## How the project changes\nOne file more.";
+        t.event(AgentEvent::AgentStart).await;
+        t.event(says(text)).await;
+        t.event(end(QUESTION, StopReason::Stop)).await;
+        fx.until("shutdown sent", shut).await;
+        fx.launcher.alive.lock().unwrap().remove("s-T1-x");
+        fx.until("closed", |fx| fx.state("T1-x") == State::Archived).await;
+        let file = fx.sup.dir.join("summaries").join("T1-x.md");
+        assert!(std::fs::read_to_string(&file).unwrap().contains(text));
+        assert_eq!(fx.sup.row("T1-x").unwrap().close_summary.as_ref(), Some(&file));
+        let md = std::fs::read_to_string(fx.sup.dir.join("board.md")).unwrap();
+        assert!(md.contains(&file.display().to_string()), "{md}");
+        fx.until("closed note", |fx| {
+            fx.said()
+                .iter()
+                .any(|l| l.starts_with("note:") && l.contains("Code closed T1-x"))
+        })
+        .await;
+        let said = fx.said();
+        assert!(
+            said.iter().any(|l| l.starts_with("notice:") && l.contains(text)),
+            "shown to the user: {said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|l| l.starts_with("note:") && l.contains(&file.display().to_string())),
+            "{said:?}"
+        );
+        assert!(!said.iter().any(|l| l.contains("replied")), "no wake for it: {said:?}");
     }
 
     #[tokio::test]

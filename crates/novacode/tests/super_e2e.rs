@@ -543,6 +543,8 @@ fn super_runs_a_write_task_through_review_merge_and_close() {
             ),
             tool("report", json!({"merge": "rebased", "summary": "rebased on main"})),
             say("rebased"),
+            // Code's close summary question, before it closes the merged task (L10.9).
+            say("## Implemented\nnote.txt with a greeting.\n## Release/deploy impact\nnone"),
         ],
     );
     script(
@@ -673,6 +675,16 @@ fn super_runs_a_write_task_through_review_merge_and_close() {
         std::thread::sleep(Duration::from_millis(100));
     }
     let t = task(&home, label);
+    // Its close summary was asked before it closed, and saved (L10.9).
+    let summary = t["close_summary"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no close summary: {t}"));
+    assert!(
+        std::fs::read_to_string(summary)
+            .unwrap()
+            .contains("## Implemented\nnote.txt with a greeting."),
+        "{summary}"
+    );
     let rv = task(&home, review);
     assert_eq!(rv["state"], "archived", "{rv}");
     assert_eq!(rv["reviewer_of"], t["id"], "{rv}");
