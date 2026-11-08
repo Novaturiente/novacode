@@ -878,6 +878,110 @@ fn lock_session(path: &Path) -> io::Result<Option<storage::FileLock>> {
     storage::try_lock(path)
 }
 
+/// Retention (L4): delete subagent sessions (first prompt starts with
+/// [`SUBAGENT_TASK_PREFIX`]) and super review sessions (cwd under `<home>/super/*/review/`)
+/// untouched for `days` days, with their `.lock`/`.bak` files; a live one stays.
+/// `days` 0 keeps all. Returns (sessions removed, bytes freed).
+pub fn cleanup_old(paths: &Paths, days: u64) -> (usize, u64) {
+    let Some(cutoff) = (days > 0)
+        .then(|| SystemTime::now().checked_sub(std::time::Duration::from_secs(days * 86_400)))
+        .flatten()
+    else {
+        return (0, 0);
+    };
+    let home = paths.home();
+    let (mut n, mut bytes) = (0, 0);
+    for dir in std::fs::read_dir(home.join("sessions")).into_iter().flatten().flatten() {
+        let dir = dir.path();
+        let Ok(files) = std::fs::read_dir(&dir) else { continue };
+        for f in files.flatten() {
+            let path = f.path();
+            if path.extension().is_none_or(|x| x != "jsonl")
+                || f.metadata().and_then(|m| m.modified()).map_or(true, |t| t > cutoff)
+            {
+                continue;
+            }
+            let Some(id) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            if home.join("run").join(format!("{id}.json")).exists() || !disposable(home, &path) {
+                continue;
+            }
+            // Held while deleting, so the session can't be opened meanwhile.
+            let Ok(Some(_lock)) = storage::try_lock(&path) else {
+                continue;
+            };
+            let prefix = format!("{id}.");
+            for g in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                if g.file_name().to_string_lossy().starts_with(&prefix) {
+                    let size = g.metadata().map_or(0, |m| m.len());
+                    if std::fs::remove_file(g.path()).is_ok() {
+                        bytes += size;
+                    }
+                }
+            }
+            n += 1;
+        }
+        // Only succeeds when empty.
+        let _ = std::fs::remove_dir(&dir);
+    }
+    (n, bytes)
+}
+
+/// A subagent's session (its first prompt is the parent's task) or a super review's.
+fn disposable(home: &Path, path: &Path) -> bool {
+    use std::io::BufRead;
+    let Ok(f) = std::fs::File::open(path) else { return false };
+    let mut lines = io::BufReader::new(f).lines().map_while(Result::ok);
+    let Some(header) = lines.next().and_then(|l| serde_json::from_str::<Header>(&l).ok()) else {
+        return false;
+    };
+    if header
+        .cwd
+        .strip_prefix(home.join("super"))
+        .is_ok_and(|rest| rest.components().nth(1).is_some_and(|c| c.as_os_str() == "review"))
+    {
+        return true;
+    }
+    lines
+        .filter(|l| l.contains("\"role\":\"user\""))
+        .find_map(|l| match serde_json::from_str::<Entry>(&l).ok()?.kind {
+            EntryKind::Message {
+                message: Message::User { content },
+            } => Some(content.iter().any(
+                |b| matches!(b, Block::Text { text, .. } if typed_prompt(text).starts_with(SUBAGENT_TASK_PREFIX)),
+            )),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+/// [`cleanup_old`] at most once a day (stamp `<home>/run/session-cleanup`), logged.
+pub fn cleanup_daily(paths: &Paths, days: u64) -> Option<(usize, u64)> {
+    if days == 0 {
+        return None;
+    }
+    let stamp = paths.home().join("run").join("session-cleanup");
+    let recent = std::fs::metadata(&stamp)
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| t.elapsed().is_ok_and(|e| e.as_secs() < 86_400));
+    if recent {
+        return None;
+    }
+    let _ = std::fs::create_dir_all(paths.home().join("run"));
+    if let Err(e) = std::fs::write(&stamp, now_ms().to_string()) {
+        tracing::warn!(error = %e, "session cleanup: cannot write stamp");
+    }
+    let (n, bytes) = cleanup_old(paths, days);
+    tracing::info!(
+        sessions = n,
+        bytes,
+        days,
+        "session cleanup: removed old subagent and review sessions"
+    );
+    Some((n, bytes))
+}
+
 pub fn find(paths: &Paths, cwd: &Path, prefix: &str) -> Result<PathBuf, StoreError> {
     // A session file path works too (tmux restore stores the file, L8.14).
     if prefix.ends_with(".jsonl") && Path::new(prefix).is_file() {
@@ -1238,6 +1342,72 @@ mod tests {
         }
         assert_eq!(list(&paths, cwd).len(), 24);
         assert_eq!(recent_prompts(&paths, cwd, None, 10), ["a", "b", "c", "d"]);
+    }
+
+    /// Novahome: 1102 sessions in 4 days and no retention. Old subagent and super review
+    /// sessions go; user, super task and live sessions stay.
+    #[test]
+    fn old_subagent_and_review_sessions_are_cleaned_up() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::new(home.path());
+        let child = format!("{SUBAGENT_TASK_PREFIX}\"scout\" task");
+        let review = home.path().join("super/-w/review/T3-ab12");
+        let task = home.path().join("super/-w/wt/T1");
+        let write = |cwd: &Path, first: &str| {
+            let mut s = Store::create(&paths, cwd, false);
+            s.append(msg(first)).unwrap();
+            s.append(reply("ok")).unwrap();
+            s
+        };
+        let age = |s: &Store, days: u64| {
+            let p = s.path().unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(SystemTime::now() - std::time::Duration::from_secs(days * 86_400))
+                .unwrap();
+            p.to_path_buf()
+        };
+        let old_child = write(Path::new("/w"), &child);
+        let old_review = write(&review, "review T1");
+        let old_user = write(Path::new("/w"), "fix the bug");
+        let old_task = write(&task, "Task T1");
+        let new_child = write(Path::new("/w"), &child);
+        let live_child = write(Path::new("/w2"), &child);
+        let ran_child = write(Path::new("/w2"), &child);
+        let gone = [age(&old_child, 20), age(&old_review, 20)];
+        let kept = [
+            age(&old_user, 20),
+            age(&old_task, 20),
+            age(&new_child, 3),
+            age(&live_child, 20),
+            age(&ran_child, 20),
+        ];
+        std::fs::write(gone[0].with_extension("jsonl.bak"), "x").unwrap();
+        std::fs::create_dir_all(home.path().join("run")).unwrap();
+        std::fs::write(home.path().join("run").join(format!("{}.json", ran_child.id())), "{}").unwrap();
+        let review_dir = gone[1].parent().unwrap().to_path_buf();
+        drop((old_child, old_review, old_user, old_task, new_child, ran_child));
+        // Setting 0: nothing goes.
+        assert_eq!(cleanup_old(&paths, 0), (0, 0));
+        assert!(gone.iter().chain(&kept).all(|p| p.exists()));
+        let (n, bytes) = cleanup_old(&paths, 14);
+        assert_eq!(n, 2);
+        assert!(bytes > 0);
+        for p in &gone {
+            assert!(!p.exists(), "{}", p.display());
+            assert!(!p.with_extension("jsonl.lock").exists() && !p.with_extension("jsonl.bak").exists());
+        }
+        assert!(!review_dir.exists(), "empty folder removed");
+        for p in &kept {
+            assert!(p.exists(), "{}", p.display());
+        }
+        drop(live_child);
+        // At most once a day.
+        assert!(cleanup_daily(&paths, 14).is_some());
+        assert!(cleanup_daily(&paths, 14).is_none());
+        assert!(!kept[3].exists(), "no longer live");
     }
 
     #[test]

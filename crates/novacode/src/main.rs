@@ -1082,6 +1082,9 @@ async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     }
     let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&cwd)), trusted);
     diag::mark("trust + settings");
+    // L4: old subagent and review sessions, off the start path.
+    let (home, days) = (paths.clone(), settings.get::<u64>("sessions.cleanupDays").unwrap_or(14));
+    tokio::task::spawn_blocking(move || session::cleanup_daily(&home, days));
     let mut providers = Providers::load(paths.home(), &settings);
     diag::mark("providers + catalog");
     let chosen = cli.model.clone().or_else(|| settings.get::<String>("model"));

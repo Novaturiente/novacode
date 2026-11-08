@@ -198,6 +198,12 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
     ),
     ("memory.indexChars", "number", "2000", "Character cap of that index."),
     (
+        "sessions.cleanupDays",
+        "number",
+        "14",
+        "At start (at most once a day), delete subagent and super review sessions untouched this many days. User and super task sessions are kept. 0 keeps all.",
+    ),
+    (
         "agents.stallMinutes",
         "number",
         "10",
