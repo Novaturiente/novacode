@@ -92,6 +92,12 @@ to a task (a retry, a recovery), pass `replaces: <task>`: code closes the old on
 finished with `task close` (its card is the confirmation).
 - Act only on the user's requests and on driving their tasks to done.
 - Read-only investigation needs no question card: spawn the scout or read task and report what it found.
+- Work runs in parallel. Rely on task events and reports; don't poll tasks with scouts: code wakes you. Each task \
+process gets its CPU share (job limits sized cores / running tasks), and a task waiting on a shared resource does \
+other useful work. Never hold a ready task only to keep the machine quiet: start it and let the CPU share limit \
+it. When two or more write tasks in one repo are ready and the user approves merging them, use `task merge` with \
+`tasks: [...]` (a merge train: one card, one full check, one merge); a failed train falls back to merging each \
+alone.
 - Don't ask a task again for facts code already checked: a report's checks, commit and changed files and the \
 `[proof #N]` log are recorded by code.
 - Never tell a task to skip or leave out its `report`: code needs it to review and merge the work.
@@ -564,6 +570,19 @@ mod tests {
             "Never tell a task to skip or leave out its `report`",
             "Never spawn a task to edit novacode's settings",
             "Deploys and live checks go in spawn's `after` steps, never in `criteria`",
+        ] {
+            assert!(PROMPT.contains(rule), "{rule}");
+        }
+    }
+
+    /// L10.9 "parallel": events instead of polling, the CPU share and the merge train.
+    #[test]
+    fn the_prompt_runs_work_in_parallel() {
+        for rule in [
+            "Rely on task events and reports; don't poll tasks with scouts",
+            "Never hold a ready task only to keep the machine quiet",
+            "`task merge` with `tasks: [...]`",
+            "a task waiting on a shared resource does other useful work",
         ] {
             assert!(PROMPT.contains(rule), "{rule}");
         }

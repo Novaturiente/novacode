@@ -71,6 +71,44 @@ pub trait Launcher: Send + Sync {
     }
 }
 
+/// A task's CPU share: `cores` split over the running write and review tasks (this one
+/// included), counted up to `max_running`; at least 1.
+fn cpu_share(cores: usize, running: usize, max_running: usize) -> usize {
+    (cores / running.min(max_running).max(1)).max(1)
+}
+
+/// `MAKEFLAGS` with `-j<n>` added, unless it already sets the jobs.
+fn makeflags(existing: Option<&str>, n: usize) -> String {
+    match existing.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(m)
+            if m.split_whitespace()
+                .any(|w| w.starts_with("-j") || w.starts_with("--jobs")) =>
+        {
+            m.to_string()
+        }
+        Some(m) => format!("{m} -j{n}"),
+        None => format!("-j{n}"),
+    }
+}
+
+/// The job-limit variables of a task process with CPU share `n` (L10.9).
+fn cpu_env(n: usize) -> Vec<(String, String)> {
+    let n_s = n.to_string();
+    let mut env: Vec<(String, String)> = [
+        "NOVACODE_CPU_SHARE",
+        "CARGO_BUILD_JOBS",
+        "VITEST_MAX_WORKERS",
+        "VITEST_MAX_THREADS",
+        "VITEST_MAX_FORKS",
+    ]
+    .iter()
+    .map(|k| (k.to_string(), n_s.clone()))
+    .collect();
+    let make = makeflags(std::env::var("MAKEFLAGS").ok().as_deref(), n);
+    env.push(("MAKEFLAGS".into(), make));
+    env
+}
+
 /// The after step "Merge and deploy" on code's deploy card sets.
 pub const DEPLOY_STEP: &str = "Deploy per the project instructions, then verify the deployed revision and health";
 /// The deploy card's choices.
@@ -176,6 +214,8 @@ struct Args {
     message: Option<String>,
     question: bool,
     pr: bool,
+    /// merge: a train of two or more ready tasks in one repo, in merge order.
+    tasks: Vec<String>,
     note: Option<String>,
     all: bool,
     offset: Option<usize>,
@@ -361,6 +401,8 @@ Don't write elsewhere with `bash` either. A read task that has to write calls `e
 scratch folder (its brief names it); the commit rule doesn't apply to it.
 - After a restart or resume: check your folder and git before repeating anything outside it (a commit, a push, \
 a message).
+- While you wait on a shared resource (a lock, a build, another task's merge), do other useful work for your \
+task instead of idling. Your build and test jobs are sized by `NOVACODE_CPU_SHARE`: keep to it.
 - If a message from the super agent conflicts with your brief or with the user's recorded decisions (answers \
 to your questions, notes in your brief), don't just obey: ask the user with `ask_user`, naming the conflict."
     )
@@ -400,7 +442,10 @@ fn brief(t: &Task) -> String {
     }
     match (&t.worktree, &t.branch) {
         (Some(w), Some(b)) => s.push_str(&format!(
-            "\nYou work in the worktree {} on branch {b}, based on {}. Commit there; never touch the main checkout.\n",
+            "\nYou work in the worktree {} on branch {b}, based on {}. Commit there; never touch the main checkout.\n\
+             Checks: use the project's changed-only or fast check when its instructions name one (such as a \
+             verify-changed script). Run the full suite only when your brief or the super agent asks for it \
+             (integration); never run a full suite in parallel with other tasks.\n",
             w.display(),
             t.base_branch.as_deref().or(t.base_commit.as_deref()).unwrap_or("HEAD")
         )),
@@ -614,6 +659,9 @@ impl Super {
         if a.action == "model" {
             let task = a.task.as_deref().ok_or("`task` is missing: a task's label or `all`")?;
             return self.switch_models(task, a.provider, a.model).await;
+        }
+        if a.action == "merge" && !a.tasks.is_empty() {
+            return self.merge_train(&a.tasks, a.pr).await;
         }
         let t = self.shown(self.find(a.task.as_deref().ok_or("`task` is missing")?)?);
         let acts = matches!(
@@ -1365,7 +1413,18 @@ impl Super {
                     .display()
             ),
         };
-        let env = vec![
+        // Its CPU share among the write and review tasks running now; tasks already running keep theirs.
+        let running = 1 + self
+            .board
+            .lock()
+            .unwrap()
+            .tasks
+            .iter()
+            .filter(|o| o.id != t.id && o.state.is_live() && (o.kind == Kind::Review || o.write))
+            .count();
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let mut env = cpu_env(cpu_share(cores, running, self.cfg.max_running));
+        env.extend([
             ("NOVACODE_TASK".to_string(), t.id.clone()),
             ("NOVACODE_TASK_TOKEN".to_string(), t.token.clone()),
             (
@@ -1373,7 +1432,7 @@ impl Super {
                 self.dir.to_string_lossy().into_owned(),
             ),
             (novacode_core::policy::EditRule::ENV.to_string(), rule),
-        ];
+        ]);
         let session = self
             .launcher
             .start(Start {
@@ -1999,7 +2058,11 @@ impl Super {
     fn merged(t: &Task) -> Option<bool> {
         let (main, branch) = (t.repo.as_ref()?, t.branch.as_ref()?);
         let base = t.base_branch.as_ref().or(t.base_commit.as_ref())?;
-        Some(git(main, &["merge-base", "--is-ancestor", branch, base]).is_ok())
+        // Or every commit of it is in the base as an equal patch (cherry-picked by a merge train).
+        Some(
+            git(main, &["merge-base", "--is-ancestor", branch, base]).is_ok()
+                || git(main, &["cherry", base, branch]).is_ok_and(|o| !o.lines().any(|l| l.starts_with('+'))),
+        )
     }
 
     /// A confirmation card made by code: true only when the user picks `ok`.
@@ -2204,7 +2267,9 @@ impl Super {
             .clone()
             .or(t.base_commit.clone())
             .unwrap_or_else(|| "its base".into());
+        // Approved on a merge train's card whose train failed: no second card.
         if !confirmed
+            && !t.merge_approved
             && !self
                 .confirm(format!("{}: merge", t.label), Self::merge_question(t, pr), "Merge")
                 .await?
@@ -2215,6 +2280,8 @@ impl Super {
             let n = b.apply(&t.id, Event::Merge)?;
             if let Some(row) = b.tasks.iter_mut().find(|r| r.id == t.id) {
                 row.pr = pr;
+                row.train = None;
+                row.merge_approved = false;
             }
             Ok::<_, String>(n)
         })??;
@@ -2281,6 +2348,133 @@ with the reason.",
         };
         let held = self.deliver(&t.id, text).await?;
         Ok(format!("{} is merging.{}", t.label, held_note(held)))
+    }
+
+    /// `task merge {tasks}` (L10.9 merge train): ready write tasks of one repo and base merge
+    /// as one. One card confirms them all; code makes the integration branch from the base,
+    /// and the first task cherry-picks every task's commits onto it in order, runs the full
+    /// check once and reports `merge: rebased` (or opens one PR). Its result lands every task
+    /// ([`Links`](super::link::Links) applies it); a failed train falls back to single merges.
+    async fn merge_train(&self, names: &[String], pr: bool) -> Result<String, String> {
+        let ts = names
+            .iter()
+            .map(|n| self.find(n).map(|t| self.shown(t)))
+            .collect::<Result<Vec<Task>, String>>()?;
+        let mut ids: Vec<&str> = ts.iter().map(|t| t.id.as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        if ids.len() < 2 {
+            return Err("a merge train takes at least two different tasks; merge one task with `task`".into());
+        }
+        let lead = &ts[0];
+        for t in &ts {
+            self.check(&t.id, Event::Merge)?;
+            if t.asking {
+                return Err(format!(
+                    "{}'s deploy card is open; the user's choice there merges it",
+                    t.label
+                ));
+            }
+            if t.repo != lead.repo || t.base_branch.is_none() || t.base_branch != lead.base_branch {
+                return Err(format!(
+                    "a merge train needs tasks in the same repo on the same base branch: {} differs from {}",
+                    t.label, lead.label
+                ));
+            }
+        }
+        let (Some(main), Some(base)) = (lead.repo.clone(), lead.base_branch.clone()) else {
+            return Err(format!("{} has no repo or base branch to merge into", lead.label));
+        };
+        let labels = ts.iter().map(|t| t.label.as_str()).collect::<Vec<_>>().join(", ");
+        let lands = match pr {
+            true => format!("it is pushed and one pull request against {base} is opened"),
+            false => format!("{base} in the main checkout {} is fast-forwarded to it", main.display()),
+        };
+        let mut q = format!(
+            "Merge {labels} together as one merge train? {} cherry-picks each task's commits, in this order, onto a \
+             new branch from {base} and runs the full check once; then {lands}. If the train fails, each task \
+             merges alone without another card.",
+            lead.label
+        );
+        for t in ts.iter().filter(|t| !t.after.is_empty()) {
+            q += &format!(" {}'s after steps run once it lands: {}.", t.label, t.after.join("; "));
+        }
+        if !self.confirm(format!("{}: merge train", lead.label), q, "Merge").await? {
+            return Ok(format!("The user declined: {labels} are not merged."));
+        }
+        if !pr && let Some(why) = main_refuses(&main, &base) {
+            return Ok(format!(
+                "The merge train of {labels} didn't start: {why}. Nothing was touched; fix it and call merge again."
+            ));
+        }
+        let sid = self.board.lock().unwrap().sid.clone();
+        let prefix = match sid.is_empty() {
+            true => "train".to_string(),
+            false => format!("train-{sid}"),
+        };
+        let branch = (1..)
+            .map(|n| format!("{prefix}-{n}"))
+            .find(|b| git(&main, &["rev-parse", "--verify", "-q", &format!("refs/heads/{b}")]).is_err())
+            .unwrap_or_default();
+        git(&main, &["branch", &branch, &format!("refs/heads/{base}")])?;
+        let rest: Vec<String> = ts[1..].iter().map(|t| t.id.clone()).collect();
+        let now = super::board::now();
+        self.edit(|b| {
+            b.apply(&lead.id, Event::Merge)?;
+            for r in b.tasks.iter_mut().filter(|r| ids.contains(&r.id.as_str())) {
+                r.pr = pr;
+                r.acted_at = now;
+                r.merge_approved = false;
+                if r.id == lead.id {
+                    r.train = Some(super::board::Train {
+                        branch: branch.clone(),
+                        tasks: rest.clone(),
+                    });
+                }
+            }
+            Ok::<_, String>(())
+        })??;
+        let own = lead.branch.clone().unwrap_or_else(|| "your branch".into());
+        let picks: String = ts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let b = t.branch.as_deref().unwrap_or("?");
+                format!("{}. {}: `git cherry-pick {base}..{b}`\n", i + 1, t.label)
+            })
+            .collect();
+        let after = ts.iter().any(|t| !t.after.is_empty());
+        let end = match (pr, after) {
+            (false, _) => format!(
+                "report `merge: rebased`: novacode then fast-forwards {base} in the main checkout {} to {branch} and \
+                 marks every task in the train merged. Don't touch the main checkout yourself.",
+                main.display()
+            ),
+            (true, false) => format!(
+                "push {branch}, open one pull request against {base} naming the tasks ({labels}), then report \
+                 `merge: pr-opened`."
+            ),
+            (true, true) => format!(
+                "push {branch}, open one pull request against {base} naming the tasks ({labels}), merge it per the \
+                 repo's normal flow (its required checks and approvals), and report `merge: merged` once it is \
+                 merged (`merge: pr-opened` only if it can't be merged yet, with the reason)."
+            ),
+        };
+        let text = format!(
+            "The user approved merging {labels} together as one merge train. Code made branch {branch} from {base}. \
+             In your worktree, commit anything open, then `git switch {branch}` and cherry-pick each task's commits \
+             onto it in this order:\n{picks}Resolve trivial conflicts. Then run the project's full check once on \
+             {branch} (this is the integration run). If it passes, {end}\nIf a cherry-pick conflicts in a way you \
+             can't resolve, or the full check fails: `git cherry-pick --abort` if one is in progress, `git switch \
+             {own}`, and report `merge: failed` naming the task whose change conflicts or fails; each task then \
+             merges alone."
+        );
+        let held = self.deliver(&lead.id, text).await?;
+        Ok(format!(
+            "The merge train of {labels} started on {branch}: {} builds it and runs the full check.{}",
+            lead.label,
+            held_note(held)
+        ))
     }
 
     /// Write tasks that need code's deploy card now; each is marked `asking` (L10.9).
@@ -2629,7 +2823,7 @@ impl Tool for TaskTool {
         "task"
     }
     fn description(&self) -> &str {
-        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], after?[], replaces?, scope?[], skills?[], goal?} (`after`: steps that run only once the merge lands, such as deploy and live checks; never put them in criteria: the review judges only the criteria, then after the merge code sends the after steps to the task, which reports done with their proof; `replaces`: the task this one succeeds, which code closes without a card); info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task, pr?} (each asks the user on a card; code itself closes a ready read task, and a write task once its merge landed and its after steps are done; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task with commits past its base, not merging or ready, ships without an approved review after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked because it kept ending without a report, or that reported `blocked`: code takes its commit and changed files from its worktree's HEAD when it has no `done`, refused when nothing is committed, and the review uses a round); note {task, note} (keeps a user decision about the task on its charter, which you see with every message); scope {task, request? | criteria? | scope?[]} (changes the brief, criteria or scope only after the user's OK on a card, which shows only what changes; scope is short points, at most 8 of at most 25 words each; code then updates the charter and tells the task); model {task | all, provider | model} (only when the user asks to switch models: each task moves to the matching tier on that provider, or to that model, after one card listing each task's old and new model; a task blocked by a provider limit is told to continue); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
+        "Start and steer tasks: separate novacode sessions that do the user's work. Actions: spawn {request, folder, slug, write, tier? | model?, type?, criteria[], after?[], replaces?, scope?[], skills?[], goal?} (`after`: steps that run only once the merge lands, such as deploy and live checks; never put them in criteria: the review judges only the criteria, then after the merge code sends the after steps to the task, which reports done with their proof; `replaces`: the task this one succeeds, which code closes without a card); info {folder} (changes nothing: whether the folder is in git, the branch a write task's worktree would start from, and trust; show it with the criteria before a non-trivial task starts); send {task, message, question?}; stop {task} (a running, queued or reviewing task; a blocked one is not running: close or send it); close {task} and merge {task | tasks[], pr?} (each asks the user on a card; `tasks`: a merge train of two or more ready write tasks in one repo, in order, on one card; code itself closes a ready read task, and a write task once its merge landed and its after steps are done; merge works on a ready task, or retries on a task blocked by a failed merge whose approval still covers its commit); accept {task} (a read task in reviewing, or blocked by code, e.g. it answered without a report; a write task with commits past its base, not merging or ready, ships without an approved review after the user's OK on a card); review {task, note?} (a ready task again without a round; a write task blocked because it kept ending without a report, or that reported `blocked`: code takes its commit and changed files from its worktree's HEAD when it has no `done`, refused when nothing is committed, and the review uses a round); note {task, note} (keeps a user decision about the task on its charter, which you see with every message); scope {task, request? | criteria? | scope?[]} (changes the brief, criteria or scope only after the user's OK on a card, which shows only what changes; scope is short points, at most 8 of at most 25 words each; code then updates the charter and tells the task); model {task | all, provider | model} (only when the user asks to switch models: each task moves to the matching tier on that provider, or to that model, after one card listing each task's old and new model; a task blocked by a provider limit is told to continue); list {all?}; read {task, offset?, limit?} (pages the task's final message)."
     }
     fn schema(&self) -> Value {
         let s = |d: &str| json!({ "type": "string", "description": d });
@@ -2655,6 +2849,7 @@ impl Tool for TaskTool {
                 "message": s("send: the message."),
                 "question": { "type": "boolean", "description": "send: only ask for information (raw output, proof): the task's state and review stay, it answers in text without a report, and its reply wakes you. Leave false for work: a plain send sets the task running and stops its review." },
                 "pr": { "type": "boolean", "description": "merge: open a pull request instead of merging locally; only when the user asked for a pull request." },
+                "tasks": { "type": "array", "items": { "type": "string" }, "description": "merge: instead of `task`, two or more ready write tasks in one repo, in merge order: a merge train (one card, one integration branch, one full check, one merge)." },
                 "note": s("review: what the review should look at. note: the user's decision to keep on the task's charter."),
                 "all": { "type": "boolean", "description": "list: archived tasks too." },
                 "offset": { "type": "integer", "description": "read: first line (0-based)." },
@@ -4826,6 +5021,152 @@ pub(super) mod tests {
         assert!(b.contains("don't edit"), "{b}");
         assert!(b.contains("call `report` with `state: done`"), "{b}");
         assert!(b.contains("then write your full answer"), "{b}");
+    }
+
+    /// L10.9 "parallel": a write task uses the project's changed-only check; the full suite
+    /// runs only at integration, never next to other tasks.
+    #[test]
+    fn a_write_brief_asks_for_the_changed_only_check() {
+        let t = Task {
+            label: "T3-w".into(),
+            write: true,
+            request: "fix it".into(),
+            worktree: Some("/r/.worktrees/T3-w".into()),
+            branch: Some("worktree-T3-w".into()),
+            ..Task::default()
+        };
+        let b = brief(&t);
+        for rule in [
+            "use the project's changed-only or fast check when its instructions name one",
+            "Run the full suite only when your brief or the super agent asks for it (integration)",
+            "never run a full suite in parallel with other tasks",
+        ] {
+            assert!(b.contains(rule), "{rule}: {b}");
+        }
+        let read = Task {
+            label: "T4-q".into(),
+            request: "why?".into(),
+            ..Task::default()
+        };
+        assert!(!brief(&read).contains("changed-only"));
+    }
+
+    #[test]
+    fn the_preamble_says_a_waiting_task_does_other_work() {
+        let p = preamble("T3-fix");
+        assert!(
+            p.contains("While you wait on a shared resource") && p.contains("do other useful work"),
+            "{p}"
+        );
+    }
+
+    /// L10.9 "CPU share": cores split over the running write and review tasks (at most
+    /// `maxRunning`), at least 1 each.
+    #[test]
+    fn the_cpu_share_splits_the_cores_over_running_tasks() {
+        assert_eq!(cpu_share(16, 1, 5), 16);
+        assert_eq!(cpu_share(16, 0, 5), 16);
+        assert_eq!(cpu_share(16, 4, 5), 4);
+        assert_eq!(cpu_share(16, 8, 5), 3, "capped by maxRunning");
+        assert_eq!(cpu_share(2, 4, 5), 1, "at least 1");
+        assert_eq!(cpu_share(16, 3, 0), 16);
+        assert_eq!(makeflags(None, 4), "-j4");
+        assert_eq!(makeflags(Some(""), 4), "-j4");
+        assert_eq!(makeflags(Some("--silent"), 4), "--silent -j4");
+        assert_eq!(makeflags(Some("-j8 --silent"), 4), "-j8 --silent");
+        assert_eq!(makeflags(Some("--jobs=8"), 4), "--jobs=8");
+    }
+
+    #[tokio::test]
+    async fn a_started_task_gets_its_cpu_share_in_its_env() {
+        let fx = fixture(5, &[]);
+        repo(&fx.root, "app");
+        run(&fx, spawn_args("app", "m", true)).await.unwrap();
+        run(&fx, spawn_args("app", "n", true)).await.unwrap();
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let starts = fx.launcher.starts.lock().unwrap().clone();
+        let env = |i: usize, k: &str| {
+            starts[i]
+                .env
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        for (i, running) in [(0, 1), (1, 2)] {
+            let n = cpu_share(cores, running, 5).to_string();
+            for k in [
+                "NOVACODE_CPU_SHARE",
+                "CARGO_BUILD_JOBS",
+                "VITEST_MAX_WORKERS",
+                "VITEST_MAX_THREADS",
+                "VITEST_MAX_FORKS",
+            ] {
+                assert_eq!(env(i, k), n, "start {i} {k}");
+            }
+            assert!(env(i, "MAKEFLAGS").contains("-j"), "{:?}", starts[i].env);
+        }
+    }
+
+    /// L10.9 "merge train": one card for the whole train; code makes the integration branch
+    /// and the first task builds it.
+    #[tokio::test]
+    async fn a_merge_train_asks_once_and_the_first_task_builds_the_train_branch() {
+        let fx = fixture(5, &[Some("Merge")]);
+        let app = repo(&fx.root, "app");
+        repo(&fx.root, "other");
+        run(&fx, spawn_args("app", "m", true)).await.unwrap();
+        run(&fx, spawn_args("app", "n", true)).await.unwrap();
+        run(&fx, spawn_args("other", "o", true)).await.unwrap();
+        for id in ["T1-m", "T2-n", "T3-o"] {
+            set_state(&fx, id, State::Ready);
+        }
+        let e = run(&fx, json!({"action": "merge", "tasks": ["T1-m"]}))
+            .await
+            .unwrap_err();
+        assert!(e.contains("at least two"), "{e}");
+        let e = run(&fx, json!({"action": "merge", "tasks": ["T1-m", "T3-o"]}))
+            .await
+            .unwrap_err();
+        assert!(e.contains("same repo"), "{e}");
+        assert!(fx.asker.asked.lock().unwrap().is_empty(), "refused before any card");
+
+        let out = run(&fx, json!({"action": "merge", "tasks": ["T1-m", "T2-n"]}))
+            .await
+            .unwrap();
+        assert!(out.contains("train"), "{out}");
+        let asked = fx.asker.asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1, "one card for the train");
+        assert!(asked[0].question.contains("T1-m, T2-n"), "{}", asked[0].question);
+        let t1 = fx.sup.row("T1-m").unwrap();
+        let train = t1.train.clone().unwrap();
+        assert_eq!(train.tasks, ["T2-n"]);
+        assert_eq!(train.branch, "train-1");
+        assert_eq!(
+            git(&app, &["rev-parse", "train-1"]).unwrap(),
+            git(&app, &["rev-parse", "main"]).unwrap()
+        );
+        assert_eq!(t1.state, State::Merging);
+        assert_eq!(state(&fx, "T2-n"), State::Ready);
+        let lock: Vec<String> = fx.sup.board.lock().unwrap().merge_locks.values().cloned().collect();
+        assert_eq!(lock, ["T1-m"]);
+        let text = fx.launcher.prompts("s1").last().unwrap().clone();
+        for want in [
+            "git switch train-1",
+            "worktree-T1-m",
+            "worktree-T2-n",
+            "cherry-pick",
+            "full check",
+            "merge: rebased",
+            "merge: failed",
+        ] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+        // A second train in that repo waits for the lock.
+        let e = run(&fx, json!({"action": "merge", "tasks": ["T2-n", "T1-m"]}))
+            .await
+            .unwrap_err();
+        assert!(e.contains("merging"), "{e}");
     }
 
     #[test]

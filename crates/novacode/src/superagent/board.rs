@@ -354,6 +354,15 @@ pub const ASKED_KEPT: usize = 10;
 /// Chars of a card's text kept.
 pub const ASKED_TEXT: usize = 200;
 
+/// A merge train (L10.9): its first task cherry-picks every task's commits, in order, onto
+/// `branch`, which lands as one merge.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Train {
+    pub branch: String,
+    /// The other tasks, in merge order.
+    pub tasks: Vec<String>,
+}
+
 /// One board row: only what super owns. Live data (busy, current model,
 /// tokens) comes from the task's run file and socket.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -467,6 +476,13 @@ pub struct Task {
     /// Code's deploy card is open now (not saved: a restart has no open card).
     #[serde(skip)]
     pub asking: bool,
+    /// On a merge train's first task: the integration branch and the other tasks in it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub train: Option<Train>,
+    /// The user approved its merge on a train's card and the train failed: its next
+    /// `task merge` needs no card.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub merge_approved: bool,
     /// Unix seconds.
     pub started: u64,
     pub updated: u64,

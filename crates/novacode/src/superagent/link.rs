@@ -1479,7 +1479,11 @@ Address every finding, commit, re-run your checks and report `done` again.",
                 }
                 // R29: the task rebased; code fast-forwards the main checkout (never sandboxed).
                 (None, Some("rebased")) => Event::MergeReport(match sup.row(&r.task) {
-                    Ok(t) if t.state == State::Merging && !t.pr => {
+                    Ok(mut t) if t.state == State::Merging && !t.pr => {
+                        // A merge train lands its integration branch.
+                        if let Some(train) = &t.train {
+                            t.branch = Some(train.branch.clone());
+                        }
                         match tokio::task::spawn_blocking(move || super::task::fast_forward(&t)).await {
                             Ok(Ok(())) => MergeResult::Merged,
                             Ok(Err(why)) => MergeResult::Failed(why),
@@ -1537,6 +1541,15 @@ Address every finding, commit, re-run your checks and report `done` again.",
             }
             sup.adopt_branch(&r.task, f.get("branch").and_then(Value::as_str)).await;
             let landed = ev == Event::MergeReport(MergeResult::Merged);
+            let train = match &ev {
+                Event::MergeReport(m) => sup
+                    .row(&r.task)
+                    .ok()
+                    .filter(|t| t.state == State::Merging)
+                    .and_then(|t| t.train)
+                    .map(|train| (train, m.clone())),
+                _ => None,
+            };
             let applied = self.apply_with(sup, &r.task, ev, &checks_text(f));
             if applied.is_none()
                 && let Some(old) = prior_done
@@ -1550,7 +1563,57 @@ Address every finding, commit, re-run your checks and report `done` again.",
             if landed && applied.is_some() {
                 self.after_landed(&r.task);
             }
+            if let (Some((train, m)), Some(_)) = (train, applied) {
+                self.train_ended(sup, &r.task, train, m);
+            }
             self.applied(sup, p);
+        }
+    }
+
+    /// The merge of train lead `lead` ended with `m` (L10.9): a landed train lands every task
+    /// in it as a single merge would; a failed one falls back to merging each alone, with
+    /// the user's approval from the train's card.
+    fn train_ended(&self, sup: &Super, lead: &str, train: board::Train, m: MergeResult) {
+        let _ = sup.edit(|b| {
+            if let Some(t) = b.tasks.iter_mut().find(|t| t.id == lead) {
+                t.train = None;
+            }
+        });
+        let lead_name = sup.name_of(lead);
+        if let MergeResult::Failed(why) = m {
+            let all: Vec<&str> = std::iter::once(lead)
+                .chain(train.tasks.iter().map(String::as_str))
+                .collect();
+            let _ = sup.edit(|b| {
+                for t in b.tasks.iter_mut().filter(|t| all.contains(&t.id.as_str())) {
+                    t.merge_approved = true;
+                }
+            });
+            let names: Vec<String> = all.iter().map(|id| sup.name_of(id)).collect();
+            self.inform.wake(format!(
+                "The merge train of {} failed: {why}. Fall back: merge alone each task, one at a time, with \
+                 `task merge` (the user approved them on the train's card, so no card opens).",
+                names.join(", ")
+            ));
+            return;
+        }
+        let landed = m == MergeResult::Merged;
+        for id in &train.tasks {
+            let extra = format!("\nIt landed in {lead_name}'s merge train.");
+            let ok = self.apply_with(sup, id, Event::Merge, "").is_some()
+                && self
+                    .apply_with(sup, id, Event::MergeReport(m.clone()), &extra)
+                    .is_some();
+            if !ok {
+                self.inform.wake(format!(
+                    "{}'s commits are in {lead_name}'s merge train, which landed, but its row changed meanwhile \
+                     (now {}): code didn't mark it merged; check it.",
+                    sup.name_of(id),
+                    sup.row(id).map_or("gone", |t| t.state.name())
+                ));
+            } else if landed {
+                self.after_landed(id);
+            }
         }
     }
 
@@ -4286,6 +4349,117 @@ mod tests {
             .collect();
         assert_eq!(merge_resumes.len(), 1, "{sent:?}");
         assert!(fx.asker.asked.lock().unwrap().len() == 1, "asked once");
+    }
+
+    /// A merge train in repo `a`: T1-x leads on `train-1` (both branches cherry-picked onto
+    /// main), T2-y is ready; each branch adds `<id>.txt`.
+    fn train(fx: &Fx) -> std::path::PathBuf {
+        let a = fx.sup.root.join("a");
+        git_repo(&a);
+        for id in ["T1-x", "T2-y"] {
+            git_in(&a, &[&["checkout", "-qb", &format!("worktree-{id}")][..]]);
+            commit_file(&a, &format!("{id}.txt"));
+            git_in(&a, &[&["checkout", "-q", "main"][..]]);
+        }
+        git_in(
+            &a,
+            &[
+                &["checkout", "-qb", "train-1"][..],
+                &["cherry-pick", "main..worktree-T1-x"],
+                &["cherry-pick", "main..worktree-T2-y"],
+                &["checkout", "-q", "main"],
+            ],
+        );
+        fx.merging("T1-x", &a);
+        fx.task("T2-y", "faux/a", State::Ready);
+        fx.sup
+            .edit(|b| {
+                for t in b.tasks.iter_mut() {
+                    t.repo = Some(a.clone());
+                    t.write = true;
+                    t.branch = Some(format!("worktree-{}", t.id));
+                    t.base_branch = Some("main".into());
+                }
+                b.tasks[0].train = Some(board::Train {
+                    branch: "train-1".into(),
+                    tasks: vec!["T2-y".into()],
+                });
+            })
+            .unwrap();
+        a
+    }
+
+    /// L10.9 "merge train": the lead's `merge: rebased` fast-forwards main to the train
+    /// branch; every task in it lands and closes like a single merge.
+    #[tokio::test]
+    async fn a_merge_train_lands_every_task_in_it() {
+        let fx = fixture(5);
+        let a = train(&fx);
+        write_report(
+            &fx,
+            "T1-x",
+            1,
+            "tok",
+            json!({"merge": "rebased", "summary": "train built"}),
+        );
+        fx.links.kick();
+        fx.until("both landed", |fx| {
+            ["T1-x", "T2-y"]
+                .iter()
+                .all(|id| fx.sup.row(id).unwrap().landed == Some(board::Landed::Merged))
+        })
+        .await;
+        assert_eq!(
+            git_head(&a, "HEAD"),
+            git_head(&a, "train-1"),
+            "main fast-forwarded to the train"
+        );
+        assert!(a.join("T1-x.txt").exists() && a.join("T2-y.txt").exists());
+        assert_eq!(fx.locks(), 0);
+        let wakes: Vec<_> = fx.said().into_iter().filter(|l| l.starts_with("wake:")).collect();
+        assert!(wakes.iter().any(|w| w.contains("T1-x merged")), "{wakes:?}");
+        assert!(
+            wakes.iter().any(|w| w.contains("T2-y merged") && w.contains("train")),
+            "{wakes:?}"
+        );
+        fx.launcher.alive.lock().unwrap().clear();
+        fx.until("both closed", |fx| {
+            fx.state("T1-x") == State::Archived && fx.state("T2-y") == State::Archived
+        })
+        .await;
+    }
+
+    /// A failed train names its tasks and falls back: each merges alone, already approved.
+    #[tokio::test]
+    async fn a_failed_merge_train_falls_back_to_single_merges() {
+        let fx = fixture(5);
+        let a = train(&fx);
+        let head = git_head(&a, "HEAD");
+        write_report(
+            &fx,
+            "T1-x",
+            1,
+            "tok",
+            json!({"merge": "failed", "summary": "T2-y conflicts in f"}),
+        );
+        fx.links.kick();
+        fx.until("lead blocked", |fx| fx.state("T1-x") == State::Blocked).await;
+        assert_eq!(git_head(&a, "HEAD"), head);
+        let (t1, t2) = (fx.sup.row("T1-x").unwrap(), fx.sup.row("T2-y").unwrap());
+        assert_eq!(t1.train, None);
+        assert_eq!((t2.state, t2.landed), (State::Ready, None));
+        assert!(t1.merge_approved && t2.merge_approved);
+        let wakes: Vec<_> = fx.said().into_iter().filter(|l| l.starts_with("wake:")).collect();
+        assert!(
+            wakes
+                .iter()
+                .any(|w| w.contains("train of T1-x, T2-y failed") && w.contains("merge alone")),
+            "{wakes:?}"
+        );
+        // Approved on the train's card: no card now (this fixture has no window to ask in).
+        let out = fx.sup.run(json!({"action": "merge", "task": "T2-y"})).await.unwrap();
+        assert!(out.contains("T2-y is merging"), "{out}");
+        assert!(!fx.sup.row("T2-y").unwrap().merge_approved, "used once");
     }
 
     fn write_report(fx: &Fx, task: &str, seq: u64, token: &str, fields: Value) {
