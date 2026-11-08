@@ -1,13 +1,15 @@
 //! Image normalisation at attach time (L2.22): sniff the real format, keep a
 //! file that already fits byte-for-byte, otherwise convert and shrink it to
-//! fit every provider (2000×2000, 4.5MB of base64, under Anthropic's 5MB).
+//! fit every provider (4.5MB of base64, under Anthropic's 5MB). The long side
+//! is at most 1568 px, the size Anthropic scales to anyway (L5); an opaque
+//! image (a screenshot) becomes JPEG when that's under half the PNG's bytes.
 //! The normalised image is what gets stored, so it's done once.
 
 use base64::Engine;
 use novacode_types::Block;
 use std::path::{Path, PathBuf};
 
-pub const MAX_SIDE: u32 = 2000;
+pub const MAX_SIDE: u32 = 1568;
 /// Base64 payload limit.
 pub const MAX_B64: usize = 4_718_592;
 /// Refuse to even decode anything bigger than this.
@@ -100,19 +102,24 @@ pub fn normalize(bytes: &[u8]) -> Result<Image, String> {
         }
     };
     // Fast path: a supported file that fits is sent byte-for-byte (header read only).
+    // A PNG that fits is still decoded: it may be far smaller as JPEG.
+    let mut fitting_png = false;
     if let Some(mime) = sniff(bytes)
         && let Ok((w, h)) = reader()?.into_dimensions()
         && w <= MAX_SIDE
         && h <= MAX_SIDE
         && b64_len(bytes.len()) <= MAX_B64
     {
-        return Ok(Image {
-            mime,
-            data: b64(bytes),
-            width: w,
-            height: h,
-            resized_from: None,
-        });
+        if mime != "image/png" {
+            return Ok(Image {
+                mime,
+                data: b64(bytes),
+                width: w,
+                height: h,
+                resized_from: None,
+            });
+        }
+        fitting_png = true;
     }
     let mut decoder = reader()?.into_decoder().map_err(|e| unsupported(e.to_string()))?;
     let orientation = decoder.orientation().ok();
@@ -121,38 +128,49 @@ pub fn normalize(bytes: &[u8]) -> Result<Image, String> {
         img.apply_orientation(o);
     }
     let (w0, h0) = (img.width(), img.height());
-    let encode = |img: &DynamicImage| -> Vec<(&'static str, Vec<u8>)> {
-        let mut out = Vec::new();
-        let mut png = Vec::new();
-        if img.write_to(&mut Cursor::new(&mut png), ImageFormat::Png).is_ok() {
-            out.push(("image/png", png));
-        }
-        // JPEG has no alpha: only offer it for opaque images.
-        if !img.color().has_alpha() {
-            for q in [80, 70, 55, 40] {
-                let mut jpg = Vec::new();
-                if JpegEncoder::new_with_quality(&mut jpg, q)
-                    .encode_image(&img.to_rgb8())
-                    .is_ok()
-                {
-                    out.push(("image/jpeg", jpg));
-                }
-            }
-        }
-        out
-    };
+    // JPEG has no alpha: only for images that are opaque (screenshots often
+    // carry an alpha channel that is fully opaque).
+    let opaque = !img.color().has_alpha() || img.to_rgba8().pixels().all(|p| p[3] == 255);
+    let fits = |b: &Vec<u8>| b64_len(b.len()) <= MAX_B64;
     let mut side = MAX_SIDE.min(w0.max(h0));
     loop {
-        let scaled = if w0.max(h0) > side {
+        let resized = w0.max(h0) > side;
+        let scaled = if resized {
             img.resize(side, side, FilterType::Lanczos3)
         } else {
             img.clone()
         };
-        // The smallest encoding that fits (PNG first when both do, it's lossless).
-        let best = encode(&scaled)
-            .into_iter()
-            .filter(|(_, b)| b64_len(b.len()) <= MAX_B64)
-            .min_by_key(|(m, b)| (*m != "image/png", b.len()));
+        let png = if fitting_png && !resized {
+            Some(bytes.to_vec())
+        } else {
+            let mut png = Vec::new();
+            scaled
+                .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+                .ok()
+                .map(|_| png)
+        };
+        let jpeg = |q: u8| {
+            let mut jpg = Vec::new();
+            JpegEncoder::new_with_quality(&mut jpg, q)
+                .encode_image(&scaled.to_rgb8())
+                .ok()
+                .map(|_| ("image/jpeg", jpg))
+        };
+        // PNG when it fits (lossless) unless JPEG is under half its bytes;
+        // otherwise the best JPEG quality that fits.
+        let best = match png.filter(fits) {
+            Some(png) => Some(
+                opaque
+                    .then(|| jpeg(80))
+                    .flatten()
+                    .filter(|(_, j)| j.len() * 2 < png.len())
+                    .unwrap_or(("image/png", png)),
+            ),
+            None if opaque => [80, 70, 55, 40]
+                .into_iter()
+                .find_map(|q| jpeg(q).filter(|(_, j)| fits(j))),
+            None => None,
+        };
         if let Some((mime, b)) = best {
             let (w, h) = (scaled.width(), scaled.height());
             return Ok(Image {
@@ -256,8 +274,12 @@ mod tests {
     fn large_or_foreign_images_are_converted_and_shrunk() {
         let big = encode(DynamicImage::ImageRgba8(RgbaImage::new(4000, 1000)), ImageFormat::Png);
         let i = normalize(&big).unwrap();
-        assert_eq!((i.width, i.height, i.resized_from), (2000, 500, Some((4000, 1000))));
+        assert_eq!((i.width, i.height, i.resized_from), (1568, 392, Some((4000, 1000))));
         assert_eq!(i.mime, "image/png", "alpha keeps PNG");
+        // A flat opaque image: PNG is tiny, so it stays PNG.
+        let flat = encode(DynamicImage::ImageRgb8(RgbImage::new(1920, 1080)), ImageFormat::Png);
+        let i = normalize(&flat).unwrap();
+        assert_eq!((i.mime, i.width, i.height), ("image/png", 1568, 882));
         let bmp = encode(DynamicImage::ImageRgb8(RgbImage::new(8, 8)), ImageFormat::Bmp);
         assert!(is_image(&bmp) && sniff(&bmp).is_none());
         let i = normalize(&bmp).unwrap();
@@ -277,6 +299,33 @@ mod tests {
         let i = normalize(&encode(DynamicImage::ImageRgb8(img), ImageFormat::Png)).unwrap();
         assert_eq!(i.mime, "image/jpeg");
         assert!(i.data.len() <= MAX_B64);
+    }
+
+    /// Photo-like: a gradient with low-amplitude noise. PNG compresses it
+    /// badly, JPEG well.
+    fn photo(w: u32, h: u32) -> Vec<u8> {
+        let mut seed = 7u32;
+        let img = RgbImage::from_fn(w, h, |x, y| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let n = (seed >> 29) as u8;
+            image::Rgb([(x / 8) as u8 ^ n, (y / 5) as u8 ^ n, ((x + y) / 12) as u8 ^ n])
+        });
+        encode(DynamicImage::ImageRgb8(img), ImageFormat::Png)
+    }
+
+    #[test]
+    fn opaque_image_uses_jpeg_when_much_smaller() {
+        // Fits already, but as JPEG it's under half the bytes: converted.
+        let png = photo(1200, 800);
+        let i = normalize(&png).unwrap();
+        assert_eq!(
+            (i.mime, i.width, i.height, i.resized_from),
+            ("image/jpeg", 1200, 800, None)
+        );
+        assert!(i.data.len() * 2 < b64(&png).len());
+        // Too big: shrunk to 1568 and JPEG.
+        let i = normalize(&photo(2560, 1440)).unwrap();
+        assert_eq!((i.mime, i.width, i.height), ("image/jpeg", 1568, 882));
     }
 
     #[test]
