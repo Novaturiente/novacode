@@ -1,3 +1,7 @@
+ novacode X.Y.Z
+ /home/u/proj · claude/opus
+ type / for commands
+
  ╭──────────────────────────────────────────────────────────────────╮
  │ ask and spawn                                                    │
  ╰──────────────────────────────────────────────────────────────────╯
@@ -27,10 +31,6 @@
  ▏ const a = await tools.read({path: 'x'});
  ▏ text(a);
  ▏ hello from x
-
-
-
-
 
 
 

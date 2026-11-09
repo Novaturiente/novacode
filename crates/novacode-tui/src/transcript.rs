@@ -29,6 +29,9 @@ pub enum Item {
         /// replayed one). Errors and replies to the user's own commands stay in view.
         folds: bool,
     },
+    /// The startup header of a new session (G3): a title line, then dim lines. Drawn only;
+    /// never sent to the agent, so never in the session file.
+    Header(Vec<String>),
     /// A full-width line that never folds: the context was compacted (L9.19).
     Divider {
         text: String,
@@ -266,6 +269,11 @@ impl Transcript {
             t.done = false;
             t.touch();
         }
+    }
+
+    /// The startup header (G3): the first item of a new session.
+    pub fn header(&mut self, lines: Vec<String>) {
+        self.turn().items.push(Item::Header(lines));
     }
 
     /// A full-width divider that stays in view when its turn folds (a compaction, L9.19).
@@ -801,7 +809,7 @@ fn lay_turn(
             || matches!(item, Item::Tool(tool) if tool.is_say());
         !matches!(
             item,
-            Item::User(_) | Item::Notice { folds: false, .. } | Item::Divider { .. }
+            Item::User(_) | Item::Notice { folds: false, .. } | Item::Divider { .. } | Item::Header(_)
         ) && !text
             && !prompt_image
     };
@@ -904,6 +912,12 @@ fn lay_turn(
                 }
             }
             Item::Divider { text, error } => lines.push(divider(text, *error, width, t)),
+            Item::Header(rows) => {
+                for (i, r) in rows.iter().enumerate() {
+                    let st = if i == 0 { t.accent } else { t.dim };
+                    lines.extend(wrap::wrap(vec![Span::styled(sanitize(r), st)], width, &[], &[]));
+                }
+            }
             Item::Notice { text, error, .. } => {
                 let st = if *error { t.error } else { t.dim };
                 // Multi-line notices (`!cmd` output) keep their lines.
