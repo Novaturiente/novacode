@@ -26,8 +26,10 @@ const EDITOR_MAX_ROWS: usize = 10;
 const WHEEL: isize = 3;
 /// Motion (TS4): one frame, a scroll's ease (4 frames) and a card's growth (3 frames).
 const STEP: Duration = Duration::from_millis(16);
-const EASE: Duration = Duration::from_millis(64);
-const GROW: Duration = Duration::from_millis(48);
+const EASE_FRAMES: u32 = 4;
+const EASE: Duration = STEP.saturating_mul(EASE_FRAMES);
+const GROW_FRAMES: u32 = 3;
+const GROW: Duration = STEP.saturating_mul(GROW_FRAMES);
 const DOUBLE_PRESS: Duration = Duration::from_millis(500);
 const COMPLETE_ROWS: usize = 8;
 /// Files listed for `@` completion; bigger trees are cut.
@@ -481,6 +483,13 @@ impl Anchor {
     }
 }
 
+/// A scroll easing to its target (TS4).
+struct ScrollMotion {
+    /// The drawn top line it started from.
+    from: usize,
+    at: Instant,
+}
+
 /// A turn's lines in `view`: (first, end), the end being where the next turn starts.
 fn turn_span(view: &View, turn: usize) -> (usize, usize) {
     let start = view.starts.get(turn).copied().unwrap_or(0);
@@ -608,8 +617,8 @@ pub struct App {
     files: Option<Vec<String>>,
     search: Option<Search>,
     pub dirty: bool,
-    /// A running scroll motion (TS4): the drawn top line it started from, and when.
-    scroll_from: Option<(usize, Instant)>,
+    /// A running scroll motion (TS4).
+    scroll_motion: Option<ScrollMotion>,
     /// When the first of the open cards appeared; `None` = drawn at full height.
     card_at: Option<Instant>,
     pub exit: Option<Exit>,
@@ -754,7 +763,7 @@ impl App {
             files: None,
             search: None,
             dirty: true,
-            scroll_from: None,
+            scroll_motion: None,
             card_at: None,
             exit: None,
             suspend: false,
@@ -2037,12 +2046,12 @@ impl App {
         }
     }
 
-    /// A card of `full` rows as drawn now: growing over 3 frames from its start.
+    /// A card of `full` rows as drawn now: growing over [`GROW_FRAMES`] frames from its start.
     fn card_rows(&self, full: u16) -> u16 {
         match self.card_at {
             Some(at) => {
-                let frames = (clock::since(at).as_millis() / STEP.as_millis() + 1).min(3) as u16;
-                (full * frames).div_ceil(3)
+                let frames = (clock::since(at).as_millis() / STEP.as_millis() + 1).min(GROW_FRAMES.into()) as u16;
+                (full * frames).div_ceil(GROW_FRAMES as u16)
             }
             _ => full,
         }
@@ -2055,13 +2064,13 @@ impl App {
 
     /// A scroll or a card is still moving (TS4): the loop draws again next frame.
     pub fn moving(&self) -> bool {
-        self.scroll_from.is_some() || self.card_growing()
+        self.scroll_motion.is_some() || self.card_growing()
     }
 
     /// End any motion now: the next frame shows where it was heading. Input does this,
     /// so motion never lags behind the user.
     pub fn settle(&mut self) {
-        self.scroll_from = None;
+        self.scroll_motion = None;
         self.card_at = None;
     }
 
@@ -2193,7 +2202,10 @@ impl App {
         let max_top = s.view.len().saturating_sub(s.area.height as usize);
         let top = (s.target as isize + delta).clamp(0, max_top as isize) as usize;
         let ease = !self.slow() && s.top == s.target && top != s.top;
-        self.scroll_from = ease.then(|| (s.top, clock::now()));
+        self.scroll_motion = ease.then(|| ScrollMotion {
+            from: s.top,
+            at: clock::now(),
+        });
         if top >= max_top {
             self.anchor = None;
             return;
@@ -2720,16 +2732,16 @@ impl App {
         let max_top = view.len().saturating_sub(h);
         let target = self.anchor.as_ref().map_or(max_top, |a| a.top(&view).min(max_top));
         self.anchor = (self.anchor.is_some() && target < max_top).then(|| Anchor::capture(&view, target, h));
-        // A scroll motion (TS4): ease out from where it started, 4 frames.
-        let top = match self.scroll_from {
-            Some((from, at)) if clock::since(at) + STEP < EASE => {
+        // A scroll motion (TS4): ease out from where it started, over EASE_FRAMES frames.
+        let top = match self.scroll_motion {
+            Some(ScrollMotion { from, at }) if clock::since(at) + STEP < EASE => {
                 let p = (clock::since(at) + STEP).as_secs_f64() / EASE.as_secs_f64();
                 let eased = 1.0 - (1.0 - p) * (1.0 - p);
                 let from = from.min(max_top) as f64;
                 (from + (target as f64 - from) * eased).round() as usize
             }
             _ => {
-                self.scroll_from = None;
+                self.scroll_motion = None;
                 target
             }
         };

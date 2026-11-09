@@ -78,3 +78,10 @@ Shortening never drops information; it only restructures it.
 - A click in the input moves the cursor there.
 - The approval card ignores the mouse, so a stray click never grants a permission.
 - Text selection and copy keep working everywhere else.
+
+## Motion
+
+- Motion is short: a scroll eases over 4 frames (about 60 ms), a card grows in over 3 frames (about 50 ms).
+- Input ends it at once: a key press, a click, the wheel or a paste jumps to where it was heading. Mouse moves and key releases don't.
+- Slow mode (`ui.slow`) turns all motion off. There is no separate motion setting.
+- Nothing moves on its own while scrolled up: the top line stays put when content above it changes.
