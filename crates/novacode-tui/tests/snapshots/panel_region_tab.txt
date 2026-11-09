@@ -1,6 +1,6 @@
-                                                                      │  1 Deploy  2 Agent
-                                                                      │ ━━━━━━━━━━
-                                                                      │ region line
+ novacode X.Y.Z                                                      │  1 Deploy  2 Agent
+ /home/u/proj · claude/opus                                           │ ━━━━━━━━━━
+ type / for commands                                                  │ region line
                                                                       │ ok
                                                                       │
                                                                       │

@@ -64,6 +64,8 @@ fn app_icons(nerd: bool) -> (App, mpsc::UnboundedReceiver<Cmd>) {
 /// Golden screen (TP2): compares the screen text with `tests/golden/<name>.txt`.
 /// A missing file fails; `UPDATE_GOLDEN=1 cargo test -p novacode-tui` (re)writes them.
 fn golden(name: &str, got: &str) {
+    let got = unversioned(got);
+    let got = got.as_str();
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/golden/{name}.txt"));
     if std::env::var_os("UPDATE_GOLDEN").is_some() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -415,7 +417,14 @@ fn screen(app: &mut App, w: u16, h: u16) -> String {
         .join("\n")
 }
 
+/// The startup header's version, so a release bump leaves goldens and snapshots alone.
+fn unversioned(s: &str) -> String {
+    s.replace(concat!("novacode ", env!("CARGO_PKG_VERSION")), "novacode X.Y.Z")
+}
+
 fn snapshot(name: &str, got: &str) {
+    let got = unversioned(got);
+    let got = got.as_str();
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/snapshots/{name}.txt"));
     if std::env::var_os("UPDATE_SNAPSHOTS").is_some() || !path.exists() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1347,7 +1356,9 @@ fn thinking_level_cycle_and_picker() {
     });
     let s = screen(&mut a, 70, 12);
     assert!(
-        s.contains("opus · high") && !s.contains("claude/opus") && s.contains("the cache is kept"),
+        s.contains("opus · high")
+            && !s.lines().last().unwrap().contains("claude/opus")
+            && s.contains("the cache is kept"),
         "{s}"
     );
     typ(&mut a, "/thinking");
@@ -1702,6 +1713,40 @@ fn prompt_echoes_at_once_and_thinking_ticks() {
     a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     a.on_agent(AgentEvent::Settled);
     assert!(!screen(&mut a, 50, 12).contains("again"));
+}
+
+/// TP9 (G3): a new session opens with version, folder, model and one hint, as the first item.
+#[test]
+fn startup_header_on_a_new_session() {
+    let (mut a, mut rx) = app(vec![]);
+    let s = screen(&mut a, 60, 12);
+    let lines: Vec<&str> = s.lines().collect();
+    assert_eq!(lines[0], format!(" novacode {}", env!("CARGO_PKG_VERSION")), "{s}");
+    assert_eq!(lines[1], " /home/u/proj · claude/opus", "{s}");
+    assert_eq!(lines[2], " type / for commands", "{s}");
+    // Only drawn: nothing reaches the agent, so the session file never gets it.
+    assert!(rx.try_recv().is_err());
+    // It scrolls away like any message: a prompt follows it.
+    for c in "hi".chars() {
+        a.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(rx.try_recv(), Ok(Cmd::Prompt(p)) if p == "hi"));
+    assert!(screen(&mut a, 60, 12).starts_with(" novacode "));
+}
+
+/// TP9: no header on resume, nor in an attach window (an existing session).
+#[test]
+fn no_startup_header_on_resume() {
+    let header = format!("novacode {}", env!("CARGO_PKG_VERSION"));
+    let (mut a, _rx) = app(vec![Message::User {
+        content: vec![Block::text("earlier")],
+    }]);
+    let s = screen(&mut a, 60, 12);
+    assert!(s.contains("earlier") && !s.contains(&header), "{s}");
+    let (mut b, _rx) = app_at(vec![], Some("01a1"));
+    let s = screen(&mut b, 60, 12);
+    assert!(!s.contains(&header), "{s}");
 }
 
 #[test]

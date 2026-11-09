@@ -558,6 +558,14 @@ impl App {
             }
             tr.on_message(&m);
         }
+        // G3: a new session (not a resume, not an attach window) opens with a header.
+        if tr.turns.is_empty() && init.attached.is_none() && !init.panel_only {
+            tr.header(vec![
+                format!("novacode {}", env!("CARGO_PKG_VERSION")),
+                format!("{} · {}", init.cwd, init.model),
+                "type / for commands".into(),
+            ]);
+        }
         let procs = std::mem::take(&mut init.procs).into_iter().collect();
         for n in std::mem::take(&mut init.notices) {
             tr.notice(n, true);

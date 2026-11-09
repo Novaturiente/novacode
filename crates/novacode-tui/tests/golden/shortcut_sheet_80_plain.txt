@@ -1,6 +1,6 @@
-
-
-
+ novacode X.Y.Z
+ /home/u/proj · claude/opus
+ type / for commands
 
 
          ╭ Shortcuts ────────────────────────────────────────────────╮

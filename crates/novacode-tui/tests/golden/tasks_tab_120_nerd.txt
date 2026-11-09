@@ -1,6 +1,6 @@
-                                                                                │  1  Tasks
-                                                                                │ ━━━━━━━━━━━
-                                                                                │   ├─ T3-fix-the-parser-for-nes… 3h00m
+ novacode X.Y.Z                                                                │  1  Tasks
+ /home/u/proj · claude/opus                                                     │ ━━━━━━━━━━━
+ type / for commands                                                            │   ├─ T3-fix-the-parser-for-nes… 3h00m
                                                                                 │   │   running · claude/claude-sonnet-…
                                                                                 │   ├─ T4-docs-site-search site   2h00m
                                                                                 │   │   running · claude/claude-sonnet-…
