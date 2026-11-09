@@ -683,7 +683,11 @@ impl App {
     pub fn on_ui(&mut self, ev: UiEvent) {
         self.dirty = true;
         match ev {
-            UiEvent::Approve(req) => self.approvals.push_back(ApprovalCard::new(req)),
+            UiEvent::Approve(req) => {
+                let mut card = ApprovalCard::new(req);
+                card.submit_key = self.keymap.keys(A::Submit);
+                self.approvals.push_back(card);
+            }
             UiEvent::ApprovalDone { id } => {
                 let front = self.approvals.front().map(|c| c.req.id);
                 self.approvals.retain(|c| c.req.id != id);
@@ -694,6 +698,7 @@ impl App {
             UiEvent::Ask(req) => {
                 let mut form = crate::ask::AskForm::new(req);
                 form.edit_key = self.keymap.keys(A::ExternalEditor);
+                form.submit_key = self.keymap.keys(A::Submit);
                 self.asks.push_back(form);
             }
             UiEvent::AskDone { id } => self.asks.retain(|f| f.req.id != id),
@@ -1271,6 +1276,16 @@ impl App {
             Event::Paste(s) if self.approvals.is_empty() && self.asks.is_empty() && self.overlay.is_none() => {
                 self.editor.paste(&s)
             }
+            // The approval card is keys only (TP5): a stray click never grants anything.
+            Event::Mouse(m) if self.approvals.front().is_some_and(|c| c.contains(m.column, m.row)) => {}
+            Event::Mouse(m)
+                if self.approvals.is_empty() && self.asks.front().is_some_and(|f| f.contains(m.column, m.row)) =>
+            {
+                if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                    let done = self.asks.front_mut().unwrap().click(m.row);
+                    self.ask_done(done);
+                }
+            }
             Event::Mouse(m) if self.overlay.is_none() => self.on_mouse(m),
             Event::Mouse(m) => {
                 self.on_screen_mouse(m);
@@ -1338,6 +1353,39 @@ impl App {
         }
     }
 
+    /// The front ask form's key or click result: on an answer or dismissal, close it,
+    /// note the answer in the transcript and send it.
+    fn ask_done(&mut self, done: crate::ask::Done) {
+        use crate::ask::Done;
+        self.dirty = true;
+        let replies = match done {
+            Done::Pending => return,
+            Done::Answered(r) => Some(r),
+            Done::Dismissed => None,
+        };
+        let Some(form) = self.asks.pop_front() else { return };
+        // Kept in the transcript so the answer stays visible (C5).
+        match &replies {
+            Some(r) => {
+                for r in r {
+                    let mut a = r.chosen.join(", ");
+                    if let Some(t) = &r.text {
+                        a = if a.is_empty() { t.clone() } else { format!("{a}; {t}") };
+                    }
+                    self.tr.notice(format!("{} → {a}", r.question), false);
+                }
+            }
+            None => self.tr.notice("questions dismissed", true),
+        }
+        if form.req.id == KILL_ASK {
+            if replies.is_some_and(|r| r.iter().any(|r| r.chosen.iter().any(|c| c == KILL_YES))) {
+                self.send(Cmd::Kill);
+            }
+            return;
+        }
+        let _ = form.req.reply.send(replies);
+    }
+
     pub fn on_key(&mut self, k: KeyEvent) {
         let now = Instant::now();
         self.selection = None;
@@ -1357,40 +1405,12 @@ impl App {
             return;
         }
         if let Some(form) = self.asks.front_mut() {
-            use crate::ask::Done;
             if self.keymap.lookup(&k, &[Scope::App]) == Some(A::ExternalEditor) && form.edit_text().is_some() {
                 self.external_editor = true;
                 return;
             }
             let done = form.handle(k, self.keymap.lookup(&k, &[Scope::Editor]));
-            self.dirty = true;
-            let replies = match done {
-                Done::Pending => return,
-                Done::Answered(r) => Some(r),
-                Done::Dismissed => None,
-            };
-            let form = self.asks.pop_front().unwrap();
-            // Kept in the transcript so the answer stays visible (C5).
-            match &replies {
-                Some(r) => {
-                    for r in r {
-                        let mut a = r.chosen.join(", ");
-                        if let Some(t) = &r.text {
-                            a = if a.is_empty() { t.clone() } else { format!("{a}; {t}") };
-                        }
-                        self.tr.notice(format!("{} → {a}", r.question), false);
-                    }
-                }
-                None => self.tr.notice("questions dismissed", true),
-            }
-            if form.req.id == KILL_ASK {
-                if replies.is_some_and(|r| r.iter().any(|r| r.chosen.iter().any(|c| c == KILL_YES))) {
-                    self.send(Cmd::Kill);
-                }
-                return;
-            }
-            let _ = form.req.reply.send(replies);
-            return;
+            return self.ask_done(done);
         }
         if let Some(o) = &mut self.overlay {
             let page = self.shown.as_ref().map_or(10, |s| s.area.height as usize);
@@ -1888,6 +1908,7 @@ impl App {
             reply,
         });
         form.edit_key = self.keymap.keys(A::ExternalEditor);
+        form.submit_key = self.keymap.keys(A::Submit);
         self.asks.push_back(form);
     }
 

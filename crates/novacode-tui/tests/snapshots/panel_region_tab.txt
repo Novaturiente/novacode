@@ -1,5 +1,5 @@
- novacode X.Y.Z                                                      │  1 Deploy  2 Agent
- /home/u/proj · claude/opus                                           │ ━━━━━━━━━━
+ novacode X.Y.Z                                                      │  Deploy  Agent
+ /home/u/proj · claude/opus                                           │ ━━━━━━━━
  type / for commands                                                  │ region line
                                                                       │ ok
                                                                       │

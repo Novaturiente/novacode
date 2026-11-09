@@ -18,6 +18,27 @@ use tokio::sync::oneshot;
 /// Keys are ignored this long after an approval card appears, so type-ahead never answers it.
 const APPROVAL_GRACE: Duration = Duration::from_millis(400);
 
+/// Two presses on the same row within this time are a double-click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+/// Tells a double-click from a click, for lists that select on click and confirm on a
+/// double-click (ask form, pickers).
+#[derive(Default)]
+pub struct Clicks(Option<(Instant, u16)>);
+
+impl Clicks {
+    /// A press on `row`: true when it completes a double-click.
+    pub fn double(&mut self, row: u16) -> bool {
+        let now = Instant::now();
+        let double = self
+            .0
+            .is_some_and(|(at, r)| r == row && now.duration_since(at) < DOUBLE_CLICK);
+        // A completed double-click starts over, so a third press is a click again.
+        self.0 = (!double).then_some((now, row));
+        double
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PickItem {
     pub label: String,
@@ -186,6 +207,10 @@ pub struct ApprovalCard {
     pub(crate) shown: Instant,
     /// Width of the reason box at the last draw, for its up/down moves.
     width: Cell<usize>,
+    /// The key that sends the reason, for its hint.
+    pub submit_key: String,
+    /// Where the card was last drawn. The card takes no mouse input (TP5).
+    area: Cell<Rect>,
 }
 
 impl ApprovalCard {
@@ -195,7 +220,14 @@ impl ApprovalCard {
             reason: None,
             shown: Instant::now(),
             width: Cell::new(40),
+            submit_key: "enter".into(),
+            area: Cell::new(Rect::default()),
         }
+    }
+
+    /// The card covers this screen cell.
+    pub fn contains(&self, x: u16, y: u16) -> bool {
+        self.area.get().contains(Position::new(x, y))
     }
 
     /// A paste goes into the reason box, if it is open.
@@ -251,7 +283,8 @@ impl ApprovalCard {
             + 2
     }
 
-    /// Tool name, then the command or path under it, then why it is asked, then the keys.
+    /// Tool name, then the command or path under it, then why it is asked (and what
+    /// "always" would allow), then the keys.
     /// `spaced`: blank lines between those parts, dropped when the screen is short.
     /// Also gives the reason box's cursor (row, column).
     fn lines(&self, w: usize, t: &Theme, spaced: bool) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
@@ -274,12 +307,15 @@ impl ApprovalCard {
             lines.push(Line::default());
         }
         let why_st = if r.risky { t.error } else { t.dim };
-        lines.extend(wrap::wrap(
-            vec![Span::styled(r.reason.clone(), why_st)],
-            w,
-            &[Span::styled("why: ", t.dim)],
-            &[Span::raw("     ")],
-        ));
+        lines.extend(wrap::wrap(vec![Span::styled(r.reason.clone(), why_st)], w, &[], &[]));
+        if !r.risky && !r.rule.is_empty() && self.reason.is_none() {
+            lines.extend(wrap::wrap(
+                vec![Span::styled(format!("A always allows {}", r.rule), t.dim)],
+                w,
+                &[],
+                &[],
+            ));
+        }
         if spaced {
             lines.push(Line::default());
         }
@@ -300,23 +336,18 @@ impl ApprovalCard {
                     };
                     lines.push(Line::from(vec![lead, Span::styled(r, t.text)]));
                 }
-                lines.push(Line::styled("(Enter send, Esc skip)", t.dim));
+                let mut keys = vec![(self.submit_key.as_str(), "send"), ("esc", "skip")];
+                keys.retain(|(k, _)| !k.is_empty());
+                lines.push(crate::hints::hints(&keys, w, t));
             }
             None => {
-                let mut keys = vec![
-                    Span::styled("y", t.ok),
-                    Span::styled(" once · ", t.dim),
-                    Span::styled("a", t.ok),
-                    Span::styled(" this session · ", t.dim),
-                ];
+                // Fixed letters, never rebound: the habit for safety decisions stays.
+                let mut keys = vec![("y", "once"), ("a", "this session")];
                 if !r.risky {
-                    keys.push(Span::styled("A", t.ok));
-                    keys.push(Span::styled(format!(" always ({}) · ", r.rule), t.dim));
+                    keys.push(("A", "always"));
                 }
-                keys.push(Span::styled("n", t.error));
-                keys.push(Span::styled(" deny", t.dim));
-                // Wrapped, not cut: a long rule must not hide `deny`.
-                lines.extend(wrap::wrap(keys, w, &[], &[]));
+                keys.push(("n", "deny"));
+                lines.push(crate::hints::hints(&keys, w, t));
             }
         }
         (lines, cursor)
@@ -325,6 +356,7 @@ impl ApprovalCard {
     pub fn render(&self, f: &mut Frame, area: Rect, t: &Theme) {
         let title = if self.req.risky { "Safety check" } else { "Allow?" };
         let inner = frame(f, area, title, t);
+        self.area.set(area);
         let w = inner.width as usize;
         let mut lines = self.lines(w, t, true);
         if lines.0.len() > inner.height as usize {
@@ -510,7 +542,7 @@ mod tests {
             text[0] == "bash" && text[1].ends_with("Inventory as I") && text[2] == "│ i=I()\"",
             "{text:?}"
         );
-        assert_eq!(text[4], "why: r");
+        assert_eq!(text[4], "r");
     }
 
     #[test]
