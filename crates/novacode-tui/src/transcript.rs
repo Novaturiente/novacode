@@ -72,6 +72,8 @@ pub struct Turn {
     pub expanded: bool,
     cache: Option<Layout>,
     drain: Option<Drain>,
+    /// A running tool's spinner or timer moved: redraw only its rows (TS2).
+    ticked: bool,
 }
 
 /// A reply that ended while some of its text was held back (TS3): the rest
@@ -143,6 +145,8 @@ struct Layout {
     image_toggles: Vec<(usize, usize)>,
     /// Line offsets (inside this turn) that toggle collapse on click.
     toggles: Vec<usize>,
+    /// (item index, first line, rows) of each tool call, so a tick redraws only its rows.
+    tools: Vec<(usize, usize, usize)>,
 }
 
 impl Turn {
@@ -162,6 +166,26 @@ impl Turn {
 
     pub fn touch(&mut self) {
         self.cache = None;
+    }
+
+    /// Redraw the rows of its running tools in the cached layout. False when there is
+    /// no layout to patch or a tool's height changed (then the whole turn is laid out).
+    fn retick(&mut self, width: usize, t: &Theme, tools: (bool, &str)) -> bool {
+        let Some(c) = &mut self.cache else { return false };
+        for &(idx, start, rows) in &c.tools {
+            let Some(Item::Tool(tool)) = self.items.get(idx) else {
+                return false;
+            };
+            if tool.done || tool.started.is_none() {
+                continue;
+            }
+            let new = lay_tool(tool, width, t, tools);
+            if new.len() != rows {
+                return false;
+            }
+            c.lines.splice(start..start + rows, new);
+        }
+        true
     }
 }
 
@@ -652,7 +676,7 @@ impl Transcript {
         }
     }
 
-    /// Animation step: re-lay the newest turn while one of its tools runs.
+    /// Animation step: redraw the running tools of the newest turn (only their rows).
     pub fn tick(&mut self) {
         if let Some(turn) = self.turns.last_mut()
             && turn
@@ -660,7 +684,7 @@ impl Transcript {
                 .iter()
                 .any(|i| matches!(i, Item::Tool(t) if !t.done && t.started.is_some()))
         {
-            turn.touch();
+            turn.ticked = true;
         }
     }
 
@@ -763,12 +787,15 @@ impl Transcript {
         let images = self.image_rows;
         let last = self.turns.len().saturating_sub(1);
         for (i, turn) in self.turns.iter_mut().enumerate() {
-            let fresh = turn
+            let tools = (self.tools_full, self.tools_hint.as_str());
+            let mut fresh = turn
                 .cache
                 .as_ref()
                 .is_some_and(|c| c.width == width && c.expanded == turn.expanded);
+            if std::mem::take(&mut turn.ticked) && fresh {
+                fresh = turn.retick(width, theme, tools);
+            }
             if !fresh {
-                let tools = (self.tools_full, self.tools_hint.as_str());
                 turn.cache = Some(lay_turn(
                     turn,
                     width,
@@ -861,6 +888,7 @@ fn lay_turn(
     let mut toggles = Vec::new();
     let mut imgs = Vec::new();
     let mut image_toggles = Vec::new();
+    let mut tool_rows = Vec::new();
     let collapsed = turn.collapsed();
     // A collapsed turn shows the prompt, every message with text, and one fold line
     // per run of steps (tool calls, notes, thinking) between them. Open, it has one
@@ -960,7 +988,11 @@ fn lay_turn(
                 let md = drain.map(|_| &mut fresh);
                 lines.extend(lay_assistant(&blocks, width, t, None, thinking, hint, md));
             }
-            Item::Tool(tool) => lines.extend(lay_tool(tool, width, t, tools)),
+            Item::Tool(tool) => {
+                let start = lines.len();
+                lines.extend(lay_tool(tool, width, t, tools));
+                tool_rows.push((idx, start, lines.len() - start));
+            }
             Item::Image(img) => {
                 let size = if img.w > 0 {
                     format!(" {}×{}", img.w, img.h)
@@ -1021,6 +1053,7 @@ fn lay_turn(
         toggles,
         images: imgs,
         image_toggles,
+        tools: tool_rows,
     }
 }
 
@@ -1543,6 +1576,12 @@ fn lay_tool(tool: &Tool, width: usize, t: &Theme, (full, hint): (bool, &str)) ->
     }
     let out = sanitize(&tool.output);
     let out = out.trim_end();
+    // A read still running shows a live count from the start, never the file (TS2).
+    if tool.name == "read" && !tool.done {
+        let n = out.lines().count();
+        lines.push(Line::styled(format!("  {n} {}", plural(n)), t.dim));
+        return lines;
+    }
     if out.is_empty() {
         return lines;
     }
@@ -1613,6 +1652,11 @@ fn lay_tool(tool: &Tool, width: usize, t: &Theme, (full, hint): (bool, &str)) ->
     }
     if skipped_after > 0 {
         lines.push(more(skipped_after, plural(skipped_after)));
+    }
+    // A running command keeps the whole tail box from its first line, so it never grows (TS2).
+    if !tool.done && !full && matches!(tool.name.as_str(), "bash" | "process") {
+        let pad = OUTPUT_TAIL - shown.len() + usize::from(skipped_before == 0);
+        lines.extend(std::iter::repeat_n(Line::styled("▏", t.border), pad));
     }
     lines
 }

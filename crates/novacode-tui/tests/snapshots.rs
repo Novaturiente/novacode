@@ -2453,6 +2453,78 @@ fn bench_frame_long() {
     println!("BENCH frame_long_p99_ms {:.2}", p99.as_secs_f64() * 1e3);
 }
 
+/// A tool call `id` that has started running, in a new turn.
+fn run_tool(a: &mut App, id: &str, name: &str, args: serde_json::Value) {
+    a.on_agent(AgentEvent::AgentStart);
+    a.on_agent(AgentEvent::Message(Message::user("go")));
+    a.on_agent(AgentEvent::Message(assistant(
+        vec![call(id, name, args.clone())],
+        StopReason::ToolUse,
+    )));
+    a.on_agent(AgentEvent::ToolStart {
+        call: ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: args,
+            arguments_error: None,
+            replay: None,
+        },
+    });
+}
+
+/// Rows of the tool call whose header contains `head`, up to the blank line after it.
+fn tool_rows(s: &str, head: &str) -> usize {
+    let lines: Vec<&str> = s.lines().collect();
+    let at = lines.iter().position(|l| l.contains(head)).expect(s);
+    lines[at..].iter().take_while(|l| !l.is_empty()).count()
+}
+
+/// TS2: a running bash call reserves its tail box once output starts; it never grows.
+#[test]
+fn a_running_commands_box_keeps_its_height() {
+    let (mut a, _rx) = app(vec![]);
+    run_tool(&mut a, "b", "bash", json!({"command": "make"}));
+    let mut heights = vec![];
+    for i in 1..=9 {
+        a.on_agent(AgentEvent::ToolUpdate {
+            call_id: "b".into(),
+            text: format!("out {i}\n"),
+        });
+        let s = screen(&mut a, 60, 30);
+        assert!(s.contains(&format!("out {i}")), "{s}");
+        heights.push(tool_rows(&s, "bash $ make"));
+    }
+    assert!(heights.iter().all(|h| *h == heights[0]), "{heights:?}");
+}
+
+/// TS2: a running read shows a line count from the start, never the file.
+#[test]
+fn a_running_read_shows_a_count_not_the_file() {
+    let (mut a, _rx) = app(vec![]);
+    run_tool(&mut a, "r", "read", json!({"path": "src/x.rs"}));
+    let s = screen(&mut a, 60, 30);
+    assert!(s.contains("0 lines"), "{s}");
+    a.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    a.on_agent(AgentEvent::ToolUpdate {
+        call_id: "r".into(),
+        text: "fn main() {}\nfn other() {}\n".into(),
+    });
+    let s = screen(&mut a, 60, 30);
+    assert!(s.contains("2 lines") && !s.contains("fn main"), "{s}");
+}
+
+/// TS2: the timer tick redraws a running tool's row with the new seconds.
+#[test]
+fn a_running_tools_timer_ticks() {
+    let (mut a, _rx) = app(vec![]);
+    run_tool(&mut a, "b", "bash", json!({"command": "make"}));
+    assert!(!screen(&mut a, 60, 30).contains("make  3s"));
+    novacode_tui::clock::advance(std::time::Duration::from_secs(3));
+    a.tr.tick();
+    let s = screen(&mut a, 60, 30);
+    assert!(s.contains("make  3s"), "{s}");
+}
+
 #[test]
 fn prompt_echoes_at_once_and_thinking_ticks() {
     let (mut a, mut rx) = app(vec![]);
