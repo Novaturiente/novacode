@@ -11,4 +11,4 @@
 ╭──────────────────────────────────────────────────────────╮
 │                                                          │
 ╰──────────────────────────────────────────────────────────╯
- ? waiting for your ap… ctx 0%  opus · medium  proj  ⎇ main
+ ? waiting for your approval    ctx 0%  opus · medium  proj

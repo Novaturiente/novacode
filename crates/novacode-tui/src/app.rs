@@ -492,6 +492,9 @@ pub struct App {
     quota: (Option<f64>, Option<f64>),
     mcp: (usize, usize),
     task_started: Option<Instant>,
+    /// This task's output tokens as the provider reports them: (finished replies, the
+    /// reply streaming now). `None` until the first usage arrives (G1).
+    task_tokens: Option<(u64, u64)>,
     started: Instant,
     /// The terminal lost focus (L10.9): the first `say` block after that gets the
     /// "new since you last looked" divider (`away.1`: placed already). A terminal reports
@@ -615,6 +618,7 @@ impl App {
             quota: (None, None),
             mcp: (0, 0),
             task_started: None,
+            task_tokens: None,
             started: Instant::now(),
             away: (true, false),
             #[cfg(feature = "images")]
@@ -839,8 +843,18 @@ impl App {
             self.panel.tick(self.focus == Focus::Panel);
         }
         match &ev {
-            AgentEvent::AgentStart => self.task_started = Some(Instant::now()),
+            AgentEvent::AgentStart => (self.task_started, self.task_tokens) = (Some(Instant::now()), None),
             AgentEvent::Settled => self.task_started = None,
+            AgentEvent::Stream(StreamEvent::Usage(u)) => self.task_tokens.get_or_insert_default().1 = u.output,
+            AgentEvent::Stream(StreamEvent::RetryRollback) => {
+                if let Some(t) = &mut self.task_tokens {
+                    t.1 = 0;
+                }
+            }
+            AgentEvent::Message(Message::Assistant(a)) if a.usage.output > 0 => {
+                let t = self.task_tokens.get_or_insert_default();
+                *t = (t.0 + a.usage.output, 0);
+            }
             _ => {}
         }
         match ev {
@@ -2647,6 +2661,17 @@ impl App {
                 t.accent,
             ));
             left.extend(self.shimmer(t));
+            // G1: how long it has run, what it has cost so far, and how to stop it.
+            let mut info = Vec::new();
+            if let Some(s) = self.task_started {
+                info.push(crate::panel::secs_pub(s.elapsed()));
+            }
+            if let Some((done, live)) = self.task_tokens {
+                info.push(format!("{} tokens", crate::panel::tokens(done + live)));
+            }
+            let key = self.keymap.keys(A::Interrupt);
+            info.push(format!("{} interrupt", if key == "escape" { "esc" } else { &key }));
+            left.push(Span::styled(format!(" · {}", info.join(" · ")), t.dim));
         } else {
             left.push(Span::styled(" ● ", t.dim));
             left.push(Span::styled("ready", t.dim));

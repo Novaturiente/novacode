@@ -806,6 +806,8 @@ fn lay_turn(
             && !prompt_image
     };
     let mut folded = false;
+    // A run of notices reads as one item: one blank line before it, none inside.
+    let mut after_notice = false;
     for (idx, item) in turn.items.iter().enumerate() {
         let step = is_step(idx);
         let run_start = step && (idx == 0 || !is_step(idx - 1));
@@ -830,6 +832,10 @@ fn lay_turn(
             }
             // A run of thinking alone gets no fold line.
             if n + notes > 0 {
+                if !lines.is_empty() {
+                    lines.push(Line::default());
+                }
+                after_notice = false;
                 toggles.push(lines.len());
                 let arrow = if collapsed { "▸" } else { "▾" };
                 let plural = |k: usize, w: &str| format!("{k} {w}{}", if k == 1 { "" } else { "s" });
@@ -851,6 +857,10 @@ fn lay_turn(
         if collapsed && step {
             continue;
         }
+        if matches!(item, Item::Notice { .. }) && !after_notice && !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        after_notice = matches!(item, Item::Notice { .. });
         match item {
             Item::User(text) => {
                 if !lines.is_empty() || !matches!(turn.items.first(), Some(Item::User(_))) {
@@ -1042,7 +1052,7 @@ fn lay_assistant(
                 };
                 let mut l = Line::styled(format!("∴ {label} · {words} words"), t.thinking);
                 if !hint.is_empty() {
-                    l.push_span(Span::styled(format!(" · {hint} to show"), t.dim));
+                    l.push_span(Span::styled(format!(" · {hint} show"), t.dim));
                 }
                 lines.push(l);
             }
@@ -1388,9 +1398,9 @@ fn lay_tool(tool: &Tool, width: usize, t: &Theme, (full, hint): (bool, &str)) ->
         let key = if hint.is_empty() {
             String::new()
         } else {
-            format!(", {hint} to expand")
+            format!(" · {hint} expand")
         };
-        Line::styled(format!("▏ … ({n} more {what}{key})"), t.dim)
+        Line::styled(format!("▏ … ({n} more {what}){key}"), t.dim)
     };
     // codemode: the script itself, then what it printed.
     if tool.name == "codemode"
@@ -1413,7 +1423,12 @@ fn lay_tool(tool: &Tool, width: usize, t: &Theme, (full, hint): (bool, &str)) ->
         }
     }
     if let Some(ui) = &tool.ui {
-        lines.extend(ui.iter().take(TOOL_UI_ROWS).map(|l| {
+        let n = if full {
+            ui.len().min(FULL_ROWS)
+        } else {
+            ui.len().min(TOOL_UI_ROWS)
+        };
+        lines.extend(ui[..n].iter().map(|l| {
             let mut s = vec![Span::raw("  ")];
             s.extend(
                 crate::panel::spans(l, t)
@@ -1422,6 +1437,9 @@ fn lay_tool(tool: &Tool, width: usize, t: &Theme, (full, hint): (bool, &str)) ->
             );
             wrap::truncate(s, width)
         }));
+        if n < ui.len() {
+            lines.push(more(ui.len() - n, plural(ui.len() - n)));
+        }
         return lines;
     }
     let out = sanitize(&tool.output);

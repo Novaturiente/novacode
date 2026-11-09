@@ -13,4 +13,4 @@ build 3/5                                                             │
 ╭ deploy mode ───────────────────────────────────────────────────────╮│
 │                                                                    ││
 ╰────────────────────────────────────────────────────────────────────╯│
- ⠋ working                   ▲ deploying  opus · medium  proj  ⎇ main │
+ ⠋ working    · 0.0s · esc interrupt ▲ deploying  opus · medium  proj │

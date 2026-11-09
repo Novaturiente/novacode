@@ -1755,7 +1755,7 @@ fn sparkline(v: &[f64], width: usize) -> String {
 }
 
 /// Token count: 900, 41.2k, 1.25M.
-fn tokens(n: u64) -> String {
+pub fn tokens(n: u64) -> String {
     match n {
         0..1000 => n.to_string(),
         1000..1_000_000 => format!("{:.1}k", n as f64 / 1e3),
