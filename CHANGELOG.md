@@ -2,6 +2,16 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.8.11] - 2026-11-09
+
+### Changed
+
+- Super task sessions are named as super shows them (`T21-cefr-scoring-engine`, without the super-session stamp), fixed against `/name`, so attach windows publish that name as `@agent_name` for tmux side panels.
+
+### Fixed
+
+- A window attached to a session that reloads (super restarting on an upgraded binary) no longer exits with "Connection refused": it keeps retrying for up to 30 s until the session listens again.
+
 ## [0.8.10] - 2026-11-09
 
 ### Added
