@@ -975,32 +975,70 @@ pub async fn attach_loop(
     base: impl Fn() -> crate::TuiBase,
     panel_only: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
+    if let Some(code) = attach(paths, prefix, base(), panel_only).await? {
+        return Ok(code);
+    }
+    // The owner closes the old socket, then goes live again with the same id. Until it
+    // listens, connecting may be refused: that is "not back yet", not the end.
+    let mut end = std::time::Instant::now() + RELOAD_WAIT;
     loop {
-        if let Some(code) = attach(paths, prefix, base(), panel_only).await? {
-            return Ok(code);
-        }
-        // The owner closes the old socket, then goes live again with the same id.
-        let back = async {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                if find_live(paths, prefix).is_ok() {
-                    break;
-                }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let waiting = std::time::Instant::now() < end;
+        if find_live(paths, prefix).is_err() {
+            if !waiting {
+                eprintln!("the session is over: it didn't come back after a reload");
+                return Ok(std::process::ExitCode::SUCCESS);
             }
-        };
-        if tokio::time::timeout(std::time::Duration::from_secs(10), back)
-            .await
-            .is_err()
-        {
-            eprintln!("the session is over: it didn't come back after a reload");
-            return Ok(std::process::ExitCode::SUCCESS);
+            continue;
+        }
+        match attach(paths, prefix, base(), panel_only).await {
+            Ok(Some(code)) => return Ok(code),
+            // Reloading again: a new wait.
+            Ok(None) => end = std::time::Instant::now() + RELOAD_WAIT,
+            Err(e) if waiting && not_up_yet(&e) => {}
+            Err(e) => return Err(e),
         }
     }
+}
+
+/// How long a window waits for a reloading session (a super restarting on its upgraded
+/// binary loads its board and tasks first).
+const RELOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A connect error that means the session's socket isn't listening yet (or is gone).
+fn not_up_yet(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            )
+        })
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reloading session's socket file can outlive its listener for a moment: connecting
+    /// is refused, which a reconnecting window treats as "not back yet".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_or_missing_socket_is_not_up_yet() {
+        use anyhow::Context;
+        let d = tempfile::tempdir().unwrap();
+        let sock = d.path().join("s.sock");
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        let refused = connect(&sock).await.context("connecting").unwrap_err();
+        assert!(not_up_yet(&refused), "{refused:#}");
+        let gone = connect(&d.path().join("none.sock"))
+            .await
+            .context("connecting")
+            .unwrap_err();
+        assert!(not_up_yet(&gone), "{gone:#}");
+        assert!(!not_up_yet(&anyhow::anyhow!("not a novacode session socket")));
+    }
 
     /// L11.14: the session address round-trips on every OS, for several clients in a row
     /// (Windows hands each its own pipe instance).
