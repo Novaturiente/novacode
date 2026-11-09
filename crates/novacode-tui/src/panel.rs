@@ -19,6 +19,11 @@ const HIDE_AFTER: Duration = Duration::from_secs(5);
 pub const MIN_WIDTH: u16 = 40;
 /// Below this terminal width the panel stays hidden (pi's status-panel rule).
 pub const MIN_SCREEN: u16 = 100;
+/// Row columns (docs/tui-style.md): the project tag's maximum width, the title's
+/// smallest width before the tag gives way, and the gap before the age.
+const TAG_MAX: usize = 12;
+const TITLE_MIN: usize = 8;
+const AGE_GAP: usize = 2;
 
 /// Session facts from the host for the Usage stats tab.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
@@ -1137,11 +1142,12 @@ impl Panel {
         out
     }
 
-    /// The shown node tab has rows with actions: a selection is drawn and moved.
-    /// Otherwise up/down just scroll.
+    /// A row tab: a selection is drawn and ↑↓ move it. Usage and Timing (stats
+    /// without row actions) and region tabs scroll instead.
     fn interactive(&self) -> bool {
-        self.current()
-            .is_some_and(|t| t.sources.iter().flat_map(|s| &s.nodes).any(|n| !n.actions.is_empty()))
+        self.current().is_some_and(|t| {
+            t.region.is_none() && !(t.owner.is_none() && matches!(t.name.as_str(), "usage" | "timing"))
+        })
     }
 
     /// A key while focused. `None` = not handled here.
@@ -1169,8 +1175,8 @@ impl Panel {
         }
         match key {
             "esc" | "q" => return Some(Some(PanelAction::Leave)),
-            "tab" => self.cycle(false),
-            "shift+tab" => self.cycle(true),
+            "tab" | "right" => self.cycle(false),
+            "shift+tab" | "left" => self.cycle(true),
             "up" | "k" => self.sel = self.sel.saturating_sub(1),
             // Without a selection this scrolls; render clamps it to the text.
             "down" | "j" if !self.interactive() => self.sel += 1,
@@ -1218,7 +1224,8 @@ impl Panel {
         w.max(MIN_WIDTH).min(screen / 2)
     }
 
-    /// Draw the panel; only a `focused` one gets the accent frame, numbers and key hints.
+    /// Draw the panel; only a `focused` one gets the accent frame and key hints, and an
+    /// unfocused one draws its selection dim.
     pub fn render(&mut self, f: &mut Frame, area: Rect, theme: &Theme, focused: bool) {
         let border = if focused { theme.accent } else { theme.border };
         let block = Block::default().borders(Borders::LEFT).border_style(border);
@@ -1238,7 +1245,7 @@ impl Panel {
         let mut rows: Vec<(Vec<Span>, Vec<Span>)> = vec![(Vec::new(), Vec::new())];
         let mut spans_at: Vec<(u16, u16, u16, String)> = Vec::new();
         let mut x = 0u16;
-        for (i, t) in tabs.iter().enumerate() {
+        for t in &tabs {
             let on = self.shown.as_deref() == Some(t.name.as_str());
             let icon = match (self.nerd, t.name.as_str()) {
                 (true, "agent") => "\u{f06a9} ",
@@ -1249,13 +1256,7 @@ impl Panel {
                 (true, "files") => "\u{f15b} ",
                 _ => "",
             };
-            // Focused: the number that jumps to it.
-            let num = if focused && i < 9 {
-                format!("{} ", i + 1)
-            } else {
-                String::new()
-            };
-            let label = format!(" {num}{icon}{} ", t.title);
+            let label = format!(" {icon}{} ", t.title);
             let lw = unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
             if x > 0 && x + lw > inner.width {
                 rows.push((Vec::new(), Vec::new()));
@@ -1324,8 +1325,33 @@ impl Panel {
                     self.sel = self.sel.min(n.saturating_sub(1));
                 }
                 let (rows, nerd, sel) = (self.rows(), self.nerd, self.sel);
-                let sel_on = focused && interactive;
                 let now = now_ms();
+                let age = |n: &Node| {
+                    n.time.map(|t| {
+                        let ms = t.ms.unwrap_or(0) + t.since.map(|s| now.saturating_sub(s)).unwrap_or(0);
+                        (clock(ms), if t.since.is_some() { theme.warn } else { theme.dim })
+                    })
+                };
+                let cells = |s: &str| unicode_width::UnicodeWidthStr::width(s);
+                // Fixed columns: the widest age and (capped) tag of the tab.
+                let age_col = rows.iter().filter_map(|r| age(r.node)).map(|(a, _)| cells(&a)).max();
+                let tag_col = rows
+                    .iter()
+                    .filter_map(|r| r.node.tag.as_deref())
+                    .map(|t| cells(t).min(TAG_MAX))
+                    .max()
+                    .unwrap_or(0);
+                // The selected row's lines become one full-width bar; dim when unfocused.
+                let bar = |l: Line<'static>| {
+                    let mut sp = l.spans;
+                    sp.push(Span::raw(" ".repeat(w.saturating_sub(crate::wrap::width(&sp)))));
+                    let sp = sp.into_iter().map(|s| {
+                        let st = if focused { s.style } else { s.style.patch(theme.dim) };
+                        let st = st.patch(theme.selection);
+                        s.style(st)
+                    });
+                    Line::from(sp.collect::<Vec<_>>())
+                };
                 let mut out = Vec::new();
                 let mut owner: Vec<Option<usize>> = Vec::new();
                 let mut sel_line = 0;
@@ -1375,47 +1401,47 @@ impl Panel {
                     } else {
                         theme.text.add_modifier(Modifier::BOLD)
                     };
-                    let mut left = vec![
-                        Span::styled(r.guide.clone(), theme.border),
-                        Span::styled(format!("{g} "), gs),
-                        Span::styled(n.label.clone(), label_style),
-                    ];
-                    if let Some(t) = &n.tag {
-                        left.push(Span::styled(format!(" {t}"), theme.dim));
-                    }
-                    let (right, rs) = match n.time {
-                        Some(t) => {
-                            let ms = t.ms.unwrap_or(0) + t.since.map(|s| now.saturating_sub(s)).unwrap_or(0);
-                            (clock(ms), if t.since.is_some() { theme.warn } else { theme.dim })
-                        }
-                        None => (String::new(), theme.dim),
+                    // Columns: guide, icon (2 cells), title (shrinks first), tag (at most
+                    // TAG_MAX, gives way below TITLE_MIN), a 2-cell gap, the age.
+                    let icon = format!("{g}{}", " ".repeat(2usize.saturating_sub(cells(&g)).max(1)));
+                    let fixed = cells(&r.guide) + cells(&icon);
+                    let right = age_col.map_or(0, |a| AGE_GAP + a);
+                    let room = w.saturating_sub(fixed + right);
+                    let tag_w = tag_col.min(room.saturating_sub(TITLE_MIN + 1));
+                    let title_w = room.saturating_sub(if tag_w > 0 { tag_w + 1 } else { 0 });
+                    // One text cut to its column and padded to fill it.
+                    let fit = |s: &str, width: usize, st: Style| {
+                        let mut v = crate::wrap::truncate(vec![Span::styled(s.to_string(), st)], width).spans;
+                        v.push(Span::raw(" ".repeat(width.saturating_sub(crate::wrap::width(&v)))));
+                        v
                     };
-                    let rw = unicode_width::UnicodeWidthStr::width(right.as_str());
-                    let l = crate::wrap::truncate(left, w.saturating_sub(rw + 1).max(1));
-                    let pad = w.saturating_sub(crate::wrap::width(&l.spans) + rw);
-                    let mut sp = l.spans;
-                    sp.push(Span::raw(" ".repeat(pad)));
-                    sp.push(Span::styled(right, rs));
-                    if sel_on && i == sel {
+                    let mut sp = vec![Span::styled(r.guide.clone(), theme.border), Span::styled(icon, gs)];
+                    sp.extend(fit(&n.label, title_w, label_style));
+                    if tag_w > 0 {
+                        sp.push(Span::raw(" "));
+                        sp.extend(fit(n.tag.as_deref().unwrap_or(""), tag_w, theme.dim));
+                    }
+                    if let Some(a) = age_col {
+                        let (t, st) = age(n).unwrap_or_default();
+                        sp.push(Span::raw(" ".repeat(AGE_GAP + a - cells(&t))));
+                        sp.push(Span::styled(t, st));
+                    }
+                    let selected = interactive && i == sel;
+                    let line = crate::wrap::truncate(sp, w);
+                    if selected {
                         sel_line = out.len();
-                        sp = sp
-                            .into_iter()
-                            .map(|s| {
-                                let st = s.style.add_modifier(Modifier::REVERSED);
-                                s.style(st)
-                            })
-                            .collect();
                     }
                     owner.resize(out.len(), None);
-                    out.push(Line::from(sp));
+                    out.push(if selected { bar(line) } else { line });
                     owner.push(Some(i));
                     // Details hang under the label; the guide keeps going to the children.
                     let has_kids = rows
                         .get(i + 1)
                         .is_some_and(|x| x.node.parent.as_deref() == Some(n.id.as_str()));
                     let pad = format!("{}{}", r.below, if has_kids { "│ " } else { "  " });
+                    let lead = [Span::styled(pad, theme.border)];
                     for (k, d) in n.detail.iter().enumerate() {
-                        let mut v = vec![Span::styled(pad.clone(), theme.border)];
+                        let mut v = Vec::new();
                         if k == 0
                             && n.status.as_deref() == Some("running")
                             && n.icon.as_deref().is_some_and(|i| i.starts_with("todo:"))
@@ -1423,8 +1449,10 @@ impl Panel {
                             v.push(Span::styled(if nerd { "\u{f0da} " } else { "▸ " }, theme.warn));
                         }
                         v.push(Span::styled(d.clone(), theme.dim));
-                        out.push(crate::wrap::truncate(v, w));
-                        owner.push(Some(i));
+                        for l in detail_lines(v, w, &lead) {
+                            out.push(if selected { bar(l) } else { l });
+                            owner.push(Some(i));
+                        }
                     }
                 }
                 if out.is_empty() {
@@ -1668,10 +1696,26 @@ impl Panel {
 /// shares, through the shared hint helper with one cell of padding.
 fn footer_line<K: AsRef<str>, V: AsRef<str>>(first: &[(K, V)], w: usize, t: &Theme) -> Line<'static> {
     let mut pairs: Vec<(&str, &str)> = first.iter().map(|(k, a)| (k.as_ref(), a.as_ref())).collect();
-    pairs.extend([("esc", "back"), ("tab", "next tab"), ("1-9", "tab")]);
+    pairs.extend([("esc", "back"), ("←→", "tab")]);
     let mut l = crate::hints::hints(&pairs, w.saturating_sub(1), t);
     l.spans.insert(0, Span::raw(" "));
     l
+}
+
+/// A detail text word-wrapped under `lead` to at most two lines; the second is cut
+/// with `…` when more is left.
+fn detail_lines(v: Vec<Span<'static>>, w: usize, lead: &[Span<'static>]) -> Vec<Line<'static>> {
+    let mut lines = crate::wrap::wrap(v, w, lead, lead);
+    if lines.len() > 2 {
+        let mut rest: Vec<Span<'static>> = lines[1].spans.clone();
+        for l in &lines[2..] {
+            rest.push(Span::styled(" ", l.spans.last().map(|s| s.style).unwrap_or_default()));
+            rest.extend(l.spans.iter().skip(lead.len()).cloned());
+        }
+        lines.truncate(1);
+        lines.push(crate::wrap::truncate(rest, w));
+    }
+    lines
 }
 
 /// A status's glyph and colour (for the process view).
@@ -1933,16 +1977,16 @@ mod tests {
             })
             .collect();
         let want = [
-            "│  1 Tasks",
-            "│ ━━━━━━━━━",
-            "│   ├─◐ T3-fix-parser novacode               2h00m",
+            "│  Tasks",
+            "│ ━━━━━━━",
+            "│   ├─◐ T3-fix-parser              novacode  2h00m",
             "│   │   running · claude/claude-sonnet-5-5 · 41.2k",
             "│   │   › parser fixed; tests pass",
-            "│   └─⏸ T4-docs site                         1h00m",
-            "│       blocked: quota · claude/claude-haiku-5-5 …",
+            "│   └─⏸ T4-docs                    site      1h00m",
+            "│       blocked: quota · claude/claude-haiku-5-5",
+            "│       · 900",
             "│",
-            "│",
-            "│  enter attach · ↑↓ move · esc back",
+            "│  enter attach · ↑↓ move · esc back · ←→ tab",
         ];
         assert_eq!(lines, want, "\n{}", lines.join("\n"));
         // Enter on a row with a session attaches to it; a queued row has none.
