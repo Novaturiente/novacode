@@ -2728,6 +2728,17 @@ fn a_finished_commands_box_keeps_its_height() {
     let s = screen(&mut a, 60, 30);
     assert!(s.contains("out 1") && s.contains("● bash"), "{s}");
     assert_eq!(tool_rows(&s, "bash $ make"), running, "{s}");
+    // Review item 1: the turn ends but stays open (turns shown expanded): the box stays.
+    key(&mut a, KeyCode::Char('o'), KeyModifiers::ALT);
+    a.on_agent(AgentEvent::Settled);
+    let s = screen(&mut a, 60, 30);
+    assert_eq!(tool_rows(&s, "bash $ make"), running, "a done, open turn keeps the box\n{s}");
+    // Folded once, then opened again: the box is gone (nothing is running any more).
+    key(&mut a, KeyCode::Char('o'), KeyModifiers::ALT);
+    screen(&mut a, 60, 30);
+    key(&mut a, KeyCode::Char('o'), KeyModifiers::ALT);
+    let s = screen(&mut a, 60, 30);
+    assert!(tool_rows(&s, "bash $ make") < running, "{s}");
 }
 
 /// TS2: a running read shows a line count from the start, never the file.

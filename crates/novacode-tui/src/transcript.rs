@@ -74,6 +74,9 @@ pub struct Turn {
     drain: Option<Drain>,
     /// A running tool's spinner or timer moved: redraw only its rows (TS2).
     ticked: bool,
+    /// Its commands keep their reserved tail box (TS2): set while it runs, cleared once
+    /// it folds. A done turn that never folds keeps the box, so nothing below moves.
+    holds_box: bool,
 }
 
 /// A reply that ended while some of its text was held back (TS3): the rest
@@ -179,7 +182,7 @@ impl Turn {
             if tool.done || tool.started.is_none() {
                 continue;
             }
-            let new = lay_tool(tool, !self.done, width, t, tools);
+            let new = lay_tool(tool, self.holds_box, width, t, tools);
             if new.len() != rows {
                 return false;
             }
@@ -788,6 +791,12 @@ impl Transcript {
         let last = self.turns.len().saturating_sub(1);
         for (i, turn) in self.turns.iter_mut().enumerate() {
             let tools = (self.tools_full, self.tools_hint.as_str());
+            // `done` and `expanded` only change with a `touch`, so the cache stays right.
+            if !turn.done {
+                turn.holds_box = true;
+            } else if turn.collapsed() {
+                turn.holds_box = false;
+            }
             let mut fresh = turn
                 .cache
                 .as_ref()
@@ -990,7 +999,7 @@ fn lay_turn(
             }
             Item::Tool(tool) => {
                 let start = lines.len();
-                lines.extend(lay_tool(tool, !turn.done, width, t, tools));
+                lines.extend(lay_tool(tool, turn.holds_box, width, t, tools));
                 tool_rows.push((idx, start, lines.len() - start));
             }
             Item::Image(img) => {
@@ -1491,8 +1500,8 @@ pub fn lay_say(s: &novacode_types::Say, open: bool, width: usize, t: &Theme) -> 
     lines
 }
 
-/// `live`: its turn is still running (a command then keeps its reserved box).
-fn lay_tool(tool: &Tool, live: bool, width: usize, t: &Theme, (full, hint): (bool, &str)) -> Vec<Line<'static>> {
+/// `holds_box`: its turn hasn't folded since it ran (a command then keeps its reserved box).
+fn lay_tool(tool: &Tool, holds_box: bool, width: usize, t: &Theme, (full, hint): (bool, &str)) -> Vec<Line<'static>> {
     if tool.is_say() {
         let open = !tool.done && tool.say.as_ref().is_some_and(|s| !s.choices.is_empty());
         return lay_say(&say_of(tool), open, width, t);
@@ -1654,9 +1663,9 @@ fn lay_tool(tool: &Tool, live: bool, width: usize, t: &Theme, (full, hint): (boo
     if skipped_after > 0 {
         lines.push(more(skipped_after, plural(skipped_after)));
     }
-    // A command keeps the whole tail box from its first line until its turn ends, so it
+    // A command keeps the whole tail box from its first line until its turn folds, so it
     // never grows and nothing below moves when it finishes (TS2).
-    if live && !full && matches!(tool.name.as_str(), "bash" | "process") {
+    if holds_box && !full && matches!(tool.name.as_str(), "bash" | "process") {
         let pad = OUTPUT_TAIL - shown.len() + usize::from(skipped_before == 0);
         lines.extend(std::iter::repeat_n(Line::styled("▏", t.border), pad));
     }
