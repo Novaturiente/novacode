@@ -39,6 +39,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `memory.store` | bool | true | Cross-session memory (SQLite) and its start-of-session index. |
 | `memory.indexItems` | number | 15 | Memory items in the session-start index. |
 | `memory.indexChars` | number | 2000 | Character cap of that index. |
+| `repoNotes.enabled` | bool | true | Learn repo notes from earlier sessions into `.novacode/notes.md` and add them to the prompt (trusted folders). |
 | `sessions.cleanupDays` | number | 14 | At start (at most once a day), delete subagent and super review sessions untouched this many days. User and super task sessions are kept. 0 keeps all. |
 | `agents.stallMinutes` | number | 10 | A subagent silent this long is stopped. |
 | `agents.timeoutMinutes` | number | 45 | A subagent running this long is stopped. |

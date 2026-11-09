@@ -32,6 +32,7 @@ const PAGES: &[(&str, &str)] = pages![
     "super.md",
     "tools.md",
     "troubleshooting.md",
+    "tui-style.md",
     "tui.md",
 ];
 const README: &str = include_str!("../../../README.md");

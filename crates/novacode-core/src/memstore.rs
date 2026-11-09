@@ -67,7 +67,7 @@ pub struct Memories {
 }
 
 /// The project a folder belongs to: the main repo's top (worktrees map back), else the folder.
-fn project_root(cwd: &Path) -> PathBuf {
+pub fn project_root(cwd: &Path) -> PathBuf {
     novacode_base::git::command_in(cwd)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .stderr(std::process::Stdio::null())
@@ -79,6 +79,15 @@ fn project_root(cwd: &Path) -> PathBuf {
         .unwrap_or_else(|| cwd.to_path_buf())
 }
 
+/// The file stem of a project's stores under `<home>/memory/projects/`.
+pub fn project_key(root: &Path) -> String {
+    let h = root
+        .to_string_lossy()
+        .bytes()
+        .fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    format!("{h:016x}")
+}
+
 fn now_ms() -> i64 {
     crate::session::now_ms() as i64
 }
@@ -86,13 +95,10 @@ fn now_ms() -> i64 {
 impl Memories {
     pub fn open(home: &Path, cwd: &Path) -> Self {
         let root = project_root(cwd);
-        let key = root
-            .to_string_lossy()
-            .bytes()
-            .fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+        let key = project_key(&root);
         Memories {
             global: home.join("memory").join("global.db"),
-            project: home.join("memory").join("projects").join(format!("{key:016x}.db")),
+            project: home.join("memory").join("projects").join(format!("{key}.db")),
             root,
         }
     }

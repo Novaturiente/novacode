@@ -3649,6 +3649,7 @@ pub(super) mod tests {
                 tool_guidelines: vec![],
                 agent: None,
                 memory_index: None,
+            repo_notes: None,
                 mode: None,
             },
             warm: false,

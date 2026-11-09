@@ -24,6 +24,7 @@ pub mod policy;
 pub mod process_ext;
 pub mod prompt;
 pub mod recovery;
+pub mod repo_notes;
 pub mod resources;
 pub mod risk;
 pub mod session;

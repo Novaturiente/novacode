@@ -39,6 +39,8 @@ pub struct Sources {
     pub agent: Option<(String, bool)>,
     /// The saved-memory index (L10.4), read once at session start so it never drifts.
     pub memory_index: Option<String>,
+    /// Learned repo notes (L10.4b), read once at session start; trusted folders only.
+    pub repo_notes: Option<String>,
     /// The active mode preset's section (L10.7); switching appends a delta.
     pub mode: Option<String>,
 }
@@ -162,6 +164,9 @@ pub fn build(src: &Sources, environment: &str) -> Sections {
     }
     if let Some(m) = src.memory_index.as_ref().filter(|m| !m.is_empty()) {
         add("memory", m.clone());
+    }
+    if let Some(n) = &src.repo_notes {
+        add("repo_notes", n.clone());
     }
     add("environment", environment.into());
     if let Some(m) = &src.mode {
@@ -352,6 +357,7 @@ mod tests {
             tool_guidelines: vec![],
             agent: None,
             memory_index: None,
+            repo_notes: None,
             mode: None,
         };
         let a = build(&src, "Date: x");

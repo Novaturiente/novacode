@@ -198,6 +198,12 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
     ),
     ("memory.indexChars", "number", "2000", "Character cap of that index."),
     (
+        "repoNotes.enabled",
+        "bool",
+        "true",
+        "Learn repo notes from earlier sessions into `.novacode/notes.md` and add them to the prompt (trusted folders).",
+    ),
+    (
         "sessions.cleanupDays",
         "number",
         "14",

@@ -15,8 +15,9 @@ The prompt is built from named sections, always in this order. A section is left
 | 5 | `project_context` | Your context files (see below). |
 | 6 | `skills` | A compact list of [skills](skills.md). |
 | 7 | `memory` | The saved-memory index from earlier sessions. |
-| 8 | `environment` | Working directory, date, git branch and HEAD, and how many files were changed at session start. |
-| 9 | `mode` | The active mode preset, if any. |
+| 8 | `repo_notes` | Notes learned from earlier sessions in this repo (see [Repo notes](#repo-notes)). Trusted folders only. |
+| 9 | `environment` | Working directory, date, git branch and HEAD, and how many files were changed at session start. |
+| 10 | `mode` | The active mode preset, if any. |
 
 `SYSTEM.md` replaces the built-in preamble. `APPEND_SYSTEM.md` adds to it. Both live in novacode's home folder (`~/.novacode`, or `$NOVACODE_HOME` if you set it). Empty files are ignored. They are read again whenever the prompt is rebuilt, so an edit shows up as a section update.
 
@@ -175,6 +176,17 @@ The `session_search` tool finds words in messages of earlier sessions. It search
 - `memory.store: false` removes the `memory` tool and the start-of-session index.
 
 You can turn off one without the other.
+
+### Repo notes
+
+novacode learns small facts about each repository from its earlier sessions: a failed tool call and the fix that followed. Examples: `pytest` is not installed here and `python -m pytest` works; a command needs `DATABASE_URL` set; a path moved; edits to one file often miss. It looks at every tool, not only shell commands.
+
+- **When it learns.** At the start of each session, in the background, novacode reads this repo's sessions it has not read yet. That includes sessions in its worktrees and skips subagent sessions. Every 3 newly read sessions, the `memory.model` helper rewrites the notes in plain words. It may also propose notes from failures the rules did not explain, citing the sessions that show them.
+- **When a note is used.** Once 3 different sessions show it. Two later sessions that contradict it (the failing command now works) retire it until it shows up again.
+- **Where they are.** Active notes are written to `<repo>/.novacode/notes.md`, at most 20 of them. Delete a line to drop that note for good; edit its text to reword it (the model then leaves it alone). You can commit the file or keep it out of git. The evidence is kept in `~/.novacode/memory/projects/<key>.notes.json`.
+- **How the model sees them.** As the `repo_notes` prompt section, read once at session start, so new notes apply from the next session. They are framed as suggestions that may be outdated. The section is added only in a [trusted](security.md) folder, because a cloned repo could ship its own `notes.md`.
+
+Turn it off with `"repoNotes": { "enabled": false }`.
 
 ## See also
 

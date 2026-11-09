@@ -335,6 +335,7 @@ async fn session_complete_and_spawn() {
             tool_guidelines: vec![],
             agent: None,
             memory_index: None,
+            repo_notes: None,
             mode: None,
         },
         warm: false,

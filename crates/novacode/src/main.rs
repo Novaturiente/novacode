@@ -1541,6 +1541,9 @@ impl Ctx {
                         .map(|d| (d.prompt.clone(), d.replace))
                 },
                 mode: None,
+                repo_notes: (self.trusted && s.get("repoNotes.enabled").unwrap_or(true))
+                    .then(|| novacode_core::repo_notes::section(&self.cwd))
+                    .flatten(),
                 memory_index: memories.as_ref().map(|m| {
                     m.index(
                         s.get("memory.indexItems").unwrap_or(15),
@@ -2027,9 +2030,23 @@ impl Ctx {
             if let Some(v) = s.get("memory.poolTargetTokens") {
                 m.pool_target = v;
             }
+            let worker = match worker {
+                Some(w) => Some(w.await),
+                None => None,
+            };
+            // Repo notes (L10.4b): learn from this repo's earlier sessions in the background;
+            // new notes reach the prompt from the next session.
+            if def.is_none() && !is_super && s.get("repoNotes.enabled").unwrap_or(true) {
+                tokio::spawn(novacode_core::repo_notes::learn(
+                    self.paths.home().to_path_buf(),
+                    self.cwd.clone(),
+                    agent.store.id().to_string(),
+                    worker.clone(),
+                ));
+            }
             match worker {
                 Some(w) => {
-                    agent = agent.with_memory(w.await, m);
+                    agent = agent.with_memory(w, m);
                     if let Some(m) = memories {
                         agent = agent.with_memory_store(m);
                     }
