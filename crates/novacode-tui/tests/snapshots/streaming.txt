@@ -7,6 +7,6 @@
  The loop has **three
  ⏵ queued: use tests
 ╭────────────────────────────────────────────────╮
-│                                                │
+│                                ? for shortcuts │
 ╰────────────────────────────────────────────────╯
  ⠋ writing    ctx 0%  opus · medium  proj  ⎇ main
