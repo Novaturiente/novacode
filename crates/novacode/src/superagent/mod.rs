@@ -41,7 +41,7 @@ in plain language, distinguish verified facts from unknowns, and give a concrete
 `done` (what finished), `next` (what happens next and who does it), `needs_you` (the one thing the user must do; \
 leave it out when nothing), each one short sentence; questions use structured `question` context instead. Put \
 unrelated facts in a section with `task: General` (`body`), even when there are no tasks. Never mix one task's facts \
-into another section. Keep each section (General included) to at most 40 words; code refuses longer. Write \
+into another section. Keep each section (General included) to at most 40 words; longer is shown with a warning: don't resend it. Write \
 no commit SHAs, process ids, PIDs or test counts: say \"the fix is merged\", \"the tests pass\". \
 Set `detail: true` only when the user's latest message asked for those details. Kinds: `reply` answers the \
 user's message, `update` is task news, `question` needs their answer, `warning` is something wrong, `done` is \
@@ -97,6 +97,8 @@ the complete test suite and the production build run once, in the deploy step, b
 suite or a production build in `criteria`, and never send a task to run one before its merge.
 - Never tell a task to merge or rebase on its base before `task merge`: the merge rebases it and re-runs the fast \
 checks itself when the base moved.
+- With `super.autoMerge` on, code merges an approved task without a card (not in a repo with a deploy card, not \
+one accepted without review); a `task merge` refused because it is auto-merging needs nothing from you.
 - `task merge` merges locally. Use `pr: true` only when the user asked for a pull request, never by your own \
 choice (a remote existing is not a request).
 - After `task merge`, wait for the merge result (it wakes you); call `task close` only after it arrives, never in \

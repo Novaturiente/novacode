@@ -205,6 +205,18 @@ pub(super) fn finished(t: &Task) -> bool {
         }
 }
 
+/// Fast mode: a task whose merge landed and whose after steps are done takes no more work.
+fn landed_done(t: &Task) -> bool {
+    t.landed.is_some() && finished(t)
+}
+
+fn landed_refusal(t: &Task) -> String {
+    format!(
+        "{} is merged and its after steps are done: spawn a new task for new work (a `question: true` send still goes)",
+        t.label
+    )
+}
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Args {
@@ -778,15 +790,11 @@ impl Super {
         match a.action.as_str() {
             "read" => self.read(&t, a.offset.unwrap_or(0), a.limit.unwrap_or(200)),
             "send" if a.question => self.ask(&t, a.message.as_deref().ok_or("`message` is missing")?).await,
-            // Fast mode: a landed task with its after steps done is finished; new work is a new task.
-            "send" if t.landed.is_some() && finished(&t) => Err(format!(
-                "{} is merged and its after steps are done: spawn a new task for new work (a `question: true` send still goes)",
-                t.label
-            )),
+            "send" if landed_done(&t) => Err(landed_refusal(&t)),
             "send" => self.send(&t, a.message.as_deref().ok_or("`message` is missing")?, a.proof).await,
             "stop" => self.stop(&t).await,
             "close" => self.close(&t).await,
-            "merge" => self.merge(&t, a.pr, false).await,
+            "merge" => self.merge(&t, a.pr, false, false).await,
             "accept" => self.accept(&t).await,
             "note" => self.note(&t, a.note.as_deref().ok_or("`note` is missing")?).await,
             "hold" => self.hold(&t, a.reason, a.user),
@@ -1992,6 +2000,9 @@ impl Super {
         }
         check_scope(&scope)?;
         self.check(&t.id, Event::Send)?;
+        if landed_done(t) {
+            return Err(landed_refusal(t));
+        }
         // Only the change: the new brief with the old one cut short, list changes as bullets.
         let mut change = String::new();
         if let Some(b) = &brief {
@@ -2476,12 +2487,13 @@ impl Super {
         })
     }
 
-    /// `confirmed`: the user already chose to merge on another code-made card (deploy).
-    async fn merge(&self, t: &Task, pr: bool, confirmed: bool) -> Result<String, String> {
+    /// `confirmed`: the user already chose to merge on another code-made card (deploy), or
+    /// `auto`: fast mode merges an approved task without a card (`super.autoMerge`).
+    async fn merge(&self, t: &Task, pr: bool, confirmed: bool, auto: bool) -> Result<String, String> {
         self.check(&t.id, Event::Merge)?;
-        if !confirmed && t.asking {
+        if !confirmed && !auto && t.asking {
             return Err(format!(
-                "{}'s deploy card is open; the user's choice there merges it",
+                "{}'s deploy card is open or it is auto-merging; that merges it",
                 t.label
             ));
         }
@@ -2496,6 +2508,7 @@ impl Super {
             .unwrap_or_else(|| "its base".into());
         // Approved on a merge train's card whose train failed: no second card.
         if !confirmed
+            && !auto
             && !t.merge_approved
             && !self
                 .confirm(format!("{}: merge", t.label), Self::merge_question(t, pr), "Merge")
@@ -2533,6 +2546,7 @@ impl Super {
         // Fast mode: only a moved base needs checks again, and only the fast ones; the full suite
         // and production build run once, in the deploy step.
         let recheck = match (tip, &t.base_commit) {
+            (Some(tip), Some(old)) if tip == *old && !pr => "The base did not move: don't re-run checks.".to_string(),
             (Some(tip), Some(old)) if tip != *old => format!(
                 "{base} moved since your work started ({} → {}): after the rebase, re-run your fast checks of the changed code (not the full suite or a production build) and {} only if they pass.",
                 &old[..old.len().min(8)],
@@ -2540,7 +2554,16 @@ impl Super {
                 if pr { "merge" } else { "go on" }
             ),
             _ if pr => "If the rebase moved your branch, re-run your fast checks before you merge.".to_string(),
-            _ => "The base did not move: don't re-run checks.".to_string(),
+            _ => "If the rebase moved your branch, re-run your fast checks.".to_string(),
+        };
+        // Fast mode: a PR merge with after steps lands on the base, so the slow gates come first.
+        let gates = match pr && !t.after.is_empty() {
+            true => format!(" {GATES_FIRST}"),
+            false => String::new(),
+        };
+        let intro = match auto {
+            true => "Your review approved this commit and super.autoMerge is on, so it merges now.",
+            false => "The user approved merging.",
         };
         // With after-merge steps, the merge must land before they can run.
         let pr_end = match t.after.is_empty() {
@@ -2561,13 +2584,13 @@ and report `merge: merged` once it is merged (`merge: pr-opened` only if it can'
         };
         let text = match pr {
             true => format!(
-                "The user approved merging. Rebase {branch} on {base}. {recheck} {open}, {pr_end}. If anything fails (a conflict, uncommitted changes to tracked \
+                "{intro} Rebase {branch} on {base}. {recheck}{gates} {open}, {pr_end}. If anything fails (a conflict, uncommitted changes to tracked \
 files in the main checkout, a failed check), report `merge: failed` with the reason. Untracked files (build output, \
 caches) are not a reason to stop: git refuses by itself if the merge would overwrite one."
             ),
             // R29: a task's shell may be sandboxed to its worktree, so code does the last step.
             false => format!(
-                "The user approved merging. Rebase {branch} onto {base} as it is now in the main checkout {} \
+                "{intro} Rebase {branch} onto {base} as it is now in the main checkout {} \
 (the same repo: no fetch is needed), and resolve any conflicts. {recheck} Commit anything the rebase left, then \
 report `merge: rebased`: novacode then fast-forwards {base} in the main checkout to your branch. Don't touch the \
 main checkout yourself. If anything fails (a conflict you can't resolve, a failed check), report `merge: failed` \
@@ -2600,7 +2623,7 @@ with the reason.",
             self.check(&t.id, Event::Merge)?;
             if t.asking {
                 return Err(format!(
-                    "{}'s deploy card is open; the user's choice there merges it",
+                    "{}'s deploy card is open or it is auto-merging; that merges it",
                     t.label
                 ));
             }
@@ -2621,7 +2644,7 @@ with the reason.",
         };
         let mut q = format!(
             "Merge {labels} together as one merge train? {} cherry-picks each task's commits, in this order, onto a \
-             new branch from {base} and runs the full check once; then {lands}. If the train fails, each task \
+             new branch from {base} and runs the fast checks of the combined changes once; then {lands}. If the train fails, each task \
              merges alone without another card.",
             lead.label
         );
@@ -2689,18 +2712,23 @@ with the reason.",
                  merged (`merge: pr-opened` only if it can't be merged yet, with the reason)."
             ),
         };
+        let gates = match pr && after {
+            true => format!(" {GATES_FIRST}"),
+            false => String::new(),
+        };
         let text = format!(
             "The user approved merging {labels} together as one merge train. Code made branch {branch} from {base}. \
              In your worktree, commit anything open, then `git switch {branch}` and cherry-pick each task's commits \
-             onto it in this order:\n{picks}Resolve trivial conflicts. Then run the project's full check once on \
-             {branch} (this is the integration run). If it passes, {end}\nIf a cherry-pick conflicts in a way you \
-             can't resolve, or the full check fails: `git cherry-pick --abort` if one is in progress, `git switch \
+             onto it in this order:\n{picks}Resolve trivial conflicts. Then run the fast checks of the combined \
+             changes once on {branch} (this is the integration run; not the complete suite or a production build, \
+             which run before deploy).{gates} If it passes, {end}\nIf a cherry-pick conflicts in a way you \
+             can't resolve, or a check fails: `git cherry-pick --abort` if one is in progress, `git switch \
              {own}`, and report `merge: failed` naming the task whose change conflicts or fails; each task then \
              merges alone."
         );
         let held = self.deliver(&lead.id, text).await?;
         Ok(format!(
-            "The merge train of {labels} started on {branch}: {} builds it and runs the full check.{}",
+            "The merge train of {labels} started on {branch}: {} builds it and runs the fast checks once.{}",
             lead.label,
             held_note(held)
         ))
@@ -2717,6 +2745,7 @@ with the reason.",
                 && t.repo.is_some()
                 && t.landed.is_none()
                 && t.after.is_empty()
+                && t.hold.is_none()
                 && !t.pr
                 && !t.accepted
                 && !t.asking
@@ -2730,15 +2759,21 @@ with the reason.",
             return vec![];
         }
         self.edit(|b| {
-            b.tasks
-                .iter_mut()
-                .filter(|t| due(t))
-                .map(|t| {
-                    // Taken once: a refused merge leaves it ready for super's own `task merge`.
-                    t.deploy_decided = true;
-                    t.id.clone()
-                })
-                .collect()
+            // One per repo, none while the repo's merge lock is held: a busy lock is no refusal.
+            let mut repos: Vec<PathBuf> = b.merge_locks.keys().cloned().collect();
+            repos.extend(b.tasks.iter().filter(|t| t.asking).filter_map(|t| t.repo.clone()));
+            let mut out = vec![];
+            for t in b.tasks.iter_mut().filter(|t| due(t)) {
+                let repo = t.repo.clone().unwrap_or_default();
+                if repos.contains(&repo) {
+                    continue;
+                }
+                repos.push(repo);
+                // Not saved: a restart has no auto-merge in flight. Blocks super's own card meanwhile.
+                t.asking = true;
+                out.push(t.id.clone());
+            }
+            out
         })
         .unwrap_or_default()
     }
@@ -2746,7 +2781,17 @@ with the reason.",
     /// Merge `id` without a card (fast mode). What happened, for super.
     pub(super) async fn auto_merge(&self, id: &str) -> Option<String> {
         let t = self.row(id).ok()?;
-        Some(match self.merge(&t, false, true).await {
+        let out = self.merge(&t, false, false, true).await;
+        let refused = out.is_err();
+        let _ = self.edit(|b| {
+            if let Some(r) = b.tasks.iter_mut().find(|r| r.id == id) {
+                r.asking = false;
+                // A refusal is not retried: super calls `task merge` once the cause is fixed.
+                r.deploy_decided |= refused;
+            }
+        });
+        Some(match out {
+            Ok(out) if out.contains("merge: failed") => format!("{}'s auto-merge failed: {out}", t.label),
             Ok(out) => format!("{} merges without a card (super.autoMerge): {out}", t.label),
             Err(e) => format!("{}'s auto-merge was refused: {e}. Call `task merge` when the cause is fixed.", t.label),
         })
@@ -2823,7 +2868,7 @@ with the reason.",
             ));
         }
         let t = self.shown(self.row(id).ok()?);
-        Some(match self.merge(&t, t.pr, true).await {
+        Some(match self.merge(&t, t.pr, true, false).await {
             Ok(out) => out,
             Err(e) => format!("{}'s merge didn't start: {e}", t.label),
         })
@@ -3125,7 +3170,7 @@ impl Tool for TaskTool {
                 "proof": { "type": "boolean", "description": "send (work): evidence only, such as running a check or showing output, with no code change. An approval of the task's commit stays: a `done` on the same commit goes straight back to ready; a new commit is reviewed." },
                 "question": { "type": "boolean", "description": "send: only ask for information (raw output, proof): the task's state and review stay, it answers in text without a report, and its reply wakes you. Leave false for work: a plain send sets the task running and stops its review." },
                 "pr": { "type": "boolean", "description": "merge: open a pull request instead of merging locally; only when the user asked for a pull request." },
-                "tasks": { "type": "array", "items": { "type": "string" }, "description": "merge: instead of `task`, two or more ready write tasks in one repo, in merge order: a merge train (one card, one integration branch, one full check, one merge)." },
+                "tasks": { "type": "array", "items": { "type": "string" }, "description": "merge: instead of `task`, two or more ready write tasks in one repo, in merge order: a merge train (one card, one integration branch, one run of fast checks, one merge)." },
                 "note": s("review: what the review should look at. note: the user's decision to keep on the task's charter."),
                 "reason": s("hold: why the task waits, in a few words."),
                 "user": { "type": "boolean", "description": "hold: true when the user paused the task; false when you keep it waiting on purpose." },
@@ -4941,19 +4986,39 @@ pub(super) mod tests {
             auto_merge: true,
             ..test_cfg(home, 5)
         });
-        repo(&fx.root, "app");
-        repo(&fx.root, "app2");
+        for r in ["app", "app2", "app3"] {
+            repo(&fx.root, r);
+        }
         run(&fx, spawn_args("app", "m", true)).await.unwrap();
         run(&fx, spawn_args("app2", "n", true)).await.unwrap();
-        approve(&fx, "T1-m", "abc");
-        approve(&fx, "T2-n", "def");
-        fx.sup.edit(|b| b.tasks[1].accepted = true).unwrap();
-        assert_eq!(fx.sup.auto_merge_due(), ["T1-m"], "accepted without review: never");
+        run(&fx, spawn_args("app3", "o", true)).await.unwrap();
+        run(&fx, spawn_args("app", "p", true)).await.unwrap();
+        for (id, c) in [("T1-m", "a1"), ("T2-n", "b2"), ("T3-o", "c3"), ("T4-p", "d4")] {
+            approve(&fx, id, c);
+        }
+        fx.sup
+            .edit(|b| {
+                b.tasks[1].accepted = true;
+                b.tasks[2].hold = Some(super::super::board::Hold {
+                    reason: "after T1".into(),
+                    user: false,
+                    at: 0,
+                });
+            })
+            .unwrap();
+        // Not accepted-without-review, not held, one per repo (T4 waits for T1's repo).
+        assert_eq!(fx.sup.auto_merge_due(), ["T1-m"]);
         assert!(fx.sup.auto_merge_due().is_empty(), "taken once");
+        let e = run(&fx, json!({"action": "merge", "task": "T1-m"})).await.unwrap_err();
+        assert!(e.contains("auto-merging"), "super's own card is refused meanwhile: {e}");
         let out = fx.sup.auto_merge("T1-m").await.unwrap();
         assert!(out.contains("without a card"), "{out}");
-        assert_eq!(fx.sup.row("T1-m").unwrap().state, State::Merging);
+        let t = fx.sup.row("T1-m").unwrap();
+        assert!(t.state == State::Merging && !t.asking);
         assert!(fx.asker.asked.lock().unwrap().is_empty(), "no merge card");
+        let text = fx.launcher.prompts("s1").last().unwrap().clone();
+        assert!(text.contains("super.autoMerge is on") && !text.contains("The user approved"), "{text}");
+        assert!(fx.sup.auto_merge_due().is_empty(), "T4 waits while app's merge lock is held");
         // A repo whose project file describes a deploy keeps its deploy card.
         let fx = fixture_cfg(&[], |home| Config {
             auto_merge: true,
@@ -5003,6 +5068,10 @@ pub(super) mod tests {
             .await
             .unwrap_err();
         assert!(e.contains("spawn a new task"), "{e}");
+        let e = run(&fx, json!({"action": "scope", "task": "T1-m", "criteria": ["more"]}))
+            .await
+            .unwrap_err();
+        assert!(e.contains("spawn a new task"), "scope too, before any card: {e}");
         run(&fx, json!({"action": "send", "task": "T1-m", "message": "which?", "question": true}))
             .await
             .unwrap();
@@ -5664,7 +5733,7 @@ pub(super) mod tests {
             "worktree-T1-m",
             "worktree-T2-n",
             "cherry-pick",
-            "full check",
+            "fast checks of the combined",
             "merge: rebased",
             "merge: failed",
         ] {
