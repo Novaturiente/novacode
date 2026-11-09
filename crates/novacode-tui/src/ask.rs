@@ -1,5 +1,6 @@
 //! The `ask_user` form (L5.21): one question at a time, choices with a cursor,
-//! multi-select, a free-text row, a note on a choice (`n`), and the focused choice's preview.
+//! multi-select, free text as the last numbered choice, a note on a choice (`n`), and the
+//! focused choice's preview. A click selects a choice, a double-click confirms it (TP5).
 
 use crate::editor::Editor;
 use crate::keys::A;
@@ -12,7 +13,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use tokio::sync::oneshot;
 
@@ -29,6 +30,7 @@ const PREVIEW_ROWS: usize = 24;
 
 #[derive(Default)]
 struct Sections {
+    /// First row of each choice, then of the free-text row, then where that row ends.
     choices: Vec<usize>,
     context_end: usize,
     preview_start: usize,
@@ -52,6 +54,12 @@ pub struct AskForm {
     edited: BTreeSet<(usize, usize)>,
     /// The key that opens the editor, for the keys line (empty = not shown).
     pub edit_key: String,
+    /// The key that sends typed text, for the keys line.
+    pub submit_key: String,
+    /// Where the form was last drawn, and which screen rows hold which choice.
+    area: Cell<Rect>,
+    choice_rows: RefCell<Vec<(u16, usize)>>,
+    clicks: crate::dialog::Clicks,
     context_scroll: Cell<usize>,
     context_page: Cell<usize>,
     context_max: Cell<usize>,
@@ -86,6 +94,10 @@ impl AskForm {
             width: Cell::new(40),
             edited: BTreeSet::new(),
             edit_key: String::new(),
+            submit_key: "enter".into(),
+            area: Cell::new(Rect::default()),
+            choice_rows: RefCell::new(Vec::new()),
+            clicks: Default::default(),
             context_scroll: Cell::new(0),
             context_page: Cell::new(1),
             context_max: Cell::new(0),
@@ -177,6 +189,34 @@ impl AskForm {
         }
     }
 
+    /// The form covers this screen cell.
+    pub fn contains(&self, x: u16, y: u16) -> bool {
+        self.area.get().contains(Position::new(x, y))
+    }
+
+    /// A press on screen row `y`: selects the choice there; a second press confirms it
+    /// (free text opens for typing).
+    pub fn click(&mut self, y: u16) -> Done {
+        let hit = self.choice_rows.borrow().iter().find(|(r, _)| *r == y).map(|(_, c)| *c);
+        let Some(i) = hit else { return Done::Pending };
+        let double = self.clicks.double(y);
+        let q = self.q;
+        self.typing = false;
+        self.noting = false;
+        self.sel[q] = i;
+        if !double {
+            return Done::Pending;
+        }
+        if i == self.rows() - 1 {
+            self.typing = true;
+            return Done::Pending;
+        }
+        if self.cur().multi && self.picked[q].is_empty() {
+            self.picked[q].insert(i);
+        }
+        self.advance()
+    }
+
     /// A paste goes into the open input, if any.
     pub fn paste(&mut self, s: &str) {
         let q = self.q;
@@ -258,6 +298,10 @@ impl AskForm {
                     if !self.picked[q].remove(&i) {
                         self.picked[q].insert(i);
                     }
+                } else if i == rows - 1 {
+                    // Free text is the last numbered choice.
+                    self.sel[q] = i;
+                    self.typing = true;
                 }
             }
             KeyCode::Enter | KeyCode::Tab if self.sel[q] == rows - 1 => self.typing = true,
@@ -353,6 +397,11 @@ impl AskForm {
             if o.recommended {
                 spans.push(Span::styled("  recommended", t.ok));
             }
+            // The note key only where it works: on the selected choice.
+            if focused {
+                spans.push(Span::raw("  "));
+                spans.extend(crate::hints::hints(&[("n", "note")], usize::MAX, t).spans);
+            }
             let indent = [Span::raw(" ".repeat(6 + mark.len()))];
             out.extend(wrap::wrap(spans, w, &[], &indent));
             if let Some(d) = o.description.as_deref().filter(|d| !d.trim().is_empty()) {
@@ -378,7 +427,7 @@ impl AskForm {
         let on_text = sel == q.options.len();
         let lead = vec![
             Span::styled(if on_text && !self.typing { " ▸ " } else { "   " }, t.accent),
-            Span::styled("✎ ", t.dim),
+            Span::styled(format!("{}. ", q.options.len() + 1), t.dim),
         ];
         let style = if self.typing || on_text { t.accent } else { t.dim };
         if self.typing || !typed.is_empty() {
@@ -388,6 +437,7 @@ impl AskForm {
                 [lead, vec![Span::styled("Type something…", style)]].concat(),
             ));
         }
+        sections.choices.push(out.len());
         gap(&mut out);
         sections.preview_start = out.len();
         if let Some(p) = q.options.get(sel).and_then(|o| o.preview.as_ref()) {
@@ -408,29 +458,48 @@ impl AskForm {
             gap(&mut out);
         }
         let has_preview = q.options.get(sel).is_some_and(|o| o.preview.is_some());
-        let mut keys = if self.typing {
-            "Enter answer · Esc back to the choices"
-        } else if self.noting && q.multi {
-            "Enter pick with note · Esc back"
+        // Only keys that work now, most important first: a narrow form drops from the end.
+        let sub = self.submit_key.as_str();
+        let mut keys: Vec<(String, &str)> = Vec::new();
+        let mut add = |k: &str, a: &'static str| keys.push((k.to_string(), a));
+        if self.typing {
+            add(sub, "answer");
+            add("esc", "back");
         } else if self.noting {
-            "Enter choose with note · Esc back"
-        } else if q.multi {
-            "↑↓ move · Space pick · n note · Enter next · ← back · Esc dismiss"
+            add(sub, if q.multi { "pick with note" } else { "choose with note" });
+            add("esc", "back");
         } else {
-            "↑↓ move · Enter choose · n note · 1-9 pick · ← back · Esc dismiss"
+            add("↑↓", "move");
+            if q.multi && !on_text {
+                add("space", "pick");
+            }
+            add(
+                "enter",
+                match (on_text, q.multi) {
+                    (true, _) => "type",
+                    (false, true) => "next",
+                    (false, false) => "choose",
+                },
+            );
+            add("esc", "dismiss");
+            if self.q > 0 {
+                add("←", "back");
+            }
+            if !q.multi {
+                keys.push((format!("1-{}", self.rows().min(9)), "pick"));
+            }
         }
-        .to_string();
         if !self.edit_key.is_empty() && (self.typing || self.noting || has_preview) {
             let what = if has_preview && !self.typing && !self.noting {
                 "view/edit in editor"
             } else {
                 "editor"
             };
-            keys = format!("{} {what} · {keys}", self.edit_key);
+            keys.insert(2.min(keys.len()), (self.edit_key.clone(), what));
         }
+        keys.retain(|(k, _)| !k.is_empty());
         sections.help_start = out.len();
-        // Wrapped, so a narrow form never hides "Esc dismiss".
-        out.extend(wrap::wrap(vec![Span::styled(keys, t.dim)], w, &[], &[]));
+        out.push(crate::hints::hints(&keys, w, t));
         (out, cursor, sections)
     }
 
@@ -451,6 +520,7 @@ impl AskForm {
             title.push_str(&format!(" · {h}"));
         }
         let inner = crate::dialog::frame(f, area, &title, t);
+        self.area.set(area);
         let w = inner.width as usize;
         let h = inner.height as usize;
         let mut content = self.content(w, t, true);
@@ -458,6 +528,13 @@ impl AskForm {
             content = self.content(w, t, false);
         }
         let (mut lines, mut cursor, sections) = content;
+        // The choice a content row belongs to, for clicks.
+        let choice_at = |row: usize| {
+            let c = &sections.choices;
+            (c.first().is_some_and(|&s| s <= row) && c.last().is_some_and(|&e| row < e))
+                .then(|| c.partition_point(|&s| s <= row) - 1)
+        };
+        let mut tags: Vec<Option<usize>> = (0..lines.len()).map(choice_at).collect();
         self.visible_shortcuts.set(u16::MAX);
         self.rendered_selection.set(Some((self.q, self.sel[self.q])));
         self.context_max.set(0);
@@ -507,10 +584,13 @@ impl AskForm {
             let start = start + usize::from(pinned.is_some());
             let end = (start + control_h - usize::from(pinned.is_some())).min(controls.len());
             let control_y = shown.len();
+            tags = vec![None; control_y];
             if let Some(row) = pinned {
                 shown.push(controls[row].clone());
+                tags.push(choice_at(sections.context_end + row));
             }
             shown.extend(controls[start..end].iter().cloned());
+            tags.extend((start..end).map(|row| choice_at(sections.context_end + row)));
             let visible = |row: usize| pinned == Some(row) || (start..end).contains(&row);
             if !visible(focus) {
                 self.rendered_selection.set(Some((usize::MAX, usize::MAX)));
@@ -535,6 +615,12 @@ impl AskForm {
             shown.extend(help);
             lines = shown;
         }
+        *self.choice_rows.borrow_mut() = tags
+            .into_iter()
+            .take(h)
+            .enumerate()
+            .filter_map(|(r, c)| Some((inner.y + r as u16, c?)))
+            .collect();
         f.render_widget(Paragraph::new(lines), inner);
         if let Some((r, c)) = cursor.filter(|&(r, _)| r < inner.height as usize) {
             f.set_cursor_position(Position::new(inner.x + c as u16, inner.y + r as u16));
@@ -612,7 +698,7 @@ mod tests {
                 "2. Revise",
                 "3. Wait",
                 "Type something",
-                "Esc dismiss",
+                "esc dismiss",
                 "PgUp/PgDn",
             ] {
                 assert!(initial.contains(control), "missing {control}: {initial}");
@@ -622,7 +708,7 @@ mod tests {
                 assert!(matches!(hit(&mut f, KeyCode::PageDown), Done::Pending));
                 let shown = screen(&f, width, height);
                 assert!(
-                    shown.contains("▸ 1. Approve") && shown.contains("Esc dismiss"),
+                    shown.contains("▸ 1. Approve") && shown.contains("esc dismiss"),
                     "{shown}"
                 );
                 seen.push_str(&shown);
@@ -657,7 +743,7 @@ mod tests {
         hit(&mut f, KeyCode::Enter);
         f.paste("my answer");
         let shown = screen(&f, 80, 24);
-        assert!(shown.contains("my answer") && shown.contains("Enter answer"), "{shown}");
+        assert!(shown.contains("my answer") && shown.contains("enter answer"), "{shown}");
         let Done::Answered(replies) = hit(&mut f, KeyCode::Enter) else {
             panic!("not answered")
         };
@@ -679,7 +765,7 @@ mod tests {
             "must draw the new selection first"
         );
         let shown = screen(&f, 80, 24);
-        assert!(shown.contains("▸ 3. Wait") && shown.contains("Esc dismiss"), "{shown}");
+        assert!(shown.contains("▸ 3. Wait") && shown.contains("esc dismiss"), "{shown}");
         let Done::Answered(replies) = hit(&mut f, KeyCode::Enter) else {
             panic!("not answered")
         };
@@ -737,7 +823,7 @@ mod tests {
         screen(&f, 80, 24);
         hit(&mut f, KeyCode::Down);
         let shown = screen(&f, 80, 24);
-        for text in ["▸ 2. Later choice", "label end", "Description end", "Esc dismiss"] {
+        for text in ["▸ 2. Later choice", "label end", "Description end", "esc dismiss"] {
             assert!(shown.contains(text), "missing {text}: {shown}");
         }
     }
@@ -760,7 +846,7 @@ mod tests {
                 hit(&mut f, KeyCode::PageDown);
                 let shown = screen(&f, width, 24);
                 assert!(
-                    shown.contains("▸ 3. Long label") && shown.contains("Esc dismiss"),
+                    shown.contains("▸ 3. Long label") && shown.contains("esc dismiss"),
                     "{shown}"
                 );
                 seen.push_str(&shown);
@@ -808,7 +894,7 @@ mod tests {
         f.paste("note end");
         let shown = screen(&f, 80, 24);
         assert!(
-            shown.contains("1. Approve") && shown.contains("note end") && shown.contains("Enter choose with note"),
+            shown.contains("1. Approve") && shown.contains("note end") && shown.contains("enter choose with note"),
             "{shown}"
         );
         assert!(matches!(hit(&mut f, KeyCode::Enter), Done::Pending));
@@ -937,7 +1023,7 @@ mod tests {
         let r = at("Run both tools");
         assert!(tall[r..=r + 1].iter().any(|l| l.contains("recommended")));
         let short = draw(f.height(60) - 4);
-        assert!(short.iter().any(|l| l.contains("Esc dismiss")), "{short:?}");
+        assert!(short.iter().any(|l| l.contains("esc dismiss")), "{short:?}");
     }
 
     #[test]

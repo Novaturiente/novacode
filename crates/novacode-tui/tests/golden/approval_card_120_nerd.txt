@@ -14,7 +14,7 @@
 │ bash                                                                                                                 │
 │ │ rm -rf target                                                                                                      │
 │                                                                                                                      │
-│ why: rm -r deletes files                                                                                             │
+│ rm -r deletes files                                                                                                  │
 │                                                                                                                      │
 │ y once · a this session · n deny                                                                                     │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

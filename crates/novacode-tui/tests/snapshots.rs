@@ -127,28 +127,110 @@ fn golden_ask_form() {
 
 /// An ask form with three described choices.
 fn open_ask(a: &mut App) {
+    std::mem::forget(ask_db(a, 1));
+}
+
+/// The database question `n` times; the receiver gets the answers.
+fn ask_db(a: &mut App, n: usize) -> tokio::sync::oneshot::Receiver<Option<Vec<novacode_types::Reply>>> {
     let (reply, rx) = tokio::sync::oneshot::channel();
-    std::mem::forget(rx);
     let choice = |label: &str, description: &str, recommended| Choice {
         label: label.into(),
         description: Some(description.into()),
         preview: None,
         recommended,
     };
+    let q = Question {
+        question: "Which database should the service use?".into(),
+        header: Some("Database".into()),
+        options: vec![
+            choice("Postgres", "Relational, already run in production.", true),
+            choice("SQLite", "One file, no server; fine for one writer.", false),
+            choice("Redis", "In memory; fast, but data needs care.", false),
+        ],
+        multi: false,
+    };
     a.on_ui(UiEvent::Ask(novacode_tui::ask::AskReq {
         id: 1,
-        questions: vec![Question {
-            question: "Which database should the service use?".into(),
-            header: Some("Database".into()),
-            options: vec![
-                choice("Postgres", "Relational, already run in production.", true),
-                choice("SQLite", "One file, no server; fine for one writer.", false),
-                choice("Redis", "In memory; fast, but data needs care.", false),
-            ],
-            multi: false,
-        }],
+        questions: vec![q; n],
         reply,
     }));
+    rx
+}
+
+/// The screen row holding `text` (first match).
+fn row_of(s: &str, text: &str) -> u16 {
+    s.lines().position(|l| l.contains(text)).unwrap_or_else(|| panic!("no {text}: {s}")) as u16
+}
+
+/// The ask form's last line inside its frame: the key hints.
+fn ask_keys(s: &str) -> String {
+    let end = s.lines().position(|l| l.starts_with("╰")).unwrap();
+    s.lines().nth(end - 1).unwrap().to_string()
+}
+
+/// TP5: every choice shows its description, free text is the last numbered choice,
+/// the note hint sits on the selected choice only, and "back" needs an earlier question.
+#[test]
+fn ask_form_lists_every_choice_and_only_working_keys() {
+    let (mut a, _rx) = app(vec![]);
+    let _answers = ask_db(&mut a, 2);
+    let s = screen(&mut a, 80, 30);
+    for d in ["Relational, already", "One file, no server", "In memory; fast"] {
+        assert!(s.contains(d), "description {d}: {s}");
+    }
+    assert!(s.contains("4. Type something…"), "{s}");
+    let notes: Vec<&str> = s.lines().filter(|l| l.contains("n note")).collect();
+    assert_eq!(notes.len(), 1, "{s}");
+    assert!(notes[0].contains("▸ 1. Postgres"), "{s}");
+    let keys = ask_keys(&s);
+    assert!(keys.contains("enter choose") && keys.contains("esc dismiss"), "{keys}");
+    assert!(!keys.contains("back"), "no earlier question: {keys}");
+    // On the free-text row: no note, and Enter types.
+    for _ in 0..3 {
+        key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+    }
+    let s = screen(&mut a, 80, 30);
+    assert!(s.contains("▸ 4. Type something…") && !s.contains("n note"), "{s}");
+    assert!(ask_keys(&s).contains("enter type"), "{s}");
+    // The second question can go back.
+    key(&mut a, KeyCode::Up, KeyModifiers::NONE);
+    screen(&mut a, 80, 30);
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    let s = screen(&mut a, 80, 30);
+    assert!(s.contains("Question 2 of 2"), "{s}");
+    assert!(ask_keys(&s).contains("← back"), "{s}");
+}
+
+/// TP5: a click selects a choice, a double-click answers with it.
+#[test]
+fn ask_form_click_selects_and_double_click_confirms() {
+    let (mut a, _rx) = app(vec![]);
+    let mut answers = ask_db(&mut a, 1);
+    let s = screen(&mut a, 80, 30);
+    let sqlite = row_of(&s, "2. SQLite");
+    click(&mut a, 10, sqlite);
+    let s = screen(&mut a, 80, 30);
+    assert!(s.contains("▸ 2. SQLite"), "{s}");
+    assert!(answers.try_recv().is_err(), "one click only selects");
+    // A click on a description line picks its choice too.
+    click(&mut a, 10, row_of(&s, "In memory; fast"));
+    assert!(screen(&mut a, 80, 30).contains("▸ 3. Redis"));
+    click(&mut a, 10, sqlite);
+    click(&mut a, 10, sqlite);
+    let r = answers.try_recv().unwrap().unwrap();
+    assert_eq!(r[0].chosen, ["SQLite"]);
+    // A double-click on free text opens it for typing instead of answering.
+    let mut answers = ask_db(&mut a, 1);
+    let s = screen(&mut a, 80, 30);
+    let free = row_of(&s, "4. Type something…");
+    click(&mut a, 10, free);
+    click(&mut a, 10, free);
+    assert!(answers.try_recv().is_err());
+    screen(&mut a, 80, 30);
+    typ(&mut a, "mysql");
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    let r = answers.try_recv().unwrap().unwrap();
+    assert_eq!(r[0].text.as_deref(), Some("mysql"));
 }
 
 /// TP2 baseline: the approval card for a risky command.
@@ -879,6 +961,42 @@ fn approval_card_blocks_input_and_answers() {
     assert_eq!(reply.try_recv().unwrap(), Answer::Session);
     let s = screen(&mut a, 60, 14);
     assert!(s.contains("allowed for this session: bash rm -rf target"), "{s}");
+}
+
+/// TP5: the approval card ignores the mouse; its fixed letters show as hints.
+#[test]
+fn approval_card_ignores_clicks() {
+    let (mut a, _rx) = app(vec![]);
+    let (tx, mut reply) = tokio::sync::oneshot::channel();
+    a.on_ui(UiEvent::Approve(ApproveReq {
+        id: 1,
+        tool: "bash".into(),
+        detail: "rm -rf target".into(),
+        reason: "deletes files".into(),
+        rule: "Bash(rm -rf:*)".into(),
+        risky: false,
+        reply: tx,
+    }));
+    a.age_approvals();
+    let s = screen(&mut a, 80, 24);
+    let keys = row_of(&s, "y once");
+    assert!(
+        s.contains("y once · a this session · A always · n deny"),
+        "{s}"
+    );
+    assert!(s.contains("Bash(rm -rf:*)"), "the rule stays visible: {s}");
+    assert!(!s.contains("why:"), "{s}");
+    let top = row_of(&s, "Allow?");
+    for row in top..=keys + 1 {
+        for col in [0, 2, 4, 10, 30] {
+            click(&mut a, col, row);
+            click(&mut a, col, row);
+        }
+    }
+    assert!(reply.try_recv().is_err(), "no click answers");
+    assert!(screen(&mut a, 80, 24).contains("Allow?"));
+    key(&mut a, KeyCode::Char('y'), KeyModifiers::NONE);
+    assert_eq!(reply.try_recv().unwrap(), Answer::Once);
 }
 
 #[test]

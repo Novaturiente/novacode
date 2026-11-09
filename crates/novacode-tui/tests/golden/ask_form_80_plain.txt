@@ -5,7 +5,7 @@
 ╭ Question · Database ─────────────────────────────────────────────────────────╮
 │ Which database should the service use?                                       │
 │                                                                              │
-│  ▸ 1. Postgres  recommended                                                  │
+│  ▸ 1. Postgres  recommended  n note                                          │
 │       Relational, already run in production.                                 │
 │                                                                              │
 │    2. SQLite                                                                 │
@@ -14,9 +14,9 @@
 │    3. Redis                                                                  │
 │       In memory; fast, but data needs care.                                  │
 │                                                                              │
-│    ✎ Type something…                                                         │
+│    4. Type something…                                                        │
 │                                                                              │
-│ ↑↓ move · Enter choose · n note · 1-9 pick · ← back · Esc dismiss            │
+│ ↑↓ move · enter choose · esc dismiss · 1-4 pick                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │                                                                              │
