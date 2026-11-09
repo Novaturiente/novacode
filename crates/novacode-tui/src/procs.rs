@@ -320,7 +320,6 @@ mod tests {
             pv("p2", "running", "\x1b[32mready\x1b[0m on http://x"),
         ]);
         panel.shown = Some("processes".into());
-        panel.focused = true;
         // Running first; the row shows the last output line without escapes.
         let shown = panel.current().unwrap().sources[0].nodes.clone();
         assert_eq!(shown[0].id, "p2");

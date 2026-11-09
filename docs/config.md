@@ -71,7 +71,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `ui.thinking` | string | `collapsed` | How thinking shows: collapsed, full or hidden. |
 | `ui.userMessage` | object | rounded box | Your messages' box: `border` (rounded, single, heavy, double, ascii, none), `borderColor` and `text` (`#rrggbb` or `{fg, bg, bold, italic, …}`), `paddingX` (1), `paddingY` (0). |
 | `ui.statusline` | object | built-in rows | `placement` (`above` the input, else below) and `rows` of segments (activity, ctx, cache, model, …). Segment names are in docs/tui.md. |
-| `ui.icons` | string | `nerd` | `unicode` when your font has no Nerd Font glyphs; any other value means `nerd` (`novacode doctor` flags it). |
+| `ui.icons` | string | `unicode` | `nerd` for Nerd Font glyphs when your font has them; any other value means `unicode` (`novacode doctor` flags it). |
 | `ui.images` | string | `auto` | Image protocol: auto, kitty, iterm2, sixel, halfblocks or off. |
 | `ui.panel.auto` | bool | true | Open the side panel by itself while todos or subagents run. |
 | `ui.panel.host` | string | `inline` | inline, tmux or auto: draw the panel in novacode or in a tmux pane. `tmux` and `auto` only take effect inside tmux. |

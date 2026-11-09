@@ -160,7 +160,7 @@ Non-interactive runs (`-p`, `--rpc`, `--bg`) never ask, so they always need `nov
 
 ### Icons show as boxes or question marks
 
-Your terminal font has no Nerd Font glyphs. Either install a Nerd Font, or switch to plain Unicode icons:
+`ui.icons` is `nerd`, but your terminal font has no Nerd Font glyphs. Either install a Nerd Font, or switch back to the default plain Unicode icons:
 
 ```json
 { "ui": { "icons": "unicode" } }

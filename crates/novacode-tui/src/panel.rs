@@ -168,6 +168,8 @@ pub enum PanelAction {
         node: Option<String>,
         action: String,
     },
+    /// Esc or q: keys go back to the input.
+    Leave,
 }
 
 pub struct Panel {
@@ -176,11 +178,10 @@ pub struct Panel {
     /// Toggled by hand: stays as the user left it until toggled again.
     pub pinned: Option<bool>,
     pub visible: bool,
-    pub focused: bool,
     /// Selected row in the shown node tab.
     pub sel: usize,
     idle_since: Option<Instant>,
-    /// Nerd Font glyphs (`ui.icons`, default nerd) instead of plain Unicode.
+    /// Nerd Font glyphs (`ui.icons: nerd`) instead of plain Unicode (the default).
     pub nerd: bool,
     /// Inner size at the last draw (sent with region keys).
     pub size: (u16, u16),
@@ -300,10 +301,9 @@ impl Default for Panel {
             shown: Some("agent".into()),
             pinned: None,
             visible: false,
-            focused: false,
             sel: 0,
             idle_since: None,
-            nerd: true,
+            nerd: false,
             size: (0, 0),
             stats: Stats::default(),
             was_pending: false,
@@ -406,15 +406,10 @@ impl Panel {
         all.filter(|n| !n.dim).map(set).min().unwrap_or(newest).min(newest)
     }
 
-    /// Open the panel on `name`, focused (Ctrl+Alt+U for Usage stats); again closes it.
+    /// Open the panel on `name` (Ctrl+Alt+U for Usage stats).
     pub fn show_tab(&mut self, name: &str) {
-        if self.visible && self.focused && self.shown.as_deref() == Some(name) {
-            self.toggle();
-            return;
-        }
         self.pinned = Some(true);
         self.visible = true;
-        self.focused = true;
         self.shown = Some(name.into());
         self.sel = 0;
     }
@@ -521,7 +516,6 @@ impl Panel {
     /// A click at a cell of the panel: a tab label switches to it; a row selects it
     /// (and opens it, in the Files tab).
     pub fn click(&mut self, col: u16, row: u16) -> Option<PanelAction> {
-        self.focused = true;
         if row < self.body.y {
             // A tab's name row or the bar row under it.
             let hit = self
@@ -980,8 +974,8 @@ impl Panel {
     /// Auto show/hide (L9.16): the Agent tab opens the panel by itself while a todo
     /// or subagent is unfinished, the Tasks tab while one of super's tasks runs
     /// (L10.9); it closes 5 s after they all finish.
-    /// Every other tab is opened by hand (Ctrl+Alt+P).
-    pub fn tick(&mut self) {
+    /// Every other tab is opened by hand (Ctrl+Alt+P). A `focused` panel stays up.
+    pub fn tick(&mut self, focused: bool) {
         let any = |name: &str, live: fn(Option<&str>) -> bool| {
             self.tabs.iter().find(|t| t.name == name).is_some_and(|t| {
                 t.sources
@@ -1010,7 +1004,7 @@ impl Panel {
             self.visible = true;
         } else if self.visible {
             let since = *self.idle_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= HIDE_AFTER && !self.focused {
+            if since.elapsed() >= HIDE_AFTER && !focused {
                 self.visible = false;
             }
         }
@@ -1020,9 +1014,6 @@ impl Panel {
         let v = !self.visible;
         self.pinned = Some(v);
         self.visible = v;
-        if !v {
-            self.focused = false;
-        }
     }
 
     /// Tab names that have something to show, in priority order.
@@ -1177,7 +1168,7 @@ impl Panel {
             return Some(None);
         }
         match key {
-            "esc" | "q" => self.focused = false,
+            "esc" | "q" => return Some(Some(PanelAction::Leave)),
             "tab" => self.cycle(false),
             "shift+tab" => self.cycle(true),
             "up" | "k" => self.sel = self.sel.saturating_sub(1),
@@ -1227,8 +1218,9 @@ impl Panel {
         w.max(MIN_WIDTH).min(screen / 2)
     }
 
-    pub fn render(&mut self, f: &mut Frame, area: Rect, theme: &Theme) {
-        let border = if self.focused { theme.accent } else { theme.border };
+    /// Draw the panel; only a `focused` one gets the accent frame, numbers and key hints.
+    pub fn render(&mut self, f: &mut Frame, area: Rect, theme: &Theme, focused: bool) {
+        let border = if focused { theme.accent } else { theme.border };
         let block = Block::default().borders(Borders::LEFT).border_style(border);
         let inner = block.inner(area);
         let inner = Rect {
@@ -1258,7 +1250,7 @@ impl Panel {
                 _ => "",
             };
             // Focused: the number that jumps to it.
-            let num = if self.focused && i < 9 {
+            let num = if focused && i < 9 {
                 format!("{} ", i + 1)
             } else {
                 String::new()
@@ -1309,9 +1301,7 @@ impl Panel {
         self.line_rows.clear();
         if self.shown.as_deref() == Some("usage") {
             let all = self.usage_lines(w, theme);
-            let footer = self
-                .focused
-                .then(|| footer_line("↑↓ scroll  1-9 tab  ⇥ tab  esc back", w, theme));
+            let footer = focused.then(|| footer_line(&[("↑↓", "scroll")], w, theme));
             let room = (body.height as usize).saturating_sub(footer.is_some() as usize);
             self.sel = self.sel.min(all.len().saturating_sub(room));
             let mut out: Vec<Line> = all.into_iter().skip(self.sel).take(room).collect();
@@ -1334,7 +1324,7 @@ impl Panel {
                     self.sel = self.sel.min(n.saturating_sub(1));
                 }
                 let (rows, nerd, sel) = (self.rows(), self.nerd, self.sel);
-                let focused = self.focused && interactive;
+                let sel_on = focused && interactive;
                 let now = now_ms();
                 let mut out = Vec::new();
                 let mut owner: Vec<Option<usize>> = Vec::new();
@@ -1406,7 +1396,7 @@ impl Panel {
                     let mut sp = l.spans;
                     sp.push(Span::raw(" ".repeat(pad)));
                     sp.push(Span::styled(right, rs));
-                    if focused && i == sel {
+                    if sel_on && i == sel {
                         sel_line = out.len();
                         sp = sp
                             .into_iter()
@@ -1440,28 +1430,15 @@ impl Panel {
                 if out.is_empty() {
                     out.push(Line::styled(" (empty)", theme.dim));
                 }
-                // Keys for the selected row while focused (pi viewer footer).
-                let footer = self.focused.then(|| {
-                    let mut k: Vec<String> = rows
+                // Keys for the selected row while focused, then moving and leaving.
+                let footer = focused.then(|| {
+                    let mut k: Vec<(String, String)> = rows
                         .get(sel)
-                        .map(|r| {
-                            r.node
-                                .actions
-                                .iter()
-                                .map(|(k, a)| format!("{} {a}", if k == "enter" { "⏎" } else { k }))
-                                .collect()
-                        })
+                        .filter(|_| interactive)
+                        .map(|r| r.node.actions.iter().map(|(k, a)| (k.clone(), a.clone())).collect())
                         .unwrap_or_default();
-                    k.push(
-                        if interactive {
-                            "1-9 ⇥ tab"
-                        } else {
-                            "↑↓ scroll  1-9 ⇥ tab"
-                        }
-                        .into(),
-                    );
-                    k.push("esc back".into());
-                    k.join("  ")
+                    k.push(("↑↓".into(), if interactive { "move" } else { "scroll" }.into()));
+                    k
                 });
                 let room = body.height as usize - footer.is_some() as usize;
                 let max_start = out.len().saturating_sub(room);
@@ -1687,18 +1664,14 @@ impl Panel {
     }
 }
 
-/// `key word  key word`: keys in the accent colour, words dim.
-fn footer_line(f: &str, w: usize, t: &Theme) -> Line<'static> {
-    let mut sp = Vec::new();
-    for (i, item) in f.split("  ").filter(|x| !x.is_empty()).enumerate() {
-        let (k, rest) = item.split_once(' ').unwrap_or((item, ""));
-        sp.push(Span::raw(if i == 0 { " " } else { "  " }));
-        sp.push(Span::styled(k.to_string(), t.accent));
-        if !rest.is_empty() {
-            sp.push(Span::styled(format!(" {rest}"), t.dim));
-        }
-    }
-    crate::wrap::truncate(sp, w)
+/// The focused panel's key line: `first` (the tab's own keys), then the keys every tab
+/// shares, through the shared hint helper with one cell of padding.
+fn footer_line<K: AsRef<str>, V: AsRef<str>>(first: &[(K, V)], w: usize, t: &Theme) -> Line<'static> {
+    let mut pairs: Vec<(&str, &str)> = first.iter().map(|(k, a)| (k.as_ref(), a.as_ref())).collect();
+    pairs.extend([("esc", "back"), ("tab", "next tab"), ("1-9", "tab")]);
+    let mut l = crate::hints::hints(&pairs, w.saturating_sub(1), t);
+    l.spans.insert(0, Span::raw(" "));
+    l
 }
 
 /// A status's glyph and colour (for the process view).
@@ -1825,7 +1798,7 @@ mod tests {
                 "node": {"id": id, "label": "scout", "status": status, "dim": status == "done"}}))
         };
         p.apply("agents", &sub("a1", "running"));
-        p.tick();
+        p.tick(false);
         assert!(p.visible, "a running subagent opens the panel");
         assert_eq!(p.live_subagents(), 1);
         assert_eq!(
@@ -1833,19 +1806,18 @@ mod tests {
             Some("Subagents · 1 running of 1")
         );
         p.toggle();
-        p.tick();
+        p.tick(false);
         assert!(!p.visible, "closed by hand stays closed for this work");
         p.apply("agents", &sub("a1", "done"));
-        p.tick();
+        p.tick(false);
         p.apply("agents", &sub("a2", "running"));
-        p.tick();
+        p.tick(false);
         assert!(p.visible, "new work opens it again");
         // Timing has no actions: no selection, j/k scroll.
         p.shown = Some("timing".into());
         p.stats.tasks.push(Task::default());
         p.refresh(0, None);
         assert!(!p.interactive());
-        p.focused = true;
         assert_eq!(p.key("j"), Some(None));
         assert_eq!(p.sel, 1, "scroll offset, clamped when drawn");
         // Files: only edited files, with their line counts; rows select, Enter opens.
@@ -1903,10 +1875,9 @@ mod tests {
         p.host.loaded = vec![("skills".into(), 3)];
         p.refresh(0, None);
         p.todos(&json!([{"id": 1, "text": "x", "status": "active"}]));
-        p.focused = true;
         p.visible = true;
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 12)).unwrap();
-        term.draw(|f| p.render(f, f.area(), &Theme::default())).unwrap();
+        term.draw(|f| p.render(f, f.area(), &Theme::default(), true)).unwrap();
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         for name in ["Agent", "Processes", "Usage stats", "Timing", "Files"] {
             assert!(text.contains(name), "{name} hidden:\n{text}");
@@ -1953,7 +1924,7 @@ mod tests {
         ]);
         p.show_tab("tasks");
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(50, 10)).unwrap();
-        term.draw(|f| p.render(f, f.area(), &Theme::default())).unwrap();
+        term.draw(|f| p.render(f, f.area(), &Theme::default(), true)).unwrap();
         let buf = term.backend().buffer();
         let lines: Vec<String> = (0..buf.area.height)
             .map(|y| {
@@ -1971,7 +1942,7 @@ mod tests {
             "│       blocked: quota · claude/claude-haiku-5-5 …",
             "│",
             "│",
-            "│  ⏎ attach  1-9 ⇥ tab  esc back",
+            "│  enter attach · ↑↓ move · esc back",
         ];
         assert_eq!(lines, want, "\n{}", lines.join("\n"));
         // Enter on a row with a session attaches to it; a queued row has none.
@@ -2000,17 +1971,17 @@ mod tests {
             ..Default::default()
         };
         p.set_tasks(vec![row("queued")]);
-        p.tick();
+        p.tick(false);
         assert!(!p.visible, "a queued task alone does not open it");
         assert_eq!(p.shown.as_deref(), Some("tasks"), "the only non-empty tab is shown");
         p.shown = Some("agent".into());
         p.set_tasks(vec![row("running")]);
-        p.tick();
+        p.tick(false);
         assert!(p.visible, "a running task opens the panel");
         assert_eq!(p.shown.as_deref(), Some("tasks"));
         assert_eq!(p.rows().len(), 1);
         p.set_tasks(vec![row("ready")]);
-        p.tick();
+        p.tick(false);
         assert!(p.idle_since.is_some(), "no task runs: the close timer starts");
     }
 
@@ -2035,7 +2006,7 @@ mod tests {
         p.apply("x", &op(json!({"op": "publish", "tab": "deploy", "source": "s", "node": {"id": "a", "label": "build", "status": "running"}})));
         p.apply("x", &op(json!({"op": "publish", "tab": "deploy", "source": "s", "node": {"id": "b", "parent": "a", "label": "step", "actions": {"r": "retry", "l": "/ps"}}})));
         assert_eq!(p.shown.as_deref(), Some("deploy"), "higher priority takes the slot");
-        p.tick();
+        p.tick(false);
         assert!(!p.visible, "extension tabs never open the panel by themselves");
         let rows: Vec<(String, String)> = p.rows().iter().map(|r| (r.node.id.clone(), r.guide.clone())).collect();
         assert_eq!(
@@ -2045,7 +2016,6 @@ mod tests {
                 ("b".to_string(), "    └─".to_string())
             ]
         );
-        p.focused = true;
         p.sel = 1;
         assert_eq!(
             p.key("r"),
@@ -2076,7 +2046,7 @@ mod tests {
                 .as_deref(),
             Some("running")
         );
-        p.tick();
+        p.tick(false);
         assert!(
             p.visible && p.shown.as_deref() == Some("agent"),
             "an open todo opens the Agent tab"
@@ -2092,10 +2062,9 @@ mod tests {
             100_000,
             None,
         );
-        p.tick();
-        p.focused = false; // a focused panel stays up
+        p.tick(false);
         p.idle_since = Some(Instant::now() - HIDE_AFTER);
-        p.tick();
+        p.tick(false);
         assert!(!p.visible, "closes once every todo is done");
         p.apply("x", &op(json!({"op": "close_tab", "name": "deploy"})));
         assert_eq!(

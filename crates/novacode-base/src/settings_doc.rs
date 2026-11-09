@@ -392,8 +392,8 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
     (
         "ui.icons",
         "string",
-        "`nerd`",
-        "`unicode` when your font has no Nerd Font glyphs; any other value means `nerd` (`novacode doctor` flags it).",
+        "`unicode`",
+        "`nerd` for Nerd Font glyphs when your font has them; any other value means `unicode` (`novacode doctor` flags it).",
     ),
     (
         "ui.images",

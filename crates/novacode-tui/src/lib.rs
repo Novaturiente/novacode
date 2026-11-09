@@ -8,6 +8,7 @@ pub mod dialog;
 pub mod editor;
 #[cfg(feature = "highlight")]
 pub mod highlight;
+pub mod hints;
 pub mod images;
 pub mod keys;
 pub mod login;

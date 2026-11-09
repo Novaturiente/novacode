@@ -4,6 +4,7 @@
 
 use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use novacode_tui::app::Focus;
 use novacode_tui::dialog::{Answer, ApproveReq, PickItem};
 use novacode_tui::{App, Cmd, Exit, Init, UiEvent};
 use novacode_types::*;
@@ -113,7 +114,7 @@ fn golden_tasks_tab() {
         });
         a.panel.visible = true;
         a.panel.show_tab("tasks");
-        a.panel.focused = true;
+        a.set_focus(Focus::Panel);
         key(a, KeyCode::Down, KeyModifiers::NONE);
     });
 }
@@ -121,30 +122,33 @@ fn golden_tasks_tab() {
 /// TP2 baseline: an ask form whose three choices each have a description.
 #[test]
 fn golden_ask_form() {
-    goldens("ask_form", 24, |a| {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        std::mem::forget(rx);
-        let choice = |label: &str, description: &str, recommended| Choice {
-            label: label.into(),
-            description: Some(description.into()),
-            preview: None,
-            recommended,
-        };
-        a.on_ui(UiEvent::Ask(novacode_tui::ask::AskReq {
-            id: 1,
-            questions: vec![Question {
-                question: "Which database should the service use?".into(),
-                header: Some("Database".into()),
-                options: vec![
-                    choice("Postgres", "Relational, already run in production.", true),
-                    choice("SQLite", "One file, no server; fine for one writer.", false),
-                    choice("Redis", "In memory; fast, but data needs care.", false),
-                ],
-                multi: false,
-            }],
-            reply,
-        }));
-    });
+    goldens("ask_form", 24, open_ask);
+}
+
+/// An ask form with three described choices.
+fn open_ask(a: &mut App) {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    std::mem::forget(rx);
+    let choice = |label: &str, description: &str, recommended| Choice {
+        label: label.into(),
+        description: Some(description.into()),
+        preview: None,
+        recommended,
+    };
+    a.on_ui(UiEvent::Ask(novacode_tui::ask::AskReq {
+        id: 1,
+        questions: vec![Question {
+            question: "Which database should the service use?".into(),
+            header: Some("Database".into()),
+            options: vec![
+                choice("Postgres", "Relational, already run in production.", true),
+                choice("SQLite", "One file, no server; fine for one writer.", false),
+                choice("Redis", "In memory; fast, but data needs care.", false),
+            ],
+            multi: false,
+        }],
+        reply,
+    }));
 }
 
 /// TP2 baseline: the approval card for a risky command.
@@ -379,7 +383,7 @@ fn needs_you_heads_the_tasks_tab_and_d_dismisses() {
     });
     a.panel.visible = true;
     a.panel.show_tab("tasks");
-    a.panel.focused = true;
+    a.set_focus(Focus::Panel);
     let s = screen(&mut a, 120, 30);
     let (needs, warn, task) = (
         s.find("NEEDS YOU").unwrap_or_else(|| panic!("{s}")),
@@ -743,6 +747,94 @@ fn interrupted_notice_survives_collapse() {
 
 fn key(a: &mut App, code: KeyCode, m: KeyModifiers) {
     a.on_key(KeyEvent::new(code, m));
+}
+
+/// A left click (press and release) at a cell.
+fn click(a: &mut App, column: u16, row: u16) {
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        a.on_event(Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
+}
+
+const FOCUS_PANEL: (KeyCode, KeyModifiers) = (KeyCode::Char('f'), KeyModifiers::CONTROL.union(KeyModifiers::ALT));
+
+/// TP3: a click in the chat takes focus from the panel; a click in the panel gives it back.
+#[test]
+fn a_click_moves_focus() {
+    let (mut a, _rx) = app(vec![]);
+    key(&mut a, FOCUS_PANEL.0, FOCUS_PANEL.1);
+    screen(&mut a, 120, 24);
+    assert_eq!(a.focus(), Focus::Panel);
+    click(&mut a, 5, 3);
+    assert_eq!(a.focus(), Focus::Input, "a click in the chat");
+    screen(&mut a, 120, 24);
+    click(&mut a, 110, 5);
+    assert_eq!(a.focus(), Focus::Panel, "a click in the panel");
+    // The input box is part of the chat too.
+    let s = screen(&mut a, 120, 24);
+    let input_row = s.lines().position(|l| l.starts_with('╭')).unwrap() as u16;
+    click(&mut a, 5, input_row + 1);
+    assert_eq!(a.focus(), Focus::Input, "a click in the input");
+}
+
+/// TP3: Esc returns focus to the input, from the panel and from a dialog.
+#[test]
+fn esc_returns_focus_to_the_input() {
+    let (mut a, _rx) = app(vec![]);
+    key(&mut a, FOCUS_PANEL.0, FOCUS_PANEL.1);
+    assert_eq!(a.focus(), Focus::Panel);
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(a.focus(), Focus::Input, "from the panel");
+    key(&mut a, FOCUS_PANEL.0, FOCUS_PANEL.1);
+    open_ask(&mut a);
+    assert_eq!(a.focus(), Focus::Dialog, "a question is open");
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(a.focus(), Focus::Input, "from a dialog");
+}
+
+/// TP3 style check: exactly one frame is coloured, the focused one. The input keeps
+/// its thinking-level colour while focused and turns `border` grey otherwise.
+#[test]
+fn only_the_focused_frame_is_coloured() {
+    let t = novacode_tui::theme::Theme::default();
+    let level = t.levels[ThinkingLevel::ALL
+        .iter()
+        .position(|l| *l == ThinkingLevel::default())
+        .unwrap()]
+    .fg;
+    // (input corner, panel edge, dialog corners) colours.
+    let frames = |a: &mut App| {
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| a.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        let corners: Vec<(u16, u16)> = (0..30)
+            .flat_map(|y| (0..120).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].symbol() == "╭")
+            .collect();
+        // The input is the lowest frame on the left edge; an ask card sits above it.
+        let input = corners.iter().copied().rev().find(|&(x, _)| x == 0).unwrap();
+        let edge = 120 - a.panel.width(120);
+        assert_eq!(buf[(edge, 0)].symbol(), "│");
+        let dialogs: Vec<_> = corners.iter().filter(|&&c| c != input).map(|&c| buf[c].fg).collect();
+        (buf[input].fg, buf[(edge, 0)].fg, dialogs)
+    };
+    let (mut a, _rx) = app(vec![]);
+    key(&mut a, KeyCode::Char('p'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+    let grey = t.border.fg.unwrap();
+    let accent = t.accent.fg.unwrap();
+    assert_eq!(frames(&mut a), (level.unwrap(), grey, vec![]), "input focused");
+    key(&mut a, FOCUS_PANEL.0, FOCUS_PANEL.1);
+    assert_eq!(frames(&mut a), (grey, accent, vec![]), "panel focused");
+    open_ask(&mut a);
+    assert_eq!(frames(&mut a), (grey, grey, vec![accent]), "dialog focused");
 }
 
 /// R7 (L10.9): a board snapshot as the wire carries it (`ui` `board`) reaches an

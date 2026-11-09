@@ -124,7 +124,7 @@ pub struct Init {
     pub panel_only: bool,
     /// `ui.panel.auto`: show the panel while work is going, hide it after (default on).
     pub panel_auto: bool,
-    /// `ui.icons`: Nerd Font glyphs in the panel (default) or plain Unicode.
+    /// `ui.icons`: Nerd Font glyphs in the panel (`nerd`) or plain Unicode (default).
     pub nerd_icons: bool,
     /// Lower frame rate, no animation (SSH or a loaded machine, L9.17).
     pub slow: bool,
@@ -416,6 +416,15 @@ enum Overlay {
     Btw(crate::btw::BtwChat),
 }
 
+/// Where keys go (docs/tui-style.md "Focus"). Only the focused part draws a coloured frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Input,
+    Panel,
+    /// An approval card, ask form or overlay is open: it takes the keys.
+    Dialog,
+}
+
 pub struct App {
     pub theme: Theme,
     pub tr: Transcript,
@@ -468,6 +477,8 @@ pub struct App {
     /// Open a file (and its session-start copy, for a diff) in the editor; the loop does it.
     pub open_file: Option<(std::path::PathBuf, Option<std::path::PathBuf>)>,
     pub panel: crate::panel::Panel,
+    /// Input or Panel: where keys go when no dialog is open (see `focus`).
+    focus: Focus,
     /// Extension status segments `ext:<ext>:<key>` → (text, style).
     ext_status: std::collections::BTreeMap<String, (String, Option<String>)>,
     /// Extension widgets → (lines, below the editor).
@@ -520,8 +531,8 @@ impl App {
         panel.nerd = init.nerd_icons;
         if init.panel_only {
             panel.pinned = Some(true);
-            panel.focused = true;
         }
+        let focus = if init.panel_only { Focus::Panel } else { Focus::Input };
         if !init.panel_auto {
             panel.pinned.get_or_insert(false);
             panel.never_auto = true;
@@ -593,6 +604,7 @@ impl App {
             external_editor: false,
             open_file: None,
             panel,
+            focus,
             ext_status: Default::default(),
             widgets: Default::default(),
             footer: None,
@@ -824,7 +836,7 @@ impl App {
         // Open at once on new todos (subagents: in `ui_op`), even while this session
         // is idle (the 1 s ticker only runs while busy or shown).
         if matches!(ev, AgentEvent::Message(Message::ToolResult { .. })) {
-            self.panel.tick();
+            self.panel.tick(self.focus == Focus::Panel);
         }
         match &ev {
             AgentEvent::AgentStart => self.task_started = Some(Instant::now()),
@@ -1066,7 +1078,7 @@ impl App {
             }
             _ => {
                 self.panel.apply(ext, &op);
-                self.panel.tick();
+                self.panel.tick(self.focus == Focus::Panel);
             }
         }
     }
@@ -1148,6 +1160,7 @@ impl App {
                 self.tr
                     .notice(format!("{label}: tmux failed ({err}); run `{cmd}`"), true);
             }
+            PanelAction::Leave => self.set_focus(Focus::Input),
             PanelAction::Ext { ext, tab, node, action } => {
                 let (width, height) = self.panel.size;
                 self.send(Cmd::ExtKey {
@@ -1183,7 +1196,7 @@ impl App {
     /// Advance timers: the panel's auto show/hide. Returns true when something changed.
     pub fn tick(&mut self) -> bool {
         let before = self.panel.visible;
-        self.panel.tick();
+        self.panel.tick(self.focus == Focus::Panel);
         // Live output while the Processes tab is on screen (the ticker runs only then or while busy).
         let popup = matches!(self.overlay, Some(Overlay::Procs(_)));
         if (popup || self.panel.procs_shown()) && self.init.attached.is_none() {
@@ -1270,10 +1283,41 @@ impl App {
         let _ = card.req.reply.send(ans);
     }
 
+    /// Where keys go now. A dialog takes them while it is open; then the input or the
+    /// panel, whichever had them (Esc and clicks change that).
+    pub fn focus(&self) -> Focus {
+        if !self.approvals.is_empty() || !self.asks.is_empty() || self.overlay.is_some() {
+            Focus::Dialog
+        } else if self.focus == Focus::Panel && self.panel.visible {
+            Focus::Panel
+        } else {
+            Focus::Input
+        }
+    }
+
+    /// Move focus to the input or the panel (shown if hidden). Dialogs take focus by
+    /// opening, so `Dialog` changes nothing; the tmux panel pane keeps it on the panel.
+    pub fn set_focus(&mut self, f: Focus) {
+        match f {
+            Focus::Input if !self.init.panel_only => self.focus = Focus::Input,
+            Focus::Panel => {
+                if !self.panel.visible {
+                    self.panel.toggle();
+                }
+                self.focus = Focus::Panel;
+            }
+            _ => {}
+        }
+    }
+
     pub fn on_key(&mut self, k: KeyEvent) {
         let now = Instant::now();
         self.selection = None;
         self.screen_sel = None;
+        // Esc always ends at the input, also when it closes a dialog over the panel.
+        if k.code == crossterm::event::KeyCode::Esc && self.focus() == Focus::Dialog {
+            self.set_focus(Focus::Input);
+        }
         if let Some(card) = self.approvals.front_mut() {
             if let Some(ans) = card.handle(k, self.keymap.lookup(&k, &[Scope::Editor])) {
                 self.answer(ans);
@@ -1417,16 +1461,14 @@ impl App {
             return;
         }
         // The focused panel takes the keys, except the ones that leave it (L9.16).
-        if self.panel.focused && self.panel.visible {
+        if self.focus() == Focus::Panel {
             match self.keymap.lookup(&k, &[Scope::App]) {
                 Some(A::PanelFocus | A::PanelToggle | A::PanelUsage | A::Clear) if !self.init.panel_only => {}
                 Some(A::Clear) => self.exit = Some(Exit::Quit),
                 _ => {
+                    // Leaving does nothing in the panel pane: it has nothing else to focus.
                     if let Some(Some(a)) = self.panel.key(&crate::keys::name(&k)) {
                         self.panel_action(a);
-                    }
-                    if !self.panel.focused && self.init.panel_only {
-                        self.panel.focused = true; // the panel pane has nothing else to focus
                     }
                     return;
                 }
@@ -1536,14 +1578,23 @@ impl App {
                 self.send(Cmd::SetThinking(all[(i + 1) % all.len()]));
             }
             Some(A::ThinkingToggle) => self.toggle_thinking(),
-            Some(A::PanelToggle) => self.panel.toggle(),
-            Some(A::PanelUsage) => self.panel.show_tab("usage"),
-            Some(A::PanelFocus) => {
+            Some(A::PanelToggle) => {
+                self.panel.toggle();
                 if !self.panel.visible {
-                    self.panel.toggle();
+                    self.set_focus(Focus::Input);
                 }
-                self.panel.focused = !self.panel.focused;
             }
+            // Again on the focused Usage tab: close it.
+            Some(A::PanelUsage) if self.focus() == Focus::Panel && self.panel.shown.as_deref() == Some("usage") => {
+                self.panel.toggle();
+                self.set_focus(Focus::Input);
+            }
+            Some(A::PanelUsage) => {
+                self.panel.show_tab("usage");
+                self.set_focus(Focus::Panel);
+            }
+            Some(A::PanelFocus) if self.focus() == Focus::Panel => self.set_focus(Focus::Input),
+            Some(A::PanelFocus) => self.set_focus(Focus::Panel),
             None if let Some((key, ext)) = self.shortcuts.iter().find(|(s, _)| crate::keys::is(&k, s)).cloned() => {
                 self.send(Cmd::ExtKey {
                     ext,
@@ -1968,6 +2019,7 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) if self.screen_sel.is_some() => {
                 let (a, b) = self.screen_sel.take().unwrap();
                 if a == b && self.overlay.is_none() && self.panel.contains(a.0, a.1) {
+                    self.set_focus(Focus::Panel);
                     if let Some(act) = self.panel.click(a.0, a.1) {
                         self.panel_action(act);
                     }
@@ -2004,6 +2056,10 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
+        // A press anywhere but the panel gives the keys back to the input.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) && !self.panel.contains(m.column, m.row) {
+            self.set_focus(Focus::Input);
+        }
         if self.panel.contains(m.column, m.row) {
             match m.kind {
                 MouseEventKind::ScrollUp => return self.panel.wheel(true),
@@ -2102,14 +2158,15 @@ impl App {
         let full = f.area();
         if self.init.panel_only {
             self.panel.visible = true;
-            self.panel.render(f, full, &self.theme);
+            self.panel.render(f, full, &self.theme, true);
             return;
         }
+        let focus = self.focus();
         // The side panel takes the right edge when the screen is wide enough (L9.16).
         let area = if self.panel.visible && full.width >= crate::panel::MIN_SCREEN {
             let w = self.panel.width(full.width);
             let [l, r] = Layout::horizontal([Constraint::Min(1), Constraint::Length(w)]).areas(full);
-            self.panel.render(f, r, &self.theme);
+            self.panel.render(f, r, &self.theme, focus == Focus::Panel);
             l
         } else {
             full
@@ -2254,6 +2311,8 @@ impl App {
             .padding(Padding::horizontal(1))
             .border_type(BorderType::Rounded)
             .border_style(match &self.editor_border {
+                // Unfocused: plain grey, so only the focused part is coloured.
+                _ if focus != Focus::Input => t.border,
                 Some(b) => t.token(Some(b)),
                 None => {
                     t.levels[ThinkingLevel::ALL

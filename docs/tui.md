@@ -381,7 +381,7 @@ A segment can also be an object: `{"id": "ctx", "format": "context {}", "style":
 
 | Setting | Values | Effect |
 |---|---|---|
-| `ui.icons` | `nerd` (default), `unicode` | Use `unicode` if your font has no Nerd Font glyphs (panel icons). |
+| `ui.icons` | `unicode` (default), `nerd` | Use `nerd` if your font has Nerd Font glyphs (panel icons). |
 | `ui.images` | `auto` (default), `kitty`, `iterm2`, `sixel`, `halfblocks`, `off` | How images in the transcript are drawn. `auto` picks by terminal: Kitty, Ghostty and Konsole use Kitty graphics; WezTerm and iTerm2 use iTerm2; foot and mlterm use Sixel; anything else uses half-blocks. `off` shows a one-line placeholder. |
 | `ui.slow` | bool | Fewer frames and a slower spinner. Default: on over SSH or when the machine load is above its core count. |
 | `notifications.enabled` | bool, default true | When a turn ends, or novacode needs you, while you are not looking at it, send a terminal notification (OSC 777). In tmux it goes to every attached client, so it reaches you over SSH too. |
