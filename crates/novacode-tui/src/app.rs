@@ -2604,10 +2604,13 @@ impl App {
             ..card
         };
         let below = (grown.height > card.height).then(|| f.buffer_mut().clone());
+        // Clicks reach only the rows actually shown.
         if let Some(c) = self.approvals.front() {
             c.render(f, grown, t, &self.keymap);
+            c.clip(card);
         } else if let Some(a) = self.asks.front() {
             a.render(f, grown, t, &self.keymap);
+            a.clip(card);
         }
         if let Some(saved) = below {
             let buf = f.buffer_mut();

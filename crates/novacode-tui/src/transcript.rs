@@ -179,7 +179,7 @@ impl Turn {
             if tool.done || tool.started.is_none() {
                 continue;
             }
-            let new = lay_tool(tool, width, t, tools);
+            let new = lay_tool(tool, !self.done, width, t, tools);
             if new.len() != rows {
                 return false;
             }
@@ -990,7 +990,7 @@ fn lay_turn(
             }
             Item::Tool(tool) => {
                 let start = lines.len();
-                lines.extend(lay_tool(tool, width, t, tools));
+                lines.extend(lay_tool(tool, !turn.done, width, t, tools));
                 tool_rows.push((idx, start, lines.len() - start));
             }
             Item::Image(img) => {
@@ -1491,7 +1491,8 @@ pub fn lay_say(s: &novacode_types::Say, open: bool, width: usize, t: &Theme) -> 
     lines
 }
 
-fn lay_tool(tool: &Tool, width: usize, t: &Theme, (full, hint): (bool, &str)) -> Vec<Line<'static>> {
+/// `live`: its turn is still running (a command then keeps its reserved box).
+fn lay_tool(tool: &Tool, live: bool, width: usize, t: &Theme, (full, hint): (bool, &str)) -> Vec<Line<'static>> {
     if tool.is_say() {
         let open = !tool.done && tool.say.as_ref().is_some_and(|s| !s.choices.is_empty());
         return lay_say(&say_of(tool), open, width, t);
@@ -1653,8 +1654,9 @@ fn lay_tool(tool: &Tool, width: usize, t: &Theme, (full, hint): (bool, &str)) ->
     if skipped_after > 0 {
         lines.push(more(skipped_after, plural(skipped_after)));
     }
-    // A running command keeps the whole tail box from its first line, so it never grows (TS2).
-    if !tool.done && !full && matches!(tool.name.as_str(), "bash" | "process") {
+    // A command keeps the whole tail box from its first line until its turn ends, so it
+    // never grows and nothing below moves when it finishes (TS2).
+    if live && !full && matches!(tool.name.as_str(), "bash" | "process") {
         let pad = OUTPUT_TAIL - shown.len() + usize::from(skipped_before == 0);
         lines.extend(std::iter::repeat_n(Line::styled("▏", t.border), pad));
     }

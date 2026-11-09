@@ -191,6 +191,11 @@ impl AskForm {
         self.area.get().contains(Position::new(x, y))
     }
 
+    /// Only `shown` of the drawn form is on screen (it is growing in, TS4).
+    pub fn clip(&self, shown: Rect) {
+        self.area.set(self.area.get().intersection(shown));
+    }
+
     /// A press on screen row `y`: selects the choice there; a second press confirms it
     /// (free text opens for typing).
     pub fn click(&mut self, y: u16) -> Done {

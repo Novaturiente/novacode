@@ -1445,6 +1445,36 @@ fn keys_work_while_a_card_grows() {
     let _ = rx.try_recv();
 }
 
+/// TS4 follow-up: while a card grows, a click on its rows not yet drawn (over the
+/// input) does not reach it.
+#[test]
+fn a_growing_card_ignores_clicks_on_its_hidden_rows() {
+    let (mut full, _frx) = app(vec![]);
+    let _fa = ask(&mut full, 3);
+    let s = screen(&mut full, 80, 30);
+    let (mut a, _rx) = app(vec![]);
+    let mut answers = ask(&mut a, 3);
+    let live = text(&draw_live(&mut a, 80, 30));
+    // Every row below the drawn card (the input, the status line).
+    let input = live
+        .lines()
+        .collect::<Vec<_>>()
+        .iter()
+        .rposition(|l| l.starts_with('╭'))
+        .unwrap();
+    for y in input..30 {
+        click(&mut a, 10, y as u16);
+        click(&mut a, 10, y as u16);
+        assert!(answers.try_recv().is_err(), "row {y} picked a hidden choice\n{live}");
+    }
+    // Control: once drawn, two clicks on a choice pick it.
+    let mut fa = _fa;
+    let y = s.lines().position(|l| l.contains("2. B")).expect(&s) as u16;
+    click(&mut full, 10, y);
+    click(&mut full, 10, y);
+    assert!(fa.try_recv().is_ok(), "a drawn choice takes clicks");
+}
+
 /// TS4: an ask form too tall for its spaced layout reserves the rows of the compact one,
 /// so no blank row sits above its hint line.
 #[test]
@@ -2676,6 +2706,28 @@ fn a_running_commands_box_keeps_its_height() {
         heights.push(tool_rows(&s, "bash $ make"));
     }
     assert!(heights.iter().all(|h| *h == heights[0]), "{heights:?}");
+}
+
+/// TS2 follow-up: a finished command keeps its reserved box until the turn folds,
+/// so nothing below it moves when it ends.
+#[test]
+fn a_finished_commands_box_keeps_its_height() {
+    let (mut a, _rx) = app(vec![]);
+    run_tool(&mut a, "b", "bash", json!({"command": "make"}));
+    a.on_agent(AgentEvent::ToolUpdate {
+        call_id: "b".into(),
+        text: "out 1\n".into(),
+    });
+    let running = tool_rows(&screen(&mut a, 60, 30), "bash $ make");
+    a.on_agent(AgentEvent::ToolEnd {
+        call_id: "b".into(),
+        is_error: false,
+        duration_ms: 10,
+    });
+    a.on_agent(AgentEvent::Message(result("b", "bash", "out 1\n", false)));
+    let s = screen(&mut a, 60, 30);
+    assert!(s.contains("out 1") && s.contains("● bash"), "{s}");
+    assert_eq!(tool_rows(&s, "bash $ make"), running, "{s}");
 }
 
 /// TS2: a running read shows a line count from the start, never the file.
