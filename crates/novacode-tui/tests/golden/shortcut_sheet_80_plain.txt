@@ -1,0 +1,24 @@
+
+
+
+
+
+         ╭ Shortcuts ────────────────────────────────────────────────╮
+         │ escape      interrupt          alt+o      fold turns      │
+         │ shift+enter newline            ctrl+r     search history  │
+         │ ctrl+l      pick model         ctrl+f     search chat     │
+         │ shift+tab   thinking level     ctrl+g     external editor │
+         │ ctrl+t      show thinking      ctrl+x     copy reply      │
+         │ ctrl+o      full tool output   ctrl+alt+p side panel      │
+         │                                                           │
+         │ alt+/ all keys · any key close                            │
+         ╰───────────────────────────────────────────────────────────╯
+
+
+
+
+
+╭──────────────────────────────────────────────────────────────────────────────╮
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ ● ready                                            opus · medium  proj  ⎇ main

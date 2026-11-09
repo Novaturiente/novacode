@@ -1,16 +1,16 @@
- ╭────────────────────────────────────────────────────────╮
- │ fix the failing test                                   │
- ╰────────╭ Model ───────────────────────────────╮────────╯
+ ╰────────────────────────────────────────────────────────╯
+
+ Running t╭ Model ───────────────────────────────╮
           │ › type to filter                     │
- Running t│ ▸ opus                               │
- ▸ 2 tool │   sonnet                             │
-          │                                      │
+ ▸ 2 tool │ ▸ opus                               │
+          │   sonnet                             │
  Fixed: th│                                      │h 2.
           │                                      │
- • tests p╰──────────────────────────────────────╯
+ • tests p│                                      │
+          ╰──────────────────────────────────────╯
  · model → claude/haiku · medium from the next message
    (the cache starts over: ~31k tokens re-sent)
 ╭──────────────────────────────────────────────────────────╮
 │                                                          │
 ╰──────────────────────────────────────────────────────────╯
- ● ready … ctx 16%  cache 97%  haiku · medium  proj  ⎇ main
+ ● ready  loading model… ctx 16%  cache 97%  haiku · medium

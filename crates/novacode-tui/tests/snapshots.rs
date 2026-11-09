@@ -827,6 +827,93 @@ fn interrupted_notice_survives_collapse() {
     );
 }
 
+/// The status line: the screen's last row.
+fn status(a: &mut App) -> String {
+    screen(a, 100, 10).lines().last().unwrap().to_string()
+}
+
+fn usage_out(output: u64) -> AgentEvent {
+    AgentEvent::Stream(StreamEvent::Usage(Usage {
+        output,
+        ..Default::default()
+    }))
+}
+
+/// G1: while busy, elapsed time and the interrupt key always show; tokens only once
+/// the provider reports usage for this turn.
+#[test]
+fn activity_line_while_busy_without_usage() {
+    let (mut a, _rx) = app(vec![]);
+    a.on_agent(AgentEvent::AgentStart);
+    let s = status(&mut a);
+    assert!(
+        s.contains("working") && s.contains("0.0s") && s.contains("esc interrupt"),
+        "{s}"
+    );
+    assert!(!s.contains("tokens"), "{s}");
+    a.on_agent(AgentEvent::Settled);
+    let s = status(&mut a);
+    assert!(!s.contains("interrupt") && !s.contains("0.0s"), "{s}");
+}
+
+#[test]
+fn activity_line_counts_the_turns_output_tokens() {
+    let (mut a, _rx) = app(vec![]);
+    a.on_agent(AgentEvent::AgentStart);
+    a.on_agent(usage_out(700));
+    assert!(
+        status(&mut a).contains("0.0s · 700 tokens · esc interrupt"),
+        "{}",
+        status(&mut a)
+    );
+    // The finished reply's usage (500 output) replaces its live count; the next reply adds.
+    a.on_agent(AgentEvent::Message(assistant(
+        vec![Block::text("hi")],
+        StopReason::ToolUse,
+    )));
+    assert!(status(&mut a).contains("500 tokens"), "{}", status(&mut a));
+    a.on_agent(usage_out(1000));
+    assert!(status(&mut a).contains("1.5k tokens"), "{}", status(&mut a));
+    // A new turn starts counting again.
+    a.on_agent(AgentEvent::Settled);
+    a.on_agent(AgentEvent::AgentStart);
+    assert!(!status(&mut a).contains("tokens"), "{}", status(&mut a));
+}
+
+#[test]
+fn activity_line_names_a_rebound_interrupt_key() {
+    let mut i = init(vec![], None);
+    let over = [("app.interrupt".to_string(), json!("ctrl+g"))].into_iter().collect();
+    i.keymap = novacode_tui::keys::Keymap::new(&over).0;
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut a = App::new(i, tx);
+    a.on_agent(AgentEvent::AgentStart);
+    let s = status(&mut a);
+    assert!(s.contains("ctrl+g interrupt") && !s.contains("esc"), "{s}");
+}
+
+/// Every fold line says what it hides: a tool's extension rows past the limit too.
+#[test]
+fn tool_ui_rows_past_the_limit_get_a_fold_line() {
+    let (mut a, _rx) = app(vec![]);
+    a.on_agent(AgentEvent::Message(Message::user("go")));
+    a.on_agent(AgentEvent::Message(assistant(
+        vec![call("x", "status", json!({}))],
+        StopReason::ToolUse,
+    )));
+    let rows: Vec<String> = (1..=15).map(|i| format!("row {i}")).collect();
+    a.on_agent(AgentEvent::Message(Message::ToolResult {
+        call_id: "x".into(),
+        tool_name: "status".into(),
+        content: vec![Block::text("ok")],
+        is_error: false,
+        details: Some(json!({ "ui": rows })),
+    }));
+    let s = screen(&mut a, 60, 30);
+    assert!(s.contains("row 12") && !s.contains("row 13"), "{s}");
+    assert!(s.contains("… (3 more lines) · ctrl+o expand"), "{s}");
+}
+
 fn key(a: &mut App, code: KeyCode, m: KeyModifiers) {
     a.on_key(KeyEvent::new(code, m));
 }
@@ -1137,6 +1224,62 @@ fn typ(a: &mut App, s: &str) {
     }
 }
 
+/// TP7 (G2): an empty input hints `? for shortcuts`; `?` there opens the shortcut
+/// sheet instead of typing, and the next key only closes it.
+#[test]
+fn question_mark_opens_the_shortcut_sheet_on_an_empty_input() {
+    let (mut a, _rx) = app(vec![]);
+    let s = screen(&mut a, 80, 24);
+    assert!(s.contains("? for shortcuts"), "{s}");
+    typ(&mut a, "?");
+    assert_eq!(a.editor.text(), "", "the ? is not typed");
+    assert_eq!(a.focus(), Focus::Dialog);
+    let s = screen(&mut a, 80, 24);
+    // Labels come from the keymap.
+    assert!(s.contains("ctrl+l") && s.contains("esc"), "{s}");
+    assert!(s.contains("alt+/ all keys"), "{s}");
+    key(&mut a, KeyCode::Char('x'), KeyModifiers::NONE);
+    assert_eq!(a.editor.text(), "", "the closing key is not typed");
+    assert_eq!(a.focus(), Focus::Input);
+    assert!(!screen(&mut a, 80, 24).contains("all keys"));
+}
+
+/// TP7: with text in the input, `?` is typed like any key and the hint is gone.
+#[test]
+fn question_mark_types_on_a_non_empty_input() {
+    let (mut a, _rx) = app(vec![]);
+    typ(&mut a, "why?");
+    assert_eq!(a.editor.text(), "why?");
+    let s = screen(&mut a, 80, 24);
+    assert!(!s.contains("for shortcuts") && !s.contains("all keys"), "{s}");
+}
+
+/// TP7 (G2): the shortcut sheet's layout.
+#[test]
+fn golden_shortcut_sheet() {
+    goldens("shortcut_sheet", 24, |a| typ(a, "?"));
+}
+
+/// TP7: a click in the input box moves the cursor to the clicked cell.
+#[test]
+fn a_click_in_the_input_moves_the_cursor() {
+    let (mut a, _rx) = app(vec![]);
+    typ(&mut a, "hello world");
+    key(&mut a, KeyCode::Enter, KeyModifiers::SHIFT);
+    typ(&mut a, "second line");
+    let s = screen(&mut a, 80, 24);
+    let top = s.lines().position(|l| l.starts_with('╭')).unwrap() as u16;
+    // Text starts after the border and one cell of padding.
+    click(&mut a, 2 + 6, top + 1);
+    typ(&mut a, "X");
+    assert_eq!(a.editor.text(), "hello Xworld\nsecond line");
+    screen(&mut a, 80, 24);
+    // Past the end of a row: the row's end.
+    click(&mut a, 60, top + 2);
+    typ(&mut a, "!");
+    assert_eq!(a.editor.text(), "hello Xworld\nsecond line!");
+}
+
 #[test]
 fn slash_and_file_completion() {
     let (mut a, mut rx) = app(vec![]);
@@ -1360,7 +1503,7 @@ fn folded_thinking_names_its_key() {
     run_events(&mut a);
     key(&mut a, KeyCode::Char('o'), KeyModifiers::ALT);
     let s = screen(&mut a, 70, 30);
-    assert!(s.contains("∴ thought · 6 words · ctrl+t to show"), "{s}");
+    assert!(s.contains("∴ thought · 6 words · ctrl+t show"), "{s}");
 }
 
 #[test]

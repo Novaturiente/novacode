@@ -257,8 +257,10 @@ pub fn render(
             };
             let left = join(side(&row.left));
             let mut right_parts = side(&row.right);
-            // Narrow screen: keep the activity; drop right-side segments from the end.
-            while !right_parts.is_empty() && crate::wrap::width(&join(right_parts.clone())) + 12 > width {
+            // Narrow screen: keep the activity (up to 40 cells: elapsed time, tokens and
+            // the interrupt key while busy); drop right-side segments from the end.
+            let keep = crate::wrap::width(&left).clamp(12, 40);
+            while !right_parts.is_empty() && crate::wrap::width(&join(right_parts.clone())) + keep > width {
                 right_parts.pop();
             }
             let mut right = join(right_parts);

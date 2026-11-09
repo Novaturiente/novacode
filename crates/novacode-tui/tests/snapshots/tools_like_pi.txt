@@ -1,6 +1,7 @@
  ╭──────────────────────────────────────────────────────────────────╮
  │ ask and spawn                                                    │
  ╰──────────────────────────────────────────────────────────────────╯
+
  ▾ 3 tool calls
 
  ● ask_user "Which database?" (+1 more)
@@ -20,7 +21,7 @@
  ▏ report line 8
  ▏ report line 9
  ▏ report line 10
- ▏ … (4 more lines, ctrl+o to expand)
+ ▏ … (4 more lines) · ctrl+o expand
 
  ● codemode
  ▏ const a = await tools.read({path: 'x'});
@@ -33,8 +34,7 @@
 
 
 
-
 ╭────────────────────────────────────────────────────────────────────╮
-│                                                                    │
+│                                                    ? for shortcuts │
 ╰────────────────────────────────────────────────────────────────────╯
  ● ready              ctx 16%  cache 97%  opus · medium  proj  ⎇ main
