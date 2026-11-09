@@ -2,6 +2,25 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.9.0] - 2026-11-09
+
+### Added
+
+- Repo notes: novacode learns small facts about each repository from its earlier sessions (a failed tool call and the fix that followed: a command spelling that works, a missing tool, an environment variable, a moved path, a file whose edits keep missing). A note is used once 3 sessions show it and retired after 2 contradict it; the `memory.model` helper rewords them every 3 sessions. Notes live in `<repo>/.novacode/notes.md` (delete a line to drop one) and reach the model as the `repo_notes` prompt section in trusted folders. Turn off with `repoNotes.enabled: false`.
+- Super fast mode: tasks and reviews run only fast checks of the changed code; the full suite and production build run once on merged main before deploy. `super.autoMerge` (default off) merges an approved task without a card; `task send` with `proof: true` keeps an approval.
+- TUI: startup header on new sessions, the `?` shortcut sheet, click-to-cursor in the input, mouse and hints in overlays, and an activity line with elapsed time, turn tokens and the interrupt key.
+
+### Changed
+
+- Super: a merge whose base did not move re-runs no checks; a merge train runs fast checks once; a landed and finished task refuses new work (spawn a new task); no progress nudge while a tool call runs; an over-long `say` section is shown with a warning instead of refused.
+- TUI: the view keeps its top line when content above changes height, markdown streams without reflow, tool rows keep fixed heights, scrolling and growing cards ease over about 60 ms (off in slow mode), panel rows sit in fixed columns with an accent rail for the selection, and icons are plain by default.
+- LSP extension: servers start in the background, one deadline covers a whole call, and a server that dies fails its waiting requests at once.
+- `scripts/build-musl.sh` honours `CARGO_TARGET_DIR`.
+
+### Fixed
+
+- The `tui-style.md` docs page ships with the binary.
+
 ## [0.8.11] - 2026-11-09
 
 ### Changed
