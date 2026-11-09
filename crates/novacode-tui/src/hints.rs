@@ -9,10 +9,11 @@ use unicode_width::UnicodeWidthStr;
 const SEP: &str = " · ";
 
 /// (key, action) pairs in `w` cells. Pairs that don't fit are dropped from the end,
-/// so put the most important first. Never wraps.
+/// so put the most important first. Never wraps. A pair with no key (an unbound action)
+/// is skipped.
 pub fn hints<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)], w: usize, t: &Theme) -> Line<'static> {
     let mut text = String::new();
-    for (k, a) in pairs {
+    for (k, a) in pairs.iter().filter(|(k, _)| !k.as_ref().is_empty()) {
         let item = format!("{} {}", k.as_ref(), a.as_ref());
         let sep = if text.is_empty() { "" } else { SEP };
         if text.width() + sep.width() + item.width() > w {
@@ -45,6 +46,8 @@ mod tests {
         assert_eq!(text(20), "↑↓ move · enter open");
         assert_eq!(text(19), "↑↓ move");
         assert_eq!(text(3), "");
+        let unbound = hints(&[("", "send"), ("esc", "back")], 80, &t);
+        assert_eq!(unbound.spans[0].content, "esc back", "an unbound key is skipped");
         let line = hints(&pairs, 80, &t);
         assert!(line.spans.iter().all(|s| s.style == t.dim), "every hint is dim");
     }

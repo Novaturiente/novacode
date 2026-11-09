@@ -20,8 +20,6 @@ pub struct BtwChat {
     scroll: usize,
     /// Input width at the last draw, for the editor's line moves.
     width: usize,
-    /// The key that sends a question, for its hint.
-    pub submit_key: String,
 }
 
 pub enum BtwKey {
@@ -37,7 +35,6 @@ impl Default for BtwChat {
             editor: Editor::default(),
             scroll: 0,
             width: 40,
-            submit_key: "enter".into(),
         }
     }
 }
@@ -70,12 +67,7 @@ impl BtwChat {
 
     /// A wheel step: `up` shows older rows (the draw stops it at the top).
     pub fn wheel(&mut self, up: bool) {
-        let w = crate::dialog::WHEEL;
-        self.scroll = if up {
-            self.scroll.saturating_add(w)
-        } else {
-            self.scroll.saturating_sub(w)
-        };
+        self.scroll = dialog::wheel_from_bottom(self.scroll, up);
     }
 
     /// `a` is the key's editor action from the keymap.
@@ -97,7 +89,7 @@ impl BtwChat {
         BtwKey::None
     }
 
-    pub fn render(&mut self, f: &mut Frame, area: Rect, t: &Theme) {
+    pub fn render(&mut self, f: &mut Frame, area: Rect, t: &Theme, km: &crate::keys::Keymap) {
         let inner = dialog::frame(f, area, "btw: side chat", t);
         let w = inner.width as usize;
         self.width = w.saturating_sub(2).max(1);
@@ -167,12 +159,11 @@ impl BtwChat {
             },
         );
         f.set_cursor_position(Position::new(inner.x + 2 + cc, iy + cr));
-        let mut keys = vec![
-            (self.submit_key.as_str(), "ask"),
-            ("esc", "close"),
-            ("pgup/pgdn", "scroll"),
+        let keys = [
+            (km.keys(A::Submit), "ask"),
+            ("esc".into(), "close"),
+            ("pgup/pgdn".into(), "scroll"),
         ];
-        keys.retain(|(k, _)| !k.is_empty());
         dialog::hint_row(f, inner, &keys, t);
     }
 }

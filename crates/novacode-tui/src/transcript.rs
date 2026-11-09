@@ -2,6 +2,7 @@
 //! L9.8). A finished turn is laid out once per width and cached; only the
 //! turn still running is laid out again. Turn-collapse is built in.
 
+use crate::clock;
 use crate::markdown;
 use crate::theme::Theme;
 use crate::wrap::{self, sanitize};
@@ -180,7 +181,7 @@ pub struct Transcript {
 pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 fn spin_frame(since: Instant) -> &'static str {
-    SPINNER[(since.elapsed().as_millis() / 100) as usize % SPINNER.len()]
+    SPINNER[(clock::since(since).as_millis() / 100) as usize % SPINNER.len()]
 }
 
 /// How thinking blocks show (L9.7, setting `ui.thinking`).
@@ -440,7 +441,7 @@ impl Transcript {
 
     pub fn on_stream(&mut self, ev: &StreamEvent) {
         if self.live.is_none() {
-            self.live_since = Some(Instant::now());
+            self.live_since = Some(clock::now());
         }
         let live = self.live.get_or_insert_with(Vec::new);
         match ev {
@@ -603,7 +604,7 @@ impl Transcript {
 
     pub fn tool_start(&mut self, id: &str) {
         if let Some(t) = self.tool(id) {
-            t.started = Some(Instant::now());
+            t.started = Some(clock::now());
         }
     }
 
@@ -687,7 +688,7 @@ impl Transcript {
         let thinking = self.thinking;
         let hint = self.thinking_hint.clone();
         let live = self.live_view();
-        let since = Some(self.live_since.unwrap_or_else(Instant::now));
+        let since = Some(self.live_since.unwrap_or_else(clock::now));
         let mut v = View {
             lines: Vec::new(),
             starts: Vec::new(),
@@ -1058,7 +1059,7 @@ fn lay_assistant(
                 // Still thinking: dots cycle and the seconds tick (the provider sends thinking in bursts).
                 let label = match live.filter(|_| j + 1 == n) {
                     Some(at) => {
-                        let ms = at.elapsed().as_millis();
+                        let ms = clock::since(at).as_millis();
                         let dots = &"...   "[3 - (ms / 400 % 4) as usize..][..3];
                         format!("thinking{dots} {}s", ms / 1000)
                     }
@@ -1394,7 +1395,7 @@ fn lay_tool(tool: &Tool, width: usize, t: &Theme, (full, hint): (bool, &str)) ->
     } else if let Some(s) = tool
         .started
         .filter(|_| !tool.done)
-        .map(|at| at.elapsed().as_secs())
+        .map(|at| clock::since(at).as_secs())
         .filter(|s| *s >= 1)
     {
         head.push(Span::styled(format!("  {s}s"), t.dim));

@@ -411,7 +411,7 @@ impl Editor {
         }
     }
 
-    /// The search prompt shown above the editor, if searching.
+    /// The search prompt shown above the editor, if searching (the app adds its keys).
     pub fn search_prompt(&self) -> Option<String> {
         self.search.as_ref().map(|(q, at, _)| {
             let state = if at.is_some() || q.is_empty() {
@@ -419,7 +419,7 @@ impl Editor {
             } else {
                 " (no match)"
             };
-            format!("history search: {q}{state}   Ctrl+R older · Enter use · Esc cancel")
+            format!("history search: {q}{state}")
         })
     }
 

@@ -330,13 +330,15 @@ impl Keymap {
         })
     }
 
-    /// Keys bound to `a`, for hints, e.g. `ctrl+l`.
+    /// The first key bound to `a`, for hints, e.g. `ctrl+l`; Escape shows as `esc`.
     pub fn keys(&self, a: A) -> String {
-        self.bindings
+        let k = self
+            .bindings
             .iter()
             .find(|b| b.def.action == a)
             .and_then(|b| b.keys.first().cloned())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if k == "escape" { "esc".into() } else { k }
     }
 
     /// Keys bound to two actions of the same scope (for `doctor` and the help popup).

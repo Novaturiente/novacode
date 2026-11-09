@@ -23,7 +23,9 @@ fn app_at(history: Vec<Message>, attached: Option<&str>) -> (App, mpsc::Unbounde
     (App::new(init(history, attached), tx), rx)
 }
 
+/// Every test app starts with a frozen clock, so times and ages on screen never drift.
 fn init(history: Vec<Message>, attached: Option<&str>) -> Init {
+    novacode_tui::clock::freeze();
     Init {
         model: "claude/opus".into(),
         cwd: "/home/u/proj".into(),
@@ -93,8 +95,7 @@ fn goldens(name: &str, h: u16, setup: impl Fn(&mut App)) {
 /// running rows and the second row selected. Below 100 columns the panel is hidden.
 #[test]
 fn golden_tasks_tab() {
-    // The clock shows minutes past an hour, so a slow test still matches.
-    let ago = |s: u64| novacode_tui::panel::now_ms() - s * 1000 - 20_000;
+    let ago = |s: u64| novacode_tui::clock::now_ms() - s * 1000 - 20_000;
     let row = |label: &str, repo: &str, secs: u64| novacode_tui::panel::TaskRow {
         label: label.into(),
         repo: repo.into(),
@@ -128,17 +129,20 @@ fn draw(a: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
     t.backend().buffer().clone()
 }
 
-/// The screen row (y) whose text contains `s`.
-fn buf_row_of(buf: &ratatui::buffer::Buffer, s: &str) -> u16 {
-    let text = |y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>();
+/// A drawn frame's text, one line per row, trailing spaces cut.
+fn text(buf: &ratatui::buffer::Buffer) -> String {
     (0..buf.area.height)
-        .find(|&y| text(y).contains(s))
-        .unwrap_or_else(|| panic!("{s} not drawn"))
+        .map(|y| {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            row.trim_end().to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Three running tasks: a long title, a long project name, and short ones.
 fn board(a: &mut App) {
-    let ago = |s: u64| novacode_tui::panel::now_ms() - s * 1000 - 20_000;
+    let ago = |s: u64| novacode_tui::clock::now_ms() - s * 1000 - 20_000;
     let row = |label: &str, repo: &str, secs: u64| novacode_tui::panel::TaskRow {
         label: label.into(),
         repo: repo.into(),
@@ -217,19 +221,19 @@ fn panel_selection_is_a_full_width_bar_dim_when_unfocused() {
     key(&mut a, KeyCode::Down, KeyModifiers::NONE);
     let buf = draw(&mut a, 120, 24);
     let x0 = 120 - a.panel.width(120) + 2;
-    let y = buf_row_of(&buf, "T4-docs");
+    let y = row_of(&text(&buf), "T4-docs");
     for yy in [y, y + 1] {
         for x in x0..120 {
             assert_eq!(buf[(x, yy)].bg, sel, "bar cell ({x}, {yy})");
         }
     }
-    let other = buf_row_of(&buf, "T5-api");
+    let other = row_of(&text(&buf), "T5-api");
     assert!((x0..120).all(|x| buf[(x, other)].bg != sel), "only the selected row");
     // Focus back on the input: the bar stays, its text turns dim.
     key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!(a.focus(), Focus::Input);
     let buf = draw(&mut a, 120, 24);
-    let y = buf_row_of(&buf, "T4-docs");
+    let y = row_of(&text(&buf), "T4-docs");
     for x in x0..120 {
         assert_eq!(buf[(x, y)].bg, sel, "unfocused bar cell ({x}, {y})");
         if buf[(x, y)].symbol() != " " {
@@ -271,7 +275,7 @@ fn panel_keys_are_the_same_on_every_tab() {
     let x0 = 120 - a.panel.width(120) + 2;
     let selected = |a: &mut App, s: &str| {
         let buf = draw(a, 120, 24);
-        let y = buf_row_of(&buf, s);
+        let y = row_of(&text(&buf), s);
         buf[(x0, y)].bg == sel
     };
     assert!(selected(&mut a, "read the code"), "the first row starts selected");
@@ -381,12 +385,6 @@ fn row_of(s: &str, text: &str) -> u16 {
         .unwrap_or_else(|| panic!("no {text}: {s}")) as u16
 }
 
-/// The ask form's last line inside its frame: the key hints.
-fn ask_keys(s: &str) -> String {
-    let end = s.lines().position(|l| l.starts_with("╰")).unwrap();
-    s.lines().nth(end - 1).unwrap().to_string()
-}
-
 /// TP5: every choice shows its description, free text is the last numbered choice,
 /// the note hint sits on the selected choice only, and "back" needs an earlier question.
 #[test]
@@ -401,7 +399,7 @@ fn ask_form_lists_every_choice_and_only_working_keys() {
     let notes: Vec<&str> = s.lines().filter(|l| l.contains("n note")).collect();
     assert_eq!(notes.len(), 1, "{s}");
     assert!(notes[0].contains("▸ 1. Postgres"), "{s}");
-    let keys = ask_keys(&s);
+    let keys = overlay_keys(&s);
     assert!(keys.contains("enter choose") && keys.contains("esc dismiss"), "{keys}");
     assert!(!keys.contains("back"), "no earlier question: {keys}");
     // On the free-text row: no note, and Enter types.
@@ -410,14 +408,14 @@ fn ask_form_lists_every_choice_and_only_working_keys() {
     }
     let s = screen(&mut a, 80, 30);
     assert!(s.contains("▸ 4. Type something…") && !s.contains("n note"), "{s}");
-    assert!(ask_keys(&s).contains("enter type"), "{s}");
+    assert!(overlay_keys(&s).contains("enter type"), "{s}");
     // The second question can go back.
     key(&mut a, KeyCode::Up, KeyModifiers::NONE);
     screen(&mut a, 80, 30);
     key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
     let s = screen(&mut a, 80, 30);
     assert!(s.contains("Question 2 of 2"), "{s}");
-    assert!(ask_keys(&s).contains("← back"), "{s}");
+    assert!(overlay_keys(&s).contains("← back"), "{s}");
 }
 
 /// TP5: a click selects a choice, a double-click answers with it.
@@ -704,16 +702,7 @@ fn needs_you_heads_the_tasks_tab_and_d_dismisses() {
 }
 
 fn screen(app: &mut App, w: u16, h: u16) -> String {
-    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-    t.draw(|f| app.draw(f)).unwrap();
-    let buf = t.backend().buffer();
-    (0..h)
-        .map(|y| {
-            let row: String = (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect();
-            row.trim_end().to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    text(&draw(app, w, h))
 }
 
 /// The startup header's version, so a release bump leaves goldens and snapshots alone.
@@ -1237,12 +1226,14 @@ fn only_the_focused_frame_is_coloured() {
 #[test]
 fn board_snapshot_from_the_wire_fills_the_tasks_tab() {
     let (mut a, _rx) = app(vec![Message::user("go")]);
-    let wire = r#"{"kind":"board","tasks":[{"label":"T1-cli-input-errors","repo":"calc","state":"running","model":"claude/claude-haiku-5-5","tokens":0,"started_ms":1793809453000,"session":"01a1a760"}]}"#;
-    a.on_ui(serde_json::from_str::<UiEvent>(wire).unwrap());
+    let started = novacode_tui::clock::now_ms() - 65_000;
+    let wire = format!(
+        r#"{{"kind":"board","tasks":[{{"label":"T1-cli-input-errors","repo":"calc","state":"running","model":"claude/claude-haiku-5-5","tokens":0,"started_ms":{started},"session":"01a1a760"}}]}}"#
+    );
+    a.on_ui(serde_json::from_str::<UiEvent>(&wire).unwrap());
     a.tick();
     key(&mut a, KeyCode::Char('p'), KeyModifiers::CONTROL | KeyModifiers::ALT);
-    // Wide enough that the title fits beside its ever-growing age.
-    let s = screen(&mut a, 200, 16);
+    let s = screen(&mut a, 120, 16);
     assert!(s.contains("Tasks") && s.contains("T1-cli-input-errors"), "{s}");
 }
 
@@ -1294,7 +1285,7 @@ fn approval_card_ignores_clicks() {
     a.age_approvals();
     let s = screen(&mut a, 80, 24);
     let keys = row_of(&s, "y once");
-    assert!(s.contains("y once · a this session · A always · n deny"), "{s}");
+    assert!(s.contains("y once · n deny · a this session · A always"), "{s}");
     assert!(s.contains("Bash(rm -rf:*)"), "the rule stays visible: {s}");
     assert!(!s.contains("why:"), "{s}");
     let top = row_of(&s, "Allow?");
@@ -1519,8 +1510,8 @@ fn wheel(a: &mut App, column: u16, row: u16, up: bool) {
     }));
 }
 
-/// The overlay's hint line: the last row inside its frame (the first frame from the top;
-/// the input's is below it).
+/// A dialog's hint line (overlay or ask form): the last row inside its frame (the first
+/// frame from the top; the input's is below it).
 fn overlay_keys(s: &str) -> String {
     let end = s.lines().position(|l| l.trim_start().starts_with('╰')).unwrap();
     s.lines()
@@ -2298,4 +2289,139 @@ fn reload_during_a_turn_waits_for_it_to_end() {
     let (mut b, _rx) = app(vec![]);
     type_(&mut b, "/reload");
     assert_eq!(b.exit, Some(Exit::Reload));
+}
+
+/// One approval card for `rm -rf target`, past its grace; the receiver gets the answer.
+fn approve_rm(a: &mut App) -> tokio::sync::oneshot::Receiver<Answer> {
+    let (tx, reply) = tokio::sync::oneshot::channel();
+    a.on_ui(UiEvent::Approve(ApproveReq {
+        id: 1,
+        tool: "bash".into(),
+        detail: "rm -rf target".into(),
+        reason: "deletes files".into(),
+        rule: "Bash(rm -rf:*)".into(),
+        risky: false,
+        reply: tx,
+    }));
+    a.age_approvals();
+    reply
+}
+
+/// TP10: on a narrow card the hint line drops from the end, so deny is never the one lost.
+#[test]
+fn approval_card_keeps_deny_on_a_narrow_screen() {
+    let (mut a, _rx) = app(vec![]);
+    let _reply = approve_rm(&mut a);
+    let s = screen(&mut a, 34, 24);
+    assert!(s.contains("y once · n deny"), "{s}");
+}
+
+/// TP10: a narrow ask form keeps `esc dismiss` right after the main key.
+#[test]
+fn ask_form_keeps_dismiss_on_a_narrow_screen() {
+    let (mut a, _rx) = app(vec![]);
+    let _answers = ask_db(&mut a, 1);
+    let s = screen(&mut a, 36, 40);
+    assert!(overlay_keys(&s).contains("esc dismiss"), "{s}");
+}
+
+/// The Files tab with `src/a.rs`, focus on the input; returns the file row's screen row.
+fn files_tab(a: &mut App) -> u16 {
+    a.on_agent(AgentEvent::ToolStart {
+        call: ToolCall {
+            id: "e".into(),
+            name: "edit".into(),
+            arguments: json!({"path": "src/a.rs"}),
+            arguments_error: None,
+            replay: None,
+        },
+    });
+    a.panel.visible = true;
+    a.panel.show_tab("files");
+    row_of(&screen(a, 120, 24), "src/a.rs")
+}
+
+/// TP10: while an approval card or ask form is open, a click in the panel neither acts
+/// on a row nor moves focus there.
+#[test]
+fn panel_clicks_do_nothing_while_a_dialog_is_open() {
+    let (mut a, mut rx) = app(vec![]);
+    let x = 120 - a.panel.width(120) + 4;
+    let row = files_tab(&mut a);
+    let _reply = approve_rm(&mut a);
+    screen(&mut a, 120, 24);
+    while rx.try_recv().is_ok() {}
+    click(&mut a, x, row);
+    click(&mut a, x, row);
+    assert!(rx.try_recv().is_err(), "no file opens under an approval card");
+    assert_eq!(a.focus(), Focus::Dialog);
+    key(&mut a, KeyCode::Char('y'), KeyModifiers::NONE);
+    assert_eq!(a.focus(), Focus::Input, "the panel did not take focus");
+
+    let (mut a, mut rx) = app(vec![]);
+    let row = files_tab(&mut a);
+    let _answers = ask_db(&mut a, 1);
+    screen(&mut a, 120, 24);
+    while rx.try_recv().is_ok() {}
+    click(&mut a, x, row);
+    click(&mut a, x, row);
+    assert!(rx.try_recv().is_err(), "no file opens under an ask form");
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(a.focus(), Focus::Input, "the panel did not take focus");
+    // With no dialog open, the same click opens the file.
+    click(&mut a, x, row);
+    assert_eq!(a.focus(), Focus::Panel);
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok()).any(|c| matches!(c, Cmd::OpenFile(_))),
+        "a click opens the file when nothing is pending"
+    );
+}
+
+/// TP10: a focused panel passes App keys it does not use, such as the keys help.
+#[test]
+fn focused_panel_lets_app_keys_through() {
+    let (mut a, _rx) = app(vec![]);
+    key(&mut a, FOCUS_PANEL.0, FOCUS_PANEL.1);
+    assert_eq!(a.focus(), Focus::Panel);
+    key(&mut a, KeyCode::Char('/'), KeyModifiers::ALT);
+    let s = screen(&mut a, 120, 30);
+    assert_eq!(a.focus(), Focus::Dialog, "the keys help opened: {s}");
+    // Keys the panel does not use and the app does not bind still don't reach the input.
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    key(&mut a, FOCUS_PANEL.0, FOCUS_PANEL.1);
+    key(&mut a, KeyCode::Char('z'), KeyModifiers::NONE);
+    assert!(a.editor.is_empty());
+}
+
+/// TP10: status icons differ in colour by state (docs/tui-style.md "Glyphs").
+#[test]
+fn task_icons_are_coloured_by_state() {
+    let t = novacode_tui::theme::Theme::default();
+    let (mut a, _rx) = app(vec![]);
+    let row = |label: &str, state: &str| novacode_tui::panel::TaskRow {
+        label: label.into(),
+        state: state.into(),
+        ..Default::default()
+    };
+    a.on_ui(UiEvent::Board {
+        // The first row is selected, so its text is drawn dim; the others keep their colours.
+        tasks: vec![
+            row("T0-sel", "queued"),
+            row("T1-run", "running"),
+            row("T2-ok", "ready"),
+            row("T3-bad", "failed"),
+        ],
+        needs: vec![],
+    });
+    a.panel.visible = true;
+    a.panel.show_tab("tasks");
+    let buf = draw(&mut a, 120, 24);
+    let x0 = 120 - a.panel.width(120);
+    for (label, glyph, colour) in [("T1-run", "◐", t.warn), ("T2-ok", "✓", t.ok), ("T3-bad", "✗", t.error)] {
+        let y = row_of(&text(&buf), label);
+        let x = (x0..120)
+            .find(|&x| buf[(x, y)].symbol() == glyph)
+            .unwrap_or_else(|| panic!("{label}: no {glyph}"));
+        assert_eq!(buf[(x, y)].fg, colour.fg.unwrap(), "{label} icon colour");
+    }
 }

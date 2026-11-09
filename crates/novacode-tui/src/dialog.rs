@@ -24,6 +24,16 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// Rows one wheel step scrolls in overlays.
 pub const WHEEL: usize = 3;
 
+/// A wheel step for a view scrolled up from its bottom (`scroll` rows; 0 = newest):
+/// `up` shows older rows. The draw stops it at the top.
+pub fn wheel_from_bottom(scroll: usize, up: bool) -> usize {
+    if up {
+        scroll.saturating_add(WHEEL)
+    } else {
+        scroll.saturating_sub(WHEEL)
+    }
+}
+
 /// The keymap's up/down keys as one hint label: `↑↓` for the default arrows.
 pub fn arrows(km: &Keymap, up: A, down: A) -> String {
     match (km.keys(up), km.keys(down)) {
@@ -40,7 +50,7 @@ pub struct Clicks(Option<(Instant, u16)>);
 impl Clicks {
     /// A press on `row`: true when it completes a double-click.
     pub fn double(&mut self, row: u16) -> bool {
-        let now = Instant::now();
+        let now = crate::clock::now();
         let double = self
             .0
             .is_some_and(|(at, r)| r == row && now.duration_since(at) < DOUBLE_CLICK);
@@ -212,7 +222,7 @@ impl Picker {
         let keys = [
             (arrows(km, A::SelUp, A::SelDown), "move"),
             (km.keys(A::SelConfirm), "pick"),
-            (km.keys(A::SelCancel).replace("escape", "esc"), "cancel"),
+            (km.keys(A::SelCancel), "cancel"),
         ];
         hint_row(f, inner, &keys, t);
         f.set_cursor_position((inner.x + 2 + self.filter.chars().count() as u16, inner.y));
@@ -276,8 +286,6 @@ pub struct ApprovalCard {
     pub(crate) shown: Instant,
     /// Width of the reason box at the last draw, for its up/down moves.
     width: Cell<usize>,
-    /// The key that sends the reason, for its hint.
-    pub submit_key: String,
     /// Where the card was last drawn. The card takes no mouse input (TP5).
     area: Cell<Rect>,
 }
@@ -287,9 +295,8 @@ impl ApprovalCard {
         Self {
             req,
             reason: None,
-            shown: Instant::now(),
+            shown: crate::clock::now(),
             width: Cell::new(40),
-            submit_key: "enter".into(),
             area: Cell::new(Rect::default()),
         }
     }
@@ -313,7 +320,7 @@ impl ApprovalCard {
 
     /// `Some` = answered. `a` is the key's editor action from the keymap (for the reason box).
     pub fn handle(&mut self, k: KeyEvent, a: Option<A>) -> Option<Answer> {
-        if self.shown.elapsed() < APPROVAL_GRACE {
+        if crate::clock::since(self.shown) < APPROVAL_GRACE {
             return None;
         }
         if let Some(r) = &mut self.reason {
@@ -346,7 +353,7 @@ impl ApprovalCard {
     }
 
     pub fn height(&self, width: u16) -> u16 {
-        self.lines(width.saturating_sub(4) as usize, &Theme::default(), true)
+        self.lines(width.saturating_sub(4) as usize, &Theme::default(), true, "enter")
             .0
             .len() as u16
             + 2
@@ -355,8 +362,8 @@ impl ApprovalCard {
     /// Tool name, then the command or path under it, then why it is asked (and what
     /// "always" would allow), then the keys.
     /// `spaced`: blank lines between those parts, dropped when the screen is short.
-    /// Also gives the reason box's cursor (row, column).
-    fn lines(&self, w: usize, t: &Theme, spaced: bool) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+    /// Also gives the reason box's cursor (row, column). `submit` sends the reason.
+    fn lines(&self, w: usize, t: &Theme, spaced: bool, submit: &str) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
         let r = &self.req;
         let bar = [Span::styled("│ ", t.dim)];
         // Line by line: `wrap::wrap` runs lines together, which glued multi-line commands.
@@ -405,31 +412,30 @@ impl ApprovalCard {
                     };
                     lines.push(Line::from(vec![lead, Span::styled(r, t.text)]));
                 }
-                let mut keys = vec![(self.submit_key.as_str(), "send"), ("esc", "skip")];
-                keys.retain(|(k, _)| !k.is_empty());
-                lines.push(crate::hints::hints(&keys, w, t));
+                lines.push(crate::hints::hints(&[(submit, "send"), ("esc", "skip")], w, t));
             }
             None => {
                 // Fixed letters, never rebound: the habit for safety decisions stays.
-                let mut keys = vec![("y", "once"), ("a", "this session")];
+                // Deny second: a narrow card drops hints from the end, never this one.
+                let mut keys = vec![("y", "once"), ("n", "deny"), ("a", "this session")];
                 if !r.risky {
                     keys.push(("A", "always"));
                 }
-                keys.push(("n", "deny"));
                 lines.push(crate::hints::hints(&keys, w, t));
             }
         }
         (lines, cursor)
     }
 
-    pub fn render(&self, f: &mut Frame, area: Rect, t: &Theme) {
+    pub fn render(&self, f: &mut Frame, area: Rect, t: &Theme, km: &Keymap) {
         let title = if self.req.risky { "Safety check" } else { "Allow?" };
         let inner = frame(f, area, title, t);
         self.area.set(area);
         let w = inner.width as usize;
-        let mut lines = self.lines(w, t, true);
+        let submit = km.keys(A::Submit);
+        let mut lines = self.lines(w, t, true, &submit);
         if lines.0.len() > inner.height as usize {
-            lines = self.lines(w, t, false);
+            lines = self.lines(w, t, false, &submit);
         }
         let (lines, cursor) = lines;
         f.render_widget(Paragraph::new(lines), inner);
@@ -629,7 +635,7 @@ mod tests {
             reply,
         });
         let text: Vec<String> = card
-            .lines(80, &Theme::default(), true)
+            .lines(80, &Theme::default(), true, "enter")
             .0
             .iter()
             .map(crate::wrap::plain)
@@ -719,7 +725,7 @@ mod tests {
         let mut c = card(false, true);
         hit(&mut c, KeyCode::Char('n'));
         c.paste("too risky");
-        let (lines, cursor) = c.lines(60, &Theme::default(), true);
+        let (lines, cursor) = c.lines(60, &Theme::default(), true, "enter");
         let text: Vec<String> = lines.iter().map(crate::wrap::plain).collect();
         assert!(text.iter().any(|l| l == "why not? too risky"), "{text:?}");
         assert_eq!(cursor.map(|(_, col)| col), Some("why not? too risky".len()));

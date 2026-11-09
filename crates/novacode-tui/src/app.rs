@@ -2,6 +2,7 @@
 //! [`AgentEvent`]s and [`UiEvent`]s in and [`Cmd`]s out, so the same UI can
 //! later sit on an attach socket (L8.13).
 
+use crate::clock;
 use crate::dialog::{self, Answer, ApprovalCard, ApproveReq, Pager, PickItem, Picked, Picker};
 use crate::editor::{Action, Editor};
 use crate::keys::{A, Keymap, Scope};
@@ -416,6 +417,23 @@ enum Overlay {
     Btw(crate::btw::BtwChat),
 }
 
+impl Overlay {
+    /// The list, when this overlay is a picker.
+    fn picker_mut(&mut self) -> Option<&mut Picker> {
+        match self {
+            Overlay::Models(p)
+            | Overlay::Sessions(p)
+            | Overlay::Thinking(p)
+            | Overlay::Branch(_, p)
+            | Overlay::RewindMode(_, p)
+            | Overlay::LoginPick(p)
+            | Overlay::CommandPick(_, p)
+            | Overlay::LoginMethod(_, p) => Some(p),
+            _ => None,
+        }
+    }
+}
+
 /// Where keys go (docs/tui-style.md "Focus"). Only the focused part draws a coloured frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -423,6 +441,14 @@ pub enum Focus {
     Panel,
     /// An approval card, ask form or overlay is open: it takes the keys.
     Dialog,
+}
+
+/// Where keys go when no dialog is open. A dialog takes focus by being open, so it is
+/// never stored ([`App::focus`] derives it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Home {
+    Input,
+    Panel,
 }
 
 pub struct App {
@@ -481,8 +507,8 @@ pub struct App {
     /// Open a file (and its session-start copy, for a diff) in the editor; the loop does it.
     pub open_file: Option<(std::path::PathBuf, Option<std::path::PathBuf>)>,
     pub panel: crate::panel::Panel,
-    /// Input or Panel: where keys go when no dialog is open (see `focus`).
-    focus: Focus,
+    /// Where keys go when no dialog is open (see `focus`).
+    home: Home,
     /// Extension status segments `ext:<ext>:<key>` → (text, style).
     ext_status: std::collections::BTreeMap<String, (String, Option<String>)>,
     /// Extension widgets → (lines, below the editor).
@@ -539,7 +565,7 @@ impl App {
         if init.panel_only {
             panel.pinned = Some(true);
         }
-        let focus = if init.panel_only { Focus::Panel } else { Focus::Input };
+        let home = if init.panel_only { Home::Panel } else { Home::Input };
         if !init.panel_auto {
             panel.pinned.get_or_insert(false);
             panel.never_auto = true;
@@ -621,7 +647,7 @@ impl App {
             external_editor: false,
             open_file: None,
             panel,
-            focus,
+            home,
             ext_status: Default::default(),
             widgets: Default::default(),
             footer: None,
@@ -633,7 +659,7 @@ impl App {
             mcp: (0, 0),
             task_started: None,
             task_tokens: None,
-            started: Instant::now(),
+            started: clock::now(),
             away: (true, false),
             #[cfg(feature = "images")]
             images: None,
@@ -655,7 +681,7 @@ impl App {
     }
 
     fn flash(&mut self, s: impl Into<String>) {
-        self.flash = Some((s.into(), Instant::now()));
+        self.flash = Some((s.into(), clock::now()));
     }
 
     /// The frame that stays up while the session is swapped under the window:
@@ -684,8 +710,7 @@ impl App {
         self.dirty = true;
         match ev {
             UiEvent::Approve(req) => {
-                let mut card = ApprovalCard::new(req);
-                card.submit_key = self.keymap.keys(A::Submit);
+                let card = ApprovalCard::new(req);
                 self.approvals.push_back(card);
             }
             UiEvent::ApprovalDone { id } => {
@@ -698,7 +723,6 @@ impl App {
             UiEvent::Ask(req) => {
                 let mut form = crate::ask::AskForm::new(req);
                 form.edit_key = self.keymap.keys(A::ExternalEditor);
-                form.submit_key = self.keymap.keys(A::Submit);
                 self.asks.push_back(form);
             }
             UiEvent::AskDone { id } => self.asks.retain(|f| f.req.id != id),
@@ -859,10 +883,10 @@ impl App {
         // Open at once on new todos (subagents: in `ui_op`), even while this session
         // is idle (the 1 s ticker only runs while busy or shown).
         if matches!(ev, AgentEvent::Message(Message::ToolResult { .. })) {
-            self.panel.tick(self.focus == Focus::Panel);
+            self.panel.tick(self.home == Home::Panel);
         }
         match &ev {
-            AgentEvent::AgentStart => (self.task_started, self.task_tokens) = (Some(Instant::now()), None),
+            AgentEvent::AgentStart => (self.task_started, self.task_tokens) = (Some(clock::now()), None),
             AgentEvent::Settled => self.task_started = None,
             AgentEvent::Stream(StreamEvent::Usage(u)) => self.task_tokens.get_or_insert_default().1 = u.output,
             AgentEvent::Stream(StreamEvent::RetryRollback) => {
@@ -1111,7 +1135,7 @@ impl App {
             }
             _ => {
                 self.panel.apply(ext, &op);
-                self.panel.tick(self.focus == Focus::Panel);
+                self.panel.tick(self.home == Home::Panel);
             }
         }
     }
@@ -1229,7 +1253,7 @@ impl App {
     /// Advance timers: the panel's auto show/hide. Returns true when something changed.
     pub fn tick(&mut self) -> bool {
         let before = self.panel.visible;
-        self.panel.tick(self.focus == Focus::Panel);
+        self.panel.tick(self.home == Home::Panel);
         // Live output while the Processes tab is on screen (the ticker runs only then or while busy).
         let popup = matches!(self.overlay, Some(Overlay::Procs(_)));
         if (popup || self.panel.procs_shown()) && self.init.attached.is_none() {
@@ -1315,7 +1339,7 @@ impl App {
     /// The next queued card just came to the front: its type-ahead grace starts now.
     fn front_card_shown(&mut self) {
         if let Some(c) = self.approvals.front_mut() {
-            c.shown = Instant::now();
+            c.shown = clock::now();
         }
     }
 
@@ -1341,7 +1365,7 @@ impl App {
     pub fn focus(&self) -> Focus {
         if !self.approvals.is_empty() || !self.asks.is_empty() || self.overlay.is_some() || self.sheet {
             Focus::Dialog
-        } else if self.focus == Focus::Panel && self.panel.visible {
+        } else if self.home == Home::Panel && self.panel.visible {
             Focus::Panel
         } else {
             Focus::Input
@@ -1352,12 +1376,12 @@ impl App {
     /// opening, so `Dialog` changes nothing; the tmux panel pane keeps it on the panel.
     pub fn set_focus(&mut self, f: Focus) {
         match f {
-            Focus::Input if !self.init.panel_only => self.focus = Focus::Input,
+            Focus::Input if !self.init.panel_only => self.home = Home::Input,
             Focus::Panel => {
                 if !self.panel.visible {
                     self.panel.toggle();
                 }
-                self.focus = Focus::Panel;
+                self.home = Home::Panel;
             }
             _ => {}
         }
@@ -1397,7 +1421,7 @@ impl App {
     }
 
     pub fn on_key(&mut self, k: KeyEvent) {
-        let now = Instant::now();
+        let now = clock::now();
         self.selection = None;
         self.screen_sel = None;
         // Esc always ends at the input, also when it closes a dialog over the panel.
@@ -1459,16 +1483,11 @@ impl App {
                         }
                     }
                 }
-                Overlay::Models(p)
-                | Overlay::Sessions(p)
-                | Overlay::Thinking(p)
-                | Overlay::Branch(_, p)
-                | Overlay::RewindMode(_, p)
-                | Overlay::LoginPick(p)
-                | Overlay::CommandPick(_, p)
-                | Overlay::LoginMethod(_, p) => {
-                    let r = p.handle(k, &self.keymap);
-                    self.picked(r);
+                o => {
+                    if let Some(p) = o.picker_mut() {
+                        let r = p.handle(k, &self.keymap);
+                        self.picked(r);
+                    }
                 }
             }
             return;
@@ -1477,18 +1496,19 @@ impl App {
             self.search_key(k);
             return;
         }
-        // The focused panel takes the keys, except the ones that leave it (L9.16).
+        // The focused panel takes the keys, except the ones that leave it (L9.16); App
+        // keys it does not use (keys help, say) fall through to the app.
         if self.focus() == Focus::Panel {
-            match self.keymap.lookup(&k, &[Scope::App]) {
+            let app = self.keymap.lookup(&k, &[Scope::App]);
+            match app {
                 Some(A::PanelFocus | A::PanelToggle | A::PanelUsage | A::Clear) if !self.init.panel_only => {}
                 Some(A::Clear) => self.exit = Some(Exit::Quit),
-                _ => {
+                _ => match self.panel.key(&crate::keys::name(&k)) {
+                    None if app.is_some() => {}
                     // Leaving does nothing in the panel pane: it has nothing else to focus.
-                    if let Some(Some(a)) = self.panel.key(&crate::keys::name(&k)) {
-                        self.panel_action(a);
-                    }
-                    return;
-                }
+                    Some(Some(a)) => return self.panel_action(a),
+                    _ => return,
+                },
             }
         }
         // `?` on an empty input opens the shortcut sheet instead of typing (G2).
@@ -1873,7 +1893,6 @@ impl App {
             reply,
         });
         form.edit_key = self.keymap.keys(A::ExternalEditor);
-        form.submit_key = self.keymap.keys(A::Submit);
         self.asks.push_back(form);
     }
 
@@ -1924,7 +1943,6 @@ impl App {
                 "/watch" => self.watch(),
                 "/btw" => {
                     let mut c = crate::btw::BtwChat::default();
-                    c.submit_key = self.keymap.keys(A::Submit);
                     if !arg.is_empty() {
                         c.ask(arg.to_string());
                         self.send(Cmd::Btw(arg.to_string()));
@@ -2048,7 +2066,7 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) if self.screen_sel.is_some() => {
                 let (a, b) = self.screen_sel.take().unwrap();
-                if a == b && self.overlay.is_none() && self.panel.contains(a.0, a.1) {
+                if a == b && self.focus() != Focus::Dialog && self.panel.contains(a.0, a.1) {
                     self.set_focus(Focus::Panel);
                     if let Some(act) = self.panel.click(a.0, a.1) {
                         self.panel_action(act);
@@ -2086,8 +2104,12 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
-        // A press anywhere but the panel gives the keys back to the input.
-        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) && !self.panel.contains(m.column, m.row) {
+        // A press anywhere but the panel gives the keys back to the input; an open
+        // dialog keeps them.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.focus() != Focus::Dialog
+            && !self.panel.contains(m.column, m.row)
+        {
             self.set_focus(Focus::Input);
         }
         // A press in the input moves its cursor; a drag from there still selects screen text.
@@ -2187,26 +2209,15 @@ impl App {
             _ => None,
         };
         let press = m.kind == MouseEventKind::Down(MouseButton::Left);
+        let picker = self.overlay.as_mut().and_then(Overlay::picker_mut);
+        if let Some(p) = picker.filter(|p| press && p.contains(m.column, m.row)) {
+            let r = p.click(m.column, m.row);
+            return self.picked(r);
+        }
         match (&mut self.overlay, up) {
             (Some(Overlay::Pager(p)), Some(up)) => p.wheel(up),
             (Some(Overlay::Procs(p)), Some(up)) => p.wheel(up),
             (Some(Overlay::Btw(c)), Some(up)) => c.wheel(up),
-            (
-                Some(
-                    Overlay::Models(p)
-                    | Overlay::Sessions(p)
-                    | Overlay::Thinking(p)
-                    | Overlay::Branch(_, p)
-                    | Overlay::RewindMode(_, p)
-                    | Overlay::LoginPick(p)
-                    | Overlay::CommandPick(_, p)
-                    | Overlay::LoginMethod(_, p),
-                ),
-                None,
-            ) if press && p.contains(m.column, m.row) => {
-                let r = p.click(m.column, m.row);
-                self.picked(r);
-            }
             _ => {
                 self.on_screen_mouse(m);
             }
@@ -2328,22 +2339,14 @@ impl App {
             let pos =
                 s.at.and_then(|a| hits.iter().position(|&h| h == a))
                     .map_or(0, |p| p + 1);
-            let line = format!(
-                " search: {}  {}/{}   Enter older · Shift+Enter newer · Esc close",
-                s.query,
-                pos,
-                hits.len()
-            );
-            notes.push(wrap::truncate(
-                vec![Span::styled(line, self.theme.warn)],
-                area.width as usize,
-            ));
+            // The search keys are matched as raw keys, so their labels are fixed.
+            let keys = [("enter", "older"), ("shift+enter", "newer"), ("esc", "close")];
+            let line = format!(" search: {}  {}/{}   ", s.query, pos, hits.len());
+            notes.push(with_hints(line, &keys, area.width as usize, &self.theme));
         }
         if let Some(s) = self.editor.search_prompt() {
-            notes.push(wrap::truncate(
-                vec![Span::styled(format!(" {s}"), self.theme.warn)],
-                area.width as usize,
-            ));
+            let keys = [("ctrl+r", "older"), ("enter", "use"), ("esc", "cancel")];
+            notes.push(with_hints(format!(" {s}   "), &keys, area.width as usize, &self.theme));
         }
         let card_h = match (self.approvals.front(), self.asks.front()) {
             (Some(c), _) => c.height(area.width).min(area.height / 2),
@@ -2460,37 +2463,27 @@ impl App {
         self.input_area = inner;
         let text: Vec<Line> = rows.into_iter().map(|r| Line::styled(r, t.text)).collect();
         f.render_widget(Paragraph::new(text).block(block), ed);
-        const HINT: &str = "? for shortcuts";
-        if focus == Focus::Input
-            && self.editor.is_empty()
-            && !self.editor.searching()
-            && inner.width as usize > HINT.len() + 2
-        {
-            let hint = Paragraph::new(Line::styled(HINT, t.dim)).alignment(ratatui::layout::Alignment::Right);
+        // `?` is matched as a raw key on an empty input (G2), so its label is fixed.
+        let hint = crate::hints::hints(&[("?", "for shortcuts")], (inner.width as usize).saturating_sub(2), t);
+        if focus == Focus::Input && self.editor.is_empty() && !self.editor.searching() && hint.width() > 0 {
+            let hint = Paragraph::new(hint).alignment(ratatui::layout::Alignment::Right);
             f.render_widget(hint, Rect { height: 1, ..inner });
         }
         if self.approvals.is_empty() && self.asks.is_empty() && self.overlay.is_none() {
             f.set_cursor_position(Position::new(inner.x + cc, inner.y + cr));
         }
         if let Some(c) = self.approvals.front() {
-            c.render(f, card, t);
+            c.render(f, card, t, &self.keymap);
         } else if let Some(a) = self.asks.front() {
-            a.render(f, card, t);
+            a.render(f, card, t, &self.keymap);
         }
         f.render_widget(Paragraph::new(status_lines), status);
 
         let t = &self.theme;
+        if let Some(p) = self.overlay.as_mut().and_then(Overlay::picker_mut) {
+            p.render(f, dialog::centered(main, 70, 70, 20), t, &self.keymap);
+        }
         match &mut self.overlay {
-            Some(
-                Overlay::Models(p)
-                | Overlay::Sessions(p)
-                | Overlay::Thinking(p)
-                | Overlay::Branch(_, p)
-                | Overlay::RewindMode(_, p)
-                | Overlay::LoginPick(p)
-                | Overlay::CommandPick(_, p)
-                | Overlay::LoginMethod(_, p),
-            ) => p.render(f, dialog::centered(main, 70, 70, 20), t, &self.keymap),
             Some(Overlay::Login(v)) => {
                 let w = (main.width * 80 / 100).max(20);
                 v.render(
@@ -2501,7 +2494,7 @@ impl App {
                 )
             }
             Some(Overlay::Pager(p)) => p.render(f, dialog::centered(main, 90, 90, main.height), t),
-            Some(Overlay::Btw(c)) => c.render(f, dialog::centered(main, 80, 80, main.height), t),
+            Some(Overlay::Btw(c)) => c.render(f, dialog::centered(main, 80, 80, main.height), t, &self.keymap),
             Some(Overlay::Procs(p)) => p.render(
                 f,
                 dialog::centered(main, 90, 90, main.height),
@@ -2509,7 +2502,8 @@ impl App {
                 self.panel.nerd,
                 t,
             ),
-            None => {}
+            // Pickers are drawn above.
+            _ => {}
         }
         if self.sheet {
             crate::shortcuts::render(f, main, &self.keymap, t);
@@ -2720,12 +2714,12 @@ impl App {
         if let Some(s) = self.task_started {
             v.insert(
                 "turn_time".into(),
-                Value_::text(crate::panel::secs_pub(s.elapsed()), t.dim),
+                Value_::text(crate::panel::secs(clock::since(s)), t.dim),
             );
         }
         v.insert(
             "session_time".into(),
-            Value_::text(crate::panel::secs_pub(self.started.elapsed()), t.dim),
+            Value_::text(crate::panel::secs(clock::since(self.started)), t.dim),
         );
         if !self.pending.is_empty() {
             v.insert(
@@ -2795,20 +2789,21 @@ impl App {
             // G1: how long it has run, what it has cost so far, and how to stop it.
             let mut info = Vec::new();
             if let Some(s) = self.task_started {
-                info.push(crate::panel::secs_pub(s.elapsed()));
+                info.push(crate::panel::secs(clock::since(s)));
             }
             if let Some((done, live)) = self.task_tokens {
                 info.push(format!("{} tokens", crate::panel::tokens(done + live)));
             }
-            let key = self.keymap.keys(A::Interrupt);
-            info.push(format!("{} interrupt", if key == "escape" { "esc" } else { &key }));
+            info.push(String::new());
             left.push(Span::styled(format!(" · {}", info.join(" · ")), t.dim));
+            let stop = [(self.keymap.keys(A::Interrupt), "interrupt")];
+            left.extend(crate::hints::hints(&stop, usize::MAX, t).spans);
         } else {
             left.push(Span::styled(" ● ", t.dim));
             left.push(Span::styled("ready", t.dim));
         }
         if let Some((msg, at)) = &self.flash {
-            if at.elapsed() < Duration::from_secs(3) {
+            if clock::since(*at) < Duration::from_secs(3) {
                 left.push(Span::styled(format!("  {msg}"), t.warn));
             } else {
                 self.flash = None;
@@ -2882,6 +2877,14 @@ fn browse(cwd: &str, q: &str) -> Option<Vec<(String, String, String)>> {
             })
             .collect(),
     )
+}
+
+/// `text` in `warn`, then key hints in the room left on the line.
+fn with_hints(text: String, keys: &[(&str, &str)], w: usize, t: &Theme) -> Line<'static> {
+    let mut line = wrap::truncate(vec![Span::styled(text, t.warn)], w);
+    let room = w.saturating_sub(line.width());
+    line.spans.extend(crate::hints::hints(keys, room, t).spans);
+    line
 }
 
 /// The text between two screen cells, row by row like a terminal selection.

@@ -54,8 +54,6 @@ pub struct AskForm {
     edited: BTreeSet<(usize, usize)>,
     /// The key that opens the editor, for the keys line (empty = not shown).
     pub edit_key: String,
-    /// The key that sends typed text, for the keys line.
-    pub submit_key: String,
     /// Where the form was last drawn, and which screen rows hold which choice.
     area: Cell<Rect>,
     choice_rows: RefCell<Vec<(u16, usize)>>,
@@ -94,7 +92,6 @@ impl AskForm {
             width: Cell::new(40),
             edited: BTreeSet::new(),
             edit_key: String::new(),
-            submit_key: "enter".into(),
             area: Cell::new(Rect::default()),
             choice_rows: RefCell::new(Vec::new()),
             clicks: Default::default(),
@@ -339,11 +336,18 @@ impl AskForm {
     /// `spaced`: a blank line between the parts, dropped when the screen is short.
     /// Also gives the open input's cursor (row, column).
     fn lines(&self, w: usize, t: &Theme, spaced: bool) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
-        let (lines, cursor, _) = self.content(w, t, spaced);
+        let (lines, cursor, _) = self.content(w, t, spaced, "enter");
         (lines, cursor)
     }
 
-    fn content(&self, w: usize, t: &Theme, spaced: bool) -> (Vec<Line<'static>>, Option<(usize, usize)>, Sections) {
+    /// `submit`: the key that sends typed text, for the keys line.
+    fn content(
+        &self,
+        w: usize,
+        t: &Theme,
+        spaced: bool,
+        submit: &str,
+    ) -> (Vec<Line<'static>>, Option<(usize, usize)>, Sections) {
         let mut sections = Sections::default();
         let q = self.cur();
         let mut out = Vec::new();
@@ -392,9 +396,9 @@ impl AskForm {
             let focused = i == sel && !self.typing && !self.noting;
             let mark = if q.multi {
                 if self.picked[self.q].contains(&i) {
-                    "[x] "
+                    "✓ "
                 } else {
-                    "[ ] "
+                    "○ "
                 }
             } else {
                 ""
@@ -412,7 +416,7 @@ impl AskForm {
                 spans.push(Span::raw("  "));
                 spans.extend(crate::hints::hints(&[("n", "note")], usize::MAX, t).spans);
             }
-            let indent = [Span::raw(" ".repeat(6 + mark.len()))];
+            let indent = [Span::raw(" ".repeat(6 + mark.chars().count()))];
             out.extend(wrap::wrap(spans, w, &[], &indent));
             if let Some(d) = o.description.as_deref().filter(|d| !d.trim().is_empty()) {
                 out.extend(wrap::wrap(
@@ -469,20 +473,16 @@ impl AskForm {
         }
         let has_preview = q.options.get(sel).is_some_and(|o| o.preview.is_some());
         // Only keys that work now, most important first: a narrow form drops from the end.
-        let sub = self.submit_key.as_str();
+        // The main key, then esc, so a narrow form always shows how to leave.
         let mut keys: Vec<(String, &str)> = Vec::new();
         let mut add = |k: &str, a: &'static str| keys.push((k.to_string(), a));
         if self.typing {
-            add(sub, "answer");
+            add(submit, "answer");
             add("esc", "back");
         } else if self.noting {
-            add(sub, if q.multi { "pick with note" } else { "choose with note" });
+            add(submit, if q.multi { "pick with note" } else { "choose with note" });
             add("esc", "back");
         } else {
-            add("↑↓", "move");
-            if q.multi && !on_text {
-                add("space", "pick");
-            }
             add(
                 "enter",
                 match (on_text, q.multi) {
@@ -492,6 +492,10 @@ impl AskForm {
                 },
             );
             add("esc", "dismiss");
+            add("↑↓", "move");
+            if q.multi && !on_text {
+                add("space", "pick");
+            }
             if self.q > 0 {
                 add("←", "back");
             }
@@ -507,7 +511,6 @@ impl AskForm {
             };
             keys.insert(2.min(keys.len()), (self.edit_key.clone(), what));
         }
-        keys.retain(|(k, _)| !k.is_empty());
         sections.help_start = out.len();
         out.push(crate::hints::hints(&keys, w, t));
         (out, cursor, sections)
@@ -520,7 +523,8 @@ impl AskForm {
             + 2
     }
 
-    pub fn render(&self, f: &mut Frame, area: Rect, t: &Theme) {
+    pub fn render(&self, f: &mut Frame, area: Rect, t: &Theme, km: &crate::keys::Keymap) {
+        let submit = km.keys(A::Submit);
         let n = self.req.questions.len();
         let mut title = "Question".to_string();
         if n > 1 {
@@ -533,9 +537,9 @@ impl AskForm {
         self.area.set(area);
         let w = inner.width as usize;
         let h = inner.height as usize;
-        let mut content = self.content(w, t, true);
+        let mut content = self.content(w, t, true, &submit);
         if content.0.len() > h {
-            content = self.content(w, t, false);
+            content = self.content(w, t, false, &submit);
         }
         let (mut lines, mut cursor, sections) = content;
         // The choice a content row belongs to, for clicks.
@@ -572,16 +576,17 @@ impl AskForm {
             let top = self.context_scroll.get().min(max);
             self.context_scroll.set(top);
             let mut shown: Vec<_> = lines.into_iter().skip(top).take(context_h).collect();
-            shown.push(Line::styled(
-                format!(
-                    "PgUp/PgDn context{} · {}–{} / {}",
-                    if overflow { "/choice" } else { "" },
-                    top + 1,
-                    top + context_h,
-                    max + context_h
-                ),
+            // Where the view is, then its key (PgUp/PgDn are matched as raw keys).
+            let mut scroll = Line::styled(
+                format!("{}–{} / {} · ", top + 1, top + context_h, max + context_h),
                 t.dim,
-            ));
+            );
+            let what = if overflow { "context/choice" } else { "context" };
+            let room = w.saturating_sub(scroll.width());
+            scroll
+                .spans
+                .extend(crate::hints::hints(&[("pgup/pgdn", what)], room, t).spans);
+            shown.push(scroll);
             let target = cursor.map_or(
                 choice_end.saturating_sub(1).min(focus + control_h.saturating_sub(1)),
                 |(r, _)| r - sections.context_end,
@@ -688,7 +693,7 @@ mod tests {
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         term.draw(|fr| {
             let area = Rect::new(0, 0, width, f.height(width).min(height * 2 / 3));
-            f.render(fr, area, &Theme::default());
+            f.render(fr, area, &Theme::default(), &Default::default());
         })
         .unwrap();
         let b = term.backend().buffer();
@@ -709,7 +714,7 @@ mod tests {
                 "3. Wait",
                 "Type something",
                 "esc dismiss",
-                "PgUp/PgDn",
+                "pgup/pgdn",
             ] {
                 assert!(initial.contains(control), "missing {control}: {initial}");
             }
@@ -848,7 +853,7 @@ mod tests {
             screen(&f, width, 24);
             hit(&mut f, KeyCode::Down);
             hit(&mut f, KeyCode::Down);
-            let (lines, _, sections) = f.content(width as usize - 4, &Theme::default(), false);
+            let (lines, _, sections) = f.content(width as usize - 4, &Theme::default(), false, "enter");
             let expected = &lines[sections.choices[2]..sections.choices[3]];
             let mut seen = screen(&f, width, 24);
             assert!(seen.contains("context/choice"), "{seen}");
@@ -1008,7 +1013,8 @@ mod tests {
         });
         let draw = |h: u16| {
             let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, h)).unwrap();
-            term.draw(|fr| f.render(fr, fr.area(), &Theme::default())).unwrap();
+            term.draw(|fr| f.render(fr, fr.area(), &Theme::default(), &Default::default()))
+                .unwrap();
             let b = term.backend().buffer().clone();
             (0..h)
                 .map(|y| {

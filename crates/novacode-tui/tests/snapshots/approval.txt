@@ -5,7 +5,7 @@
 │ bash                                                     │
 │ │ rm -rf target                                          │
 │ rm -r deletes files                                      │
-│ y once · a this session · n deny                         │
+│ y once · n deny · a this session                         │
 │                                                          │
 ╰──────────────────────────────────────────────────────────╯
 ╭──────────────────────────────────────────────────────────╮

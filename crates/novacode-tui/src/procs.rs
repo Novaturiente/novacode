@@ -181,7 +181,7 @@ pub fn output_lines(p: &ProcView, w: usize, t: &Theme) -> Vec<Line<'static>> {
 /// Header rows: status line, command, rule.
 pub fn header(p: &ProcView, i: usize, n: usize, w: usize, nerd: bool, t: &Theme) -> Vec<Line<'static>> {
     let (g, gs) = crate::panel::status_glyph(&p.status, nerd, t);
-    let elapsed = crate::panel::now_ms().saturating_sub(p.started_ms);
+    let elapsed = crate::clock::now_ms().saturating_sub(p.started_ms);
     let right = format!("‹ {}/{n} ›", i + 1);
     let mut left = vec![
         Span::styled(format!(" {g} "), gs),
@@ -227,12 +227,7 @@ impl ProcPopup {
 
     /// A wheel step: `up` shows older output (the draw stops it at the top).
     pub fn wheel(&mut self, up: bool) {
-        let w = crate::dialog::WHEEL;
-        self.scroll = if up {
-            self.scroll.saturating_add(w)
-        } else {
-            self.scroll.saturating_sub(w)
-        };
+        self.scroll = crate::dialog::wheel_from_bottom(self.scroll, up);
     }
 
     /// A key; true = close.

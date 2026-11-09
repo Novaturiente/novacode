@@ -3,6 +3,7 @@
 //! [`AgentEvent`]s every window sees, so an attached window or the tmux panel pane
 //! (L9.18) shows the same thing as the session's own window.
 
+use crate::clock;
 use crate::theme::Theme;
 use novacode_types::ui::{Line as ULine, Node, UiOp};
 use novacode_types::{AgentEvent, Message, StopReason, Usage};
@@ -12,7 +13,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// Hide the panel this long after everything finished (unless pinned).
 const HIDE_AFTER: Duration = Duration::from_secs(5);
@@ -120,6 +121,8 @@ pub struct Tab {
     pub sources: Vec<Source>,
     /// A region tab: lines the extension paints.
     pub region: Option<Vec<ULine>>,
+    /// A built-in stats tab (Usage, Timing): no row actions, so ↑↓ scroll it.
+    pub stats: bool,
 }
 
 impl Tab {
@@ -132,6 +135,7 @@ impl Tab {
             owner: None,
             sources: Vec::new(),
             region: None,
+            stats: false,
         }
     }
 
@@ -242,12 +246,7 @@ struct Task {
     wall: Duration,
 }
 
-pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
+use crate::clock::now_ms;
 
 /// Node ids of Needs you rows start with this.
 const NEED: &str = "need:";
@@ -268,11 +267,7 @@ fn node(id: &str, label: impl Into<String>) -> Node {
     }
 }
 
-pub fn secs_pub(d: Duration) -> String {
-    secs(d)
-}
-
-fn secs(d: Duration) -> String {
+pub fn secs(d: Duration) -> String {
     let s = d.as_secs_f64();
     if s >= 60.0 {
         format!("{}m{:02}s", s as u64 / 60, s as u64 % 60)
@@ -299,8 +294,14 @@ impl Default for Panel {
                 agent,
                 Tab::new("tasks", "Tasks", 25),
                 Tab::new("processes", "Processes", 15),
-                Tab::new("usage", "Usage stats", 5),
-                Tab::new("timing", "Timing", 4),
+                Tab {
+                    stats: true,
+                    ..Tab::new("usage", "Usage stats", 5)
+                },
+                Tab {
+                    stats: true,
+                    ..Tab::new("timing", "Timing", 4)
+                },
                 Tab::new("files", "Files", 3),
             ],
             shown: Some("agent".into()),
@@ -726,7 +727,7 @@ impl Panel {
 
     /// Feed the built-in tabs.
     pub fn on_agent(&mut self, ev: &AgentEvent, window_tokens: u64, price: Option<&novacode_types::Cost>) {
-        let now = Instant::now();
+        let now = clock::now();
         if matches!(ev, AgentEvent::AgentStart) {
             self.run += 1;
         }
@@ -1008,8 +1009,8 @@ impl Panel {
             self.idle_since = None;
             self.visible = true;
         } else if self.visible {
-            let since = *self.idle_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= HIDE_AFTER && !focused {
+            let since = *self.idle_since.get_or_insert_with(clock::now);
+            if clock::since(since) >= HIDE_AFTER && !focused {
                 self.visible = false;
             }
         }
@@ -1145,9 +1146,8 @@ impl Panel {
     /// A row tab: a selection is drawn and ↑↓ move it. Usage and Timing (stats
     /// without row actions) and region tabs scroll instead.
     fn interactive(&self) -> bool {
-        self.current().is_some_and(|t| {
-            t.region.is_none() && !(t.owner.is_none() && matches!(t.name.as_str(), "usage" | "timing"))
-        })
+        self.current()
+            .is_some_and(|t| t.region.is_none() && !(t.owner.is_none() && t.stats))
     }
 
     /// A key while focused. `None` = not handled here.
@@ -2107,7 +2107,7 @@ mod tests {
             None,
         );
         p.tick(false);
-        p.idle_since = Some(Instant::now() - HIDE_AFTER);
+        p.idle_since = Some(clock::now() - HIDE_AFTER);
         p.tick(false);
         assert!(!p.visible, "closes once every todo is done");
         p.apply("x", &op(json!({"op": "close_tab", "name": "deploy"})));
