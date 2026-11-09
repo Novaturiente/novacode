@@ -117,7 +117,9 @@ fn calls(entries: &[&Entry]) -> Vec<Call> {
     let mut pending: BTreeMap<String, Value> = BTreeMap::new();
     let mut out = vec![];
     for e in entries {
-        let EntryKind::Message { message } = &e.kind else { continue };
+        let EntryKind::Message { message } = &e.kind else {
+            continue;
+        };
         match message {
             Message::Assistant(a) => {
                 for c in a.tool_calls() {
@@ -154,7 +156,8 @@ fn calls(entries: &[&Entry]) -> Vec<Call> {
 fn is_var(k: &str) -> bool {
     k.len() > 1
         && k.starts_with(|c: char| c.is_ascii_uppercase())
-        && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && k.chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// A command's leading program words (`python -m pytest`, `npx tsc`, `cargo test`) and the
@@ -162,11 +165,20 @@ fn is_var(k: &str) -> bool {
 fn head(cmd: &str) -> (String, Vec<String>) {
     let mut vars = vec![];
     let mut first: Option<String> = None;
-    for seg in cmd.split(['&', ';', '|', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
+    for seg in cmd
+        .split(['&', ';', '|', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         let mut words = seg.split_whitespace();
         match words.clone().next() {
             Some("export") => {
-                vars.extend(words.skip(1).filter_map(|w| w.split_once('=')).map(|(k, _)| k.to_string()));
+                vars.extend(
+                    words
+                        .skip(1)
+                        .filter_map(|w| w.split_once('='))
+                        .map(|(k, _)| k.to_string()),
+                );
                 continue;
             }
             Some("cd" | "source" | "." | "set") => continue,
@@ -185,7 +197,10 @@ fn head(cmd: &str) -> (String, Vec<String>) {
                 continue;
             }
             let after_m = out.last() == Some(&"-m");
-            if !after_m && ((w.starts_with('-') && w != "-m") || w.contains(['/', '.', '=', '"', '\'', '$', '`', '(', '<', '>', '*'])) {
+            if !after_m
+                && ((w.starts_with('-') && w != "-m")
+                    || w.contains(['/', '.', '=', '"', '\'', '$', '`', '(', '<', '>', '*']))
+            {
                 break;
             }
             out.push(w);
@@ -206,8 +221,10 @@ fn head(cmd: &str) -> (String, Vec<String>) {
 static ABSENT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"([\w.+-]+): command not found|command not found: ([\w.+-]+)").unwrap());
 static ENV: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b([A-Z][A-Z0-9_]{2,})\b[^\n]{0,40}?\b(?:is not set|not set|is required|must be set|missing|undefined)")
-        .unwrap()
+    Regex::new(
+        r"\b([A-Z][A-Z0-9_]{2,})\b[^\n]{0,40}?\b(?:is not set|not set|is required|must be set|missing|undefined)",
+    )
+    .unwrap()
 });
 static MARK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^- (.*?)\s*<!-- note:(.+?) -->\s*$").unwrap());
 
@@ -265,13 +282,15 @@ pub fn scan(session: &str, cwd: &Path, entries: &[&Entry]) -> Evidence {
                     continue;
                 }
                 if let Some(p) = absent(&c.out) {
-                    ev.confirm.push((key(format!("absent:{p}")), format!("`{p}` is not installed here.")));
+                    ev.confirm
+                        .push((key(format!("absent:{p}")), format!("`{p}` is not installed here.")));
                     explained = true;
                 }
                 if let Some(var) = ENV.captures(&c.out).map(|m| m[1].to_string())
                     && later().any(|b| b.tool == "bash" && b.ok && head(&cmd_of(b)).1.contains(&var))
                 {
-                    ev.confirm.push((key(format!("env:{var}")), format!("`{h}` needs `{var}` set.")));
+                    ev.confirm
+                        .push((key(format!("env:{var}")), format!("`{h}` needs `{var}` set.")));
                     explained = true;
                 }
                 // The fix wraps the failing words in order (`pytest` -> `python -m pytest`).
@@ -284,7 +303,8 @@ pub fn scan(session: &str, cwd: &Path, entries: &[&Entry]) -> Evidence {
                     .map(|b| head(&cmd_of(b)).0)
                     .find(|b| *b != h && wraps(b))
                 {
-                    ev.confirm.push((key(format!("form:{h}")), format!("`{h}` fails here; `{fix}` works.")));
+                    ev.confirm
+                        .push((key(format!("form:{h}")), format!("`{h}` fails here; `{fix}` works.")));
                     explained = true;
                 }
             }
@@ -310,14 +330,20 @@ pub fn scan(session: &str, cwd: &Path, entries: &[&Entry]) -> Evidence {
                     .find(|q| *q != p && Path::new(q).file_name().map(|n| n.to_os_string()) == name)
                     && let (Some(p), Some(q)) = (rel(&p), rel(&q))
                 {
-                    ev.confirm.push((key(format!("path:{p}")), format!("`{p}` does not exist; the file is `{q}`.")));
+                    ev.confirm.push((
+                        key(format!("path:{p}")),
+                        format!("`{p}` does not exist; the file is `{q}`."),
+                    ));
                     explained = true;
                 }
             }
             (tool, false) if c.out.starts_with("invalid arguments") && later().any(|b| b.tool == tool && b.ok) => {
                 // The error's kind, not the model's quoted input.
                 let first = c.out.lines().next().unwrap_or_default();
-                let e = short(first.split('"').next().unwrap_or(first).trim_end_matches([' ', ':']), 80);
+                let e = short(
+                    first.split('"').next().unwrap_or(first).trim_end_matches([' ', ':']),
+                    80,
+                );
                 ev.confirm.push((
                     key(format!("args:{tool}:{e}")),
                     format!("`{tool}` calls often fail with `{e}`: check its parameters."),
@@ -438,11 +464,7 @@ impl State {
 
     /// The model step: reword notes and propose new ones from recent failures.
     pub async fn word(&mut self, w: &Worker) -> Result<Usage, String> {
-        let mut known: Vec<(&String, &Note)> = self
-            .notes
-            .iter()
-            .filter(|(_, n)| !n.rejected && !n.user)
-            .collect();
+        let mut known: Vec<(&String, &Note)> = self.notes.iter().filter(|(_, n)| !n.rejected && !n.user).collect();
         known.sort_by_key(|(_, n)| std::cmp::Reverse(n.seen.len()));
         known.truncate(40);
         let mut body = String::from("Notes (key | sessions | text):\n");
@@ -464,8 +486,12 @@ impl State {
             tail: Vec::new(),
             model: w.model.clone(),
             messages: vec![
-                Message::System { text: WORDER_PROMPT.into() },
-                Message::User { content: vec![Block::text(body)] },
+                Message::System {
+                    text: WORDER_PROMPT.into(),
+                },
+                Message::User {
+                    content: vec![Block::text(body)],
+                },
             ],
             tools: vec![write_tool()],
             max_tokens: 4096,
@@ -606,7 +632,11 @@ fn read_sessions(st: &mut State, home: &Path, root: &Path, current: &str) -> usi
         let subagent = branch.iter().find_map(|e| match &e.kind {
             EntryKind::Message {
                 message: Message::User { content },
-            } => Some(content.iter().any(|b| matches!(b, Block::Text { text, .. } if text.starts_with(SUBAGENT_TASK_PREFIX)))),
+            } => Some(
+                content
+                    .iter()
+                    .any(|b| matches!(b, Block::Text { text, .. } if text.starts_with(SUBAGENT_TASK_PREFIX))),
+            ),
             _ => None,
         });
         if s.header.cwd.starts_with(root) && subagent == Some(false) {
@@ -639,7 +669,8 @@ pub async fn learn(home: PathBuf, cwd: PathBuf, current: String, worker: Option<
     })
     .await
     .map_err(|e| e.to_string())?;
-    if let Some(w) = worker.filter(|_| st.unworded >= MODEL_EVERY && (!st.failures.is_empty() || !st.notes.is_empty())) {
+    if let Some(w) = worker.filter(|_| st.unworded >= MODEL_EVERY && (!st.failures.is_empty() || !st.notes.is_empty()))
+    {
         // A failed model step leaves the rule wording; it runs again after the next session.
         let _ = st.word(&w).await;
     }
@@ -669,7 +700,9 @@ pub fn section(cwd: &Path) -> Option<String> {
     );
     let start = s.len();
     for l in t.lines().filter(|l| l.starts_with("- ")) {
-        let l = MARK.captures(l).map_or(l[2..].trim().to_string(), |c| c[1].trim().to_string());
+        let l = MARK
+            .captures(l)
+            .map_or(l[2..].trim().to_string(), |c| c[1].trim().to_string());
         if s.len() + l.len() + 3 > MAX_CHARS {
             break;
         }
@@ -697,7 +730,12 @@ mod tests {
                 kind: EntryKind::Message { message },
             });
         };
-        push(Message::User { content: vec![Block::text("fix it")] }, &mut out);
+        push(
+            Message::User {
+                content: vec![Block::text("fix it")],
+            },
+            &mut out,
+        );
         for (i, (tool, args, ok, text)) in calls.iter().enumerate() {
             let call_id = format!("c{i}");
             push(
@@ -755,12 +793,32 @@ mod tests {
     fn rules_pair_each_failure_with_its_fix() {
         let cwd = Path::new("/r");
         let e = entries(&[
-            ("bash", bash("pytest tests/a.py"), false, "bash: pytest: command not found\n[exit code 127]"),
+            (
+                "bash",
+                bash("pytest tests/a.py"),
+                false,
+                "bash: pytest: command not found\n[exit code 127]",
+            ),
             ("bash", bash("python -m pytest tests/a.py"), true, "1 passed"),
-            ("bash", bash("npm run migrate"), false, "Error: DATABASE_URL is not set\n[exit code 1]"),
+            (
+                "bash",
+                bash("npm run migrate"),
+                false,
+                "Error: DATABASE_URL is not set\n[exit code 1]",
+            ),
             ("bash", bash("DATABASE_URL=x npm run migrate"), true, "ok"),
-            ("edit", json!({"path": "/r/src/a.rs"}), false, "old_text not found (read the file again)"),
-            ("read", json!({"path": "/r/src/lib/b.rs"}), false, "/r/src/lib/b.rs does not exist"),
+            (
+                "edit",
+                json!({"path": "/r/src/a.rs"}),
+                false,
+                "old_text not found (read the file again)",
+            ),
+            (
+                "read",
+                json!({"path": "/r/src/lib/b.rs"}),
+                false,
+                "/r/src/lib/b.rs does not exist",
+            ),
             ("read", json!({"path": "/r/src/b.rs"}), true, "fn b() {}"),
             ("grep", json!({}), false, "invalid arguments: missing field `pattern`"),
             ("grep", json!({"pattern": "x"}), true, "a.rs:1"),
@@ -794,7 +852,12 @@ mod tests {
         ]);
         assert!(scan("s", cwd, &e.iter().collect::<Vec<_>>()).confirm.is_empty());
         // A main-checkout session editing a worktree's file names it as the repo does.
-        let e = entries(&[("edit", json!({"path": "/r/.worktrees/t1/src/a.rs"}), false, "old_text not found")]);
+        let e = entries(&[(
+            "edit",
+            json!({"path": "/r/.worktrees/t1/src/a.rs"}),
+            false,
+            "old_text not found",
+        )]);
         assert_eq!(keys(&scan("s", cwd, &e.iter().collect::<Vec<_>>())), ["edit:src/a.rs"]);
     }
 
@@ -819,7 +882,10 @@ mod tests {
         assert!(st.notes["form:a"].active(), "one contradiction is not enough");
         st.fold("s5", ev(&[], &["form:a", "form:unknown"]));
         assert!(!st.notes["form:a"].active(), "retired");
-        assert!(!st.notes.contains_key("form:unknown"), "contradictions never create notes");
+        assert!(
+            !st.notes.contains_key("form:unknown"),
+            "contradictions never create notes"
+        );
         st.fold("s6", ev(&["form:a"], &[]));
         assert!(st.notes["form:a"].active(), "confirmed again");
     }
@@ -831,7 +897,10 @@ mod tests {
             st.fold(s, ev(&["form:a", "form:b"], &[]));
         }
         let (text, keys) = st.render();
-        assert!(text.starts_with("# Repo notes") && text.contains("- about form:a <!-- note:form:a -->"), "{text}");
+        assert!(
+            text.starts_with("# Repo notes") && text.contains("- about form:a <!-- note:form:a -->"),
+            "{text}"
+        );
         st.rendered = keys;
         let edited = text
             .lines()
@@ -868,7 +937,12 @@ mod tests {
         }));
         assert_eq!(st.notes["form:a"].text, "about form:a", "the user's wording stays");
         assert_eq!(st.notes["form:c"].text, "Run `c` first.");
-        let m: Vec<&Note> = st.notes.iter().filter(|(k, _)| k.starts_with("model:")).map(|(_, n)| n).collect();
+        let m: Vec<&Note> = st
+            .notes
+            .iter()
+            .filter(|(k, _)| k.starts_with("model:"))
+            .map(|(_, n)| n)
+            .collect();
         assert_eq!(m.len(), 1);
         assert!(m[0].active(), "three cited sessions");
     }
@@ -888,7 +962,9 @@ mod tests {
             ]);
             if subagent {
                 e[0].kind = EntryKind::Message {
-                    message: Message::User { content: vec![Block::text(format!("{SUBAGENT_TASK_PREFIX}x"))] },
+                    message: Message::User {
+                        content: vec![Block::text(format!("{SUBAGENT_TASK_PREFIX}x"))],
+                    },
                 };
             }
             let h = crate::session::Header {
@@ -918,8 +994,15 @@ mod tests {
         let file = std::fs::read_to_string(notes_path(&repo)).unwrap();
         assert!(file.contains("`tsc --noEmit`") || file.contains("`tsc`"), "{file}");
         let s = section(&repo).unwrap();
-        assert!(s.contains("\n- `tsc` is not installed here.") && !s.contains("<!--"), "{s}");
-        assert_eq!(learn(home.clone(), repo.clone(), "now".into(), None).await.unwrap(), 0, "nothing new");
+        assert!(
+            s.contains("\n- `tsc` is not installed here.") && !s.contains("<!--"),
+            "{s}"
+        );
+        assert_eq!(
+            learn(home.clone(), repo.clone(), "now".into(), None).await.unwrap(),
+            0,
+            "nothing new"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

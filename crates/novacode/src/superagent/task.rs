@@ -791,7 +791,10 @@ impl Super {
             "read" => self.read(&t, a.offset.unwrap_or(0), a.limit.unwrap_or(200)),
             "send" if a.question => self.ask(&t, a.message.as_deref().ok_or("`message` is missing")?).await,
             "send" if landed_done(&t) => Err(landed_refusal(&t)),
-            "send" => self.send(&t, a.message.as_deref().ok_or("`message` is missing")?, a.proof).await,
+            "send" => {
+                self.send(&t, a.message.as_deref().ok_or("`message` is missing")?, a.proof)
+                    .await
+            }
             "stop" => self.stop(&t).await,
             "close" => self.close(&t).await,
             "merge" => self.merge(&t, a.pr, false, false).await,
@@ -2793,7 +2796,10 @@ with the reason.",
         Some(match out {
             Ok(out) if out.contains("merge: failed") => format!("{}'s auto-merge failed: {out}", t.label),
             Ok(out) => format!("{} merges without a card (super.autoMerge): {out}", t.label),
-            Err(e) => format!("{}'s auto-merge was refused: {e}. Call `task merge` when the cause is fixed.", t.label),
+            Err(e) => format!(
+                "{}'s auto-merge was refused: {e}. Call `task merge` when the cause is fixed.",
+                t.label
+            ),
         })
     }
 
@@ -3649,7 +3655,7 @@ pub(super) mod tests {
                 tool_guidelines: vec![],
                 agent: None,
                 memory_index: None,
-            repo_notes: None,
+                repo_notes: None,
                 mode: None,
             },
             warm: false,
@@ -5018,8 +5024,14 @@ pub(super) mod tests {
         assert!(t.state == State::Merging && !t.asking);
         assert!(fx.asker.asked.lock().unwrap().is_empty(), "no merge card");
         let text = fx.launcher.prompts("s1").last().unwrap().clone();
-        assert!(text.contains("super.autoMerge is on") && !text.contains("The user approved"), "{text}");
-        assert!(fx.sup.auto_merge_due().is_empty(), "T4 waits while app's merge lock is held");
+        assert!(
+            text.contains("super.autoMerge is on") && !text.contains("The user approved"),
+            "{text}"
+        );
+        assert!(
+            fx.sup.auto_merge_due().is_empty(),
+            "T4 waits while app's merge lock is held"
+        );
         // A repo whose project file describes a deploy keeps its deploy card.
         let fx = fixture_cfg(&[], |home| Config {
             auto_merge: true,
@@ -5073,9 +5085,12 @@ pub(super) mod tests {
             .await
             .unwrap_err();
         assert!(e.contains("spawn a new task"), "scope too, before any card: {e}");
-        run(&fx, json!({"action": "send", "task": "T1-m", "message": "which?", "question": true}))
-            .await
-            .unwrap();
+        run(
+            &fx,
+            json!({"action": "send", "task": "T1-m", "message": "which?", "question": true}),
+        )
+        .await
+        .unwrap();
     }
 
     /// L10.9: `task merge` with `pr` reuses an open PR whose head is the task's commit.
@@ -5398,7 +5413,10 @@ pub(super) mod tests {
         let text = fx.launcher.prompts("s1").last().unwrap().clone();
         assert!(!text.contains("moved since"), "{text}");
         // Fast mode: an unmoved base re-runs nothing.
-        assert!(text.contains("don't re-run checks") && !text.contains("re-run your"), "{text}");
+        assert!(
+            text.contains("don't re-run checks") && !text.contains("re-run your"),
+            "{text}"
+        );
         assert!(text.contains("no fetch is needed"), "{text}");
         // The base gets a new commit after T2 started.
         run(&fx, spawn_args("app", "b", true)).await.unwrap();
