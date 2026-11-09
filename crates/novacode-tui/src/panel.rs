@@ -1346,16 +1346,18 @@ impl Panel {
                     .map(|t| cells(t).min(TAG_MAX))
                     .max()
                     .unwrap_or(0);
-                // The selected row's lines become one full-width bar; dim when unfocused.
-                let bar = |l: Line<'static>| {
-                    let mut sp = l.spans;
-                    sp.push(Span::raw(" ".repeat(w.saturating_sub(crate::wrap::width(&sp)))));
-                    let sp = sp.into_iter().map(|s| {
-                        let st = if focused { s.style } else { s.style.patch(theme.dim) };
-                        let st = st.patch(theme.selection);
-                        s.style(st)
-                    });
-                    Line::from(sp.collect::<Vec<_>>())
+                // Rows sit one cell in: the selected row's lines carry a rail there,
+                // accent while the panel has focus, border grey when it hasn't.
+                let rw = w.saturating_sub(1);
+                let rail = |l: Line<'static>, on: bool| {
+                    let r = match (on, focused) {
+                        (false, _) => Span::raw(" "),
+                        (true, true) => Span::styled("▎", theme.accent),
+                        (true, false) => Span::styled("▎", theme.border),
+                    };
+                    let mut sp = vec![r];
+                    sp.extend(l.spans);
+                    Line::from(sp)
                 };
                 let mut out = Vec::new();
                 let mut owner: Vec<Option<usize>> = Vec::new();
@@ -1399,7 +1401,10 @@ impl Panel {
                     }
                     let (g, gs) = glyph(n.icon.as_deref(), n.status.as_deref(), nerd, theme);
                     let todo = n.icon.as_deref().is_some_and(|i| i.starts_with("todo:"));
-                    let label_style = if n.dim && todo {
+                    let selected = interactive && i == sel;
+                    let label_style = if selected && focused {
+                        theme.accent.add_modifier(Modifier::BOLD)
+                    } else if n.dim && todo {
                         theme.dim.add_modifier(Modifier::CROSSED_OUT)
                     } else if n.dim {
                         theme.text
@@ -1412,7 +1417,7 @@ impl Panel {
                     let icon = format!("{g}{}", " ".repeat(2usize.saturating_sub(cells(&g)).max(1)));
                     let fixed = cells(&r.guide) + cells(&icon);
                     let right = age_col.map_or(0, |a| AGE_GAP + a);
-                    let room = w.saturating_sub(fixed + right);
+                    let room = rw.saturating_sub(fixed + right);
                     let tag_w = tag_col.min(room.saturating_sub(TITLE_MIN + 1));
                     let tag = match n.tag.clone() {
                         Some(t) if tag_w > 0 => crate::wrap::truncate(vec![Span::styled(t, theme.dim)], tag_w).spans,
@@ -1431,13 +1436,12 @@ impl Panel {
                         sp.push(Span::raw(" ".repeat(AGE_GAP + a - cells(&t))));
                         sp.push(Span::styled(t, st));
                     }
-                    let selected = interactive && i == sel;
-                    let line = crate::wrap::truncate(sp, w);
+                    let line = crate::wrap::truncate(sp, rw);
                     if selected {
                         sel_line = out.len();
                     }
                     owner.resize(out.len(), None);
-                    out.push(if selected { bar(line) } else { line });
+                    out.push(rail(line, selected));
                     owner.push(Some(i));
                     // Details hang under the label; the guide keeps going to the children.
                     let has_kids = rows
@@ -1454,8 +1458,8 @@ impl Panel {
                             v.push(Span::styled(if nerd { "\u{f0da} " } else { "▸ " }, theme.warn));
                         }
                         v.push(Span::styled(d.clone(), theme.dim));
-                        for l in detail_lines(v, w, &lead) {
-                            out.push(if selected { bar(l) } else { l });
+                        for l in detail_lines(v, rw, &lead) {
+                            out.push(rail(l, selected));
                             owner.push(Some(i));
                         }
                     }
@@ -2030,11 +2034,11 @@ mod tests {
         let want = [
             "│  Tasks",
             "│ ━━━━━━━",
-            "│   ├─◐ T3-fix-parser              novacode  2h00m",
-            "│   │   running · sonnet-5-5 · 41.2k",
-            "│   │   › parser fixed; tests pass",
-            "│   └─⏸ T4-docs                        site  1h00m",
-            "│       blocked: quota · haiku-5-5 · 900",
+            "│ ▎  ├─◐ T3-fix-parser             novacode  2h00m",
+            "│ ▎  │   running · sonnet-5-5 · 41.2k",
+            "│ ▎  │   › parser fixed; tests pass",
+            "│    └─⏸ T4-docs                       site  1h00m",
+            "│        blocked: quota · haiku-5-5 · 900",
             "│",
             "│",
             "│  enter attach · ↑↓ move · esc back · ←→ tab",

@@ -16,7 +16,7 @@ Every screen in the terminal UI follows these rules: the transcript, the side pa
 - Detail lines sit under their main line, indented 2 cells.
 - Frames have 1 cell of padding on the left and right.
 - Panel rows use fixed columns: status icon (2 cells reserved), title (shrinks first), project tag (has a maximum width), age (right-aligned, at least a 2-cell gap before it).
-- The selected row is one full-width bar in the `selection` colour, including its detail lines.
+- The selected row is marked by a rail `▎` in the cell left of the row, on its main and detail lines, and its title turns `accent` bold. No background fill. Unfocused, the rail is `border` grey and the title keeps its normal style.
 
 ## Glyphs
 
@@ -44,7 +44,7 @@ Use the roles from `Theme` (`crates/novacode-tui/src/theme.rs`), never raw colou
 
 - `text`: main lines. `dim`: detail lines, hints, fold lines, unfocused selection.
 - `accent`: the focused frame, the list cursor, links to act on. `border`: unfocused frames.
-- `selection`: the selected-row bar. `matched`: the current search match.
+- `selection`: mouse text selection and picker highlights. `matched`: the current search match.
 - `ok`, `warn`, `error`: state only (done, running or caution, failed). `add`, `del`: diffs.
 - `heading`, `code`, `code_block`, `link`, `quote`, `thinking`, `user`, `toggle`: their content type.
 - Every screen must stay readable on a light background and with the 256-colour fallback.

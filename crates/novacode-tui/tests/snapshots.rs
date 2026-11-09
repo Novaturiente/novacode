@@ -285,12 +285,12 @@ fn panel_rows_keep_fixed_columns() {
     }
 }
 
-/// TP4: the selected row is one full-width bar in the `selection` colour, its detail
-/// line included; an unfocused panel keeps it, with dim text.
+/// The selected row carries an accent rail `▎` on its left edge, detail line included,
+/// and an accent title; no background fill. An unfocused panel keeps the rail in grey.
 #[test]
-fn panel_selection_is_a_full_width_bar_dim_when_unfocused() {
+fn panel_selection_is_an_accent_rail_grey_when_unfocused() {
     let t = novacode_tui::theme::Theme::default();
-    let (sel, dim) = (t.selection.bg.unwrap(), t.dim.fg.unwrap());
+    let (accent, border) = (t.accent.fg.unwrap(), t.border.fg.unwrap());
     let (mut a, _rx) = app(vec![]);
     board(&mut a);
     a.set_focus(Focus::Panel);
@@ -299,31 +299,28 @@ fn panel_selection_is_a_full_width_bar_dim_when_unfocused() {
     let x0 = 120 - a.panel.width(120) + 2;
     let y = row_of(&text(&buf), "T4-docs");
     for yy in [y, y + 1] {
-        for x in x0..120 {
-            assert_eq!(buf[(x, yy)].bg, sel, "bar cell ({x}, {yy})");
-        }
+        assert_eq!(buf[(x0, yy)].symbol(), "▎", "rail at ({x0}, {yy})");
+        assert_eq!(buf[(x0, yy)].fg, accent, "rail colour at ({x0}, {yy})");
     }
+    let tx = (x0..120).find(|&x| buf[(x, y)].symbol() == "T").unwrap();
+    assert_eq!(buf[(tx, y)].fg, accent, "the selected title is accent");
+    let sel = t.selection.bg.unwrap();
+    assert!((x0..120).all(|x| buf[(x, y)].bg != sel), "no background fill");
     let other = row_of(&text(&buf), "T5-api");
-    assert!((x0..120).all(|x| buf[(x, other)].bg != sel), "only the selected row");
-    // Focus back on the input: the bar stays, its text turns dim.
+    assert_eq!(buf[(x0, other)].symbol(), " ", "only the selected row");
+    // Focus back on the input: the rail stays, in border grey.
     key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!(a.focus(), Focus::Input);
     let buf = draw(&mut a, 120, 24);
     let y = row_of(&text(&buf), "T4-docs");
-    for x in x0..120 {
-        assert_eq!(buf[(x, y)].bg, sel, "unfocused bar cell ({x}, {y})");
-        if buf[(x, y)].symbol() != " " {
-            assert_eq!(buf[(x, y)].fg, dim, "unfocused text is dim at ({x}, {y})");
-        }
-    }
+    assert_eq!(buf[(x0, y)].symbol(), "▎");
+    assert_eq!(buf[(x0, y)].fg, border, "unfocused rail is grey");
 }
 
 /// TP4: ↑↓ move the selection on every row tab (also one without actions), ←→ switch
 /// tabs, 1–9 still jump but are not printed, and the footer has one format.
 #[test]
 fn panel_keys_are_the_same_on_every_tab() {
-    let t = novacode_tui::theme::Theme::default();
-    let sel = t.selection.bg.unwrap();
     let (mut a, _rx) = app(vec![]);
     a.on_agent(AgentEvent::AgentStart);
     a.on_agent(AgentEvent::ToolStart {
@@ -352,7 +349,7 @@ fn panel_keys_are_the_same_on_every_tab() {
     let selected = |a: &mut App, s: &str| {
         let buf = draw(a, 120, 24);
         let y = row_of(&text(&buf), s);
-        buf[(x0, y)].bg == sel
+        buf[(x0, y)].symbol() == "▎"
     };
     assert!(selected(&mut a, "read the code"), "the first row starts selected");
     key(&mut a, KeyCode::Down, KeyModifiers::NONE);
