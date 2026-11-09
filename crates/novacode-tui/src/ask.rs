@@ -516,11 +516,17 @@ impl AskForm {
         (out, cursor, sections)
     }
 
-    pub fn height(&self, width: u16) -> u16 {
-        self.lines(width.saturating_sub(4) as usize, &Theme::default(), true)
-            .0
-            .len() as u16
-            + 2
+    /// Rows the form takes, at most `max`: the spaced layout when it fits, else the
+    /// compact one, the same choice [`AskForm::render`] makes.
+    pub fn height(&self, width: u16, max: u16) -> u16 {
+        let rows = |spaced| {
+            self.lines(width.saturating_sub(4) as usize, &Theme::default(), spaced)
+                .0
+                .len() as u16
+                + 2
+        };
+        let spaced = rows(true);
+        if spaced <= max { spaced } else { rows(false).min(max) }
     }
 
     pub fn render(&self, f: &mut Frame, area: Rect, t: &Theme, km: &crate::keys::Keymap) {
@@ -692,7 +698,7 @@ mod tests {
     fn screen(f: &AskForm, width: u16, height: u16) -> String {
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         term.draw(|fr| {
-            let area = Rect::new(0, 0, width, f.height(width).min(height * 2 / 3));
+            let area = Rect::new(0, 0, width, f.height(width, height * 2 / 3));
             f.render(fr, area, &Theme::default(), &Default::default());
         })
         .unwrap();
@@ -1026,7 +1032,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let tall = draw(f.height(60));
+        let tall = draw(f.height(60, u16::MAX));
         eprintln!("{}", tall.join("\n"));
         assert!(tall[0].contains("Question 1 of 2 · Agent loop"), "{tall:?}");
         let at = |s: &str| tall.iter().position(|l| l.contains(s)).unwrap();
@@ -1038,7 +1044,7 @@ mod tests {
         );
         let r = at("Run both tools");
         assert!(tall[r..=r + 1].iter().any(|l| l.contains("recommended")));
-        let short = draw(f.height(60) - 4);
+        let short = draw(f.height(60, u16::MAX) - 4);
         assert!(short.iter().any(|l| l.contains("esc dismiss")), "{short:?}");
     }
 

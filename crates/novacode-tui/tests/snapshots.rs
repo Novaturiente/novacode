@@ -197,8 +197,15 @@ fn panel_rows_fill_title_and_detail_room() {
     assert!(lines[t7 + 2].ends_with('…'), "{s}");
 }
 
-/// A drawn frame's cells, for colour checks.
+/// A drawn frame's cells, for colour checks. Any motion (TS4) is finished first, as a
+/// real screen would be a few frames later; [`draw_live`] draws mid-motion.
 fn draw(a: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+    a.settle();
+    draw_live(a, w, h)
+}
+
+/// One frame at the frozen clock's time, motion left running.
+fn draw_live(a: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
     let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
     t.draw(|f| a.draw(f)).unwrap();
     t.backend().buffer().clone()
@@ -1275,6 +1282,180 @@ fn the_top_line_stays_while_content_above_changes() {
     assert_eq!(first(&mut a), top, "panel opened");
     a.panel.visible = false;
     assert_eq!(first(&mut a), top, "panel closed");
+}
+
+/// An app with `slow` set (L9.17: no motion).
+fn slow_app() -> (App, mpsc::UnboundedReceiver<Cmd>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut i = init(vec![], None);
+    i.slow = true;
+    (App::new(i, tx), rx)
+}
+
+/// A reply of 200 numbered lines.
+fn long_reply(a: &mut App) {
+    a.on_agent(AgentEvent::Message(Message::user("go")));
+    let text = (1..=200).map(|i| format!("- row {i}")).collect::<Vec<_>>().join("\n");
+    a.on_agent(AgentEvent::Message(assistant(
+        vec![Block::text(text)],
+        StopReason::Stop,
+    )));
+    a.on_agent(AgentEvent::Settled);
+}
+
+/// The first text row of a frame drawn mid-motion.
+fn top_row(a: &mut App) -> String {
+    let s = text(&draw_live(a, 80, 20));
+    s.lines().find(|l| !l.trim().is_empty()).unwrap().trim().to_string()
+}
+
+const FRAME: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// TS4: PgUp and the wheel ease to their target over 4 frames; slow mode jumps at once;
+/// a new scroll during the motion jumps straight to its target.
+#[test]
+fn scrolling_eases_to_its_target() {
+    let (mut a, _rx) = app(vec![]);
+    let (mut s, _srx) = slow_app();
+    long_reply(&mut a);
+    long_reply(&mut s);
+    let start = top_row(&mut a);
+    assert_eq!(top_row(&mut s), start);
+    key(&mut a, KeyCode::PageUp, KeyModifiers::NONE);
+    key(&mut s, KeyCode::PageUp, KeyModifiers::NONE);
+    let want = top_row(&mut s);
+    assert_ne!(want, start, "slow mode jumps at once");
+    assert!(!s.moving(), "slow mode never animates");
+    assert!(a.moving(), "a redraw is asked for while moving");
+    let mut frames = vec![top_row(&mut a)];
+    for _ in 0..3 {
+        novacode_tui::clock::advance(FRAME);
+        frames.push(top_row(&mut a));
+    }
+    assert_ne!(frames[0], start, "the first frame already moves");
+    assert_ne!(frames[0], want, "{frames:?}");
+    assert_ne!(frames[2], want, "{frames:?}");
+    assert_eq!(frames[3], want, "the target after 4 frames: {frames:?}");
+    assert!(!a.moving(), "no redraws once there");
+    // A second scroll mid-motion lands on its target in the next frame.
+    key(&mut a, KeyCode::PageUp, KeyModifiers::NONE);
+    key(&mut s, KeyCode::PageUp, KeyModifiers::NONE);
+    let mid = top_row(&mut a);
+    top_row(&mut s);
+    key(&mut a, KeyCode::PageUp, KeyModifiers::NONE);
+    key(&mut s, KeyCode::PageUp, KeyModifiers::NONE);
+    let want = top_row(&mut s);
+    assert_ne!(mid, want);
+    assert_eq!(top_row(&mut a), want, "no lag builds up");
+    assert!(!a.moving());
+    // The wheel eases too.
+    wheel(&mut a, 10, 5, false);
+    wheel(&mut s, 10, 5, false);
+    let want = top_row(&mut s);
+    assert_ne!(top_row(&mut a), want);
+    novacode_tui::clock::advance(FRAME * 3);
+    assert_eq!(top_row(&mut a), want);
+}
+
+/// A one-question form with `n` short context lines and choices A, B.
+fn ask(a: &mut App, n: usize) -> tokio::sync::oneshot::Receiver<Option<Vec<Reply>>> {
+    let (reply, answers) = tokio::sync::oneshot::channel();
+    let question: String = (1..=n).map(|i| format!("context {i}\n")).collect();
+    a.on_ui(UiEvent::Ask(novacode_tui::ask::AskReq {
+        id: 1,
+        questions: vec![Question {
+            question,
+            header: None,
+            options: ["A", "B"]
+                .map(|l| Choice {
+                    label: l.into(),
+                    description: None,
+                    preview: None,
+                    recommended: false,
+                })
+                .to_vec(),
+            multi: false,
+        }],
+        reply,
+    }));
+    answers
+}
+
+/// Rows of the first frame from the top (a card; the input's frame is below it).
+fn card_rows(s: &str) -> usize {
+    let top = s.lines().position(|l| l.trim_start().starts_with('╭')).unwrap();
+    let input = s
+        .lines()
+        .collect::<Vec<_>>()
+        .iter()
+        .rposition(|l| l.trim_start().starts_with('╭'))
+        .unwrap();
+    input - top
+}
+
+/// TS4: the ask form and the approval card grow to full height over 3 frames (at once in
+/// slow mode), and keys work from the first frame.
+#[test]
+fn cards_grow_over_three_frames() {
+    let (mut a, _rx) = app(vec![]);
+    let _answers = ask(&mut a, 3);
+    let mut rows = vec![card_rows(&text(&draw_live(&mut a, 80, 30)))];
+    for _ in 0..2 {
+        novacode_tui::clock::advance(FRAME);
+        rows.push(card_rows(&text(&draw_live(&mut a, 80, 30))));
+    }
+    assert!(rows[0] < rows[1] && rows[1] < rows[2], "{rows:?}");
+    assert_eq!(
+        rows[2],
+        card_rows(&screen(&mut a, 80, 30)),
+        "full height after 3 frames"
+    );
+    assert!(!a.moving());
+    // Slow mode: full at once.
+    let (mut s, _srx) = slow_app();
+    let _sa = ask(&mut s, 3);
+    assert_eq!(card_rows(&text(&draw_live(&mut s, 80, 30))), rows[2]);
+    // The approval card grows too.
+    let (mut a, _rx) = app(vec![]);
+    let (tx, _reply) = tokio::sync::oneshot::channel();
+    a.on_ui(UiEvent::Approve(ApproveReq {
+        id: 1,
+        tool: "bash".into(),
+        detail: "rm -rf target".into(),
+        reason: "rm -r deletes files".into(),
+        rule: "rm -rf target".into(),
+        risky: true,
+        reply: tx,
+    }));
+    let first = card_rows(&text(&draw_live(&mut a, 80, 30)));
+    assert!(first < card_rows(&screen(&mut a, 80, 30)));
+}
+
+/// TS4: a key pressed in a card's first frame is handled.
+#[test]
+fn keys_work_while_a_card_grows() {
+    let (mut a, mut rx) = app(vec![]);
+    let mut answers = ask(&mut a, 3);
+    draw_live(&mut a, 80, 30);
+    assert!(a.moving());
+    key(&mut a, KeyCode::Char('2'), KeyModifiers::NONE);
+    let got = answers.try_recv().expect("answered").expect("not dismissed");
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(format!("{got:?}").contains('B'), "{got:?}");
+    let _ = rx.try_recv();
+}
+
+/// TS4: an ask form too tall for its spaced layout reserves the rows of the compact one,
+/// so no blank row sits above its hint line.
+#[test]
+fn a_compact_ask_form_reserves_its_own_height() {
+    let (mut a, _rx) = app(vec![]);
+    // Spaced: 13 + gap + 2 choices + typed + gap + hints = 19 rows, over the 18 inside a
+    // 30-row screen's form; compact: 17.
+    let _answers = ask(&mut a, 13);
+    let s = screen(&mut a, 80, 30);
+    assert!(overlay_keys(&s).starts_with("enter choose"), "{s}");
+    assert_eq!(card_rows(&s), 17 + 2, "{s}");
 }
 
 /// A left click (press and release) at a cell.

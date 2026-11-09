@@ -123,9 +123,10 @@ pub async fn run_in(
                     }
                 }
                 last_draw = Instant::now();
-                // Text still held back: draw again next frame.
-                app.dirty = behind;
-                deadline = behind.then(|| tokio::time::Instant::from_std(last_draw + frame));
+                // Text still held back, or a motion running (TS4): draw again next frame.
+                let again = behind || app.moving();
+                app.dirty = again;
+                deadline = again.then(|| tokio::time::Instant::from_std(last_draw + frame));
             } else {
                 deadline = Some(tokio::time::Instant::from_std(last_draw + frame));
             }

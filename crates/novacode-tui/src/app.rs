@@ -24,6 +24,10 @@ use unicode_width::UnicodeWidthStr;
 
 const EDITOR_MAX_ROWS: usize = 10;
 const WHEEL: isize = 3;
+/// Motion (TS4): one frame, a scroll's ease (4 frames) and a card's growth (3 frames).
+const STEP: Duration = Duration::from_millis(16);
+const EASE: Duration = Duration::from_millis(64);
+const GROW: Duration = Duration::from_millis(48);
 const DOUBLE_PRESS: Duration = Duration::from_millis(500);
 const COMPLETE_ROWS: usize = 8;
 /// Files listed for `@` completion; bigger trees are cut.
@@ -374,7 +378,9 @@ struct Pos {
 
 struct Shown {
     view: View,
+    /// The drawn top line and the one a running scroll motion is heading for.
     top: usize,
+    target: usize,
     area: Rect,
     /// The "jump to bottom" pill, drawn while scrolled up; a click on it follows the tail.
     jump: Option<Rect>,
@@ -575,6 +581,10 @@ pub struct App {
     files: Option<Vec<String>>,
     search: Option<Search>,
     pub dirty: bool,
+    /// A running scroll motion (TS4): the drawn top line it started from, and when.
+    scroll_from: Option<(usize, Instant)>,
+    /// When the first of the open cards appeared; `None` = drawn at full height.
+    card_at: Option<Instant>,
     pub exit: Option<Exit>,
     pub suspend: bool,
     /// Open `$EDITOR` on the prompt (needs the terminal, so the loop does it).
@@ -717,6 +727,8 @@ impl App {
             files: None,
             search: None,
             dirty: true,
+            scroll_from: None,
+            card_at: None,
             exit: None,
             suspend: false,
             external_editor: false,
@@ -786,6 +798,7 @@ impl App {
         match ev {
             UiEvent::Approve(req) => {
                 let card = ApprovalCard::new(req);
+                self.card_opens();
                 self.approvals.push_back(card);
             }
             UiEvent::ApprovalDone { id } => {
@@ -798,6 +811,7 @@ impl App {
             UiEvent::Ask(req) => {
                 let mut form = crate::ask::AskForm::new(req);
                 form.edit_key = self.keymap.keys(A::ExternalEditor);
+                self.card_opens();
                 self.asks.push_back(form);
             }
             UiEvent::AskDone { id } => self.asks.retain(|f| f.req.id != id),
@@ -1346,6 +1360,7 @@ impl App {
         self.dirty = true;
         if matches!(ev, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)) {
             self.away.0 = false;
+            self.settle();
         }
         match ev {
             Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
@@ -1968,7 +1983,38 @@ impl App {
             reply,
         });
         form.edit_key = self.keymap.keys(A::ExternalEditor);
+        self.card_opens();
         self.asks.push_back(form);
+    }
+
+    /// A card is about to open: it grows in (TS4) unless one is already on screen.
+    fn card_opens(&mut self) {
+        if self.approvals.is_empty() && self.asks.is_empty() {
+            self.card_at = Some(clock::now());
+        }
+    }
+
+    /// A card of `full` rows as drawn now: growing over 3 frames from its start.
+    fn card_rows(&self, full: u16) -> u16 {
+        match self.card_at {
+            Some(at) if !self.init.slow => {
+                let frames = (clock::since(at).as_millis() / STEP.as_millis() + 1).min(3) as u16;
+                (full * frames).div_ceil(3)
+            }
+            _ => full,
+        }
+    }
+
+    /// A scroll or a card is still moving (TS4): the loop draws again next frame.
+    pub fn moving(&self) -> bool {
+        !self.init.slow && (self.scroll_from.is_some() || self.card_at.is_some_and(|at| clock::since(at) + STEP < GROW))
+    }
+
+    /// End any motion now: the next frame shows where it was heading. Input does this,
+    /// so motion never lags behind the user.
+    pub fn settle(&mut self) {
+        self.scroll_from = None;
+        self.card_at = None;
     }
 
     fn copy_reply(&mut self) {
@@ -2092,10 +2138,14 @@ impl App {
         }
     }
 
+    /// Wheel and PgUp/PgDn: ease to the new top over a few frames (TS4). A scroll while a
+    /// motion runs starts from its target and jumps there, so lag never builds up.
     fn scroll_by(&mut self, delta: isize) {
         let Some(s) = &self.shown else { return };
         let max_top = s.view.lines.len().saturating_sub(s.area.height as usize);
-        let top = (s.top as isize + delta).clamp(0, max_top as isize) as usize;
+        let top = (s.target as isize + delta).clamp(0, max_top as isize) as usize;
+        let ease = !self.init.slow && s.top == s.target && top != s.top;
+        self.scroll_from = ease.then(|| (s.top, clock::now()));
         if top >= max_top {
             self.anchor = None;
             return;
@@ -2423,11 +2473,12 @@ impl App {
             let keys = [("ctrl+r", "older"), ("enter", "use"), ("esc", "cancel")];
             notes.push(with_hints(format!(" {s}   "), &keys, area.width as usize, &self.theme));
         }
-        let card_h = match (self.approvals.front(), self.asks.front()) {
+        let full_card = match (self.approvals.front(), self.asks.front()) {
             (Some(c), _) => c.height(area.width).min(area.height / 2),
-            (None, Some(f)) => f.height(area.width).min(area.height * 2 / 3),
+            (None, Some(f)) => f.height(area.width, area.height * 2 / 3),
             _ => 0,
         };
+        let card_h = self.card_rows(full_card);
         let comp_h = self
             .completion
             .as_ref()
@@ -2547,10 +2598,27 @@ impl App {
         if self.approvals.is_empty() && self.asks.is_empty() && self.overlay.is_none() {
             f.set_cursor_position(Position::new(inner.x + cc, inner.y + cr));
         }
+        // A growing card (TS4) is laid out at full height; only its top rows show.
+        let grown = Rect {
+            height: full_card.min(area.bottom().saturating_sub(card.y)),
+            ..card
+        };
+        let below = (grown.height > card.height).then(|| f.buffer_mut().clone());
         if let Some(c) = self.approvals.front() {
-            c.render(f, card, t, &self.keymap);
+            c.render(f, grown, t, &self.keymap);
         } else if let Some(a) = self.asks.front() {
-            a.render(f, card, t, &self.keymap);
+            a.render(f, grown, t, &self.keymap);
+        }
+        if let Some(saved) = below {
+            let buf = f.buffer_mut();
+            for y in card.bottom()..grown.bottom() {
+                for x in grown.left()..grown.right() {
+                    let p = Position::new(x, y);
+                    if let (Some(c), Some(old)) = (buf.cell_mut(p), saved.cell(p)) {
+                        *c = old.clone();
+                    }
+                }
+            }
         }
         f.render_widget(Paragraph::new(status_lines), status);
 
@@ -2597,8 +2665,21 @@ impl App {
         let view = self.tr.layout(area.width as usize, &self.theme);
         let h = area.height as usize;
         let max_top = view.lines.len().saturating_sub(h);
-        let top = self.anchor.as_ref().map_or(max_top, |a| a.top(&view).min(max_top));
-        self.anchor = (self.anchor.is_some() && top < max_top).then(|| Anchor::capture(&view, top, h));
+        let target = self.anchor.as_ref().map_or(max_top, |a| a.top(&view).min(max_top));
+        self.anchor = (self.anchor.is_some() && target < max_top).then(|| Anchor::capture(&view, target, h));
+        // A scroll motion (TS4): ease out from where it started, 4 frames.
+        let top = match self.scroll_from {
+            Some((from, at)) if !self.init.slow && clock::since(at) + STEP < EASE => {
+                let p = (clock::since(at) + STEP).as_secs_f64() / EASE.as_secs_f64();
+                let eased = 1.0 - (1.0 - p) * (1.0 - p);
+                let from = from.min(max_top) as f64;
+                (from + (target as f64 - from) * eased).round() as usize
+            }
+            _ => {
+                self.scroll_from = None;
+                target
+            }
+        };
         let visible: Vec<Line> = view.lines[top..(top + h).min(view.lines.len())].to_vec();
         f.render_widget(Paragraph::new(visible), area);
         // Images only when wholly on screen; otherwise their placeholder line shows.
@@ -2668,7 +2749,13 @@ impl App {
             f.render_widget(Paragraph::new(Line::styled(label, style)), r);
             r
         });
-        self.shown = Some(Shown { view, top, area, jump });
+        self.shown = Some(Shown {
+            view,
+            top,
+            target,
+            area,
+            jump,
+        });
     }
 
     /// Every status segment that has something to show (L9.12).
