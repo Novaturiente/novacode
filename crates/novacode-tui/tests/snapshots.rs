@@ -123,31 +123,30 @@ fn golden_tasks_tab() {
 }
 
 /// TP10 after-capture bugs at 120 columns: a title takes the room a short tag leaves
-/// (tags stay aligned on their right edge), and a detail line is filled before it wraps
-/// (`running ·` is not left alone); a word longer than the line is cut with `…`.
+/// (tags stay aligned on their right edge), and a task's detail shows the model's short
+/// name, so it fits on one line. Detail lines wrap only at ` · `; a part longer than
+/// the line is cut with `…`.
 #[test]
 fn panel_rows_fill_title_and_detail_room() {
     let ago = |s: u64| novacode_tui::clock::now_ms() - s * 1000 - 20_000;
-    let row = |label: &str, repo: &str, summary: Option<&str>| novacode_tui::panel::TaskRow {
+    let row = |label: &str, repo: &str, model: &str| novacode_tui::panel::TaskRow {
         label: label.into(),
         repo: repo.into(),
         state: "running".into(),
-        model: "claude/claude-sonnet-5-5".into(),
+        model: model.into(),
         tokens: 41_200,
         started_ms: ago(3600),
-        summary: summary.map(String::from),
         ..Default::default()
     };
+    let sonnet = "claude/claude-sonnet-5-5";
     let (mut a, _rx) = app(vec![]);
     a.on_ui(UiEvent::Board {
         tasks: vec![
-            row("T3-fix-the-parser-for-nested-generic-arguments", "novacode", None),
-            row("T4-docs-site-search", "site", None),
-            row(
-                "T5-api-retry-backoff",
-                "api",
-                Some("see abcdefghijklmnopqrstuvwxyzabcdefghijklmnop end"),
-            ),
+            row("T3-fix-the-parser-for-nested-generic-arguments", "novacode", sonnet),
+            row("T4-docs-site-search", "site", sonnet),
+            row("T5-api-retry-backoff", "api", sonnet),
+            row("T6-wide", "api", "openai/gpt-6-codex-max-preview"),
+            row("T7-long", "api", "x/averyveryverylongmodelnamewithoutbreaks-preview"),
         ],
         needs: vec![],
     });
@@ -177,21 +176,25 @@ fn panel_rows_fill_title_and_detail_room() {
         "tags share a right edge"
     );
     assert_eq!(end(t5, " api "), end(t4, " site "), "tags share a right edge");
-    let detail = lines[at("T4-") + 1];
+    // Two rows per task: the main line and one detail line with the short model name.
+    for (id, next) in [("T4-", "T5-"), ("T5-", "T6-")] {
+        let d = lines[at(id) + 1];
+        assert!(d.ends_with("running · sonnet-5-5 · 41.2k"), "{d:?}\n{s}");
+        assert!(lines[at(id) + 2].contains(next), "one detail line\n{s}");
+    }
+    // Too wide for one line: it wraps at ` · ` only, never inside `gpt-6-codex-…`.
+    let t6 = at("T6-");
+    assert!(lines[t6 + 1].ends_with("│   running"), "{:?}\n{s}", lines[t6 + 1]);
     assert!(
-        detail.contains("running · claude/claude-sonnet-"),
-        "the detail line is filled: {detail:?}\n{s}"
+        lines[t6 + 2].ends_with("│   gpt-6-codex-max-preview · 41.2k"),
+        "{:?}\n{s}",
+        lines[t6 + 2]
     );
-    let sum = at("› see");
-    assert!(
-        lines[sum].trim_end().ends_with('…'),
-        "a too-long word is cut: {}\n{s}",
-        lines[sum]
-    );
-    assert!(
-        lines[sum + 1].trim_end().ends_with("end"),
-        "the text goes on after it\n{s}"
-    );
+    // One part longer than the line is cut with `…`.
+    let t7 = at("T7-");
+    assert!(lines[t7 + 1].ends_with("    running"), "{s}");
+    assert!(lines[t7 + 2].contains("    averyvery"), "{s}");
+    assert!(lines[t7 + 2].ends_with('…'), "{s}");
 }
 
 /// A drawn frame's cells, for colour checks.

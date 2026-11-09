@@ -1,14 +1,14 @@
  novacode X.Y.Z                                                                │  Tasks
  /home/u/proj · claude/opus                                                     │ ━━━━━━━
  type / for commands                                                            │   ├─◐ T3-fix-the-pars… novacode  3h00m
-                                                                                │   │   running · claude/claude-sonnet-
-                                                                                │   │   5-5 · 41.2k
+                                                                                │   │   running · sonnet-5-5 · 41.2k
                                                                                 │   ├─◐ T4-docs-site-search  site  2h00m
-                                                                                │   │   running · claude/claude-sonnet-
-                                                                                │   │   5-5 · 41.2k
+                                                                                │   │   running · sonnet-5-5 · 41.2k
                                                                                 │   └─◐ T5-api-retry-backoff  api  1h00m
-                                                                                │       running · claude/claude-sonnet-
-                                                                                │       5-5 · 41.2k
+                                                                                │       running · sonnet-5-5 · 41.2k
+                                                                                │
+                                                                                │
+                                                                                │
                                                                                 │
                                                                                 │
                                                                                 │

@@ -456,7 +456,12 @@ impl Panel {
                     ms: None,
                     since: Some(r.started_ms),
                 });
-                n.detail = vec![format!("{} · {} · {}", r.state, r.model, tokens(r.tokens))];
+                n.detail = vec![format!(
+                    "{} · {} · {}",
+                    r.state,
+                    short_model(&r.model),
+                    tokens(r.tokens)
+                )];
                 if let Some(s) = r.summary {
                     n.detail.push(format!("› {s}"));
                 }
@@ -1702,10 +1707,56 @@ fn footer_line<K: AsRef<str>, V: AsRef<str>>(first: &[(K, V)], w: usize, t: &The
     l
 }
 
-/// A detail text filled under `lead` (see `wrap::fill`) to at most two lines; the second is cut
-/// with `…` when more is left.
+/// A model's short name for a task row: `claude/claude-sonnet-5-5` -> `sonnet-5-5`,
+/// `openai/gpt-6` -> `gpt-6`.
+fn short_model(m: &str) -> &str {
+    match m.split_once('/') {
+        Some((p, rest)) => rest.strip_prefix(p).and_then(|r| r.strip_prefix('-')).unwrap_or(rest),
+        None => m,
+    }
+}
+
+/// A detail text under `lead`, at most two lines; the second is cut with `…` when more
+/// is left. A text of ` · `-separated parts wraps only between parts, and a part longer
+/// than the line is cut; other text word-wraps.
 fn detail_lines(v: Vec<Span<'static>>, w: usize, lead: &[Span<'static>]) -> Vec<Line<'static>> {
-    let mut lines = crate::wrap::fill(v, w, lead, lead);
+    const SEP: &str = " · ";
+    if v.iter().any(|s| s.content.contains(SEP)) {
+        let mut parts: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+        for s in v {
+            for (k, piece) in s.content.split(SEP).enumerate() {
+                if k > 0 {
+                    parts.push(Vec::new());
+                }
+                if !piece.is_empty() {
+                    parts.last_mut().unwrap().push(Span::styled(piece.to_string(), s.style));
+                }
+            }
+        }
+        let room = w.saturating_sub(crate::wrap::width(lead));
+        let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+        for p in parts {
+            let style = p.last().map(|s| s.style).unwrap_or_default();
+            let full = rows.len() == 2;
+            match rows.last_mut() {
+                // Once there are two lines, the rest joins the second one, cut below.
+                Some(r) if full || crate::wrap::width(r) + 3 + crate::wrap::width(&p) <= room => {
+                    r.push(Span::styled(SEP, style));
+                    r.extend(p);
+                }
+                _ => rows.push(p),
+            }
+        }
+        return rows
+            .into_iter()
+            .map(|r| {
+                let mut l = lead.to_vec();
+                l.extend(crate::wrap::truncate(r, room).spans);
+                Line::from(l)
+            })
+            .collect();
+    }
+    let mut lines = crate::wrap::wrap(v, w, lead, lead);
     if lines.len() > 2 {
         let mut rest: Vec<Span<'static>> = lines[1].spans.clone();
         for l in &lines[2..] {
@@ -1980,11 +2031,11 @@ mod tests {
             "│  Tasks",
             "│ ━━━━━━━",
             "│   ├─◐ T3-fix-parser              novacode  2h00m",
-            "│   │   running · claude/claude-sonnet-5-5 · 41.2k",
+            "│   │   running · sonnet-5-5 · 41.2k",
             "│   │   › parser fixed; tests pass",
             "│   └─⏸ T4-docs                        site  1h00m",
-            "│       blocked: quota · claude/claude-haiku-5-5",
-            "│       · 900",
+            "│       blocked: quota · haiku-5-5 · 900",
+            "│",
             "│",
             "│  enter attach · ↑↓ move · esc back · ←→ tab",
         ];
