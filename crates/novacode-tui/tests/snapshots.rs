@@ -1106,6 +1106,62 @@ fn typ(a: &mut App, s: &str) {
     }
 }
 
+/// TP7 (G2): an empty input hints `? for shortcuts`; `?` there opens the shortcut
+/// sheet instead of typing, and the next key only closes it.
+#[test]
+fn question_mark_opens_the_shortcut_sheet_on_an_empty_input() {
+    let (mut a, _rx) = app(vec![]);
+    let s = screen(&mut a, 80, 24);
+    assert!(s.contains("? for shortcuts"), "{s}");
+    typ(&mut a, "?");
+    assert_eq!(a.editor.text(), "", "the ? is not typed");
+    assert_eq!(a.focus(), Focus::Dialog);
+    let s = screen(&mut a, 80, 24);
+    // Labels come from the keymap.
+    assert!(s.contains("ctrl+l") && s.contains("esc"), "{s}");
+    assert!(s.contains("alt+/ all keys"), "{s}");
+    key(&mut a, KeyCode::Char('x'), KeyModifiers::NONE);
+    assert_eq!(a.editor.text(), "", "the closing key is not typed");
+    assert_eq!(a.focus(), Focus::Input);
+    assert!(!screen(&mut a, 80, 24).contains("all keys"));
+}
+
+/// TP7: with text in the input, `?` is typed like any key and the hint is gone.
+#[test]
+fn question_mark_types_on_a_non_empty_input() {
+    let (mut a, _rx) = app(vec![]);
+    typ(&mut a, "why?");
+    assert_eq!(a.editor.text(), "why?");
+    let s = screen(&mut a, 80, 24);
+    assert!(!s.contains("for shortcuts") && !s.contains("all keys"), "{s}");
+}
+
+/// TP7 (G2): the shortcut sheet's layout.
+#[test]
+fn golden_shortcut_sheet() {
+    goldens("shortcut_sheet", 24, |a| typ(a, "?"));
+}
+
+/// TP7: a click in the input box moves the cursor to the clicked cell.
+#[test]
+fn a_click_in_the_input_moves_the_cursor() {
+    let (mut a, _rx) = app(vec![]);
+    typ(&mut a, "hello world");
+    key(&mut a, KeyCode::Enter, KeyModifiers::SHIFT);
+    typ(&mut a, "second line");
+    let s = screen(&mut a, 80, 24);
+    let top = s.lines().position(|l| l.starts_with('╭')).unwrap() as u16;
+    // Text starts after the border and one cell of padding.
+    click(&mut a, 2 + 6, top + 1);
+    typ(&mut a, "X");
+    assert_eq!(a.editor.text(), "hello Xworld\nsecond line");
+    screen(&mut a, 80, 24);
+    // Past the end of a row: the row's end.
+    click(&mut a, 60, top + 2);
+    typ(&mut a, "!");
+    assert_eq!(a.editor.text(), "hello Xworld\nsecond line!");
+}
+
 #[test]
 fn slash_and_file_completion() {
     let (mut a, mut rx) = app(vec![]);

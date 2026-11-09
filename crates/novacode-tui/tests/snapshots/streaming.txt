@@ -7,6 +7,6 @@
  The loop has **three
  ⏵ queued: use tests
 ╭────────────────────────────────────────────────╮
-│                                                │
+│                                ? for shortcuts │
 ╰────────────────────────────────────────────────╯
  ⠋ writing    · 0.0s · esc interrupt       ctx 0%

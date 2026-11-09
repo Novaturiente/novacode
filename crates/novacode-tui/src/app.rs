@@ -463,6 +463,10 @@ pub struct App {
     last_ctrl_c: Option<Instant>,
     last_esc: Option<Instant>,
     editor_width: usize,
+    /// The input's text area as last drawn, for clicks (TP7).
+    input_area: Rect,
+    /// The shortcut sheet is open (G2): any key closes it.
+    sheet: bool,
     approvals: VecDeque<ApprovalCard>,
     asks: VecDeque<crate::ask::AskForm>,
     overlay: Option<Overlay>,
@@ -595,6 +599,8 @@ impl App {
             last_ctrl_c: None,
             last_esc: None,
             editor_width: 80,
+            input_area: Rect::default(),
+            sheet: false,
             approvals: VecDeque::new(),
             asks: VecDeque::new(),
             overlay: None,
@@ -1300,7 +1306,7 @@ impl App {
     /// Where keys go now. A dialog takes them while it is open; then the input or the
     /// panel, whichever had them (Esc and clicks change that).
     pub fn focus(&self) -> Focus {
-        if !self.approvals.is_empty() || !self.asks.is_empty() || self.overlay.is_some() {
+        if !self.approvals.is_empty() || !self.asks.is_empty() || self.overlay.is_some() || self.sheet {
             Focus::Dialog
         } else if self.focus == Focus::Panel && self.panel.visible {
             Focus::Panel
@@ -1331,6 +1337,10 @@ impl App {
         // Esc always ends at the input, also when it closes a dialog over the panel.
         if k.code == crossterm::event::KeyCode::Esc && self.focus() == Focus::Dialog {
             self.set_focus(Focus::Input);
+        }
+        if self.sheet {
+            self.sheet = false;
+            return;
         }
         if let Some(card) = self.approvals.front_mut() {
             if let Some(ans) = card.handle(k, self.keymap.lookup(&k, &[Scope::Editor])) {
@@ -1487,6 +1497,17 @@ impl App {
                     return;
                 }
             }
+        }
+        // `?` on an empty input opens the shortcut sheet instead of typing (G2).
+        if k.code == crossterm::event::KeyCode::Char('?')
+            && !k
+                .modifiers
+                .intersects(crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT)
+            && self.editor.is_empty()
+            && !self.editor.searching()
+        {
+            self.sheet = true;
+            return;
         }
         if self.completion.is_some() && self.completion_key(k) {
             return;
@@ -2074,6 +2095,20 @@ impl App {
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) && !self.panel.contains(m.column, m.row) {
             self.set_focus(Focus::Input);
         }
+        // A press in the input moves its cursor; a drag from there still selects screen text.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.approvals.is_empty()
+            && self.asks.is_empty()
+            && self.input_area.contains(Position::new(m.column, m.row))
+        {
+            let r = self.input_area;
+            self.editor.click(
+                r.width as usize,
+                r.height as usize,
+                (m.row - r.y) as usize,
+                (m.column - r.x) as usize,
+            );
+        }
         if self.panel.contains(m.column, m.row) {
             match m.kind {
                 MouseEventKind::ScrollUp => return self.panel.wheel(true),
@@ -2339,8 +2374,18 @@ impl App {
             block = block.title(Span::styled(format!(" {title} "), t.dim));
         }
         let inner = block.inner(ed);
+        self.input_area = inner;
         let text: Vec<Line> = rows.into_iter().map(|r| Line::styled(r, t.text)).collect();
         f.render_widget(Paragraph::new(text).block(block), ed);
+        const HINT: &str = "? for shortcuts";
+        if focus == Focus::Input
+            && self.editor.is_empty()
+            && !self.editor.searching()
+            && inner.width as usize > HINT.len() + 2
+        {
+            let hint = Paragraph::new(Line::styled(HINT, t.dim)).alignment(ratatui::layout::Alignment::Right);
+            f.render_widget(hint, Rect { height: 1, ..inner });
+        }
         if self.approvals.is_empty() && self.asks.is_empty() && self.overlay.is_none() {
             f.set_cursor_position(Position::new(inner.x + cc, inner.y + cr));
         }
@@ -2382,6 +2427,9 @@ impl App {
                 t,
             ),
             None => {}
+        }
+        if self.sheet {
+            crate::shortcuts::render(f, main, &self.keymap, t);
         }
     }
 

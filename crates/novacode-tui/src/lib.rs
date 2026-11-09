@@ -16,6 +16,7 @@ pub mod markdown;
 pub mod panel;
 pub mod procs;
 pub mod prompt;
+pub mod shortcuts;
 pub mod statusline;
 pub mod term;
 pub mod theme;
