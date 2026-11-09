@@ -2190,6 +2190,113 @@ fn stream_pacer_reveals_gradually() {
     assert!((5..60).contains(&frames), "caught up in {frames} frames");
 }
 
+/// A reply streaming into block 0 of a fresh turn.
+fn start_reply(a: &mut App) {
+    a.on_agent(AgentEvent::AgentStart);
+    a.on_agent(AgentEvent::Message(Message::user("go")));
+    a.on_agent(AgentEvent::Stream(StreamEvent::BlockStart {
+        index: 0,
+        kind: BlockKind::Text,
+        name: None,
+    }));
+}
+
+fn delta(a: &mut App, text: &str) {
+    a.on_agent(AgentEvent::Stream(StreamEvent::Delta {
+        index: 0,
+        text: text.into(),
+    }));
+}
+
+/// TS3: a block that is followed by another one keeps its lines while text streams.
+#[test]
+fn finished_blocks_keep_their_lines_while_text_streams() {
+    let (mut a, _rx) = app(vec![]);
+    start_reply(&mut a);
+    // Each chunk, and the first line of the block still open after it.
+    let chunks = [
+        (
+            "First paragraph that is long enough to wrap across a couple of lines.\n\n",
+            "First",
+        ),
+        ("- one\n- two\n\n", "• one"),
+        ("Then a *third", "Then"),
+        ("* block with **more", "Then"),
+        ("** text\n\n```\ncode", "▏ code"),
+        (" more\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n", "a "),
+    ];
+    let mut kept: Vec<String> = Vec::new();
+    for (chunk, open) in chunks {
+        delta(&mut a, chunk);
+        while a.pace() {}
+        let s = screen(&mut a, 40, 40);
+        let lines: Vec<String> = s.lines().map(String::from).collect();
+        let first = lines.iter().position(|l| l.trim_start().starts_with("First")).unwrap();
+        assert_eq!(lines[first..first + kept.len()], kept[..], "{s}");
+        let at = lines
+            .iter()
+            .rposition(|l| l.trim_start().starts_with(open))
+            .unwrap_or_else(|| panic!("{open}\n{s}"));
+        kept = lines[first..at].to_vec();
+    }
+    assert!(
+        kept.iter().any(|l| l.contains("third block with more text")),
+        "{kept:?}"
+    );
+}
+
+/// TS3: a table's columns only widen while it streams.
+#[test]
+fn streamed_table_columns_only_widen() {
+    let (mut a, _rx) = app(vec![]);
+    start_reply(&mut a);
+    let mut last = 0;
+    // An unclosed code span shows its backtick, then closes narrower.
+    for chunk in ["| name | v |\n|---|---|\n| `ab", "cdef", "`", " | 1 |\n| x | 2 |\n"] {
+        delta(&mut a, chunk);
+        while a.pace() {}
+        let s = screen(&mut a, 60, 20);
+        let sep = s.lines().find(|l| l.contains('┼')).unwrap_or_else(|| panic!("{s}"));
+        let w = sep.chars().position(|c| c == '┼').unwrap();
+        assert!(w >= last, "column shrank from {last} to {w}\n{s}");
+        last = w;
+    }
+}
+
+/// TS3: when the reply ends, the held-back text keeps climbing for a few frames.
+#[test]
+fn final_message_drains_the_backlog_instead_of_dumping_it() {
+    let (mut a, _rx) = app(vec![]);
+    start_reply(&mut a);
+    let text = "word ".repeat(300);
+    delta(&mut a, &text);
+    for _ in 0..3 {
+        a.pace();
+    }
+    let words = |a: &mut App| screen(a, 60, 80).matches("word").count();
+    let live = screen(&mut a, 60, 80);
+    let shown = words(&mut a);
+    assert!(shown < 300, "{shown}");
+    a.on_agent(AgentEvent::Message(assistant(
+        vec![Block::text(text.trim_end())],
+        StopReason::Stop,
+    )));
+    let after = screen(&mut a, 60, 80);
+    let body = |s: &str| s.lines().filter(|l| l.contains("word")).collect::<Vec<_>>().join("\n");
+    assert_eq!(body(&after), body(&live), "the reply's end doesn't jump");
+    let mut frames = 0;
+    let mut prev = shown;
+    while a.pace() {
+        frames += 1;
+        let n = words(&mut a);
+        assert!(n >= prev, "{n} < {prev}");
+        prev = n;
+    }
+    // About 150 ms at 16 ms a frame.
+    assert!((2..=10).contains(&frames), "drained in {frames} frames");
+    assert_eq!(words(&mut a), 300);
+}
+
 #[test]
 fn thinking_level_cycle_and_picker() {
     let (mut a, mut rx) = app(vec![]);

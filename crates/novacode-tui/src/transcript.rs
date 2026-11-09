@@ -15,6 +15,8 @@ const OUTPUT_TAIL: usize = 4;
 /// The divider before the first of super's messages the user hasn't seen (L10.9).
 pub const NEW_SINCE: &str = "new since you last looked";
 const LIVE_CAP: usize = 64 * 1024;
+/// Frames a reply's held-back text takes to show once the reply ends (TS3): about 150 ms.
+const DRAIN_FRAMES: usize = 9;
 
 pub enum Item {
     User(String),
@@ -69,6 +71,18 @@ pub struct Turn {
     pub done: bool,
     pub expanded: bool,
     cache: Option<Layout>,
+    drain: Option<Drain>,
+}
+
+/// A reply that ended while some of its text was held back (TS3): the rest
+/// keeps climbing for a few frames instead of showing at once.
+struct Drain {
+    /// Its index in `items`.
+    item: usize,
+    /// Bytes of each block shown so far.
+    shown: Vec<usize>,
+    /// Bytes added per frame.
+    step: Vec<usize>,
 }
 
 /// An image, base64, with its pixel size (0 when unknown).
@@ -168,6 +182,8 @@ pub struct Transcript {
     pub tools_hint: String,
     /// Stream pacer (L9.7): bytes of each live block shown so far.
     pub(crate) live_shown: Vec<usize>,
+    /// The live text blocks' finished markdown, rendered once (TS3).
+    pub(crate) live_md: Vec<markdown::Stream>,
     /// Tallest an open image may be, in rows (the transcript height); 0 = this
     /// terminal draws no images (L9.14).
     pub image_rows: usize,
@@ -374,6 +390,7 @@ impl Transcript {
         }
         self.live = None;
         self.live_shown.clear();
+        self.live_md.clear();
     }
 
     /// Mark every turn finished (the agent stopped).
@@ -461,6 +478,7 @@ impl Transcript {
             StreamEvent::RetryRollback => {
                 self.live = None;
                 self.live_shown.clear();
+                self.live_md.clear();
             }
             _ => {}
         }
@@ -504,24 +522,50 @@ impl Transcript {
                 });
             }
             Message::Assistant(a) => {
-                self.live = None;
-                self.live_shown.clear();
-                let blocks: Vec<(BlockKind, String)> = a
+                let live = self.live.take().unwrap_or_default();
+                let live_shown = std::mem::take(&mut self.live_shown);
+                self.live_md.clear();
+                let (blocks, shown): (Vec<(BlockKind, String)>, Vec<usize>) = a
                     .content
                     .iter()
-                    .filter_map(|b| match b {
-                        Block::Text { text, replay } if !text.trim().is_empty() => {
-                            Some((BlockKind::Text, with_sources(text, replay.as_ref())))
+                    .enumerate()
+                    .filter_map(|(i, b)| {
+                        let block = match b {
+                            Block::Text { text, replay } if !text.trim().is_empty() => {
+                                (BlockKind::Text, with_sources(text, replay.as_ref()))
+                            }
+                            Block::Thinking { text, .. } if !text.trim().is_empty() => {
+                                (BlockKind::Thinking, text.clone())
+                            }
+                            Block::ProviderNative { item, .. } => (BlockKind::Text, searched(item)?),
+                            _ => return None,
+                        };
+                        // What the stream pacer had shown of it (stream block i).
+                        let mut n = match live.get(i) {
+                            Some((k, _)) if *k == block.0 => live_shown.get(i).copied().unwrap_or(0),
+                            _ => block.1.len(),
                         }
-                        Block::Thinking { text, .. } if !text.trim().is_empty() => {
-                            Some((BlockKind::Thinking, text.clone()))
+                        .min(block.1.len());
+                        while !block.1.is_char_boundary(n) {
+                            n += 1;
                         }
-                        Block::ProviderNative { item, .. } => searched(item).map(|q| (BlockKind::Text, q)),
-                        _ => None,
+                        Some((block, n))
                     })
-                    .collect();
+                    .unzip();
                 let turn = self.turn();
                 if !blocks.is_empty() {
+                    if blocks.iter().zip(&shown).any(|((_, t), n)| *n < t.len()) {
+                        let step = blocks
+                            .iter()
+                            .zip(&shown)
+                            .map(|((_, t), n)| (t.len() - n).div_ceil(DRAIN_FRAMES).max(1))
+                            .collect();
+                        turn.drain = Some(Drain {
+                            item: turn.items.len(),
+                            shown,
+                            step,
+                        });
+                    }
                     turn.items.push(Item::Assistant(blocks));
                 }
                 for c in a.tool_calls() {
@@ -644,9 +688,29 @@ impl Transcript {
     /// Reveal a bit more of the live text; `true` while some is still held back.
     /// The step grows with the backlog, so the display never falls far behind.
     pub fn pace(&mut self) -> bool {
-        let Some(live) = &self.live else { return false };
-        self.live_shown.resize(live.len(), 0);
         let mut behind = false;
+        // A reply that ended with text held back shows the rest within DRAIN_FRAMES.
+        for turn in &mut self.turns {
+            let Some(d) = &mut turn.drain else { continue };
+            let mut left = false;
+            if let Some(Item::Assistant(blocks)) = turn.items.get(d.item) {
+                for (i, (_, text)) in blocks.iter().enumerate() {
+                    let mut n = (d.shown[i] + d.step[i]).min(text.len());
+                    while !text.is_char_boundary(n) {
+                        n += 1;
+                    }
+                    d.shown[i] = n;
+                    left |= n < text.len();
+                }
+            }
+            if !left {
+                turn.drain = None;
+            }
+            turn.cache = None;
+            behind |= left;
+        }
+        let Some(live) = &self.live else { return behind };
+        self.live_shown.resize(live.len(), 0);
         for (i, (kind, text)) in live.iter().enumerate() {
             let shown = &mut self.live_shown[i];
             if !matches!(kind, BlockKind::Text | BlockKind::Thinking) {
@@ -730,15 +794,17 @@ impl Transcript {
             if i == last
                 && let Some(live) = &live
             {
+                let md = Some(&mut self.live_md);
                 v.lines
-                    .extend(lay_assistant(live, width, theme, since, thinking, &hint));
+                    .extend(lay_assistant(live, width, theme, since, thinking, &hint, md));
             }
         }
         if self.turns.is_empty()
             && let Some(live) = &live
         {
+            let md = Some(&mut self.live_md);
             v.lines
-                .extend(lay_assistant(live, width, theme, since, thinking, &hint));
+                .extend(lay_assistant(live, width, theme, since, thinking, &hint, md));
         }
         if let Some(text) = &self.echo {
             let turn = Turn {
@@ -878,13 +944,21 @@ fn lay_turn(
                 lines.extend(user_box(text, width, t));
             }
             Item::Assistant(blocks) => {
+                let drain = turn.drain.as_ref().filter(|d| d.item == idx);
                 // Collapsed, a message shows its text, not its thinking.
                 let blocks: Vec<_> = blocks
                     .iter()
+                    .enumerate()
+                    .map(|(i, (k, s))| match drain {
+                        Some(d) => (*k, s[..d.shown[i]].to_string()),
+                        None => (*k, s.clone()),
+                    })
                     .filter(|(k, _)| !collapsed || *k == BlockKind::Text)
-                    .cloned()
                     .collect();
-                lines.extend(lay_assistant(&blocks, width, t, None, thinking, hint));
+                // Still draining: streamed markdown, without highlighting.
+                let mut fresh = Vec::new();
+                let md = drain.map(|_| &mut fresh);
+                lines.extend(lay_assistant(&blocks, width, t, None, thinking, hint, md));
             }
             Item::Tool(tool) => lines.extend(lay_tool(tool, width, t, tools)),
             Item::Image(img) => {
@@ -1014,6 +1088,8 @@ fn lay_assistant(
     live: Option<Instant>,
     thinking: Thinking,
     hint: &str,
+    // Streaming: each text block's finished markdown, kept between frames.
+    mut md: Option<&mut Vec<markdown::Stream>>,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::default()];
     let mut after_thinking = false;
@@ -1071,7 +1147,15 @@ fn lay_assistant(
                 }
                 lines.push(l);
             }
-            BlockKind::Text => lines.extend(markdown::render(text, width, t, live.is_none())),
+            BlockKind::Text => lines.extend(match md.as_deref_mut() {
+                Some(cache) => {
+                    if cache.len() <= j {
+                        cache.resize_with(j + 1, Default::default);
+                    }
+                    markdown::render_live(text, width, t, &mut cache[j])
+                }
+                None => markdown::render(text, width, t, true),
+            }),
             _ => {}
         }
     }

@@ -7,36 +7,74 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+const OPTS: Options = Options::ENABLE_TABLES
+    .union(Options::ENABLE_STRIKETHROUGH)
+    .union(Options::ENABLE_TASKLISTS);
+
 /// `highlight`: colour code blocks (off while streaming, so it never runs per frame).
 pub fn render(md: &str, width: usize, t: &Theme, highlight: bool) -> Vec<Line<'static>> {
-    let mut r = R {
-        t,
-        highlight,
-        lang: String::new(),
-        width,
-        out: Vec::new(),
-        cur: Vec::new(),
-        styles: vec![t.text],
-        lists: Vec::new(),
-        bullet: None,
-        quote: 0,
-        code: None,
-        links: Vec::new(),
-        table: None,
-    };
-    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
-    for ev in Parser::new_ext(md, opts) {
+    let mut r = R::new(t, highlight, width);
+    for ev in Parser::new_ext(md, OPTS) {
         r.event(ev);
     }
-    r.flush();
-    while r
-        .out
-        .last()
-        .is_some_and(|l| l.spans.iter().all(|s| s.content.trim().is_empty()))
-    {
-        r.out.pop();
+    r.finish()
+}
+
+/// A streaming reply's finished blocks, rendered once (TS3). A top-level block is
+/// finished once the next one starts; only the text from there on is parsed again.
+#[derive(Default)]
+pub struct Stream {
+    /// The source of the finished blocks.
+    src: String,
+    width: usize,
+    lines: Vec<Line<'static>>,
+    /// Column widths of each table still open; they only grow.
+    tables: Vec<Vec<usize>>,
+}
+
+/// [`render`] for text that only grows, without highlighting: reuses the finished
+/// blocks' lines from `s`, and table columns never narrow.
+pub fn render_live(md: &str, width: usize, t: &Theme, s: &mut Stream) -> Vec<Line<'static>> {
+    if s.width != width || !md.starts_with(&s.src) {
+        *s = Stream {
+            width,
+            ..Stream::default()
+        };
     }
-    r.out
+    let tail = &md[s.src.len()..];
+    let mut r = R::new(t, false, width);
+    r.out = s.lines.clone();
+    r.grow = Some(std::mem::take(&mut s.tables));
+    // (source offset, lines, tables) before the newest top-level block.
+    let mut done = None;
+    let mut depth = 0usize;
+    let mut seen = false;
+    for (ev, range) in Parser::new_ext(tail, OPTS).into_offset_iter() {
+        if depth == 0 && matches!(ev, Event::Start(_) | Event::Rule) {
+            // From the start of its line, so its indent parses the same.
+            let at = tail[..range.start].rfind('\n').map_or(0, |i| i + 1);
+            // A block on the unfinished last line may still turn into part of the one
+            // above (`| 1` under a table), so that one isn't finished yet.
+            if seen && tail[at..].contains('\n') {
+                done = Some((at, r.out.len(), r.tables_seen));
+            }
+            seen = true;
+        }
+        match ev {
+            Event::Start(_) => depth += 1,
+            Event::End(_) => depth -= 1,
+            _ => {}
+        }
+        r.event(ev);
+    }
+    let mut tables = r.grow.take().unwrap_or_default();
+    if let Some((at, n, k)) = done {
+        s.src.push_str(&tail[..at]);
+        s.lines = r.out[..n].to_vec();
+        tables.drain(..k.min(tables.len()));
+    }
+    s.tables = tables;
+    r.finish()
 }
 
 struct List {
@@ -64,9 +102,45 @@ struct R<'a> {
     code: Option<String>,
     links: Vec<String>,
     table: Option<Table>,
+    /// While streaming: each table's column widths so far, so they never shrink.
+    grow: Option<Vec<Vec<usize>>>,
+    tables_seen: usize,
 }
 
-impl R<'_> {
+impl<'a> R<'a> {
+    fn new(t: &'a Theme, highlight: bool, width: usize) -> Self {
+        R {
+            t,
+            highlight,
+            lang: String::new(),
+            width,
+            out: Vec::new(),
+            cur: Vec::new(),
+            styles: vec![t.text],
+            lists: Vec::new(),
+            bullet: None,
+            quote: 0,
+            code: None,
+            links: Vec::new(),
+            table: None,
+            grow: None,
+            tables_seen: 0,
+        }
+    }
+
+    /// The lines, without trailing blank ones.
+    fn finish(mut self) -> Vec<Line<'static>> {
+        self.flush();
+        while self
+            .out
+            .last()
+            .is_some_and(|l| l.spans.iter().all(|s| s.content.trim().is_empty()))
+        {
+            self.out.pop();
+        }
+        self.out
+    }
+
     fn style(&self) -> Style {
         *self.styles.last().unwrap()
     }
@@ -319,6 +393,17 @@ impl R<'_> {
                 widths[i] = widths[i].max(c.width());
             }
         }
+        if let Some(grow) = &mut self.grow {
+            if grow.len() <= self.tables_seen {
+                grow.resize(self.tables_seen + 1, Vec::new());
+            }
+            let seen = &mut grow[self.tables_seen];
+            for (w, s) in widths.iter_mut().zip(seen.iter()) {
+                *w = (*w).max(*s);
+            }
+            seen.clone_from(&widths);
+        }
+        self.tables_seen += 1;
         let gaps = cols.saturating_sub(1) * 3;
         let fits = widths.iter().sum::<usize>() + gaps <= self.width;
         if !fits && self.width >= gaps + cols * 3 {
@@ -439,5 +524,18 @@ mod tests {
         );
         // Unfinished markdown while streaming still renders.
         assert_eq!(md("```\npartial", 40), ["▏ partial"]);
+    }
+
+    #[test]
+    fn streamed_render_matches_a_full_parse() {
+        let doc = "# Title\n\nSome *text* that wraps\nover lines.\n\npara\n- item\n  - nested\n\n1. one\n2. two\n\n> quote\nlazy\n\n---\n\n```rust\nfn x() {}\n```\n\nSetext\n---\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nend.";
+        let t = Theme::default();
+        let mut s = Stream::default();
+        for (i, _) in doc.char_indices().skip(1).chain([(doc.len(), ' ')]) {
+            let live: Vec<String> = render_live(&doc[..i], 24, &t, &mut s).iter().map(wrap::plain).collect();
+            let full: Vec<String> = render(&doc[..i], 24, &t, false).iter().map(wrap::plain).collect();
+            assert_eq!(live, full, "after {:?}", &doc[..i]);
+        }
+        assert!(!s.src.is_empty(), "finished blocks are kept");
     }
 }
