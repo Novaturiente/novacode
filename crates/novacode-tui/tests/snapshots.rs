@@ -1221,6 +1221,62 @@ fn key(a: &mut App, code: KeyCode, m: KeyModifiers) {
     a.on_key(KeyEvent::new(code, m));
 }
 
+/// TS1: scrolled up, the top screen line stays put while content above it changes
+/// height: a tool's output grows, turns fold, and the panel re-wraps the transcript.
+#[test]
+fn the_top_line_stays_while_content_above_changes() {
+    let (mut a, _rx) = app(vec![]);
+    let turn = |a: &mut App, n: usize| {
+        a.on_agent(AgentEvent::Message(Message::user(format!("prompt {n}"))));
+        let out = (1..=30).map(|i| format!("out {n}.{i}")).collect::<Vec<_>>().join("\n");
+        let id = format!("t{n}");
+        a.on_agent(AgentEvent::Message(assistant(
+            vec![call(&id, "bash", json!({"command": "make"}))],
+            StopReason::ToolUse,
+        )));
+        a.on_agent(AgentEvent::Message(result(&id, "bash", &out, false)));
+        let long = "a long paragraph that wraps differently at each width ".repeat(8);
+        let lines = (1..=40)
+            .map(|i| format!("- answer {n}.{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        a.on_agent(AgentEvent::Message(assistant(
+            vec![Block::text(format!("{long}\n\n{lines}"))],
+            StopReason::Stop,
+        )));
+        a.on_agent(AgentEvent::Settled);
+    };
+    turn(&mut a, 1);
+    turn(&mut a, 2);
+    // Open every turn, then page up into the last answer.
+    key(&mut a, KeyCode::Char('o'), KeyModifiers::ALT);
+    screen(&mut a, 120, 20);
+    key(&mut a, KeyCode::PageUp, KeyModifiers::NONE);
+    // The transcript part of the first row (the panel, when open, is on the right).
+    let first = |a: &mut App| {
+        let w = if a.panel.visible { 120 - a.panel.width(120) } else { 120 };
+        let s = screen(a, 120, 20);
+        s.lines()
+            .next()
+            .unwrap()
+            .chars()
+            .take(w as usize)
+            .collect::<String>()
+            .trim()
+            .to_string()
+    };
+    let top = first(&mut a);
+    assert!(top.contains("answer 2."), "{top}");
+    key(&mut a, KeyCode::Char('o'), KeyModifiers::CONTROL);
+    assert_eq!(first(&mut a), top, "tool output grew above");
+    key(&mut a, KeyCode::Char('o'), KeyModifiers::ALT);
+    assert_eq!(first(&mut a), top, "turns folded");
+    a.panel.visible = true;
+    assert_eq!(first(&mut a), top, "panel opened");
+    a.panel.visible = false;
+    assert_eq!(first(&mut a), top, "panel closed");
+}
+
 /// A left click (press and release) at a cell.
 fn click(a: &mut App, column: u16, row: u16) {
     for kind in [

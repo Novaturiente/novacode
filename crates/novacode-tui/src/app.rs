@@ -380,6 +380,81 @@ struct Shown {
     jump: Option<Rect>,
 }
 
+/// Where the view is held while scrolled up (TS1): a line of a turn, found again by its
+/// text after content above it changes height (folds, growing output, a re-wrap).
+struct Anchor {
+    turn: usize,
+    /// The key line, as an offset inside the turn.
+    off: usize,
+    /// The key line's text (empty: use `off` as is) and the turn's height when drawn.
+    text: String,
+    len: usize,
+    /// Rows from the top of the view down to the key line.
+    back: usize,
+}
+
+impl Anchor {
+    /// Line `off` of `turn` at the top, as set by a scroll.
+    fn at(turn: usize, off: usize) -> Self {
+        Anchor {
+            turn,
+            off,
+            text: String::new(),
+            len: 0,
+            back: 0,
+        }
+    }
+
+    /// The anchor for a view drawn from `top`: the first non-blank line in view of the top line's turn.
+    fn capture(view: &View, top: usize, h: usize) -> Self {
+        let turn = view.starts.partition_point(|&st| st <= top).saturating_sub(1);
+        let (start, end) = turn_span(view, turn);
+        let text = |i: usize| wrap::plain(&view.lines[i]).trim_end().to_string();
+        let key = (top..end.min(top + h))
+            .find(|&i| !text(i).trim().is_empty())
+            .unwrap_or(top);
+        Anchor {
+            turn,
+            off: key.saturating_sub(start),
+            text: if key < view.lines.len() {
+                text(key)
+            } else {
+                String::new()
+            },
+            len: end - start,
+            back: key - top,
+        }
+    }
+
+    /// The top line in `view`: the key line found by its text nearest its old offset,
+    /// else a line that starts like it (a re-wrap), else the same share of the turn.
+    fn top(&self, view: &View) -> usize {
+        let (start, end) = turn_span(view, self.turn);
+        let guess = start + self.off;
+        let text = |i: usize| wrap::plain(&view.lines[i]);
+        let key = if self.text.is_empty() || guess < end && text(guess).trim_end() == self.text {
+            guess
+        } else {
+            let near = |hit: &dyn Fn(&str) -> bool| {
+                (start..end)
+                    .filter(|&i| hit(text(i).trim_end()))
+                    .min_by_key(|&i| i.abs_diff(guess))
+            };
+            near(&|t| t == self.text)
+                .or_else(|| near(&|t| !t.trim().is_empty() && (t.starts_with(&self.text) || self.text.starts_with(t))))
+                .unwrap_or_else(|| start + self.off * (end - start) / self.len.max(1))
+        };
+        key.min(end.saturating_sub(1)).saturating_sub(self.back)
+    }
+}
+
+/// A turn's lines in `view`: (first, end), the end being where the next turn starts.
+fn turn_span(view: &View, turn: usize) -> (usize, usize) {
+    let start = view.starts.get(turn).copied().unwrap_or(0);
+    let end = view.starts.get(turn + 1).copied().unwrap_or(view.lines.len());
+    (start, end.max(start))
+}
+
 /// Popup under the cursor: `@file` or a slash command (L9.5).
 struct Completion {
     /// Byte where the completed token starts.
@@ -477,8 +552,8 @@ pub struct App {
     /// Steering messages sent but not yet delivered.
     /// Queued while busy: (text, steer).
     pending: Vec<(String, bool)>,
-    /// `None` = follow the tail; otherwise (turn, line offset in turn) at the top.
-    anchor: Option<(usize, usize)>,
+    /// `None` = follow the tail; otherwise the line held at the top.
+    anchor: Option<Anchor>,
     shown: Option<Shown>,
     selection: Option<(Pos, Pos)>,
     /// A drag outside the chat (status line, dialogs, panel): (start, end) as (column, row).
@@ -2011,7 +2086,7 @@ impl App {
             _ => (turn + 1 < s.view.starts.len()).then_some(turn + 1),
         };
         match target {
-            Some(t) => self.anchor = Some((t, 0)),
+            Some(t) => self.anchor = Some(Anchor::at(t, 0)),
             None if dir > 0 => self.anchor = None,
             None => {}
         }
@@ -2027,7 +2102,7 @@ impl App {
         }
         let turn = s.view.starts.partition_point(|&st| st <= top).saturating_sub(1);
         let start = s.view.starts.get(turn).copied().unwrap_or(0);
-        self.anchor = Some((turn, top - start));
+        self.anchor = Some(Anchor::at(turn, top - start));
     }
 
     /// What Ctrl+G opens: the question form's text or preview (a plan), else the prompt.
@@ -2522,17 +2597,8 @@ impl App {
         let view = self.tr.layout(area.width as usize, &self.theme);
         let h = area.height as usize;
         let max_top = view.lines.len().saturating_sub(h);
-        let top = match self.anchor {
-            None => max_top,
-            Some((turn, off)) => {
-                let start = view.starts.get(turn).copied().unwrap_or(0);
-                let next = view.starts.get(turn + 1).copied().unwrap_or(view.lines.len());
-                (start + off.min(next.saturating_sub(start + 1))).min(max_top)
-            }
-        };
-        if self.anchor.is_some() && top >= max_top {
-            self.anchor = None;
-        }
+        let top = self.anchor.as_ref().map_or(max_top, |a| a.top(&view).min(max_top));
+        self.anchor = (self.anchor.is_some() && top < max_top).then(|| Anchor::capture(&view, top, h));
         let visible: Vec<Line> = view.lines[top..(top + h).min(view.lines.len())].to_vec();
         f.render_widget(Paragraph::new(visible), area);
         // Images only when wholly on screen; otherwise their placeholder line shows.
