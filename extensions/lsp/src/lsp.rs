@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Notify, oneshot, watch};
+use tokio::time::Instant;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -339,29 +340,22 @@ impl Client {
 
     /// Wait until the server is ready and has published for `uri` after `since`,
     /// then a short quiet spell for follow-ups (servers often publish twice), all
-    /// within `budget`. False: still loading when the budget ran out.
-    async fn settle(&self, uri: &str, since: u64, budget: Duration) -> bool {
-        let end = tokio::time::Instant::now() + budget;
+    /// by `end`. False: still loading when the time ran out.
+    async fn settle(&self, uri: &str, since: u64, end: Instant) -> bool {
         let mut seen = since;
+        let mut until = end;
         loop {
             let n = self.changed.notified();
             let now = self.snapshot(uri).0;
             if !self.ready() {
-                if tokio::time::timeout_at(end, n).await.is_err() {
-                    return self.ready();
-                }
-                continue;
-            }
-            if now > seen {
+                until = end;
+            } else if now > seen {
                 seen = now;
-                // Something arrived: give stragglers 300 ms, not the whole budget.
-                let quiet = (tokio::time::Instant::now() + Duration::from_millis(300)).min(end);
-                if tokio::time::timeout_at(quiet, n).await.is_err() {
-                    return self.ready();
-                }
-                continue;
+                // Something arrived: give stragglers 300 ms, not the whole wait. Other
+                // files' publishes wake us too; they must not reset this to `end`.
+                until = (Instant::now() + Duration::from_millis(300)).min(end);
             }
-            if tokio::time::timeout_at(end, n).await.is_err() {
+            if tokio::time::timeout_at(until, n).await.is_err() {
                 return self.ready();
             }
         }
@@ -377,7 +371,15 @@ fn one_line(m: &str) -> String {
     }
 }
 
-async fn read_loop(c: std::sync::Weak<Client>, mut r: BufReader<tokio::process::ChildStdout>) {
+async fn read_loop(c: std::sync::Weak<Client>, r: BufReader<tokio::process::ChildStdout>) {
+    read_messages(&c, r).await;
+    // The server is gone: fail its waiting requests now, not at their timeout.
+    if let Some(c) = c.upgrade() {
+        c.pending.lock().unwrap().clear();
+    }
+}
+
+async fn read_messages(c: &std::sync::Weak<Client>, mut r: BufReader<tokio::process::ChildStdout>) {
     loop {
         let mut len = 0usize;
         loop {
@@ -467,14 +469,22 @@ async fn read_loop(c: std::sync::Weak<Client>, mut r: BufReader<tokio::process::
     }
 }
 
-/// A started client, or why it couldn't start (said once, never retried).
+/// A started client, or why it couldn't start (never retried).
 type Started = Result<Arc<Client>, String>;
+
+/// One (server, root): started in the background, so no check waits past its deadline.
+struct Slot {
+    /// `None` while the server starts.
+    started: watch::Receiver<Option<Started>>,
+    /// The start failure was told to the model (said once).
+    told: AtomicBool,
+}
 
 /// The after-tool handler: one client per (server, root), started on first use.
 pub struct Lsp {
     cfg: Config,
     servers: Vec<(String, Server)>,
-    clients: tokio::sync::Mutex<HashMap<(String, PathBuf), Started>>,
+    clients: Mutex<HashMap<(String, PathBuf), Arc<Slot>>>,
     /// What the model was last told per file: (errors, warnings) it saw.
     told: Mutex<HashMap<String, Vec<Diag>>>,
     cwd: PathBuf,
@@ -514,37 +524,66 @@ impl Lsp {
             .map_or_else(|| self.cwd.clone(), Path::to_path_buf)
     }
 
-    async fn client(&self, name: &str, s: &Server, root: PathBuf) -> Result<Arc<Client>, String> {
-        let mut g = self.clients.lock().await;
-        if let Some(c) = g.get(&(name.to_string(), root.clone())) {
-            // A failure was already reported: stay quiet.
-            return c.clone().map_err(|_| String::new());
+    fn slot(&self, name: &str, s: &Server, root: PathBuf) -> Arc<Slot> {
+        let mut g = self.clients.lock().unwrap();
+        g.entry((name.to_string(), root.clone()))
+            .or_insert_with(|| {
+                let (tx, rx) = watch::channel(None);
+                let (s, name, logs) = (s.clone(), name.to_string(), self.logs.clone());
+                tokio::spawn(async move {
+                    let _ = std::fs::create_dir_all(&logs);
+                    let c = Client::start(&s, &root, &logs.join(format!("lsp-{name}.log"))).await;
+                    if let Err(e) = &c {
+                        eprintln!("language server {name}: {e}");
+                    }
+                    let _ = tx.send(Some(c));
+                });
+                Arc::new(Slot {
+                    started: rx,
+                    told: AtomicBool::new(false),
+                })
+            })
+            .clone()
+    }
+
+    /// The client once started, waiting at most until `end`; `None`: still starting.
+    async fn client(slot: &Slot, end: Instant) -> Option<Started> {
+        let mut rx = slot.started.clone();
+        match tokio::time::timeout_at(end, rx.wait_for(Option::is_some)).await {
+            Err(_) => None,
+            Ok(Ok(v)) => v.clone(),
+            Ok(Err(_)) => Some(Err("its start task ended".into())),
         }
-        let _ = std::fs::create_dir_all(&self.logs);
-        let c = Client::start(s, &root, &self.logs.join(format!("lsp-{name}.log"))).await;
-        if let Err(e) = &c {
-            eprintln!("language server {name}: {e}");
-        }
-        g.insert((name.to_string(), root), c.clone());
-        c
     }
 
     /// Diagnostics for the files a tool touched, as text for the model.
     pub async fn check(&self, paths: &[PathBuf], baseline_only: bool) -> Option<String> {
         let max_sev = if self.cfg.severity == "warning" { 2 } else { 1 };
-        let budget = Duration::from_millis(self.cfg.wait_ms);
+        // One deadline for the whole call: novacode disables an extension that
+        // answers after `timeoutMs`, however many files were touched.
+        let end = Instant::now() + Duration::from_millis(self.cfg.wait_ms);
         let mut report = Vec::new();
         let mut failed = Vec::new();
+        // Send every file first, so servers work on them while we wait.
+        let mut synced = Vec::new();
         for path in paths {
             let Some((name, s, ext)) = self.server_for(path) else {
                 continue;
             };
-            let root = self.root(s, path);
-            let c = match self.client(name, s, root).await {
-                Ok(c) => c,
-                Err(e) => {
-                    if !e.is_empty() {
+            let slot = self.slot(name, s, self.root(s, path));
+            let c = match Self::client(&slot, end).await {
+                Some(Ok(c)) => c,
+                // Kept for the first edit when a `read` sees it: reads report nothing.
+                Some(Err(e)) => {
+                    if !baseline_only && !slot.told.swap(true, Ordering::Relaxed) {
                         failed.push(e);
+                    }
+                    continue;
+                }
+                None => {
+                    if !baseline_only {
+                        let rel = path.strip_prefix(&self.cwd).unwrap_or(path).display().to_string();
+                        report.push(format!("{rel}: not checked, {name} is still starting"));
                     }
                     continue;
                 }
@@ -554,7 +593,10 @@ impl Lsp {
             if c.sync(path, &ext).await.is_none() {
                 continue;
             }
-            if !c.settle(&u, before, budget).await {
+            synced.push((path, name, c, u, before));
+        }
+        for (path, name, c, u, before) in synced {
+            if !c.settle(&u, before, end).await {
                 // Saying nothing would read as "no errors"; old diagnostics stay as the baseline.
                 if !baseline_only {
                     let rel = path.strip_prefix(&self.cwd).unwrap_or(path).display().to_string();
@@ -562,7 +604,8 @@ impl Lsp {
                 }
                 continue;
             }
-            if let Some(m) = c.unhealthy.lock().unwrap().as_deref()
+            if !baseline_only
+                && let Some(m) = c.unhealthy.lock().unwrap().as_deref()
                 && !c.warned.swap(true, Ordering::Relaxed)
             {
                 report.push(format!("({name}: {}; only cargo check errors are shown)", one_line(m)));
@@ -692,6 +735,90 @@ mod tests {
         let (lsp, _) = Lsp::new(Config::default(), d.path(), &d.path().join("logs"));
         let r = lsp.check(std::slice::from_ref(&f), false).await;
         assert!(!r.unwrap_or_default().contains("cannot index"));
+    }
+
+    /// A scripted server (`tests/fake_lsp.py`, needs python3) in `mode`, for `.fk` files.
+    fn fake(mode: &str, wait_ms: u64, files: usize) -> Option<(tempfile::TempDir, Arc<Lsp>, Vec<PathBuf>)> {
+        if !on_path("python3") {
+            return None;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_lsp.py");
+        let cfg: Config = serde_json::from_value(json!({
+            "waitMs": wait_ms,
+            "servers": { "fake": { "command": "python3", "args": [script, mode], "extensions": ["fk"] } }
+        }))
+        .unwrap();
+        let (lsp, _) = Lsp::new(cfg, d.path(), &d.path().join("logs"));
+        let paths = (0..files)
+            .map(|i| {
+                let p = d.path().join(format!("f{i}.fk"));
+                std::fs::write(&p, "x\n").unwrap();
+                p
+            })
+            .collect();
+        Some((d, lsp, paths))
+    }
+
+    /// novacode disables the extension past `timeoutMs`: many files still share one wait.
+    #[tokio::test]
+    async fn many_files_share_one_wait() {
+        let Some((_d, lsp, paths)) = fake("loading", 500, 4) else {
+            return;
+        };
+        let t = std::time::Instant::now();
+        let r = lsp.check(&paths, false).await.unwrap();
+        assert!(t.elapsed() < Duration::from_millis(1500), "{:?}", t.elapsed());
+        assert_eq!(r.matches("still loading").count(), 4, "{r}");
+    }
+
+    /// Publishes for other files must not stretch a file's 300 ms quiet spell to the whole wait.
+    #[tokio::test]
+    async fn ready_server_answers_without_the_whole_wait() {
+        let Some((_d, lsp, paths)) = fake("errors", 5000, 3) else {
+            return;
+        };
+        let t = std::time::Instant::now();
+        let r = lsp.check(&paths, false).await.unwrap();
+        assert!(t.elapsed() < Duration::from_millis(3000), "{:?}", t.elapsed());
+        assert_eq!(r.matches("1 problem").count(), 3, "{r}");
+    }
+
+    /// A server that dies fails at once, and a `read` doesn't use up the one notice.
+    #[tokio::test]
+    async fn start_failure_is_told_on_the_first_edit() {
+        let Some((_d, lsp, paths)) = fake("crash", 3000, 1) else {
+            return;
+        };
+        let t = std::time::Instant::now();
+        assert_eq!(lsp.check(&paths, true).await, None, "a read reports nothing");
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        let r = lsp.check(&paths, false).await.unwrap();
+        assert!(r.contains("language server unavailable"), "{r}");
+        assert_eq!(lsp.check(&paths, false).await, None, "said once");
+    }
+
+    #[tokio::test]
+    async fn unhealthy_notice_survives_a_read() {
+        let Some((_d, lsp, paths)) = fake("unhealthy", 3000, 1) else {
+            return;
+        };
+        assert_eq!(lsp.check(&paths, true).await, None);
+        let r = lsp.check(&paths, false).await.unwrap();
+        assert!(r.contains("no std sources"), "{r}");
+        assert_eq!(lsp.check(&paths, false).await, None, "said once");
+    }
+
+    /// A slow start doesn't hold the call: the file is "not checked" until it's up.
+    #[tokio::test]
+    async fn slow_start_is_not_waited_for() {
+        let Some((_d, lsp, paths)) = fake("slow", 300, 1) else {
+            return;
+        };
+        let t = std::time::Instant::now();
+        let r = lsp.check(&paths, false).await.unwrap();
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        assert!(r.contains("still starting"), "{r}");
     }
 
     /// A real server, when this machine has one: an edit that breaks the file is reported.
