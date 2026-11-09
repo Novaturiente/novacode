@@ -1270,7 +1270,9 @@ impl App {
             }
             // The approval card is keys only (TP5): a stray click never grants anything.
             Event::Mouse(m) if self.approvals.front().is_some_and(|c| c.contains(m.column, m.row)) => {}
-            Event::Mouse(m) if self.approvals.is_empty() && self.asks.front().is_some_and(|f| f.contains(m.column, m.row)) => {
+            Event::Mouse(m)
+                if self.approvals.is_empty() && self.asks.front().is_some_and(|f| f.contains(m.column, m.row)) =>
+            {
                 if m.kind == MouseEventKind::Down(MouseButton::Left) {
                     let done = self.asks.front_mut().unwrap().click(m.row);
                     self.ask_done(done);

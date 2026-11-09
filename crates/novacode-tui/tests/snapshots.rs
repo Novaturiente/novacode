@@ -159,7 +159,9 @@ fn ask_db(a: &mut App, n: usize) -> tokio::sync::oneshot::Receiver<Option<Vec<no
 
 /// The screen row holding `text` (first match).
 fn row_of(s: &str, text: &str) -> u16 {
-    s.lines().position(|l| l.contains(text)).unwrap_or_else(|| panic!("no {text}: {s}")) as u16
+    s.lines()
+        .position(|l| l.contains(text))
+        .unwrap_or_else(|| panic!("no {text}: {s}")) as u16
 }
 
 /// The ask form's last line inside its frame: the key hints.
@@ -1067,10 +1069,7 @@ fn approval_card_ignores_clicks() {
     a.age_approvals();
     let s = screen(&mut a, 80, 24);
     let keys = row_of(&s, "y once");
-    assert!(
-        s.contains("y once · a this session · A always · n deny"),
-        "{s}"
-    );
+    assert!(s.contains("y once · a this session · A always · n deny"), "{s}");
     assert!(s.contains("Bash(rm -rf:*)"), "the rule stays visible: {s}");
     assert!(!s.contains("why:"), "{s}");
     let top = row_of(&s, "Allow?");
