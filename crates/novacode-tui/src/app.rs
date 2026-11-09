@@ -391,44 +391,67 @@ struct Shown {
 struct Anchor {
     turn: usize,
     /// The key line, as an offset inside the turn.
-    off: usize,
-    /// The key line's text (empty: use `off` as is) and the turn's height when drawn.
+    key_line: usize,
+    /// The key line's text (empty: use `key_line` as is).
     text: String,
-    len: usize,
+    /// The turn's height when drawn.
+    turn_rows: usize,
     /// Rows from the top of the view down to the key line.
-    back: usize,
+    rows_above_key: usize,
 }
 
+/// A shorter line that a key line may have re-wrapped into must be at least this long
+/// (chars) to count as the same line; shorter ones match too much.
+const REWRAP_MIN: usize = 12;
+
 impl Anchor {
-    /// Line `off` of `turn` at the top, as set by a scroll.
-    fn at(turn: usize, off: usize) -> Self {
+    /// Line `key_line` of `turn` at the top, as set by a scroll.
+    fn at(turn: usize, key_line: usize) -> Self {
         Anchor {
             turn,
-            off,
+            key_line,
             text: String::new(),
-            len: 0,
-            back: 0,
+            turn_rows: 0,
+            rows_above_key: 0,
         }
     }
 
-    /// The anchor for a view drawn from `top`: the first non-blank line in view of the top line's turn.
+    /// The anchor for a view drawn from `top`: the first line in view of the top line's
+    /// turn that can be found again by its text. Not a border or pad row, not a line whose
+    /// text repeats in the turn, not a line redrawn as time passes (a running tool);
+    /// without one, the top line's offset in its turn.
     fn capture(view: &View, top: usize, h: usize) -> Self {
-        let turn = view.starts.partition_point(|&st| st <= top).saturating_sub(1);
+        let turn = view.turn_at(top);
         let (start, end) = turn_span(view, turn);
-        let text = |i: usize| wrap::plain(&view.lines[i]).trim_end().to_string();
-        let key = (top..end.min(top + h))
-            .find(|&i| !text(i).trim().is_empty())
-            .unwrap_or(top);
-        Anchor {
-            turn,
-            off: key.saturating_sub(start),
-            text: if key < view.lines.len() {
-                text(key)
-            } else {
-                String::new()
+        let texts: Vec<String> = (start..end)
+            .map(|i| {
+                view.line(i)
+                    .map(|l| wrap::plain(l).trim_end().to_string())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let mut count = std::collections::HashMap::<&str, usize>::new();
+        for t in &texts {
+            *count.entry(t).or_default() += 1;
+        }
+        // Box-drawing and block characters (borders, pads, bars) say nothing about the line.
+        let has_words = |t: &str| {
+            t.chars()
+                .any(|c| !c.is_whitespace() && !('\u{2500}'..='\u{259F}').contains(&c))
+        };
+        let key = (top..end.min(top + h)).find(|&i| {
+            let t = &texts[i - start];
+            has_words(t) && count[t.as_str()] == 1 && !view.changing(i)
+        });
+        match key {
+            Some(key) => Anchor {
+                turn,
+                key_line: key - start,
+                text: texts[key - start].clone(),
+                turn_rows: end - start,
+                rows_above_key: key - top,
             },
-            len: end - start,
-            back: key - top,
+            None => Anchor::at(turn, top.saturating_sub(start)),
         }
     }
 
@@ -436,8 +459,8 @@ impl Anchor {
     /// else a line that starts like it (a re-wrap), else the same share of the turn.
     fn top(&self, view: &View) -> usize {
         let (start, end) = turn_span(view, self.turn);
-        let guess = start + self.off;
-        let text = |i: usize| wrap::plain(&view.lines[i]);
+        let guess = start + self.key_line;
+        let text = |i: usize| view.line(i).map(wrap::plain).unwrap_or_default();
         let key = if self.text.is_empty() || guess < end && text(guess).trim_end() == self.text {
             guess
         } else {
@@ -446,18 +469,22 @@ impl Anchor {
                     .filter(|&i| hit(text(i).trim_end()))
                     .min_by_key(|&i| i.abs_diff(guess))
             };
+            let rewrapped = |t: &str| {
+                !t.trim().is_empty()
+                    && (t.starts_with(&self.text) || t.chars().count() >= REWRAP_MIN && self.text.starts_with(t))
+            };
             near(&|t| t == self.text)
-                .or_else(|| near(&|t| !t.trim().is_empty() && (t.starts_with(&self.text) || self.text.starts_with(t))))
-                .unwrap_or_else(|| start + self.off * (end - start) / self.len.max(1))
+                .or_else(|| near(&rewrapped))
+                .unwrap_or_else(|| start + self.key_line * (end - start) / self.turn_rows.max(1))
         };
-        key.min(end.saturating_sub(1)).saturating_sub(self.back)
+        key.min(end.saturating_sub(1)).saturating_sub(self.rows_above_key)
     }
 }
 
 /// A turn's lines in `view`: (first, end), the end being where the next turn starts.
 fn turn_span(view: &View, turn: usize) -> (usize, usize) {
     let start = view.starts.get(turn).copied().unwrap_or(0);
-    let end = view.starts.get(turn + 1).copied().unwrap_or(view.lines.len());
+    let end = view.starts.get(turn + 1).copied().unwrap_or(view.len());
     (start, end.max(start))
 }
 
@@ -1887,8 +1914,7 @@ impl App {
         }
         let q = s.query.to_lowercase();
         sh.view
-            .lines
-            .iter()
+            .lines()
             .enumerate()
             .filter(|(_, l)| wrap::plain(l).to_lowercase().contains(&q))
             .map(|(i, _)| i)
@@ -2142,7 +2168,7 @@ impl App {
 
     fn top_turn(&self) -> Option<(usize, &Shown)> {
         let s = self.shown.as_ref()?;
-        Some((s.view.starts.partition_point(|&st| st <= s.top).saturating_sub(1), s))
+        Some((s.view.turn_at(s.top), s))
     }
 
     fn jump_prompt(&mut self, dir: isize) {
@@ -2164,7 +2190,7 @@ impl App {
     /// motion runs starts from its target and jumps there, so lag never builds up.
     fn scroll_by(&mut self, delta: isize) {
         let Some(s) = &self.shown else { return };
-        let max_top = s.view.lines.len().saturating_sub(s.area.height as usize);
+        let max_top = s.view.len().saturating_sub(s.area.height as usize);
         let top = (s.target as isize + delta).clamp(0, max_top as isize) as usize;
         let ease = !self.slow() && s.top == s.target && top != s.top;
         self.scroll_from = ease.then(|| (s.top, clock::now()));
@@ -2172,7 +2198,7 @@ impl App {
             self.anchor = None;
             return;
         }
-        let turn = s.view.starts.partition_point(|&st| st <= top).saturating_sub(1);
+        let turn = s.view.turn_at(top);
         let start = s.view.starts.get(turn).copied().unwrap_or(0);
         self.anchor = Some(Anchor::at(turn, top - start));
     }
@@ -2314,14 +2340,10 @@ impl App {
                         .shown
                         .as_ref()
                         .and_then(|s| s.view.toggles.iter().find(|(l, _)| *l == a.line).map(|(_, t)| *t));
-                    let thought = self
-                        .shown
-                        .as_ref()
-                        .and_then(|s| s.view.lines.get(a.line))
-                        .is_some_and(|l| {
-                            let p = wrap::plain(l);
-                            p.starts_with("∴ ")
-                        });
+                    let thought = self.shown.as_ref().and_then(|s| s.view.line(a.line)).is_some_and(|l| {
+                        let p = wrap::plain(l);
+                        p.starts_with("∴ ")
+                    });
                     let image = self
                         .shown
                         .as_ref()
@@ -2427,8 +2449,9 @@ impl App {
     fn selected_text(&self, a: Pos, b: Pos) -> String {
         let Some(s) = &self.shown else { return String::new() };
         let mut out = Vec::new();
-        for n in a.line..=b.line.min(s.view.lines.len().saturating_sub(1)) {
-            let text = wrap::plain(&s.view.lines[n]);
+        for n in a.line..=b.line.min(s.view.len().saturating_sub(1)) {
+            let Some(line) = s.view.line(n) else { break };
+            let text = wrap::plain(line);
             let from = if n == a.line { a.col } else { 0 };
             let to = if n == b.line { b.col + 1 } else { usize::MAX };
             let mut w = 0;
@@ -2694,7 +2717,7 @@ impl App {
         }
         let view = self.tr.layout(area.width as usize, &self.theme);
         let h = area.height as usize;
-        let max_top = view.lines.len().saturating_sub(h);
+        let max_top = view.len().saturating_sub(h);
         let target = self.anchor.as_ref().map_or(max_top, |a| a.top(&view).min(max_top));
         self.anchor = (self.anchor.is_some() && target < max_top).then(|| Anchor::capture(&view, target, h));
         // A scroll motion (TS4): ease out from where it started, 4 frames.
@@ -2710,7 +2733,7 @@ impl App {
                 target
             }
         };
-        let visible: Vec<Line> = view.lines[top..(top + h).min(view.lines.len())].to_vec();
+        let visible = view.window(top, h);
         f.render_widget(Paragraph::new(visible), area);
         // Images only when wholly on screen; otherwise their placeholder line shows.
         #[cfg(feature = "images")]
@@ -2733,7 +2756,7 @@ impl App {
             let buf = f.buffer_mut();
             for row in 0..area.height {
                 let n = top + row as usize;
-                let Some(line) = view.lines.get(n) else { break };
+                let Some(line) = view.line(n) else { break };
                 let plain = wrap::plain(line).to_lowercase();
                 let Some(byte) = plain.find(&q) else { continue };
                 let col = plain[..byte].width() as u16;

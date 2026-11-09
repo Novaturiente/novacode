@@ -1284,6 +1284,35 @@ fn the_top_line_stays_while_content_above_changes() {
     assert_eq!(first(&mut a), top, "panel closed");
 }
 
+/// Review item 2: scrolled up over a running command's tail box, new output does not
+/// move the view (the anchor never keys on a changing or padding row).
+#[test]
+fn the_view_holds_over_a_live_command_tail() {
+    let (mut a, _rx) = app(vec![]);
+    long_reply(&mut a);
+    run_tool(&mut a, "b", "bash", json!({"command": "make"}));
+    let out = |a: &mut App, i: usize| {
+        a.on_agent(AgentEvent::ToolUpdate {
+            call_id: "b".into(),
+            text: format!("out {i}\n"),
+        });
+    };
+    out(&mut a, 1);
+    // One transcript row, scrolled up onto the box's second row: an empty pad row.
+    screen(&mut a, 60, 5);
+    wheel(&mut a, 10, 0, true);
+    let first = screen(&mut a, 60, 5);
+    assert!(first.lines().next().unwrap().starts_with(" ▏  "), "{first}");
+    for i in 2..=14 {
+        out(&mut a, i);
+        let s = screen(&mut a, 60, 5);
+        // The box's second row: the newest lines scroll through it.
+        let want = format!(" ▏ out {} ", i.max(5) - 3);
+        let row = s.lines().next().unwrap();
+        assert!(row.starts_with(&want), "after out {i}:\n{s}\nwas:\n{first}");
+    }
+}
+
 /// An app with `slow` set (L9.17: no motion).
 fn slow_app() -> (App, mpsc::UnboundedReceiver<Cmd>) {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -2772,7 +2801,11 @@ fn a_finished_commands_box_keeps_its_height() {
     key(&mut a, KeyCode::Char('o'), KeyModifiers::ALT);
     a.on_agent(AgentEvent::Settled);
     let s = screen(&mut a, 60, 30);
-    assert_eq!(tool_rows(&s, "bash $ make"), running, "a done, open turn keeps the box\n{s}");
+    assert_eq!(
+        tool_rows(&s, "bash $ make"),
+        running,
+        "a done, open turn keeps the box\n{s}"
+    );
     // Folded once, then opened again: the box is gone (nothing is running any more).
     key(&mut a, KeyCode::Char('o'), KeyModifiers::ALT);
     screen(&mut a, 60, 30);

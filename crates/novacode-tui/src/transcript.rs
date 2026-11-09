@@ -9,6 +9,8 @@ use crate::wrap::{self, sanitize};
 use novacode_types::{Block, BlockKind, Message, StreamEvent};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
+use std::ops::Range;
+use std::sync::Arc;
 use std::time::Instant;
 
 const OUTPUT_TAIL: usize = 4;
@@ -59,6 +61,11 @@ pub struct Tool {
 }
 
 impl Tool {
+    /// Started and not finished: its spinner and timer move.
+    fn running(&self) -> bool {
+        !self.done && self.started.is_some()
+    }
+
     /// A `say` that is drawn as a block (an error result shows as a tool call).
     pub fn is_say(&self) -> bool {
         self.name == "say" && !self.is_error
@@ -138,18 +145,28 @@ impl Img {
 /// The most rows a tool's own `details.ui` lines take.
 const TOOL_UI_ROWS: usize = 12;
 
+/// Where a tool call's rows sit in its turn's layout.
+struct ToolRows {
+    /// Its index in the turn's items.
+    item: usize,
+    /// Its first line inside the turn.
+    first: usize,
+    rows: usize,
+}
+
 struct Layout {
     width: usize,
     expanded: bool,
-    lines: Vec<Line<'static>>,
+    /// Shared with the [`View`]s drawn from it, so a frame never copies a finished turn.
+    lines: Arc<Vec<Line<'static>>>,
     /// (first reserved line inside the turn, rows, image) for open images.
     images: Vec<(usize, usize, Img)>,
     /// (line inside the turn, item index) of image fold lines.
     image_toggles: Vec<(usize, usize)>,
     /// Line offsets (inside this turn) that toggle collapse on click.
     toggles: Vec<usize>,
-    /// (item index, first line, rows) of each tool call, so a tick redraws only its rows.
-    tools: Vec<(usize, usize, usize)>,
+    /// Each tool call's rows, so a tick redraws only its rows.
+    tools: Vec<ToolRows>,
 }
 
 impl Turn {
@@ -175,18 +192,19 @@ impl Turn {
     /// no layout to patch or a tool's height changed (then the whole turn is laid out).
     fn retick(&mut self, width: usize, t: &Theme, tools: (bool, &str)) -> bool {
         let Some(c) = &mut self.cache else { return false };
-        for &(idx, start, rows) in &c.tools {
-            let Some(Item::Tool(tool)) = self.items.get(idx) else {
+        for r in &c.tools {
+            let Some(Item::Tool(tool)) = self.items.get(r.item) else {
                 return false;
             };
-            if tool.done || tool.started.is_none() {
+            if !tool.running() {
                 continue;
             }
             let new = lay_tool(tool, self.holds_box, width, t, tools);
-            if new.len() != rows {
+            if new.len() != r.rows {
                 return false;
             }
-            c.lines.splice(start..start + rows, new);
+            // Copies the turn's lines only while a drawn view still shares them.
+            Arc::make_mut(&mut c.lines).splice(r.first..r.first + r.rows, new);
         }
         true
     }
@@ -247,10 +265,14 @@ impl Thinking {
     }
 }
 
-/// The laid-out transcript for one frame.
+/// The laid-out transcript for one frame. Its lines are runs shared with the turns'
+/// caches, so drawing a frame copies only the rows on screen.
+#[derive(Default)]
 pub struct View {
-    pub lines: Vec<Line<'static>>,
-    /// Where each turn starts in `lines`.
+    /// (first line, lines) of each run, in order.
+    runs: Vec<(usize, Arc<Vec<Line<'static>>>)>,
+    len: usize,
+    /// Where each turn starts.
     pub starts: Vec<usize>,
     /// (line, turn) pairs a click toggles.
     pub toggles: Vec<(usize, usize)>,
@@ -258,6 +280,58 @@ pub struct View {
     pub images: Vec<(usize, usize, Img)>,
     /// (line, turn, item) of image fold lines a click toggles.
     pub image_toggles: Vec<(usize, usize, usize)>,
+    /// Lines redrawn as time passes (running tools, streaming text): never a scroll anchor.
+    pub changing: Vec<Range<usize>>,
+}
+
+impl View {
+    fn push(&mut self, lines: Arc<Vec<Line<'static>>>) {
+        if !lines.is_empty() {
+            let n = lines.len();
+            self.runs.push((self.len, lines));
+            self.len += n;
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn line(&self, i: usize) -> Option<&Line<'static>> {
+        let r = self.runs.partition_point(|(first, _)| *first <= i).checked_sub(1)?;
+        let (first, lines) = &self.runs[r];
+        lines.get(i - first)
+    }
+
+    pub fn lines(&self) -> impl Iterator<Item = &Line<'static>> {
+        self.runs.iter().flat_map(|(_, l)| l.iter())
+    }
+
+    /// Up to `n` lines from `from`, copied (the rows on screen).
+    pub fn window(&self, from: usize, n: usize) -> Vec<Line<'static>> {
+        (from..(from + n).min(self.len))
+            .filter_map(|i| self.line(i).cloned())
+            .collect()
+    }
+
+    /// The turn that line `i` is in.
+    pub fn turn_at(&self, i: usize) -> usize {
+        self.starts.partition_point(|&st| st <= i).saturating_sub(1)
+    }
+
+    /// Line `i` is redrawn as time passes.
+    pub fn changing(&self, i: usize) -> bool {
+        self.changing.iter().any(|r| r.contains(&i))
+    }
+
+    #[cfg(test)]
+    fn to_vec(&self) -> Vec<Line<'static>> {
+        self.lines().cloned().collect()
+    }
 }
 
 impl Transcript {
@@ -682,10 +756,7 @@ impl Transcript {
     /// Animation step: redraw the running tools of the newest turn (only their rows).
     pub fn tick(&mut self) {
         if let Some(turn) = self.turns.last_mut()
-            && turn
-                .items
-                .iter()
-                .any(|i| matches!(i, Item::Tool(t) if !t.done && t.started.is_some()))
+            && turn.items.iter().any(|i| matches!(i, Item::Tool(t) if t.running()))
         {
             turn.ticked = true;
         }
@@ -780,13 +851,8 @@ impl Transcript {
         let hint = self.thinking_hint.clone();
         let live = self.live_view();
         let since = Some(self.live_since.unwrap_or_else(clock::now));
-        let mut v = View {
-            lines: Vec::new(),
-            starts: Vec::new(),
-            toggles: Vec::new(),
-            images: Vec::new(),
-            image_toggles: Vec::new(),
-        };
+        let mut v = View::default();
+        let blank = Arc::new(vec![Line::default()]);
         let images = self.image_rows;
         let last = self.turns.len().saturating_sub(1);
         for (i, turn) in self.turns.iter_mut().enumerate() {
@@ -817,38 +883,45 @@ impl Transcript {
             }
             let c = turn.cache.as_ref().unwrap();
             if i > 0 {
-                v.lines.push(Line::default());
+                v.push(blank.clone());
             }
-            v.starts.push(v.lines.len());
-            v.toggles.extend(c.toggles.iter().map(|o| (v.lines.len() + o, i)));
-            let at = v.lines.len();
+            let at = v.len();
+            v.starts.push(at);
+            v.toggles.extend(c.toggles.iter().map(|o| (at + o, i)));
             v.images
                 .extend(c.images.iter().map(|(o, r, img)| (at + o, *r, img.clone())));
             v.image_toggles
                 .extend(c.image_toggles.iter().map(|(o, item)| (at + o, i, *item)));
-            v.lines.extend(c.lines.iter().cloned());
+            v.changing.extend(
+                c.tools
+                    .iter()
+                    .filter(|r| matches!(turn.items.get(r.item), Some(Item::Tool(t)) if t.running()))
+                    .map(|r| at + r.first..at + r.first + r.rows),
+            );
+            v.push(c.lines.clone());
             if i == last
                 && let Some(live) = &live
             {
                 let md = Some(&mut self.live_md);
-                v.lines
-                    .extend(lay_assistant(live, width, theme, since, thinking, &hint, md));
+                let at = v.len();
+                v.push(Arc::new(lay_assistant(live, width, theme, since, thinking, &hint, md)));
+                v.changing.push(at..v.len());
             }
         }
         if self.turns.is_empty()
             && let Some(live) = &live
         {
             let md = Some(&mut self.live_md);
-            v.lines
-                .extend(lay_assistant(live, width, theme, since, thinking, &hint, md));
+            v.push(Arc::new(lay_assistant(live, width, theme, since, thinking, &hint, md)));
+            v.changing.push(0..v.len());
         }
         if let Some(text) = &self.echo {
             let turn = Turn {
                 items: vec![Item::User(text.clone())],
                 ..Default::default()
             };
-            if !v.lines.is_empty() {
-                v.lines.push(Line::default());
+            if !v.is_empty() {
+                v.push(blank);
             }
             let c = lay_turn(
                 &turn,
@@ -859,7 +932,7 @@ impl Transcript {
                 images,
                 (self.tools_full, &self.tools_hint),
             );
-            v.lines.extend(c.lines);
+            v.push(c.lines);
         }
         v
     }
@@ -998,9 +1071,13 @@ fn lay_turn(
                 lines.extend(lay_assistant(&blocks, width, t, None, thinking, hint, md));
             }
             Item::Tool(tool) => {
-                let start = lines.len();
+                let first = lines.len();
                 lines.extend(lay_tool(tool, turn.holds_box, width, t, tools));
-                tool_rows.push((idx, start, lines.len() - start));
+                tool_rows.push(ToolRows {
+                    item: idx,
+                    first,
+                    rows: lines.len() - first,
+                });
             }
             Item::Image(img) => {
                 let size = if img.w > 0 {
@@ -1058,7 +1135,7 @@ fn lay_turn(
     Layout {
         width,
         expanded: turn.expanded,
-        lines,
+        lines: Arc::new(lines),
         toggles,
         images: imgs,
         image_toggles,
@@ -1809,7 +1886,7 @@ mod reminder_tests {
         tr.settle();
         tr.notice("model → x", false);
         let v = tr.layout(60, &crate::theme::Theme::default());
-        let s: Vec<String> = v.lines.iter().map(crate::wrap::plain).collect();
+        let s: Vec<String> = v.lines().map(crate::wrap::plain).collect();
         let s = s.join("\n");
         assert!(s.contains("▸ 2 notes"), "{s}");
         assert!(!s.contains("proc_1"), "{s}");
@@ -1844,7 +1921,7 @@ mod reminder_tests {
         tr.on_message(&reply(vec![Block::text("done")]));
         tr.settle();
         let v = tr.layout(60, &crate::theme::Theme::default());
-        let s = v.lines.iter().map(crate::wrap::plain).collect::<Vec<_>>().join("\n");
+        let s = v.lines().map(crate::wrap::plain).collect::<Vec<_>>().join("\n");
         let at = |x: &str| s.find(x).unwrap_or_else(|| panic!("{x} missing: {s}"));
         assert!(at("first update") < at("▸ 2 notes"), "{s}");
         assert!(
@@ -1861,7 +1938,7 @@ mod reminder_tests {
         tr.on_message(&reply(vec![Block::text("report")]));
         tr.settle();
         let v = tr.layout(60, &crate::theme::Theme::default());
-        let s = v.lines.iter().map(crate::wrap::plain).collect::<Vec<_>>().join("\n");
+        let s = v.lines().map(crate::wrap::plain).collect::<Vec<_>>().join("\n");
         assert!(!s.contains("schedule s6") && !s.contains("allowed for"), "{s}");
         assert!(s.contains("▸ 2 notes\n") && s.contains("report"), "{s}");
     }
@@ -1887,8 +1964,7 @@ mod reminder_tests {
         tr.settle();
         let v = tr.layout(80, &theme);
         let line = v
-            .lines
-            .iter()
+            .lines()
             .find(|l| crate::wrap::plain(l).contains("context compacted"))
             .expect("the divider stays after the turn folds");
         assert_eq!(crate::wrap::width(&line.spans), 80);
@@ -1898,7 +1974,7 @@ mod reminder_tests {
             "{text}"
         );
         assert!(text.ends_with('━'), "{text}");
-        let all: Vec<String> = v.lines.iter().map(crate::wrap::plain).collect();
+        let all: Vec<String> = v.lines().map(crate::wrap::plain).collect();
         assert!(all.iter().any(|l| l.contains("▸ 1 note")), "{all:?}");
         assert!(!all.iter().any(|l| l.contains("a step note")), "{all:?}");
         assert!(
@@ -2065,7 +2141,7 @@ mod say_tests {
         assert_eq!(plain(&lay_say(&s, false, 80, &Theme::default())), expected);
         let mut tr = Transcript::default();
         tr.on_message(&call(args));
-        let rendered = plain(&tr.layout(80, &Theme::default()).lines);
+        let rendered = plain(&tr.layout(80, &Theme::default()).to_vec());
         for line in &expected[1..] {
             assert!(rendered.iter().any(|l| l == line), "missing {line}: {rendered:?}");
         }
@@ -2218,7 +2294,7 @@ mod say_tests {
         let args = structured_question();
         let mut tr = Transcript::default();
         tr.on_message(&call(args.clone()));
-        let text = plain(&tr.layout(100, &Theme::default()).lines);
+        let text = plain(&tr.layout(100, &Theme::default()).to_vec());
         assert!(text.iter().any(|l| l == "│ What you requested:"), "{text:?}");
         assert!(text.iter().any(|l| l == "│ 1. Wait — keep tasks blocked — No changes"));
         let mut s: Say = serde_json::from_value(args).unwrap();
@@ -2268,8 +2344,8 @@ mod say_tests {
             replay.on_message(&call(args));
             replay.on_message(&result);
             replay.settle();
-            let text = plain(&live.layout(100, &Theme::default()).lines);
-            assert_eq!(text, plain(&replay.layout(100, &Theme::default()).lines));
+            let text = plain(&live.layout(100, &Theme::default()).to_vec());
+            assert_eq!(text, plain(&replay.layout(100, &Theme::default()).to_vec()));
             assert!(text.iter().any(|l| l == expected), "{text:?}");
             assert!(text.iter().any(|l| l == "│ ✓ you answered: Wait — keep tasks blocked"));
         }
@@ -2379,8 +2455,8 @@ mod say_tests {
             replay.on_message(&m);
         }
         replay.settle();
-        let a = plain(&live.layout(70, &t).lines);
-        let b = plain(&replay.layout(70, &t).lines);
+        let a = plain(&live.layout(70, &t).to_vec());
+        let b = plain(&replay.layout(70, &t).to_vec());
         assert_eq!(a, b);
         assert!(
             a.iter().any(|l| l.contains("WARNING")) && !a.iter().any(|l| l.contains("tool call")),
@@ -2398,7 +2474,7 @@ mod say_tests {
             details: None,
         });
         bad.settle();
-        let lines = plain(&bad.layout(70, &t).lines);
+        let lines = plain(&bad.layout(70, &t).to_vec());
         assert!(lines.iter().any(|l| l.contains("1 tool call")), "{lines:?}");
     }
 }
@@ -2424,5 +2500,53 @@ mod search_tests {
             with_sources("1.99.1", Some(&r)),
             "1.99.1\n\nSources:\n- [A](https://a)\n- [https://b](https://b)"
         );
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use novacode_types::{AssistantMessage, StopReason};
+
+    /// Review item 6: a frame shares each finished turn's cached lines with the view
+    /// instead of copying them, so its cost doesn't grow with the transcript.
+    #[test]
+    fn a_long_transcript_lays_out_without_copying_finished_turns() {
+        let mut tr = Transcript::default();
+        for i in 0..2000 {
+            tr.on_message(&Message::user(format!("question {i}")));
+            tr.on_message(&Message::Assistant(AssistantMessage {
+                content: vec![Block::text(format!("answer {i}\n\n- one\n- two"))],
+                stop: StopReason::Stop,
+                usage: Default::default(),
+                provider: "p".into(),
+                model: "m".into(),
+                response_id: None,
+                error_message: None,
+                thinking_level: None,
+            }));
+        }
+        tr.settle();
+        let t = Theme::default();
+        let first = tr.layout(80, &t);
+        // The newest turn changes; the other 1,999 must come from the cache untouched.
+        tr.notice("a new note", false);
+        let next = tr.layout(80, &t);
+        assert_eq!(next.starts.len(), 2000);
+        let run = |v: &View, turn: usize| {
+            let at = v.starts[turn];
+            v.runs
+                .iter()
+                .find(|(first, _)| *first == at)
+                .map(|(_, l)| l.clone())
+                .unwrap()
+        };
+        for i in 0..1999 {
+            let cached = &tr.turns[i].cache.as_ref().unwrap().lines;
+            assert!(Arc::ptr_eq(&run(&next, i), cached), "turn {i} was copied");
+            assert!(Arc::ptr_eq(&run(&first, i), cached), "turn {i} was laid out again");
+        }
+        assert!(!Arc::ptr_eq(&run(&next, 1999), &run(&first, 1999)));
+        assert!(next.lines().any(|l| wrap::plain(l).contains("a new note")));
     }
 }
