@@ -11,7 +11,7 @@ target=x86_64-unknown-linux-musl
 CC_x86_64_unknown_linux_musl="$cc" \
   CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-feature=+crt-static" \
   cargo build --release --locked --target "$target" -p novacode
-bin="target/$target/release/novacode"
+bin="${CARGO_TARGET_DIR:-target}/$target/release/novacode"
 file "$bin" | grep -q "static" || { echo "not a static binary: $(file "$bin")" >&2; exit 1; }
 ls -lh "$bin"
 if [ $# -gt 0 ]; then

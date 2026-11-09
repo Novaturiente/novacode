@@ -1,6 +1,7 @@
 //! Plain data shared by every crate (L1). No I/O, no logic beyond helpers.
 //!
-//! Serde policy (L1.6): enums are tagged with `"type"`, optional fields default
+//! Serde policy (L1.6): enums are tagged with `"type"` (except `Message`: `"role"`,
+//! `StreamEvent`: `"stream"`, `ui::UiOp`: `"op"`), optional fields default
 //! and are skipped when empty, unknown fields are ignored, unknown blocks load
 //! as [`Block::Unknown`]. Maps keep insertion order (`preserve_order`) so the
 //! bytes we store are the bytes we send (L1.7 rule 3).

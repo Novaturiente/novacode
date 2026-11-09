@@ -27,7 +27,8 @@ pub const API_VERSION: u32 = 1;
 
 /// What the extension's `novacode.*` calls reach on the host side.
 pub trait ExtHost: Send + Sync + 'static {
-    /// `op` is `exec`, `readFile`, `writeFile`, `notify`, `remind`, `log`, `ui`, `ask`, `messages`, `complete` or `spawnAgent`.
+    /// `op` is `exec`, `readFile`, `writeFile`, `notify`, `remind`, `log`, `ui`, `ask`, `messages`, `complete`,
+    /// `spawnAgent`, `sendMessage`, `settings`, `stateAppend` or `stateEntries`.
     fn call(&self, op: String, args: Value) -> BoxFuture<'static, Result<Value, String>>;
 }
 
