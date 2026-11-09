@@ -19,7 +19,11 @@ fn app(history: Vec<Message>) -> (App, mpsc::UnboundedReceiver<Cmd>) {
 /// `attached`: the session id of an attach window.
 fn app_at(history: Vec<Message>, attached: Option<&str>) -> (App, mpsc::UnboundedReceiver<Cmd>) {
     let (tx, rx) = mpsc::unbounded_channel();
-    let init = Init {
+    (App::new(init(history, attached), tx), rx)
+}
+
+fn init(history: Vec<Message>, attached: Option<&str>) -> Init {
+    Init {
         model: "claude/opus".into(),
         cwd: "/home/u/proj".into(),
         branch: Some("main".into()),
@@ -45,8 +49,122 @@ fn app_at(history: Vec<Message>, attached: Option<&str>) -> (App, mpsc::Unbounde
         slow: false,
         images: "off".into(),
         procs: Vec::new(),
+    }
+}
+
+/// An empty app with Nerd (`true`) or plain icons, for golden screens.
+fn app_icons(nerd: bool) -> (App, mpsc::UnboundedReceiver<Cmd>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut i = init(vec![], None);
+    i.nerd_icons = nerd;
+    (App::new(i, tx), rx)
+}
+
+/// Golden screen (TP2): compares the screen text with `tests/golden/<name>.txt`.
+/// A missing file fails; `UPDATE_GOLDEN=1 cargo test -p novacode-tui` (re)writes them.
+fn golden(name: &str, got: &str) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/golden/{name}.txt"));
+    if std::env::var_os("UPDATE_GOLDEN").is_some() {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, got).unwrap();
+        return;
+    }
+    let want = std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("golden {name} missing; UPDATE_GOLDEN=1 to write it\n{got}"));
+    assert_eq!(got, want, "golden {name} differs; UPDATE_GOLDEN=1 to accept");
+}
+
+/// Every golden screen is drawn at 80 and 120 columns, with plain and Nerd icons.
+fn goldens(name: &str, h: u16, setup: impl Fn(&mut App)) {
+    for nerd in [false, true] {
+        for w in [80, 120] {
+            let (mut a, _rx) = app_icons(nerd);
+            setup(&mut a);
+            let icons = if nerd { "nerd" } else { "plain" };
+            golden(&format!("{name}_{w}_{icons}"), &screen(&mut a, w, h));
+        }
+    }
+}
+
+/// TP2 baseline: the Tasks tab with a long title, a project tag, a 3-hour age, several
+/// running rows and the second row selected. Below 100 columns the panel is hidden.
+#[test]
+fn golden_tasks_tab() {
+    // The clock shows minutes past an hour, so a slow test still matches.
+    let ago = |s: u64| novacode_tui::panel::now_ms() - s * 1000 - 20_000;
+    let row = |label: &str, repo: &str, secs: u64| novacode_tui::panel::TaskRow {
+        label: label.into(),
+        repo: repo.into(),
+        state: "running".into(),
+        model: "claude/claude-sonnet-5-5".into(),
+        tokens: 41_200,
+        started_ms: ago(secs),
+        session: Some(format!("01{label}")),
+        ..Default::default()
     };
-    (App::new(init, tx), rx)
+    goldens("tasks_tab", 24, |a| {
+        a.on_ui(UiEvent::Board {
+            tasks: vec![
+                row("T3-fix-the-parser-for-nested-generic-arguments", "novacode", 3 * 3600),
+                row("T4-docs-site-search", "site", 2 * 3600),
+                row("T5-api-retry-backoff", "api", 3600),
+            ],
+            needs: vec![],
+        });
+        a.panel.visible = true;
+        a.panel.show_tab("tasks");
+        a.panel.focused = true;
+        key(a, KeyCode::Down, KeyModifiers::NONE);
+    });
+}
+
+/// TP2 baseline: an ask form whose three choices each have a description.
+#[test]
+fn golden_ask_form() {
+    goldens("ask_form", 24, |a| {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        std::mem::forget(rx);
+        let choice = |label: &str, description: &str, recommended| Choice {
+            label: label.into(),
+            description: Some(description.into()),
+            preview: None,
+            recommended,
+        };
+        a.on_ui(UiEvent::Ask(novacode_tui::ask::AskReq {
+            id: 1,
+            questions: vec![Question {
+                question: "Which database should the service use?".into(),
+                header: Some("Database".into()),
+                options: vec![
+                    choice("Postgres", "Relational, already run in production.", true),
+                    choice("SQLite", "One file, no server; fine for one writer.", false),
+                    choice("Redis", "In memory; fast, but data needs care.", false),
+                ],
+                multi: false,
+            }],
+            reply,
+        }));
+    });
+}
+
+/// TP2 baseline: the approval card for a risky command.
+#[test]
+fn golden_approval_card() {
+    goldens("approval_card", 24, |a| {
+        a.on_agent(AgentEvent::AgentStart);
+        a.on_agent(AgentEvent::Message(Message::user("clean")));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::mem::forget(rx);
+        a.on_ui(UiEvent::Approve(ApproveReq {
+            id: 1,
+            tool: "bash".into(),
+            detail: "rm -rf target".into(),
+            reason: "rm -r deletes files".into(),
+            rule: "rm -rf target".into(),
+            risky: true,
+            reply: tx,
+        }));
+    });
 }
 
 /// L9 `/kill`: in a session's own window it is refused with a pointer to `/quit`.

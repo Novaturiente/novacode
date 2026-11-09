@@ -1,0 +1,24 @@
+
+
+
+
+╭ Question · Database ─────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Which database should the service use?                                                                               │
+│                                                                                                                      │
+│  ▸ 1. Postgres  recommended                                                                                          │
+│       Relational, already run in production.                                                                         │
+│                                                                                                                      │
+│    2. SQLite                                                                                                         │
+│       One file, no server; fine for one writer.                                                                      │
+│                                                                                                                      │
+│    3. Redis                                                                                                          │
+│       In memory; fast, but data needs care.                                                                          │
+│                                                                                                                      │
+│    ✎ Type something…                                                                                                 │
+│                                                                                                                      │
+│ ↑↓ move · Enter choose · n note · 1-9 pick · ← back · Esc dismiss                                                    │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ ? waiting for your answer                                                                  opus · medium  proj  ⎇ main

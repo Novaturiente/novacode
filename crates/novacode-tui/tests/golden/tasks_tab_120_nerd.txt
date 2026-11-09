@@ -1,0 +1,24 @@
+                                                                                │  1  Tasks
+                                                                                │ ━━━━━━━━━━━
+                                                                                │   ├─ T3-fix-the-parser-for-nes… 3h00m
+                                                                                │   │   running · claude/claude-sonnet-…
+                                                                                │   ├─ T4-docs-site-search site   2h00m
+                                                                                │   │   running · claude/claude-sonnet-…
+                                                                                │   └─ T5-api-retry-backoff api   1h00m
+                                                                                │       running · claude/claude-sonnet-…
+                                                                                │
+                                                                                │
+                                                                                │
+                                                                                │
+                                                                                │
+                                                                                │
+                                                                                │
+                                                                                │
+                                                                                │
+                                                                                │
+                                                                                │
+                                                                                │
+╭──────────────────────────────────────────────────────────────────────────────╮│
+│                                                                              ││
+╰──────────────────────────────────────────────────────────────────────────────╯│
+ ● ready                                            opus · medium  proj  ⎇ main │  ⏎ attach  1-9 ⇥ tab  esc back
