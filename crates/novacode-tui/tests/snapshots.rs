@@ -2362,6 +2362,44 @@ fn streamed_table_columns_only_widen() {
     }
 }
 
+/// Review item 5: a streamed table's columns don't narrow when the reply ends, while the
+/// rest of the reply drains or once it is committed.
+#[test]
+fn a_streamed_tables_columns_survive_the_reply_ending() {
+    for drain in [false, true] {
+        let (mut a, _rx) = app(vec![]);
+        start_reply(&mut a);
+        let col = |a: &mut App| {
+            let s = screen(a, 60, 40);
+            let sep = s.lines().find(|l| l.contains('┼')).unwrap_or_else(|| panic!("{s}"));
+            sep.chars().position(|c| c == '┼').unwrap()
+        };
+        let mut text = String::new();
+        for chunk in ["| name | v |\n|---|---|\n| `ab", "cdef", "`", " | 1 |\n| x | 2 |\n"] {
+            text.push_str(chunk);
+            delta(&mut a, chunk);
+            while a.pace() {}
+            col(&mut a);
+        }
+        let wide = col(&mut a);
+        if drain {
+            let tail = format!("\n{}", "word ".repeat(200));
+            text.push_str(&tail);
+            delta(&mut a, &tail);
+        }
+        a.on_agent(AgentEvent::Message(assistant(
+            vec![Block::text(text.clone())],
+            StopReason::Stop,
+        )));
+        assert_eq!(col(&mut a), wide, "drain {drain}: the reply's end");
+        while a.pace() {
+            assert_eq!(col(&mut a), wide, "drain {drain}: while draining");
+        }
+        a.on_agent(AgentEvent::Settled);
+        assert_eq!(col(&mut a), wide, "drain {drain}: committed");
+    }
+}
+
 /// TS3: when the reply ends, the held-back text keeps climbing for a few frames.
 #[test]
 fn final_message_drains_the_backlog_instead_of_dumping_it() {

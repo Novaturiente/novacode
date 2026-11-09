@@ -79,6 +79,10 @@ pub struct Turn {
     pub expanded: bool,
     cache: Option<Layout>,
     drain: Option<Drain>,
+    /// The table widths each streamed reply reached, by reply number (its count among
+    /// the turn's replies; dividers shift item indices): drawn again, its tables keep
+    /// them (TS3).
+    table_widths: Vec<(usize, Vec<TableWidths>)>,
     /// A running tool's spinner or timer moved: redraw only its rows (TS2).
     ticked: bool,
     /// Its commands keep their reserved tail box (TS2): set while it runs, cleared once
@@ -95,6 +99,28 @@ struct Drain {
     shown: Vec<usize>,
     /// Bytes added per frame.
     step: Vec<usize>,
+    /// Each text block's streamed markdown, carried over from the live reply.
+    md: Vec<markdown::Stream>,
+}
+
+/// Column widths of each table in one text block, in order.
+type TableWidths = Vec<Vec<usize>>;
+
+/// How [`lay_assistant`] draws markdown.
+enum Md<'a> {
+    /// Committed: each text block's table widths from when it streamed (may be empty).
+    Done(&'a [TableWidths]),
+    /// Streaming or draining: each text block's markdown state, kept between frames.
+    Live(&'a mut Vec<markdown::Stream>),
+}
+
+/// `n`, moved forward to the next char boundary of `s`.
+fn ceil_boundary(s: &str, mut n: usize) -> usize {
+    n = n.min(s.len());
+    while !s.is_char_boundary(n) {
+        n += 1;
+    }
+    n
 }
 
 /// An image, base64, with its pixel size (0 when unknown).
@@ -186,6 +212,24 @@ impl Turn {
 
     pub fn touch(&mut self) {
         self.cache = None;
+    }
+
+    /// Keep the table widths of item `item`'s streamed text blocks, when it has tables.
+    fn keep_widths(&mut self, item: usize, md: &[markdown::Stream]) {
+        let w: Vec<TableWidths> = md.iter().map(markdown::Stream::table_widths).collect();
+        if w.iter().any(|t| !t.is_empty()) {
+            let reply = self.reply_no(item);
+            self.table_widths.retain(|(r, _)| *r != reply);
+            self.table_widths.push((reply, w));
+        }
+    }
+
+    /// The replies before item `item`.
+    fn reply_no(&self, item: usize) -> usize {
+        self.items[..item.min(self.items.len())]
+            .iter()
+            .filter(|i| matches!(i, Item::Assistant(_)))
+            .count()
     }
 
     /// Redraw the rows of its running tools in the cached layout. False when there is
@@ -625,7 +669,7 @@ impl Transcript {
             Message::Assistant(a) => {
                 let live = self.live.take().unwrap_or_default();
                 let live_shown = std::mem::take(&mut self.live_shown);
-                self.live_md.clear();
+                let live_md = std::mem::take(&mut self.live_md);
                 let (blocks, shown): (Vec<(BlockKind, String)>, Vec<usize>) = a
                     .content
                     .iter()
@@ -642,30 +686,34 @@ impl Transcript {
                             _ => return None,
                         };
                         // What the stream pacer had shown of it (stream block i).
-                        let mut n = match live.get(i) {
+                        let n = match live.get(i) {
                             Some((k, _)) if *k == block.0 => live_shown.get(i).copied().unwrap_or(0),
                             _ => block.1.len(),
-                        }
-                        .min(block.1.len());
-                        while !block.1.is_char_boundary(n) {
-                            n += 1;
-                        }
+                        };
+                        let n = ceil_boundary(&block.1, n);
                         Some((block, n))
                     })
                     .unzip();
                 let turn = self.turn();
                 if !blocks.is_empty() {
+                    let item = turn.items.len();
                     if blocks.iter().zip(&shown).any(|((_, t), n)| *n < t.len()) {
                         let step = blocks
                             .iter()
                             .zip(&shown)
                             .map(|((_, t), n)| (t.len() - n).div_ceil(DRAIN_FRAMES).max(1))
                             .collect();
+                        if let Some(old) = turn.drain.take() {
+                            turn.keep_widths(old.item, &old.md);
+                        }
                         turn.drain = Some(Drain {
-                            item: turn.items.len(),
+                            item,
                             shown,
                             step,
+                            md: live_md,
                         });
+                    } else {
+                        turn.keep_widths(item, &live_md);
                     }
                     turn.items.push(Item::Assistant(blocks));
                 }
@@ -738,10 +786,7 @@ impl Transcript {
             }
             t.output.push_str(text);
             if t.output.len() > LIVE_CAP {
-                let mut cut = t.output.len() - LIVE_CAP;
-                while !t.output.is_char_boundary(cut) {
-                    cut += 1;
-                }
+                let cut = ceil_boundary(&t.output, t.output.len() - LIVE_CAP);
                 t.output.drain(..cut);
             }
         }
@@ -793,16 +838,13 @@ impl Transcript {
             let mut left = false;
             if let Some(Item::Assistant(blocks)) = turn.items.get(d.item) {
                 for (i, (_, text)) in blocks.iter().enumerate() {
-                    let mut n = (d.shown[i] + d.step[i]).min(text.len());
-                    while !text.is_char_boundary(n) {
-                        n += 1;
-                    }
+                    let n = ceil_boundary(text, d.shown[i] + d.step[i]);
                     d.shown[i] = n;
                     left |= n < text.len();
                 }
             }
-            if !left {
-                turn.drain = None;
+            if !left && let Some(d) = turn.drain.take() {
+                turn.keep_widths(d.item, &d.md);
             }
             turn.cache = None;
             behind |= left;
@@ -816,10 +858,7 @@ impl Transcript {
                 continue;
             }
             let backlog = text.len() - (*shown).min(text.len());
-            let mut next = (*shown + (backlog / 8).max(3)).min(text.len());
-            while !text.is_char_boundary(next) {
-                next += 1;
-            }
+            let next = ceil_boundary(text, *shown + (backlog / 8).max(3));
             *shown = next;
             behind |= next < text.len();
         }
@@ -871,8 +910,10 @@ impl Transcript {
                 fresh = turn.retick(width, theme, tools);
             }
             if !fresh {
+                let mut drain = turn.drain.take();
                 turn.cache = Some(lay_turn(
                     turn,
+                    drain.as_mut(),
                     width,
                     theme,
                     thinking,
@@ -880,6 +921,7 @@ impl Transcript {
                     images,
                     tools,
                 ));
+                turn.drain = drain;
             }
             let c = turn.cache.as_ref().unwrap();
             if i > 0 {
@@ -902,7 +944,7 @@ impl Transcript {
             if i == last
                 && let Some(live) = &live
             {
-                let md = Some(&mut self.live_md);
+                let md = Md::Live(&mut self.live_md);
                 let at = v.len();
                 v.push(Arc::new(lay_assistant(live, width, theme, since, thinking, &hint, md)));
                 v.changing.push(at..v.len());
@@ -911,7 +953,7 @@ impl Transcript {
         if self.turns.is_empty()
             && let Some(live) = &live
         {
-            let md = Some(&mut self.live_md);
+            let md = Md::Live(&mut self.live_md);
             v.push(Arc::new(lay_assistant(live, width, theme, since, thinking, &hint, md)));
             v.changing.push(0..v.len());
         }
@@ -925,6 +967,7 @@ impl Transcript {
             }
             let c = lay_turn(
                 &turn,
+                None,
                 width,
                 theme,
                 thinking,
@@ -957,8 +1000,11 @@ fn images_of(content: &[Block]) -> impl Iterator<Item = Item> + '_ {
     })
 }
 
+/// `drain`: the turn's reply still draining (TS3), taken out of it to lend its markdown.
+#[allow(clippy::too_many_arguments)]
 fn lay_turn(
     turn: &Turn,
+    mut drain: Option<&mut Drain>,
     width: usize,
     t: &Theme,
     thinking: Thinking,
@@ -991,6 +1037,8 @@ fn lay_turn(
             && !prompt_image
     };
     let mut folded = false;
+    // Replies so far (see `Turn::table_widths`).
+    let mut replies = 0;
     // A run of notices reads as one item: one blank line before it, none inside.
     let mut after_notice = false;
     for (idx, item) in turn.items.iter().enumerate() {
@@ -1054,20 +1102,29 @@ fn lay_turn(
                 lines.extend(user_box(text, width, t));
             }
             Item::Assistant(blocks) => {
-                let drain = turn.drain.as_ref().filter(|d| d.item == idx);
+                let reply_no = replies;
+                replies += 1;
+                let mut drain = drain.as_deref_mut().filter(|d| d.item == idx);
                 // Collapsed, a message shows its text, not its thinking.
                 let blocks: Vec<_> = blocks
                     .iter()
                     .enumerate()
-                    .map(|(i, (k, s))| match drain {
+                    .map(|(i, (k, s))| match &drain {
                         Some(d) => (*k, s[..d.shown[i]].to_string()),
                         None => (*k, s.clone()),
                     })
                     .filter(|(k, _)| !collapsed || *k == BlockKind::Text)
                     .collect();
                 // Still draining: streamed markdown, without highlighting.
-                let mut fresh = Vec::new();
-                let md = drain.map(|_| &mut fresh);
+                let md = match &mut drain {
+                    Some(d) => Md::Live(&mut d.md),
+                    None => Md::Done(
+                        turn.table_widths
+                            .iter()
+                            .find(|(r, _)| *r == reply_no)
+                            .map_or(&[][..], |(_, w)| w),
+                    ),
+                };
                 lines.extend(lay_assistant(&blocks, width, t, None, thinking, hint, md));
             }
             Item::Tool(tool) => {
@@ -1207,11 +1264,12 @@ fn lay_assistant(
     live: Option<Instant>,
     thinking: Thinking,
     hint: &str,
-    // Streaming: each text block's finished markdown, kept between frames.
-    mut md: Option<&mut Vec<markdown::Stream>>,
+    mut md: Md,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::default()];
     let mut after_thinking = false;
+    // Text blocks so far: `md` is indexed by it (thinking blocks merge, text never does).
+    let mut text_blocks = 0;
     // Thinking that arrives as several blocks in a row (interleaved thinking) reads as one.
     let mut merged: Vec<(BlockKind, String)> = Vec::new();
     for (kind, text) in blocks {
@@ -1266,15 +1324,19 @@ fn lay_assistant(
                 }
                 lines.push(l);
             }
-            BlockKind::Text => lines.extend(match md.as_deref_mut() {
-                Some(cache) => {
-                    if cache.len() <= j {
-                        cache.resize_with(j + 1, Default::default);
+            BlockKind::Text => {
+                let k = text_blocks;
+                text_blocks += 1;
+                lines.extend(match &mut md {
+                    Md::Live(cache) => {
+                        if cache.len() <= k {
+                            cache.resize_with(k + 1, Default::default);
+                        }
+                        markdown::render_live(text, width, t, &mut cache[k])
                     }
-                    markdown::render_live(text, width, t, &mut cache[j])
-                }
-                None => markdown::render(text, width, t, true),
-            }),
+                    Md::Done(w) => markdown::render_widened(text, width, t, true, w.get(k).map_or(&[], |v| v)),
+                })
+            }
             _ => {}
         }
     }

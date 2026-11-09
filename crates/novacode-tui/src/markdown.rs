@@ -13,7 +13,16 @@ const OPTS: Options = Options::ENABLE_TABLES
 
 /// `highlight`: colour code blocks (off while streaming, so it never runs per frame).
 pub fn render(md: &str, width: usize, t: &Theme, highlight: bool) -> Vec<Line<'static>> {
+    render_widened(md, width, t, highlight, &[])
+}
+
+/// [`render`] with each table's columns at least `tables` wide (by table, then column):
+/// a streamed reply keeps the widths its tables reached while streaming (TS3).
+pub fn render_widened(md: &str, width: usize, t: &Theme, highlight: bool, tables: &[Vec<usize>]) -> Vec<Line<'static>> {
     let mut r = R::new(t, highlight, width);
+    if !tables.is_empty() {
+        r.min_table_widths = Some(tables.to_vec());
+    }
     for ev in Parser::new_ext(md, OPTS) {
         r.event(ev);
     }
@@ -30,6 +39,25 @@ pub struct Stream {
     lines: Vec<Line<'static>>,
     /// Column widths of each table still open; they only grow.
     tables: Vec<Vec<usize>>,
+    /// Column widths of the tables in the finished blocks.
+    done_tables: Vec<Vec<usize>>,
+}
+
+impl Stream {
+    /// Every table's column widths so far, in order: for [`render_widened`].
+    pub fn table_widths(&self) -> Vec<Vec<usize>> {
+        self.done_tables.iter().chain(&self.tables).cloned().collect()
+    }
+}
+
+/// Where the finished blocks of a streamed parse end.
+struct Finished {
+    /// Bytes of the parsed text.
+    src: usize,
+    /// Lines drawn.
+    lines: usize,
+    /// Tables seen.
+    tables: usize,
 }
 
 /// [`render`] for text that only grows, without highlighting: reuses the finished
@@ -44,8 +72,8 @@ pub fn render_live(md: &str, width: usize, t: &Theme, s: &mut Stream) -> Vec<Lin
     let tail = &md[s.src.len()..];
     let mut r = R::new(t, false, width);
     r.out = s.lines.clone();
-    r.grow = Some(std::mem::take(&mut s.tables));
-    // (source offset, lines, tables) before the newest top-level block.
+    r.min_table_widths = Some(std::mem::take(&mut s.tables));
+    // Everything before the newest top-level block.
     let mut done = None;
     let mut depth = 0usize;
     let mut seen = false;
@@ -56,7 +84,11 @@ pub fn render_live(md: &str, width: usize, t: &Theme, s: &mut Stream) -> Vec<Lin
             // A block on the unfinished last line may still turn into part of the one
             // above (`| 1` under a table), so that one isn't finished yet.
             if seen && tail[at..].contains('\n') {
-                done = Some((at, r.out.len(), r.tables_seen));
+                done = Some(Finished {
+                    src: at,
+                    lines: r.out.len(),
+                    tables: r.tables_seen,
+                });
             }
             seen = true;
         }
@@ -67,11 +99,11 @@ pub fn render_live(md: &str, width: usize, t: &Theme, s: &mut Stream) -> Vec<Lin
         }
         r.event(ev);
     }
-    let mut tables = r.grow.take().unwrap_or_default();
-    if let Some((at, n, k)) = done {
-        s.src.push_str(&tail[..at]);
-        s.lines = r.out[..n].to_vec();
-        tables.drain(..k.min(tables.len()));
+    let mut tables = r.min_table_widths.take().unwrap_or_default();
+    if let Some(f) = done {
+        s.src.push_str(&tail[..f.src]);
+        s.lines = r.out[..f.lines].to_vec();
+        s.done_tables.extend(tables.drain(..f.tables.min(tables.len())));
     }
     s.tables = tables;
     r.finish()
@@ -102,8 +134,9 @@ struct R<'a> {
     code: Option<String>,
     links: Vec<String>,
     table: Option<Table>,
-    /// While streaming: each table's column widths so far, so they never shrink.
-    grow: Option<Vec<Vec<usize>>>,
+    /// Each table's column widths so far (streaming, or a streamed reply drawn again):
+    /// no column is drawn narrower, and each grows to what this parse needs.
+    min_table_widths: Option<Vec<Vec<usize>>>,
     tables_seen: usize,
 }
 
@@ -123,7 +156,7 @@ impl<'a> R<'a> {
             code: None,
             links: Vec::new(),
             table: None,
-            grow: None,
+            min_table_widths: None,
             tables_seen: 0,
         }
     }
@@ -393,11 +426,11 @@ impl<'a> R<'a> {
                 widths[i] = widths[i].max(c.width());
             }
         }
-        if let Some(grow) = &mut self.grow {
-            if grow.len() <= self.tables_seen {
-                grow.resize(self.tables_seen + 1, Vec::new());
+        if let Some(mins) = &mut self.min_table_widths {
+            if mins.len() <= self.tables_seen {
+                mins.resize(self.tables_seen + 1, Vec::new());
             }
-            let seen = &mut grow[self.tables_seen];
+            let seen = &mut mins[self.tables_seen];
             for (w, s) in widths.iter_mut().zip(seen.iter()) {
                 *w = (*w).max(*s);
             }
