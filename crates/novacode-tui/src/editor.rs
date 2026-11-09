@@ -543,6 +543,19 @@ impl Editor {
         (shown, ((r - first) as u16, c as u16))
     }
 
+    /// A click at (row, col) of what [`Editor::view`] shows: the cursor goes there,
+    /// or to the row's end when the click is past it.
+    pub fn click(&mut self, width: usize, max: usize, row: usize, col: usize) {
+        let rows = self.rows(width);
+        let (r, _) = self.cursor_pos(&rows);
+        let first = (r + 1).saturating_sub(max);
+        let t = (first + row).min(rows.len() - 1);
+        self.cursor = self.at_col(&rows[t], col);
+        self.hist = None;
+        self.yanked = None;
+        self.last_edit = None;
+    }
+
     /// Rows needed at `width`, for the layout.
     pub fn height(&self, width: usize) -> usize {
         self.rows(width).len()

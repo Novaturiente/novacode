@@ -5,6 +5,6 @@
  Hi! How can I help with
  this project today?
 ╭────────────────────────────╮
-│                            │
+│            ? for shortcuts │
 ╰────────────────────────────╯
  ● ready   ctx 16%  cache 97%
