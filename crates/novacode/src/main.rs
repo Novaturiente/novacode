@@ -1494,6 +1494,8 @@ impl Ctx {
             let known = task.is_some() && saved == task;
             (task, known)
         };
+        // Named as super shows it, so tmux side panels list the task by that name.
+        let task_name = task_id.as_ref().map(|id| superagent::task::session_name(&id.task));
         let (window_tokens, max_tokens) = models::Limits::new(s).of(&route);
         // Cross-session memory (L10.4); `memory.store: false` turns it off.
         let memories = s
@@ -2032,6 +2034,9 @@ impl Ctx {
                     }
                 }
                 None => agent = agent.with_memory(session_worker, m).without_observer(),
+            }
+            if let Some(name) = task_name {
+                agent = agent.with_fixed_name(name);
             }
             if is_super {
                 let root = self.cwd.file_name().unwrap_or(self.cwd.as_os_str()).to_string_lossy();

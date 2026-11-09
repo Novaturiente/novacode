@@ -394,6 +394,15 @@ fn ok_choice(label: &str) -> Choice {
 }
 
 /// The task preamble, in the task's system prompt (not a user message, so it stays cached).
+/// A task session's fixed name: its id as super shows it, without the `<sid4>-` stamp of
+/// its super session (`48e2-T21-cefr` → `T21-cefr`).
+pub fn session_name(id: &str) -> String {
+    match id.split_once('-') {
+        Some((sid, rest)) if sid.len() == 4 && sid.bytes().all(|b| b.is_ascii_hexdigit()) => rest.into(),
+        _ => id.into(),
+    }
+}
+
 pub fn preamble(label: &str) -> String {
     format!(
         "You are task {label}, a session started by novacode's super agent. The user talks to the super agent, \
@@ -5332,6 +5341,15 @@ pub(super) mod tests {
             matches!(tail[0], ClientCmd::Prompt { text, raw: true } if text == "continue"),
             "{tail:?}"
         );
+    }
+
+    /// A task session is named as super shows it, for tmux side panels.
+    #[test]
+    fn a_task_session_is_named_without_its_super_stamp() {
+        assert_eq!(session_name("48e2-T21-cefr-scoring-engine"), "T21-cefr-scoring-engine");
+        assert_eq!(session_name("48e2-T18-review-T16-blind"), "T18-review-T16-blind");
+        assert_eq!(session_name("T1-fix-it"), "T1-fix-it");
+        assert_eq!(session_name("cefr-T1"), "cefr-T1");
     }
 
     /// Real run A/L (R26): read tasks whose answer did not fit in 80 words answered in

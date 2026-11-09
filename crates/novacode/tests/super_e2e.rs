@@ -206,6 +206,13 @@ fn restart_recovery_card_waits_for_a_late_window() {
         t["state"] == "running" && t["session"].as_str().is_some_and(|s| run_file(&home, s).exists())
     });
     let session = task(&home, label)["session"].as_str().unwrap().to_string();
+    // Named as super shows it, for tmux side panels.
+    until("the task session carries its label", || {
+        std::fs::read_to_string(run_file(&home, &session))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .is_some_and(|r| r["state"]["name"] == label)
+    });
     drop(sock);
 
     // Super stops, then its task's process goes.
