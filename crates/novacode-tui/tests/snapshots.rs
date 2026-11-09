@@ -1457,6 +1457,20 @@ fn cards_grow_over_three_frames() {
     assert!(first < card_rows(&screen(&mut a, 80, 30)));
 }
 
+/// Review item 4: on a terminal too short for the whole card, once the growth is over
+/// the card is drawn into the rows it has, so its hint line shows.
+#[test]
+fn a_card_on_a_short_terminal_shows_its_hints_after_growing() {
+    let (mut a, _rx) = app(vec![]);
+    let _answers = ask(&mut a, 3);
+    for _ in 0..4 {
+        draw_live(&mut a, 80, 9);
+        novacode_tui::clock::advance(FRAME);
+    }
+    let s = text(&draw_live(&mut a, 80, 9));
+    assert!(s.contains("enter choose"), "{s}");
+}
+
 /// TS4: a key pressed in a card's first frame is handled.
 #[test]
 fn keys_work_while_a_card_grows() {

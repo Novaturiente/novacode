@@ -2006,7 +2006,7 @@ impl App {
 
     /// A card is about to open: it grows in (TS4) unless one is already on screen.
     fn card_opens(&mut self) {
-        if self.approvals.is_empty() && self.asks.is_empty() {
+        if !self.slow() && self.approvals.is_empty() && self.asks.is_empty() {
             self.card_at = Some(clock::now());
         }
     }
@@ -2014,7 +2014,7 @@ impl App {
     /// A card of `full` rows as drawn now: growing over 3 frames from its start.
     fn card_rows(&self, full: u16) -> u16 {
         match self.card_at {
-            Some(at) if !self.init.slow => {
+            Some(at) => {
                 let frames = (clock::since(at).as_millis() / STEP.as_millis() + 1).min(3) as u16;
                 (full * frames).div_ceil(3)
             }
@@ -2022,9 +2022,14 @@ impl App {
         }
     }
 
+    /// A card opened less than [`GROW`] ago and is not full height yet.
+    fn card_growing(&self) -> bool {
+        self.card_at.is_some_and(|at| clock::since(at) + STEP < GROW)
+    }
+
     /// A scroll or a card is still moving (TS4): the loop draws again next frame.
     pub fn moving(&self) -> bool {
-        !self.init.slow && (self.scroll_from.is_some() || self.card_at.is_some_and(|at| clock::since(at) + STEP < GROW))
+        self.scroll_from.is_some() || self.card_growing()
     }
 
     /// End any motion now: the next frame shows where it was heading. Input does this,
@@ -2161,7 +2166,7 @@ impl App {
         let Some(s) = &self.shown else { return };
         let max_top = s.view.lines.len().saturating_sub(s.area.height as usize);
         let top = (s.target as isize + delta).clamp(0, max_top as isize) as usize;
-        let ease = !self.init.slow && s.top == s.target && top != s.top;
+        let ease = !self.slow() && s.top == s.target && top != s.top;
         self.scroll_from = ease.then(|| (s.top, clock::now()));
         if top >= max_top {
             self.anchor = None;
@@ -2615,10 +2620,15 @@ impl App {
         if self.approvals.is_empty() && self.asks.is_empty() && self.overlay.is_none() {
             f.set_cursor_position(Position::new(inner.x + cc, inner.y + cr));
         }
-        // A growing card (TS4) is laid out at full height; only its top rows show.
-        let grown = Rect {
-            height: full_card.min(area.bottom().saturating_sub(card.y)),
-            ..card
+        // A growing card (TS4) is laid out at full height; only its top rows show. Past
+        // the growth it is drawn into its own rows, which a short screen may cut.
+        let grown = if self.card_growing() {
+            Rect {
+                height: full_card.min(area.bottom().saturating_sub(card.y)),
+                ..card
+            }
+        } else {
+            card
         };
         let below = (grown.height > card.height).then(|| f.buffer_mut().clone());
         // Clicks reach only the rows actually shown.
@@ -2689,7 +2699,7 @@ impl App {
         self.anchor = (self.anchor.is_some() && target < max_top).then(|| Anchor::capture(&view, target, h));
         // A scroll motion (TS4): ease out from where it started, 4 frames.
         let top = match self.scroll_from {
-            Some((from, at)) if !self.init.slow && clock::since(at) + STEP < EASE => {
+            Some((from, at)) if clock::since(at) + STEP < EASE => {
                 let p = (clock::since(at) + STEP).as_secs_f64() / EASE.as_secs_f64();
                 let eased = 1.0 - (1.0 - p) * (1.0 - p);
                 let from = from.min(max_top) as f64;
@@ -2918,7 +2928,7 @@ impl App {
     fn shimmer(&self, t: &Theme) -> Vec<Span<'static>> {
         let dots = &"...   "[3 - (self.spinner / 4 % 4)..][..3];
         let text: Vec<char> = format!("{}{dots}", self.activity).chars().collect();
-        if self.init.slow {
+        if self.slow() {
             return vec![Span::styled(text.into_iter().collect::<String>(), t.text)];
         }
         // A 3-char window, then a pause as long as the text before it comes round again.
