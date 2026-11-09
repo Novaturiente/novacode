@@ -1360,6 +1360,23 @@ impl App {
         self.dirty = true;
         if matches!(ev, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)) {
             self.away.0 = false;
+        }
+        // Motion ends on real input only: any-motion mouse tracking reports every move,
+        // and key releases follow every press.
+        let input = match &ev {
+            Event::Key(k) => k.kind != KeyEventKind::Release,
+            Event::Mouse(m) => matches!(
+                m.kind,
+                MouseEventKind::Down(_)
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight
+            ),
+            Event::Paste(_) => true,
+            _ => false,
+        };
+        if input {
             self.settle();
         }
         match ev {

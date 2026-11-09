@@ -1357,6 +1357,32 @@ fn scrolling_eases_to_its_target() {
     assert_eq!(top_row(&mut a), want);
 }
 
+/// Review item 3: a mouse move (any-motion tracking) or a key release during an ease
+/// does not end it; a key press does.
+#[test]
+fn only_real_input_ends_a_motion() {
+    let (mut a, _rx) = app(vec![]);
+    long_reply(&mut a);
+    top_row(&mut a);
+    key(&mut a, KeyCode::PageUp, KeyModifiers::NONE);
+    assert!(a.moving());
+    a.on_event(Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: 10,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    }));
+    assert!(a.moving(), "a mouse move ends the ease");
+    a.on_event(Event::Key(KeyEvent::new_with_kind(
+        KeyCode::Char('x'),
+        KeyModifiers::NONE,
+        crossterm::event::KeyEventKind::Release,
+    )));
+    assert!(a.moving(), "a key release ends the ease");
+    a.on_event(Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
+    assert!(!a.moving(), "a key press ends it");
+}
+
 /// A one-question form with `n` short context lines and choices A, B.
 fn ask(a: &mut App, n: usize) -> tokio::sync::oneshot::Receiver<Option<Vec<Reply>>> {
     let (reply, answers) = tokio::sync::oneshot::channel();
