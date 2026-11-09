@@ -516,7 +516,8 @@ pub struct Task {
     /// close, a `say` question naming it): a task with none for long is stalled.
     #[serde(skip_serializing_if = "is_default")]
     pub acted_at: u64,
-    /// The user chose on the deploy card (or dismissed it): it isn't asked again.
+    /// The user chose on the deploy card (or dismissed it), or fast mode took it for an
+    /// auto-merge: it isn't asked or auto-merged again.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub deploy_decided: bool,
     /// Code's deploy card is open now (not saved: a restart has no open card).

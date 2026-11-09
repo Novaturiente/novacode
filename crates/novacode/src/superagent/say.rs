@@ -387,19 +387,6 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
                 .iter()
                 .flat_map(|s| [&s.done, &s.next, &s.needs_you, &s.body].into_iter().chain(&s.decided))
         };
-        for s in &a.sections {
-            let n: usize = [&s.done, &s.next, &s.needs_you, &s.body]
-                .into_iter()
-                .chain(&s.decided)
-                .map(|t| t.split_whitespace().count())
-                .sum();
-            if n > SECTION_WORDS {
-                return Err(format!(
-                    "{}: {n} words, at most {SECTION_WORDS} per task; keep the complete picture in fewer plain words",
-                    s.task
-                ));
-            }
-        }
         if !a.detail
             && let Some(t) = texts().find_map(|t| technical(t))
         {
@@ -409,6 +396,32 @@ fn check(a: &Args, board: &Board) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Non-question sections over [`SECTION_WORDS`]: shown anyway (a retry costs a full model
+/// call on super's context), with a warning for next time.
+fn over_cap(a: &Args) -> Option<String> {
+    if a.kind == "question" {
+        return None;
+    }
+    let long: Vec<String> = a
+        .sections
+        .iter()
+        .filter_map(|s| {
+            let n: usize = [&s.done, &s.next, &s.needs_you, &s.body]
+                .into_iter()
+                .chain(&s.decided)
+                .map(|t| t.split_whitespace().count())
+                .sum();
+            (n > SECTION_WORDS).then(|| format!("{}: {n} words", s.task))
+        })
+        .collect();
+    (!long.is_empty()).then(|| {
+        format!(
+            " Over the cap of {SECTION_WORDS} words per task ({}): don't resend it; keep the next one shorter.",
+            long.join(", ")
+        )
+    })
 }
 
 /// The `gate` field's help, in both tools' schemas.
@@ -636,7 +649,7 @@ keeps a General answer on the General charter. Ask only for a gated step: a ques
 deploy, production, delete, cost, scope or unclear) and is refused without one, or when its decision is open on \
 a card already; decide anything else yourself and list it under `decided` in your next update or reply. Other \
 kinds say per task `done`, `next` and `needs_you` in plain words, plus optional `decided` points, at most 40 words \
-per task section (General included). A question is short points: each question field and each blocker's issue, evidence and \
+per task section (General included; longer is shown with a warning, don't resend it). A question is short points: each question field and each blocker's issue, evidence and \
 impact at most 40 words, at most 5 blockers; longer is refused."
     }
     fn schema(&self) -> Value {
@@ -646,7 +659,7 @@ impact at most 40 words, at most 5 blockers; longer is refused."
                 "kind": { "type": "string", "enum": KINDS, "description": "update (task news), question (you need the user's answer), warning (something is wrong), done (work finished), note (an aside), reply (answer to the user's message)." },
                 "priority": { "type": "string", "enum": ["normal", "high"], "description": "high only when the user should look now. Default normal." },
                 "gate": { "type": "string", "enum": GATES, "description": GATE_HELP },
-                "sections": { "type": "array", "minItems": 1, "description": "One subsection per task, with only its facts. Use General for unrelated content. Do not repeat labels. Outside questions: at most 40 words per task section (done, next, needs_you, decided and body together; longer is refused).", "items": { "type": "object", "properties": {
+                "sections": { "type": "array", "minItems": 1, "description": "One subsection per task, with only its facts. Use General for unrelated content. Do not repeat labels. Outside questions: at most 40 words per task section (done, next, needs_you, decided and body together; longer is shown with a warning).", "items": { "type": "object", "properties": {
                     "task": { "type": "string", "description": "Exact board task label, or General." },
                     "done": { "type": "string", "description": "Non-question kinds, required for a task: what finished, one short plain sentence." },
                     "next": { "type": "string", "description": "Non-question kinds, required for a task: what happens next and who does it (you, the task, the user)." },
@@ -753,6 +766,7 @@ impact at most 40 words, at most 5 blockers; longer is refused."
                     }
                 }
             }
+            text += &over_cap(&a).unwrap_or_default();
             ToolOutput {
                 details: Some(json!({ "say": say, "need": id })),
                 ..ToolOutput::text(text)
@@ -912,8 +926,9 @@ mod tests {
         let long = args(json!({"kind": "reply", "sections": [
             {"task": "General", "body": words(30), "decided": [words(5), words(6)]}
         ]}));
-        let e = check(&long, &b).unwrap_err();
-        assert!(e.contains("General: 41 words, at most 40"), "{e}");
+        assert_eq!(check(&long, &b), Ok(()));
+        let w = over_cap(&long).unwrap();
+        assert!(w.contains("General: 41 words") && w.contains("don't resend"), "{w}");
         let mut q = question_args("T2-api");
         q["sections"][0]["decided"] = json!(["x"]);
         assert!(check(&args(q), &b).unwrap_err().contains("`decided`"));
@@ -1323,10 +1338,11 @@ mod tests {
         };
         // 40 per section: 80 in the whole message is fine.
         assert_eq!(check(&msg(36, 40), &b), Ok(()));
-        let e = check(&msg(37, 3), &b).unwrap_err();
-        assert!(e.contains("T2-api: 41 words, at most 40 per task"), "{e}");
-        let e = check(&msg(3, 41), &b).unwrap_err();
-        assert!(e.contains("General: 41 words, at most 40 per task"), "{e}");
+        assert_eq!(over_cap(&msg(36, 40)), None);
+        // Over the cap: shown (no retry), with a warning naming the section.
+        assert_eq!(check(&msg(37, 3), &b), Ok(()));
+        assert!(over_cap(&msg(37, 3)).unwrap().contains("T2-api: 41 words"));
+        assert!(over_cap(&msg(3, 41)).unwrap().contains("General: 41 words"));
         // Questions keep their own per-field caps.
         let mut q = question_args("T2-api");
         q["sections"][0]["question"]["recommendation"] = json!(words(40));

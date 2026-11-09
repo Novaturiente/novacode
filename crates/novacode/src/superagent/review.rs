@@ -400,8 +400,9 @@ need) before any verdict.\n",
     }
     if !done.checks.is_empty() {
         s += "\nRecorded checks: each check the task cited, as code recorded it when it ran (command, exit code, \
-whether it ran before the task's last edit, the end of its output); not the task's words. Re-run the ones that \
-matter, don't take them on trust.\n";
+whether it ran before the task's last edit, how long it took, the end of its output); not the task's words. A \
+check that passed after the last edit is real: don't re-run it unless its output looks wrong. Re-run a check \
+that failed, ran before the last edit, or that you doubt, if it is fast.\n";
         for c in &done.checks {
             s += &format!("{c}\n");
         }
@@ -420,8 +421,9 @@ matter, don't take them on trust.\n";
     if let (Some(_), Some(base)) = (&done.commit, base) {
         let scratch_base = i.scratch.join("base");
         s += &format!(
-            "\nAlso check that nothing else broke (run the tests and builds of the changed code and its callers; the \
-full suite when the impact is unclear) and that there is no new bug (read `git diff {base}...HEAD`).\n"
+            "\nAlso check that nothing else broke (run the fast checks of the changed code and its callers: the \
+typecheck, lint and their tests; never the complete test suite or a production build, which run once before \
+deploy) and that there is no new bug (read `git diff {base}...HEAD`).\n"
         );
         if t.ty == TaskType::Bugfix {
             s += &format!(
@@ -794,6 +796,7 @@ mod tests {
             worktree_copy: vec!["AGENTS.md".into()],
             home: home.clone(),
             watch: Default::default(),
+            auto_merge: false,
         };
         let launcher = Arc::new(FakeLauncher::default());
         let cards = Arc::new(Pick::default());
@@ -1626,6 +1629,7 @@ mod tests {
             worktree_copy: vec![],
             home: fx.sup.home().to_path_buf(),
             watch: Default::default(),
+            auto_merge: false,
         };
         let again = Super::new(&fx.sup.root, fx.sup.dir.clone(), cfg, None, fx.launcher.clone()).unwrap();
         drop(again);

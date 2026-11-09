@@ -258,6 +258,12 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "Super mode (docs/super.md): tasks running at once, review tasks included; a new `task spawn` over the limit waits as `queued`. Messages to existing tasks never wait. At least 1: `0` counts as 1.",
     ),
     (
+        "super.autoMerge",
+        "boolean",
+        "false",
+        "Super mode: a write task whose review approved its commit merges into your local main checkout without a merge card. Never a task accepted without review, a pull request, or a repo whose instructions mention deploying (its deploy card is the merge choice). Push and deploy still ask.",
+    ),
+    (
         "super.tiers",
         "object",
         "presets by model family: `claude` haiku/sonnet/opus (high); `codex` gpt-luna/gpt-sol/gpt-astra (high); `antigravity` gemini-flash medium/gemini-flash high/Gemini Argon (fallback: gemini-flash high)",
@@ -279,7 +285,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "super.watch.progressMinutes",
         "number",
         "20",
-        "Super mode: a task that has worked this long without a `progress` report is asked for one at its next tool boundary (no interrupt); never while it waits on your answer. `0`: no nudges.",
+        "Super mode: a task that has worked this long without a `progress` report is asked for one at its next tool boundary (no interrupt); never while it waits on your answer or is inside a tool call. `0`: no nudges.",
     ),
     (
         "super.watch.stallMinutes",

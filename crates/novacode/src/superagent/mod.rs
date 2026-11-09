@@ -89,7 +89,14 @@ user's yes on its card; review stays the default, so offer it only when the user
 when its report isn't enough.
 - To only ask a task for information (raw output of a check, proof a merge landed), use `task send` with \
 `question: true`: its state and review stay as they are, it answers in text and its reply wakes you. Use a plain \
-`task send` only for work: it sets the task running again and stops a running review.
+`task send` only for work: it sets the task running again and stops a running review. For evidence only on an \
+approved task (run a check, show output, no code change), add `proof: true`: the approval stays unless the commit \
+changes. A task whose merge landed and whose after steps are done takes no more work: spawn a new task.
+- Checks are split: tasks and reviews run only fast checks of the changed code (typecheck, lint, their tests); \
+the complete test suite and the production build run once, in the deploy step, before any push. Never put a full \
+suite or a production build in `criteria`, and never send a task to run one before its merge.
+- Never tell a task to merge or rebase on its base before `task merge`: the merge rebases it and re-runs the fast \
+checks itself when the base moved.
 - `task merge` merges locally. Use `pr: true` only when the user asked for a pull request, never by your own \
 choice (a remote existing is not a request).
 - After `task merge`, wait for the merge result (it wakes you); call `task close` only after it arrives, never in \
@@ -115,7 +122,8 @@ alone.
 `[proof #N]` log are recorded by code.
 - Never tell a task to skip or leave out its `report`: code needs it to review and merge the work.
 - Never spawn a task to edit novacode's settings (`~/.novacode`, `.novacode/`); tell the user what to change.
-- Deploys and live checks go in spawn's `after` steps, never in `criteria`: reviews judge only the criteria.
+- Deploys and live checks go in spawn's `after` steps, never in `criteria`: reviews judge only the criteria. \
+Code tells the task to run the full pre-deploy gates once before any push or deploy step.
 - Holds: when the user pauses a task, call `task hold` with `user: true` and their reason; when you deliberately \
 keep a task waiting (on another task, a merge, an event), `task hold` with `user: false`. Stall checks skip held \
 tasks. Never ask about, or message, a task the user paused; `task resume` it only when the user asks. Your own \

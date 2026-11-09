@@ -1599,6 +1599,7 @@ impl Ctx {
                 worktree_copy: worktree_copy(s),
                 home: home.to_path_buf(),
                 watch: superagent::watch(s),
+                auto_merge: s.get("super.autoMerge").unwrap_or(false),
             };
             let launcher = Arc::new(task::Procs {
                 exe: live_path(std::env::current_exe()?),

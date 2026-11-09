@@ -354,11 +354,12 @@ impl Watcher {
 
     /// A progress nudge is due at `now`: task `t` has run a turn for `every` seconds (0 = off)
     /// since its last progress report, the run's start and the last nudge, and isn't
-    /// waiting on a card.
+    /// waiting on a card or inside a tool call (the nudge waits for the call to end).
     fn progress_due(&self, now: u64, every: u64, t: &board::Task) -> bool {
         let since = t.health.progress_at.max(self.run_start).max(self.nudged);
         every > 0
             && self.running
+            && self.calls.is_empty()
             && t.kind == board::Kind::Work
             && t.state == State::Running
             && now.saturating_sub(since) >= every
@@ -952,6 +953,7 @@ impl Links {
             self.inform.note(n);
         }
         self.deploy_cards(&sup);
+        self.auto_merges(&sup);
         self.health_check(&sup);
         self.remind(&sup);
         self.upgraded();
@@ -991,6 +993,18 @@ impl Links {
                     true => me.inform.note(out),
                     false => me.inform.wake(out),
                 }
+            });
+        }
+    }
+
+    /// Fast mode: merge approved tasks without a card, off the loop (a merge sends the task work).
+    fn auto_merges(&self, sup: &Arc<Super>) {
+        for id in sup.auto_merge_due() {
+            let (me, sup) = (self.me.clone(), sup.clone());
+            tokio::spawn(async move {
+                let Some(out) = sup.auto_merge(&id).await else { return };
+                let Some(me) = me.upgrade() else { return };
+                me.inform.note(out);
             });
         }
     }
@@ -1987,8 +2001,9 @@ fn done_facts(f: &serde_json::Map<String, Value>) -> board::Done {
             };
             let folder = c["folder"].as_str().map(|d| format!(" in {d}")).unwrap_or_default();
             let mut line = format!(
-                "- `{}`{folder} → {code}{}",
+                "- `{}`{folder} → {code}{}{}",
                 c["command"].as_str().unwrap_or("?"),
+                took(c),
                 stale(c)
             );
             if let Some(tail) = c["tail"].as_str().map(str::trim_end).filter(|t| !t.is_empty()) {
@@ -2150,6 +2165,17 @@ starts a new review.",
         s += &format!("\nIt asks: {q}");
     }
     s
+}
+
+/// How long a reported check ran, so a review skips re-running a slow one it can trust.
+fn took(c: &Value) -> String {
+    match (c["started_at"].as_u64(), c["ended_at"].as_u64()) {
+        (Some(a), Some(b)) if b >= a => match (b - a) / 1000 {
+            s if s < 60 => format!(", took {s}s"),
+            s => format!(", took {} min", s.div_ceil(60)),
+        },
+        _ => String::new(),
+    }
 }
 
 /// The mark on a reported check that ran before the task's last edit.
@@ -3184,6 +3210,7 @@ mod tests {
             worktree_copy: vec![],
             home: home.clone(),
             watch,
+            auto_merge: false,
         };
         let pending = Arc::new(super::super::remind::Pending::default());
         let sup = Arc::new(
@@ -3351,8 +3378,21 @@ mod tests {
             "a progress report restarts the interval"
         );
         assert!(w.progress_due(4200, 1200, &t));
+        // Fast mode: not inside a tool call; due again once it ends.
+        w.calls.insert("c1".into(), ("bash".into(), 4000));
+        assert!(!w.progress_due(4200, 1200, &t), "not inside a tool call");
+        w.calls.clear();
+        assert!(w.progress_due(4200, 1200, &t));
         t.state = State::WaitingYou;
         assert!(!w.progress_due(9000, 1200, &t), "not while waiting on a card");
+    }
+
+    #[test]
+    fn a_review_sees_how_long_each_check_took() {
+        let c = |a: u64, b: Option<u64>| json!({"started_at": a, "ended_at": b});
+        assert_eq!(took(&c(1_000, Some(46_000))), ", took 45s");
+        assert_eq!(took(&c(0, Some(2_041_000))), ", took 35 min");
+        assert_eq!(took(&c(1_000, None)), "", "still running or killed: no time");
     }
 
     #[test]
