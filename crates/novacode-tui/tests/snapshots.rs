@@ -127,7 +127,7 @@ fn draw(a: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
 }
 
 /// The screen row (y) whose text contains `s`.
-fn row_of(buf: &ratatui::buffer::Buffer, s: &str) -> u16 {
+fn buf_row_of(buf: &ratatui::buffer::Buffer, s: &str) -> u16 {
     let text = |y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>();
     (0..buf.area.height)
         .find(|&y| text(y).contains(s))
@@ -188,8 +188,14 @@ fn panel_rows_keep_fixed_columns() {
                 l[..b].chars().count()
             })
             .collect();
-        assert!(tag_at.iter().all(|&x| x == tag_at[0]), "tags share a column {tag_at:?}: {rows:#?}");
-        assert!(!rows[1].contains("a-very-long-project-name"), "the tag is capped: {rows:#?}");
+        assert!(
+            tag_at.iter().all(|&x| x == tag_at[0]),
+            "tags share a column {tag_at:?}: {rows:#?}"
+        );
+        assert!(
+            !rows[1].contains("a-very-long-project-name"),
+            "the tag is capped: {rows:#?}"
+        );
         assert!(rows[0].contains("T3-fix-the-"), "the title keeps its room: {rows:#?}");
         if w == 120 {
             assert!(rows[0].contains('…'), "a long title is cut: {rows:#?}");
@@ -209,19 +215,19 @@ fn panel_selection_is_a_full_width_bar_dim_when_unfocused() {
     key(&mut a, KeyCode::Down, KeyModifiers::NONE);
     let buf = draw(&mut a, 120, 24);
     let x0 = 120 - a.panel.width(120) + 2;
-    let y = row_of(&buf, "T4-docs");
+    let y = buf_row_of(&buf, "T4-docs");
     for yy in [y, y + 1] {
         for x in x0..120 {
             assert_eq!(buf[(x, yy)].bg, sel, "bar cell ({x}, {yy})");
         }
     }
-    let other = row_of(&buf, "T5-api");
+    let other = buf_row_of(&buf, "T5-api");
     assert!((x0..120).all(|x| buf[(x, other)].bg != sel), "only the selected row");
     // Focus back on the input: the bar stays, its text turns dim.
     key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!(a.focus(), Focus::Input);
     let buf = draw(&mut a, 120, 24);
-    let y = row_of(&buf, "T4-docs");
+    let y = buf_row_of(&buf, "T4-docs");
     for x in x0..120 {
         assert_eq!(buf[(x, y)].bg, sel, "unfocused bar cell ({x}, {y})");
         if buf[(x, y)].symbol() != " " {
@@ -263,7 +269,7 @@ fn panel_keys_are_the_same_on_every_tab() {
     let x0 = 120 - a.panel.width(120) + 2;
     let selected = |a: &mut App, s: &str| {
         let buf = draw(a, 120, 24);
-        let y = row_of(&buf, s);
+        let y = buf_row_of(&buf, s);
         buf[(x0, y)].bg == sel
     };
     assert!(selected(&mut a, "read the code"), "the first row starts selected");
@@ -273,7 +279,10 @@ fn panel_keys_are_the_same_on_every_tab() {
     key(&mut a, KeyCode::Up, KeyModifiers::NONE);
     assert!(selected(&mut a, "read the code"), "↑ moves back");
     let s = screen(&mut a, 120, 24);
-    assert!(!s.contains("1 Agent") && !s.contains("1-9"), "numbers are not printed:\n{s}");
+    assert!(
+        !s.contains("1 Agent") && !s.contains("1-9"),
+        "numbers are not printed:\n{s}"
+    );
     assert!(s.contains("↑↓ move · esc back · ←→ tab"), "one footer format:\n{s}");
     key(&mut a, KeyCode::Right, KeyModifiers::NONE);
     assert_eq!(a.panel.shown.as_deref(), Some("files"), "→ next tab");
