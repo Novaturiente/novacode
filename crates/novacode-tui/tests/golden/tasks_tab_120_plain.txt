@@ -1,14 +1,14 @@
-                                                                                │  1 Tasks
-                                                                                │ ━━━━━━━━━
-                                                                                │   ├─◐ T3-fix-the-parser-for-nes… 3h00m
-                                                                                │   │   running · claude/claude-sonnet-…
-                                                                                │   ├─◐ T4-docs-site-search site   2h00m
-                                                                                │   │   running · claude/claude-sonnet-…
-                                                                                │   └─◐ T5-api-retry-backoff api   1h00m
-                                                                                │       running · claude/claude-sonnet-…
-                                                                                │
-                                                                                │
-                                                                                │
+                                                                                │  Tasks
+                                                                                │ ━━━━━━━
+                                                                                │   ├─◐ T3-fix-the-pars… novacode  3h00m
+                                                                                │   │   running ·
+                                                                                │   │   claude/claude-sonnet-5-5 · 41.2k
+                                                                                │   ├─◐ T4-docs-site-se… site      2h00m
+                                                                                │   │   running ·
+                                                                                │   │   claude/claude-sonnet-5-5 · 41.2k
+                                                                                │   └─◐ T5-api-retry-ba… api       1h00m
+                                                                                │       running ·
+                                                                                │       claude/claude-sonnet-5-5 · 41.2k
                                                                                 │
                                                                                 │
                                                                                 │

@@ -119,6 +119,212 @@ fn golden_tasks_tab() {
     });
 }
 
+/// A drawn frame's cells, for colour checks.
+fn draw(a: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+    t.draw(|f| a.draw(f)).unwrap();
+    t.backend().buffer().clone()
+}
+
+/// The screen row (y) whose text contains `s`.
+fn row_of(buf: &ratatui::buffer::Buffer, s: &str) -> u16 {
+    let text = |y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>();
+    (0..buf.area.height)
+        .find(|&y| text(y).contains(s))
+        .unwrap_or_else(|| panic!("{s} not drawn"))
+}
+
+/// Three running tasks: a long title, a long project name, and short ones.
+fn board(a: &mut App) {
+    let ago = |s: u64| novacode_tui::panel::now_ms() - s * 1000 - 20_000;
+    let row = |label: &str, repo: &str, secs: u64| novacode_tui::panel::TaskRow {
+        label: label.into(),
+        repo: repo.into(),
+        state: "running".into(),
+        model: "claude/claude-sonnet-5-5".into(),
+        tokens: 41_200,
+        started_ms: ago(secs),
+        session: Some(format!("01{label}")),
+        ..Default::default()
+    };
+    a.on_ui(UiEvent::Board {
+        tasks: vec![
+            row("T3-fix-the-parser-for-nested-generic-arguments", "novacode", 3 * 3600),
+            row("T4-docs", "a-very-long-project-name", 2 * 3600),
+            row("T5-api", "api", 3600),
+        ],
+        needs: vec![],
+    });
+    a.panel.visible = true;
+    a.panel.show_tab("tasks");
+}
+
+/// TP4: title, tag and age sit in fixed columns with a 2-cell gap before the age, on a
+/// narrow (40) and a wide (60) panel. The title shrinks first; a long tag is capped.
+#[test]
+fn panel_rows_keep_fixed_columns() {
+    for w in [120u16, 240] {
+        let (mut a, _rx) = app(vec![]);
+        board(&mut a);
+        let s = screen(&mut a, w, 24);
+        let edge = (w - a.panel.width(w)) as usize;
+        let rows: Vec<String> = ["T3-", "T4-", "T5-"]
+            .iter()
+            .map(|id| {
+                let l = s.lines().find(|l| l.contains(id)).unwrap_or_else(|| panic!("{s}"));
+                l.chars().skip(edge).collect()
+            })
+            .collect();
+        let panel_w = a.panel.width(w) as usize;
+        let tag_at: Vec<usize> = rows
+            .iter()
+            .zip(["novacode", "a-very", "api"])
+            .map(|(l, tag)| {
+                let c: Vec<char> = l.chars().collect();
+                assert_eq!(c.len(), panel_w, "the age ends at the right edge: {l:?}");
+                let age = c.iter().rposition(|ch| *ch == ' ').unwrap();
+                assert!(c[age - 1] == ' ', "a 2-cell gap before the age: {l:?}");
+                let b = l.rfind(tag).unwrap_or_else(|| panic!("tag {tag} pushed out: {l:?}"));
+                l[..b].chars().count()
+            })
+            .collect();
+        assert!(tag_at.iter().all(|&x| x == tag_at[0]), "tags share a column {tag_at:?}: {rows:#?}");
+        assert!(!rows[1].contains("a-very-long-project-name"), "the tag is capped: {rows:#?}");
+        assert!(rows[0].contains("T3-fix-the-"), "the title keeps its room: {rows:#?}");
+        if w == 120 {
+            assert!(rows[0].contains('…'), "a long title is cut: {rows:#?}");
+        }
+    }
+}
+
+/// TP4: the selected row is one full-width bar in the `selection` colour, its detail
+/// line included; an unfocused panel keeps it, with dim text.
+#[test]
+fn panel_selection_is_a_full_width_bar_dim_when_unfocused() {
+    let t = novacode_tui::theme::Theme::default();
+    let (sel, dim) = (t.selection.bg.unwrap(), t.dim.fg.unwrap());
+    let (mut a, _rx) = app(vec![]);
+    board(&mut a);
+    a.set_focus(Focus::Panel);
+    key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+    let buf = draw(&mut a, 120, 24);
+    let x0 = 120 - a.panel.width(120) + 2;
+    let y = row_of(&buf, "T4-docs");
+    for yy in [y, y + 1] {
+        for x in x0..120 {
+            assert_eq!(buf[(x, yy)].bg, sel, "bar cell ({x}, {yy})");
+        }
+    }
+    let other = row_of(&buf, "T5-api");
+    assert!((x0..120).all(|x| buf[(x, other)].bg != sel), "only the selected row");
+    // Focus back on the input: the bar stays, its text turns dim.
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(a.focus(), Focus::Input);
+    let buf = draw(&mut a, 120, 24);
+    let y = row_of(&buf, "T4-docs");
+    for x in x0..120 {
+        assert_eq!(buf[(x, y)].bg, sel, "unfocused bar cell ({x}, {y})");
+        if buf[(x, y)].symbol() != " " {
+            assert_eq!(buf[(x, y)].fg, dim, "unfocused text is dim at ({x}, {y})");
+        }
+    }
+}
+
+/// TP4: ↑↓ move the selection on every row tab (also one without actions), ←→ switch
+/// tabs, 1–9 still jump but are not printed, and the footer has one format.
+#[test]
+fn panel_keys_are_the_same_on_every_tab() {
+    let t = novacode_tui::theme::Theme::default();
+    let sel = t.selection.bg.unwrap();
+    let (mut a, _rx) = app(vec![]);
+    a.on_agent(AgentEvent::AgentStart);
+    a.on_agent(AgentEvent::ToolStart {
+        call: ToolCall {
+            id: "e".into(),
+            name: "edit".into(),
+            arguments: json!({"path": "src/a.rs"}),
+            arguments_error: None,
+            replay: None,
+        },
+    });
+    a.on_agent(AgentEvent::Message(Message::ToolResult {
+        call_id: "t".into(),
+        tool_name: "todo".into(),
+        content: vec![],
+        is_error: false,
+        details: Some(json!({"todo": [
+            {"id": 1, "text": "read the code", "status": "done"},
+            {"id": 2, "text": "write the panel", "status": "active"},
+        ]})),
+    }));
+    a.panel.visible = true;
+    a.panel.show_tab("agent");
+    a.set_focus(Focus::Panel);
+    let x0 = 120 - a.panel.width(120) + 2;
+    let selected = |a: &mut App, s: &str| {
+        let buf = draw(a, 120, 24);
+        let y = row_of(&buf, s);
+        buf[(x0, y)].bg == sel
+    };
+    assert!(selected(&mut a, "read the code"), "the first row starts selected");
+    key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+    assert!(selected(&mut a, "write the panel"), "↓ moves on a tab without actions");
+    assert!(!selected(&mut a, "read the code"));
+    key(&mut a, KeyCode::Up, KeyModifiers::NONE);
+    assert!(selected(&mut a, "read the code"), "↑ moves back");
+    let s = screen(&mut a, 120, 24);
+    assert!(!s.contains("1 Agent") && !s.contains("1-9"), "numbers are not printed:\n{s}");
+    assert!(s.contains("↑↓ move · esc back · ←→ tab"), "one footer format:\n{s}");
+    key(&mut a, KeyCode::Right, KeyModifiers::NONE);
+    assert_eq!(a.panel.shown.as_deref(), Some("files"), "→ next tab");
+    assert!(selected(&mut a, "src/a.rs"), "a fresh tab selects its first row");
+    key(&mut a, KeyCode::Left, KeyModifiers::NONE);
+    assert_eq!(a.panel.shown.as_deref(), Some("agent"), "← previous tab");
+    key(&mut a, KeyCode::Char('2'), KeyModifiers::NONE);
+    assert_eq!(a.panel.shown.as_deref(), Some("files"), "2 still jumps");
+    assert_eq!(a.focus(), Focus::Panel);
+}
+
+/// TP4: Usage and Timing have no row actions: ↑↓ scroll them, with no selection bar.
+#[test]
+fn usage_and_timing_tabs_scroll() {
+    let t = novacode_tui::theme::Theme::default();
+    let sel = t.selection.bg.unwrap();
+    let (mut a, _rx) = app(vec![]);
+    for _ in 0..8 {
+        a.on_agent(AgentEvent::AgentStart);
+        let mut m = assistant(vec![Block::text("ok")], StopReason::Stop);
+        if let Message::Assistant(x) = &mut m {
+            x.usage = Usage {
+                input: 1000,
+                output: 200,
+                cache_read: 3000,
+                cache_write: 100,
+                reasoning: None,
+            };
+        }
+        a.on_agent(AgentEvent::Message(m));
+        a.on_agent(AgentEvent::Settled);
+    }
+    for (tab, top) in [("timing", "per task"), ("usage", "CONTEXT")] {
+        a.panel.visible = true;
+        a.panel.show_tab(tab);
+        a.set_focus(Focus::Panel);
+        let x0 = 120 - a.panel.width(120) + 2;
+        let s = screen(&mut a, 120, 12);
+        assert!(s.contains(top), "{tab} starts at the top:\n{s}");
+        key(&mut a, KeyCode::Down, KeyModifiers::NONE);
+        let buf = draw(&mut a, 120, 12);
+        let s = screen(&mut a, 120, 12);
+        assert!(!s.contains(top), "↓ scrolls {tab}:\n{s}");
+        assert!(s.contains("↑↓ scroll"), "{tab} footer:\n{s}");
+        let bar = (0..12).any(|y| (x0..120).any(|x| buf[(x, y)].bg == sel));
+        assert!(!bar, "{tab} draws no selection");
+        key(&mut a, KeyCode::Up, KeyModifiers::NONE);
+        assert!(screen(&mut a, 120, 12).contains(top), "↑ scrolls {tab} back");
+    }
+}
+
 /// TP2 baseline: an ask form whose three choices each have a description.
 #[test]
 fn golden_ask_form() {
@@ -1017,7 +1223,8 @@ fn board_snapshot_from_the_wire_fills_the_tasks_tab() {
     a.on_ui(serde_json::from_str::<UiEvent>(wire).unwrap());
     a.tick();
     key(&mut a, KeyCode::Char('p'), KeyModifiers::CONTROL | KeyModifiers::ALT);
-    let s = screen(&mut a, 120, 16);
+    // Wide enough that the title fits beside its ever-growing age.
+    let s = screen(&mut a, 200, 16);
     assert!(s.contains("Tasks") && s.contains("T1-cli-input-errors"), "{s}");
 }
 
