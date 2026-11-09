@@ -1125,16 +1125,18 @@ impl Panel {
                     .iter()
                     .filter(|n| n.parent.as_deref().filter(|p| ids.contains(p)) == parent)
                     .collect();
+                // The guide leaves one cell for the selection pointer before the icon,
+                // so `below` is 3 wide and a child's guide starts under the parent's icon.
                 for (i, n) in kids.iter().enumerate() {
                     let last = i + 1 == kids.len();
+                    let below = format!("{prefix}{}", if last { "   " } else { "│  " });
                     out.push(Row {
                         node: n,
                         title: None,
                         rule: false,
                         guide: format!("{prefix}{}", if last { "└─" } else { "├─" }),
-                        below: format!("{prefix}{}", if last { "  " } else { "│ " }),
+                        below: below.clone(),
                     });
-                    let below = format!("{prefix}{}", if last { "  " } else { "│ " });
                     walk(all, ids, Some(&n.id), &below, out);
                 }
             }
@@ -1346,19 +1348,6 @@ impl Panel {
                     .map(|t| cells(t).min(TAG_MAX))
                     .max()
                     .unwrap_or(0);
-                // Rows sit one cell in: the selected row's lines carry a rail there,
-                // accent while the panel has focus, border grey when it hasn't.
-                let rw = w.saturating_sub(1);
-                let rail = |l: Line<'static>, on: bool| {
-                    let r = match (on, focused) {
-                        (false, _) => Span::raw(" "),
-                        (true, true) => Span::styled("▎", theme.accent),
-                        (true, false) => Span::styled("▎", theme.border),
-                    };
-                    let mut sp = vec![r];
-                    sp.extend(l.spans);
-                    Line::from(sp)
-                };
                 let mut out = Vec::new();
                 let mut owner: Vec<Option<usize>> = Vec::new();
                 let mut sel_line = 0;
@@ -1402,22 +1391,32 @@ impl Panel {
                     let (g, gs) = glyph(n.icon.as_deref(), n.status.as_deref(), nerd, theme);
                     let todo = n.icon.as_deref().is_some_and(|i| i.starts_with("todo:"));
                     let selected = interactive && i == sel;
-                    let label_style = if selected && focused {
-                        theme.accent.add_modifier(Modifier::BOLD)
-                    } else if n.dim && todo {
+                    let label_style = if n.dim && todo {
                         theme.dim.add_modifier(Modifier::CROSSED_OUT)
                     } else if n.dim {
                         theme.text
                     } else {
                         theme.text.add_modifier(Modifier::BOLD)
                     };
-                    // Columns: guide, icon (2 cells), title (shrinks first), tag (at most
+                    // The selected row: bold title, `▸` before the icon (accent, dim unfocused);
+                    // other rows carry on the guide's `─` in that cell.
+                    let label_style = if selected {
+                        label_style.add_modifier(Modifier::BOLD)
+                    } else {
+                        label_style
+                    };
+                    let pointer = match (selected, focused) {
+                        (false, _) => Span::styled("─", theme.border),
+                        (true, true) => Span::styled("▸", theme.accent),
+                        (true, false) => Span::styled("▸", theme.dim),
+                    };
+                    // Columns: guide, pointer (1 cell), icon (2 cells), title (shrinks first), tag (at most
                     // TAG_MAX, gives way below TITLE_MIN, right-aligned so the title takes
                     // what a short tag leaves), a 2-cell gap, the age.
                     let icon = format!("{g}{}", " ".repeat(2usize.saturating_sub(cells(&g)).max(1)));
-                    let fixed = cells(&r.guide) + cells(&icon);
+                    let fixed = cells(&r.guide) + 1 + cells(&icon);
                     let right = age_col.map_or(0, |a| AGE_GAP + a);
-                    let room = rw.saturating_sub(fixed + right);
+                    let room = w.saturating_sub(fixed + right);
                     let tag_w = tag_col.min(room.saturating_sub(TITLE_MIN + 1));
                     let tag = match n.tag.clone() {
                         Some(t) if tag_w > 0 => crate::wrap::truncate(vec![Span::styled(t, theme.dim)], tag_w).spans,
@@ -1425,7 +1424,11 @@ impl Panel {
                     };
                     let tag_cells = crate::wrap::width(&tag);
                     let title_w = room.saturating_sub(if tag_cells > 0 { tag_cells + 1 } else { 0 });
-                    let mut sp = vec![Span::styled(r.guide.clone(), theme.border), Span::styled(icon, gs)];
+                    let mut sp = vec![
+                        Span::styled(r.guide.clone(), theme.border),
+                        pointer,
+                        Span::styled(icon, gs),
+                    ];
                     let title = crate::wrap::truncate(vec![Span::styled(n.label.clone(), label_style)], title_w).spans;
                     let pad = room.saturating_sub(crate::wrap::width(&title) + tag_cells);
                     sp.extend(title);
@@ -1436,12 +1439,12 @@ impl Panel {
                         sp.push(Span::raw(" ".repeat(AGE_GAP + a - cells(&t))));
                         sp.push(Span::styled(t, st));
                     }
-                    let line = crate::wrap::truncate(sp, rw);
+                    let line = crate::wrap::truncate(sp, w);
                     if selected {
                         sel_line = out.len();
                     }
                     owner.resize(out.len(), None);
-                    out.push(rail(line, selected));
+                    out.push(line);
                     owner.push(Some(i));
                     // Details hang under the label; the guide keeps going to the children.
                     let has_kids = rows
@@ -1458,8 +1461,8 @@ impl Panel {
                             v.push(Span::styled(if nerd { "\u{f0da} " } else { "▸ " }, theme.warn));
                         }
                         v.push(Span::styled(d.clone(), theme.dim));
-                        for l in detail_lines(v, rw, &lead) {
-                            out.push(rail(l, selected));
+                        for l in detail_lines(v, w, &lead) {
+                            out.push(l);
                             owner.push(Some(i));
                         }
                     }
@@ -2034,10 +2037,10 @@ mod tests {
         let want = [
             "│  Tasks",
             "│ ━━━━━━━",
-            "│ ▎  ├─◐ T3-fix-parser             novacode  2h00m",
-            "│ ▎  │   running · sonnet-5-5 · 41.2k",
-            "│ ▎  │   › parser fixed; tests pass",
-            "│    └─⏸ T4-docs                       site  1h00m",
+            "│   ├─▸◐ T3-fix-parser             novacode  2h00m",
+            "│   │    running · sonnet-5-5 · 41.2k",
+            "│   │    › parser fixed; tests pass",
+            "│   └──⏸ T4-docs                       site  1h00m",
             "│        blocked: quota · haiku-5-5 · 900",
             "│",
             "│",
@@ -2112,7 +2115,7 @@ mod tests {
             rows,
             vec![
                 ("a".to_string(), "  └─".to_string()),
-                ("b".to_string(), "    └─".to_string())
+                ("b".to_string(), "     └─".to_string())
             ]
         );
         p.sel = 1;

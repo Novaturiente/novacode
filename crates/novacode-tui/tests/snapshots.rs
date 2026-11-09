@@ -184,9 +184,9 @@ fn panel_rows_fill_title_and_detail_room() {
     }
     // Too wide for one line: it wraps at ` · ` only, never inside `gpt-6-codex-…`.
     let t6 = at("T6-");
-    assert!(lines[t6 + 1].ends_with("│   running"), "{:?}\n{s}", lines[t6 + 1]);
+    assert!(lines[t6 + 1].ends_with("│    running"), "{:?}\n{s}", lines[t6 + 1]);
     assert!(
-        lines[t6 + 2].ends_with("│   gpt-6-codex-max-preview · 41.2k"),
+        lines[t6 + 2].ends_with("│    gpt-6-codex-max-preview · 41.2k"),
         "{:?}\n{s}",
         lines[t6 + 2]
     );
@@ -285,36 +285,53 @@ fn panel_rows_keep_fixed_columns() {
     }
 }
 
-/// The selected row carries an accent rail `▎` on its left edge, detail line included,
-/// and an accent title; no background fill. An unfocused panel keeps the rail in grey.
+/// The selected row has an accent `▸` pointer right before its status icon and a bold
+/// title; no background on any cell, detail lines unmarked. Unfocused, the pointer is
+/// dim, the title stays bold and nothing else dims.
 #[test]
-fn panel_selection_is_an_accent_rail_grey_when_unfocused() {
+fn panel_selection_is_a_pointer_and_bold_title() {
     let t = novacode_tui::theme::Theme::default();
-    let (accent, border) = (t.accent.fg.unwrap(), t.border.fg.unwrap());
+    let (accent, dim, sel) = (t.accent.fg.unwrap(), t.dim.fg.unwrap(), t.selection.bg.unwrap());
     let (mut a, _rx) = app(vec![]);
     board(&mut a);
     a.set_focus(Focus::Panel);
     key(&mut a, KeyCode::Down, KeyModifiers::NONE);
-    let buf = draw(&mut a, 120, 24);
     let x0 = 120 - a.panel.width(120) + 2;
-    let y = row_of(&text(&buf), "T4-docs");
-    for yy in [y, y + 1] {
-        assert_eq!(buf[(x0, yy)].symbol(), "▎", "rail at ({x0}, {yy})");
-        assert_eq!(buf[(x0, yy)].fg, accent, "rail colour at ({x0}, {yy})");
+    for focused in [true, false] {
+        if !focused {
+            key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(a.focus(), Focus::Input);
+        }
+        let buf = draw(&mut a, 120, 24);
+        let y = row_of(&text(&buf), "T4-docs");
+        // Title, then its 2-cell status icon column, then the pointer.
+        let tx = (x0..120).find(|&x| buf[(x, y)].symbol() == "T").unwrap();
+        let px = tx - 3;
+        assert_eq!(
+            buf[(px, y)].symbol(),
+            "▸",
+            "pointer before the icon (focused {focused})"
+        );
+        assert_ne!(buf[(px + 1, y)].symbol(), " ", "the icon follows the pointer");
+        let want = if focused { accent } else { dim };
+        assert_eq!(buf[(px, y)].fg, want, "pointer colour (focused {focused})");
+        assert!(
+            buf[(tx, y)].modifier.contains(ratatui::style::Modifier::BOLD),
+            "the selected title is bold (focused {focused})"
+        );
+        assert_ne!(buf[(tx, y)].fg, dim, "the title is not dimmed (focused {focused})");
+        for yy in [y, y + 1] {
+            assert!((x0..120).all(|x| buf[(x, yy)].bg != sel), "no background on line {yy}");
+        }
+        assert!(
+            (x0..120).all(|x| buf[(x, y + 1)].symbol() != "▸"),
+            "the detail line is not marked"
+        );
+        let other = row_of(&text(&buf), "T5-api");
+        assert_eq!(buf[(px, other)].symbol(), "─", "only the selected row");
+        let ox = (x0..120).find(|&x| buf[(x, other)].symbol() == "T").unwrap();
+        assert_eq!(ox, tx, "the pointer column is reserved on every row");
     }
-    let tx = (x0..120).find(|&x| buf[(x, y)].symbol() == "T").unwrap();
-    assert_eq!(buf[(tx, y)].fg, accent, "the selected title is accent");
-    let sel = t.selection.bg.unwrap();
-    assert!((x0..120).all(|x| buf[(x, y)].bg != sel), "no background fill");
-    let other = row_of(&text(&buf), "T5-api");
-    assert_eq!(buf[(x0, other)].symbol(), " ", "only the selected row");
-    // Focus back on the input: the rail stays, in border grey.
-    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
-    assert_eq!(a.focus(), Focus::Input);
-    let buf = draw(&mut a, 120, 24);
-    let y = row_of(&text(&buf), "T4-docs");
-    assert_eq!(buf[(x0, y)].symbol(), "▎");
-    assert_eq!(buf[(x0, y)].fg, border, "unfocused rail is grey");
 }
 
 /// TP4: ↑↓ move the selection on every row tab (also one without actions), ←→ switch
@@ -345,11 +362,9 @@ fn panel_keys_are_the_same_on_every_tab() {
     a.panel.visible = true;
     a.panel.show_tab("agent");
     a.set_focus(Focus::Panel);
-    let x0 = 120 - a.panel.width(120) + 2;
     let selected = |a: &mut App, s: &str| {
-        let buf = draw(a, 120, 24);
-        let y = row_of(&text(&buf), s);
-        buf[(x0, y)].symbol() == "▎"
+        let t = text(&draw(a, 120, 24));
+        t.lines().find(|l| l.contains(s)).is_some_and(|l| l.contains('▸'))
     };
     assert!(selected(&mut a, "read the code"), "the first row starts selected");
     key(&mut a, KeyCode::Down, KeyModifiers::NONE);
