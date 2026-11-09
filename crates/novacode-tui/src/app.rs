@@ -1270,18 +1270,28 @@ impl App {
             }
             // The approval card is keys only (TP5): a stray click never grants anything.
             Event::Mouse(m) if self.approvals.front().is_some_and(|c| c.contains(m.column, m.row)) => {}
+            // A click closes the shortcut sheet and does nothing else (TP8).
+            Event::Mouse(m) if self.sheet => {
+                if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                    self.sheet = false;
+                }
+            }
             Event::Mouse(m)
                 if self.approvals.is_empty() && self.asks.front().is_some_and(|f| f.contains(m.column, m.row)) =>
             {
-                if m.kind == MouseEventKind::Down(MouseButton::Left) {
-                    let done = self.asks.front_mut().unwrap().click(m.row);
-                    self.ask_done(done);
+                let form = self.asks.front_mut().unwrap();
+                match m.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let done = form.click(m.row);
+                        self.ask_done(done);
+                    }
+                    MouseEventKind::ScrollUp => form.wheel(true),
+                    MouseEventKind::ScrollDown => form.wheel(false),
+                    _ => {}
                 }
             }
             Event::Mouse(m) if self.overlay.is_none() => self.on_mouse(m),
-            Event::Mouse(m) => {
-                self.on_screen_mouse(m);
-            }
+            Event::Mouse(m) => self.on_overlay_mouse(m),
             Event::FocusGained => {
                 self.away.0 = false;
                 self.send(Cmd::Focus(true))
@@ -1448,55 +1458,10 @@ impl App {
                 | Overlay::RewindMode(_, p)
                 | Overlay::LoginPick(p)
                 | Overlay::CommandPick(_, p)
-                | Overlay::LoginMethod(_, p) => match p.handle(k, &self.keymap) {
-                    Picked::Pending => {}
-                    Picked::Cancel => self.overlay = None,
-                    Picked::Value(v) => {
-                        let o = self.overlay.take();
-                        match o {
-                            Some(Overlay::Models(_)) => self.set_model(&v),
-                            Some(Overlay::Thinking(_)) => self.set_thinking(&v),
-                            Some(Overlay::LoginPick(_)) => self.send(Cmd::Login {
-                                provider: v,
-                                method: None,
-                            }),
-                            Some(Overlay::CommandPick(command, _)) => self.send(Cmd::Prompt(format!("{command} {v}"))),
-                            Some(Overlay::LoginMethod(provider, _)) => self.send(Cmd::Login {
-                                provider,
-                                method: Some(v),
-                            }),
-                            Some(Overlay::Branch(BranchAction::Rewind, _)) if v == "undo" => {
-                                self.exit = Some(Exit::Rewind {
-                                    at: v,
-                                    files: true,
-                                    chat: false,
-                                })
-                            }
-                            Some(Overlay::Branch(BranchAction::Rewind, _)) => {
-                                let item = |label: &str, value: &str| PickItem {
-                                    label: label.into(),
-                                    detail: String::new(),
-                                    value: value.into(),
-                                };
-                                let items = vec![
-                                    item("Files and conversation", "both"),
-                                    item("Conversation only", "chat"),
-                                    item("Files only", "files"),
-                                ];
-                                self.overlay = Some(Overlay::RewindMode(v, Picker::new("Restore what?", items)));
-                            }
-                            Some(Overlay::Branch(a, _)) => self.exit = Some(Exit::Branch(a, Some(v))),
-                            Some(Overlay::RewindMode(at, _)) => {
-                                self.exit = Some(Exit::Rewind {
-                                    at,
-                                    files: v != "chat",
-                                    chat: v != "files",
-                                })
-                            }
-                            _ => self.exit = Some(Exit::Resume(v)),
-                        }
-                    }
-                },
+                | Overlay::LoginMethod(_, p) => {
+                    let r = p.handle(k, &self.keymap);
+                    self.picked(r);
+                }
             }
             return;
         }
@@ -1951,6 +1916,7 @@ impl App {
                 "/watch" => self.watch(),
                 "/btw" => {
                     let mut c = crate::btw::BtwChat::default();
+                    c.submit_key = self.keymap.keys(A::Submit);
                     if !arg.is_empty() {
                         c.ask(arg.to_string());
                         self.send(Cmd::Btw(arg.to_string()));
@@ -2204,6 +2170,94 @@ impl App {
         }
     }
 
+    /// Mouse over an open overlay (TP8): the wheel scrolls the pager, process view and
+    /// side chat; a click picks in pickers. Anything else selects screen text.
+    fn on_overlay_mouse(&mut self, m: MouseEvent) {
+        let up = match m.kind {
+            MouseEventKind::ScrollUp => Some(true),
+            MouseEventKind::ScrollDown => Some(false),
+            _ => None,
+        };
+        let press = m.kind == MouseEventKind::Down(MouseButton::Left);
+        match (&mut self.overlay, up) {
+            (Some(Overlay::Pager(p)), Some(up)) => p.wheel(up),
+            (Some(Overlay::Procs(p)), Some(up)) => p.wheel(up),
+            (Some(Overlay::Btw(c)), Some(up)) => c.wheel(up),
+            (
+                Some(
+                    Overlay::Models(p)
+                    | Overlay::Sessions(p)
+                    | Overlay::Thinking(p)
+                    | Overlay::Branch(_, p)
+                    | Overlay::RewindMode(_, p)
+                    | Overlay::LoginPick(p)
+                    | Overlay::CommandPick(_, p)
+                    | Overlay::LoginMethod(_, p),
+                ),
+                None,
+            ) if press && p.contains(m.column, m.row) => {
+                let r = p.click(m.column, m.row);
+                self.picked(r);
+            }
+            _ => {
+                self.on_screen_mouse(m);
+            }
+        }
+    }
+
+    /// A picker's key or click result: close it on cancel, act on a pick.
+    fn picked(&mut self, r: Picked) {
+        match r {
+            Picked::Pending => {}
+            Picked::Cancel => self.overlay = None,
+            Picked::Value(v) => {
+                let o = self.overlay.take();
+                match o {
+                    Some(Overlay::Models(_)) => self.set_model(&v),
+                    Some(Overlay::Thinking(_)) => self.set_thinking(&v),
+                    Some(Overlay::LoginPick(_)) => self.send(Cmd::Login {
+                        provider: v,
+                        method: None,
+                    }),
+                    Some(Overlay::CommandPick(command, _)) => self.send(Cmd::Prompt(format!("{command} {v}"))),
+                    Some(Overlay::LoginMethod(provider, _)) => self.send(Cmd::Login {
+                        provider,
+                        method: Some(v),
+                    }),
+                    Some(Overlay::Branch(BranchAction::Rewind, _)) if v == "undo" => {
+                        self.exit = Some(Exit::Rewind {
+                            at: v,
+                            files: true,
+                            chat: false,
+                        })
+                    }
+                    Some(Overlay::Branch(BranchAction::Rewind, _)) => {
+                        let item = |label: &str, value: &str| PickItem {
+                            label: label.into(),
+                            detail: String::new(),
+                            value: value.into(),
+                        };
+                        let items = vec![
+                            item("Files and conversation", "both"),
+                            item("Conversation only", "chat"),
+                            item("Files only", "files"),
+                        ];
+                        self.overlay = Some(Overlay::RewindMode(v, Picker::new("Restore what?", items)));
+                    }
+                    Some(Overlay::Branch(a, _)) => self.exit = Some(Exit::Branch(a, Some(v))),
+                    Some(Overlay::RewindMode(at, _)) => {
+                        self.exit = Some(Exit::Rewind {
+                            at,
+                            files: v != "chat",
+                            chat: v != "files",
+                        })
+                    }
+                    _ => self.exit = Some(Exit::Resume(v)),
+                }
+            }
+        }
+    }
+
     fn selected_text(&self, a: Pos, b: Pos) -> String {
         let Some(s) = &self.shown else { return String::new() };
         let mut out = Vec::new();
@@ -2428,7 +2482,7 @@ impl App {
                 | Overlay::LoginPick(p)
                 | Overlay::CommandPick(_, p)
                 | Overlay::LoginMethod(_, p),
-            ) => p.render(f, dialog::centered(main, 70, 70, 20), t),
+            ) => p.render(f, dialog::centered(main, 70, 70, 20), t, &self.keymap),
             Some(Overlay::Login(v)) => {
                 let w = (main.width * 80 / 100).max(20);
                 v.render(

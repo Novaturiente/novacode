@@ -225,6 +225,16 @@ impl ProcPopup {
             .unwrap_or(0)
     }
 
+    /// A wheel step: `up` shows older output (the draw stops it at the top).
+    pub fn wheel(&mut self, up: bool) {
+        let w = crate::dialog::WHEEL;
+        self.scroll = if up {
+            self.scroll.saturating_add(w)
+        } else {
+            self.scroll.saturating_sub(w)
+        };
+    }
+
     /// A key; true = close.
     pub fn handle(&mut self, k: &crossterm::event::KeyEvent, procs: &[ProcView], page: usize) -> bool {
         use crossterm::event::{KeyCode, KeyModifiers};
@@ -260,7 +270,16 @@ impl ProcPopup {
     ) {
         let inner = crate::dialog::frame(f, area, "Processes", t);
         let (w, h) = (inner.width as usize, inner.height as usize);
-        let keys = Line::styled("←→ process  ↑↓ PgUp PgDn scroll  g/G top/tail  Esc close", t.dim);
+        let keys = crate::hints::hints(
+            &[
+                ("←→", "process"),
+                ("↑↓", "scroll"),
+                ("esc", "close"),
+                ("g/G", "top/tail"),
+            ],
+            w,
+            t,
+        );
         let mut out = Vec::new();
         if procs.is_empty() {
             out.push(Line::styled("no processes (long-running commands land here)", t.dim));

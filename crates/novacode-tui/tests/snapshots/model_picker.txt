@@ -6,7 +6,7 @@
           │   sonnet                             │
  Fixed: th│                                      │h 2.
           │                                      │
- • tests p│                                      │
+ • tests p│ ↑↓ move · enter pick · esc cancel    │
           ╰──────────────────────────────────────╯
  · model → claude/haiku · medium from the next message
    (the cache starts over: ~31k tokens re-sent)

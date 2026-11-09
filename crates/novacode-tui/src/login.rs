@@ -178,23 +178,19 @@ impl LoginView {
             out.extend(text(i, t.dim));
         }
         out.push(Line::default());
+        // Most important first: a narrow dialog drops hints from the end.
         let mut keys = Vec::new();
-        if self.url.is_some() {
-            keys.push(format!("{copy_key} copy URL"));
-            keys.push("Ctrl+O open in browser".into());
+        if self.url.is_some() && !copy_key.is_empty() {
+            keys.push((copy_key, "copy URL"));
         }
         if self.input.is_some() {
-            keys.push("Enter submit".into());
+            keys.push(("enter", "submit"));
         }
-        keys.push(
-            if self.error.is_some() {
-                "Esc close"
-            } else {
-                "Esc cancel"
-            }
-            .into(),
-        );
-        out.extend(text(&keys.join(" · "), t.dim));
+        keys.push(("esc", if self.error.is_some() { "close" } else { "cancel" }));
+        if self.url.is_some() {
+            keys.push(("ctrl+o", "open"));
+        }
+        out.push(crate::hints::hints(&keys, w, t));
         out
     }
 

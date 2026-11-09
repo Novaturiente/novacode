@@ -1279,6 +1279,203 @@ fn a_click_in_the_input_moves_the_cursor() {
     assert_eq!(a.editor.text(), "hello Xworld\nsecond line!");
 }
 
+/// A wheel step at a cell: `up` scrolls up.
+fn wheel(a: &mut App, column: u16, row: u16, up: bool) {
+    let kind = if up {
+        MouseEventKind::ScrollUp
+    } else {
+        MouseEventKind::ScrollDown
+    };
+    a.on_event(Event::Mouse(MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }));
+}
+
+/// The overlay's hint line: the last row inside its frame (the first frame from the top;
+/// the input's is below it).
+fn overlay_keys(s: &str) -> String {
+    let end = s.lines().position(|l| l.trim_start().starts_with('╰')).unwrap();
+    s.lines()
+        .nth(end - 1)
+        .unwrap()
+        .trim_matches(|c| c == '│' || c == ' ')
+        .to_string()
+}
+
+/// TP8: while the shortcut sheet is open, a click closes it and leaves the cursor alone.
+#[test]
+fn a_click_closes_the_shortcut_sheet() {
+    let (mut a, _rx) = app(vec![]);
+    let s = screen(&mut a, 80, 24);
+    let top = s.lines().position(|l| l.starts_with('╭')).unwrap() as u16;
+    typ(&mut a, "?");
+    screen(&mut a, 80, 24);
+    click(&mut a, 10, top + 1);
+    assert_eq!(a.focus(), Focus::Input);
+    assert!(!screen(&mut a, 80, 24).contains("all keys"));
+    typ(&mut a, "hi");
+    assert_eq!(a.editor.text(), "hi");
+}
+
+fn models(a: &mut App) {
+    let items = ["opus", "sonnet", "haiku"]
+        .map(|m| PickItem {
+            label: m.into(),
+            detail: String::new(),
+            value: format!("claude/{m}"),
+        })
+        .to_vec();
+    a.on_ui(UiEvent::Models { result: Ok(items) });
+}
+
+/// TP8: a click on a picker row selects it, a double-click picks it.
+#[test]
+fn picker_click_selects_and_double_click_picks() {
+    let (mut a, mut rx) = app(vec![]);
+    models(&mut a);
+    let s = screen(&mut a, 80, 24);
+    let row = row_of(&s, "sonnet");
+    let col = s.lines().nth(row as usize).unwrap().find("sonnet").unwrap() as u16;
+    click(&mut a, col, row);
+    assert!(screen(&mut a, 80, 24).contains("▸ sonnet"));
+    assert!(rx.try_recv().is_err(), "one click only selects");
+    click(&mut a, col, row);
+    assert_eq!(rx.try_recv().unwrap(), Cmd::SetModel("claude/sonnet".into()));
+    assert_eq!(a.focus(), Focus::Input, "the picker closed");
+}
+
+/// TP8: the wheel scrolls the pager, the process view and the side chat.
+#[test]
+fn the_wheel_scrolls_overlays() {
+    let text: String = (1..=80).map(|i| format!("line {i}\n")).collect();
+    // Pager: starts at the top; down shows later lines, up goes back.
+    let (mut a, _rx) = app(vec![]);
+    a.on_ui(UiEvent::Page {
+        title: "Output".into(),
+        text: text.clone(),
+    });
+    let s = screen(&mut a, 80, 24);
+    assert!(s.contains("line 1\n") || s.contains("line 1 "), "{s}");
+    wheel(&mut a, 40, 10, false);
+    let s = screen(&mut a, 80, 24);
+    assert!(!s.contains("line 2 ") && s.contains("line 4"), "{s}");
+    wheel(&mut a, 40, 10, true);
+    assert!(screen(&mut a, 80, 24).contains("line 2 "));
+    // Process view: follows the tail; up shows older output.
+    let (mut a, _rx) = app(vec![]);
+    typ(&mut a, "/ps");
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    a.on_ui(UiEvent::Procs {
+        items: vec![novacode_tui::procs::ProcView {
+            id: "p1".into(),
+            name: "dev".into(),
+            command: "npm run dev".into(),
+            status: "running".into(),
+            state: "running".into(),
+            started_ms: 1,
+            output: text.clone(),
+        }],
+    });
+    let s = screen(&mut a, 80, 24);
+    assert!(s.contains("line 80"), "{s}");
+    wheel(&mut a, 40, 10, true);
+    assert!(!screen(&mut a, 80, 24).contains("line 80"));
+    wheel(&mut a, 40, 10, false);
+    assert!(screen(&mut a, 80, 24).contains("line 80"));
+    // Side chat: follows the newest; up shows older rows.
+    let (mut a, _rx) = app(vec![]);
+    typ(&mut a, "/btw why");
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    a.on_ui(UiEvent::Btw {
+        result: Ok(text.replace('\n', "\n\n")),
+    });
+    let s = screen(&mut a, 80, 24);
+    assert!(s.contains("line 80"), "{s}");
+    wheel(&mut a, 40, 10, true);
+    assert!(!screen(&mut a, 80, 24).contains("line 80"));
+}
+
+/// TP8: every overlay ends with a hint line in the shared `key action · key action` format.
+#[test]
+fn every_overlay_shows_hints() {
+    let (mut a, _rx) = app(vec![]);
+    models(&mut a);
+    assert_eq!(
+        overlay_keys(&screen(&mut a, 80, 24)),
+        "↑↓ move · enter pick · esc cancel"
+    );
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    a.on_ui(UiEvent::Page {
+        title: "Output".into(),
+        text: "x".into(),
+    });
+    assert!(overlay_keys(&screen(&mut a, 80, 24)).starts_with("↑↓ scroll · "));
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    key(&mut a, KeyCode::Char('/'), KeyModifiers::ALT);
+    let s = screen(&mut a, 80, 24);
+    assert!(overlay_keys(&s).contains("type filter"), "{s}");
+    assert!(!s.contains("Esc closes"), "{s}");
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    typ(&mut a, "/ps");
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(overlay_keys(&screen(&mut a, 80, 24)).starts_with("←→ process · "));
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    typ(&mut a, "/btw");
+    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
+    let s = screen(&mut a, 80, 24);
+    assert!(overlay_keys(&s).starts_with("enter ask · "), "{s}");
+    assert!(!s.contains("PgUp/PgDn scroll"), "{s}");
+    key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+    a.on_ui(UiEvent::LoginStep {
+        provider: "claude".into(),
+        step: novacode_tui::login::LoginStep::Url {
+            url: "https://claude.ai/x".into(),
+            note: "Sign in".into(),
+            paste: true,
+        },
+    });
+    let s = screen(&mut a, 80, 24);
+    let keys = overlay_keys(&s);
+    assert!(
+        keys.ends_with("copy URL · enter submit · esc cancel · ctrl+o open"),
+        "{s}"
+    );
+}
+
+/// TP8 (story 27): the wheel scrolls an ask form that does not fit.
+#[test]
+fn the_wheel_scrolls_a_long_ask_form() {
+    let (mut a, _rx) = app(vec![]);
+    let (reply, _answers) = tokio::sync::oneshot::channel();
+    let question: String = (1..=30).map(|i| format!("context {i}\n")).collect();
+    a.on_ui(UiEvent::Ask(novacode_tui::ask::AskReq {
+        id: 1,
+        questions: vec![Question {
+            question,
+            header: None,
+            options: vec![Choice {
+                label: "Go".into(),
+                description: None,
+                preview: None,
+                recommended: false,
+            }],
+            multi: false,
+        }],
+        reply,
+    }));
+    let s = screen(&mut a, 80, 30);
+    assert!(s.contains("context 1\n") || s.contains("context 1 "), "{s}");
+    let row = row_of(&s, "context 2");
+    wheel(&mut a, 10, row, false);
+    let s = screen(&mut a, 80, 30);
+    assert!(!s.contains("context 2 ") && s.contains("context 4"), "{s}");
+    wheel(&mut a, 10, row, true);
+    assert!(screen(&mut a, 80, 30).contains("context 2 "));
+}
+
 #[test]
 fn slash_and_file_completion() {
     let (mut a, mut rx) = app(vec![]);

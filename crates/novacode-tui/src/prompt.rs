@@ -35,7 +35,7 @@ pub fn select(title: &str, body: &[String], items: Vec<PickItem>) -> std::io::Re
             let [top, rest] =
                 Layout::vertical([Constraint::Length(lines.len() as u16 + 1), Constraint::Min(3)]).areas(area);
             f.render_widget(Paragraph::new(lines), top);
-            p.render(f, rest, &theme);
+            p.render(f, rest, &theme, &km);
         })?;
         match event::read()? {
             Event::Key(k) if k.kind != KeyEventKind::Release => match p.handle(k, &km) {

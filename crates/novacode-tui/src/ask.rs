@@ -217,6 +217,16 @@ impl AskForm {
         self.advance()
     }
 
+    /// A wheel step scrolls the context of a form that does not fit (`up` toward the top).
+    pub fn wheel(&mut self, up: bool) {
+        let (s, w) = (self.context_scroll.get(), crate::dialog::WHEEL);
+        self.context_scroll.set(if up {
+            s.saturating_sub(w)
+        } else {
+            (s + w).min(self.context_max.get())
+        });
+    }
+
     /// A paste goes into the open input, if any.
     pub fn paste(&mut self, s: &str) {
         let q = self.q;

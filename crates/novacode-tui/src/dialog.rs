@@ -21,6 +21,17 @@ const APPROVAL_GRACE: Duration = Duration::from_millis(400);
 /// Two presses on the same row within this time are a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
+/// Rows one wheel step scrolls in overlays.
+pub const WHEEL: usize = 3;
+
+/// The keymap's up/down keys as one hint label: `↑↓` for the default arrows.
+pub fn arrows(km: &Keymap, up: A, down: A) -> String {
+    match (km.keys(up), km.keys(down)) {
+        (u, d) if u == "up" && d == "down" => "↑↓".into(),
+        (u, d) => format!("{u}/{d}"),
+    }
+}
+
 /// Tells a double-click from a click, for lists that select on click and confirm on a
 /// double-click (ask form, pickers).
 #[derive(Default)]
@@ -58,6 +69,10 @@ pub struct Picker {
     items: Vec<PickItem>,
     filter: String,
     sel: usize,
+    /// The screen row of the first item row, its index and the rows shown, at the last draw (for clicks).
+    rows_at: Cell<(u16, usize, usize)>,
+    area: Cell<Rect>,
+    clicks: Clicks,
 }
 
 /// Lower is better; `None` = not a subsequence.
@@ -81,6 +96,37 @@ impl Picker {
             items,
             filter: String::new(),
             sel: 0,
+            rows_at: Cell::new((0, 0, 0)),
+            area: Cell::new(Rect::default()),
+            clicks: Clicks::default(),
+        }
+    }
+
+    /// The picker covers this screen cell.
+    pub fn contains(&self, x: u16, y: u16) -> bool {
+        self.area.get().contains(Position::new(x, y))
+    }
+
+    /// A press at a screen cell: selects the item there; a double-click picks it.
+    pub fn click(&mut self, x: u16, y: u16) -> Picked {
+        if !self.contains(x, y) {
+            return Picked::Pending;
+        }
+        let (top, first, n) = self.rows_at.get();
+        let Some(i) = y
+            .checked_sub(top)
+            .map(|r| first + r as usize)
+            .filter(|&i| i < first + n)
+        else {
+            return Picked::Pending;
+        };
+        self.sel = i;
+        if !self.clicks.double(y) {
+            return Picked::Pending;
+        }
+        match self.visible().get(i) {
+            Some(item) => Picked::Value(item.value.clone()),
+            None => Picked::Pending,
         }
     }
 
@@ -132,16 +178,20 @@ impl Picker {
         Picked::Pending
     }
 
-    pub fn render(&self, f: &mut Frame, area: Rect, t: &Theme) {
+    pub fn render(&self, f: &mut Frame, area: Rect, t: &Theme, km: &Keymap) {
         let inner = frame(f, area, &self.title, t);
+        self.area.set(area);
         let mut lines = vec![Line::from(vec![
             Span::styled("› ", t.accent),
             Span::styled(self.filter.clone(), t.text),
             Span::styled(if self.filter.is_empty() { "type to filter" } else { "" }, t.dim),
         ])];
         let vis = self.visible();
-        let rows = inner.height.saturating_sub(1) as usize;
+        // The filter row above the items, the hint row below them.
+        let rows = inner.height.saturating_sub(2) as usize;
         let first = (self.sel + 1).saturating_sub(rows);
+        self.rows_at
+            .set((inner.y + 1, first, vis.len().saturating_sub(first).min(rows)));
         for (i, item) in vis.iter().enumerate().skip(first).take(rows) {
             let selected = i == self.sel;
             let mark = if selected { "▸ " } else { "  " };
@@ -159,8 +209,27 @@ impl Picker {
             lines.push(Line::styled("  no match", t.dim));
         }
         f.render_widget(Paragraph::new(lines), inner);
+        let keys = [
+            (arrows(km, A::SelUp, A::SelDown), "move"),
+            (km.keys(A::SelConfirm), "pick"),
+            (km.keys(A::SelCancel).replace("escape", "esc"), "cancel"),
+        ];
+        hint_row(f, inner, &keys, t);
         f.set_cursor_position((inner.x + 2 + self.filter.chars().count() as u16, inner.y));
     }
+}
+
+/// Key hints on the last row inside an overlay's frame.
+pub fn hint_row<K: AsRef<str>, V: AsRef<str>>(f: &mut Frame, inner: Rect, keys: &[(K, V)], t: &Theme) {
+    if inner.height == 0 {
+        return;
+    }
+    let row = Rect {
+        y: inner.y + inner.height - 1,
+        height: 1,
+        ..inner
+    };
+    f.render_widget(Paragraph::new(crate::hints::hints(keys, inner.width as usize, t)), row);
 }
 
 /// Clear `area`, draw a rounded frame with a title, return the inside.
@@ -379,6 +448,8 @@ pub struct Pager {
     /// Typing filters lines (keys help).
     filterable: bool,
     all: Vec<Line<'static>>,
+    /// Text rows at the last draw, for the wheel's bottom stop.
+    page: Cell<usize>,
 }
 
 impl Pager {
@@ -394,7 +465,18 @@ impl Pager {
             top: 0,
             filter: None,
             filterable: false,
+            page: Cell::new(10),
         }
+    }
+
+    /// A wheel step: `up` scrolls toward the top.
+    pub fn wheel(&mut self, up: bool) {
+        let max = self.lines.len().saturating_sub(self.page.get());
+        self.top = if up {
+            self.top.saturating_sub(WHEEL)
+        } else {
+            (self.top + WHEEL).min(max)
+        };
     }
 
     pub fn keys_help(km: &Keymap, t: &Theme) -> Self {
@@ -428,12 +510,13 @@ impl Pager {
             all.push(Line::styled(format!("conflict: {c}"), t.error));
         }
         Self {
-            title: "Keys — type to filter, Esc closes".into(),
+            title: "Keys".into(),
             lines: all.clone(),
             all,
             top: 0,
             filter: Some(String::new()),
             filterable: true,
+            page: Cell::new(10),
         }
     }
 
@@ -488,7 +571,9 @@ impl Pager {
             title = format!("{title} · /{q}");
         }
         let inner = frame(f, area, &title, t);
-        let h = inner.height as usize;
+        // The last row holds the hints.
+        let h = (inner.height as usize).saturating_sub(1);
+        self.page.set(h);
         let shown: Vec<Line> = self
             .lines
             .iter()
@@ -497,6 +582,17 @@ impl Pager {
             .map(|l| wrap::truncate(l.spans.clone(), inner.width as usize))
             .collect();
         f.render_widget(Paragraph::new(shown), inner);
+        let keys: &[(&str, &str)] = if self.filterable {
+            &[("↑↓", "scroll"), ("esc", "close"), ("type", "filter")]
+        } else {
+            &[
+                ("↑↓", "scroll"),
+                ("esc", "close"),
+                ("space", "page"),
+                ("g/G", "top/end"),
+            ]
+        };
+        hint_row(f, inner, keys, t);
     }
 }
 

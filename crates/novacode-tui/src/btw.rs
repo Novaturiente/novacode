@@ -20,6 +20,8 @@ pub struct BtwChat {
     scroll: usize,
     /// Input width at the last draw, for the editor's line moves.
     width: usize,
+    /// The key that sends a question, for its hint.
+    pub submit_key: String,
 }
 
 pub enum BtwKey {
@@ -35,6 +37,7 @@ impl Default for BtwChat {
             editor: Editor::default(),
             scroll: 0,
             width: 40,
+            submit_key: "enter".into(),
         }
     }
 }
@@ -65,6 +68,16 @@ impl BtwChat {
         self.editor.paste(s);
     }
 
+    /// A wheel step: `up` shows older rows (the draw stops it at the top).
+    pub fn wheel(&mut self, up: bool) {
+        let w = crate::dialog::WHEEL;
+        self.scroll = if up {
+            self.scroll.saturating_add(w)
+        } else {
+            self.scroll.saturating_sub(w)
+        };
+    }
+
     /// `a` is the key's editor action from the keymap.
     pub fn handle(&mut self, k: KeyEvent, a: Option<A>, page: usize) -> BtwKey {
         match k.code {
@@ -85,12 +98,13 @@ impl BtwChat {
     }
 
     pub fn render(&mut self, f: &mut Frame, area: Rect, t: &Theme) {
-        let inner = dialog::frame(f, area, "btw: side chat · Enter ask · PgUp/PgDn scroll · Esc close", t);
+        let inner = dialog::frame(f, area, "btw: side chat", t);
         let w = inner.width as usize;
         self.width = w.saturating_sub(2).max(1);
         let (rows, (cr, cc)) = self.editor.view(self.width, 5);
         let input_h = rows.len().max(1) as u16;
-        let body_h = inner.height.saturating_sub(input_h + 1);
+        // Body, rule, input, hints.
+        let body_h = inner.height.saturating_sub(input_h + 2);
 
         let mut body = Vec::new();
         if self.entries.is_empty() {
@@ -153,6 +167,13 @@ impl BtwChat {
             },
         );
         f.set_cursor_position(Position::new(inner.x + 2 + cc, iy + cr));
+        let mut keys = vec![
+            (self.submit_key.as_str(), "ask"),
+            ("esc", "close"),
+            ("pgup/pgdn", "scroll"),
+        ];
+        keys.retain(|(k, _)| !k.is_empty());
+        dialog::hint_row(f, inner, &keys, t);
     }
 }
 
