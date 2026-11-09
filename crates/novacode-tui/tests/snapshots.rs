@@ -122,6 +122,78 @@ fn golden_tasks_tab() {
     });
 }
 
+/// TP10 after-capture bugs at 120 columns: a title takes the room a short tag leaves
+/// (tags stay aligned on their right edge), and a detail line is filled before it wraps
+/// (`running ·` is not left alone); a word longer than the line is cut with `…`.
+#[test]
+fn panel_rows_fill_title_and_detail_room() {
+    let ago = |s: u64| novacode_tui::clock::now_ms() - s * 1000 - 20_000;
+    let row = |label: &str, repo: &str, summary: Option<&str>| novacode_tui::panel::TaskRow {
+        label: label.into(),
+        repo: repo.into(),
+        state: "running".into(),
+        model: "claude/claude-sonnet-5-5".into(),
+        tokens: 41_200,
+        started_ms: ago(3600),
+        summary: summary.map(String::from),
+        ..Default::default()
+    };
+    let (mut a, _rx) = app(vec![]);
+    a.on_ui(UiEvent::Board {
+        tasks: vec![
+            row("T3-fix-the-parser-for-nested-generic-arguments", "novacode", None),
+            row("T4-docs-site-search", "site", None),
+            row(
+                "T5-api-retry-backoff",
+                "api",
+                Some("see abcdefghijklmnopqrstuvwxyzabcdefghijklmnop end"),
+            ),
+        ],
+        needs: vec![],
+    });
+    a.panel.visible = true;
+    a.panel.show_tab("tasks");
+    let s = screen(&mut a, 120, 30);
+    let lines: Vec<&str> = s.lines().collect();
+    let at = |id: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(id))
+            .unwrap_or_else(|| panic!("{id}\n{s}"))
+    };
+    let (t4, t5) = (lines[at("T4-")], lines[at("T5-")]);
+    assert!(
+        t4.contains("T4-docs-site-search "),
+        "the title uses the free room: {t4:?}"
+    );
+    assert!(
+        t5.contains("T5-api-retry-backoff "),
+        "the title uses the free room: {t5:?}"
+    );
+    let end = |l: &str, tag: &str| l[..l.rfind(tag).unwrap()].chars().count() + tag.chars().count();
+    assert_eq!(
+        end(t4, " site "),
+        end(lines[at("T3-")], " novacode "),
+        "tags share a right edge"
+    );
+    assert_eq!(end(t5, " api "), end(t4, " site "), "tags share a right edge");
+    let detail = lines[at("T4-") + 1];
+    assert!(
+        detail.contains("running · claude/claude-sonnet-"),
+        "the detail line is filled: {detail:?}\n{s}"
+    );
+    let sum = at("› see");
+    assert!(
+        lines[sum].trim_end().ends_with('…'),
+        "a too-long word is cut: {}\n{s}",
+        lines[sum]
+    );
+    assert!(
+        lines[sum + 1].trim_end().ends_with("end"),
+        "the text goes on after it\n{s}"
+    );
+}
+
 /// A drawn frame's cells, for colour checks.
 fn draw(a: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
     let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -182,7 +254,8 @@ fn panel_rows_keep_fixed_columns() {
             })
             .collect();
         let panel_w = a.panel.width(w) as usize;
-        let tag_at: Vec<usize> = rows
+        // Tags are right-aligned: each ends where the 2-cell gap before the age starts.
+        let tag_end: Vec<usize> = rows
             .iter()
             .zip(["novacode", "a-very", "api"])
             .map(|(l, tag)| {
@@ -190,13 +263,13 @@ fn panel_rows_keep_fixed_columns() {
                 assert_eq!(c.len(), panel_w, "the age ends at the right edge: {l:?}");
                 let age = c.iter().rposition(|ch| *ch == ' ').unwrap();
                 assert!(c[age - 1] == ' ', "a 2-cell gap before the age: {l:?}");
-                let b = l.rfind(tag).unwrap_or_else(|| panic!("tag {tag} pushed out: {l:?}"));
-                l[..b].chars().count()
+                assert!(l.contains(tag), "tag {tag} pushed out: {l:?}");
+                c[..age].iter().rposition(|ch| *ch != ' ').unwrap() + 1
             })
             .collect();
         assert!(
-            tag_at.iter().all(|&x| x == tag_at[0]),
-            "tags share a column {tag_at:?}: {rows:#?}"
+            tag_end.iter().all(|&x| x == tag_end[0]),
+            "tags share a right edge {tag_end:?}: {rows:#?}"
         );
         assert!(
             !rows[1].contains("a-very-long-project-name"),

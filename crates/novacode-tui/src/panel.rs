@@ -1402,25 +1402,25 @@ impl Panel {
                         theme.text.add_modifier(Modifier::BOLD)
                     };
                     // Columns: guide, icon (2 cells), title (shrinks first), tag (at most
-                    // TAG_MAX, gives way below TITLE_MIN), a 2-cell gap, the age.
+                    // TAG_MAX, gives way below TITLE_MIN, right-aligned so the title takes
+                    // what a short tag leaves), a 2-cell gap, the age.
                     let icon = format!("{g}{}", " ".repeat(2usize.saturating_sub(cells(&g)).max(1)));
                     let fixed = cells(&r.guide) + cells(&icon);
                     let right = age_col.map_or(0, |a| AGE_GAP + a);
                     let room = w.saturating_sub(fixed + right);
                     let tag_w = tag_col.min(room.saturating_sub(TITLE_MIN + 1));
-                    let title_w = room.saturating_sub(if tag_w > 0 { tag_w + 1 } else { 0 });
-                    // One text cut to its column and padded to fill it.
-                    let fit = |s: &str, width: usize, st: Style| {
-                        let mut v = crate::wrap::truncate(vec![Span::styled(s.to_string(), st)], width).spans;
-                        v.push(Span::raw(" ".repeat(width.saturating_sub(crate::wrap::width(&v)))));
-                        v
+                    let tag = match n.tag.clone() {
+                        Some(t) if tag_w > 0 => crate::wrap::truncate(vec![Span::styled(t, theme.dim)], tag_w).spans,
+                        _ => Vec::new(),
                     };
+                    let tag_cells = crate::wrap::width(&tag);
+                    let title_w = room.saturating_sub(if tag_cells > 0 { tag_cells + 1 } else { 0 });
                     let mut sp = vec![Span::styled(r.guide.clone(), theme.border), Span::styled(icon, gs)];
-                    sp.extend(fit(&n.label, title_w, label_style));
-                    if tag_w > 0 {
-                        sp.push(Span::raw(" "));
-                        sp.extend(fit(n.tag.as_deref().unwrap_or(""), tag_w, theme.dim));
-                    }
+                    let title = crate::wrap::truncate(vec![Span::styled(n.label.clone(), label_style)], title_w).spans;
+                    let pad = room.saturating_sub(crate::wrap::width(&title) + tag_cells);
+                    sp.extend(title);
+                    sp.push(Span::raw(" ".repeat(pad)));
+                    sp.extend(tag);
                     if let Some(a) = age_col {
                         let (t, st) = age(n).unwrap_or_default();
                         sp.push(Span::raw(" ".repeat(AGE_GAP + a - cells(&t))));
@@ -1702,10 +1702,10 @@ fn footer_line<K: AsRef<str>, V: AsRef<str>>(first: &[(K, V)], w: usize, t: &The
     l
 }
 
-/// A detail text word-wrapped under `lead` to at most two lines; the second is cut
+/// A detail text filled under `lead` (see `wrap::fill`) to at most two lines; the second is cut
 /// with `…` when more is left.
 fn detail_lines(v: Vec<Span<'static>>, w: usize, lead: &[Span<'static>]) -> Vec<Line<'static>> {
-    let mut lines = crate::wrap::wrap(v, w, lead, lead);
+    let mut lines = crate::wrap::fill(v, w, lead, lead);
     if lines.len() > 2 {
         let mut rest: Vec<Span<'static>> = lines[1].spans.clone();
         for l in &lines[2..] {
@@ -1982,7 +1982,7 @@ mod tests {
             "│   ├─◐ T3-fix-parser              novacode  2h00m",
             "│   │   running · claude/claude-sonnet-5-5 · 41.2k",
             "│   │   › parser fixed; tests pass",
-            "│   └─⏸ T4-docs                    site      1h00m",
+            "│   └─⏸ T4-docs                        site  1h00m",
             "│       blocked: quota · claude/claude-haiku-5-5",
             "│       · 900",
             "│",

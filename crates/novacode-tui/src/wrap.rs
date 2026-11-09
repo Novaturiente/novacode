@@ -62,6 +62,28 @@ pub fn wrap(
     first: &[Span<'static>],
     rest: &[Span<'static>],
 ) -> Vec<Line<'static>> {
+    lay_out(content, width, first, rest, false)
+}
+
+/// Like [`wrap`], but each line is filled further: it may also break after `/` or
+/// `-`, and a word longer than the line is cut with `…` where it stands instead of
+/// moving to a line of its own (panel detail lines).
+pub fn fill(
+    content: Vec<Span<'static>>,
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+) -> Vec<Line<'static>> {
+    lay_out(content, width, first, rest, true)
+}
+
+fn lay_out(
+    content: Vec<Span<'static>>,
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+    fill: bool,
+) -> Vec<Line<'static>> {
     let mut cells: Vec<(&str, Style)> = Vec::new();
     for s in &content {
         for g in s.content.graphemes(true) {
@@ -84,18 +106,42 @@ pub fn wrap(
                 break;
             }
             w += gw;
-            if cells[end].0 == " " {
+            let g = cells[end].0;
+            if g == " " || (fill && (g == "/" || g == "-")) {
                 brk = Some(end + 1);
             }
             end += 1;
         }
-        let take = if end < cells.len() {
+        let mut take = if end < cells.len() {
             brk.filter(|&b| b > i).unwrap_or(end.max(i + 1))
         } else {
             end
         };
+        // Fill: the word cut at the edge, when it can't fit on any line, ends here with `…`.
+        let mut cut = None;
+        if fill && end < cells.len() && cells[end].0 != " " {
+            let start = brk.filter(|&b| b > i).unwrap_or(i);
+            let stop = (end..cells.len())
+                .find(|&k| cells[k].0 == " " || cells[k].0 == "/" || cells[k].0 == "-")
+                .map_or(cells.len(), |k| k + (cells[k].0 != " ") as usize);
+            let word: usize = cells[start..stop].iter().map(|c| c.0.width()).sum();
+            if word > avail {
+                // Leave one cell for the `…`.
+                let (mut keep, mut kw) = (end, w);
+                while keep > i && kw + 1 > avail {
+                    keep -= 1;
+                    kw -= cells[keep].0.width();
+                }
+                take = keep;
+                cut = Some(stop);
+            }
+        }
         let mut line: Vec<Span<'static>> = prefix.to_vec();
         push_run(&mut line, &cells[i..take]);
+        if let Some(stop) = cut {
+            line.push(Span::styled("…", cells[take.min(stop - 1)].1));
+            take = stop;
+        }
         trim_end(&mut line);
         out.push(Line::from(line));
         i = take;
@@ -192,6 +238,19 @@ mod tests {
             texts(&wrap(vec![Span::raw("日本語です")], 6, &[], &[])),
             ["日本語", "です"]
         );
+    }
+
+    #[test]
+    fn fill_breaks_inside_paths_and_cuts_long_words() {
+        let l = fill(
+            vec![Span::raw("running · claude/claude-sonnet-5-5 · 41.2k")],
+            32,
+            &[],
+            &[],
+        );
+        assert_eq!(texts(&l), ["running · claude/claude-sonnet-", "5-5 · 41.2k"]);
+        let l = fill(vec![Span::raw("see abcdefghijklmn end")], 10, &[], &[]);
+        assert_eq!(texts(&l), ["see abcde…", "end"]);
     }
 
     #[test]
