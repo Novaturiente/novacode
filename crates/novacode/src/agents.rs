@@ -26,7 +26,7 @@ use tokio::sync::{Notify, mpsc};
 pub const MAX_DEPTH: u32 = 2;
 /// The running binary, for children. After an update deletes it, Linux still runs it
 /// as `/proc/self/exe`, and a child of the same version speaks the same `--rpc`.
-fn own_exe() -> PathBuf {
+pub(crate) fn own_exe() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_else(|_| "novacode".into());
     let proc = Path::new("/proc/self/exe");
     if exe.to_str().is_some_and(|s| s.ends_with(" (deleted)")) && proc.exists() {

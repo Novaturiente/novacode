@@ -26,6 +26,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
+mod acp;
 mod activity;
 mod agents;
 mod diag;
@@ -108,6 +109,9 @@ struct Cli {
     /// Serve the wire protocol on stdin/stdout: JSONL commands in, events out.
     #[arg(long, conflicts_with = "print")]
     rpc: bool,
+    /// Serve the Agent Client Protocol on stdin/stdout, for editors such as Zed.
+    #[arg(long, conflicts_with_all = ["print", "rpc", "bg"])]
+    acp: bool,
     /// Run in the background with no window; prints the session id. Attach with `novacode attach`.
     #[arg(long, value_name = "PROMPT", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["print", "rpc"])]
     bg: Option<String>,
@@ -678,6 +682,9 @@ fn fail(e: anyhow::Error) -> ExitCode {
 }
 
 async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
+    if cli.acp {
+        return acp::run(paths, cli.model.clone()).await;
+    }
     let auth_store = AuthStore::new(paths.home().join("auth.json"));
     match cli.command {
         Some(Command::Login {
@@ -2636,6 +2643,10 @@ async fn start_session(
     let mcp = agent.mcp().cloned();
     let extensions = agent.extensions().cloned();
     let modes = agent.modes().cloned();
+    if let Some(m) = &modes {
+        state.modes = m.names();
+        state.mode = m.active();
+    }
     let adapter = agent.adapter().clone();
     let goals = ctx.goals.lock().unwrap().take();
     let (handle, task) = agent::spawn(agent);
@@ -2644,6 +2655,10 @@ async fn start_session(
         hub.seed_ui(e.setup_ui());
     }
     slot.set(&hub);
+    if let Some(m) = &modes {
+        let h = hub.clone();
+        m.on_change(move |mode| h.update(false, |s| s.mode = mode));
+    }
     let host = Arc::new(host::Host {
         hub,
         cur: Arc::new(std::sync::Mutex::new((spec, level))),

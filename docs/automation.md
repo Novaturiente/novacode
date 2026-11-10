@@ -117,7 +117,7 @@ novacode -p "list the files here" --json | jq -r 'select(.type=="event" and .eve
 
 ## The `--rpc` protocol
 
-`--rpc` runs a session with no window and speaks the same JSON lines on stdin and stdout. One command per line in, messages out. Use it to put novacode behind your own editor plugin, web page or script. It can't be combined with `-p`.
+`--rpc` runs a session with no window and speaks the same JSON lines on stdin and stdout. One command per line in, messages out. Use it to put novacode behind your own editor plugin, web page or script. It can't be combined with `-p`. For editors that speak the Agent Client Protocol (Zed and others), use `--acp` instead: see [Editors](editors.md).
 
 ```sh
 novacode --rpc -m claude/claude-opus-5-5
@@ -174,7 +174,7 @@ A line that isn't a valid command gets `{"type":"response","command":"parse","ok
 
 ### Slash commands over RPC
 
-`prompt` text starting with `/` runs the command in the session instead of going to the model. These work: `/compact`, `/context`, `/mcp`, `/name <text>`, `/worktree [name|exit|remove]`, `/btw <q>`, `/docs`, `/export [html]`, `/model <id>`, `/thinking <level>`, `/plan`, `/mode`, `/goal`, `/usage`, `/account [name]`, `/websearch [engine]`, `/debug`, plus skills, prompt templates and extension commands. `get_commands` lists them.
+`prompt` text starting with `/` runs the command in the session instead of going to the model. A command that starts no run (`/mode`, `/goal status`, a mistyped `/name`) answers `"disposition": "handled"`, so no `agent_end` will name it. These work: `/compact`, `/context`, `/mcp`, `/name <text>`, `/worktree [name|exit|remove]`, `/btw <q>`, `/docs`, `/export [html]`, `/model <id>`, `/thinking <level>`, `/plan`, `/mode`, `/goal`, `/usage`, `/account [name]`, `/websearch [engine]`, `/debug`, plus skills, prompt templates and extension commands. `get_commands` lists them.
 
 These need the session's own window and answer with an error such as `/resume works only in the session's own window`: `/resume`, `/new`, `/tree`, `/rewind`, `/fork`, `/clone`, `/reload`, `/restart`, `/login`, `/keys`, `/copy`, `/ps`, `/quit`. `/model` and `/thinking` without an argument (the pickers) fail the same way. The session-changing ones also don't work in a window opened with `novacode attach`.
 
@@ -185,6 +185,7 @@ These need the session's own window and answer with an error such as `/resume wo
 | Field | Meaning |
 |---|---|
 | `session`, `cwd`, `model`, `level` | Session id, folder, `provider/model`, thinking level |
+| `modes`, `mode` | Mode presets (`plan` and your own) and the active one; absent when none is on |
 | `account?` | The subscription account requests go to (`default`, `work`, …). It changes when novacode rotates accounts or you use `/account`. Absent on API-key routes. |
 | `window_tokens`, `context_tokens` | Context window size and tokens in use |
 | `compactions` | Compactions on the session's current branch |

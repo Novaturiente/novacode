@@ -31,7 +31,11 @@ pub struct Modes {
     policy: Arc<Policy>,
     presets: Vec<Preset>,
     active: Mutex<Option<String>>,
+    /// Told the new mode after every switch (the session state, L8.7).
+    watch: Mutex<Option<ModeWatch>>,
 }
+
+type ModeWatch = Box<dyn Fn(Option<String>) + Send + Sync>;
 
 impl Modes {
     /// `plan` built in; `modes.<name>` from settings add to or replace it.
@@ -51,6 +55,7 @@ impl Modes {
             policy,
             presets,
             active: Mutex::default(),
+            watch: Mutex::default(),
         })
     }
 
@@ -77,7 +82,15 @@ impl Modes {
         self.policy
             .set_overlay(p.map(|p| (p.name.clone(), p.read_only, p.tools.clone())));
         *self.active.lock().unwrap() = p.map(|p| p.name.clone());
+        if let Some(w) = &*self.watch.lock().unwrap() {
+            w(p.map(|p| p.name.clone()));
+        }
         Ok(())
+    }
+
+    /// Call `f` with the new mode after every switch, whoever made it (`/mode`, a tool).
+    pub fn on_change(&self, f: impl Fn(Option<String>) + Send + Sync + 'static) {
+        *self.watch.lock().unwrap() = Some(Box::new(f));
     }
 
     /// The `mode` prompt section of the active preset.

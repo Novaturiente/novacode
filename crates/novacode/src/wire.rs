@@ -68,6 +68,11 @@ pub struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
     pub level: ThinkingLevel,
+    /// Mode presets (L10.7) and the active one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     pub window_tokens: u64,
     /// A run is in progress (between `agent_start` and `settled`).
     pub busy: bool,

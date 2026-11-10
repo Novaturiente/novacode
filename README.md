@@ -69,7 +69,7 @@ The full walk-through and a list of every flag and subcommand are in [docs/quick
 
 **Start here:** [Install](docs/install.md) · [Quickstart](docs/quickstart.md) · [Providers and login](docs/providers.md) · [Coming from Claude Code, pi or Codex](docs/migrating.md)
 
-**Using it:** [The terminal UI](docs/tui.md) · [Sessions](docs/sessions.md) · [Tools](docs/tools.md) · [Context and memory](docs/context.md) · [Skills and prompt templates](docs/skills.md) · [Subagents, plan mode and goals](docs/subagents.md) · [Super mode](docs/super.md) (experimental, `--features super` builds only) · [Security and permissions](docs/security.md)
+**Using it:** [The terminal UI](docs/tui.md) · [Editors (Zed, ACP)](docs/editors.md) · [Sessions](docs/sessions.md) · [Tools](docs/tools.md) · [Context and memory](docs/context.md) · [Skills and prompt templates](docs/skills.md) · [Subagents, plan mode and goals](docs/subagents.md) · [Super mode](docs/super.md) (experimental, `--features super` builds only) · [Security and permissions](docs/security.md)
 
 **Extending it:** [MCP servers](docs/mcp.md) · [Extensions](docs/extensions.md) · [Packages](docs/packages.md) · [Scripting and automation](docs/automation.md)
 

@@ -35,6 +35,9 @@ sha2 = "0.10"
 clap.workspace = true
 tokio = { workspace = true, features = ["signal", "net"] }
 tokio-util.workspace = true
+# L8.12: ACP v1 types only; the JSON-RPC loop is ours (acp.rs).
+agent-client-protocol-schema = { version = "1.16", default-features = false }
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -18,6 +18,7 @@ const PAGES: &[(&str, &str)] = pages![
     "automation.md",
     "config.md",
     "context.md",
+    "editors.md",
     "extensions.md",
     "install.md",
     "mcp.md",

@@ -241,10 +241,15 @@ async fn dispatch(
             "commands": host.commands().into_iter().map(|(name, description)| json!({"name": name, "description": description})).collect::<Vec<_>>()
         })),
         ClientCmd::Prompt { text, .. } => {
-            let disposition = if hub.state().busy { "queued" } else { "started" };
+            let was = hub.state().busy;
+            let disposition = if was { "queued" } else { "started" };
             // Busy from hand-in, not from agent_start: a second prompt right after is queued.
             hub.update(false, |s| s.busy = true);
-            host.handle_as(Cmd::Prompt(text), ui, false, Some(id)).await;
+            if !host.handle_as(Cmd::Prompt(text), ui, false, Some(id)).await {
+                // Handled here (`/mode`, a typo…): no run, so no `agent_end` will name it.
+                hub.update(false, |s| s.busy = was);
+                return Ok(json!({ "disposition": "handled" }));
+            }
             Ok(json!({ "disposition": disposition }))
         }
         ClientCmd::Steer { text } => {

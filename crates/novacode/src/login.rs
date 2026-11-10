@@ -318,7 +318,7 @@ pub async fn catch_or_input(
 }
 
 /// `4%2F0Ab` → `4/0Ab` (query values in a redirect URL).
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
