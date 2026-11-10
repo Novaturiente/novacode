@@ -31,6 +31,8 @@ pub struct Host {
     pub limits: models::Limits,
     /// `memory.model`: set, background models stay on it across `/model`.
     pub memory_model: Option<String>,
+    /// `models.small` (L2.29): per-provider small model overrides.
+    pub small_models: Option<serde_json::Value>,
     pub trace: Option<Trace>,
     pub processes: Option<Arc<novacode_tools::process::ProcessManager>>,
     pub mcp: Option<Arc<novacode_core::mcp::Hub>>,
@@ -382,7 +384,14 @@ impl Host {
                         Ok((mut sw, route)) => {
                             // Observer and goal judge move to the new provider's small model.
                             if me.memory_model.is_none() {
-                                let (w, note) = models::helper(&me.providers, None, &route, sw.adapter.clone()).await;
+                                let (w, note) = models::helper(
+                                    &me.providers,
+                                    None,
+                                    me.small_models.as_ref(),
+                                    &route,
+                                    sw.adapter.clone(),
+                                )
+                                .await;
                                 if let Some(text) = note {
                                     let _ = tx.send(UiEvent::Notice { text, error: false });
                                 }

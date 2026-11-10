@@ -50,7 +50,7 @@ classifier models and request tracing.
 - `schema.rs`: `openapi_subset`, `Rejection`, `rejected`, `strip`, `Quirks` (`load`,
   `ephemeral`, `apply`, `learn`).
 - `transform.rs`: `for_target`, `Target`, `safe_id`, `NO_RESULT`,
-  `IMAGE_OMITTED`, `KEEP_IMAGES`, `OLD_IMAGE`.
+  `IMAGE_OMITTED`, `MAX_IMAGES`, `IMAGE_STEP`, `OLD_IMAGE`.
 - `classify.rs`: `classify`, `find`, `key_env`, `MODELS`, `Model`, `Wire`,
   `Question`, `Answer`, `Outcome`, `Context`, `BoolCriteria`, `Image`.
 - `quota.rs`: `cached`, `supported`, `Quota`, `Window` (`resets_in`), `MAX_AGE` (5 min).

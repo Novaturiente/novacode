@@ -24,9 +24,12 @@ pub struct Target<'a> {
 /// Only a call novacode stopped during (crash, kill, power loss) has no stored result (L4.17).
 pub const NO_RESULT: &str = "No result: novacode stopped while this tool ran, so it may have partly run. Check its effects before running it again.";
 pub const IMAGE_OMITTED: &str = "(image omitted: model does not support images)";
-/// How many images (the newest, across the request) are sent; each older one
-/// is re-sent with every request otherwise (L5).
-pub const KEEP_IMAGES: usize = 4;
+/// Images sent before the oldest are cut (provider limits: Anthropic takes 100). Old
+/// images leave with compaction; this cap is a backstop (L2.17).
+pub const MAX_IMAGES: usize = 80;
+/// The oldest images are cut in steps of this many, so the cached prefix changes once
+/// per step, not once per new image.
+pub const IMAGE_STEP: usize = 40;
 pub const OLD_IMAGE: &str = "[older image omitted to save context; read the file again to see it]";
 
 pub fn for_target(messages: &[Message], t: &Target) -> Vec<Message> {
@@ -139,8 +142,8 @@ pub fn for_target(messages: &[Message], t: &Target) -> Vec<Message> {
     out
 }
 
-/// Only the newest [`KEEP_IMAGES`] images are sent. The cut moves only when
-/// a new image arrives, so the cached prefix changes once per image.
+/// Past [`MAX_IMAGES`] images, the oldest are cut in steps of [`IMAGE_STEP`]: between
+/// cuts the earlier messages stay byte-identical and the prompt cache holds.
 fn drop_old_images(out: &mut [Message]) {
     let contents = || {
         out.iter().filter_map(|m| match m {
@@ -152,7 +155,10 @@ fn drop_old_images(out: &mut [Message]) {
         .flatten()
         .filter(|b| matches!(b, Block::Image { .. }))
         .count();
-    let mut old = total.saturating_sub(KEEP_IMAGES);
+    let mut old = match total > MAX_IMAGES {
+        true => (total - IMAGE_STEP) / IMAGE_STEP * IMAGE_STEP,
+        false => 0,
+    };
     for m in out.iter_mut() {
         if old == 0 {
             return;
@@ -368,15 +374,45 @@ mod tests {
     }
 
     #[test]
+    fn old_images_stay_until_the_cap_then_go_in_steps() {
+        let img = || Block::Image {
+            mime_type: "image/png".into(),
+            data: "AA".into(),
+        };
+        let t = Target {
+            provider: "openai",
+            model: "gpt-5",
+            images: true,
+            normalize_id: None,
+        };
+        let sent = |n: usize| {
+            let msgs = vec![Message::User {
+                content: (0..n).map(|_| img()).collect(),
+            }];
+            let out = for_target(&msgs, &t);
+            let Message::User { content } = &out[0] else { panic!() };
+            let kept = content.iter().filter(|b| matches!(b, Block::Image { .. })).count();
+            (kept, content.iter().position(|b| matches!(b, Block::Image { .. })))
+        };
+        assert_eq!(sent(MAX_IMAGES), (MAX_IMAGES, Some(0)), "under the cap nothing changes");
+        // Past it, the cut jumps a whole step and then holds while images arrive.
+        assert_eq!(sent(MAX_IMAGES + 1).1, Some(IMAGE_STEP));
+        assert_eq!(sent(MAX_IMAGES + 20).1, Some(IMAGE_STEP));
+        assert_eq!(sent(MAX_IMAGES + IMAGE_STEP).1, Some(2 * IMAGE_STEP));
+    }
+
+    #[test]
     fn only_the_newest_images_are_sent() {
         let img = || Block::Image {
             mime_type: "image/png".into(),
             data: "AA".into(),
         };
         let mut msgs = vec![Message::User {
-            content: vec![Block::text("look"), img()],
+            content: std::iter::once(Block::text("look"))
+                .chain((0..IMAGE_STEP).map(|_| img()))
+                .collect(),
         }];
-        for i in 0..KEEP_IMAGES {
+        for i in 0..MAX_IMAGES - IMAGE_STEP + 1 {
             let id = format!("c{i}");
             msgs.push(asst("openai", "gpt-5", StopReason::ToolUse, vec![call(&id)]));
             msgs.push(result(&id));
@@ -389,7 +425,10 @@ mod tests {
         };
         let out = for_target(&msgs, &t);
         let Message::User { content } = &out[0] else { panic!() };
-        assert_eq!(content[1], Block::text(OLD_IMAGE), "the oldest image is replaced");
+        assert!(
+            content[1..].iter().all(|b| *b == Block::text(OLD_IMAGE)),
+            "the oldest step is replaced"
+        );
         let kept: usize = out
             .iter()
             .filter_map(|m| match m {
@@ -399,7 +438,7 @@ mod tests {
             .flatten()
             .filter(|b| matches!(b, Block::Image { .. }))
             .count();
-        assert_eq!(kept, KEEP_IMAGES);
+        assert_eq!(kept, MAX_IMAGES - IMAGE_STEP + 1);
         assert_eq!(&out[1..], &msgs[1..], "the newest images are untouched");
     }
 

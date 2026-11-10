@@ -59,6 +59,12 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "Per-model catalog overrides, keyed `\"<provider>/<id>\"`: `contextWindow`, `maxTokens`, `images`, `reasoning` (bools), `name`, `cost`. See docs/providers.md.",
     ),
     (
+        "models.small",
+        "object",
+        "unset (each provider's built-in small model)",
+        "Your own small model per provider, e.g. `{\"claude\": \"claude-sonnet\", \"codex\": \"gpt-luna\"}` (a model on that provider). `\"*\": \"provider/model\"` uses one fixed model for every provider without its own entry. Used by the helper (observer, namer, judges; `memory.model` still wins), `small` subagents such as `scout`, and read delegation. Built-in: Claude Haiku, Codex Luna, Gemini Flash.",
+    ),
+    (
         "models.deny",
         "list",
         "[]",
@@ -185,6 +191,24 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "Size the dropper trims active notes down to.",
     ),
     (
+        "memory.idleCompactTokens",
+        "number",
+        "100000",
+        "Compact before a run when the prompt cache expired since the last model call (5 min with `cacheRetention: short`, 60 min with `long`) and the context is at least this big: the cold rewrite is then the summary, not the whole history. 0 turns it off.",
+    ),
+    (
+        "read.delegate",
+        "bool",
+        "true",
+        "Read delegation: `read` gets a `question` field answered by the provider's small model (`models.small`), and a full read of a large text file returns a map of its sections instead of the text. Off, or no small model: plain reads.",
+    ),
+    (
+        "read.delegateAboveLines",
+        "number",
+        "400",
+        "Lines above which a full `read` (no offset, limit or question) returns the small model's map. 0: never map, `question` still works.",
+    ),
+    (
         "memory.store",
         "bool",
         "true",
@@ -226,6 +250,12 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "number",
         "4",
         "Subagents running at once; more wait as `queued`, in spawn order. A subagent's own subagents run one at a time.",
+    ),
+    (
+        "agents.model",
+        "string",
+        "inherit",
+        "Model of agent types that name none (`worker`, `reviewer`, `auditor`): `inherit` (the parent's), `small`, a family (`sonnet`) or model id on the parent's provider, or a fixed `provider/model`.",
     ),
     (
         "agents.parentPicksTools",

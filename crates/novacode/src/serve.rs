@@ -1145,6 +1145,7 @@ mod tests {
             providers: Arc::new(novacode_ai::connect::Providers::load(&home, &settings)),
             limits: crate::models::Limits::new(&settings),
             memory_model: None,
+            small_models: None,
             trace: None,
             processes: None,
             mcp: None,

@@ -801,8 +801,11 @@ fn screen(app: &mut App, w: u16, h: u16) -> String {
 }
 
 /// The startup header's version, so a release bump leaves goldens and snapshots alone.
+/// The version as `X.Y.Z`, padded to its width: a version of another length (0.8.11 vs
+/// 0.9.0) must not shift the columns after it.
 fn unversioned(s: &str) -> String {
-    s.replace(concat!("novacode ", env!("CARGO_PKG_VERSION")), "novacode X.Y.Z")
+    let v = env!("CARGO_PKG_VERSION");
+    s.replace(&format!("novacode {v}"), &format!("novacode {:<1$}", "X.Y.Z", v.len()))
 }
 
 fn snapshot(name: &str, got: &str) {

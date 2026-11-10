@@ -1,4 +1,4 @@
- novacode X.Y.Z                                                      │  Deploy  Agent
+ novacode X.Y.Z                                                       │  Deploy  Agent
  /home/u/proj · claude/opus                                           │ ━━━━━━━━
  type / for commands                                                  │ region line
                                                                       │ ok

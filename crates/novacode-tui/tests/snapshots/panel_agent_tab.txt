@@ -1,4 +1,4 @@
- novacode X.Y.Z                                                      │  Agent
+ novacode X.Y.Z                                                       │  Agent
  /home/u/proj · claude/opus                                           │ ━━━━━━━
  type / for commands                                                  │ ▍ TODOS                            1/3
                                                                       │    ▰▰▰▱▱▱▱▱▱▱

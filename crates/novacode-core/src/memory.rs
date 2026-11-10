@@ -47,6 +47,48 @@ pub struct Worker {
     pub model: String,
 }
 
+/// Read delegation (L5.4b): the small model answers about a file for `read`.
+impl novacode_tools::read::Delegate for Worker {
+    fn model(&self) -> String {
+        format!("{}/{}", self.provider, self.model)
+    }
+
+    fn ask<'a>(
+        &'a self,
+        system: &'static str,
+        user: String,
+        cancel: CancellationToken,
+    ) -> futures_util::future::BoxFuture<'a, Result<String, String>> {
+        Box::pin(async move {
+            let req = Request {
+                tail: Vec::new(),
+                model: self.model.clone(),
+                messages: vec![
+                    Message::System { text: system.into() },
+                    Message::User {
+                        content: vec![Block::text(user)],
+                    },
+                ],
+                tools: vec![],
+                max_tokens: 4096,
+                cache: CacheRetention::Short,
+                thinking: None,
+                images: false,
+                session: None,
+            };
+            let mut rx = self.adapter.stream(req, cancel);
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    StreamEvent::Done(m) => return Ok(m.text()),
+                    StreamEvent::Error(m) => return Err(m.error_message.unwrap_or_else(|| format!("{:?}", m.stop))),
+                    _ => {}
+                }
+            }
+            Err("stream ended without a result".into())
+        })
+    }
+}
+
 /// Memory settings (`memory.*`).
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -62,6 +104,9 @@ pub struct Settings {
     pub reflect_after: u64,
     /// Active notes the dropper prunes back to, in tokens.
     pub pool_target: u64,
+    /// Idle compaction (L4.5b): compact before a run once the prompt cache expired and the
+    /// context is at least this many tokens; 0 = off.
+    pub idle_compact: u64,
 }
 
 impl Settings {
@@ -73,6 +118,7 @@ impl Settings {
             chunk_tokens: 30_000,
             reflect_after: 20_000,
             pool_target: 10_000,
+            idle_compact: 100_000,
         }
     }
 }

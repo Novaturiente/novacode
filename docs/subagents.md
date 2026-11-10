@@ -12,7 +12,7 @@ A subagent does not see your conversation. The model must give it a complete tas
 
 | Type | What it is for | Tools | Model |
 |---|---|---|---|
-| `scout` | Read-only recon: find where something is done, map a folder, summarise long files | `read`, `grep`, `find`, `ls`, `todo` | the small model of the parent's current provider (falls back to the parent's) |
+| `scout` | Read-only recon: find where something is done, map a folder, summarise long files | `read`, `grep`, `find`, `ls`, `todo` | the small model of the parent's current provider (`models.small`; falls back to the parent's) |
 | `worker` | A bounded change: edit the named files, run the check, report | all of the parent's tools | the parent's |
 | `reviewer` | Review a change for bugs, risk and missing tests; changes nothing | `read`, `grep`, `find`, `ls`, `bash`, `todo` | the parent's |
 | `auditor` | Checks that a goal is really done (used by `/goal`); changes nothing | `read`, `grep`, `find`, `ls`, `bash` | the parent's (or `goal.auditModel`) |
@@ -102,7 +102,7 @@ Frontmatter fields:
 | `description` | Shown to the model so it can pick the type. |
 | `tools` | Comma-separated tool names, or a YAML list. Leave it out to give all of the parent's tools. `mcp__server__tool` gives that MCP server (MCP tools come per server). If none of the listed tools is available, the spawn is refused. |
 | `disallowedTools` | Never given, whatever the spawn asks. `mcp__server…` drops that server. Listing `bash` also removes `process`. |
-| `model` | `provider/model`, `small`, `inherit` (the parent's), a family such as `sonnet`, `opus`, `haiku` (on the parent's provider, when it has the family; else the parent's model), or a model id on the parent's provider. |
+| `model` | `provider/model`, `small`, `inherit` (the parent's), a family such as `sonnet`, `opus`, `haiku` (on the parent's provider, when it has the family; else the parent's model), or a model id on the parent's provider. Unset or `inherit`: the `agents.model` setting when you set one (same values), else the parent's model. `small` is the provider's small model, which `models.small` can change per provider. |
 | `thinking` | Thinking level, added to the model as `model:level`. Claude Code's `effort` works too. |
 | `permissionMode` | `plan`: the subagent starts read-only. Other values never give it more than its parent and are ignored (`doctor` lists them). |
 | `mcpServers` | Names of configured MCP servers it gets. Inline server definitions are not supported. |

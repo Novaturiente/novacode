@@ -58,8 +58,17 @@ Two limits protect the context window:
 | `path` | File path, relative to the working directory or absolute. `~/` works. |
 | `offset` | First line, 1-based. |
 | `limit` | Max lines (capped at 2000). |
+| `question` | Only with read delegation: ask the small model about the file (or the `offset`/`limit` range) instead of reading it. |
 
-Lines longer than 2000 characters are clipped with `… [line clipped at 2000 chars; use grep or bash \`cut -c\` to see the rest]`, since `offset` can't reach the rest of a line. Files over 64 MiB are refused before loading; use `grep`, or `sed -n 'a,bp' file` through `bash`. A read is also cut at 50 KB. When more is left, the result says which `offset` to continue with. An `offset` past the end is an error. Images come back as images, converted and shrunk to fit if needed: the long side is at most 1568 px, and an opaque image such as a screenshot is sent as JPEG when that is under half the size of the PNG. Only the newest 4 images in the conversation are sent to the model; older ones are replaced by a short note in the request (the session file keeps them), so read the file again to see one. Binary files (a NUL byte near the start) are refused. A directory is an error: use `ls`.
+Lines longer than 2000 characters are clipped with `… [line clipped at 2000 chars; use grep or bash \`cut -c\` to see the rest]`, since `offset` can't reach the rest of a line. Files over 64 MiB are refused before loading; use `grep`, or `sed -n 'a,bp' file` through `bash`. A read is also cut at 50 KB. When more is left, the result says which `offset` to continue with. An `offset` past the end is an error. Images come back as images, converted and shrunk to fit if needed: the long side is at most 1568 px, and an opaque image such as a screenshot is sent as JPEG when that is under half the size of the PNG. Images stay in the conversation until it compacts. Past 80 images, the oldest 40 are replaced by a short note in the request at once (the session file keeps them), so the prompt cache holds between cuts; read the file again to see one. Binary files (a NUL byte near the start) are refused. A directory is an error: use `ls`.
+
+**Read delegation** (`read.delegate`, on by default). When the session's provider has a small model (`models.small`, built-in Claude Haiku, Codex Luna, Gemini Flash) that isn't the session's own model:
+
+- `question` sends the file, with line numbers, to the small model, which answers in bullets that cite `file:line`. Only the answer enters the context. It is not for editing (read the range: edits need the exact text), debugging or design decisions.
+- A full read (no `offset`, `limit` or `question`) of a text file over `read.delegateAboveLines` lines (400) returns the line count and the small model's map of the file (sections with line ranges) instead of the text. Read the range you need.
+- Ranged reads, small files, images and reads from codemode scripts work as before. If the small model fails, the read is a normal one.
+
+The small model can be wrong; its line numbers let the main model check. Up to 400,000 characters of the file go to it per call.
 
 ### write
 

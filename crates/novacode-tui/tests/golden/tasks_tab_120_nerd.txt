@@ -1,4 +1,4 @@
- novacode X.Y.Z                                                                │   Tasks
+ novacode X.Y.Z                                                                 │   Tasks
  /home/u/proj · claude/opus                                                     │ ━━━━━━━━━
  type / for commands                                                            │   ├── T3-fix-the-par… novacode  3h00m
                                                                                 │   │    running · sonnet-5-5 · 41.2k

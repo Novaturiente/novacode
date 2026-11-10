@@ -1051,6 +1051,7 @@ async fn long_session_compacts_from_notes() {
             chunk_tokens: 3000,
             reflect_after: u64::MAX,
             pool_target: u64::MAX,
+            idle_compact: 0,
         },
     );
     let prompts: Vec<String> = (0..8).map(|i| format!("task {i} {big}")).collect();
@@ -1140,6 +1141,7 @@ async fn long_run_compacts_between_model_calls() {
             chunk_tokens: 3000,
             reflect_after: u64::MAX,
             pool_target: u64::MAX,
+            idle_compact: 0,
         },
     );
     let (agent, _) = drive(agent, &["refine it until it works"]).await;
@@ -1203,6 +1205,7 @@ async fn context_that_cannot_shrink_compacts_once() {
             chunk_tokens: 3000,
             reflect_after: u64::MAX,
             pool_target: u64::MAX,
+            idle_compact: 0,
         },
     );
     // ~50k tokens: the split turn's prompt stays word for word in the summary.
@@ -1608,6 +1611,7 @@ async fn a_context_builder_rebuilds_requests_and_keeps_the_session_whole() {
                 chunk_tokens: 3000,
                 reflect_after: u64::MAX,
                 pool_target: u64::MAX,
+                idle_compact: 0,
             },
         );
         if builder {
@@ -1703,6 +1707,7 @@ async fn compaction_without_notes_falls_back() {
             chunk_tokens: 3000,
             reflect_after: u64::MAX,
             pool_target: u64::MAX,
+            idle_compact: 0,
         },
     );
     let prompts: Vec<String> = (0..5).map(|i| format!("task {i} {big}")).collect();
@@ -1774,6 +1779,7 @@ async fn compaction_without_the_observer() {
             chunk_tokens: 3000,
             reflect_after: u64::MAX,
             pool_target: u64::MAX,
+            idle_compact: 0,
         },
     )
     .without_observer();
@@ -1816,6 +1822,7 @@ async fn compaction_guide_reaches_the_summary_and_follows_it() {
             chunk_tokens: 3000,
             reflect_after: u64::MAX,
             pool_target: u64::MAX,
+            idle_compact: 0,
         },
     )
     .without_observer()
@@ -1859,6 +1866,7 @@ async fn background_models_follow_a_model_switch() {
         chunk_tokens: 3000,
         reflect_after: u64::MAX,
         pool_target: u64::MAX,
+        idle_compact: 0,
     };
     let prompts: Vec<String> = (0..5).map(|i| format!("task {i} {big}")).collect();
     let refs: Vec<&str> = prompts.iter().map(String::as_str).collect();
@@ -1943,6 +1951,7 @@ async fn compact_splits_one_long_turn_and_keeps_its_prompt() {
             chunk_tokens: 3000,
             reflect_after: u64::MAX,
             pool_target: u64::MAX,
+            idle_compact: 0,
         },
     );
     let (mut agent, _) = drive(agent, &["add a --profile flag"]).await;

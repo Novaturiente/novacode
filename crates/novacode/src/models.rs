@@ -125,22 +125,39 @@ pub async fn switch(
     Ok((switch, route))
 }
 
+/// The small model for `provider` as `provider/model` (L2.29): `models.small.<provider>`,
+/// else `models.small["*"]` (one fixed model for every provider), else the profile's
+/// `smallModel`. A value without `/` is a model on `provider`.
+pub fn small_spec(p: &Providers, overrides: Option<&serde_json::Value>, provider: &str) -> Option<String> {
+    let qualify = |m: &str| match m.contains('/') {
+        true => m.to_string(),
+        false => format!("{provider}/{m}"),
+    };
+    let set = |k: &str| {
+        overrides?
+            .get(k)?
+            .as_str()
+            .filter(|m| !m.trim().is_empty())
+            .map(qualify)
+    };
+    set(provider).or_else(|| set("*")).or_else(|| {
+        let m = p.profile(provider).ok()?.extra_str("smallModel")?;
+        Some(qualify(&m))
+    })
+}
+
 /// The background model (observer, goal judge) for a session on `route`: `explicit`
-/// (`memory.model`), else the provider's small model, else the session's own.
+/// (`memory.model`), else the provider's small model ([`small_spec`]), else the session's own.
 /// One that can't resolve, is denied (`models.deny`) or can't connect falls back to the
 /// session's; the second value is then a notice for the user.
 pub async fn helper(
     p: &Arc<Providers>,
     explicit: Option<String>,
+    overrides: Option<&serde_json::Value>,
     route: &Route,
     main: Arc<dyn Adapter>,
 ) -> (novacode_core::memory::Worker, Option<String>) {
-    let small = p.profile(&route.provider).ok().and_then(|pr| {
-        pr.extra
-            .get("smallModel")?
-            .as_str()
-            .map(|m| format!("{}/{m}", route.provider))
-    });
+    let small = small_spec(p, overrides, &route.provider);
     let session = novacode_core::memory::Worker {
         adapter: main.clone(),
         provider: route.provider.clone(),
@@ -337,7 +354,7 @@ mod tests {
         let p = denying(&["claude-haiku*"]);
         let route = p.resolve("claude/claude-opus-4-5").unwrap();
         let main: Arc<dyn Adapter> = Arc::new(novacode_ai::faux::Faux::new([]));
-        let (w, note) = helper(&p, Some("claude/claude-haiku-4-5".into()), &route, main).await;
+        let (w, note) = helper(&p, Some("claude/claude-haiku-4-5".into()), None, &route, main).await;
         assert_eq!((w.provider.as_str(), w.model.as_str()), ("claude", "claude-opus-4-5"));
         let note = note.expect("the fallback is shown");
         assert!(
@@ -345,8 +362,30 @@ mod tests {
             "{note}"
         );
         // The provider's small model (`claude-haiku`, an alias) is denied too.
-        let (w, note) = helper(&p, None, &route, Arc::new(novacode_ai::faux::Faux::new([]))).await;
+        let (w, note) = helper(&p, None, None, &route, Arc::new(novacode_ai::faux::Faux::new([]))).await;
         assert_eq!(w.model, "claude-opus-4-5");
         assert!(note.is_some_and(|n| n.contains("models.deny")));
+    }
+
+    #[test]
+    fn the_small_model_is_per_provider_with_user_overrides_and_a_fixed_one() {
+        let p = denying(&[]);
+        // Profiles: claude's Haiku, codex's Luna (L2.29); none for a provider without one.
+        assert_eq!(small_spec(&p, None, "claude").as_deref(), Some("claude/claude-haiku"));
+        assert_eq!(small_spec(&p, None, "codex").as_deref(), Some("codex/gpt-luna"));
+        assert_eq!(small_spec(&p, None, "302ai"), None);
+        // `models.small`: a provider's own entry, then `*` for every other one.
+        let o = serde_json::json!({"claude": "claude-sonnet", "*": "claude/claude-haiku"});
+        assert_eq!(
+            small_spec(&p, Some(&o), "claude").as_deref(),
+            Some("claude/claude-sonnet")
+        );
+        assert_eq!(
+            small_spec(&p, Some(&o), "codex").as_deref(),
+            Some("claude/claude-haiku")
+        );
+        // A bare id under `*` is on the session's provider.
+        let o = serde_json::json!({"*": "tiny"});
+        assert_eq!(small_spec(&p, Some(&o), "302ai").as_deref(), Some("302ai/tiny"));
     }
 }

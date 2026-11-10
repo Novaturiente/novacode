@@ -1066,6 +1066,25 @@ impl Agent {
                 .is_none_or(|c| c < at || t >= c.saturating_add(regrow))
     }
 
+    /// Idle compaction (L4.5b): the prompt cache expired since the last model call (or
+    /// cache warming), so the next request rewrites the whole context anyway; when it is
+    /// large, compacting first makes that rewrite the summary instead.
+    fn idle_compact_due(&self) -> bool {
+        let Some(m) = self.memory.as_ref() else { return false };
+        if m.settings.idle_compact == 0 || self.context.is_some() {
+            return false;
+        }
+        let last = self.store.branch().iter().rev().find_map(|e| match &e.kind {
+            EntryKind::Message {
+                message: Message::Assistant(_),
+            }
+            | EntryKind::WarmUsage { .. } => Some(e.ts_ms),
+            _ => None,
+        });
+        cache_expired(last, crate::session::now_ms(), self.cfg.cache)
+            && self.context_tokens() >= m.settings.idle_compact
+    }
+
     /// Start the observer once enough new conversation built up since its last notes.
     fn start_observer(&mut self) {
         let Some(m) = self.memory.as_ref() else { return };
@@ -2977,6 +2996,9 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
                 continue;
             }
             if pending {
+                if agent.idle_compact_due() {
+                    agent.compact("the prompt cache expired while idle").await;
+                }
                 agent.run().await;
                 let idle = {
                     let q = agent.shared.queues.lock().unwrap();
@@ -3159,9 +3181,29 @@ async fn warmer(shared: Arc<Shared>, events: broadcast::Sender<AgentEvent>) {
     }
 }
 
+/// The provider's prompt cache has expired since the last model call at `last` (Unix ms):
+/// 5 min for `short` retention, 60 min for `long`. No call yet: nothing cached to lose.
+fn cache_expired(last: Option<u64>, now: u64, cache: CacheRetention) -> bool {
+    let ttl_ms = match cache {
+        CacheRetention::Long => 3_600_000,
+        _ => 300_000,
+    };
+    last.is_some_and(|t| now.saturating_sub(t) > ttl_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cache_expires_after_its_retention() {
+        let min = 60_000;
+        assert!(!cache_expired(None, 100 * min, CacheRetention::Short), "no call yet");
+        assert!(!cache_expired(Some(0), 5 * min, CacheRetention::Short));
+        assert!(cache_expired(Some(0), 5 * min + 1, CacheRetention::Short));
+        assert!(!cache_expired(Some(0), 59 * min, CacheRetention::Long));
+        assert!(cache_expired(Some(0), 61 * min, CacheRetention::Long));
+    }
 
     /// A `/btw` runner keeps its own user-wait clock, apart from the main one.
     #[test]

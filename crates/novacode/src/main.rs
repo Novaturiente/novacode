@@ -1400,11 +1400,33 @@ impl Ctx {
         route: &novacode_ai::connect::Route,
         main: Arc<dyn novacode_ai::adapter::Adapter>,
     ) -> novacode_core::memory::Worker {
-        let (w, note) = models::helper(&self.providers, explicit, route, main).await;
+        let small = self.settings.get::<serde_json::Value>("models.small");
+        let (w, note) = models::helper(&self.providers, explicit, small.as_ref(), route, main).await;
         if let Some(n) = note {
             self.note(n);
         }
         w
+    }
+
+    /// The provider's small model for read delegation (L5.4b); none without one, or when
+    /// it can't be used (a note says why): delegating to the session's own model saves nothing.
+    async fn small_worker(
+        &self,
+        route: &novacode_ai::connect::Route,
+        main: Arc<dyn novacode_ai::adapter::Adapter>,
+    ) -> Option<novacode_core::memory::Worker> {
+        let small = self.settings.get::<serde_json::Value>("models.small");
+        let spec = models::small_spec(&self.providers, small.as_ref(), &route.provider)?;
+        let (w, note) = models::helper(&self.providers, Some(spec), None, route, main).await;
+        match note {
+            Some(n) => {
+                self.note(format!("read delegation off: {n}"));
+                None
+            }
+            // A session already on its small model (a scout) reads for itself.
+            None if (w.provider.as_str(), w.model.as_str()) == (route.provider.as_str(), route.model.as_str()) => None,
+            None => Some(w),
+        }
     }
 
     /// Build the agent for `model` (`provider/model[:level]`). Returns the resolved `provider/model`.
@@ -1590,6 +1612,16 @@ impl Ctx {
         };
         let memory_on = s.get("memory.enabled").unwrap_or(true);
         let mut all = novacode_tools::builtins(false);
+        // Read delegation (L5.4b): `read` asks the provider's small model about large files.
+        if s.get("read.delegate").unwrap_or(true)
+            && let Some(w) = self.small_worker(&route, adapter.clone()).await
+            && let Some(t) = all.iter_mut().find(|t| t.name() == "read")
+        {
+            *t = Arc::new(novacode_tools::read::Read {
+                delegate: Some(Arc::new(w)),
+                above_lines: s.get("read.delegateAboveLines").unwrap_or(400),
+            });
+        }
         all.push(Arc::new(novacode_tools::process::ProcessTool));
         all.push(Arc::new(novacode_core::web::WebFetch));
         // Codemode-only: scripts call it as models.classify().
@@ -1749,10 +1781,10 @@ impl Ctx {
         {
             // Asked at spawn time: `/model` may have switched provider since.
             let providers = self.providers.clone();
+            let small = s.get::<serde_json::Value>("models.small");
             let models: agents::ModelLookup = Arc::new(move |provider: &str, wanted: &str| {
                 if wanted == "small" {
-                    let p = providers.profile(provider).ok()?;
-                    return Some(format!("{provider}/{}", p.extra.get("smallModel")?.as_str()?));
+                    return models::small_spec(&providers, small.as_ref(), provider);
                 }
                 // Claude Code's family names (`sonnet`), when this provider's catalog has the family.
                 if matches!(wanted, "sonnet" | "opus" | "haiku" | "fable") {
@@ -1773,7 +1805,21 @@ impl Ctx {
                 home: self.paths.home().to_path_buf(),
                 cwd: self.cwd.clone(),
                 trusted: self.trusted,
-                defs: defs.clone(),
+                // `agents.model` (L2.29): the model of agent types that name none.
+                defs: match s
+                    .get::<String>("agents.model")
+                    .filter(|m| !m.is_empty() && m != "inherit")
+                {
+                    Some(m) => defs
+                        .iter()
+                        .cloned()
+                        .map(|mut d| {
+                            d.model.get_or_insert_with(|| m.clone());
+                            d
+                        })
+                        .collect(),
+                    None => defs.clone(),
+                },
                 parent_picks: s.get("agents.parentPicksTools").unwrap_or(true),
                 servers: server_names.clone(),
                 stall_min: s.get("agents.stallMinutes").unwrap_or(10),
@@ -2065,6 +2111,9 @@ impl Ctx {
             }
             if let Some(v) = s.get("memory.poolTargetTokens") {
                 m.pool_target = v;
+            }
+            if let Some(v) = s.get("memory.idleCompactTokens") {
+                m.idle_compact = v;
             }
             let worker = match worker {
                 Some(w) => Some(w.await),
@@ -2608,6 +2657,7 @@ async fn start_session(
         adapter: Default::default(),
         limits: models::Limits::new(&ctx.settings),
         memory_model: ctx.settings.get("memory.model"),
+        small_models: ctx.settings.get("models.small"),
         trace: ctx.trace(),
         processes,
         mcp,

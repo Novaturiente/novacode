@@ -243,7 +243,7 @@ mod tests {
         std::fs::write(&f, "one\ntwo\nthree\n").unwrap();
         let c = ctx(d.path());
         let edit = |o: &str, n: &str| json!({"path": "a.txt", "edits": [{"old_text": o, "new_text": n}]});
-        crate::read::Read.execute(json!({"path": "a.txt"}), &c).await;
+        crate::read::Read::default().execute(json!({"path": "a.txt"}), &c).await;
         // Two edits of one file in a row: the second sees the first's own write as seen.
         let r = Edit.execute(edit("one", "1"), &c).await;
         assert!(!r.is_error && !text(&r).contains("changed on disk"), "{}", text(&r));

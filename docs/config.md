@@ -15,6 +15,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `cache.warm` | bool | false | Keep the prompt cache alive with 1-token replays while it pays off. |
 | `providers` | object | {} | Add a provider or change a bundled one: `providers.<id>.{api, name, baseUrl, auth, env, apiKey, keyOptional, catalog, headers, compat}`, merged field by field over the bundled profile. See docs/providers.md. |
 | `models` | object | {} | Per-model catalog overrides, keyed `"<provider>/<id>"`: `contextWindow`, `maxTokens`, `images`, `reasoning` (bools), `name`, `cost`. See docs/providers.md. |
+| `models.small` | object | unset (each provider's built-in small model) | Your own small model per provider, e.g. `{"claude": "claude-sonnet", "codex": "gpt-luna"}` (a model on that provider). `"*": "provider/model"` uses one fixed model for every provider without its own entry. Used by the helper (observer, namer, judges; `memory.model` still wins), `small` subagents such as `scout`, and read delegation. Built-in: Claude Haiku, Codex Luna, Gemini Flash. |
 | `models.deny` | list | [] | Models never used, as globs (`*` any run, `?` one character), e.g. `["claude-fable*"]`. Each glob is matched against `provider/model`, the bare model id and its last `/` segment, after aliases resolve. A denied session model, `/model` or subagent model is an error; a denied helper, judge or resumed model falls back with a notice. Denied models leave the model list. Prices of past replies still count. |
 | `permissions` | object | auto mode, lenient | Global only. `security` lenient\|hardened: hardened adds the command judge, the sandbox and asks for shared commands and config changes (docs/security.md#security-levels); `mode` auto\|ask\|read-only; `allow`/`ask`/`deny` lists of rules like `Bash(git push:*)`; `protected: {commands, paths}`; `profiles.<name>.{tools, deny}`, named tool sets; `judge`: the command judge's model in auto mode at the hardened level, `off` or a `provider/model[:level]` (default the observer's model). See docs/security.md. |
 | `tools.<name>.exposure` | string | per tool | How a tool reaches the model: `listed` (declared to it), `codemode` (alias `codemode-only`: only codemode scripts call it), `deferred` (found through `tool_search`) or `hidden` (user and UI only). |
@@ -36,6 +37,9 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `memory.compactAtTokens` | number | min(80% of window, 400k) | Context size that triggers auto-compaction. During a run it fires at 95% of the window at most; a value at or above the window turns auto-compaction off. |
 | `memory.reflectAfterTokens` | number | 20000 | New conversation tokens before the reflector runs. |
 | `memory.poolTargetTokens` | number | 10000 | Size the dropper trims active notes down to. |
+| `memory.idleCompactTokens` | number | 100000 | Compact before a run when the prompt cache expired since the last model call (5 min with `cacheRetention: short`, 60 min with `long`) and the context is at least this big: the cold rewrite is then the summary, not the whole history. 0 turns it off. |
+| `read.delegate` | bool | true | Read delegation: `read` gets a `question` field answered by the provider's small model (`models.small`), and a full read of a large text file returns a map of its sections instead of the text. Off, or no small model: plain reads. |
+| `read.delegateAboveLines` | number | 400 | Lines above which a full `read` (no offset, limit or question) returns the small model's map. 0: never map, `question` still works. |
 | `memory.store` | bool | true | Cross-session memory (SQLite) and its start-of-session index. |
 | `memory.indexItems` | number | 15 | Memory items in the session-start index. |
 | `memory.indexChars` | number | 2000 | Character cap of that index. |
@@ -44,6 +48,7 @@ Global settings live in `~/.novacode/settings.json` and project settings in `.no
 | `agents.stallMinutes` | number | 10 | A subagent silent this long is stopped. |
 | `agents.timeoutMinutes` | number | 45 | A subagent running this long is stopped. |
 | `agents.maxConcurrent` | number | 4 | Subagents running at once; more wait as `queued`, in spawn order. A subagent's own subagents run one at a time. |
+| `agents.model` | string | inherit | Model of agent types that name none (`worker`, `reviewer`, `auditor`): `inherit` (the parent's), `small`, a family (`sonnet`) or model id on the parent's provider, or a fixed `provider/model`. |
 | `agents.parentPicksTools` | bool | true | The model may pick a subagent's tools (`tools`) and MCP servers (`mcp`) when it spawns one, from its own. Off: only the type's tools. |
 | `agents.env` | object | {} | Environment variables every subagent starts with, e.g. `{"CAVEMAN_DEFAULT_MODE": "off", "PONYTAIL_SUBAGENT_MATCHER": "^$"}` keeps those plugins' `SubagentStart` text out of subagents. |
 | `agents.<name>.tools` | list | the agent file's | Default tools of subagent type `<name>` (built-ins too); a subagent sees only its tools. |

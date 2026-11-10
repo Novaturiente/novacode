@@ -249,7 +249,7 @@ pub fn builtins(apply_patch: bool) -> Vec<Arc<dyn Tool>> {
         Arc::new(edit::Edit)
     };
     vec![
-        Arc::new(read::Read),
+        Arc::new(read::Read::default()),
         Arc::new(write::Write),
         edit,
         Arc::new(bash::Bash),

@@ -87,7 +87,8 @@
   "compat": {
    "noMaxTokens": true
   },
-  "originator": "novacode"
+  "originator": "novacode",
+  "smallModel": "gpt-luna"
  },
  "cohere": {
   "name": "Cohere",

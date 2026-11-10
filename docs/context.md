@@ -129,7 +129,8 @@ Two more background steps keep the notes small. They run in the same background 
 | Setting | Default | Meaning |
 |---|---|---|
 | `memory.enabled` | `true` | Turn the observer (session notes) and `recall` on or off. Compaction runs either way. |
-| `memory.model` | the provider's small model, else the session model | Model used for the observer, reflector and dropper. |
+| `memory.model` | the provider's small model (`models.small`), else the session model | Model used for the observer, reflector and dropper. |
+| `memory.idleCompactTokens` | `100000` | Compact before a run when the prompt cache expired while you were away (5 min, or 60 min with `cacheRetention: long`) and the context is at least this big. The next request would rewrite the whole context anyway; this way it rewrites the summary. `0` turns it off. |
 | `memory.observeAfterTokens` | `10000` | New tokens before the observer runs. |
 | `memory.keepRecentTokens` | `20000` | Tokens kept word for word after a compaction. |
 | `memory.compactAtTokens` | 80% of the window, at most 400000 | Context size that triggers automatic compaction. |
