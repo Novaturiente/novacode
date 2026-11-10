@@ -329,11 +329,15 @@ impl Host {
                     }
                 }
             }
-            Cmd::Prompt(t) | Cmd::Steer(t) if is_mode_command(&t) => {
-                if let Some(task) = self.mode_command(&t, ui) {
+            Cmd::Prompt(t) | Cmd::Steer(t) if is_mode_command(&t) => match self.mode_command(&t, ui) {
+                Ok(Some(task)) => {
                     return Box::pin(self.handle_as(Cmd::Prompt(task), ui, local, wire)).await;
                 }
-            }
+                Ok(None) => {}
+                Err(text) => {
+                    let _ = ui.send(UiEvent::Notice { text, error: true });
+                }
+            },
             Cmd::Prompt(t) | Cmd::Steer(t) if t.starts_with('/') && self.ext_command(&t, ui).await => {}
             // `/typo` alone on a line is a mistyped command, not a prompt (`/tmp is full` is).
             Cmd::Prompt(t) | Cmd::Steer(t) if self.unknown_command(&t) => {
@@ -380,83 +384,17 @@ impl Host {
                 }
             }
             Cmd::SetModel(m) => {
-                let (me, tx) = (self.clone(), ui.clone());
+                let (me, ui) = (self.clone(), ui.clone());
                 tokio::spawn(async move {
-                    let level = me.cur.lock().unwrap().1;
-                    match models::switch(&me.providers, &m, level, me.limits, me.trace.clone()).await {
-                        Ok((mut sw, route)) => {
-                            // Observer and goal judge move to the new provider's small model.
-                            if me.memory_model.is_none() {
-                                let (w, note) = models::helper(
-                                    &me.providers,
-                                    None,
-                                    me.small_models.as_ref(),
-                                    &route,
-                                    sw.adapter.clone(),
-                                )
-                                .await;
-                                if let Some(text) = note {
-                                    let _ = tx.send(UiEvent::Notice { text, error: false });
-                                }
-                                if let Some(g) = &me.goals {
-                                    g.set_judge_model(w.clone());
-                                }
-                                sw.helper = Some(w);
-                            }
-                            let price = models::price(&me.providers, &route);
-                            let ev = UiEvent::ModelSet {
-                                model: route.spec(),
-                                window_tokens: sw.window_tokens,
-                                level: sw.thinking,
-                                price,
-                            };
-                            *me.cur.lock().unwrap() = (route.spec(), sw.thinking);
-                            me.hub.update(local, |s| {
-                                s.model = route.spec();
-                                s.level = sw.thinking;
-                                s.window_tokens = sw.window_tokens;
-                                s.price = price;
-                            });
-                            me.follow_account(sw.adapter.clone());
-                            me.hub.handle.set_model(sw);
-                            let _ = tx.send(ev);
-                        }
-                        Err(e) => {
-                            let _ = tx.send(UiEvent::Notice {
-                                text: format!("model not changed: {e:#}"),
-                                error: true,
-                            });
-                        }
+                    if let Err(text) = me.set_model(&m, &ui, local).await {
+                        let _ = ui.send(UiEvent::Notice { text, error: true });
                     }
                 });
             }
             Cmd::SetThinking(l) => {
-                let spec = self.cur.lock().unwrap().0.clone();
-                let route = match models::usable(&self.providers, &spec) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = ui.send(UiEvent::Notice {
-                            text: format!("thinking not changed: {e}"),
-                            error: true,
-                        });
-                        return false;
-                    }
-                };
-                let level = route.clamp(l);
-                self.cur.lock().unwrap().1 = level;
-                h.set_thinking(level);
-                self.hub.update(local, |s| s.level = level);
-                let mut note = format!("thinking → {} from the next message", level.as_str());
-                if level != l {
-                    note += &format!(" ({} has no `{}`)", route.model, l.as_str());
+                if let Err(text) = self.set_thinking(l, ui, local) {
+                    let _ = ui.send(UiEvent::Notice { text, error: true });
                 }
-                // L1.7: say what the change costs, never block.
-                note += if route.thinking_change_keeps_cache() {
-                    "; the cache is kept"
-                } else {
-                    "; the cache starts over"
-                };
-                let _ = ui.send(UiEvent::Thinking { level, note });
             }
             Cmd::ListModels => {
                 let (me, tx) = (self.clone(), ui.clone());
@@ -720,6 +658,72 @@ impl Host {
         false
     }
 
+    /// Apply a model switch before acknowledging it to RPC clients.
+    pub async fn set_model(&self, m: &str, ui: &UnboundedSender<UiEvent>, local: bool) -> Result<(), String> {
+        let level = self.cur.lock().unwrap().1;
+        let (mut sw, route) = models::switch(&self.providers, m, level, self.limits, self.trace.clone())
+            .await
+            .map_err(|e| format!("model not changed: {e:#}"))?;
+        // Observer and goal judge move to the new provider's small model.
+        if self.memory_model.is_none() {
+            let (w, note) = models::helper(
+                &self.providers,
+                None,
+                self.small_models.as_ref(),
+                &route,
+                sw.adapter.clone(),
+            )
+            .await;
+            if let Some(text) = note {
+                let _ = ui.send(UiEvent::Notice { text, error: false });
+            }
+            if let Some(g) = &self.goals {
+                g.set_judge_model(w.clone());
+            }
+            sw.helper = Some(w);
+        }
+        let price = models::price(&self.providers, &route);
+        let ev = UiEvent::ModelSet {
+            model: route.spec(),
+            window_tokens: sw.window_tokens,
+            level: sw.thinking,
+            price,
+        };
+        *self.cur.lock().unwrap() = (route.spec(), sw.thinking);
+        self.hub.update(local, |s| {
+            s.model = route.spec();
+            s.level = sw.thinking;
+            s.window_tokens = sw.window_tokens;
+            s.price = price;
+        });
+        self.follow_account(sw.adapter.clone());
+        self.hub.handle.set_model(sw);
+        let _ = ui.send(ev);
+        Ok(())
+    }
+
+    /// Apply the model-supported thinking level, including any clamp.
+    pub fn set_thinking(&self, l: ThinkingLevel, ui: &UnboundedSender<UiEvent>, local: bool) -> Result<(), String> {
+        let spec = self.cur.lock().unwrap().0.clone();
+        let route = models::usable(&self.providers, &spec).map_err(|e| format!("thinking not changed: {e}"))?;
+        let level = route.clamp(l);
+        self.cur.lock().unwrap().1 = level;
+        self.hub.handle.set_thinking(level);
+        self.hub.update(local, |s| s.level = level);
+        let mut note = format!("thinking → {} from the next message", level.as_str());
+        if level != l {
+            note += &format!(" ({} has no `{}`)", route.model, l.as_str());
+        }
+        // L1.7: say what the change costs, never block.
+        note += if route.thinking_change_keeps_cache() {
+            "; the cache is kept"
+        } else {
+            "; the cache starts over"
+        };
+        let _ = ui.send(UiEvent::Thinking { level, note });
+        Ok(())
+    }
+
     /// A slash command typed over RPC or attach (L8.9): run by the session, never
     /// sent as a prompt. `None` = not one of these (skills and templates expand later).
     pub fn slash(&self, text: &str) -> Option<Result<Cmd, String>> {
@@ -764,14 +768,11 @@ impl Host {
     }
 
     /// `/plan [task]` and `/mode [name|off]`. Returns a task to send after switching.
-    fn mode_command(&self, text: &str, ui: &UnboundedSender<UiEvent>) -> Option<String> {
+    pub fn mode_command(&self, text: &str, ui: &UnboundedSender<UiEvent>) -> Result<Option<String>, String> {
         let say = |text: String, error: bool| {
             let _ = ui.send(UiEvent::Notice { text, error });
         };
-        let Some(m) = &self.modes else {
-            say("modes are not available in this session".into(), true);
-            return None;
-        };
+        let m = self.modes.as_ref().ok_or("modes are not available in this session")?;
         let (cmd, arg) = text
             .trim()
             .split_once(char::is_whitespace)
@@ -788,36 +789,29 @@ impl Host {
                     ),
                     false,
                 );
-                return None;
+                return Ok(None);
             }
             ("/mode", "off") => None,
             (_, name) => Some(name),
         };
-        match m.set(target) {
-            Ok(()) => {
-                // A lasting marker in every window's status line while a mode is on.
-                self.hub.handle.emit(novacode_types::AgentEvent::Ui {
-                    ext: "novacode".into(),
-                    op: novacode_types::ui::UiOp::Status {
-                        key: "mode".into(),
-                        text: target.map(|n| format!("⏸ {n} mode")),
-                        style: Some("warn".into()),
-                    },
-                });
-                say(
-                    match target {
-                        Some(n) => format!("{n} mode on (from the next step)"),
-                        None => "mode off".into(),
-                    },
-                    false,
-                )
-            }
-            Err(e) => {
-                say(e, true);
-                return None;
-            }
-        }
-        (cmd == "/plan" && !arg.is_empty()).then(|| arg.to_string())
+        m.set(target)?;
+        // A lasting marker in every window's status line while a mode is on.
+        self.hub.handle.emit(novacode_types::AgentEvent::Ui {
+            ext: "novacode".into(),
+            op: novacode_types::ui::UiOp::Status {
+                key: "mode".into(),
+                text: target.map(|n| format!("⏸ {n} mode")),
+                style: Some("warn".into()),
+            },
+        });
+        say(
+            match target {
+                Some(n) => format!("{n} mode on (from the next step)"),
+                None => "mode off".into(),
+            },
+            false,
+        );
+        Ok((cmd == "/plan" && !arg.is_empty()).then(|| arg.to_string()))
     }
 
     /// Every slash command: built-ins, then templates and skills (L8.9).

@@ -234,8 +234,16 @@ async fn dispatch(
         }
         ClientCmd::Prompt { text, .. } if text.starts_with('/') && host.slash(&text).is_some() => {
             let cmd = host.slash(&text).unwrap()?;
-            host.handle(cmd, ui, false).await;
+            match cmd {
+                Cmd::SetModel(model) => host.set_model(&model, ui, false).await?,
+                Cmd::SetThinking(level) => host.set_thinking(level, ui, false)?,
+                cmd => host.handle(cmd, ui, false).await,
+            }
             Ok(json!({ "disposition": "handled" }))
+        }
+        ClientCmd::Prompt { text, .. } if text.split_whitespace().next() == Some("/mode") => {
+            host.mode_command(&text, ui)?;
+            Ok(json!({ "disposition": "handled", "state": hub.state() }))
         }
         ClientCmd::GetCommands => Ok(json!({
             "commands": host.commands().into_iter().map(|(name, description)| json!({"name": name, "description": description})).collect::<Vec<_>>()
@@ -263,8 +271,14 @@ async fn dispatch(
             }
             via(Cmd::Abort).await
         }
-        ClientCmd::SetModel { model } => via(Cmd::SetModel(model)).await,
-        ClientCmd::SetThinking { level } => via(Cmd::SetThinking(level)).await,
+        ClientCmd::SetModel { model } => {
+            host.set_model(&model, ui, false).await?;
+            Ok(serde_json::to_value(hub.state()).unwrap_or_default())
+        }
+        ClientCmd::SetThinking { level } => {
+            host.set_thinking(level, ui, false)?;
+            Ok(serde_json::to_value(hub.state()).unwrap_or_default())
+        }
         ClientCmd::Compact => via(Cmd::Compact).await,
         ClientCmd::ListModels => via(Cmd::ListModels).await,
         ClientCmd::GetContext => Ok(json!({ "text": hub.handle.context().render() })),
@@ -1136,6 +1150,21 @@ mod tests {
         let (handle, task) = novacode_core::agent::spawn(agent);
         let hub = crate::hub::Hub::start(handle, vec![], State::default(), None);
         let settings = novacode_base::settings::Settings::load(&home, None, false);
+        let modes = novacode_core::modes::Modes::new(
+            Arc::new(novacode_core::policy::Policy::new(
+                Default::default(),
+                home.clone(),
+                None,
+            )),
+            Default::default(),
+        );
+        let mode_hub = hub.clone();
+        modes.on_change(move |mode| mode_hub.update(false, |s| s.mode = mode));
+        let mut providers = novacode_ai::connect::Providers::load(&home, &settings);
+        providers.catalog = novacode_ai::catalog::Catalog::load(
+            &home.join("no-catalog.json"),
+            Some(&json!({ "deepseek/test-clamp": { "reasoning": false } })),
+        );
         let host = Arc::new(Host {
             hub,
             cur: Arc::new(std::sync::Mutex::new(("faux/m".into(), Default::default()))),
@@ -1147,7 +1176,7 @@ mod tests {
                 templates: vec![],
             },
             undo: Default::default(),
-            providers: Arc::new(novacode_ai::connect::Providers::load(&home, &settings)),
+            providers: Arc::new(providers),
             limits: crate::models::Limits::new(&settings),
             memory_model: None,
             small_models: None,
@@ -1155,12 +1184,13 @@ mod tests {
             processes: None,
             mcp: None,
             extensions: None,
-            modes: None,
+            modes: Some(modes),
             goals: Some(goals.clone()),
             login: Default::default(),
             adapter: Default::default(),
             worktree_copy: vec![],
         });
+        check_configuration_acknowledgements(&host).await;
         let live = go_live(&host, true).unwrap();
         let (r, mut w) = tokio::io::split(connect(&live.sock).await.unwrap());
         w.write_all(
@@ -1218,6 +1248,80 @@ mod tests {
         host.hub.handle.shutdown();
         let _ = task.await;
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// RPC acknowledges the applied state and rejects invalid configuration before success.
+    async fn check_configuration_acknowledgements(host: &Arc<Host>) {
+        let (ui, _rx) = mpsc::unbounded_channel();
+        let original = serde_json::to_value(host.hub.state()).unwrap();
+        for cmd in [
+            ClientCmd::SetModel {
+                model: "faux/missing".into(),
+            },
+            ClientCmd::Prompt {
+                text: "/model faux/missing".into(),
+                raw: false,
+            },
+        ] {
+            let error = dispatch(host, cmd, None, &ui).await.unwrap_err();
+            assert!(error.contains("model not changed: unknown faux model"), "{error}");
+            assert_eq!(serde_json::to_value(host.hub.state()).unwrap(), original);
+        }
+        let error = dispatch(
+            host,
+            ClientCmd::SetThinking {
+                level: novacode_types::ThinkingLevel::High,
+            },
+            None,
+            &ui,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("thinking not changed: unknown faux model"), "{error}");
+        host.cur.lock().unwrap().0 = "deepseek/test-clamp".into();
+        let applied = dispatch(
+            host,
+            ClientCmd::SetThinking {
+                level: novacode_types::ThinkingLevel::High,
+            },
+            None,
+            &ui,
+        )
+        .await
+        .unwrap();
+        assert_eq!(host.cur.lock().unwrap().1, novacode_types::ThinkingLevel::Off);
+        assert_eq!(applied["level"], "off");
+        assert_eq!(applied, serde_json::to_value(host.hub.state()).unwrap());
+        host.cur.lock().unwrap().0 = "faux/m".into();
+        for (text, expected) in [("/mode plan", Some("plan")), ("/mode off", None)] {
+            let applied = dispatch(
+                host,
+                ClientCmd::Prompt {
+                    text: text.into(),
+                    raw: false,
+                },
+                None,
+                &ui,
+            )
+            .await
+            .unwrap();
+            assert_eq!(host.hub.state().mode.as_deref(), expected);
+            assert_eq!(applied["state"], serde_json::to_value(host.hub.state()).unwrap());
+            let error = dispatch(
+                host,
+                ClientCmd::Prompt {
+                    text: "/mode missing".into(),
+                    raw: false,
+                },
+                None,
+                &ui,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.starts_with("no mode"), "{error}");
+            assert_eq!(host.hub.state().mode.as_deref(), expected);
+            assert!(!host.hub.state().busy);
+        }
     }
 
     // The boot time comes from /proc/stat, so only Linux can call our own pid's old run dead.

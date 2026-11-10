@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
@@ -41,11 +41,13 @@ pub async fn run(paths: Paths, model: Option<String>) -> anyhow::Result<ExitCode
         out,
         next: AtomicU64::new(1),
         waiting: Mutex::default(),
+        closed: AtomicBool::new(false),
         sessions: Mutex::default(),
         caps: Mutex::default(),
         paths,
         model,
     });
+    let mut requests = tokio::task::JoinSet::new();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Ok(Some(l)) = lines.next_line().await {
         let Ok(msg) = serde_json::from_str::<Value>(&l) else {
@@ -56,7 +58,7 @@ pub async fn run(paths: Paths, model: Option<String>) -> anyhow::Result<ExitCode
         match (msg.get("method").and_then(Value::as_str), id) {
             (Some(method), Some(id)) => {
                 let (acp, method, params) = (acp.clone(), method.to_string(), msg["params"].clone());
-                tokio::spawn(async move {
+                requests.spawn(async move {
                     let r = acp.request_in(&method, params).await;
                     acp.send(match r {
                         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
@@ -72,20 +74,30 @@ pub async fn run(paths: Paths, model: Option<String>) -> anyhow::Result<ExitCode
                     Some(e) => Err(e.clone()),
                     None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
                 };
-                if let Some(tx) = id.as_u64().and_then(|n| acp.waiting.lock().unwrap().remove(&n)) {
+                if let Some((_, tx)) = id.as_u64().and_then(|n| acp.waiting.lock().unwrap().remove(&n)) {
                     let _ = tx.send(r);
                 }
             }
             (None, None) => {}
         }
+        while requests.try_join_next().is_some() {}
     }
+    acp.closed.store(true, Ordering::SeqCst);
+    acp.waiting.lock().unwrap().clear();
+    requests.shutdown().await;
     // The editor left: end every session cleanly (its processes, its session file).
     let all: Vec<Arc<Sess>> = acp.sessions.lock().unwrap().drain().map(|(_, s)| s).collect();
     for s in all {
         s.close().await;
     }
     drop(acp);
-    let _ = writer.await;
+    let mut writer = writer;
+    if tokio::time::timeout(std::time::Duration::from_secs(1), &mut writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -100,7 +112,8 @@ struct Caps {
 struct Acp {
     out: mpsc::UnboundedSender<String>,
     next: AtomicU64,
-    waiting: Mutex<HashMap<u64, oneshot::Sender<ClientReply>>>,
+    waiting: Mutex<HashMap<u64, (String, oneshot::Sender<ClientReply>)>>,
+    closed: AtomicBool,
     sessions: Mutex<HashMap<String, Arc<Sess>>>,
     caps: Mutex<Caps>,
     paths: Paths,
@@ -144,10 +157,16 @@ impl Acp {
     }
 
     /// A request to the client (permission, form); waits for its answer.
-    async fn ask_client(&self, method: &str, params: impl Serialize) -> ClientReply {
+    async fn ask_client(&self, session: &Sess, method: &str, params: impl Serialize) -> ClientReply {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.waiting.lock().unwrap().insert(id, tx);
+        {
+            let mut waiting = self.waiting.lock().unwrap();
+            if self.closed.load(Ordering::SeqCst) || session.closed.load(Ordering::SeqCst) {
+                return Err(Value::Null);
+            }
+            waiting.insert(id, (session.id.clone(), tx));
+        }
         self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
         rx.await.unwrap_or(Err(Value::Null))
     }
@@ -202,7 +221,7 @@ impl Acp {
             }
             "session/load" => {
                 let r: acp::LoadSessionRequest = serde_json::from_value(params).map_err(bad)?;
-                let old = self.sessions.lock().unwrap().remove(&*r.session_id.0);
+                let old = self.sessions.lock().unwrap().get(&*r.session_id.0).cloned();
                 if let Some(old) = old {
                     old.close().await;
                 }
@@ -232,7 +251,7 @@ impl Acp {
             }
             "session/close" => {
                 let r: acp::CloseSessionRequest = serde_json::from_value(params).map_err(bad)?;
-                let s = self.sessions.lock().unwrap().remove(&*r.session_id.0);
+                let s = self.sessions.lock().unwrap().get(&*r.session_id.0).cloned();
                 if let Some(s) = s {
                     s.close().await;
                 }
@@ -246,7 +265,8 @@ impl Acp {
     /// keep translating its messages until it ends.
     async fn open(self: &Arc<Self>, cwd: &Path, resume: Option<&str>) -> Result<Arc<Sess>, RpcError> {
         let mut cmd = tokio::process::Command::new(crate::agents::own_exe());
-        cmd.arg("--rpc")
+        cmd.kill_on_drop(true)
+            .arg("--rpc")
             .current_dir(cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -291,6 +311,7 @@ impl Acp {
             prompts: Mutex::default(),
             replies: Mutex::default(),
             child: tokio::sync::Mutex::new(Some(child)),
+            closed: AtomicBool::new(false),
             view: Mutex::new(View {
                 state,
                 ..Default::default()
@@ -339,8 +360,8 @@ struct View {
     models: Vec<(String, String)>,
     /// Kind of each streamed block of the current reply, by index.
     blocks: HashMap<usize, BlockKind>,
-    /// Tool calls shown but not finished: `(call id, tool, started)`, oldest first.
-    calls: Vec<(String, String, bool)>,
+    /// Tool calls shown but not finished.
+    calls: Vec<String>,
     /// Tools whose diff stays as their content when they finish.
     diffs: Vec<String>,
     last_error: Option<String>,
@@ -361,6 +382,7 @@ struct Sess {
     /// Wire request id → the command waiting for its `response`.
     replies: Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>,
     child: tokio::sync::Mutex<Option<tokio::process::Child>>,
+    closed: AtomicBool,
     view: Mutex<View>,
 }
 
@@ -424,38 +446,53 @@ impl Sess {
         match id {
             "model" => {
                 self.call(ClientCmd::SetModel { model: value.into() }).await?;
-                self.view.lock().unwrap().state.model = value.into();
             }
             "thought_level" => {
                 let level = ThinkingLevel::parse(value).ok_or_else(|| format!("unknown thinking level `{value}`"))?;
                 self.call(ClientCmd::SetThinking { level }).await?;
-                self.view.lock().unwrap().state.level = level;
             }
             "mode" => {
+                if value != "off" && !self.view.lock().unwrap().state.modes.iter().any(|mode| mode == value) {
+                    return Err(format!("unknown mode `{value}`"));
+                }
                 let text = format!("/mode {value}");
                 self.call(ClientCmd::Prompt { text, raw: false }).await?;
-                self.view.lock().unwrap().state.mode = (value != "off").then(|| value.to_string());
             }
             _ => return Err(format!("unknown option `{id}`")),
         }
+        let state = self.call(ClientCmd::GetState).await?;
+        self.on_state(serde_json::from_value(state).map_err(|e| format!("invalid session state: {e}"))?);
         Ok(())
     }
 
+    fn cancel_client_requests(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        if let Some(a) = self.acp() {
+            a.waiting.lock().unwrap().retain(|_, (session, _)| session != &self.id);
+        }
+    }
+
     async fn close(&self) {
-        let _ = self.call(ClientCmd::Shutdown).await;
+        self.cancel_client_requests();
         if let Some(mut c) = self.child.lock().await.take() {
-            // shortcut: a session that ignores shutdown is killed after 10 s; its file may miss the tail.
-            if tokio::time::timeout(std::time::Duration::from_secs(10), c.wait())
+            // Bound the acknowledgment as well as process exit: either can stall.
+            let shutdown = async {
+                let _ = self.call(ClientCmd::Shutdown).await;
+                let _ = c.wait().await;
+            };
+            if tokio::time::timeout(std::time::Duration::from_secs(10), shutdown)
                 .await
                 .is_err()
             {
                 let _ = c.kill().await;
             }
         }
+        self.ended();
     }
 
     /// The child is gone: everything still waiting fails.
     fn ended(&self) {
+        self.cancel_client_requests();
         for (_, tx) in self.prompts.lock().unwrap().drain() {
             let _ = tx.send(Err("the session process ended".into()));
         }
@@ -463,7 +500,10 @@ impl Sess {
             let _ = tx.send(Err("the session process ended".into()));
         }
         if let Some(a) = self.acp() {
-            a.sessions.lock().unwrap().remove(&self.id);
+            let mut sessions = a.sessions.lock().unwrap();
+            if sessions.get(&self.id).is_some_and(|s| std::ptr::eq(s.as_ref(), self)) {
+                sessions.remove(&self.id);
+            }
         }
     }
 
@@ -605,15 +645,10 @@ impl Sess {
                 _ => {}
             },
             AgentEvent::ToolStart { call } => {
-                let known = self.view.lock().unwrap().calls.iter().any(|c| c.0 == call.id);
+                let known = self.view.lock().unwrap().calls.contains(&call.id);
                 if !known {
                     self.tool_call(&call.id, &call.name, &call.arguments, acp::ToolCallStatus::InProgress);
                 }
-                let mut v = self.view.lock().unwrap();
-                if let Some(c) = v.calls.iter_mut().find(|c| c.0 == call.id) {
-                    c.2 = true;
-                }
-                drop(v);
                 let f = acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress);
                 self.update(acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(call.id, f)));
             }
@@ -673,7 +708,7 @@ impl Sess {
     fn tool_call(&self, id: &str, tool: &str, args: &Value, status: acp::ToolCallStatus) {
         let diffs = diffs(tool, args, &self.cwd);
         let mut v = self.view.lock().unwrap();
-        v.calls.push((id.to_string(), tool.to_string(), false));
+        v.calls.push(id.to_string());
         if !diffs.is_empty() {
             v.diffs.push(id.to_string());
         }
@@ -689,7 +724,7 @@ impl Sess {
 
     fn tool_result(&self, id: &str, content: &[Block], is_error: bool) {
         let mut v = self.view.lock().unwrap();
-        v.calls.retain(|c| c.0 != id);
+        v.calls.retain(|c| c != id);
         let keep_diff = !is_error && v.diffs.contains(&id.to_string());
         v.diffs.retain(|d| d != id);
         drop(v);
@@ -708,26 +743,17 @@ impl Sess {
         )));
     }
 
-    /// A permission card (L6.1) as `session/request_permission` on the call that asks.
+    /// A permission card (L6.1), independent of streamed calls: the wire has no call id.
     async fn approve(&self, id: u64, tool: String, detail: String, reason: String) {
         let Some(a) = self.acp() else { return };
-        // Approval comes before `tool_start`: the oldest shown, unstarted call of this tool.
-        let call = {
-            let v = self.view.lock().unwrap();
-            v.calls.iter().find(|c| c.1 == tool && !c.2).map(|c| c.0.clone())
-        };
-        let call = match call {
-            Some(c) => c,
-            None => {
-                let c = format!("approval-{id}");
-                self.tool_call(&c, &tool, &json!({ "command": detail }), acp::ToolCallStatus::Pending);
-                c
-            }
-        };
-        let mut fields = acp::ToolCallUpdateFields::new();
-        if !reason.is_empty() {
-            fields = fields.title(format!("{} ({reason})", title_text(&tool, &detail)));
-        }
+        // Never borrow another call's diff: all same-tool approvals precede ToolStart.
+        let call = format!("approval-{id}");
+        let text = format!("{tool}: {detail}\n\n{reason}");
+        let fields = acp::ToolCallUpdateFields::new()
+            .title(title_text(&tool, &detail))
+            .kind(kind(&tool))
+            .status(acp::ToolCallStatus::Pending)
+            .content(vec![text.into()]);
         let options = vec![
             acp::PermissionOption::new("once", "Allow once", acp::PermissionOptionKind::AllowOnce),
             acp::PermissionOption::new(
@@ -742,8 +768,12 @@ impl Sess {
             ),
             acp::PermissionOption::new("deny", "Deny", acp::PermissionOptionKind::RejectOnce),
         ];
-        let req = acp::RequestPermissionRequest::new(self.id.clone(), acp::ToolCallUpdate::new(call, fields), options);
-        let answer = match a.ask_client("session/request_permission", req).await {
+        let req = acp::RequestPermissionRequest::new(
+            self.id.clone(),
+            acp::ToolCallUpdate::new(call.clone(), fields),
+            options,
+        );
+        let answer = match a.ask_client(self, "session/request_permission", req).await {
             Ok(v) => match serde_json::from_value::<acp::RequestPermissionResponse>(v).map(|r| r.outcome) {
                 Ok(acp::RequestPermissionOutcome::Selected(s)) => match &*s.option_id.0 {
                     "once" => Answer::Once,
@@ -755,6 +785,15 @@ impl Sess {
             },
             Err(_) => Answer::Deny(None),
         };
+        let status = if matches!(answer, Answer::Deny(_)) {
+            acp::ToolCallStatus::Failed
+        } else {
+            acp::ToolCallStatus::Completed
+        };
+        self.update(acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+            call,
+            acp::ToolCallUpdateFields::new().status(status),
+        )));
         self.cmd(ClientCmd::Approval { approval: id, answer });
     }
 
@@ -779,7 +818,7 @@ impl Sess {
         };
         let mode = acp::ElicitationFormMode::new(acp::ElicitationSessionScope::new(self.id.clone()), form(&questions));
         let req = acp::CreateElicitationRequest::new(mode, message);
-        let replies = match a.ask_client("elicitation/create", req).await {
+        let replies = match a.ask_client(self, "elicitation/create", req).await {
             Ok(v) => match serde_json::from_value::<acp::CreateElicitationResponse>(v).map(|r| r.action) {
                 Ok(acp::ElicitationAction::Accept(acc)) => Some(replies(&questions, &acc.content.unwrap_or_default())),
                 _ => None,

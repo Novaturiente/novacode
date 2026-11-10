@@ -37,6 +37,7 @@ Project settings, project MCP servers and project skills load only in folders yo
 - **Files:** @-mentioned files reach the model as their paths.
 - **Model, thinking and mode:** pickers in the composer change the model, the thinking level and the mode (plan mode and your mode presets).
 - **Slash commands:** `/compact`, `/context`, `/model`, `/thinking`, `/mode`, skills and prompt templates all work. Command output appears as a reply.
+- **Accounts:** `/account <name>` switches to an existing subscription account. The bare `/account` picker is not displayed; use the named command instead.
 - **Context use:** Zed shows the context in use against the model's window. Compaction shows as an entry in the thread.
 - **History:** past sessions of the folder are listed in Zed's thread history and reopen with their messages and tool calls.
 
@@ -51,6 +52,8 @@ Every editor session is a live session, so `novacode attach <id>` opens it in a 
 - answering an `ask_user` question in an editor that has no forms.
 
 Long `bash` output appears when the command finishes, not while it runs.
+
+The editor does not display terminal-only pickers, extension panels, `/btw` side conversations or `/goal edit` drafts. Use a terminal for those features. `/login` is refused over ACP: run `novacode login` in a terminal. Some commands require the session's own window rather than an attached window; if a command says so, leave it for a terminal-owned session.
 
 ## Troubleshooting
 

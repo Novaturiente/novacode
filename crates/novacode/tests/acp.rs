@@ -97,6 +97,16 @@ impl Editor {
         }
     }
 
+    fn wait_for_request(&mut self, method: &str) -> Value {
+        loop {
+            let m = self.rx.recv_timeout(Duration::from_secs(15)).expect("a client request");
+            self.seen.push(m.clone());
+            if m["method"] == method {
+                return m;
+            }
+        }
+    }
+
     fn updates(&self, kind: &str) -> Vec<&Value> {
         self.seen
             .iter()
@@ -223,6 +233,147 @@ fn a_prompt_with_an_image_runs_a_tool_and_shows_its_diff() {
     drop(ed.stdin);
     let status = ed.child.wait().unwrap();
     assert!(status.success());
+}
+
+fn wait_for_exit(child: &mut Child) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "ACP exited with {status}");
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("ACP did not exit within 15 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn same_tool_approvals_never_borrow_another_calls_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    let (home, cwd, script) = setup(
+        dir.path(),
+        concat!(
+            r#"{"tools": [{"name": "write", "args": {"path": "a.txt", "content": "first"}}, {"name": "write", "args": {"path": "b.txt", "content": "second"}}]}"#,
+            "\n",
+            r#"{"text": "done"}"#,
+            "\n"
+        ),
+    );
+    std::fs::write(
+        home.join("settings.json"),
+        r#"{"model":"faux/script","permissions":{"mode":"ask"}}"#,
+    )
+    .unwrap();
+    let mut ed = start(&cwd, &home, &script);
+    ed.send(json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":cwd,"mcpServers":[]}}));
+    let sid = ed.until(2, "once")["result"]["sessionId"].clone();
+    ed.send(json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":sid,"prompt":[{"type":"text","text":"write both"}]}}));
+    assert_eq!(ed.until(3, "once")["result"]["stopReason"], "end_turn");
+    let cards: Vec<_> = ed
+        .seen
+        .iter()
+        .filter(|m| m["method"] == "session/request_permission")
+        .map(|m| &m["params"]["toolCall"])
+        .collect();
+    assert_eq!(cards.len(), 2, "{cards:?}");
+    assert_ne!(cards[0]["toolCallId"], cards[1]["toolCallId"]);
+    for (card, path) in cards.iter().zip(["a.txt", "b.txt"]) {
+        assert!(card["toolCallId"].as_str().unwrap().starts_with("approval-"));
+        let content = card["content"].as_array().unwrap();
+        assert!(content.iter().all(|c| c["type"] != "diff"), "{card}");
+        let text = content[0]["content"]["text"].as_str().unwrap();
+        assert!(text.contains("write:") && text.contains(path), "{card}");
+        assert!(text.contains("ask mode"), "the exact approval reason is shown: {card}");
+    }
+    assert_eq!(std::fs::read_to_string(cwd.join("a.txt")).unwrap(), "first");
+    assert_eq!(std::fs::read_to_string(cwd.join("b.txt")).unwrap(), "second");
+    drop(ed.stdin);
+    wait_for_exit(&mut ed.child);
+}
+
+#[test]
+fn unanswered_permissions_and_forms_cancel_on_close_and_eof() {
+    for (tool, method) in [
+        (
+            json!({"name":"write","args":{"path":"a.txt","content":"hello"}}),
+            "session/request_permission",
+        ),
+        (
+            json!({"name":"ask_user","args":{"questions":[{"question":"Name?"}]}}),
+            "elicitation/create",
+        ),
+    ] {
+        for close in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (home, cwd, script) = setup(dir.path(), &format!("{}\n", json!({"tools":[tool]})));
+            std::fs::write(
+                home.join("settings.json"),
+                r#"{"model":"faux/script","permissions":{"mode":"ask"}}"#,
+            )
+            .unwrap();
+            let mut ed = start(&cwd, &home, &script);
+            ed.send(json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":cwd,"mcpServers":[]}}));
+            let sid = ed.until(2, "once")["result"]["sessionId"].clone();
+            ed.send(json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":sid,"prompt":[{"type":"text","text":"start"}]}}));
+            ed.wait_for_request(method);
+            if close {
+                ed.send(json!({"jsonrpc":"2.0","id":4,"method":"session/close","params":{"sessionId":sid}}));
+                let response = ed.until(4, "deny");
+                assert_eq!(response["result"], json!({}), "{response}");
+            }
+            drop(ed.stdin);
+            wait_for_exit(&mut ed.child);
+        }
+    }
+}
+
+#[test]
+fn config_changes_report_applied_values_and_reject_invalid_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let (home, cwd, script) = setup(dir.path(), "{\"text\":\"hello\"}\n");
+    let mut ed = start(&cwd, &home, &script);
+    ed.send(json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":cwd,"mcpServers":[]}}));
+    let sid = ed.until(2, "once")["result"]["sessionId"].clone();
+    for (id, config, value, expected) in [
+        (3, "model", "faux/missing", None),
+        (4, "mode", "missing", None),
+        (5, "model", "faux/script:low", Some("faux/script")),
+        (6, "thought_level", "high", Some("high")),
+        (7, "mode", "off", Some("off")),
+        (8, "mode", "", None),
+        (9, "mode", "plan extra", None),
+    ] {
+        ed.send(json!({"jsonrpc":"2.0","id":id,"method":"session/set_config_option","params":{"sessionId":sid,"configId":config,"value":value}}));
+        let response = ed.until(id, "once");
+        if let Some(expected) = expected {
+            let options = response["result"]["configOptions"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{response}"));
+            assert_eq!(
+                options.iter().find(|o| o["id"] == config).unwrap()["currentValue"],
+                expected,
+                "{response}"
+            );
+            if id == 5 {
+                assert_eq!(
+                    options.iter().find(|o| o["id"] == "thought_level").unwrap()["currentValue"],
+                    "low",
+                    "model switch applies its thinking suffix"
+                );
+            }
+        } else {
+            assert!(
+                response.get("error").is_some(),
+                "invalid {config} was accepted: {response}"
+            );
+        }
+    }
+    drop(ed.stdin);
+    wait_for_exit(&mut ed.child);
 }
 
 #[test]
