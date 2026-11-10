@@ -2,6 +2,18 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.9.3] - 2026-11-10
+
+### Added
+
+- `novacode --acp`: run novacode inside Zed and other Agent Client Protocol editors (JetBrains, Neovim, Emacs). Chat with thinking, tool calls with reviewable diffs, permission cards, `ask_user` forms, pasted images and screenshots, model / thinking / mode pickers, slash commands, context use, and thread history. Each editor thread is a normal session you can `novacode attach` to. Setup is in [docs/editors.md](docs/editors.md).
+- The session state (`hello.state`, `get_state`) now lists `modes` and the active `mode`.
+
+### Fixed
+
+- RPC and attach: a prompt that starts no run (`/mode`, `/goal status`, a mistyped `/command`) now answers `"disposition": "handled"` and no longer leaves the session marked busy.
+- RPC: `set_model`, `set_thinking` and `/mode` answer after the change is applied and report an unknown model or mode as an error, instead of acknowledging first.
+
 ## [0.9.2] - 2026-11-10
 
 ### Fixed
