@@ -2,6 +2,13 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.9.2] - 2026-11-10
+
+### Fixed
+
+- Windows: session files are saved under `~/.novacode/sessions/` again. The folder name kept `C:\`, which made it replace the sessions folder; sessions written before this fix are not listed for resume.
+- Windows: repo notes find the repo's sessions, and paths outside the checkout (such as `/tmp/x`) no longer become notes.
+
 ## [0.9.1] - 2026-11-10
 
 ### Added
