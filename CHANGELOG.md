@@ -2,6 +2,24 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.9.1] - 2026-11-10
+
+### Added
+
+- Read delegation (`read.delegate`, on by default): `read` takes a `question` that the provider's small model answers with `file:line` references, and a full read of a text file over `read.delegateAboveLines` (400) lines returns the small model's map of its sections instead of the text. Ranged reads, scripts and providers without a small model read as before.
+- Idle compaction (`memory.idleCompactTokens`, default 100000): when the prompt cache expired while you were away and the context is large, novacode compacts before the next run instead of rewriting the whole history into the cache.
+- `models.small`: your own small model per provider, or `"*": "provider/model"` for one fixed model. Codex's built-in small model is `gpt-luna`.
+- `agents.model`: the model for subagent types that name none (worker, reviewer, auditor), e.g. `small` or `sonnet`; unset keeps the parent's.
+
+### Changed
+
+- Super mode is compiled only with `--features super`; release builds ship without it (not ready for production).
+- Old images stay in the conversation until it compacts; past 80 images the oldest 40 are cut at once. Before, every new image past 4 rewrote the whole prompt cache.
+
+### Fixed
+
+- TUI snapshot tests no longer depend on the version string's length.
+
 ## [0.9.0] - 2026-11-09
 
 ### Added
