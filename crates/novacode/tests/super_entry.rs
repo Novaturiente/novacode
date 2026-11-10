@@ -1,5 +1,6 @@
 //! `novacode --super` entry (L10.9 "Entry and scope"): one super per root, launchers attach.
 //! Without a terminal the launcher prints the super's session id instead of attaching.
+#![cfg(feature = "super")]
 
 use std::path::Path;
 use std::process::{Command, Output};

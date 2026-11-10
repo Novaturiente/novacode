@@ -8,7 +8,7 @@
 //! Each step that could race another waits for super to go idle: the user's answer to the
 //! relayed card and two gate files the scripted commands wait for are given only after
 //! super's previous turn ended, so every wake is its own turn and takes its own script line.
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", feature = "super"))]
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};

@@ -29,12 +29,20 @@ const PAGES: &[(&str, &str)] = pages![
     "sessions.md",
     "skills.md",
     "subagents.md",
-    "super.md",
     "tools.md",
     "troubleshooting.md",
     "tui-style.md",
     "tui.md",
 ];
+/// Pages only for builds with super mode (L10.9).
+#[cfg(feature = "super")]
+const SUPER_PAGES: &[(&str, &str)] = pages!["super.md"];
+#[cfg(not(feature = "super"))]
+const SUPER_PAGES: &[(&str, &str)] = &[];
+
+fn pages() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    PAGES.iter().chain(SUPER_PAGES)
+}
 const README: &str = include_str!("../../../README.md");
 
 pub fn dir(paths: &Paths) -> PathBuf {
@@ -45,7 +53,7 @@ pub fn dir(paths: &Paths) -> PathBuf {
 /// counts as new. FNV-1a 64 over README and every page name and text.
 fn stamp() -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for part in std::iter::once(README).chain(PAGES.iter().flat_map(|(n, t)| [*n, *t])) {
+    for part in std::iter::once(README).chain(pages().flat_map(|(n, t)| [*n, *t])) {
         // A 0 byte between parts, so moving text from one part to the next changes the hash.
         for b in part.bytes().chain([0]) {
             h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
@@ -67,7 +75,7 @@ pub fn install(paths: &Paths) -> std::io::Result<()> {
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d)?;
     std::fs::write(d.join("README.md"), README)?;
-    for (name, text) in PAGES {
+    for (name, text) in pages() {
         std::fs::write(d.join(name), text)?;
     }
     std::fs::write(d.join("VERSION"), stamp)
@@ -87,7 +95,7 @@ pub fn brief(paths: &Paths, cwd: &Path) -> String {
          - README.md: overview and feature list\n",
         d.display()
     );
-    for (name, text) in PAGES {
+    for (name, text) in pages() {
         s.push_str(&format!("- {name}: {}\n", title(text)));
     }
     s.push_str("\nConfig files (✓ exists, · not yet):\n");
@@ -133,6 +141,8 @@ pub fn brief(paths: &Paths, cwd: &Path) -> String {
 mod tests {
     use super::*;
 
+    const SUPER_ONLY: &[&str] = &["super.md"];
+
     #[test]
     fn every_page_ships_and_installs_once_per_version() {
         let dir_pages: std::collections::BTreeSet<String> =
@@ -140,8 +150,9 @@ mod tests {
                 .unwrap()
                 .filter_map(|e| e.ok()?.file_name().into_string().ok())
                 .filter(|n| n.ends_with(".md"))
+                .filter(|n| cfg!(feature = "super") || !SUPER_ONLY.contains(&n.as_str()))
                 .collect();
-        let shipped: std::collections::BTreeSet<String> = PAGES.iter().map(|(n, _)| n.to_string()).collect();
+        let shipped: std::collections::BTreeSet<String> = pages().map(|(n, _)| n.to_string()).collect();
         assert_eq!(dir_pages, shipped, "add new docs pages to PAGES");
 
         let tmp = std::env::temp_dir().join(format!("nc-docs-{}", std::process::id()));

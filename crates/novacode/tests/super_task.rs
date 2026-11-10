@@ -2,7 +2,7 @@
 //! real task process in an untrusted repo, which starts only after the trust card is
 //! answered, gets its worktree, environment, brief and the project's MCP servers; then
 //! super stops it.
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", feature = "super"))]
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};

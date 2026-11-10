@@ -55,6 +55,7 @@ impl Card {
     }
 
     /// The child's card id.
+    #[cfg(feature = "super")]
     pub fn id(&self) -> u64 {
         match self {
             Card::Ask { id, .. } | Card::Approve { id, .. } => *id,
@@ -62,6 +63,7 @@ impl Card {
     }
 
     /// What it asks, in a few words.
+    #[cfg(feature = "super")]
     pub fn what(&self) -> String {
         match self {
             Card::Ask { questions, .. } => questions

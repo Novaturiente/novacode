@@ -315,6 +315,7 @@ impl Hub {
 
     /// Super's board changed (L10.9): every window's Tasks tab gets the new rows,
     /// and windows that connect later get the latest.
+    #[cfg(feature = "super")]
     pub fn set_board(&self, tasks: Vec<novacode_tui::panel::TaskRow>, needs: Vec<novacode_tui::panel::NeedRow>) {
         let Ok(ui) = serde_json::to_value(UiEvent::Board {
             tasks: tasks.clone(),

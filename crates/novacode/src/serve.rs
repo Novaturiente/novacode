@@ -556,6 +556,7 @@ pub fn find_live(paths: &Paths, prefix: &str) -> anyhow::Result<RunFile> {
 
 /// Whether the live session `id` is shutting down (`novacode stop` just reached it): its
 /// socket is gone or says bye before it answers a state request. Unsure (no answer in 2 s): no.
+#[cfg(feature = "super")]
 pub async fn closing(paths: &Paths, id: &str) -> bool {
     let Ok(f) = find_live(paths, id) else { return true };
     let Ok(stream) = connect(&f.socket).await else {
@@ -687,7 +688,9 @@ pub async fn attach(
     });
     let approvals = req_tx.clone();
     let killed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (killed_tx, home, kill_id) = (killed.clone(), paths.home().to_path_buf(), id.clone());
+    let killed_tx = killed.clone();
+    #[cfg(feature = "super")]
+    let (home, kill_id) = (paths.home().to_path_buf(), id.clone());
     let mut last = state.clone();
     let bye: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
     let bye_seen = bye.clone();
@@ -887,6 +890,7 @@ pub async fn attach(
                 // `/kill` (L9): end the session like `novacode stop`; a super's next start is a new session.
                 Cmd::Kill => {
                     killed_tx.store(true, std::sync::atomic::Ordering::Relaxed);
+                    #[cfg(feature = "super")]
                     crate::superagent::entry::mark_fresh(&home, &kill_id);
                     ClientCmd::Shutdown
                 }

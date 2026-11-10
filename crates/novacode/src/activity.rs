@@ -107,6 +107,7 @@ async fn tmux_seen(pane: &str) -> bool {
 }
 
 /// A desktop notification from a session with no window of its own (super, L10.9).
+#[cfg(feature = "super")]
 pub async fn desktop(title: String, body: String) {
     notify(&title, &body, std::env::var_os("TMUX").is_some()).await;
 }
