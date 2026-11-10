@@ -2041,7 +2041,8 @@ mod tests {
         let p =
             Policy::new(Permissions::default(), "/home/u".into(), None).with_edit_rule(EditRule::from_env().unwrap());
         let a = main.join(".worktrees/a");
-        assert_eq!(edits(&p, &cwd, &cwd.join("f")), cwd == a);
+        // `current_dir` may drop Windows' `\\?\` prefix: compare resolved paths.
+        assert_eq!(edits(&p, &cwd, &cwd.join("f")), real(&cwd) == real(&a));
         assert!(!edits(&p, &cwd, &main.join(".worktrees/b/f")));
         assert!(!edits(&p, &cwd, &main.join("f")));
     }
@@ -2081,14 +2082,18 @@ mod tests {
 
     #[test]
     fn edit_rule_values() {
+        // Absolute on this platform.
+        let abs = |p: &str| if cfg!(windows) { format!("C:{p}") } else { p.to_string() };
         assert_eq!(
-            EditRule::parse("worktree:/w/t"),
-            Ok(EditRule::Worktree { folder: "/w/t".into() })
+            EditRule::parse(&format!("worktree:{}", abs("/w/t"))),
+            Ok(EditRule::Worktree {
+                folder: abs("/w/t").into()
+            })
         );
         assert_eq!(
-            EditRule::parse("review:/s/review/a-1"),
+            EditRule::parse(&format!("review:{}", abs("/s/review/a-1"))),
             Ok(EditRule::Review {
-                dir: "/s/review/a-1".into()
+                dir: abs("/s/review/a-1").into()
             })
         );
         for bad in [

@@ -254,10 +254,11 @@ pub fn scan(session: &str, cwd: &Path, entries: &[&Entry]) -> Evidence {
     // `None` outside it.
     let rel = |p: &str| -> Option<String> {
         let r = Path::new(p).strip_prefix(cwd).unwrap_or(Path::new(p));
-        if r.is_absolute() {
+        // `has_root`: on Windows `/tmp/x` is not absolute, but it is outside the checkout.
+        if r.has_root() || r.is_absolute() {
             return None;
         }
-        let r = r.display().to_string();
+        let r = novacode_base::platform::slash_path(r);
         Some(match r.strip_prefix(".worktrees/").and_then(|w| w.split_once('/')) {
             Some((_, rest)) => rest.to_string(),
             None => r,
@@ -593,7 +594,7 @@ pub fn notes_path(root: &Path) -> PathBuf {
 /// Read the repo's unread session files into `st`; how many were read. Subagent sessions,
 /// other repos and session `current` are skipped.
 fn read_sessions(st: &mut State, home: &Path, root: &Path, current: &str) -> usize {
-    let slug = root.display().to_string().replace('/', "-");
+    let slug = crate::session::slug(root);
     let nested = format!("{slug}-");
     let mut files: Vec<(std::time::SystemTime, PathBuf, u64)> = std::fs::read_dir(home.join("sessions"))
         .into_iter()
@@ -954,7 +955,7 @@ mod tests {
         let (home, repo) = (tmp.join("home"), tmp.join("repo"));
         std::fs::create_dir_all(&repo).unwrap();
         let session = |cwd: &Path, id: &str, subagent: bool| {
-            let dir = home.join("sessions").join(cwd.display().to_string().replace('/', "-"));
+            let dir = home.join("sessions").join(crate::session::slug(cwd));
             std::fs::create_dir_all(&dir).unwrap();
             let mut e = entries(&[
                 ("bash", bash("tsc --noEmit"), false, "tsc: command not found"),

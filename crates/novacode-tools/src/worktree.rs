@@ -813,6 +813,8 @@ mod tests {
             std::fs::write(f, s).unwrap();
         };
         git(&root, &["init", "-q"]).unwrap();
+        // Windows runners check out with CRLF; this test compares exact bytes.
+        git(&root, &["config", "core.autocrlf", "false"]).unwrap();
         // `.claude/` is half tracked; `.codegraph/` is ignored, AGENTS.md is untracked but not ignored.
         w("CLAUDE.md", "tracked\n");
         w(".claude/settings.json", "{}\n");

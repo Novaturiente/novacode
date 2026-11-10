@@ -204,10 +204,14 @@ fn end_line(path: &Path) -> io::Result<()> {
 
 /// Folder for one cwd: `<home>/sessions/<cwd with / as ->/`.
 pub fn dir_for(paths: &Paths, cwd: &Path) -> PathBuf {
-    paths
-        .home()
-        .join("sessions")
-        .join(cwd.display().to_string().replace('/', "-"))
+    paths.home().join("sessions").join(slug(cwd))
+}
+
+/// `cwd` as one folder name under `sessions/`. On Windows `\` and `:` go too: a joined
+/// `C:\…` would replace the sessions folder, not nest under it.
+pub fn slug(cwd: &Path) -> String {
+    let seps: &[char] = if cfg!(windows) { &['/', '\\', ':'] } else { &['/'] };
+    cwd.display().to_string().replace(seps, "-")
 }
 
 impl Store {
