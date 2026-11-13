@@ -13,26 +13,38 @@ pub struct SseParser {
     buf: Vec<u8>,
     cur: SseEvent,
     has_data: bool,
+    /// Bytes of `buf` already searched for a line end, so a long line isn't rescanned per chunk.
+    scanned: usize,
 }
 
 impl SseParser {
     pub fn push(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
-        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
-            let mut line: Vec<u8> = self.buf.drain(..=nl).collect();
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
+        // A line ends at `\r\n`, `\n` or a lone `\r` (SSE spec).
+        while let Some(i) = self.buf[self.scanned..].iter().position(|&b| b == b'\n' || b == b'\r') {
+            let i = self.scanned + i;
+            if self.buf[i] == b'\r' && i + 1 == self.buf.len() {
+                self.scanned = i; // its `\n` may come in the next chunk
+                return out;
             }
+            let end = if self.buf[i] == b'\r' && self.buf[i + 1] == b'\n' {
+                i + 2
+            } else {
+                i + 1
+            };
+            let line: Vec<u8> = self.buf.drain(..end).take(i).collect();
+            self.scanned = 0;
             self.line(&String::from_utf8_lossy(&line), &mut out);
         }
+        self.scanned = self.buf.len();
         out
     }
 
     /// Flush a final event that wasn't followed by a blank line.
     pub fn finish(&mut self) -> Option<SseEvent> {
         let mut out = Vec::new();
+        self.scanned = 0;
         if !self.buf.is_empty() {
             let rest = String::from_utf8_lossy(&std::mem::take(&mut self.buf)).into_owned();
             self.line(rest.trim_end_matches('\r'), &mut out);
@@ -83,5 +95,14 @@ mod tests {
         let want = [("a", "{\"x\":1}"), ("", "l1\nl2"), ("b", "")];
         let got: Vec<_> = got.iter().map(|e| (e.event.as_str(), e.data.as_str())).collect();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn lone_cr_ends_lines_and_split_crlf_counts_once() {
+        let mut p = SseParser::default();
+        let mut got = p.push(b"event: a\rdata: 1\r\rdata: 2\r");
+        got.extend(p.push(b"\n\r\n"));
+        let got: Vec<_> = got.iter().map(|e| (e.event.as_str(), e.data.as_str())).collect();
+        assert_eq!(got, [("a", "1"), ("", "2")]);
     }
 }

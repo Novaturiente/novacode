@@ -108,12 +108,19 @@ impl Tool for Edit {
 /// match replaced text other than what the model sent (then it needs the diff).
 pub fn apply_edits(raw: &str, edits: &[(String, String)]) -> Result<(String, String, Option<String>), String> {
     let (bom, body) = raw.strip_prefix(BOM).map_or(("", raw), |b| (BOM, b));
-    let crlf = body.contains("\r\n");
-    let text = if crlf {
-        body.replace("\r\n", "\n")
-    } else {
-        body.to_string()
-    };
+    // Match on LF text; `crs` holds where a `\r\n` was, so untouched lines keep their own ending.
+    let mut text = String::with_capacity(body.len());
+    let mut crs: Vec<usize> = Vec::new();
+    let mut rest = body;
+    while let Some(i) = rest.find("\r\n") {
+        text.push_str(&rest[..i]);
+        crs.push(text.len());
+        text.push('\n');
+        rest = &rest[i + 2..];
+    }
+    text.push_str(rest);
+    let raw = |p: usize| p + crs.partition_point(|&q| q < p);
+    let is_crlf = |q: usize| crs.binary_search(&q).is_ok();
     let mut ranges: Vec<(Range<usize>, String)> = Vec::new();
     let mut fuzzy = false;
     for (i, (old, new)) in edits.iter().enumerate() {
@@ -129,7 +136,7 @@ pub fn apply_edits(raw: &str, edits: &[(String, String)]) -> Result<(String, Str
     if ranges.windows(2).any(|w| w[0].0.end > w[1].0.start) {
         return Err("two edits overlap; merge them into one".into());
     }
-    let mut out = text.clone();
+    let mut out = body.to_string();
     let mut diff = String::new();
     let mut spots = Vec::new();
     for (r, new) in ranges.iter().rev() {
@@ -150,9 +157,14 @@ pub fn apply_edits(raw: &str, edits: &[(String, String)]) -> Result<(String, Str
             hunk.push_str(&format!("{line}+ {l}\n"));
         }
         diff.insert_str(0, &hunk);
-        out.replace_range(r.clone(), new);
+        // New lines take the ending of the line the edit starts on.
+        let crlf = match text[r.start..].find('\n') {
+            Some(k) => is_crlf(r.start + k),
+            None => text[..r.start].rfind('\n').is_some_and(is_crlf),
+        };
+        let new = if crlf { new.replace('\n', "\r\n") } else { new.clone() };
+        out.replace_range(raw(r.start)..raw(r.end), &new);
     }
-    let out = if crlf { out.replace('\n', "\r\n") } else { out };
     Ok((format!("{bom}{out}"), diff, (!fuzzy).then(|| spots.join(", "))))
 }
 
@@ -234,6 +246,16 @@ mod tests {
         assert_eq!(out, "\u{feff}A\r\nb\r\nC\r\nD\r\n");
         assert_eq!(summary.as_deref(), Some("line 1 (-1 +1), line 3 (-1 +2)"));
         assert!(diff.starts_with("1- a\n1+ A\n3- c\n"));
+    }
+
+    #[test]
+    fn mixed_line_endings_keep_untouched_lines() {
+        let src = "a\r\nb\nc\r\nd\ne";
+        let (out, _, _) = apply_edits(src, &[e("b\nc", "B\nC"), e("e", "E\nF")]).unwrap();
+        // `b` ends in LF, so the new lines do too; `c`'s CRLF and `d`'s LF are kept.
+        assert_eq!(out, "a\r\nB\nC\r\nd\nE\nF");
+        let (out, _, _) = apply_edits("x\r\ny\n", &[e("x\r\n", "1\n2\n")]).unwrap();
+        assert_eq!(out, "1\r\n2\r\ny\n");
     }
 
     #[tokio::test]

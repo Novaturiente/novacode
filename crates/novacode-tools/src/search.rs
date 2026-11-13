@@ -125,7 +125,13 @@ fn grep(a: GrepArgs, root: PathBuf, cwd: PathBuf, cancel: CancellationToken) -> 
         Ok(m) => m,
         Err(e) => return ToolOutput::error(format!("bad pattern: {e}")),
     };
-    let glob = match a.glob.as_deref().map(globset::Glob::new).transpose() {
+    // Paths are matched relative to `path`, so a leading `./` would match nothing.
+    let glob = match a
+        .glob
+        .as_deref()
+        .map(|g| globset::Glob::new(g.trim_start_matches("./")))
+        .transpose()
+    {
         Ok(g) => g.map(|g| g.compile_matcher()),
         Err(e) => return ToolOutput::error(format!("bad glob: {e}")),
     };
@@ -222,7 +228,8 @@ impl Tool for Find {
             let root = ctx.path(a.path.as_deref().unwrap_or("."));
             let cancel = ctx.cancel.clone();
             blocking(move || {
-                let g = match globset::Glob::new(&a.pattern) {
+                // Paths are matched relative to `path`, so a leading `./` would match nothing.
+                let g = match globset::Glob::new(a.pattern.trim_start_matches("./")) {
                     Ok(g) => g.compile_matcher(),
                     Err(e) => return ToolOutput::error(format!("bad glob: {e}")),
                 };
@@ -364,6 +371,10 @@ mod tests {
 
         let o = Find.execute(json!({"pattern": "*.rs"}), &c).await;
         assert_eq!(text(&o), "src/a.rs");
+        let o = Find.execute(json!({"pattern": "./src/*.rs"}), &c).await;
+        assert_eq!(text(&o), "src/a.rs");
+        let o = Grep.execute(json!({"pattern": "beta", "glob": "./src/*.rs"}), &c).await;
+        assert_eq!(text(&o), "src/a.rs:2: fn beta() {}");
         let o = Ls.execute(json!({}), &c).await;
         assert_eq!(text(&o), ".git/\n.gitignore\nb.txt\nignored/\nsrc/");
     }

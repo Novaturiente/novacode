@@ -492,21 +492,30 @@ impl Conn {
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|c| c.starts_with("text/event-stream"));
-        if !sse {
-            let v: Value =
-                serde_json::from_slice(&resp.bytes().await.map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-            return answer(&v);
-        }
         let mut stream = resp.bytes_stream();
         let mut parser = novacode_ai::sse::SseParser::default();
+        let (mut json, mut total) = (Vec::new(), 0usize);
         loop {
             let chunk = tokio::time::timeout(idle, stream.next())
                 .await
                 .map_err(|_| format!("no answer or progress for {}s", idle.as_secs()))?;
             let Some(chunk) = chunk else {
-                return Err("the stream ended without an answer".into());
+                if sse {
+                    return Err("the stream ended without an answer".into());
+                }
+                return answer(&serde_json::from_slice(&json).map_err(|e| e.to_string())?);
             };
-            for ev in parser.push(&chunk.map_err(|e| e.to_string())?) {
+            let chunk = chunk.map_err(|e| e.to_string())?;
+            total += chunk.len();
+            if total > MAX_REPLY_BYTES {
+                // Dropping the stream closes the connection.
+                return Err(format!("reply over {} MiB, refused", MAX_REPLY_BYTES >> 20));
+            }
+            if !sse {
+                json.extend_from_slice(&chunk);
+                continue;
+            }
+            for ev in parser.push(&chunk) {
                 let Ok(v) = serde_json::from_str::<Value>(&ev.data) else {
                     continue;
                 };
@@ -517,6 +526,9 @@ impl Conn {
         }
     }
 }
+
+/// Largest HTTP reply read for one call (pi's message limit), so a broken server can't fill memory.
+const MAX_REPLY_BYTES: usize = 16 << 20;
 
 fn provider_safe(name: &str) -> bool {
     (1..=64).contains(&name.len()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')

@@ -2107,13 +2107,11 @@ impl Agent {
                 Some(b) => b.build(&self.store, self.store.projection()),
                 None => self.store.projection(),
             };
-            // Never ask for more output than the window has room for (L2.21), with 4096
-            // spare for the estimate's error (pi's margin).
-            let room = self
-                .cfg
-                .window_tokens
-                .saturating_sub(novacode_types::estimate::context(&messages))
-                .saturating_sub(4096);
+            // Never ask for more output than the window has room for (L2.21): 15% of the
+            // estimate (at least 4096) spare for its error, since some providers count input
+            // higher (OpenRouter, pi #10497), and at most 32k once the room is short.
+            let estimate = novacode_types::estimate::context(&messages);
+            let room = output_room(self.cfg.window_tokens, estimate);
             let req = Request {
                 tail: tail.clone(),
                 model: self.cfg.model.clone(),
@@ -2556,6 +2554,20 @@ fn sanitize(id: &str) -> String {
 
 /// Loop-level retries (L4.6), on top of the provider's own quick ones (L2.18), sized to outlast overload spells.
 const LOOP_RETRIES: u32 = 4;
+
+/// Output tokens a request may ask for (L2.21, pi's rule): window minus input minus
+/// max(4096, 15% of input). When that leaves under 32k, only 4096 spare, capped at 32k.
+fn output_room(window: u64, input: u64) -> u64 {
+    const FIXED: u64 = 4096;
+    const MIN_WITH_RATIO: u64 = 32_768;
+    let room = window
+        .saturating_sub(input)
+        .saturating_sub(FIXED.max(input.div_ceil(100) * 15));
+    if room >= MIN_WITH_RATIO {
+        return room;
+    }
+    MIN_WITH_RATIO.min(window.saturating_sub(input).saturating_sub(FIXED))
+}
 const LOOP_RETRY_BASE: Duration = Duration::from_secs(2);
 
 /// Wait before loop retry `attempt` (0-based): base·2^attempt with up to 25% jitter down,
@@ -3141,6 +3153,8 @@ async fn warmer(shared: Arc<Shared>, events: broadcast::Sender<AgentEvent>) {
         };
         let mut req = sent.req.clone();
         req.max_tokens = 1;
+        // No session: a replay must not use or replace the session's message thread (L2.30).
+        req.session = None;
         let mut rx = adapter.stream(req, CancellationToken::new());
         let mut done = None;
         while let Some(ev) = rx.recv().await {
@@ -3189,6 +3203,19 @@ fn cache_expired(last: Option<u64>, now: u64, cache: CacheRetention) -> bool {
         _ => 300_000,
     };
     last.is_some_and(|t| now.saturating_sub(t) > ttl_ms)
+}
+
+#[cfg(test)]
+mod output_room_tests {
+    #[test]
+    fn margin_scales_with_input_and_caps_near_full() {
+        use super::output_room;
+        assert_eq!(output_room(200_000, 100_000), 85_000); // 15% of 100k spare
+        assert_eq!(output_room(200_000, 10_000), 185_904); // 4096 floor
+        assert_eq!(output_room(200_000, 160_000), 32_768); // short room: capped
+        assert_eq!(output_room(200_000, 190_000), 5_904); // nearly full: window - input - 4096
+        assert_eq!(output_room(1000, 5000), 0);
+    }
 }
 
 #[cfg(test)]

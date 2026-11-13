@@ -138,6 +138,8 @@ struct R<'a> {
     /// no column is drawn narrower, and each grows to what this parse needs.
     min_table_widths: Option<Vec<Vec<usize>>>,
     tables_seen: usize,
+    /// Inside an HTML comment, which isn't shown.
+    comment: bool,
 }
 
 impl<'a> R<'a> {
@@ -158,6 +160,7 @@ impl<'a> R<'a> {
             table: None,
             min_table_widths: None,
             tables_seen: 0,
+            comment: false,
         }
     }
 
@@ -398,6 +401,10 @@ impl<'a> R<'a> {
                 let st = if done { t.ok } else { t.dim };
                 self.cur.push(Span::styled(if done { "[x] " } else { "[ ] " }, st));
             }
+            // shortcut: text after a `-->` on the same line is hidden too; split on it if that shows up.
+            Event::Html(s) | Event::InlineHtml(s) if self.comment || s.trim_start().starts_with("<!--") => {
+                self.comment = !s.contains("-->");
+            }
             Event::Html(s) | Event::InlineHtml(s) => self.text(&s),
             _ => {}
         }
@@ -503,6 +510,12 @@ mod tests {
 
     fn md(s: &str, w: usize) -> Vec<String> {
         render(s, w, &Theme::default(), true).iter().map(wrap::plain).collect()
+    }
+
+    #[test]
+    fn html_comments_are_hidden() {
+        let out = md("a <!-- note --> b\n\n<!--\nhidden\n-->\n\n<b>shown</b>\n", 40);
+        assert_eq!(out, ["a  b", "", "<b>shown</b>"]);
     }
 
     #[test]

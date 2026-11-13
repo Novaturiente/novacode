@@ -8,15 +8,50 @@ use crate::retry;
 use crate::sse::SseEvent;
 use crate::trace::Trace;
 use crate::transform::{self, Target};
-use novacode_types::{Block, BlockKind, ErrorKind, Message, StopReason, StreamEvent, ThinkingLevel, Usage};
+use novacode_types::{
+    AssistantMessage, Block, BlockKind, ErrorKind, Message, StopReason, StreamEvent, ThinkingLevel, Usage,
+};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub const PROVIDER: &str = "anthropic";
 const API_VERSION: &str = "2023-06-01";
+const THREADS_BETA: &str = "message-threads-2026-08-12";
+/// Thread rejections a new thread fixes: expired, raced, or a fixed setting changed (pi's list).
+const NEW_THREAD_ERRORS: &[&str] = &[
+    "thread_not_found",
+    "thread_already_continued",
+    "thread_continue_in_flight",
+    "thread_fingerprint_mismatch",
+];
+
+/// L2.30: where a session's next request can continue its server-side thread.
+#[derive(Debug, Clone)]
+enum Thread {
+    At {
+        /// Messages of the last full request plus its reply.
+        count: usize,
+        /// Hash of the fixed settings and the messages before the reply.
+        prefix: u64,
+        /// Hash of the reply as the next request will send it.
+        reply: u64,
+        reply_id: String,
+    },
+    /// The endpoint refused threads: plain requests for this session.
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Plain,
+    Create,
+    Continue,
+}
 
 /// Vendor-controlled values for the Claude subscription. Bundled defaults;
 /// overridable in settings because Anthropic changes them (L2.1).
@@ -52,6 +87,7 @@ pub enum Auth {
     Bearer(String),
 }
 
+#[derive(Clone)]
 pub struct Anthropic {
     http: reqwest::Client,
     base_url: String,
@@ -62,6 +98,10 @@ pub struct Anthropic {
     headers: BTreeMap<String, String>,
     /// Swap the `web_search` function tool for Anthropic's server-side search (L2.23).
     native_search: bool,
+    /// L2.30: message threads, on only for Anthropic's own endpoint (a gateway that
+    /// drops the `thread` field would silently lose the history).
+    threads_on: bool,
+    threads: Arc<Mutex<HashMap<String, Thread>>>,
 }
 
 /// Replace a function tool named `web_search` with the provider's own search tool,
@@ -96,6 +136,8 @@ impl Anthropic {
             provider: PROVIDER.into(),
             headers: BTreeMap::new(),
             native_search: false,
+            threads_on: true,
+            threads: Arc::default(),
         }
     }
 
@@ -118,7 +160,169 @@ impl Anthropic {
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self.threads_on = self.base_url.contains("api.anthropic.com");
         self
+    }
+
+    /// L2.30: the session this request is threaded under, if threads apply.
+    fn thread_session(&self, req: &Request) -> Option<String> {
+        let s = req.session.clone()?;
+        let on = self.threads_on
+            && self.provider == PROVIDER
+            && !matches!(self.threads.lock().unwrap().get(&s), Some(Thread::Off));
+        on.then_some(s)
+    }
+
+    /// L2.30: send `body` continuing the session's thread when nothing before the last
+    /// reply changed, else as a new thread. A thread rejection is resent once in full.
+    fn stream_threaded(
+        &self,
+        req: &Request,
+        session: String,
+        body: Value,
+        betas: Vec<&'static str>,
+        effort: Option<String>,
+        cancel: CancellationToken,
+    ) -> mpsc::Receiver<StreamEvent> {
+        let settings = settings_hash(&self.base_url, &body, &betas);
+        let msgs: Vec<Value> = body["messages"].as_array().cloned().unwrap_or_default();
+        // Each reply continues once; removing it also keeps a concurrent request from trying.
+        let prev = self.threads.lock().unwrap().remove(&session);
+        let cont = match prev {
+            Some(Thread::At {
+                count,
+                prefix,
+                reply,
+                reply_id,
+            }) if msgs.len() > count
+                && prefix_hash(settings, &msgs[..count - 1]) == prefix
+                && value_hash(&msgs[count - 1]) == reply =>
+            {
+                Some((count, reply_id))
+            }
+            _ => None,
+        };
+        let (model, images) = (req.model.clone(), req.images);
+        let this = self.clone();
+        let (tx, out) = mpsc::channel(crate::adapter::EVENT_BUFFER);
+        tokio::spawn(async move {
+            let mut mode = if cont.is_some() { Mode::Continue } else { Mode::Create };
+            loop {
+                let send = match (&mode, &cont) {
+                    (Mode::Continue, Some((count, id))) => {
+                        let mut c = body.clone();
+                        if let Some(o) = c.as_object_mut() {
+                            // A subscription request without the billing block is refused (429), so a
+                            // continue keeps that block; the thread still keeps its own prompt (live check).
+                            let billing = o.remove("system").and_then(|s| s.get(0).cloned()).filter(|b| {
+                                b["text"]
+                                    .as_str()
+                                    .is_some_and(|t| t.starts_with("x-anthropic-billing-header:"))
+                            });
+                            if let Some(b) = billing {
+                                o.insert("system".into(), json!([b]));
+                            }
+                            o.remove("tools");
+                        }
+                        c["messages"] = Value::Array(msgs[*count..].to_vec());
+                        c["thread"] = json!({ "type": "continue", "previous_message_id": id });
+                        c
+                    }
+                    (Mode::Plain, _) => body.clone(),
+                    _ => {
+                        let mut c = body.clone();
+                        c["thread"] = json!({ "type": "create" });
+                        c
+                    }
+                };
+                let bytes = serde_json::to_vec(&send).unwrap_or_default();
+                let (mut b, rx) = http::channel(&this.provider, &model);
+                b.thinking_level = effort.clone();
+                let request = this.http_request(&bytes, &betas);
+                let mut rx = http::drive(
+                    b,
+                    rx,
+                    request,
+                    bytes,
+                    this.trace.clone(),
+                    cancel.clone(),
+                    State::default,
+                );
+                let (mut content, mut next) = (false, None);
+                while let Some(ev) = rx.recv().await {
+                    match &ev {
+                        StreamEvent::BlockStart { .. } | StreamEvent::Delta { .. } | StreamEvent::BlockEnd { .. } => {
+                            content = true
+                        }
+                        StreamEvent::Error(m) if !content => {
+                            next = fallback(mode, m);
+                            if next.is_some() {
+                                tracing::info!(error = ?m.error_message, "anthropic: thread refused, resending in full");
+                                break;
+                            }
+                        }
+                        StreamEvent::Done(m) => this.record(&session, mode, settings, &msgs, m, &model, images),
+                        _ => {}
+                    }
+                    if tx.send(ev).await.is_err() {
+                        return;
+                    }
+                }
+                match next {
+                    Some(n) => mode = n,
+                    None => return,
+                }
+            }
+        });
+        out
+    }
+
+    /// Remember where the session's next request can continue: after `m`, the reply
+    /// to the full request `msgs`.
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &self,
+        session: &str,
+        mode: Mode,
+        settings: u64,
+        msgs: &[Value],
+        m: &AssistantMessage,
+        model: &str,
+        images: bool,
+    ) {
+        let entry = match (mode, &m.response_id) {
+            (Mode::Plain, _) => Thread::Off,
+            (_, Some(id)) => {
+                // Convert the reply as the next request will, so a reply the loop changed
+                // before resending it is noticed and sent in full.
+                let one = [Message::Assistant(m.clone())];
+                let target = Target {
+                    provider: &self.provider,
+                    model,
+                    images,
+                    normalize_id: Some(transform::safe_id),
+                };
+                let history = transform::for_target(&one, &target);
+                let (conv, _) = convert_messages(&history, &self.provider, mid_convo_system(model));
+                let mut replies = conv.iter().filter(|v| v["role"] == "assistant");
+                let (Some(r), None) = (replies.next(), replies.next()) else {
+                    return;
+                };
+                Thread::At {
+                    count: msgs.len() + 1,
+                    prefix: prefix_hash(settings, msgs),
+                    reply: value_hash(r),
+                    reply_id: id.clone(),
+                }
+            }
+            _ => return,
+        };
+        let mut map = self.threads.lock().unwrap();
+        // shortcut: drop everything past 1000 sessions instead of the oldest; a dropped one only sends its next request in full.
+        if map.len() >= 1000 {
+            map.clear();
+        }
+        map.insert(session.to_string(), entry);
     }
 
     /// Model ids this login or key can use, newest first (the live list, L2.10).
@@ -217,10 +421,9 @@ impl Adapter for Anthropic {
                 json!({ "type": "web_search_20250305", "name": "web_search", "max_uses": 5 }),
             );
         }
-        let body = serde_json::to_vec(&body).unwrap_or_default();
         let effort = in_conversation_effort(&req.model, req.thinking);
         // Mid-conversation effort needs these two betas (as pi sends them).
-        let mut betas: Vec<&str> = Vec::new();
+        let mut betas: Vec<&'static str> = Vec::new();
         if effort.is_some() {
             betas.extend([
                 "mid-conversation-output-config-2026-07-01",
@@ -230,6 +433,11 @@ impl Adapter for Anthropic {
         if native_tool_changes(&self.provider, &req.model) && !req.tools.is_empty() {
             betas.push("inline-tools-2026-09-15");
         }
+        if let Some(session) = self.thread_session(&req) {
+            betas.push(THREADS_BETA);
+            return self.stream_threaded(&req, session, body, betas, effort, cancel);
+        }
+        let body = serde_json::to_vec(&body).unwrap_or_default();
         let request = self.http_request(&body, &betas);
         let (mut b, rx) = http::channel(&self.provider, &req.model);
         b.thinking_level = effort;
@@ -345,10 +553,14 @@ fn read_usage(u: &Value, usage: &mut Usage) {
 fn classify(status: u16, headers: &reqwest::header::HeaderMap, body: &str) -> Failure {
     let v: Value = serde_json::from_str(body).unwrap_or_default();
     let etype = v["error"]["type"].as_str().unwrap_or_default();
-    let msg = v["error"]["message"]
+    let mut msg = v["error"]["message"]
         .as_str()
         .map(String::from)
         .unwrap_or_else(|| format!("HTTP {status}: {body}"));
+    // Thread rejections name their cause here (L2.30).
+    if let Some(code) = v["error"]["details"]["error_code"].as_str() {
+        msg = format!("{msg} ({code})");
+    }
     let kind = match status {
         401 | 403 => ErrorKind::Auth,
         429 => ErrorKind::RateLimit {
@@ -359,6 +571,85 @@ fn classify(status: u16, headers: &reqwest::header::HeaderMap, body: &str) -> Fa
         _ => error_kind(etype, &msg),
     };
     (kind, msg)
+}
+
+/// L2.30: how to resend a thread request the server refused before any output, if at all.
+fn fallback(mode: Mode, m: &AssistantMessage) -> Option<Mode> {
+    let msg = m.error_message.as_deref().unwrap_or_default();
+    if mode == Mode::Plain || !matches!(m.stop, StopReason::Error { .. }) {
+        return None;
+    }
+    if NEW_THREAD_ERRORS.iter().any(|c| msg.contains(c)) {
+        return Some(if mode == Mode::Continue {
+            Mode::Create
+        } else {
+            Mode::Plain
+        });
+    }
+    // The endpoint can't thread this request, or doesn't know the `thread` field.
+    let unsupported = msg.contains("thread_unsupported_request")
+        || (m.stop
+            == (StopReason::Error {
+                kind: ErrorKind::InvalidRequest,
+            })
+            && msg.contains("thread"));
+    unsupported.then_some(Mode::Plain)
+}
+
+/// Hash of what a `continue` keeps from the thread: the endpoint and the fixed fields.
+fn settings_hash(base_url: &str, body: &Value, betas: &[&str]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    base_url.hash(&mut h);
+    betas.hash(&mut h);
+    for k in ["model", "system", "tools", "thinking", "output_config", "tool_choice"] {
+        k.hash(&mut h);
+        feed(&body[k], &mut h);
+    }
+    h.finish()
+}
+
+fn prefix_hash(settings: u64, msgs: &[Value]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write_u64(settings);
+    msgs.iter().for_each(|m| feed(m, &mut h));
+    h.finish()
+}
+
+fn value_hash(v: &Value) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    feed(v, &mut h);
+    h.finish()
+}
+
+/// Hash JSON the way the API reads it: cache markers move between requests and don't
+/// change a message, and string content is the same as one text block.
+fn feed(v: &Value, h: &mut impl Hasher) {
+    match v {
+        Value::Object(o) => {
+            h.write_u8(b'{');
+            for (k, x) in o {
+                if k == "cache_control" {
+                    continue;
+                }
+                k.hash(h);
+                match x {
+                    Value::String(s) if k == "content" => feed(&json!([{ "type": "text", "text": s }]), h),
+                    _ => feed(x, h),
+                }
+            }
+            h.write_u8(b'}');
+        }
+        Value::Array(a) => {
+            h.write_u8(b'[');
+            a.iter().for_each(|x| feed(x, h));
+            h.write_u8(b']');
+        }
+        Value::String(s) => {
+            h.write_u8(b's');
+            s.hash(h);
+        }
+        other => other.to_string().hash(h),
+    }
 }
 
 fn error_kind(etype: &str, msg: &str) -> ErrorKind {
@@ -1287,6 +1578,143 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         );
         let call = m.tool_calls().next().unwrap();
         assert_eq!((call.id.as_str(), &call.arguments), ("tu1", &json!({"path": "a.rs"})));
+    }
+
+    /// Like [`serve`], and also hands back each request's JSON body.
+    async fn serve_capture(responses: Vec<String>) -> (String, mpsc::UnboundedReceiver<Value>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            for r in responses {
+                let (mut s, _) = l.accept().await.unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = vec![0u8; 65536];
+                // Read headers, then content-length bytes of body.
+                let body = loop {
+                    let n = s.read(&mut chunk).await.unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(i) = text.find("\r\n\r\n") {
+                        let len: usize = text[..i]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= i + 4 + len {
+                            break buf[i + 4..i + 4 + len].to_vec();
+                        }
+                    }
+                };
+                let _ = tx.send(serde_json::from_slice(&body).unwrap_or_default());
+                s.write_all(r.as_bytes()).await.unwrap();
+                s.shutdown().await.unwrap();
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    const TEXT_SSE: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_A\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n\
+event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+    #[tokio::test]
+    async fn message_threads_continue_and_fall_back() {
+        let ok = || http("200 OK", "content-type: text/event-stream\r\n", TEXT_SSE);
+        let expired = http(
+            "400 Bad Request",
+            "",
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"no such thread","details":{"error_code":"thread_not_found"}}}"#,
+        );
+        let (url, mut bodies) = serve_capture(vec![ok(), ok(), expired, ok(), ok()]).await;
+        let mut a = Anthropic::new(Auth::ApiKey("k".into()), None).with_base_url(url);
+        a.threads_on = true;
+        let ask = |messages: Vec<Message>| {
+            let mut r = req(messages);
+            r.messages.insert(0, Message::System { text: "sys".into() });
+            r.session = Some("s1".into());
+            r
+        };
+        let mut history = vec![Message::user("one")];
+
+        // 1. A new thread with everything.
+        let m = collect(a.stream(ask(history.clone()), CancellationToken::new())).await;
+        let b = bodies.recv().await.unwrap();
+        assert_eq!(b["thread"], json!({"type": "create"}));
+        assert!(b.get("system").is_some());
+        assert_eq!(b["messages"].as_array().unwrap().len(), 1);
+
+        // 2. Nothing earlier changed: only the new message, no system.
+        history.extend([Message::Assistant(m), Message::user("two")]);
+        let m = collect(a.stream(ask(history.clone()), CancellationToken::new())).await;
+        let b = bodies.recv().await.unwrap();
+        assert_eq!(b["thread"], json!({"type": "continue", "previous_message_id": "msg_A"}));
+        assert!(b.get("system").is_none());
+        assert_eq!(b["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(b["messages"][0]["content"][0]["text"], "two");
+
+        // 3. The thread expired: resent once in full as a new thread.
+        history.extend([Message::Assistant(m), Message::user("three")]);
+        let m = collect(a.stream(ask(history.clone()), CancellationToken::new())).await;
+        assert_eq!(m.stop, StopReason::Stop, "{:?}", m.error_message);
+        assert_eq!(bodies.recv().await.unwrap()["thread"]["type"], "continue");
+        let b = bodies.recv().await.unwrap();
+        assert_eq!(b["thread"], json!({"type": "create"}));
+        assert_eq!(b["messages"].as_array().unwrap().len(), 5);
+
+        // 4. An earlier message changed: a new thread, not a continue.
+        history[0] = Message::user("edited");
+        history.extend([Message::Assistant(m), Message::user("four")]);
+        collect(a.stream(ask(history), CancellationToken::new())).await;
+        assert_eq!(bodies.recv().await.unwrap()["thread"], json!({"type": "create"}));
+    }
+
+    #[tokio::test]
+    async fn subscription_continue_keeps_only_the_billing_block() {
+        let ok = || http("200 OK", "content-type: text/event-stream\r\n", TEXT_SSE);
+        let (url, mut bodies) = serve_capture(vec![ok(), ok()]).await;
+        let auth = Auth::OAuth {
+            access_token: "t".into(),
+            profile: OAuthProfile::default(),
+        };
+        let mut a = Anthropic::new(auth, None).with_base_url(url);
+        a.threads_on = true;
+        let mut r = req(vec![Message::System { text: "sys".into() }, Message::user("one")]);
+        r.session = Some("s".into());
+        let m = collect(a.stream(r.clone(), CancellationToken::new())).await;
+        assert!(bodies.recv().await.unwrap()["system"].as_array().unwrap().len() > 1);
+        r.messages.extend([Message::Assistant(m), Message::user("two")]);
+        collect(a.stream(r, CancellationToken::new())).await;
+        let b = bodies.recv().await.unwrap();
+        assert_eq!(b["thread"]["type"], "continue");
+        let sys = b["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 1);
+        assert!(
+            sys[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("x-anthropic-billing-header:")
+        );
+    }
+
+    #[test]
+    fn threads_only_on_anthropics_endpoint_with_a_session() {
+        let mut r = req(vec![Message::user("hi")]);
+        let a = Anthropic::new(Auth::ApiKey("k".into()), None);
+        assert_eq!(a.thread_session(&r), None, "no session");
+        r.session = Some("s".into());
+        assert_eq!(a.thread_session(&r).as_deref(), Some("s"));
+        let gw = Anthropic::new(Auth::ApiKey("k".into()), None).with_base_url("https://gateway.example");
+        assert_eq!(gw.thread_session(&r), None, "gateway");
+        let vendor = Anthropic::new(Auth::ApiKey("k".into()), None).with_provider("minimax");
+        assert_eq!(vendor.thread_session(&r), None, "vendor");
     }
 
     #[tokio::test]

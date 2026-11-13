@@ -154,7 +154,7 @@ impl Adapter for OpenAiResponses {
         if let Auth::Codex { .. } = self.auth {
             r = r.header("OpenAI-Beta", "responses=experimental");
             if let Some(s) = &req.session {
-                r = r.header("session_id", s);
+                r = r.header("session-id", s);
             }
         }
         let request = r.body(body.clone());
