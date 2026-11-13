@@ -2603,8 +2603,8 @@ mod layout_tests {
                 .map(|(_, l)| l.clone())
                 .unwrap()
         };
-        for i in 0..1999 {
-            let cached = &tr.turns[i].cache.as_ref().unwrap().lines;
+        for (i, turn) in tr.turns.iter().take(1999).enumerate() {
+            let cached = &turn.cache.as_ref().unwrap().lines;
             assert!(Arc::ptr_eq(&run(&next, i), cached), "turn {i} was copied");
             assert!(Arc::ptr_eq(&run(&first, i), cached), "turn {i} was laid out again");
         }

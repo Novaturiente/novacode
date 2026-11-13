@@ -1222,9 +1222,10 @@ mod tests {
         let args = json!({"path": "src/x.rs", "edits": [{"old_text": "a", "new_text": "b"}]});
         let d = to_value(diffs("edit", &args, Path::new("/w")));
         assert_eq!(d[0]["type"], "diff");
+        let want = Path::new("/w").join("src/x.rs");
         assert_eq!(
             (d[0]["path"].as_str(), d[0]["oldText"].as_str()),
-            (Some("/w/src/x.rs"), Some("a"))
+            (want.to_str(), Some("a"))
         );
         assert_eq!(title("bash", &json!({"command": "ls\nrm x"})), "bash: ls…");
         assert_eq!(title("todo", &json!({})), "todo");
