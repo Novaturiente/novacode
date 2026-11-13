@@ -2,6 +2,26 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.9.4] - 2026-11-13
+
+### Added
+
+- Anthropic message threads on `api.anthropic.com`: after the first request of a session, only the new messages are sent (about 1 KB instead of the full conversation). Token use and prompt caching are unchanged. A rejected thread falls back to one full request.
+
+### Changed
+
+- Claude subscription requests no longer pose as Claude Code: novacode's own user agent, no `x-app`, no `claude-code-20250219` beta, no identity sentence. Only the required billing block stays. To bring the old headers back, see [Claude subscription headers](docs/providers.md#claude-subscription-headers).
+- The output-token margin now grows with the input size instead of a fixed 4096 tokens.
+
+### Fixed
+
+- `edit`: in a file with mixed line endings, untouched lines keep their own ending.
+- `find` and `grep`: a leading `./` in the pattern now matches.
+- Markdown: HTML comments are hidden.
+- Codex: the session header is `session-id` (was `session_id`).
+- Streaming: a lone `\r` ends a line.
+- MCP over HTTP: a reply over 16 MiB is refused instead of read into memory.
+
 ## [0.9.3] - 2026-11-10
 
 ### Added
