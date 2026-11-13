@@ -912,7 +912,7 @@ pub fn cleanup_old(paths: &Paths, days: u64) -> (usize, u64) {
                 continue;
             }
             // Held while deleting, so the session can't be opened meanwhile.
-            let Ok(Some(_lock)) = storage::try_lock(&path) else {
+            let Ok(Some(_lock)) = lock_session(&path) else {
                 continue;
             };
             let prefix = format!("{id}.");
