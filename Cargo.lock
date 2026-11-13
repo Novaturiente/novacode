@@ -1994,7 +1994,7 @@ checksum = "610a5acd306ec67f907abe5567859a3c693fb9886eb1f012ab8f2a47bef3db51"
 
 [[package]]
 name = "novacode"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "agent-client-protocol-schema",
  "anyhow",
@@ -2021,7 +2021,7 @@ dependencies = [
 
 [[package]]
 name = "novacode-ai"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -2041,7 +2041,7 @@ dependencies = [
 
 [[package]]
 name = "novacode-base"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "jsonc-parser",
  "regex",
@@ -2057,7 +2057,7 @@ dependencies = [
 
 [[package]]
 name = "novacode-core"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -2084,7 +2084,7 @@ dependencies = [
 
 [[package]]
 name = "novacode-script"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "futures-util",
  "oxc_allocator",
@@ -2101,7 +2101,7 @@ dependencies = [
 
 [[package]]
 name = "novacode-tools"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -2127,7 +2127,7 @@ dependencies = [
 
 [[package]]
 name = "novacode-tui"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "base64 0.22.1",
  "crossterm",
@@ -2150,7 +2150,7 @@ dependencies = [
 
 [[package]]
 name = "novacode-types"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "schemars 1.2.3",
  "serde",

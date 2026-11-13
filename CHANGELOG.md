@@ -2,6 +2,12 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.9.5] - 2026-11-13
+
+### Fixed
+
+- Build: the workspace passes clippy 1.100 (`needless_range_loop` in a TUI test), and the ACP diff test passes on Windows. No change in behaviour.
+
 ## [0.9.4] - 2026-11-13
 
 ### Added
