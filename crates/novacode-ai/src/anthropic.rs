@@ -61,16 +61,21 @@ pub struct OAuthProfile {
     pub betas: String,
     /// First system block, e.g. `cc_version=…; cc_entrypoint=sdk-cli; cch=…;`.
     pub billing_header: String,
+    /// Second system block; empty = none.
     pub identity: String,
 }
 
+/// Only the billing block is required: without it subscription requests get 429s.
+/// The Claude Code user agent, `x-app`, `claude-code-20250219` beta and identity
+/// sentence are not needed (jcode's probes, DECISIONS 2026-11-13). A `claude-cli/…`
+/// `userAgent` setting brings `x-app: cli` back.
 impl Default for OAuthProfile {
     fn default() -> Self {
         Self {
-            user_agent: "claude-cli/2.1.294 (external, sdk-cli)".into(),
-            betas: "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14".into(),
+            user_agent: concat!("novacode/", env!("CARGO_PKG_VERSION")).into(),
+            betas: "oauth-2025-04-20,interleaved-thinking-2025-05-14".into(),
             billing_header: "cc_version=2.1.294; cc_entrypoint=sdk-cli; cch=33f85;".into(),
-            identity: "You are a Claude agent, built on Anthropic's Claude Agent SDK.".into(),
+            identity: String::new(),
         }
     }
 }
@@ -371,10 +376,14 @@ impl Anthropic {
         let mut r = match &self.auth {
             Auth::ApiKey(k) => r.header("x-api-key", k),
             Auth::Bearer(t) => r.bearer_auth(t),
-            Auth::OAuth { access_token, profile } => r
-                .bearer_auth(access_token)
-                .header("user-agent", &profile.user_agent)
-                .header("x-app", "cli"),
+            Auth::OAuth { access_token, profile } => {
+                let r = r.bearer_auth(access_token).header("user-agent", &profile.user_agent);
+                if profile.user_agent.starts_with("claude-cli/") {
+                    r.header("x-app", "cli")
+                } else {
+                    r
+                }
+            }
         };
         for (k, v) in &self.headers {
             r = r.header(k, v);
@@ -820,7 +829,9 @@ pub fn build_body(req: &Request, oauth: Option<&OAuthProfile>, ns: &str) -> Valu
     let mut system: Vec<Value> = Vec::new();
     if let Some(p) = oauth {
         system.push(json!({ "type": "text", "text": format!("x-anthropic-billing-header: {}", p.billing_header) }));
-        system.push(json!({ "type": "text", "text": p.identity }));
+        if !p.identity.is_empty() {
+            system.push(json!({ "type": "text", "text": p.identity }));
+        }
     }
     // The leading System messages are the prompt; later ones are deltas (L4.7) and
     // stay where they are, so the cached prefix never changes.
@@ -1464,10 +1475,12 @@ mod tests {
 
     #[test]
     fn oauth_system_blocks_and_long_ttl() {
-        let mut r = req(vec![Message::user("hi")]);
+        let mut r = req(vec![Message::System { text: "prompt".into() }, Message::user("hi")]);
         r.cache = CacheRetention::Long;
         let body = build_body(&r, Some(&OAuthProfile::default()), PROVIDER);
         let sys = body["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 2, "billing block, then the prompt: no identity sentence");
+        assert_eq!(sys[1]["text"], "prompt");
         assert!(
             sys[0]["text"]
                 .as_str()

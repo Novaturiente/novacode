@@ -286,6 +286,24 @@ novacode retries failures that are likely to pass on their own: network errors, 
 
 **Token refresh errors.** Subscription tokens are refreshed when they are less than 5 minutes from expiring. If the refresh fails because of a network error, a token-server error (5xx), a timeout (408) or a rate limit (429), the request fails as a temporary error and is retried on the same account. A login that is gone makes novacode switch to the next account: expired or revoked, refused by the token server with any other 4xx (such as 400 or 401), or not logged in.
 
+### Claude subscription headers
+
+A Claude subscription request sends novacode's own user agent and only one Claude Code value: the billing block, the first `system` block (`x-anthropic-billing-header: …`). Without that block Anthropic refuses the request with a 429 that never clears. If Anthropic starts refusing novacode's plain requests too, bring back Claude Code's headers and identity sentence in `~/.novacode/settings.json`:
+
+```json
+{
+  "providers": {
+    "claude": {
+      "userAgent": "claude-cli/2.1.294 (external, sdk-cli)",
+      "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
+      "identity": "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+    }
+  }
+}
+```
+
+A `userAgent` that starts with `claude-cli/` also sends `x-app: cli`. `identity` becomes the second `system` block. `billingHeader` replaces the billing block's text (default `cc_version=2.1.294; cc_entrypoint=sdk-cli; cch=33f85;`). Each key is optional and replaces only its own default. Check with `--trace`: the request headers and `system` blocks are in the trace file.
+
 ## Check and remove
 
 ```sh
