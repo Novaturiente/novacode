@@ -77,6 +77,23 @@ Project config (project settings, extensions, hooks, project MCP servers) loads 
 
 Your `AGENTS.md` and `CLAUDE.md` files still load. `--api-key` is hidden from crash logs.
 
+### One fast model call: `--bare`
+
+For editor completion (for example a Neovim plugin), `--bare` makes `-p` send one small request and print only the answer text. It sends no tools and no system prompt, and it loads no session, memory, skills, context files, MCP servers, hooks or reminders. No thinking setting is sent unless the model has `:level`.
+
+```sh
+novacode --bare -p "$PROMPT" -m claude/claude-haiku-4-5 --stop '</completion>' --max-tokens 128
+```
+
+| Flag | What it does |
+|---|---|
+| `--max-tokens N` | Cap the answer at N tokens (default: the `maxTokens` limit) |
+| `--stop TEXT` | End the answer at TEXT, which is not printed. Repeat for several. |
+
+The provider stops generating at the stop text where it supports that (Anthropic, OpenAI chat, Gemini). The OpenAI Responses API has no such parameter, so there the answer is only cut after it arrives.
+
+With `--trace`, every record has `ts` (Unix time in ms) and a `response` record marks when the response headers arrived, so you can see where the time goes.
+
 ## In CI
 
 ```sh

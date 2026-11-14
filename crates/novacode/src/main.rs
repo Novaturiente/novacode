@@ -29,6 +29,7 @@ use tokio::sync::{broadcast, mpsc};
 mod acp;
 mod activity;
 mod agents;
+mod bare;
 mod diag;
 mod docs;
 mod doctor;
@@ -106,6 +107,16 @@ struct Cli {
     /// With -p: write the wire protocol's JSONL events to stdout instead of the answer.
     #[arg(long, requires = "print")]
     json: bool,
+    /// With -p: one model call for editor completion. No tools, system prompt, session,
+    /// memory, skills, MCP, hooks or reminders; prints only the answer text.
+    #[arg(long, requires = "print", conflicts_with_all = ["json", "resume", "continue", "worktree", "agent", "tools", "mcp", "profile", "mode"])]
+    bare: bool,
+    /// With --bare: the answer's token cap (default: the `maxTokens` limit).
+    #[arg(long, requires = "bare")]
+    max_tokens: Option<u32>,
+    /// With --bare: stop at this text, which is not printed (repeatable).
+    #[arg(long, requires = "bare")]
+    stop: Vec<String>,
     /// Serve the wire protocol on stdin/stdout: JSONL commands in, events out.
     #[arg(long, conflicts_with = "print")]
     rpc: bool,
@@ -1138,6 +1149,24 @@ async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         });
     }
     drop(auth_store);
+    if cli.bare
+        && let Some(prompt) = prompt
+    {
+        let trace = cli.trace.then(|| Trace {
+            path: paths.logs().join(format!("trace-{}.jsonl", new_id())),
+        });
+        if let Some(t) = &trace {
+            eprintln!("trace: {}", t.path.display());
+        }
+        let opts = bare::Opts {
+            max_tokens: cli.max_tokens,
+            stop: cli.stop.clone(),
+        };
+        let text = bare::run(&providers, &settings, &model, prompt, trace, opts).await?;
+        print!("{text}");
+        std::io::stdout().flush()?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let ctx = Ctx {
         quirks: Arc::new(novacode_ai::schema::Quirks::load(paths.home())),
         paths,

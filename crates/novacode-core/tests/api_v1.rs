@@ -424,6 +424,7 @@ async fn provider_requests(dir: &std::path::Path) -> String {
         serde_json::from_value(json!({"command": "python3", "args": [f, log]})).unwrap(),
     );
     let req = Request {
+        stop: Vec::new(),
         model: "m".into(),
         messages: vec![novacode_types::Message::user("hi")],
         tools: vec![],

@@ -78,6 +78,7 @@ fn open_requests(store: &Store) -> Vec<String> {
 /// One plain text call to the helper model.
 pub async fn helper_text(w: &Worker, system: &str, user: String) -> Result<String, String> {
     let req = Request {
+        stop: Vec::new(),
         tail: Vec::new(),
         model: w.model.clone(),
         messages: vec![

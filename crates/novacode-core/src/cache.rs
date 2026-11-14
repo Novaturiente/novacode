@@ -143,6 +143,7 @@ mod tests {
 
     fn req(model: &str, msgs: &[&str]) -> Request {
         Request {
+            stop: Vec::new(),
             tail: Vec::new(),
             model: model.into(),
             messages: msgs.iter().map(|m| Message::user(*m)).collect(),

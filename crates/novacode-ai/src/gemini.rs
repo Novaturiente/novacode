@@ -225,6 +225,9 @@ pub fn build_request(req: &Request, ns: &str) -> Value {
     }
     let mut config = Map::new();
     config.insert("maxOutputTokens".into(), json!(req.max_tokens));
+    if !req.stop.is_empty() {
+        config.insert("stopSequences".into(), json!(req.stop));
+    }
     if let Some(t) = thinking(&req.model, req.thinking) {
         config.insert("thinkingConfig".into(), t);
     }
@@ -593,6 +596,7 @@ mod tests {
 
     fn req(model: &str, messages: Vec<Message>) -> Request {
         Request {
+            stop: Vec::new(),
             tail: Vec::new(),
             model: model.into(),
             messages,

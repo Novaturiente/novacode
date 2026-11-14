@@ -61,6 +61,7 @@ impl novacode_tools::read::Delegate for Worker {
     ) -> futures_util::future::BoxFuture<'a, Result<String, String>> {
         Box::pin(async move {
             let req = Request {
+                stop: Vec::new(),
                 tail: Vec::new(),
                 model: self.model.clone(),
                 messages: vec![
@@ -347,6 +348,7 @@ pub async fn observe(w: &Worker, known: &[Note], c: &Chunk, session: &str) -> Re
         let _ = writeln!(existing, "- {}", n.content);
     }
     let req = Request {
+        stop: Vec::new(),
         tail: Vec::new(),
         model: w.model.clone(),
         messages: vec![
@@ -689,6 +691,7 @@ async fn ask(
 ) -> Result<(Vec<Value>, Usage), String> {
     let name = tool.name.clone();
     let req = Request {
+        stop: Vec::new(),
         tail: Vec::new(),
         model: w.model.clone(),
         messages: vec![
@@ -821,6 +824,7 @@ pub async fn summarize(
     guide: Option<&str>,
 ) -> Result<(String, Usage), String> {
     let req = Request {
+        stop: Vec::new(),
         tail: Vec::new(),
         model: model.into(),
         messages: vec![

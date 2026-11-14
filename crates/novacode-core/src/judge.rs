@@ -880,6 +880,7 @@ impl Judge {
         let w = self.worker.lock().unwrap().clone();
         let seen = self.seen.lock().unwrap().clone();
         let req = Request {
+            stop: Vec::new(),
             tail: Vec::new(),
             model: w.model.clone(),
             messages: vec![

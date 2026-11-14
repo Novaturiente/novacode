@@ -50,6 +50,40 @@ fn print_mode_replays_a_tool_call_then_text() {
     check_two_step(&run(&cwd, &home, &[("NOVACODE_FAUX_SCRIPT", &script)], &[]));
 }
 
+/// `--bare` (L8.17): only the answer text, cut at the stop text; no session saved.
+#[test]
+fn bare_prints_only_the_answer_cut_at_the_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (home, cwd) = (dir.path().join("home"), dir.path().join("work"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    let script = dir.path().join("script.jsonl");
+    std::fs::write(&script, "{\"text\": \"foo(bar)</completion> trailing\"}\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_novacode"))
+        .current_dir(&cwd)
+        .args([
+            "--bare",
+            "-p",
+            "go",
+            "-m",
+            "faux/script",
+            "--stop",
+            "</completion>",
+            "--max-tokens",
+            "64",
+        ])
+        .env("NOVACODE_HOME", &home)
+        .env("NOVACODE_FAUX_SCRIPT", &script)
+        .env_remove("NOVACODE_FAUX_SCRIPT_DIR")
+        .env_remove("NOVACODE_TASK")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout, "foo(bar)");
+    assert!(!home.join("sessions").exists(), "no session file");
+}
+
 #[test]
 fn script_dir_picks_the_file_named_after_the_task() {
     let dir = tempfile::tempdir().unwrap();

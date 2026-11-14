@@ -139,6 +139,9 @@ async fn stream_body<W: Wire>(
     trace: Option<&Trace>,
     mut wire: W,
 ) -> Result<StopReason, Failure> {
+    if let Some(t) = trace {
+        t.response(resp.status().as_u16());
+    }
     let mut body = resp.bytes_stream();
     let mut sse = SseParser::default();
     loop {

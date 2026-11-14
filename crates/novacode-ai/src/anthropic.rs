@@ -927,6 +927,9 @@ pub fn build_body(req: &Request, oauth: Option<&OAuthProfile>, ns: &str) -> Valu
         }
     }
     body.insert("max_tokens".into(), json!(max_tokens));
+    if !req.stop.is_empty() {
+        body.insert("stop_sequences".into(), json!(req.stop));
+    }
     if !system.is_empty() {
         body.insert("system".into(), Value::Array(system));
     }
@@ -1112,6 +1115,7 @@ mod tests {
 
     fn req(messages: Vec<Message>) -> Request {
         Request {
+            stop: Vec::new(),
             tail: Vec::new(),
             model: "claude-x".into(),
             messages,
@@ -1279,6 +1283,17 @@ mod tests {
         r.model = "claude-opus-4-8".into();
         let b = build_body(&r, None, PROVIDER);
         assert_eq!(b["output_config"], json!({ "effort": "medium" }));
+    }
+
+    #[test]
+    fn bare_request_sends_stop_sequences_and_nothing_extra() {
+        let mut r = req(vec![Message::user("a")]);
+        let b = build_body(&r, None, PROVIDER);
+        assert!(b.get("stop_sequences").is_none());
+        r.stop = vec!["</completion>".into()];
+        let b = build_body(&r, None, PROVIDER);
+        assert_eq!(b["stop_sequences"], json!(["</completion>"]));
+        assert!(b.get("tools").is_none() && b.get("system").is_none(), "{b}");
     }
 
     #[test]

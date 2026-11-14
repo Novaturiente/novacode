@@ -173,6 +173,7 @@ mod tests {
 
     fn req() -> Request {
         Request {
+            stop: Vec::new(),
             tail: Vec::new(),
             thinking: None,
             images: true,

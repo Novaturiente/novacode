@@ -503,6 +503,7 @@ mod tests {
 
     fn req(messages: Vec<Message>) -> Request {
         Request {
+            stop: Vec::new(),
             tail: Vec::new(),
             model: "gpt-5.5".into(),
             messages,

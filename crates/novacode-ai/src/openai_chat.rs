@@ -171,6 +171,9 @@ pub fn build_body(req: &Request, c: &Compat, ns: &str, cache_key: bool) -> Value
     }
     let field = c.max_tokens_field.as_deref().unwrap_or("max_tokens");
     body.insert(field.into(), json!(req.max_tokens));
+    if !req.stop.is_empty() {
+        body.insert("stop".into(), json!(req.stop));
+    }
     // `thinking` is only set for reasoning models (L2.16): Off switches reasoning off where
     // the format has a documented switch.
     // shortcut: the plain `openai` format sends nothing for Off (vendors differ on `none`).
@@ -639,6 +642,7 @@ mod tests {
 
     fn req(messages: Vec<Message>) -> Request {
         Request {
+            stop: Vec::new(),
             tail: Vec::new(),
             model: "m".into(),
             messages,

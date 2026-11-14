@@ -494,6 +494,7 @@ impl Goals {
             Judge::Model { worker, .. } => {
                 let w = worker.lock().unwrap().clone();
                 let req = novacode_ai::adapter::Request {
+                    stop: Vec::new(),
                     tail: Vec::new(),
                     model: w.model.clone(),
                     messages: vec![

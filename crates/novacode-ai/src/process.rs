@@ -324,6 +324,7 @@ for line in sys.stdin:
 
     fn req(text: &str) -> Request {
         Request {
+            stop: Vec::new(),
             model: "small".into(),
             messages: vec![Message::user(text)],
             tools: vec![],

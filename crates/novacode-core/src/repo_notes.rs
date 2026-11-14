@@ -484,6 +484,7 @@ impl State {
             );
         }
         let req = Request {
+            stop: Vec::new(),
             tail: Vec::new(),
             model: w.model.clone(),
             messages: vec![

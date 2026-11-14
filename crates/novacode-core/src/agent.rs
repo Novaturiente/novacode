@@ -429,6 +429,7 @@ impl Agent {
             let ago = Duration::from_millis(crate::session::now_ms().saturating_sub(ts));
             *shared.sent.lock().unwrap() = Some(crate::cache::Sent {
                 req: Request {
+                    stop: Vec::new(),
                     tail: Vec::new(),
                     model,
                     messages,
@@ -578,6 +579,7 @@ impl Agent {
             script: false,
         };
         let template = Request {
+            stop: Vec::new(),
             tail: Vec::new(),
             model: self.cfg.model.clone(),
             messages: Vec::new(),
@@ -2113,6 +2115,7 @@ impl Agent {
             let estimate = novacode_types::estimate::context(&messages);
             let room = output_room(self.cfg.window_tokens, estimate);
             let req = Request {
+                stop: Vec::new(),
                 tail: tail.clone(),
                 model: self.cfg.model.clone(),
                 max_tokens: self.cfg.max_tokens.min(room.clamp(1024, u32::MAX as u64) as u32),

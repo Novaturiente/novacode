@@ -388,6 +388,7 @@ mod tests {
         // `gone` has no usable login (as after a revoked refresh token).
         let a = Live::new(p.clone(), "sub", vec!["gone".into(), "work".into()], None, first);
         let req = Request {
+            stop: Vec::new(),
             tail: Vec::new(),
             model: "m".into(),
             messages: vec![Message::user("hi")],
@@ -441,6 +442,7 @@ mod tests {
         let (first, _) = p.adapter_for("sub", "default", None).await.unwrap();
         let a = Live::new(p.clone(), "sub", vec!["default".into(), "work".into()], None, first);
         let req = Request {
+            stop: Vec::new(),
             tail: Vec::new(),
             model: "m".into(),
             messages: vec![Message::user("hi")],
@@ -504,6 +506,7 @@ mod tests {
         let mut named = a.follow_account().unwrap();
         assert_eq!(*named.borrow_and_update(), "default");
         let req = Request {
+            stop: Vec::new(),
             tail: Vec::new(),
             model: "m".into(),
             messages: vec![Message::user("hi")],
@@ -568,6 +571,7 @@ mod tests {
         let a = Live::new(p.clone(), "sub", vec!["default".into(), "work".into()], None, first);
         *a.inner.fault.lock().unwrap() = Some(|| AuthError::Http("token request failed: connection reset".into()));
         let req = Request {
+            stop: Vec::new(),
             tail: Vec::new(),
             model: "m".into(),
             messages: vec![Message::user("hi")],
@@ -616,6 +620,7 @@ mod tests {
             AuthError::Rejected(r#"token endpoint returned 401 Unauthorized: {"error":"unauthorized_client"}"#.into())
         });
         let req = Request {
+            stop: Vec::new(),
             tail: Vec::new(),
             model: "m".into(),
             messages: vec![Message::user("hi")],

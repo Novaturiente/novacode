@@ -35,6 +35,8 @@ pub struct Request {
     /// Text for this request only, never stored (extensions' `before_request`). Sent
     /// after the last cache marker as `<system-reminder>`s, so the cached prefix holds.
     pub tail: Vec<String>,
+    /// Stop sequences: generation ends at the first one (`--bare --stop`). Empty = none.
+    pub stop: Vec<String>,
 }
 
 impl Request {

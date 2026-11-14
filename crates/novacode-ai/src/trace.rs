@@ -21,7 +21,13 @@ pub struct Trace {
 }
 
 impl Trace {
-    fn write(&self, v: serde_json::Value) {
+    /// Every record carries `ts`, Unix time in ms, so a reader can split connect,
+    /// first token and the rest of one request (and compare with process start).
+    fn write(&self, mut v: serde_json::Value) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        v["ts"] = json!(ts);
         if let Err(e) = append_jsonl(&self.path, &v) {
             tracing::warn!(path = %self.path.display(), error = %e, "trace write failed");
         }
@@ -45,6 +51,11 @@ impl Trace {
             .collect();
         let body: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
         self.write(json!({ "kind": "request", "url": built.url().as_str(), "headers": headers, "body": body }));
+    }
+
+    /// The response headers arrived with a success status: the stream starts.
+    pub fn response(&self, status: u16) {
+        self.write(json!({ "kind": "response", "status": status }));
     }
 
     pub fn response_error(&self, status: u16, body: &str) {
@@ -82,5 +93,7 @@ mod tests {
         assert!(!text.contains("secret\"") && !text.contains("tok\""), "{text}");
         assert!(text.contains("<redacted>") && text.contains("\"a\":1"));
         assert!(text.contains("application/json"), "ordinary headers stay: {text}");
+        let rec: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert!(rec["ts"].as_u64().unwrap() > 1_700_000_000_000, "timestamped: {text}");
     }
 }
