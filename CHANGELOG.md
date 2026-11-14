@@ -2,6 +2,13 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.9.6] - 2026-11-15
+
+### Added
+
+- `--bare` for `-p`: one model call with no tools, no system prompt, no session, memory, skills, context files, MCP servers, hooks or reminders; prints only the answer text. Meant for editor completion. `--max-tokens N` caps the answer; `--stop TEXT` (repeatable) ends it at TEXT, sent as a stop sequence to Anthropic, OpenAI chat and Gemini and always cut client-side. See [automation](docs/automation.md#one-fast-model-call---bare).
+- `--trace` records carry `ts` (Unix time in ms), and a `response` record marks when the response headers arrived.
+
 ## [0.9.5] - 2026-11-13
 
 ### Fixed
