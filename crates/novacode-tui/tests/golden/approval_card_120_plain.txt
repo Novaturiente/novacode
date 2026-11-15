@@ -1,4 +1,4 @@
- novacode X.Y.Z
+ novacode X.Y.Z 
  /home/u/proj · claude/opus
  type / for commands
 

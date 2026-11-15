@@ -2,6 +2,27 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.10.0] - 2026-11-15
+
+### Added
+
+- Memory recall per prompt: after each prompt, saved memories that share at least two of its words (one for a one-word prompt; `deploy` also finds `deploys`) are added after it, up to 5, each once per session. A local search with no model call; recalled items count as used, so the start-of-session index now ranks by use. See [context](docs/context.md#cross-session-memory).
+- Loud account notices: an automatic account switch shows a bold full-width line (`claude: switched to account work`) with the reason below. When every account of a provider is out, a red line says to switch provider with `/model`, followed by each account's reset time and the other providers you are logged in to.
+
+### Changed
+
+- Subagents no longer run the background observer (notes, reflections). They still compact, with the session model.
+- Only reflections the reflector marks as lasting are saved to project memory; one with mostly the same words as a saved item refreshes that item. Each store keeps at most 500 unpinned items: past that, each new item replaces the least used one.
+- A session in a temporary folder saves no reflections to project memory and gets no recall; reading memory never creates a database file.
+- A `bash` call that sleeps 30 seconds or more is refused while one of the session's processes runs; the error points to process watches and `schedule`.
+- Memory workers (observer, reflector, dropper, summaries) cache only their system prompt on Anthropic, instead of writing their one-off messages to the cache.
+- The skills list in the prompt names each folder once; the `bash` description says each call starts in the working directory.
+- Built-in model catalog refreshed from models.dev: 206 models added, 223 removed, prices and limits updated; the `llama` provider is gone from the source.
+
+### Fixed
+
+- A package installed both globally and in the project loads once (the project's copy), so its hooks and skills no longer run twice.
+
 ## [0.9.6] - 2026-11-15
 
 ### Added
