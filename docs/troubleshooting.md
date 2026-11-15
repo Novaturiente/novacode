@@ -93,7 +93,7 @@ If you have a subscription and it hits its limit, the message says when it reset
 You have these options:
 
 - Wait for the reset. `/usage` shows your quota windows.
-- Add a second account. When one runs out, novacode switches to the next one on its own and tells you (`account `default` is exhausted (…); switched to account `work``). It remembers which accounts are out, so a new session doesn't start with a spent one. novacode never falls back to a metered API key by itself.
+- Add a second account. When one runs out, novacode switches to the next one on its own and tells you with a bold line (`claude: switched to account `work``) and the reason below it. When every account is out, a red line tells you to switch provider with `/model` and lists the providers you are logged in to. It remembers which accounts are out, so a new session doesn't start with a spent one. novacode never falls back to a metered API key by itself.
 - Switch to another model or provider with `/model`.
 
 ```sh

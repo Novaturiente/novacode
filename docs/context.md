@@ -98,7 +98,7 @@ There are two kinds of memory. They solve different problems.
 
 ### Session memory and compaction
 
-While you work, a small background "observer" reads the new part of the conversation and writes short notes: decisions, fixes, preferences. The notes are saved in the session file. They are not sent to the main model while the context still fits.
+While you work, a small background "observer" reads the new part of the conversation and writes short notes: decisions, fixes, preferences. The notes are saved in the session file. They are not sent to the main model while the context still fits. Subagents have no observer: they usually end before they would compact, so their notes went unused and their facts crowded project memory. They still compact, with the session model.
 
 When the context gets close to full, novacode **compacts**. It keeps your most recent messages as they are and replaces everything older with a summary built from the notes (lasting facts first, then notes, then the files that were read and changed). If the notes lag behind the cut point, the observer first catches up with extra calls to the worker model (`memory.model`, else the provider's small model, else the session model). If that fails, the session model summarises the gap instead. If both fail, the older messages are dropped and the summary says "No notes were available"; the model is told to ask you if it needs what they held.
 

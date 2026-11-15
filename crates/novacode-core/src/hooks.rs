@@ -637,8 +637,89 @@ impl Handler for BashWrites {
     }
 }
 
+/// Built in: blocks a long `sleep` in `bash` while a background process runs. The
+/// process wakes the agent on exit or a watched line; sleeping kept the turn busy
+/// (the user locked out) for up to 10 minutes per call.
+pub struct BashSleep(pub Arc<novacode_tools::process::ProcessManager>);
+
+/// Seconds of the longest `sleep N` (`N`, `Ns`, `Nm`) in a command.
+pub fn sleep_secs(cmd: &str) -> u64 {
+    let words: Vec<&str> = cmd.split(|c: char| c.is_whitespace() || ";&|()".contains(c)).collect();
+    words
+        .windows(2)
+        .filter(|w| w[0] == "sleep")
+        .filter_map(|w| {
+            let (n, mult) = match w[1].strip_suffix('m') {
+                Some(n) => (n, 60.0),
+                None => (w[1].strip_suffix('s').unwrap_or(w[1]), 1.0),
+            };
+            n.parse::<f64>().ok().map(|n| (n * mult) as u64)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+const SLEEP_LIMIT: u64 = 30;
+
+impl Handler for BashSleep {
+    fn label(&self) -> &str {
+        "novacode"
+    }
+    fn before_tool<'a>(&'a self, tool: &'a str, args: &'a Value) -> BoxFuture<'a, Gate> {
+        let long = tool == "bash" && args["command"].as_str().is_some_and(|c| sleep_secs(c) >= SLEEP_LIMIT);
+        Box::pin(async move {
+            if !long {
+                return Gate::Allow;
+            }
+            let ids: Vec<String> = self
+                .0
+                .list()
+                .into_iter()
+                .filter(|i| i.end.is_none())
+                .map(|i| i.id)
+                .collect();
+            if ids.is_empty() {
+                return Gate::Allow;
+            }
+            Gate::Block(format!(
+                "Not run: sleeping {SLEEP_LIMIT}s or more while {} runs keeps the turn busy and the user locked out. It wakes you when it exits or a watched line appears (`process` watch, `stall_seconds` for silence); for periodic reports use the `schedule` tool (find it with `tool_search`). End the turn instead of sleeping.",
+                ids.join(", ")
+            ))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn long_sleeps() {
+        use super::sleep_secs;
+        assert_eq!(sleep_secs("sleep 580; ls x | wc -l"), 580);
+        assert_eq!(sleep_secs("cd a && sleep 2m"), 120);
+        assert_eq!(sleep_secs("sleep 0.5"), 0);
+        assert_eq!(sleep_secs("for i in 1 2; do sleep 45s; done"), 45);
+        assert_eq!(sleep_secs("echo sleep"), 0);
+        assert_eq!(sleep_secs("ls"), 0);
+    }
+
+    #[tokio::test]
+    async fn blocks_long_sleep_only_while_a_process_runs() {
+        use super::{BashSleep, Gate, Handler};
+        let d = tempfile::tempdir().unwrap();
+        let pm = novacode_tools::process::ProcessManager::new(d.path(), "s1");
+        let h = BashSleep(pm.clone());
+        let args = |c: &str| serde_json::json!({ "command": c });
+        assert!(
+            matches!(h.before_tool("bash", &args("sleep 60")).await, Gate::Allow),
+            "nothing running"
+        );
+        pm.start("job", "sleep 30", d.path(), &[], true, None).unwrap();
+        assert!(matches!(h.before_tool("bash", &args("sleep 60")).await, Gate::Block(_)));
+        assert!(matches!(h.before_tool("bash", &args("sleep 2")).await, Gate::Allow));
+        assert!(matches!(h.before_tool("read", &args("sleep 60")).await, Gate::Allow));
+        pm.kill_all();
+    }
+
     #[test]
     fn the_walk_skips_python_bytecode() {
         let d = tempfile::tempdir().unwrap();

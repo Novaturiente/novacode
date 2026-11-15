@@ -12,7 +12,7 @@ use crate::connect::Providers;
 use crate::retry;
 use crate::trace::Trace;
 use futures_util::future::BoxFuture;
-use novacode_types::{ErrorKind, StopReason, StreamEvent};
+use novacode_types::{ErrorKind, HEADLINE, StopReason, StreamEvent};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -126,6 +126,66 @@ fn exhausted(stop: &StopReason) -> bool {
 }
 
 impl Inner {
+    /// An account switch: a headline, then why.
+    fn switched(&self, to: usize, why: &str) -> String {
+        format!(
+            "{HEADLINE}{}: switched to account `{}`\n{why}",
+            self.provider, self.accounts[to]
+        )
+    }
+
+    /// No account of this provider can answer: a headline naming the way out, then
+    /// each account's state and the providers that are logged in.
+    fn all_out(&self, why: &str) -> String {
+        let p = &self.provider;
+        let mut s = if self.accounts.len() > 1 {
+            format!(
+                "{HEADLINE}All {} {p} accounts are out: switch to another provider with /model\n",
+                self.accounts.len()
+            )
+        } else {
+            format!("{HEADLINE}The {p} account is out: switch to another provider with /model\n")
+        };
+        s.push_str(why);
+        let now = now_ms();
+        for a in &self.accounts {
+            let state = match self.providers.auth.exhausted_until(p, a) {
+                Some(t) => format!("resets in {}", human(t.saturating_sub(now))),
+                None => "not usable now".into(),
+            };
+            s.push_str(&format!("\n- `{a}`: {state}"));
+        }
+        let others = self.other_providers();
+        if others.is_empty() {
+            s.push_str(&format!("\nNo other provider is logged in: `novacode login <provider>`, or add a {p} account with `novacode login {p} --account <name>`."));
+        } else {
+            s.push_str(&format!(
+                "\nLogged in and usable: {}. Or add a {p} account with `novacode login {p} --account <name>`.",
+                others.join(", ")
+            ));
+        }
+        s
+    }
+
+    /// Other providers with a login or key, not all of whose accounts are out.
+    fn other_providers(&self) -> Vec<String> {
+        let ps = &self.providers;
+        ps.profiles
+            .values()
+            .filter(|q| q.id != self.provider && q.api != crate::catalog::Api::Process && !q.key_optional)
+            .filter(|q| ps.connected(q))
+            .filter(|q| {
+                !q.oauth()
+                    || ps
+                        .auth
+                        .accounts(&q.id)
+                        .iter()
+                        .any(|a| ps.auth.exhausted_until(&q.id, a).is_none())
+            })
+            .map(|q| format!("`{}`", q.id))
+            .collect()
+    }
+
     fn set_current(&self, i: usize) {
         self.current.store(i, Ordering::Relaxed);
         self.named.send_replace(self.accounts[i].clone());
@@ -192,13 +252,15 @@ impl Inner {
                     // A broken login (e.g. a revoked refresh token) shouldn't block a working account.
                     if rotate && tried + 1 < n {
                         let next = (i + 1) % n;
-                        let note = format!("{msg}; switched to account `{}`", self.accounts[next]);
+                        let note = self.switched(next, &msg);
                         if tx.send(StreamEvent::Notice { text: note }).await.is_err() {
                             return;
                         }
                         self.set_current(next);
                         continue 'accounts;
                     }
+                    // Every login tried and broken: say how to get going again.
+                    let msg = if rotate && n > 1 { self.all_out(&msg) } else { msg };
                     return Builder::new(tx, &self.provider, &req.model).fail(kind, msg).await;
                 }
             };
@@ -231,9 +293,9 @@ impl Inner {
                     && let Some(next) = self.next_free(i)
                 {
                     let why = m.error_message.as_deref().unwrap_or("used up");
-                    let note = format!(
-                        "{} account `{}` is exhausted ({why}); switched to account `{}`",
-                        self.provider, self.accounts[i], self.accounts[next]
+                    let note = self.switched(
+                        next,
+                        &format!("{} account `{}` is exhausted ({why})", self.provider, self.accounts[i]),
                     );
                     if tx.send(StreamEvent::Notice { text: note }).await.is_err() {
                         return;
@@ -261,13 +323,12 @@ impl Inner {
                         } => format!("resets in {}", human(*ms)),
                         _ => "quota used up".into(),
                     };
-                    m.error_message = Some(format!(
-                        "{} account `{}`: {} ({wait}). Add another account with `novacode login {} --account <name>`, or switch model with /model.",
+                    m.error_message = Some(self.all_out(&format!(
+                        "{} account `{}`: {} ({wait}).",
                         self.provider,
                         self.accounts[i],
                         m.error_message.as_deref().unwrap_or("rate limited"),
-                        self.provider
-                    ));
+                    )));
                 }
                 forwarded = true;
                 if tx.send(ev).await.is_err() {
@@ -465,7 +526,13 @@ mod tests {
                 kind: ErrorKind::QuotaExhausted
             }
         );
-        assert!(m.error_message.unwrap().contains("account `default`"));
+        let e = m.error_message.unwrap();
+        assert!(e.contains("account `default`"), "{e}");
+        assert!(
+            e.starts_with("‼ All 2 sub accounts are out: switch to another provider with /model\n"),
+            "{e}"
+        );
+        assert!(e.contains("- `work`: resets in 1m"), "{e}");
         assert!(
             p.auth.exhausted_until("sub", "default").is_some(),
             "the last account is marked too"

@@ -211,7 +211,7 @@ novacode packages install
 
 ## Which one wins
 
-A package never overrides your own files. For skills, prompts and agents, the first folder with a name wins: your project's `.novacode/`, the project's `.claude/`, `~/.novacode/`, `~/.claude/`, `~/.agents/skills` (skills only), and last the packages. Project packages come before your global packages. [Skills](skills.md#where-skills-are-found) has the full order.
+A package never overrides your own files. For skills, prompts and agents, the first folder with a name wins: your project's `.novacode/`, the project's `.claude/`, `~/.novacode/`, `~/.claude/`, `~/.agents/skills` (skills only), and last the packages. Project packages come before your global packages, and a package installed in both places loads once, from the project (its hooks and skills don't run twice). [Skills](skills.md#where-skills-are-found) has the full order.
 
 A package's skill, prompt or agent whose name is already taken is not lost: it loads as `<package>:<name>`. For example, if you have your own `retro` skill and install `mattpocock/skills`, its skill is `/skill:skills:retro`. `novacode doctor` lists every clash and the name it loads under. Extension files that clash are settled by order alone: your project, then `~/.novacode`, then packages.
 

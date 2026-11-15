@@ -415,11 +415,7 @@ impl Transcript {
     /// The agent's own note (a schedule firing, a subagent report, a cache miss): it
     /// folds with the steps even when it arrives after the turn ended.
     pub fn agent_notice(&mut self, text: impl Into<String>) {
-        self.turn().items.push(Item::Notice {
-            text: text.into(),
-            error: false,
-            folds: true,
-        });
+        push_notice(&mut self.turn().items, text.into(), false, true);
     }
 
     /// A run with no new prompt (a schedule or subagent woke the agent) goes on in the
@@ -732,11 +728,7 @@ impl Transcript {
                     }));
                 }
                 if let Some(e) = &a.error_message {
-                    turn.items.push(Item::Notice {
-                        text: e.clone(),
-                        error: true,
-                        folds: false,
-                    });
+                    push_notice(&mut turn.items, e.clone(), true, false);
                 }
             }
             Message::ToolResult {
@@ -1861,6 +1853,27 @@ fn reminder_line(text: &str) -> Option<String> {
 }
 
 /// `━━ text ━━…` exactly `width` cells wide; a long text is cut with `…`.
+/// A notice; one starting with [`novacode_types::HEADLINE`] puts its first line in a
+/// divider that stays in view (an account switch, every account out), the rest below.
+fn push_notice(items: &mut Vec<Item>, text: String, error: bool, folds: bool) {
+    let Some(rest) = text.strip_prefix(novacode_types::HEADLINE) else {
+        items.push(Item::Notice { text, error, folds });
+        return;
+    };
+    let (head, body) = rest.split_once('\n').unwrap_or((rest, ""));
+    items.push(Item::Divider {
+        text: head.to_string(),
+        error,
+    });
+    if !body.trim().is_empty() {
+        items.push(Item::Notice {
+            text: body.to_string(),
+            error,
+            folds: false,
+        });
+    }
+}
+
 fn divider(text: &str, error: bool, width: usize, t: &Theme) -> Line<'static> {
     if width == 0 {
         return Line::default();
@@ -1876,6 +1889,19 @@ fn divider(text: &str, error: bool, width: usize, t: &Theme) -> Line<'static> {
 #[cfg(test)]
 mod reminder_tests {
     use super::reminder_line;
+
+    #[test]
+    fn a_headline_notice_gets_a_divider_that_stays_in_view() {
+        let mut tr = super::Transcript::default();
+        tr.agent_notice("‼ claude: switched to account `work`\nclaude account `default` is exhausted");
+        tr.agent_notice("plain");
+        let items = &tr.turns[0].items;
+        assert!(
+            matches!(&items[0], super::Item::Divider { text, error: false } if text == "claude: switched to account `work`")
+        );
+        assert!(matches!(&items[1], super::Item::Notice { text, folds: false, .. } if text.contains("exhausted")));
+        assert!(matches!(&items[2], super::Item::Notice { text, folds: true, .. } if text == "plain"));
+    }
 
     #[test]
     fn a_process_end_rewrites_its_start_line() {

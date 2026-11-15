@@ -297,6 +297,10 @@ pub enum BlockKind {
 /// Streamed by an adapter for one model call (L1.4). Consumers build their own
 /// view from deltas; the finished message comes once in `Done`/`Error`.
 /// Tagged `stream` (not `type`) so it nests inside `AgentEvent::Stream` on the wire.
+/// A notice or error message starting with this shows its first line as a full-width
+/// headline that never folds (an account switch, every account of a provider out).
+pub const HEADLINE: &str = "‼ ";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "stream", rename_all = "snake_case")]
 pub enum StreamEvent {

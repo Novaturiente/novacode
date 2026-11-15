@@ -16,6 +16,10 @@ pub enum CacheRetention {
     Short,
     /// Long TTL where offered (Anthropic: 1 hour).
     Long,
+    /// Short, but only the system prompt and tools are marked: for one-off requests
+    /// whose messages differ every call (memory workers), where a marker on them is
+    /// a cache write never read.
+    SystemOnly,
 }
 
 /// Everything an adapter needs for one model call.

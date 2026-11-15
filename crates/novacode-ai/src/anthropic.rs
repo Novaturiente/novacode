@@ -413,7 +413,7 @@ impl Adapter for Anthropic {
         let budget = thinking_style(&req.model) == ThinkingStyle::Budget
             && req.thinking.is_some_and(|l| l != ThinkingLevel::Off);
         (!budget).then_some(std::time::Duration::from_secs(match req.cache {
-            CacheRetention::Short => 300,
+            CacheRetention::Short | CacheRetention::SystemOnly => 300,
             CacheRetention::Long => 3600,
         }))
     }
@@ -823,7 +823,7 @@ pub fn build_body(req: &Request, oauth: Option<&OAuthProfile>, ns: &str) -> Valu
         },
     );
     let cache = match req.cache {
-        CacheRetention::Short => json!({ "type": "ephemeral" }),
+        CacheRetention::Short | CacheRetention::SystemOnly => json!({ "type": "ephemeral" }),
         CacheRetention::Long => json!({ "type": "ephemeral", "ttl": "1h" }),
     };
     let mut system: Vec<Value> = Vec::new();
@@ -849,7 +849,11 @@ pub fn build_body(req: &Request, oauth: Option<&OAuthProfile>, ns: &str) -> Valu
         .iter()
         .map(|t| json!({ "name": t.name, "description": t.description, "input_schema": t.schema }))
         .collect();
-    place_cache_markers(&mut system, &mut messages, &cache);
+    let marked: &mut [Value] = match req.cache {
+        CacheRetention::SystemOnly => &mut [],
+        _ => &mut messages,
+    };
+    place_cache_markers(&mut system, marked, &cache);
     // Per-request text goes after the last marker: into the last user turn, else a new one.
     if !req.tail.is_empty() {
         let block = json!({ "type": "text", "text": crate::adapter::tail_text(&req.tail) });
@@ -1503,6 +1507,15 @@ mod tests {
                 .starts_with("x-anthropic-billing-header: cc_version=")
         );
         assert_eq!(sys[1]["cache_control"], json!({"type": "ephemeral", "ttl": "1h"}));
+    }
+
+    #[test]
+    fn system_only_marks_no_message() {
+        let mut r = req(vec![Message::System { text: "prompt".into() }, Message::user("hi")]);
+        r.cache = CacheRetention::SystemOnly;
+        let body = build_body(&r, None, PROVIDER);
+        assert_eq!(body["system"][0]["cache_control"], json!({"type": "ephemeral"}));
+        assert!(!body["messages"].to_string().contains("cache_control"), "{body}");
     }
 
     #[test]

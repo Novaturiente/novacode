@@ -547,7 +547,8 @@ fn best_tag<'a>(tags: impl Iterator<Item = &'a str>) -> Option<String> {
 }
 
 /// Packages that load in this session, in precedence order: a trusted project's
-/// first, then the user's. Disabled ones are left out (see [`problems`]).
+/// first, then the user's. Disabled ones are left out (see [`problems`]); a name
+/// installed in both loads once, the project's copy (else its hooks run twice).
 pub fn enabled(home: &Path, cwd: &Path, trusted: bool) -> Vec<Package> {
     let mut v = Vec::new();
     if trusted {
@@ -555,6 +556,8 @@ pub fn enabled(home: &Path, cwd: &Path, trusted: bool) -> Vec<Package> {
     }
     v.extend(Store::global(home).list());
     v.retain(|p| p.disabled.is_none());
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|p| seen.insert(p.name.clone()));
     v
 }
 
@@ -1030,5 +1033,13 @@ mod tests {
                 .any(|p| p.name == "team"),
             "untrusted: not loaded"
         );
+        // The same name installed globally too: loads once, the project's copy.
+        install("team", mk("team", None)).await;
+        let team: Vec<Package> = enabled(home.path(), proj.path(), true)
+            .into_iter()
+            .filter(|p| p.name == "team")
+            .collect();
+        assert_eq!(team.len(), 1, "one copy");
+        assert!(team[0].dir.starts_with(proj.path()), "{:?}", team[0].dir);
     }
 }

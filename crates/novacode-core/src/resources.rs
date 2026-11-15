@@ -333,19 +333,27 @@ pub fn render_skills(skills: &[Skill]) -> String {
     let mut s = String::from(
         "Skills: specialized instructions for specific tasks. When a task matches one, activate it first with the `skill` tool (it applies the skill's tool rules), or read its file: `<folder>/<name>/SKILL.md`, or the path in brackets. Resolve relative paths in it against the skill's own folder.",
     );
+    let mut rows: Vec<(&Skill, bool, Option<&Path>)> = listed
+        .into_iter()
+        .map(|k| {
+            // `<folder>/<name>/SKILL.md` is implied; anything else shows its path.
+            let implied = k.path.file_name().is_some_and(|f| f == "SKILL.md")
+                && k.path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|d| d.to_string_lossy() == k.name);
+            let group = if implied {
+                k.path.parent().and_then(Path::parent)
+            } else {
+                k.path.parent()
+            };
+            (k, implied, group)
+        })
+        .collect();
+    // Stable: name order within a folder, each folder header once.
+    rows.sort_by_key(|r| r.2);
     let mut folder: Option<&Path> = None;
-    for k in listed {
-        // `<folder>/<name>/SKILL.md` is implied; anything else shows its path.
-        let implied = k.path.file_name().is_some_and(|f| f == "SKILL.md")
-            && k.path
-                .parent()
-                .and_then(Path::file_name)
-                .is_some_and(|d| d.to_string_lossy() == k.name);
-        let group = if implied {
-            k.path.parent().and_then(Path::parent)
-        } else {
-            k.path.parent()
-        };
+    for (k, implied, group) in rows {
         if group != folder {
             folder = group;
             s.push_str(&format!("\n{}/", group.map(show).unwrap_or_default()));
@@ -666,6 +674,16 @@ mod tests {
                 && cap(&"word ".repeat(100)).chars().count() <= DESCRIPTION_CAP + 1
         );
         assert!(!r.contains("secret"), "hidden skills aren't listed");
+        // Name-sorted skills from two folders, interleaved: each folder line once.
+        let sk = |dir: &str, name: &str| Skill {
+            name: name.into(),
+            description: "d".into(),
+            path: PathBuf::from(format!("/{dir}/{name}/SKILL.md")),
+            ..Default::default()
+        };
+        let r2 = render_skills(&[sk("x", "a"), sk("y", "b"), sk("x", "c"), sk("y", "d")]);
+        assert_eq!(r2.matches("\n/x/").count(), 1, "{r2}");
+        assert!(r2.contains("\n/x/\n- a: d\n- c: d\n/y/\n- b: d\n- d: d"), "{r2}");
         let x = expand("/skill:secret do it", &s, &[]);
         assert!(
             x.starts_with("<skill name=\"secret\"") && x.contains("\nS\n</skill>\n\ndo it"),

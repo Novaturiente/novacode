@@ -129,7 +129,7 @@ pub const WARM_THRESHOLD: f64 = 10_000.0;
 /// dollars, so one rule serves subscriptions and API keys.
 pub fn warm_saving(tokens: u64, retention: CacheRetention, chance: f64) -> f64 {
     let write = match retention {
-        CacheRetention::Short => 1.25,
+        CacheRetention::Short | CacheRetention::SystemOnly => 1.25,
         CacheRetention::Long => 2.0,
     };
     let t = tokens as f64;

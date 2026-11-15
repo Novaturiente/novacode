@@ -2082,6 +2082,11 @@ impl Ctx {
             agent = agent.with_mcp(h);
         }
         // Command hooks (L7.1), then extension handlers; none inside a hook's own novacode (recursion guard).
+        if carry.as_ref().is_none_or(|c| c.processes.is_none()) {
+            let pm =
+                novacode_tools::process::ProcessManager::new(&self.paths.home().join("processes"), agent.store.id());
+            agent = agent.with_processes(pm);
+        }
         // File claims first (L10.1): two agents of one tree never edit the same file.
         let mut handlers: Vec<Arc<dyn novacode_core::hooks::Handler>> = vec![
             Arc::new(agents::Claims::new(
@@ -2092,6 +2097,9 @@ impl Ctx {
             )),
             Arc::new(novacode_core::hooks::BashWrites),
         ];
+        if let Some(pm) = agent.processes() {
+            handlers.push(Arc::new(novacode_core::hooks::BashSleep(pm.clone())));
+        }
         #[cfg(feature = "super")]
         if let Some((_, proof)) = &task {
             handlers.push(proof.clone());
@@ -2125,11 +2133,6 @@ impl Ctx {
             && let Some(repo) = novacode_core::checkpoint::resolve(&self.cwd, self.paths.home())
         {
             agent = agent.with_checkpoints(repo);
-        }
-        if carry.as_ref().is_none_or(|c| c.processes.is_none()) {
-            let pm =
-                novacode_tools::process::ProcessManager::new(&self.paths.home().join("processes"), agent.store.id());
-            agent = agent.with_processes(pm);
         }
         {
             let mut m = novacode_core::memory::Settings::for_window(window);
@@ -2166,6 +2169,9 @@ impl Ctx {
                 ));
             }
             match worker {
+                // A subagent's notes went unused (it ends before compacting) and its
+                // reflections flooded project memory: compaction only.
+                _ if def.is_some() => agent = agent.with_memory(session_worker, m).without_observer(),
                 Some(w) => {
                     agent = agent.with_memory(w, m);
                     if let Some(m) = memories {

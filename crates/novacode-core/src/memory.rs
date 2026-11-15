@@ -72,7 +72,7 @@ impl novacode_tools::read::Delegate for Worker {
                 ],
                 tools: vec![],
                 max_tokens: 4096,
-                cache: CacheRetention::Short,
+                cache: CacheRetention::SystemOnly,
                 thinking: None,
                 images: false,
                 session: None,
@@ -335,8 +335,8 @@ pub fn parse_notes(args: &Value, c: &Chunk, known: &[Note]) -> Vec<Note> {
     out
 }
 
-/// One observer call. The system prompt is fixed and existing notes only grow
-/// at the end between calls, so the worker's own prefix stays cacheable.
+/// One observer call. Only the fixed system prompt is cached: the notes block grows
+/// and the chunk is new every call, so a marker on them was a write never read.
 const CUT_OFF: &str = "reply hit the output token limit";
 
 pub async fn observe(w: &Worker, known: &[Note], c: &Chunk, session: &str) -> Result<(Vec<Note>, Usage), String> {
@@ -361,7 +361,7 @@ pub async fn observe(w: &Worker, known: &[Note], c: &Chunk, session: &str) -> Re
         ],
         tools: vec![record_tool()],
         max_tokens: 8192,
-        cache: CacheRetention::Short,
+        cache: CacheRetention::SystemOnly,
         thinking: None,
         images: false,
         session: Some(format!("{session}-memory")),
@@ -702,7 +702,7 @@ async fn ask(
         ],
         tools: vec![tool],
         max_tokens: 8192,
-        cache: CacheRetention::Short,
+        cache: CacheRetention::SystemOnly,
         thinking: None,
         images: false,
         session: Some(format!("{session}-memory")),
@@ -840,7 +840,7 @@ pub async fn summarize(
         ],
         tools: vec![],
         max_tokens: 8192,
-        cache: CacheRetention::Short,
+        cache: CacheRetention::SystemOnly,
         thinking: None,
         images: false,
         session: Some(format!("{session}-summary")),
