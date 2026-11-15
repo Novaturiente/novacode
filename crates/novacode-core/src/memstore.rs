@@ -1,7 +1,7 @@
 //! Cross-session memory (L10.4): SQLite + FTS5, one global database and one
 //! per project under `<home>/memory/`. Written by the model (`memory remember`)
-//! and by the observer's reflections; read through `memory search` and a short
-//! index written once at session start (never injected per turn).
+//! and by the observer's lasting reflections; read through `memory search`, a short
+//! index written once at session start, and [`Memories::recall`] after each prompt.
 
 use futures_util::future::BoxFuture;
 use novacode_tools::{Tool, ToolCtx, ToolOutput};
@@ -92,6 +92,43 @@ fn now_ms() -> i64 {
     crate::session::now_ms() as i64
 }
 
+/// Unpinned items a database keeps; past it, each new item evicts the least used one.
+const CAP: i64 = 500;
+
+/// Word overlap at which a new reflection counts as one already saved.
+const NEAR: f64 = 0.6;
+
+/// Words too common to say what a prompt is about.
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "with", "that", "this", "from", "what", "have", "are", "was", "were", "can", "you", "your",
+    "our", "how", "why", "now", "then", "all", "any", "but", "not", "use", "into", "need", "want", "should", "would",
+    "could", "make", "there", "they", "them", "will", "just", "also", "about", "when", "where", "which", "while",
+    "each", "more", "some", "only", "does", "did", "done", "let", "lets", "see", "get", "got", "please", "proceed",
+    "yes", "okay", "look", "check", "show", "its", "it's", "has", "had",
+];
+
+/// The words of `text` worth matching on: lowercased, 3+ characters, no stopwords.
+fn terms(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        let w = w.to_lowercase();
+        if w.chars().count() >= 3 && !STOPWORDS.contains(&w.as_str()) && !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// Same words, mostly (Jaccard of the word sets, 0..1).
+fn overlap(a: &str, b: &str) -> f64 {
+    let (a, b) = (terms(a), terms(b));
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let both = a.iter().filter(|w| b.contains(w)).count() as f64;
+    both / ((a.len() + b.len()) as f64 - both)
+}
+
 impl Memories {
     pub fn open(home: &Path, cwd: &Path) -> Self {
         let root = project_root(cwd);
@@ -103,11 +140,20 @@ impl Memories {
         }
     }
 
-    fn conn(&self, scope: Scope) -> rusqlite::Result<Connection> {
-        let path = match scope {
+    fn path(&self, scope: Scope) -> &Path {
+        match scope {
             Scope::Project => &self.project,
             Scope::Global => &self.global,
-        };
+        }
+    }
+
+    /// For reading: `None` when nothing was ever saved there (no empty file made).
+    fn read_conn(&self, scope: Scope) -> Option<Connection> {
+        self.path(scope).is_file().then(|| self.conn(scope).ok()).flatten()
+    }
+
+    fn conn(&self, scope: Scope) -> rusqlite::Result<Connection> {
+        let path = self.path(scope);
         if let Some(d) = path.parent() {
             let _ = std::fs::create_dir_all(d);
         }
@@ -123,7 +169,9 @@ impl Memories {
         Ok(c)
     }
 
-    /// Save `text`; the same text again (case and spacing aside) refreshes it instead.
+    /// Save `text`; the same text again (case and spacing aside) refreshes it instead,
+    /// and so does a `reflection` with mostly the same words as a saved item. Past
+    /// [`CAP`] unpinned items, the least used one makes room.
     pub fn remember(
         &self,
         scope: Scope,
@@ -138,7 +186,10 @@ impl Memories {
         let same: Option<i64> = {
             let mut st = c.prepare("SELECT id, text FROM items")?;
             let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
-            rows.flatten().find(|(_, t)| norm(t) == norm(text)).map(|(id, _)| id)
+            let near = kind == "reflection";
+            rows.flatten()
+                .find(|(_, t)| norm(t) == norm(text) || (near && overlap(t, text) >= NEAR))
+                .map(|(id, _)| id)
         };
         let id = match same {
             Some(id) => {
@@ -153,7 +204,15 @@ impl Memories {
                     "INSERT INTO items(text, kind, pinned, created_ms, source) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![text, kind, pinned as i64, now_ms(), source],
                 )?;
-                c.last_insert_rowid()
+                let id = c.last_insert_rowid();
+                // One in, one out: a store over the cap stays its size (a cleanup shrinks it).
+                c.execute(
+                    "DELETE FROM items WHERE id = (SELECT id FROM items WHERE pinned = 0 AND id != ?1 \
+                     AND (SELECT count(*) FROM items WHERE pinned = 0) > ?2 \
+                     ORDER BY hits > 0, max(used_ms, created_ms), id LIMIT 1)",
+                    params![id, CAP],
+                )?;
+                id
             }
         };
         Ok(format!("{}{id}", scope.prefix()))
@@ -163,16 +222,71 @@ impl Memories {
         let Some((scope, n)) = parse_id(id) else {
             return Ok(false);
         };
-        Ok(self.conn(scope)?.execute("DELETE FROM items WHERE id = ?1", [n])? > 0)
+        let Some(c) = self.read_conn(scope) else {
+            return Ok(false);
+        };
+        Ok(c.execute("DELETE FROM items WHERE id = ?1", [n])? > 0)
     }
 
     /// Best matches of both databases (bm25), project first on a tie; counts a hit on each.
     pub fn search(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<Item>> {
-        // Any word may match: quoted, so FTS syntax in the query can't break it.
-        let q = query
+        let words: Vec<String> = query
             .split(|c: char| !c.is_alphanumeric() && c != '_')
             .filter(|w| w.len() > 1)
-            .map(|w| format!("\"{w}\""))
+            .map(str::to_string)
+            .collect();
+        let found = self.matches(&words, limit, false)?;
+        self.hit(&found)?;
+        Ok(found)
+    }
+
+    /// Saved items that match `prompt` on at least two of its words (one for a
+    /// one-word prompt), best first, leaving out `seen` ids; counts a hit on each.
+    /// A word matches as a prefix (`deploy` finds `deploys`), plural `s` dropped.
+    pub fn recall(&self, prompt: &str, limit: usize, seen: &[String]) -> rusqlite::Result<Vec<Item>> {
+        let words: Vec<String> = terms(prompt)
+            .into_iter()
+            .map(|w| match w.strip_suffix('s') {
+                Some(stem) if stem.chars().count() >= 4 => stem.to_string(),
+                _ => w,
+            })
+            .collect();
+        let need = words.len().min(2);
+        let found: Vec<Item> = self
+            .matches(&words, limit * 4, true)?
+            .into_iter()
+            .filter(|i| !seen.contains(&i.id))
+            .filter(|i| {
+                let have = terms(&i.text);
+                need > 0 && words.iter().filter(|w| have.iter().any(|h| h.starts_with(*w))).count() >= need
+            })
+            .take(limit)
+            .collect();
+        self.hit(&found)?;
+        Ok(found)
+    }
+
+    fn hit(&self, items: &[Item]) -> rusqlite::Result<()> {
+        for it in items {
+            if let Some((scope, n)) = parse_id(&it.id)
+                && let Some(c) = self.read_conn(scope)
+            {
+                c.execute(
+                    "UPDATE items SET hits = hits + 1, used_ms = ?2 WHERE id = ?1",
+                    params![n, now_ms()],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Items matching any of `words` (bm25 over both databases), best first.
+    fn matches(&self, words: &[String], limit: usize, prefix: bool) -> rusqlite::Result<Vec<Item>> {
+        // Quoted, so FTS syntax in the query can't break it.
+        let star = if prefix { "*" } else { "" };
+        let q = words
+            .iter()
+            .map(|w| format!("\"{}\"{star}", w.replace('"', "")))
             .collect::<Vec<_>>()
             .join(" OR ");
         if q.is_empty() {
@@ -180,7 +294,7 @@ impl Memories {
         }
         let mut hits: Vec<(f64, Item)> = Vec::new();
         for scope in [Scope::Project, Scope::Global] {
-            let c = self.conn(scope)?;
+            let Some(c) = self.read_conn(scope) else { continue };
             let mut st = c.prepare(
                 "SELECT items.id, items.text, items.kind, items.pinned, bm25(items_fts) \
                  FROM items_fts JOIN items ON items.id = items_fts.rowid \
@@ -197,16 +311,7 @@ impl Memories {
                     },
                 ))
             })?;
-            let found: Vec<(f64, Item)> = rows.flatten().collect();
-            for (_, it) in &found {
-                if let Some((_, n)) = parse_id(&it.id) {
-                    c.execute(
-                        "UPDATE items SET hits = hits + 1, used_ms = ?2 WHERE id = ?1",
-                        params![n, now_ms()],
-                    )?;
-                }
-            }
-            hits.extend(found);
+            hits.extend(rows.flatten());
         }
         // bm25: lower is better. Stable sort keeps project ahead on a tie.
         hits.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -218,7 +323,7 @@ impl Memories {
     pub fn index(&self, max_items: usize, max_chars: usize) -> String {
         let mut items = Vec::new();
         for scope in [Scope::Project, Scope::Global] {
-            let Ok(c) = self.conn(scope) else { continue };
+            let Some(c) = self.read_conn(scope) else { continue };
             let Ok(mut st) =
                 c.prepare("SELECT id, text FROM items ORDER BY pinned DESC, hits DESC, created_ms DESC LIMIT ?1")
             else {
@@ -253,13 +358,13 @@ impl Memories {
     }
 
     pub fn count(&self, scope: Scope) -> usize {
-        self.conn(scope)
+        self.read_conn(scope)
             .and_then(|c| {
                 c.query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))
                     .optional()
+                    .ok()
+                    .flatten()
             })
-            .ok()
-            .flatten()
             .unwrap_or(0) as usize
     }
 }
@@ -424,5 +529,106 @@ mod tests {
             1,
             "persists"
         );
+    }
+
+    #[test]
+    fn reading_makes_no_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = Memories::open(tmp.path(), tmp.path());
+        assert_eq!(m.index(10, 2000), "");
+        assert!(m.search("anything at all", 5).unwrap().is_empty());
+        assert!(m.recall("deploy the site", 5, &[]).unwrap().is_empty());
+        assert!(!m.forget("p1").unwrap());
+        assert_eq!(m.count(Scope::Project), 0);
+        assert!(!tmp.path().join("memory").exists(), "no empty files");
+    }
+
+    #[test]
+    fn recall_matches_the_prompt_and_counts_hits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = Memories::open(tmp.path(), tmp.path());
+        let deploy = m
+            .remember(
+                Scope::Project,
+                "Pushing to main deploys production; wait for the user's go-ahead.",
+                "reflection",
+                false,
+                "s",
+            )
+            .unwrap();
+        m.remember(
+            Scope::Project,
+            "The main menu lives in src/nav.ts.",
+            "reflection",
+            false,
+            "s",
+        )
+        .unwrap();
+        let got = m.recall("Please deploy this to production", 5, &[]).unwrap();
+        assert_eq!(got.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), [deploy.as_str()]);
+        assert!(
+            m.recall("deploy production", 5, std::slice::from_ref(&deploy))
+                .unwrap()
+                .is_empty(),
+            "seen ids skipped"
+        );
+        assert!(m.recall("what about main", 5, &[]).unwrap().len() <= 2);
+        assert!(m.recall("the and for", 5, &[]).unwrap().is_empty(), "only stopwords");
+        // Hits rank the index: the recalled item comes first.
+        assert!(
+            m.index(1, 2000).contains(&format!("[{deploy}]")),
+            "{}",
+            m.index(1, 2000)
+        );
+    }
+
+    #[test]
+    fn near_duplicate_reflections_and_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = Memories::open(tmp.path(), tmp.path());
+        let a = m
+            .remember(
+                Scope::Project,
+                "Tests run with cargo nextest in the workspace root, never cargo test.",
+                "reflection",
+                false,
+                "s",
+            )
+            .unwrap();
+        let b = m
+            .remember(
+                Scope::Project,
+                "Tests run with cargo nextest in the workspace root, not cargo test.",
+                "reflection",
+                false,
+                "s",
+            )
+            .unwrap();
+        assert_eq!(a, b, "a reworded reflection refreshes the saved one");
+        let c = m
+            .remember(
+                Scope::Project,
+                "Tests run with cargo nextest in the workspace root, not cargo test.",
+                "fact",
+                false,
+                "s",
+            )
+            .unwrap();
+        assert_ne!(a, c, "the model's own facts merge only on the same text");
+        let pinned = m.remember(Scope::Project, "pinned rule", "fact", true, "s").unwrap();
+        for i in 0..CAP + 5 {
+            m.remember(Scope::Project, &format!("filler number {i} zz{i}"), "fact", false, "s")
+                .unwrap();
+        }
+        let c = m.read_conn(Scope::Project).unwrap();
+        let unpinned: i64 = c
+            .query_row("SELECT count(*) FROM items WHERE pinned = 0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(unpinned, CAP, "held at the cap");
+        assert!(
+            m.search("pinned rule", 5).unwrap().iter().any(|i| i.id == pinned),
+            "pinned never evicted"
+        );
+        assert!(m.search("zz0", 5).unwrap().is_empty(), "the oldest unused went first");
     }
 }

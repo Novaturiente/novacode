@@ -565,6 +565,10 @@ pub struct Reflection {
     pub content: String,
     /// Note ids whose meaning this reflection preserves.
     pub supports: Vec<String>,
+    /// A later session on this project needs it (saved to project memory), not
+    /// only this task.
+    #[serde(default)]
+    pub lasting: bool,
 }
 
 pub const REFLECTOR_PROMPT: &str = "You are the reflector for a coding agent's memory. You get the lasting facts already distilled (reflections) and the active notes. Distil NEW lasting facts with the record_reflections tool: user preferences, constraints and corrections; decisions and their reasons; finished outcomes that must not be redone; long-lived blockers; project goals and invariants.
@@ -573,7 +577,8 @@ pub const REFLECTOR_PROMPT: &str = "You are the reflector for a coding agent's m
 - Leave working state, files inspected, commands run and failed attempts as notes.
 - Don't reword existing reflections.
 - content: one line of plain prose, leading with the fact, keeping exact names, paths and reasons.
-- supports: ids of the notes whose meaning the reflection fully keeps. Only those: a later step may drop the notes you list.";
+- supports: ids of the notes whose meaning the reflection fully keeps. Only those: a later step may drop the notes you list.
+- lasting: true only when a future session on this project, with a different task, needs the fact: a user preference or rule, a decision and its reason, how the project or its tools work. false for this task's progress, outcomes, file sizes, dates written, and anything a fresh look at the code would show.";
 
 pub const DROPPER_PROMPT: &str = "You prune a coding agent's memory. You get the reflections and the active notes, each note marked with how many reflections cite it. Propose notes to drop with the drop_notes tool. The default is KEEP; when unsure, keep.
 
@@ -587,8 +592,9 @@ fn reflect_tool() -> ToolDef {
             "type": "object",
             "properties": {"reflections": {"type": "array", "items": {"type": "object", "properties": {
                 "content": {"type": "string"},
-                "supports": {"type": "array", "items": {"type": "string"}}
-            }, "required": ["content", "supports"]}}},
+                "supports": {"type": "array", "items": {"type": "string"}},
+                "lasting": {"type": "boolean"}
+            }, "required": ["content", "supports", "lasting"]}}},
             "required": ["reflections"]
         }),
     }
@@ -774,7 +780,13 @@ pub async fn reflect(
             if content.is_empty() || supports.is_empty() || refl.iter().chain(&out).any(|x| x.id == id) {
                 continue;
             }
-            out.push(Reflection { id, content, supports });
+            let lasting = r["lasting"].as_bool().unwrap_or(false);
+            out.push(Reflection {
+                id,
+                content,
+                supports,
+                lasting,
+            });
         }
     }
     Ok((out, usage))

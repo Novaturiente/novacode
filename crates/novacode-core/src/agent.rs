@@ -991,8 +991,9 @@ impl Agent {
                     .entries
                     .iter()
                     .filter_map(|e| match e {
+                        // Only what a later session needs; this task's progress stays here.
                         EntryKind::Reflections { reflections, .. } => {
-                            Some(reflections.iter().map(|r| r.content.clone()))
+                            Some(reflections.iter().filter(|r| r.lasting).map(|r| r.content.clone()))
                         }
                         _ => None,
                     })
@@ -1424,6 +1425,49 @@ impl Agent {
         self
     }
 
+    /// Saved memories that match a user prompt (L10.4), as a note for after it; ones
+    /// an earlier note of this session gave are left out. Local FTS, no model call.
+    async fn recall(&self, content: &[Block]) -> Option<String> {
+        let store = self.memory.as_ref()?.store.clone()?;
+        let prompt: String = content
+            .iter()
+            .filter_map(|b| match b {
+                Block::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let seen: Vec<String> = self
+            .store
+            .branch()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::CustomMessage { kind, text, .. } if kind == "memory" => Some(text.clone()),
+                _ => None,
+            })
+            .flat_map(|t| {
+                t.lines()
+                    .filter_map(|l| Some(l.strip_prefix("- [")?.split_once(']')?.0.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let found = tokio::task::spawn_blocking(move || store.recall(&prompt, 5, &seen))
+            .await
+            .ok()?
+            .inspect_err(|e| tracing::warn!(%e, "memory recall"))
+            .ok()?;
+        (!found.is_empty()).then(|| {
+            let lines: Vec<String> = found
+                .iter()
+                .map(|i| format!("- [{}] {}", i.id, i.text.chars().take(300).collect::<String>()))
+                .collect();
+            format!(
+                "Saved memories that may matter for this prompt (from earlier sessions; they can be stale, so check before relying on one):\n{}",
+                lines.join("\n")
+            )
+        })
+    }
+
     /// Run `SessionStart` (`SubagentStart` in a subagent) and save what it says for the model.
     async fn plugin_context(&mut self, source: &str) {
         let Some(p) = &self.plugins else { return };
@@ -1816,12 +1860,20 @@ impl Agent {
                     None => vec![],
                 };
                 added = true;
+                let recalled = self.recall(&content).await;
                 self.add(EntryKind::Message {
                     message: Message::User { content },
                 });
                 for text in extra {
                     self.add(EntryKind::CustomMessage {
                         kind: "hook".into(),
+                        text,
+                        display: false,
+                    });
+                }
+                if let Some(text) = recalled {
+                    self.add(EntryKind::CustomMessage {
+                        kind: "memory".into(),
                         text,
                         display: false,
                     });

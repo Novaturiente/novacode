@@ -2174,7 +2174,9 @@ impl Ctx {
                 _ if def.is_some() => agent = agent.with_memory(session_worker, m).without_observer(),
                 Some(w) => {
                     agent = agent.with_memory(w, m);
-                    if let Some(m) = memories {
+                    // Not in a temp folder: its reflections would fill a store no
+                    // later session reads (2,158 such stores on novahome).
+                    if let Some(m) = memories.filter(|_| !self.cwd.starts_with(std::env::temp_dir())) {
                         agent = agent.with_memory_store(m);
                     }
                 }

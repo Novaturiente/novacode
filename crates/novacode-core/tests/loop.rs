@@ -3159,3 +3159,55 @@ async fn todo_notes_come_back_unless_turned_off() {
     assert!(notes(false).await, "the note comes back by default");
     assert!(!notes(true).await, "no note when turned off");
 }
+
+/// L10.4: a prompt brings matching saved memories in after it, once per session.
+#[tokio::test]
+async fn saved_memories_matching_a_prompt_follow_it_once() {
+    use novacode_core::memory::{Settings, Worker};
+    use novacode_core::memstore::{Memories, Scope};
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let mem = Memories::open(home.path(), work.path());
+    mem.remember(
+        Scope::Project,
+        "Pushing to main deploys production; wait for the user's go-ahead.",
+        "reflection",
+        false,
+        "old",
+    )
+    .unwrap();
+    let main = Faux::new((0..2).map(|i| FauxReply::text(&format!("ok {i}"))));
+    let reqs = main.requests.clone();
+    let store = Store::create(&Paths::new(home.path()), work.path(), false);
+    let worker = Worker {
+        adapter: Arc::new(Faux::new(vec![])),
+        provider: "faux".into(),
+        model: "small".into(),
+    };
+    let settings = Settings {
+        observe_after: u64::MAX,
+        ..Settings::for_window(200_000)
+    };
+    let agent = Agent::new(
+        Arc::new(main),
+        vec![],
+        store,
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    )
+    .with_memory(worker, settings)
+    .with_memory_store(mem);
+    drive(agent, &["deploy this to production", "deploy production again"]).await;
+    let reqs = reqs.lock().unwrap();
+    let first = wire_messages(&reqs[0]).join("\n");
+    assert!(
+        first.contains("Saved memories that may matter") && first.contains("deploys production"),
+        "{first}"
+    );
+    let second = wire_messages(&reqs[1]).join("\n");
+    assert_eq!(
+        second.matches("deploys production").count(),
+        1,
+        "not given twice: {second}"
+    );
+}

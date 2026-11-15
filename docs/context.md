@@ -147,7 +147,11 @@ The model has a `memory` tool with three actions:
 | `search` | Find saved facts. |
 | `forget` | Delete one by id (`p12` is a project item, `g3` is a global one). |
 
-Project memories belong to the project (the main repo, so worktrees share them). Global memories apply everywhere. Lasting facts from the reflector are also saved as project memories.
+Project memories belong to the project (the main repo, so worktrees share them). Global memories apply everywhere. Reflector facts that it marks as lasting (a preference, a decision and its reason, how the project works; not this task's progress) are also saved as project memories. A reflector fact with mostly the same words as a saved one refreshes that one instead of adding a copy.
+
+After each prompt you send, novacode searches both stores for items that share at least two words with it (one for a one-word prompt; `deploy` also finds `deploys`) and adds up to 5 of them after the prompt as a note for the model. An item is given once per session. This is a local search, with no model call, and each item it gives counts as used.
+
+Each store keeps at most 500 unpinned items. Past that, each new item replaces the least used one (never used first, then the oldest). A session in a temporary folder (`/tmp`) saves no reflector facts and gets no per-prompt recall; the `memory` tool still works there. Reading memory never creates a file.
 
 At session start, novacode writes a short index of saved memories into the prompt. In each store, pinned items come first, then the most used, then the newest. Project items are listed before global ones. Each line is cut at 300 characters. It is written once and does not change during the session.
 
@@ -155,7 +159,7 @@ At session start, novacode writes a short index of saved memories into the promp
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `memory.store` | `true` | Turn cross-session memory and its index on or off. |
+| `memory.store` | `true` | Turn cross-session memory, its index and the per-prompt recall on or off. |
 | `memory.indexItems` | `15` | Most items in the start-of-session index. |
 | `memory.indexChars` | `2000` | Character cap for that index. |
 
