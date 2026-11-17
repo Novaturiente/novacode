@@ -2,7 +2,7 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
-## [Unreleased]
+## [0.11.0] - 2026-11-17
 
 ### Removed
 

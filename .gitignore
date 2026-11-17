@@ -1,4 +1,5 @@
 target/
+target-try/
 /Progress
 /AGENTS.md
 /.claude/skills/logo-designer
