@@ -17,7 +17,7 @@ This folder is the `novacode` binary crate. It holds the clap CLI, the print/JSO
   - `handle`/`handle_as`, `slash`, `ext_command`, `commands`, `user_shell`, `export`, `follow_account`.
   - `MODE_COMMANDS` lists the mode slash commands.
 - `hub.rs`: `Hub` is one live session shared by many windows.
-  - `start`, `connect`/`disconnect`, `set_board`, `state`, `history`, `stop`, `seed_ui`, `ui_log`.
+  - `start`, `connect`/`disconnect`, `state`, `history`, `stop`, `seed_ui`, `ui_log`.
   - `update`, `answer`/`answer_ask`, `close`, `set_focus`/`focused`.
   - `compactions` counts compaction entries.
   - `HubSlot` holds the hub, and `Dismiss` is the card-dismiss callback type.

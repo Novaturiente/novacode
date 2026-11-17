@@ -1,7 +1,7 @@
 # novacode-types/src
 
 ## Overview
-Plain data types shared by every novacode crate (layer L1). Everything lives in `lib.rs`. The crate does no I/O and holds no logic beyond small helpers. It defines the conversation model (messages, blocks, tool calls), the provider stream and agent event protocol, the extension UI protocol, token estimates, and the `ask_user` / `say` structured forms.
+Plain data types shared by every novacode crate (layer L1). Everything lives in `lib.rs`. The crate does no I/O and holds no logic beyond small helpers. It defines the conversation model (messages, blocks, tool calls), the provider stream and agent event protocol, the extension UI protocol, token estimates, and the `ask_user` structured forms.
 
 ## Interface
 - `Replay { provider, data }`: opaque provider data (thinking signatures, encrypted reasoning) kept byte-exact and sent back only to `provider`.
@@ -17,7 +17,7 @@ Plain data types shared by every novacode crate (layer L1). Everything lives in 
 - `BlockKind`, `StreamEvent` (provider streaming events), `AgentEvent` (session events the UI and extensions consume).
 - `mod ui`: extension UI protocol — `API_VERSION = 1`, `Seg`, `Line`, `Time`, `Node`, `UiOp` (with `slot(ext)`).
 - `mod estimate`: token estimates — `IMAGE_TOKENS = 1372`, `text()`, `message()`, `context()`.
-- Structured user interaction: `Question`, `Choice`, `Reply` (`ask_user`), and `Say`, `SaySection`, `SayQuestion`, `SayBlocker` (with `SayQuestion::paragraphs()`).
+- Structured user interaction: `Question`, `Choice`, `Reply` (`ask_user`).
 
 ## Invariants
 - `ToolResult.details` is UI-only and never sent to a model; `Custom` messages are harness-only and converted or dropped before sending.

@@ -20,7 +20,7 @@ normalisation.
   `LocalEnv`, `SandboxedEnv`, `FileState`.
 - `env.rs`: `ExecutionEnv` trait (`read`, `write`, `remove`, `stat`,
   `canonical`, `exec`, `sandbox`), `LocalEnv`, `SandboxedEnv`, `ExecSpec`,
-  `ExecResult`, `FileMeta`, `TASK_VARS`.
+  `ExecResult`, `FileMeta`.
 - `files.rs`: `FileState` (`lock`, `saw`, `check_stale`, `record`; stale-file
   guard), `FileGuard`.
 - `guard.rs`: `truncate`, `check_budget`, `estimate_tokens`, `Budget`,
@@ -31,7 +31,7 @@ normalisation.
   `todo::Todo`, `ask::AskUser`, `toolsearch::{ToolSearch, Call}`,
   `worktree::{EnterWorktree, ExitWorktree}`.
 - `process.rs`: `ProcessManager`, `Event`, `Info`, `End`, `Watch`,
-  `Attention`, `adopt`, `release`, `stop_inside`, `end_group`,
+  `Attention`, `adopt`, `release`,
   `kill_group_now`, `pid_alive`.
 - `sandbox.rs`: `Sandbox` (`new`, `mode`, `light`, `available`, `wraps`,
   `args`, `git_snapshot`, `hint`, …), `Config`, `Mode`, `command`, `hint_for`,

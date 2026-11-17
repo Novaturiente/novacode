@@ -12,7 +12,7 @@ Shared foundations (layer L0) used by the rest of novacode: home and project pat
 - `logging.rs` (L0.7): `init(&Paths, trace) -> std::io::Result<WorkerGuard>`.
 - `redact.rs` (L6.6): `Secrets`, `Redactor` (`new(source)`, `with_patterns(on)`, `apply(text) -> Option<String>`).
 - `git.rs` (L6.5): `command`, `bookkeeping`, `command_in(dir)`, `bookkeeping_in(dir)`, `pin(root, common_dir)`, `pin_repo(dir)`, `pinned(dir)`.
-- `platform.rs` (L11.14): `home`, `bash`, `sh`, `TASK_VARS`, `drop_task_vars`, `own_group`, `set_create_mode`, `set_mode`, `canonicalize`, `slash_path`, `link_dir`, `unlink_dir` (unix and Windows variants).
+- `platform.rs` (L11.14): `home`, `bash`, `sh`, `own_group`, `set_create_mode`, `set_mode`, `canonicalize`, `slash_path`, `link_dir`, `unlink_dir` (unix and Windows variants).
 
 ## Invariants
 - `write_atomic` replaces a file so readers see the old or new file, never a torn one, and keeps the old one as `<path>.bak`. Writes follow symlinks: the path is canonicalized, the symlink's target is replaced, and `.bak` sits next to the target (`read_json` looks for it there too). Use `write_atomic_no_backup` for user-owned files where `<path>.bak` may be the user's own.

@@ -11,8 +11,7 @@ Loop and session:
 - `agent.rs`: `Agent` (builder: `new`, `with_policy`, `with_hooks`, `with_mcp`, `with_extensions`, `with_memory`, `with_checkpoints`, `with_modes`, `with_approver`, `with_judge`, …, `run`, `compact`), `spawn(Agent) -> (SessionHandle, JoinHandle<Agent>)`, `SessionHandle` (`prompt`, `steer`, `remind`, `abort`, `subscribe`, `set_model`, `set_thinking`, `add_tools`, `side_question`, `rename`, `move_to`, `dequeue`, `compact`, `shutdown`, `prompts`, `context`, `prompt_content`, `steer_content`, `remind_as`), `Config`, `Switch`, `Carry`, `ContextReport`, `StateSaver`, `EVENT_BUFFER`.
 - `session.rs`: `Store`, `StoreError`, `Header`, `Entry`, `EntryKind`, `PromptNode`, `Summary`, `VERSION`, `dir_for`, `list`, `find`, `summary`, `recent_prompts`, `cleanup_old`, `cleanup_daily`, `now_ms`.
 - `pipeline.rs`: `Prepared`, `prepare`, `def`, `schema`, `authorize`, `authorize_cancellable`, `run`.
-- `prompt.rs`: `Sections`, `Sources`, `EnvState`, `build`, `render`, `diff`, `render_update`, `context_files`, `global_file`, `env_state`, `environment`, `reminder`, `DEFAULT_PREAMBLE`.
-- `context_window.rs`: `Builder`, `Plain`, `Quiet`, `StateFn`, `rebuild`.
+- `prompt.rs`: `Sections`, `Sources`, `EnvState`, `build`, `render`, `diff`, `render_update`, `context_files`, `env_state`, `environment`, `reminder`, `DEFAULT_PREAMBLE`.
 - `recovery.rs`: `Recovery`, `Nudge`.
 - `cache.rs`: `Sent`, `Miss`, `miss`, `human`, `warm_delay`, `return_chance`, `warm_saving`, `WARM_THRESHOLD`.
 - `checkpoint.rs`: `Repo`, `Snapshot`, `Rewound`, `resolve`, `snapshot`, `pre_image`, `rewind`, `undo`, `session_base`, `MAX_UNTRACKED`.
@@ -23,7 +22,7 @@ Loop and session:
 
 Safety:
 
-- `policy.rs`: `Policy`, `Mode` (`Auto`, `Ask`, `ReadOnly`), `Security`, `Permissions`, `Protected`, `Profile`, `Rule`, `Verdict`, `HookDecision`, `ApprovalRequest`, `Approval`, trait `Approver`, `Overlay`, `EditRule` (+ `ENV`).
+- `policy.rs`: `Policy`, `Mode` (`Auto`, `Ask`, `ReadOnly`), `Security`, `Permissions`, `Protected`, `Profile`, `Rule`, `Verdict`, `HookDecision`, `ApprovalRequest`, `Approval`, trait `Approver`, `Overlay`.
 - `risk.rs`: `classify`, `Risk`, `Level` (`Safe`, `Low`, `Confirm`, `Shared`, `Catastrophic`), `Ctx`, `segments`, `nested`, `programs`, `credential_dirs`, `protected_path`.
 - `judge.rs`: `Judge`, `Decision`, `Answer`, `Subject`, `Seen`, `needs_judge`, `approves`, `parse`, `prompt`, `TIMEOUT`, `MAX_COMMAND`.
 - `trust.rs`: `TrustStore`, `State`, `Fingerprint`, `resolve`, `fingerprint`, `has_project_config`, `path_key`, `fnv_hex`.
