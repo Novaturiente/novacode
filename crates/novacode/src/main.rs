@@ -9,7 +9,7 @@ use novacode_ai::trace::Trace;
 use novacode_base::redact::Redactor;
 use novacode_base::{logging, new_id, paths::Paths, settings, settings::Settings};
 use novacode_core::agent::{self, Agent, Config};
-use novacode_core::policy::{Approver, EditRule, Mode, Permissions, Policy, Security};
+use novacode_core::policy::{Approver, Mode, Permissions, Policy, Security};
 use novacode_core::resources;
 use novacode_core::session::{self, Store};
 use novacode_core::trust::{self, TrustStore};
@@ -44,9 +44,6 @@ mod schedule;
 mod serve;
 mod stats;
 mod status;
-// Super mode (L10.9): compiled only with `--features super` (DECISIONS 2026-11-10).
-#[cfg(feature = "super")]
-mod superagent;
 mod update;
 mod updates;
 mod usage;
@@ -126,22 +123,6 @@ struct Cli {
     /// Run in the background with no window; prints the session id. Attach with `novacode attach`.
     #[arg(long, value_name = "PROMPT", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["print", "rpc"])]
     bg: Option<String>,
-    /// Start (or reattach to) the super agent for this folder: one session that runs your tasks.
-    #[cfg(feature = "super")]
-    #[arg(long = "super", conflicts_with_all = ["print", "rpc", "bg", "resume", "continue", "worktree", "mode", "profile", "trust", "no_session", "agent", "tools", "mcp", "initial", "profile_startup"])]
-    super_: bool,
-    /// The detached super process itself (set by the `--super` launcher).
-    #[cfg(feature = "super")]
-    #[arg(long, hide = true, requires = "super_")]
-    super_serve: bool,
-    /// `/restart` of the detached super: resume this session (`-r` is refused with `--super`).
-    #[cfg(feature = "super")]
-    #[arg(long, hide = true, requires = "super_serve")]
-    super_resume: Option<String>,
-    /// The detached super restarted itself after its binary was upgraded (L10.9).
-    #[cfg(feature = "super")]
-    #[arg(long, hide = true, requires = "super_serve")]
-    super_upgraded: bool,
     /// API key for the model's provider, for this run only (ahead of saved and env keys).
     #[arg(long, value_name = "KEY")]
     api_key: Option<String>,
@@ -150,16 +131,6 @@ struct Cli {
     initial: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
-}
-
-impl Cli {
-    /// The detached super process itself; never without the `super` feature (L10.9).
-    fn is_super_serve(&self) -> bool {
-        #[cfg(feature = "super")]
-        return self.super_serve;
-        #[cfg(not(feature = "super"))]
-        false
-    }
 }
 
 #[derive(Subcommand, Clone)]
@@ -418,7 +389,7 @@ fn permissions(s: &Settings) -> Permissions {
 }
 
 /// The tools a session is built with: `--tools` (comma-separated; `*` is every tool, over
-/// the agent type's list: super's scouts, D2), else its agent type's; `None` is every tool.
+/// the agent type's list, D2), else its agent type's; `None` is every tool.
 fn session_tools(arg: Option<&str>, def: Option<Vec<String>>) -> Option<Vec<String>> {
     match arg {
         Some("*") => None,
@@ -435,15 +406,8 @@ fn session_tools(arg: Option<&str>, def: Option<Vec<String>>) -> Option<Vec<Stri
 
 /// The sandbox of a session in `cwd` (L6.5): its project folders, the settings'
 /// extra places and the user's protected paths. At the lenient level without a
-/// `sandbox.mode` it only locks credentials (L6.9). A review task (`edit_rule` `review:`) may
-/// also write its whole scratch folder, where it puts the base checkout (L10.9).
-fn session_sandbox(
-    s: &Settings,
-    cwd: &Path,
-    novacode_home: &Path,
-    perms: &Permissions,
-    edit_rule: Option<&EditRule>,
-) -> Arc<Sandbox> {
+/// `sandbox.mode` it only locks credentials (L6.9).
+fn session_sandbox(s: &Settings, cwd: &Path, novacode_home: &Path, perms: &Permissions) -> Arc<Sandbox> {
     // Host git pin (L6.5): the project's common git dir, resolved before any model command runs.
     novacode_base::git::pin_repo(cwd);
     let (mode, light) = sandbox_mode(s, perms.security);
@@ -455,9 +419,6 @@ fn session_sandbox(
         std::env::var_os("CARGO_HOME").as_deref(),
         std::env::var_os("GOPATH").as_deref(),
     ));
-    if let Some(EditRule::Review { dir }) = edit_rule {
-        allow_write.push(dir.to_string_lossy().into_owned());
-    }
     let sb = Arc::new(Sandbox::new(sbx::Config {
         mode,
         light,
@@ -752,8 +713,7 @@ async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
                     }
                 }
                 let perms = permissions(&settings);
-                let rule = EditRule::from_env().ok().flatten();
-                let sb = session_sandbox(&settings, &cwd, paths.home(), &perms, rule.as_ref());
+                let sb = session_sandbox(&settings, &cwd, paths.home(), &perms);
                 return Ok(doctor::doctor(&p, &settings, &sb, perms.security, problems, shadowed).await);
             }
             return Ok(doctor::auth_status(&p));
@@ -1019,33 +979,8 @@ async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
         }
         None => {}
     }
-    // --super (L10.9): the launcher starts or finds the root's super and attaches; the
-    // detached super itself holds the root's lock for its whole life.
-    #[cfg(feature = "super")]
-    let _super_lock = if cli.super_ {
-        if !cli.super_serve {
-            return super_launch(&paths).await;
-        }
-        let root = novacode_base::platform::canonicalize(std::env::current_dir()?)?;
-        let Some(lock) = superagent::entry::claim(paths.home(), &root)? else {
-            // Another super won the race; its launchers attach to it.
-            return Ok(ExitCode::SUCCESS);
-        };
-        cli.bg = Some(String::new());
-        // The last super's session continues, unless `/kill` ended it (L9) or it is gone.
-        let here = std::env::current_dir()?;
-        cli.resume = cli.super_resume.take().or_else(|| {
-            superagent::entry::last_session(paths.home(), &root).filter(|id| session::find(&paths, &here, id).is_ok())
-        });
-        Some(lock)
-    } else {
-        None
-    };
     // --bg: start a detached copy of this command and report its session id.
-    // A super task is already detached by super (L10.9), without NOVACODE_BG_CHILD: that
-    // would reach every `--bg` the task's commands start.
-    let detached = std::env::var_os("NOVACODE_BG_CHILD").is_some() || std::env::var_os("NOVACODE_TASK").is_some();
-    if cli.bg.is_some() && !cli.is_super_serve() && !detached {
+    if cli.bg.is_some() && std::env::var_os("NOVACODE_BG_CHILD").is_none() {
         return spawn_bg();
     }
     let headless = cli.bg.is_some() || cli.rpc || cli.profile_startup;
@@ -1504,24 +1439,13 @@ impl Ctx {
         let (adapter, api_key) = self.providers.adapter(&route.provider, trace).await?;
         diag::mark("connect provider");
         let s = &self.settings;
-        // Super mode (L10.9): its own prompt and tools, no project files, skills or MCP.
-        let is_super = self.cli.is_super_serve();
-        // Super's cards are re-asked while they wait (L10.9).
-        #[cfg(feature = "super")]
-        let reminders = is_super.then(Arc::<superagent::remind::Pending>::default);
-        #[cfg(feature = "super")]
-        let asker = match &reminders {
-            Some(r) => asker.map(|a| r.asker(a)),
-            None => asker,
-        };
         let perms = permissions(s);
         // Lenient (L6.9): no judge.
         let judge_spec = match perms.security {
             Security::Lenient => Some("off".to_string()),
             Security::Hardened => perms.judge.clone(),
         };
-        let edit_rule = EditRule::from_env().map_err(anyhow::Error::msg)?;
-        let sandbox = session_sandbox(s, &self.cwd, self.paths.home(), &perms, edit_rule.as_ref());
+        let sandbox = session_sandbox(s, &self.cwd, self.paths.home(), &perms);
         let mut policy = Policy::new(
             perms,
             novacode_base::platform::home().unwrap_or_default(),
@@ -1533,8 +1457,6 @@ impl Ctx {
         if let Some(p) = &self.cli.profile {
             policy = policy.with_profile(p).map_err(anyhow::Error::msg)?;
         }
-        // A super mode task's fence for the edit tools (L10.9); its subagents inherit the variable.
-        policy = policy.with_edit_rule(edit_rule);
         // Shared: mode presets change it at run time, and subagents read its mode.
         let policy = Arc::new(policy);
         // A subagent: its role prompt, and only its tools and MCP servers (L10.1).
@@ -1555,47 +1477,15 @@ impl Ctx {
                 .map(String::from)
                 .collect()
         };
-        let allowed: Option<Vec<String>> = match is_super {
-            #[cfg(feature = "super")]
-            true => Some(superagent::tools(s)),
-            _ => session_tools(self.cli.tools.as_deref(), def.as_ref().and_then(|d| d.tools.clone())),
-        };
+        let allowed = session_tools(self.cli.tools.as_deref(), def.as_ref().and_then(|d| d.tools.clone()));
         let granted: Option<Vec<String>> = def
             .as_ref()
             .map(|d| self.cli.mcp.as_ref().map_or_else(|| d.mcp.clone(), csv));
-        // A super task's own session (L10.9): which task it is, from its env or saved entry.
-        #[cfg(feature = "super")]
-        let (task_id, task_saved) = {
-            use superagent::report::Identity;
-            let vars = Identity::from_vars(|v| std::env::var(v).ok());
-            let saved = Identity::saved(store.branch());
-            let task = Identity::resolve(agents::Place::from_env().depth, vars, saved.clone());
-            let known = task.is_some() && saved == task;
-            (task, known)
-        };
-        // Named as super shows it, so tmux side panels list the task by that name.
-        #[cfg(feature = "super")]
-        let task_name = task_id.as_ref().map(|id| superagent::task::session_name(&id.task));
-        // A subagent's role prompt; super and its task sessions have their own.
+        // A subagent's role prompt.
         let role = def
             .as_ref()
             .filter(|d| !d.prompt.is_empty())
             .map(|d| (d.prompt.clone(), d.replace));
-        #[cfg(feature = "super")]
-        let role = if is_super {
-            Some((
-                superagent::prompt(
-                    self.paths.home(),
-                    (!self.cli.no_context_files).then_some(self.cwd.as_path()),
-                ),
-                true,
-            ))
-        } else if let Some(id) = task_id.as_ref().filter(|_| def.is_none()) {
-            // The task preamble: in the system prompt, so it stays cached.
-            Some((superagent::task::preamble(&id.task), false))
-        } else {
-            role
-        };
         let (window_tokens, max_tokens) = models::Limits::new(s).of(&route);
         // Cross-session memory (L10.4); `memory.store: false` turns it off.
         let memories = s
@@ -1621,8 +1511,8 @@ impl Ctx {
             prompt: novacode_core::prompt::Sources {
                 cwd: self.cwd.clone(),
                 home: self.paths.home().to_path_buf(),
-                context_files: !self.cli.no_context_files && !is_super,
-                skill_dirs: if is_super { vec![] } else { self.skill_dirs() },
+                context_files: !self.cli.no_context_files,
+                skill_dirs: self.skill_dirs(),
                 tool_guidelines: vec![],
                 agent: role,
                 mode: None,
@@ -1672,121 +1562,12 @@ impl Ctx {
         }));
         all.push(Arc::new(novacode_tools::worktree::EnterWorktree(worktree_copy(s))));
         all.push(Arc::new(novacode_tools::worktree::ExitWorktree(asker.clone())));
-        // Super's `ask_user` is its own (below); other sessions' is unchanged.
-        if let Some(a) = asker.clone().filter(|_| !is_super) {
+        if let Some(a) = asker.clone() {
             all.push(Arc::new(novacode_tools::ask::AskUser(a)));
-        }
-        // Super's decision check (L10.9): the helper model and where its nudge goes.
-        #[cfg(feature = "super")]
-        let mut decision_check: Option<(novacode_core::memory::Worker, Arc<dyn superagent::link::Inform>)> = None;
-        // Super itself, for the context builder's health-check callback.
-        #[cfg(feature = "super")]
-        let mut super_ref: Option<std::sync::Weak<superagent::task::Super>> = None;
-        // Super's own subagents (scouts, reviewers it asked for): a self-restart waits for them.
-        #[cfg(feature = "super")]
-        let super_agents: Arc<std::sync::OnceLock<Arc<agents::Supervisor>>> = Default::default();
-        // What started super's current run: set by its context builder, read by `say`.
-        #[cfg(feature = "super")]
-        let say_trigger: superagent::say::Trigger = Default::default();
-        // Super's latest state block: set by its context builder, read by the decision check.
-        #[cfg(feature = "super")]
-        let shown: superagent::context::Shown = Default::default();
-        #[cfg(feature = "super")]
-        if is_super {
-            use superagent::task;
-            let home = self.paths.home();
-            let cfg = task::Config {
-                max_running: superagent::max_running(s),
-                models: Arc::new(superagent::models::Models::real(self.providers.clone(), s)),
-                model: route.spec(),
-                thinking: cfg.thinking,
-                worktree_copy: worktree_copy(s),
-                home: home.to_path_buf(),
-                watch: superagent::watch(s),
-                auto_merge: s.get("super.autoMerge").unwrap_or(false),
-            };
-            let launcher = Arc::new(task::Procs {
-                exe: live_path(std::env::current_exe()?),
-                paths: self.paths.clone(),
-            });
-            let dir = superagent::entry::dir(home, &self.cwd);
-            let reminders = reminders.clone().unwrap_or_default();
-            let sup = Arc::new(
-                task::Super::new(&self.cwd, dir, cfg, asker.clone(), launcher)?.with_reminders(reminders.clone()),
-            );
-            // Each super session numbers its tasks from T1 (L10.9).
-            sup.set_session(store.id());
-            super_ref = Some(Arc::downgrade(&sup));
-            // The helper model, as for the observer: none with `memory.enabled: false`.
-            let helper = match memory_on {
-                true => Some(self.helper(s.get("memory.model"), &route, adapter.clone()).await),
-                false => None,
-            };
-            if let Some(h) = helper.clone() {
-                let _ = sup.helper.set(h);
-            }
-            if let Some(path) = store.path() {
-                all.push(Arc::new(superagent::context::HistorySearch {
-                    file: path.to_path_buf(),
-                }));
-            }
-            // Task links (L10.9): relay, code-made reports, inbox, wakes.
-            if let Some(slot) = slot.clone() {
-                let _ = sup.hub.set(slot.clone());
-                let inform = Arc::new(superagent::link::HubInform {
-                    slot: slot.clone(),
-                    desktop: s.get("notifications.enabled").unwrap_or(true),
-                    agents: super_agents.clone(),
-                });
-                decision_check = helper.map(|h| (h, inform.clone() as Arc<dyn superagent::link::Inform>));
-                superagent::feed_board(slot.clone(), &sup, self.paths.clone());
-                if self.cli.super_upgraded {
-                    let text = format!(
-                        "novacode was upgraded to {}; super restarted",
-                        env!("CARGO_PKG_VERSION")
-                    );
-                    superagent::link::Inform::notice(inform.as_ref(), text.clone());
-                    superagent::link::Inform::note(inform.as_ref(), text);
-                }
-                superagent::link::Links::start(
-                    &sup,
-                    reminders.asker(Arc::new(slot.clone())),
-                    reminders.approver(Arc::new(slot)),
-                    inform,
-                );
-            }
-            all.push(Arc::new(superagent::say::SayTool {
-                sup: sup.clone(),
-                asker: asker.clone(),
-                trigger: say_trigger.clone(),
-            }));
-            // Super's questions are short points and never block its run (L10.9).
-            if let Some(a) = asker.clone() {
-                all.push(Arc::new(superagent::say::ShortAskUser {
-                    ask: novacode_tools::ask::AskUser(a),
-                    sup: sup.clone(),
-                }));
-            }
-            all.push(Arc::new(task::TaskTool(sup)));
         }
         all.push(Arc::new(novacode_tools::todo::Todo::new(
             store.todo().map(|t| t.0).unwrap_or_default(),
         )));
-        // A super task's own session (L10.9): the `report` tool and its proof log; never in a subagent.
-        #[cfg(feature = "super")]
-        let task = {
-            task_id.map(|id| {
-                let proof = Arc::new(superagent::report::ProofLog::restore(store.branch()));
-                let seq = superagent::report::last_seq(store.branch());
-                all.push(Arc::new(superagent::report::ReportTool::new(
-                    id.clone(),
-                    proof.clone(),
-                    seq,
-                    worktree_copy(s),
-                )));
-                (id, proof)
-            })
-        };
         if store.path().is_some() {
             all.push(Arc::new(novacode_core::export::SessionSearch {
                 sessions_root: self.paths.home().join("sessions"),
@@ -1806,9 +1587,6 @@ impl Ctx {
         let (mut servers, mcp_warnings) = novacode_core::mcp::load(self.paths.home(), &self.cwd, self.trusted);
         if let Some(g) = &granted {
             servers.retain(|c| g.contains(&c.name));
-        }
-        if is_super {
-            servers.clear();
         }
         let server_names: Vec<String> = servers.iter().map(|c| c.name.clone()).collect();
         let mut supervisor = None;
@@ -1874,8 +1652,6 @@ impl Ctx {
                 unattended: approver.is_none(),
                 policy: policy.clone(),
                 worktree_copy: worktree_copy(s),
-                // Super's scouts: inside its root, with their folder's trust and MCP (L10.9).
-                root: is_super.then(|| self.cwd.clone()),
             };
             // `/reload` keeps the supervisor, so running subagents carry on and report back.
             let kept = carry.as_ref().and_then(|_| self.sup.lock().unwrap().clone());
@@ -1887,8 +1663,6 @@ impl Ctx {
                 None => agents::Supervisor::new(setup),
             };
             *self.sup.lock().unwrap() = Some(sup.clone());
-            #[cfg(feature = "super")]
-            let _ = super_agents.set(sup.clone());
             // Goals (/goal): audited by the `auditor` subagent.
             let g = goals::Goals::new(
                 self.paths.home().join("goals").join(format!("{}.json", store.id())),
@@ -1910,7 +1684,6 @@ impl Ctx {
         // none inside a hook's own novacode (recursion guard).
         let plugin_hooks = (!novacode_core::hooks::disabled()).then(|| {
             Arc::new(novacode_core::plugin_hooks::PluginHooks::load(
-                // Super runs them too; its context sends only each hook message's newest copy.
                 &novacode_core::packages::enabled(self.paths.home(), &self.cwd, self.trusted),
                 &self.cwd,
                 store.id(),
@@ -2100,10 +1873,6 @@ impl Ctx {
         if let Some(pm) = agent.processes() {
             handlers.push(Arc::new(novacode_core::hooks::BashSleep(pm.clone())));
         }
-        #[cfg(feature = "super")]
-        if let Some((_, proof)) = &task {
-            handlers.push(proof.clone());
-        }
         if !novacode_core::hooks::disabled() {
             let hook_cfg: novacode_core::hooks::Config = s.get("hooks").unwrap_or_default();
             let cmds = Arc::new(novacode_core::hooks::Commands {
@@ -2160,7 +1929,7 @@ impl Ctx {
             };
             // Repo notes (L10.4b): learn from this repo's earlier sessions in the background;
             // new notes reach the prompt from the next session.
-            if def.is_none() && !is_super && s.get("repoNotes.enabled").unwrap_or(true) {
+            if def.is_none() && s.get("repoNotes.enabled").unwrap_or(true) {
                 tokio::spawn(novacode_core::repo_notes::learn(
                     self.paths.home().to_path_buf(),
                     self.cwd.clone(),
@@ -2182,47 +1951,8 @@ impl Ctx {
                 }
                 None => agent = agent.with_memory(session_worker, m).without_observer(),
             }
-            #[cfg(feature = "super")]
-            if let Some(name) = task_name {
-                agent = agent.with_fixed_name(name);
-            }
-            #[cfg(feature = "super")]
-            if is_super {
-                let root = self.cwd.file_name().unwrap_or(self.cwd.as_os_str()).to_string_lossy();
-                agent = agent.with_fixed_name(format!("Super · {root}"));
-                // Its todo is the user's open requests, already in its state block (L10.9).
-                agent = agent.without_todo_notes();
-                let dir = superagent::entry::dir(self.paths.home(), &self.cwd);
-                agent = agent.with_compaction_guide_fn(Arc::new(superagent::compaction_guide(dir.clone())));
-                // Rebuilt every request: state block + newest chat in 6k tokens (L10.9).
-                // A health check answered `OK` is recorded on the board.
-                let sup = super_ref.clone();
-                let on_ok = Arc::new(move || {
-                    if let Some(s) = sup.as_ref().and_then(std::sync::Weak::upgrade) {
-                        s.checked();
-                    }
-                });
-                // The Models section follows super's current model (`/model` in its window).
-                let sup = super_ref.clone();
-                let models = Arc::new(move |last: Option<(String, String)>, thinking: Option<ThinkingLevel>| {
-                    let Some(s) = sup.as_ref().and_then(std::sync::Weak::upgrade) else {
-                        return String::new();
-                    };
-                    if let (Some((p, m)), Some(thinking)) = (last, thinking) {
-                        s.set_current_model(format!("{p}/{m}"), thinking);
-                    }
-                    s.models_section()
-                });
-                agent = agent.with_context_builder(superagent::context::builder(
-                    dir,
-                    on_ok,
-                    models,
-                    say_trigger.clone(),
-                    shown.clone(),
-                ));
-            }
             // Named for the session list (L4.18); not scripts, pipelines or subagents.
-            if !is_super && self.cli.print.is_none() && !self.cli.rpc {
+            if self.cli.print.is_none() && !self.cli.rpc {
                 agent = agent.with_auto_name();
             }
         }
@@ -2234,25 +1964,6 @@ impl Ctx {
         }
         if let Some(c) = carry {
             agent = agent.adopt(c);
-        }
-        #[cfg(feature = "super")]
-        if let Some((helper, inform)) = decision_check {
-            superagent::context::decision_check(agent.subscribe(), Some(helper), inform, shown);
-        }
-        #[cfg(feature = "super")]
-        if let Some((id, proof)) = task {
-            // Saved after the agent wrote a new session's system prompt (an entry before it
-            // would make the session look old, and the prompt would never be written).
-            if !task_saved && let Err(e) = agent.store.append(id.entry()) {
-                // A failed write stays in memory and goes out with the next flush.
-                tracing::warn!("super task identity not saved yet: {e}");
-            }
-            proof.save_to(agent.state_saver());
-            if let Some(pm) = agent.processes() {
-                proof.watch(pm);
-            }
-            superagent::report::spawn_writer(agent.subscribe(), id.dir.clone());
-            superagent::report::rewrite_unapplied(agent.store.branch(), &id);
         }
         Ok((agent, route.spec()))
     }
@@ -2994,12 +2705,6 @@ async fn serve_headless(ctx: &Ctx, store: Store, model: String) -> anyhow::Resul
     } else {
         // The parent waits for this line; nothing else goes to stdout.
         println!("{}", host.id);
-        #[cfg(feature = "super")]
-        if ctx.cli.super_serve {
-            // The socket is up: launchers may attach now.
-            let root = novacode_base::platform::canonicalize(std::env::current_dir()?)?;
-            superagent::entry::write_session(ctx.paths.home(), &root, &host.id)?;
-        }
         let (sink, _) = mpsc::unbounded_channel();
         if let Some(p) = ctx.cli.bg.clone().filter(|p| !p.trim().is_empty()) {
             host.handle(Cmd::Prompt(p), &sink, false).await;
@@ -3042,19 +2747,9 @@ async fn serve_headless(ctx: &Ctx, store: Store, model: String) -> anyhow::Resul
     if let Some(sup) = sup {
         sup.stop_all().await;
     }
-    // Super restarts on its upgraded binary (L10.9): its windows reconnect to the same session.
-    #[cfg(feature = "super")]
-    let upgraded = ctx.cli.super_serve && superagent::upgrade::requested();
-    #[cfg(not(feature = "super"))]
-    let upgraded = false;
-    let id = host.id.clone();
-    live.end(if upgraded { serve::RELOADING } else { "session ended" })
-        .await;
+    live.end("session ended").await;
     // Let the last lines (and the bye) reach RPC clients.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    if upgraded {
-        return Err(restart_with(&id, &["--super-upgraded"]));
-    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -3070,13 +2765,7 @@ fn live_path(exe: std::path::PathBuf) -> std::path::PathBuf {
 }
 
 fn restart(id: &str) -> anyhow::Error {
-    restart_with(id, &[])
-}
-
-/// [`restart`], with `extra` arguments.
-fn restart_with(id: &str, extra: &[&str]) -> anyhow::Error {
-    let mut args = restart_args(std::env::args().skip(1), id);
-    args.extend(extra.iter().map(|a| a.to_string()));
+    let args = restart_args(std::env::args().skip(1), id);
     let exe = match std::env::current_exe() {
         Ok(e) => live_path(e),
         Err(e) => return e.into(),
@@ -3096,8 +2785,7 @@ fn restart_with(id: &str, extra: &[&str]) -> anyhow::Error {
 }
 
 /// This process's arguments for resuming session `id`: its own resume and worktree
-/// flags dropped (the session's folder decides), then `-r id`, or `--super-resume id`
-/// for the detached super.
+/// flags dropped (the session's folder decides), then `-r id`.
 fn restart_args(own: impl Iterator<Item = String>, id: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut skip = false;
@@ -3113,18 +2801,11 @@ fn restart_args(own: impl Iterator<Item = String>, id: &str) -> Vec<String> {
             // The resumed session's folder decides where it runs (worktree included).
             "-w" | "--worktree" => skip_name = true,
             s if s.starts_with("--worktree=") || s.starts_with("-w") && s.len() > 2 => {}
-            s if s.starts_with("--resume=") || s.starts_with("--super-resume=") => {}
-            "--super-resume" => skip = true,
-            "--super-upgraded" => {}
+            s if s.starts_with("--resume=") => {}
             _ => args.push(a),
         }
     }
-    let flag = if args.iter().any(|a| a == "--super-serve") {
-        "--super-resume"
-    } else {
-        "-r"
-    };
-    args.extend([flag.into(), id.to_string()]);
+    args.extend(["-r".into(), id.to_string()]);
     args
 }
 
@@ -3189,75 +2870,6 @@ fn detach(c: &mut std::process::Command) {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         c.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
-}
-
-/// `novacode --super` (L10.9): start this folder's super unless one runs, wait up to 10 s
-/// for its session, then attach (without a terminal: print its session id).
-#[cfg(feature = "super")]
-async fn super_launch(paths: &Paths) -> anyhow::Result<ExitCode> {
-    use superagent::entry;
-    let root = novacode_base::platform::canonicalize(std::env::current_dir()?)?;
-    let home = paths.home().to_path_buf();
-    entry::check_root(&home, &root)?;
-    // A super that `novacode stop` just reached is still live while it shuts down: wait for
-    // it to exit (and free the folder's lock), then start a new one.
-    let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let id = loop {
-        let id = super_find_or_start(paths, &root).await?;
-        if !serve::closing(paths, &id).await {
-            break id;
-        }
-        eprintln!("super agent {id} is shutting down; waiting for it to exit (up to 30 s)");
-        while serve::find_live(paths, &id).is_ok() || entry::locked(&home, &root) {
-            if std::time::Instant::now() >= gone_by {
-                bail!("super agent {id} is still shutting down after 30 s; try again when it is gone");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-    };
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        eprintln!("super agent {id} runs for {}", root.display());
-        eprintln!("attach with: novacode --super (in {})", root.display());
-        println!("{id}");
-        return Ok(ExitCode::SUCCESS);
-    }
-    let trusted = trust::resolve(&TrustStore::new(paths.home().join("trust.json")), &root, false);
-    let settings = Settings::load(&paths.settings(), Some(&Paths::project_settings(&root)), trusted);
-    serve::attach_loop(paths, &id, || tui_base(paths, &settings), false).await
-}
-
-/// The running super's session for `root`, or a new detached super's once it is up.
-#[cfg(feature = "super")]
-async fn super_find_or_start(paths: &Paths, root: &Path) -> anyhow::Result<String> {
-    use superagent::entry;
-    let (home, root) = (paths.home().to_path_buf(), root.to_path_buf());
-    Ok(
-        match entry::running(&home, &root, |id| serve::find_live(paths, id).is_ok()) {
-            Some(id) => id,
-            None => {
-                // Not through spawn_bg: its NOVACODE_BG_CHILD would reach every task super starts,
-                // and it reports a super that lost the lock race as a failed start.
-                let mut c = std::process::Command::new(live_path(std::env::current_exe()?));
-                c.args(std::env::args_os().skip(1))
-                    .arg("--super-serve")
-                    .current_dir(&root)
-                    .env_remove("NOVACODE_BG_CHILD")
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
-                detach(&mut c);
-                let mut child = c.spawn()?;
-                std::thread::spawn(move || child.wait());
-                let (p, r) = (paths.clone(), root.clone());
-                tokio::task::spawn_blocking(move || {
-                    entry::wait(p.home(), &r, std::time::Duration::from_secs(10), |id| {
-                        serve::find_live(&p, id).is_ok()
-                    })
-                })
-                .await??
-            }
-        },
-    )
 }
 
 fn spawn_bg() -> anyhow::Result<ExitCode> {
@@ -4031,48 +3643,14 @@ async fn login(store: &AuthStore, provider: &str, account: &str, method: Option<
 
 #[cfg(test)]
 mod tests {
-    /// L10.9: `--super` takes `-m`; every other session flag is refused with it.
-    #[cfg(feature = "super")]
+    /// `/restart` re-runs the session's own arguments, minus resume and worktree flags, plus `-r id`.
     #[test]
-    fn super_allows_model_and_refuses_other_session_flags() {
-        use clap::Parser;
-        let parse = |args: &[&str]| super::Cli::try_parse_from(["novacode"].iter().chain(args));
-        let ok = parse(&["--super", "-m", "faux/faux"]).unwrap();
-        assert!(ok.super_ && ok.model.as_deref() == Some("faux/faux"));
-        for bad in [
-            &["--super", "--bg"][..],
-            &["--super", "-r", "abc"],
-            &["--super", "-c"],
-            &["--super", "-w"],
-            &["--super", "--mode", "auto"],
-            &["--super", "--profile", "scout"],
-            &["--super", "--trust"],
-            &["--super", "-p", "hi"],
-            &["--super", "--rpc"],
-            &["--super", "--no-session"],
-            &["--super", "fix the build"],
-        ] {
-            assert!(parse(bad).is_err(), "{bad:?} should be refused");
-        }
-    }
-
-    /// ST09 open point: `/restart` re-runs the session's own arguments plus its id. For the
-    /// detached super that must parse (`-r` is refused with `--super`) and resume it.
-    #[cfg(feature = "super")]
-    #[test]
-    fn restart_args_resume_a_super_and_any_other_session() {
-        use clap::Parser;
-        fn args(a: &[&str]) -> std::vec::IntoIter<String> {
-            a.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
-        }
-        let parse = |a: Vec<String>| super::Cli::try_parse_from(std::iter::once("novacode".to_string()).chain(a));
-        let sup = super::restart_args(args(&["--super", "-m", "faux/script", "--super-serve"]), "abc");
-        let cli = parse(sup).expect("a super's restart parses");
-        assert!(cli.super_serve && cli.super_resume.as_deref() == Some("abc") && cli.resume.is_none());
-        let plain = super::restart_args(args(&["-m", "faux/script", "-r", "old", "-w", "x"]), "abc");
-        assert_eq!(plain, ["-m", "faux/script", "-r", "abc"]);
-        // Only the detached super may resume: a launcher can't.
-        assert!(parse(args(&["--super", "--super-resume", "abc"]).collect()).is_err());
+    fn restart_args_resume_the_session() {
+        let args = ["-m", "faux/script", "-r", "old", "-w", "x"].map(String::from);
+        assert_eq!(
+            super::restart_args(args.into_iter(), "abc"),
+            ["-m", "faux/script", "-r", "abc"]
+        );
     }
 
     /// L6.9: unset is lenient with a credentials-only sandbox; a bad `permissions` is
@@ -4119,91 +3697,7 @@ mod tests {
         assert!(super::relocated_caches(None, None).is_empty());
     }
 
-    /// M2: a review edits only under its scratch folder, so its sandbox lets it write the whole
-    /// folder, not only the `work` checkout: the brief's base checkout goes next to it.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_review_session_s_sandbox_can_write_its_whole_scratch_folder() {
-        review_scratch_writable(r#"{"sandbox": {"mode": "on"}}"#).await;
-    }
-
-    /// Novahome findings: at the lenient level (credentials only) all of `~/.novacode` was
-    /// read-only, the review scratch in it too ("mkdir: cannot create directory 'scratch':
-    /// Read-only file system").
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_lenient_review_session_can_write_its_scratch_in_the_novacode_folder() {
-        review_scratch_writable("{}").await;
-    }
-
-    /// A review's scratch under the novacode folder (`<home>/super/review/T2`): its sandbox
-    /// with `settings` adds the base checkout next to `work`, while the rest of the novacode
-    /// folder stays read-only.
-    #[cfg(target_os = "linux")]
-    async fn review_scratch_writable(settings: &str) {
-        use std::path::Path;
-        // Not under /tmp: that is writable anyway.
-        let tmp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let nc = root.join("home");
-        let (app, scratch) = (root.join("app"), nc.join("super/review/T2"));
-        let work = scratch.join("work");
-        std::fs::create_dir_all(&app).unwrap();
-        let git = |dir: &Path, args: &[&str]| {
-            let ok = std::process::Command::new("git")
-                .args([
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "-c",
-                    "commit.gpgsign=false",
-                ])
-                .args(args)
-                .current_dir(dir)
-                .status()
-                .unwrap()
-                .success();
-            assert!(ok, "git {args:?}");
-        };
-        git(&app, &["init", "-q"]);
-        git(&app, &["commit", "-q", "--allow-empty", "-m", "x"]);
-        std::fs::create_dir_all(&scratch).unwrap();
-        git(
-            &app,
-            &["worktree", "add", "-q", "--detach", &work.to_string_lossy(), "HEAD"],
-        );
-        let file = root.join("settings.json");
-        std::fs::write(&file, settings).unwrap();
-        let s = novacode_base::settings::Settings::load(&file, None, false);
-        let rule = super::EditRule::Review { dir: scratch.clone() };
-        let sb = super::session_sandbox(&s, &work, &nc, &super::permissions(&s), Some(&rule));
-        if !sb.available() {
-            eprintln!("no bubblewrap here: skipped");
-            return;
-        }
-        let cmd = format!("git worktree add -q --detach '{}' HEAD", scratch.join("base").display());
-        let out = super::sbx::command(Some(&sb), &cmd, &work)
-            .unwrap()
-            .output()
-            .await
-            .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        assert!(scratch.join("base/.git").exists());
-        let out = super::sbx::command(Some(&sb), "touch ../../../x", &work)
-            .unwrap()
-            .output()
-            .await
-            .unwrap();
-        assert!(
-            !out.status.success() && !nc.join("x").exists(),
-            "the rest of the novacode folder stays read-only"
-        );
-    }
-
-    /// Novahome findings: super ran the packages' Claude Code hooks (caveman, ponytail mode
-    /// text, 28 messages); super has no skills or packages, tasks keep them.
-    /// D2: `--tools=*` (super's scouts) is every tool, over the agent type's own list.
+    /// D2: `--tools=*` is every tool, over the agent type's own list.
     #[test]
     fn tools_star_lifts_the_agent_types_list() {
         let def = Some(vec!["read".to_string()]);

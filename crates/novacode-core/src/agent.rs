@@ -139,13 +139,6 @@ pub struct Agent {
     extensions: Option<Arc<crate::extensions::Extensions>>,
     /// Claude Code plugin hooks (L7.14) and the state they need.
     plugins: Option<Plugins>,
-    /// Super's rebuilt context (L10.9): each request is built from the projection; the
-    /// session file is unchanged. `None` = the projection is sent as is.
-    context: Option<crate::context_window::Builder>,
-    /// Super's root-based name, never replaced by manual or automatic naming.
-    fixed_name: Option<String>,
-    /// Show a stale open todo list again (L5.12); off in super (L10.9).
-    todo_notes: bool,
 }
 
 struct Plugins {
@@ -178,9 +171,6 @@ struct Memory {
     auto_name: bool,
     /// What the last naming was based on: `start`, or a compaction's id.
     named_for: Option<String>,
-    /// This session's own compaction instructions (super's, L10.9): made at each
-    /// compaction, given to the summary model and repeated after the summary.
-    guide: Option<Arc<dyn Fn() -> String + Send + Sync>>,
 }
 
 /// What a background observer run produced.
@@ -474,9 +464,6 @@ impl Agent {
             hooks: Arc::default(),
             extensions: None,
             plugins: None,
-            context: None,
-            fixed_name: None,
-            todo_notes: true,
             pending_cp: None,
             cwd_gone: false,
         };
@@ -621,12 +608,8 @@ impl Agent {
             if compacted {
                 m.cause = "compaction (expected once)".into();
             }
-            // A window whose context is rebuilt on every request (super) misses by design:
-            // logged, not shown.
-            if self.context.is_none() {
-                let text = format!("cache miss: {} prompt tokens not read from cache ({})", m.lost, m.cause);
-                self.emit(AgentEvent::Stream(StreamEvent::Notice { text }));
-            }
+            let text = format!("cache miss: {} prompt tokens not read from cache ({})", m.lost, m.cause);
+            self.emit(AgentEvent::Stream(StreamEvent::Notice { text }));
             let line = serde_json::json!({
                 "session": self.store.id(),
                 "provider": self.cfg.provider,
@@ -834,42 +817,7 @@ impl Agent {
             observe: true,
             auto_name: false,
             named_for: None,
-            guide: None,
         });
-        self
-    }
-
-    /// Compaction instructions of this session (after `with_memory`), made when a
-    /// compaction runs (super's carry its board then).
-    /// Rebuild every request with `b` (super, L10.9). Auto-compaction is off: the request
-    /// no longer grows with the session.
-    pub fn with_context_builder(mut self, b: crate::context_window::Builder) -> Self {
-        self.context = Some(b);
-        self
-    }
-
-    pub fn with_compaction_guide_fn(mut self, f: Arc<dyn Fn() -> String + Send + Sync>) -> Self {
-        if let Some(m) = self.memory.as_mut() {
-            m.guide = Some(f);
-        }
-        self
-    }
-
-    /// Fix the session's name, including when resuming an older named session.
-    pub fn with_fixed_name(mut self, name: String) -> Self {
-        if self.store.name() != Some((name.clone(), false)) {
-            self.add(EntryKind::SessionInfo {
-                name: name.clone(),
-                auto: false,
-            });
-        }
-        self.fixed_name = Some(name);
-        self
-    }
-
-    /// No stale-todo notes (super, L10.9: its todo holds the user's open requests, shown in its state block).
-    pub fn without_todo_notes(mut self) -> Self {
-        self.todo_notes = false;
         self
     }
 
@@ -886,7 +834,7 @@ impl Agent {
     /// touched; the name lands when the owner is idle. A `/name` pins the name.
     fn start_naming(&mut self) {
         let Some(m) = self.memory.as_mut() else { return };
-        if !m.auto_name || self.fixed_name.is_some() {
+        if !m.auto_name {
             return;
         }
         let path = self.store.branch();
@@ -1058,9 +1006,6 @@ impl Agent {
     /// Auto-compaction is due at threshold `at`, unless the last compaction already left
     /// the context past `at` and it hasn't grown by [`COMPACT_REGROW_PCT`] of the window since.
     fn compact_due(&self, at: u64) -> bool {
-        if self.context.is_some() {
-            return false;
-        }
         let t = self.context_tokens();
         let regrow = self.cfg.window_tokens * COMPACT_REGROW_PCT / 100;
         t >= at
@@ -1074,7 +1019,7 @@ impl Agent {
     /// large, compacting first makes that rewrite the summary instead.
     fn idle_compact_due(&self) -> bool {
         let Some(m) = self.memory.as_ref() else { return false };
-        if m.settings.idle_compact == 0 || self.context.is_some() {
+        if m.settings.idle_compact == 0 {
             return false;
         }
         let last = self.store.branch().iter().rev().find_map(|e| match &e.kind {
@@ -1182,12 +1127,7 @@ impl Agent {
         self.collect_notes(true).await;
         let tokens_before = self.context_tokens();
         let Some(m) = self.memory.as_ref() else { return false };
-        let (settings, worker, observe, guide) = (
-            m.settings.clone(),
-            m.worker.clone(),
-            m.observe,
-            m.guide.as_ref().map(|f| f()),
-        );
+        let (settings, worker, observe) = (m.settings.clone(), m.worker.clone(), m.observe);
         let (from, cut) = {
             let path = self.store.branch();
             let from = path
@@ -1249,7 +1189,7 @@ impl Agent {
                     ),
                 }));
             }
-            match memory::summarize(&self.adapter, &self.cfg.model, &gap, self.store.id(), guide.as_deref()).await {
+            match memory::summarize(&self.adapter, &self.cfg.model, &gap, self.store.id()).await {
                 Ok((t, _)) => summary_text = Some(t),
                 Err(e) => self.emit(AgentEvent::Stream(StreamEvent::Notice {
                     text: format!("summary failed too ({e}); dropping the older messages"),
@@ -1274,9 +1214,6 @@ impl Agent {
             summary.push_str(&format!(
                 "\n\n## Request in progress\nThe conversation below continues the turn started by this user message:\n{p}"
             ));
-        }
-        if let Some(g) = &guide {
-            summary.push_str(&format!("\n\n## After this compaction\n{g}"));
         }
         let fallback = notes.is_empty() && refl.is_empty() && summary_text.is_none();
         let system = crate::prompt::render(&self.store.sections());
@@ -1578,11 +1515,6 @@ impl Agent {
         self
     }
 
-    /// Saves `(ext, kind, data)` state entries in the session file, as extensions do.
-    pub fn state_saver(&self) -> StateSaver {
-        state_append(self.shared.clone())
-    }
-
     pub fn extensions(&self) -> Option<&Arc<crate::extensions::Extensions>> {
         self.extensions.as_ref()
     }
@@ -1634,11 +1566,6 @@ impl Agent {
     }
 
     fn add(&mut self, kind: EntryKind) -> String {
-        self.add_as(kind, true)
-    }
-
-    /// [`add`](Self::add); `emit: false` stores a message without telling the windows.
-    fn add_as(&mut self, kind: EntryKind, emit: bool) -> String {
         if let EntryKind::Message {
             message: Message::Assistant(a),
         } = &kind
@@ -1647,7 +1574,7 @@ impl Agent {
             self.usage_stale = false;
         }
         let ev = match &kind {
-            EntryKind::Message { message } if emit => Some(message.clone()),
+            EntryKind::Message { message } => Some(message.clone()),
             _ => None,
         };
         let id = match self.store.append(kind) {
@@ -1809,21 +1736,11 @@ impl Agent {
         let start = self.store.branch().last().map(|e| e.id.clone());
         let mut first = true;
         let mut refused = false;
-        // Wire prompts this run took, for `AgentEnd` (L10.9).
+        // Wire prompts this run took, for `AgentEnd`.
         let mut prompts = Vec::new();
-        // A silent check (`context_window::Quiet`): its note's entry, while the run had
-        // no prompt and no tool call.
-        let mut quiet_note: Option<String> = None;
-        let mut plain = true;
-        // `context_window::Plain`: this run was a marked check; its plain-text nudge went out;
-        // it called the tool. `held`: plain text kept out of the windows and its nudge, hidden
-        // from the context once the run ends.
-        let (mut checked, mut plain_nudged, mut said) = (false, false, false);
-        let mut held: Vec<String> = Vec::new();
         let stop = loop {
             let queued = self.take_queued(steering_only);
             let mut added = queued.is_empty();
-            plain &= queued.is_empty();
             for Queued { content, wire } in queued {
                 prompts.extend(wire);
                 // A user message ends an activated skill's turn rules (L5.25).
@@ -1885,8 +1802,7 @@ impl Agent {
             }
             self.flush_ext_state();
             // An open todo list the model stopped updating (L5.12): show it again.
-            if self.todo_notes
-                && let Some((items, ago)) = self.store.todo()
+            if let Some((items, ago)) = self.store.todo()
                 && ago >= novacode_tools::todo::STALE_AFTER
                 && self.store.todo_notes() < novacode_tools::todo::MAX_STALE_NOTES
                 && items.iter().any(|i| {
@@ -1907,22 +1823,12 @@ impl Agent {
                 q.wake = false;
                 q.reminders.drain(..).collect()
             };
-            let marker = self
-                .context
-                .as_ref()
-                .and_then(|c| c.quiet.as_ref())
-                .map(|q| q.marker.clone());
             for (kind, text) in notes {
-                let check = marker.as_deref().is_some_and(|m| text.starts_with(m));
-                let id = self.add(EntryKind::CustomMessage {
+                self.add(EntryKind::CustomMessage {
                     kind,
                     text,
                     display: false,
                 });
-                if check {
-                    quiet_note = Some(id);
-                    checked = true;
-                }
             }
             steering_only = true;
             // L4.16: no model call while the session file is missing entries.
@@ -1946,57 +1852,9 @@ impl Agent {
             let stop = msg.stop.clone();
             let has_text = !msg.text().trim().is_empty();
             let text = msg.text();
-            let quiet = plain && calls.is_empty() && stop == StopReason::Stop && text.trim() == "OK";
-            plain &= calls.is_empty();
-            let plain_cfg = self.context.as_ref().and_then(|c| c.plain.clone());
-            said |= plain_cfg
-                .as_ref()
-                .is_some_and(|p| calls.iter().any(|c| c.name == p.tool));
-            let plain_text = plain_cfg.is_some()
-                && calls.is_empty()
-                && stop == StopReason::Stop
-                && has_text
-                && !(checked && text.trim() == "OK");
-            if let Some(p) = plain_cfg.filter(|_| plain_text && plain_nudged && !said) {
-                // Plain text after the nudge: code sends it through the tool.
-                self.emit(AgentEvent::Stream(StreamEvent::RetryRollback));
-                let mut msg = msg;
-                msg.content.retain(|b| !matches!(b, Block::Text { .. }));
-                let call = ToolCall {
-                    id: format!("{}-plain-{}", p.tool, crate::session::now_ms()),
-                    name: p.tool.clone(),
-                    arguments: (p.args)(text.trim()),
-                    arguments_error: None,
-                    replay: None,
-                };
-                msg.content.push(Block::ToolCall(call.clone()));
-                self.add(EntryKind::Message {
-                    message: Message::Assistant(msg),
-                });
-                self.run_tools(vec![call], &cancel).await;
-                break stop;
-            }
-            match quiet_note.take().filter(|_| quiet) {
-                Some(note) => self.hide_ok(msg, note),
-                // Plain text after the tool in the same run is a redundant recap: hidden, no nudge.
-                None if plain_text && said => {
-                    let id = self.hold_plain(msg);
-                    self.add(EntryKind::ContextEdit {
-                        target: id,
-                        replace: None,
-                    });
-                }
-                // Plain text before its nudge: the model still sees it, no window does.
-                None if plain_text && !plain_nudged => {
-                    let id = self.hold_plain(msg);
-                    held.push(id);
-                }
-                None => {
-                    self.add(EntryKind::Message {
-                        message: Message::Assistant(msg),
-                    });
-                }
-            }
+            self.add(EntryKind::Message {
+                message: Message::Assistant(msg),
+            });
             // L4.16: and no tool runs either.
             if !calls.is_empty() && !self.saved() {
                 self.skip_calls(&calls, "Not run: the session could not be saved.");
@@ -2036,7 +1894,7 @@ impl Agent {
                 Some(Nudge::CutOff)
             } else if Recovery::looks_like_text_tool_call(&text) {
                 Some(Nudge::TextToolCall)
-            } else if !has_text && after_tools && !said {
+            } else if !has_text && after_tools {
                 Some(Nudge::EmptyAfterTools)
             } else {
                 None
@@ -2052,25 +1910,12 @@ impl Agent {
                 self.nudge(&say);
                 continue;
             }
-            if plain_text && !said && !std::mem::replace(&mut plain_nudged, true) {
-                let n = self
-                    .context
-                    .as_ref()
-                    .and_then(|c| c.plain.as_ref())
-                    .map(|p| p.nudge.clone());
-                let id = self.nudge(&n.unwrap_or_default());
-                held.push(id);
-                continue;
-            }
             if !self.shared.queues.lock().unwrap().follow_up.is_empty() {
                 steering_only = false;
                 continue;
             }
             break stop;
         };
-        for target in held {
-            self.add(EntryKind::ContextEdit { target, replace: None });
-        }
         // Stop (L7.14): a plugin hook's block keeps the agent going with its reason.
         if stop == StopReason::Stop
             && !refused
@@ -2157,10 +2002,7 @@ impl Agent {
         let mut compacted = false;
         loop {
             let route = format!("{}/{}", self.cfg.provider, self.cfg.model);
-            let messages = match &self.context {
-                Some(b) => b.build(&self.store, self.store.projection()),
-                None => self.store.projection(),
-            };
+            let messages = self.store.projection();
             // Never ask for more output than the window has room for (L2.21): 15% of the
             // estimate (at least 4096) spare for its error, since some providers count input
             // higher (OpenRouter, pi #10497), and at most 32k once the room is short.
@@ -2294,36 +2136,6 @@ impl Agent {
                 _ = cancel.cancelled() => return failed(&self.cfg, ErrorKind::Aborted, "aborted during retry wait"),
             }
         }
-    }
-
-    /// A silent check's `OK` (`context_window::Quiet`): kept on record, hidden from the
-    /// windows and the model together with its note.
-    fn hide_ok(&mut self, m: AssistantMessage, note: String) {
-        self.emit(AgentEvent::Stream(StreamEvent::RetryRollback));
-        let id = self.add_as(
-            EntryKind::Message {
-                message: Message::Assistant(m),
-            },
-            false,
-        );
-        for target in [note, id] {
-            self.add(EntryKind::ContextEdit { target, replace: None });
-        }
-        if let Some(q) = self.context.as_ref().and_then(|c| c.quiet.as_ref()) {
-            (q.on_ok)();
-        }
-    }
-
-    /// Plain text in a `context_window::Plain` window: saved, never shown raw. The windows
-    /// drop what it streamed and get no message event.
-    fn hold_plain(&mut self, m: AssistantMessage) -> String {
-        self.emit(AgentEvent::Stream(StreamEvent::RetryRollback));
-        self.add_as(
-            EntryKind::Message {
-                message: Message::Assistant(m),
-            },
-            false,
-        )
     }
 
     /// Keep a failed attempt on record, hidden from the model. It is asked for again,
@@ -2918,7 +2730,7 @@ impl SessionHandle {
     }
 
     /// Drop every queued follow-up and steer, images too, so an abort right after starts no
-    /// run (super's Stop, L10.9). Dropped prompts never reach the model or `AgentEnd.prompts`.
+    /// run. Dropped prompts never reach the model or `AgentEnd.prompts`.
     pub fn drop_follow_ups(&self) {
         let mut q = self.shared.queues.lock().unwrap();
         q.follow_up.clear();
@@ -3018,24 +2830,17 @@ pub fn spawn(agent: Agent) -> (SessionHandle, tokio::task::JoinHandle<Agent>) {
             agent.flush_ext_state();
             agent.collect_notes(false).await;
             if let Some(name) = agent.shared.rename.lock().unwrap().take() {
-                if let Some(fixed) = &agent.fixed_name {
-                    agent.emit(AgentEvent::Stream(StreamEvent::Notice {
-                        text: format!("this session's name is fixed as \"{fixed}\"; /name cannot change it"),
-                    }));
-                } else {
-                    log_err(agent.store.append(crate::session::EntryKind::SessionInfo {
-                        name: name.clone(),
-                        auto: false,
-                    }));
-                    agent.emit(AgentEvent::Stream(StreamEvent::Notice {
-                        text: format!("session named \"{name}\""),
-                    }));
-                    agent.emit(AgentEvent::SessionNamed { name });
-                }
+                log_err(agent.store.append(crate::session::EntryKind::SessionInfo {
+                    name: name.clone(),
+                    auto: false,
+                }));
+                agent.emit(AgentEvent::Stream(StreamEvent::Notice {
+                    text: format!("session named \"{name}\""),
+                }));
+                agent.emit(AgentEvent::SessionNamed { name });
             }
             let auto = agent.shared.auto_name.lock().unwrap().take();
             if let Some(name) = auto
-                && agent.fixed_name.is_none()
                 && agent.store.name().is_none_or(|(_, auto)| auto)
             {
                 log_err(agent.store.append(crate::session::EntryKind::SessionInfo {

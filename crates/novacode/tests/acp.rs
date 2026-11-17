@@ -16,8 +16,6 @@ fn start(cwd: &std::path::Path, home: &std::path::Path, script: &std::path::Path
         .current_dir(cwd)
         .env("NOVACODE_HOME", home)
         .env("NOVACODE_FAUX_SCRIPT", script)
-        .env_remove("NOVACODE_FAUX_SCRIPT_DIR")
-        .env_remove("NOVACODE_TASK")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()

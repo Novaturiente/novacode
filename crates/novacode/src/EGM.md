@@ -2,12 +2,12 @@
 
 ## Overview
 
-This folder is the `novacode` binary crate. It holds the clap CLI, the print/JSON/RPC/background/super run modes, the live-session host and hub, the wire protocol, subagents, goals, logins, and the maintenance subcommands. The engine, tools and TUI live in the sibling crates `novacode-core`, `novacode-tools`, `novacode-tui`, `novacode-ai` and `novacode-base`.
+This folder is the `novacode` binary crate. It holds the clap CLI, the print/JSON/RPC/background run modes, the live-session host and hub, the wire protocol, subagents, goals, logins, and the maintenance subcommands. The engine, tools and TUI live in the sibling crates `novacode-core`, `novacode-tools`, `novacode-tui`, `novacode-ai` and `novacode-base`.
 
 ## Interface
 
 - `main.rs`: the `Cli` struct (clap) and `fn main`/`run`.
-  - Flags: `-p/--print`, `-m/--model`, `-c/--continue`, `-r/--resume`, `-w/--worktree`, `--mode`, `--profile`, `--json`, `--rpc`, `--bg`, `--super`, `--trust`, `-v/--verbose`, `--no-session`, `--no-context-files`, `--api-key`, `--trace` and `--profile-startup`. Hidden: `--agent`, `--tools`, `--mcp`, `--super-serve`, `--super-resume`, `--super-upgraded`.
+  - Flags: `-p/--print`, `-m/--model`, `-c/--continue`, `-r/--resume`, `-w/--worktree`, `--mode`, `--profile`, `--json`, `--rpc`, `--bg`, `--trust`, `-v/--verbose`, `--no-session`, `--no-context-files`, `--api-key`, `--trace` and `--profile-startup`. Hidden: `--agent`, `--tools`, `--mcp`.
   - Subcommands: `login`, `logout`, `models`, `auth status`, `doctor`, `export`, `attach`, `panel`, `agents`, `restore`, `stop`, `status`, `debug bundle`, `stats`, `install`, `uninstall`, `update`, `packages`, `mcp`, `import claude`, `trust`, `shell-init`. Hidden: `claude-hook`, `debug crash`.
 - `wire.rs`: the JSONL wire protocol (L8.7), `PROTOCOL = 1`.
   - Types: `ServerMsg`, `ClientCmd`, `Request`, `State`, `Activity`/`ActState`, `CacheStats`, `ClientToolDef`.
@@ -30,7 +30,7 @@ This folder is the `novacode` binary crate. It holds the clap CLI, the print/JSO
   - `Def`, `defs`, `configure`, `grant`, `Claims`, `Supervisor`, `Setup`, `Place`.
   - `AgentTool` is the `agent` tool, `AgentCfg` its config, and `ModelLookup`/`ModelCheck` are model callback types.
   - `MAX_DEPTH = 2`.
-- `relay.rs`: `Card`, `Label` and `relay(asker, approver, card, label)` re-open a child's cards in the parent. Shared by `agents.rs` and `superagent/link.rs`.
+- `relay.rs`: `Card`, `Label` and `relay(asker, approver, card, label)` re-open a child's cards in the parent. Used by `agents.rs`.
 - `goals.rs`: `/goal`.
   - `Goals`, `Goal`, `State`, `Judge`, `Config`.
   - `GoalTool` is the `goal` tool, and `START_NOTE` is the start note.
@@ -39,7 +39,7 @@ This folder is the `novacode` binary crate. It holds the clap CLI, the print/JSO
   - `Limits`, `price`, `spent`, `usable`, `session_route`, `spawn_check`.
   - `switch`, `helper`, `list`, `command`.
 - `login.rs`: `oauth`, `check_key`, `methods`, `providers`, `key_note`, `print_step`, `catch_or_input`, `stdin_lines`, `Io`.
-- `activity.rs`: `Sinks` (`for_window`/`for_attach`/`headless`) with `spawn`, `follow`, `desktop` and `project`. These cover tmux, herdr, `hooks.onActivity` and notifications.
+- `activity.rs`: `Sinks` (`for_window`/`for_attach`/`headless`) with `spawn`, `follow` and `project`. These cover tmux, herdr, `hooks.onActivity` and notifications.
 - Maintenance commands, one per file:
   - `doctor.rs`: `auth_status`, `doctor`.
   - `diag.rs`: `install_crash_hook`, `bundle`, `gather`, `scrub`, `mark`, `profile`.
@@ -50,14 +50,13 @@ This folder is the `novacode` binary crate. It holds the clap CLI, the print/JSO
   - `update.rs`: `run`, `check`, `newer`, `install_kind`, `REPO`.
   - `updates.rs`: `at_start`, `enabled`, `path`, `Cache`.
   - `usage.rs`: `report`, `quotas`.
-- `superagent/`: super mode (L10.9). See [superagent](./superagent/EGM.md).
 
 ## Invariants
 
-- The wire protocol is a public surface. Changes must keep `tests/wire.snap.jsonl` passing. `PROTOCOL` is a plain number. `attach` refuses any `hello.protocol` other than `PROTOCOL`; the subagent supervisor and the super task links read `Hello` but don't check `protocol`.
+- The wire protocol is a public surface. Changes must keep `tests/wire.snap.jsonl` passing. `PROTOCOL` is a plain number. `attach` refuses any `hello.protocol` other than `PROTOCOL`; the subagent supervisor reads `Hello` but doesn't check `protocol`.
 - The hub fans events out to every client in order. Activity sinks run in one task each, so updates stay in order.
 - Subagent depth is capped at `MAX_DEPTH = 2`. A child (`novacode --rpc`, piped stdio) dies with its parent.
-- Card relay has a single implementation (`relay.rs`), shared by subagents and super tasks.
+- Card relay has a single implementation (`relay.rs`), used by subagents.
 - `novacode update` only replaces release installs. It never overwrites AUR or source builds, and never touches `~/.novacode`.
 - The update check asks at most once per 24 h, cached in `~/.novacode/cache/updates.json`. It never installs anything.
 - Schedules live in tool-result details in the session file. There is no system cron.

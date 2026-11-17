@@ -213,13 +213,6 @@ pub fn context_files(cwd: &Path, home: &Path) -> Vec<(PathBuf, String)> {
 /// Context file names, one per folder, the first found winning.
 const NAMES: [&str; 5] = ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
 
-/// The global context file of novacode's `home` alone (super mode, L10.9).
-pub fn global_file(home: &Path) -> Option<(PathBuf, String)> {
-    let p = NAMES.iter().map(|n| home.join(n)).find(|p| p.is_file())?;
-    let text = std::fs::read_to_string(&p).ok().filter(|t| !t.trim().is_empty())?;
-    Some((p, text))
-}
-
 /// `(worktree root, main checkout root)` when `cwd` is in a linked git worktree
 /// (`.git` file pointing at `<main>/.git/worktrees/<name>`). Submodules don't match.
 fn nested_worktree(cwd: &Path) -> Option<(PathBuf, PathBuf)> {

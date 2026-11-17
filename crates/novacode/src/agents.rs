@@ -689,8 +689,6 @@ struct Cfg {
     policy: Arc<novacode_core::policy::Policy>,
     /// `worktree.copy`: untracked files copied into a child's worktree.
     worktree_copy: Vec<String>,
-    /// Super mode's root (see [`Setup::root`]).
-    root: Option<PathBuf>,
 }
 
 impl Cfg {
@@ -714,7 +712,6 @@ impl Cfg {
             env: s.env,
             policy: s.policy,
             worktree_copy: s.worktree_copy,
-            root: s.root,
         }
     }
 }
@@ -746,10 +743,6 @@ pub struct Setup {
     pub policy: Arc<novacode_core::policy::Policy>,
     /// `worktree.copy`, passed to `worktree::create_new`.
     pub worktree_copy: Vec<String>,
-    /// Super mode (L10.9): children run only in this folder or below it (symlinks
-    /// resolved), each with its own folder's trust and MCP servers, and the regular tool
-    /// set as ceiling instead of this session's own tools.
-    pub root: Option<PathBuf>,
 }
 
 impl Supervisor {
@@ -990,31 +983,8 @@ impl Supervisor {
             Some(c) => at(&cfg.cwd, c),
             None => cfg.cwd.clone(),
         };
-        // Super's scouts: its target folder's trust and servers, no cap from super's tools.
-        let (trusted, own, servers, def) = match &cfg.root {
-            Some(root) => {
-                cwd = in_root(root, &cwd)?;
-                let store = novacode_core::trust::TrustStore::new(self.home.join("trust.json"));
-                let trusted = novacode_core::trust::resolve(&store, &cwd, false);
-                let servers: Vec<String> = novacode_core::mcp::load(&self.home, &cwd, trusted)
-                    .0
-                    .into_iter()
-                    .map(|c| c.name)
-                    .collect();
-                let mut def = def.clone();
-                def.mcp = servers.clone();
-                // D2: every tool a regular session in that folder has (a scout gets bash too).
-                def.tools = None;
-                (trusted, None, servers, std::borrow::Cow::Owned(def))
-            }
-            None => (
-                cfg.trusted,
-                cfg.own.clone(),
-                cfg.servers.clone(),
-                std::borrow::Cow::Borrowed(def),
-            ),
-        };
-        let (mut tools, mcp, mut notes) = grant(&def, a.tools, a.mcp, cfg.parent_picks, own.as_deref(), &servers);
+        let (trusted, own, servers) = (cfg.trusted, cfg.own.clone(), cfg.servers.clone());
+        let (mut tools, mcp, mut notes) = grant(def, a.tools, a.mcp, cfg.parent_picks, own.as_deref(), &servers);
         // `models.deny` (L2.28): a model asked for is refused; a type's own falls back, visibly.
         if let Err(e) = (cfg.allow)(&model) {
             if asked {
@@ -1230,8 +1200,6 @@ impl Supervisor {
         let mut chain = self.place.chain.clone();
         chain.push(self.me.clone());
         cmd.envs(&self.c().env);
-        // A super task's subagents can't report for it (L10.9).
-        novacode_base::platform::drop_task_vars(cmd.as_std_mut());
         cmd.current_dir(&cwd)
             .env("NOVACODE_HOME", &self.home)
             .env("NOVACODE_AGENT_DEPTH", (self.place.depth + 1).to_string())
@@ -1628,20 +1596,6 @@ fn dur(ms: u64) -> String {
     }
 }
 
-/// Super mode: `cwd` resolved (symlinks followed), refused outside `root`.
-fn in_root(root: &Path, cwd: &Path) -> Result<PathBuf, String> {
-    let real = novacode_base::platform::canonicalize(cwd).map_err(|e| format!("`{}`: {e}", cwd.display()))?;
-    let root = novacode_base::platform::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    if !real.starts_with(&root) {
-        return Err(format!(
-            "`{}` is outside the super root {}: subagents run only there",
-            real.display(),
-            root.display()
-        ));
-    }
-    Ok(real)
-}
-
 fn at(cwd: &Path, p: &str) -> PathBuf {
     match p.strip_prefix("~/") {
         Some(rest) => novacode_base::platform::home().unwrap_or_default().join(rest),
@@ -1690,13 +1644,7 @@ struct SpawnArgs {
 pub struct AgentTool {
     pub sup: Arc<Supervisor>,
     description: String,
-    /// Has `wait`; super's has none (L10.9): its reports arrive on their own and wake it.
-    waits: bool,
 }
-
-/// Super's answer to `agent wait`.
-const SUPER_NO_WAIT: &str =
-    "super has no `agent wait`: reports arrive on their own and wake you; end your turn instead";
 
 impl AgentTool {
     pub fn new(sup: Arc<Supervisor>) -> Self {
@@ -1735,14 +1683,8 @@ impl AgentTool {
                 "A subagent sees only its type's tools (in brackets below).".to_string(),
             )
         };
-        // Super (the only one with a root) never blocks on its scouts.
-        let waits = cfg.root.is_none();
-        let wait = match waits {
-            true => "wait {ids?, any?, timeout?} (blocks until reports arrive, default all, 600 s); ",
-            false => "",
-        };
+        let wait = "wait {ids?, any?, timeout?} (blocks until reports arrive, default all, 600 s); ";
         AgentTool {
-            waits,
             description: format!(
                 "Run subagents: separate novacode sessions that work in the background and report back.\n\
                  Actions: spawn {{task, title?, agent?, model?, cwd?, after?: [ids], notify?: wake|next|quiet, worktree?{pick}}} → id; \
@@ -1766,10 +1708,7 @@ impl Tool for AgentTool {
         &self.description
     }
     fn schema(&self) -> Value {
-        let mut actions = vec!["spawn", "list", "status", "log", "read", "send", "wait", "stop"];
-        if !self.waits {
-            actions.retain(|a| *a != "wait");
-        }
+        let actions = ["spawn", "list", "status", "log", "read", "send", "wait", "stop"];
         json!({
             "type": "object",
             "properties": {
@@ -1882,7 +1821,6 @@ impl Tool for AgentTool {
                         Err(e) => ToolOutput::error(e),
                     }
                 }
-                "wait" if !self.waits => ToolOutput::error(SUPER_NO_WAIT),
                 "wait" => {
                     let ids: Vec<String> = args["ids"]
                         .as_array()
@@ -1952,7 +1890,7 @@ mod tests {
             "    time.sleep(0.3)".into(),
             format!("    print({:?}, flush=True)", ev(AgentEvent::AgentStart)),
             format!(
-                "    print({reply:?}.replace('REPLY', os.getcwd() + ' :: ' + m['text'].split(chr(10))[-1] + os.environ.get('NC_ENV', '') + os.environ.get('NOVACODE_TASK', '') + ' ARGS ' + ' '.join(sys.argv[1:])), flush=True)"
+                "    print({reply:?}.replace('REPLY', os.getcwd() + ' :: ' + m['text'].split(chr(10))[-1] + os.environ.get('NC_ENV', '') + ' ARGS ' + ' '.join(sys.argv[1:])), flush=True)"
             ),
             format!("    print({:?}, flush=True)", ev(AgentEvent::Settled)),
         ];
@@ -1987,7 +1925,6 @@ mod tests {
             }),
             skill_dirs: vec![],
             worktree_copy: vec![],
-            root: None,
             max_running: 4,
             exe: Some(fake_child(&tmp)),
             nerd: false,
@@ -2017,85 +1954,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// L10.9 scouts: super's subagents run only inside its root, and each gets its target
-    /// folder's trust and MCP servers (global plus project), not super's (none).
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn super_scouts_get_their_folders_mcp_and_trust_inside_the_root_only() {
-        let tmp = std::env::temp_dir().join(format!("nc-sup-scout-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let (home, root, outside) = (tmp.join("home"), tmp.join("root"), tmp.join("outside"));
-        let (proj, plain) = (root.join("proj"), root.join("plain"));
-        for d in [&home, &proj, &plain, &outside] {
-            std::fs::create_dir_all(d).unwrap();
-        }
-        let server = |name: &str| json!({"mcpServers": {name: {"command": "true"}}}).to_string();
-        std::fs::write(home.join("mcp.json"), server("globsrv")).unwrap();
-        std::fs::write(proj.join(".mcp.json"), server("projsrv")).unwrap();
-        std::fs::write(plain.join(".mcp.json"), server("untrusted")).unwrap();
-        novacode_core::trust::TrustStore::new(home.join("trust.json"))
-            .set(&proj, true)
-            .unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
-        let sup = Supervisor::new(Setup {
-            slot: HubSlot::default(),
-            unattended: false,
-            me: "ROOT".into(),
-            home: home.clone(),
-            cwd: root.clone(),
-            trusted: false,
-            defs: defs(&[]).0,
-            parent_picks: true,
-            servers: vec![],
-            stall_min: 10,
-            timeout_min: 45,
-            models: Arc::new(|_: &str, _: &str| None),
-            allow: Arc::new(|_: &str| Ok(())),
-            skill_dirs: vec![],
-            worktree_copy: vec![],
-            max_running: 4,
-            exe: Some(fake_child(&tmp)),
-            nerd: false,
-            env: Default::default(),
-            policy: Arc::new(novacode_core::policy::Policy::new(
-                Default::default(),
-                tmp.clone(),
-                None,
-            )),
-            root: Some(root.clone()),
-        });
-        // Super's own tool list (its 5) is not the children's ceiling.
-        sup.set_own_tools(vec!["task".into(), "agent".into()]);
-        let spawn = |cwd: &str| {
-            sup.spawn(
-                serde_json::from_value(json!({"task": "t", "agent": "scout", "cwd": cwd, "model": "p/m"})).unwrap(),
-            )
-        };
-        for bad in [outside.to_str().unwrap(), "link", "../outside", "missing"] {
-            let err = spawn(bad).unwrap_err();
-            assert!(err.contains("root") || err.contains("missing"), "{bad}: {err}");
-        }
-        let (p, _) = spawn("proj").unwrap();
-        let (q, _) = spawn("plain").unwrap();
-        let out = sup.wait(vec![p.clone()], false, Duration::from_secs(20)).await;
-        assert!(
-            out.contains("--mcp=globsrv,projsrv ") && out.contains(" --trust"),
-            "the trusted project's servers and trust: {out}"
-        );
-        // D2 (novahome findings): a regular session's whole tool set, bash included, not the
-        // scout type's read-only list.
-        assert!(
-            out.contains("--tools=* ") && !out.contains("--tools=read,"),
-            "every tool of a regular session: {out}"
-        );
-        let out = sup.wait(vec![q], false, Duration::from_secs(20)).await;
-        assert!(
-            out.contains("--mcp=globsrv") && !out.contains("untrusted") && !out.contains("--trust"),
-            "an untrusted folder: global servers only: {out}"
-        );
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn spawn_after_wait_and_send() {
@@ -2121,12 +1979,7 @@ mod tests {
             max_running: 4,
             exe: Some(fake_child(&tmp)),
             nerd: false,
-            env: [
-                ("NC_ENV".to_string(), " env-set".to_string()),
-                ("NOVACODE_TASK".to_string(), " task-leak".to_string()),
-            ]
-            .into(),
-            root: None,
+            env: [("NC_ENV".to_string(), " env-set".to_string())].into(),
             policy: Arc::new(novacode_core::policy::Policy::new(
                 Default::default(),
                 tmp.clone(),
@@ -2152,10 +2005,6 @@ mod tests {
             out.matches(" env-set").count(),
             3,
             "`agents.env` reaches every child: {out}"
-        );
-        assert!(
-            !out.contains("task-leak"),
-            "a task's identity never reaches its subagents: {out}"
         );
         assert_eq!(sup.children.lock().unwrap().len(), 3);
         let started: Vec<u64> = ["a1", "a2", "a3"]
@@ -2222,7 +2071,6 @@ mod tests {
             skill_dirs: vec![],
             max_running: 2,
             worktree_copy: vec![],
-            root: None,
             exe: Some(exe),
             nerd: false,
             env: Default::default(),
@@ -2272,43 +2120,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// L10.9: super's `agent` tool has no `wait`: reports arrive on their own.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn super_has_no_agent_wait() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ctx = ToolCtx {
-            cwd: tmp.path().to_path_buf(),
-            env: Arc::new(novacode_tools::LocalEnv),
-            cancel: Default::default(),
-            updates: None,
-            files: Default::default(),
-            session_id: "s".into(),
-            processes: None,
-            native_tools: false,
-            nested: None,
-            script: false,
-        };
-        let normal = AgentTool::new(Supervisor::new(test_setup(tmp.path(), "/bin/false".into())));
-        assert!(
-            normal.schema()["properties"]["action"]["enum"]
-                .to_string()
-                .contains("wait")
-        );
-        let mut setup = test_setup(tmp.path(), "/bin/false".into());
-        setup.root = Some(tmp.path().to_path_buf());
-        let sup = AgentTool::new(Supervisor::new(setup));
-        assert!(
-            !sup.schema()["properties"]["action"]["enum"]
-                .to_string()
-                .contains("wait")
-        );
-        assert!(!sup.description().contains("wait {"), "{}", sup.description());
-        let out = sup.execute(json!({"action": "wait"}), &ctx).await;
-        let text = serde_json::to_string(&out.content).unwrap();
-        assert!(out.is_error && text.contains("reports arrive on their own"), "{text}");
-    }
-
     #[cfg(unix)]
     fn test_setup(tmp: &Path, exe: PathBuf) -> Setup {
         Setup {
@@ -2328,7 +2139,6 @@ mod tests {
             skill_dirs: vec![],
             max_running: 4,
             worktree_copy: vec![],
-            root: None,
             exe: Some(exe),
             nerd: false,
             env: Default::default(),

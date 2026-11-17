@@ -41,8 +41,6 @@ struct Inner {
     asks: BTreeMap<u64, (ServerMsg, AskReply)>,
     /// The owner's own TUI, if any: gets approvals and remote state changes.
     local: Option<mpsc::UnboundedSender<UiEvent>>,
-    /// Super's latest board snapshot (L10.9), for late windows.
-    board: Option<ServerMsg>,
     closed: bool,
     /// [`Hub::stop`] ran: cards close unanswered, new ones too.
     stopping: bool,
@@ -57,12 +55,7 @@ pub struct Hub {
     focused: std::sync::atomic::AtomicBool,
     /// Print mode: no window will ever answer, so approvals and questions are refused at once.
     pub unattended: std::sync::atomic::AtomicBool,
-    /// Super's `/dismiss <id>` (L10.9 Needs you): takes the row off its board; false when not there.
-    pub dismiss: std::sync::OnceLock<Dismiss>,
 }
-
-/// Takes a Needs you row off super's board by id; false when it isn't there.
-pub type Dismiss = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// Compactions on a session branch (L9.19): the hub state's `compactions` at start.
 pub fn compactions(branch: &[&novacode_core::session::Entry]) -> u32 {
@@ -103,7 +96,6 @@ impl Hub {
                 approvals: BTreeMap::new(),
                 asks: BTreeMap::new(),
                 local,
-                board: None,
                 closed: false,
                 stopping: false,
             }),
@@ -112,7 +104,6 @@ impl Hub {
             changed: tokio::sync::watch::channel(state).0,
             focused: true.into(),
             unattended: false.into(),
-            dismiss: Default::default(),
         });
         let h = Arc::downgrade(&hub);
         tokio::spawn(async move {
@@ -301,7 +292,6 @@ impl Hub {
         first.extend(g.tail.iter().map(|e| ServerMsg::Event { event: e.clone() }));
         first.extend(g.approvals.values().map(|p| p.msg.clone()));
         first.extend(g.asks.values().map(|(m, _)| m.clone()));
-        first.extend(g.board.clone());
         if g.closed {
             first.push(ServerMsg::Bye {
                 reason: "session ended".into(),
@@ -311,25 +301,6 @@ impl Hub {
         g.next_client += 1;
         g.clients.insert(id, tx.clone());
         (id, first, tx, rx)
-    }
-
-    /// Super's board changed (L10.9): every window's Tasks tab gets the new rows,
-    /// and windows that connect later get the latest.
-    #[cfg(feature = "super")]
-    pub fn set_board(&self, tasks: Vec<novacode_tui::panel::TaskRow>, needs: Vec<novacode_tui::panel::NeedRow>) {
-        let Ok(ui) = serde_json::to_value(UiEvent::Board {
-            tasks: tasks.clone(),
-            needs: needs.clone(),
-        }) else {
-            return;
-        };
-        let mut g = self.inner.lock().unwrap();
-        let msg = ServerMsg::Ui { ui };
-        g.clients.retain(|_, c| c.send(msg.clone()).is_ok());
-        g.board = Some(msg);
-        if let Some(l) = &g.local {
-            let _ = l.send(UiEvent::Board { tasks, needs });
-        }
     }
 
     pub fn disconnect(&self, id: u64) {
@@ -585,7 +556,7 @@ impl Drop for Open {
 
 /// The session's approver: every window of the hub (L6.1, L8.13). The hub is
 /// created after the agent (it needs the handle), so it is found through this slot.
-/// Cards opened before the hub starts (super's restart recovery, L10.9 R10) wait for it.
+/// Cards opened before the hub starts wait for it.
 #[derive(Clone, Default)]
 pub struct HubSlot(
     pub Arc<std::sync::OnceLock<std::sync::Weak<Hub>>>,

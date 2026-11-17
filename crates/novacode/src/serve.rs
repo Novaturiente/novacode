@@ -209,7 +209,7 @@ impl novacode_tools::Tool for ClientTool {
     }
 }
 
-/// `id` = the request's id, echoed on the `agent_end` of the run that takes a prompt or steer (L10.9).
+/// `id` = the request's id, echoed on the `agent_end` of the run that takes a prompt or steer.
 async fn dispatch(
     host: &Arc<Host>,
     cmd: ClientCmd,
@@ -573,38 +573,6 @@ pub fn find_live(paths: &Paths, prefix: &str) -> anyhow::Result<RunFile> {
     }
 }
 
-/// Whether the live session `id` is shutting down (`novacode stop` just reached it): its
-/// socket is gone or says bye before it answers a state request. Unsure (no answer in 2 s): no.
-#[cfg(feature = "super")]
-pub async fn closing(paths: &Paths, id: &str) -> bool {
-    let Ok(f) = find_live(paths, id) else { return true };
-    let Ok(stream) = connect(&f.socket).await else {
-        return true;
-    };
-    let (r, mut w) = tokio::io::split(stream);
-    let probe = Request {
-        id: Some("probe".into()),
-        cmd: ClientCmd::GetState,
-    };
-    if w.write_all(line(&probe).as_bytes()).await.is_err() || w.flush().await.is_err() {
-        return true;
-    }
-    let mut lines = BufReader::new(r).lines();
-    let answer = async {
-        while let Ok(Some(l)) = lines.next_line().await {
-            match serde_json::from_str::<ServerMsg>(&l) {
-                Ok(ServerMsg::Bye { .. }) => return true,
-                Ok(ServerMsg::Response { id: Some(rid), .. }) if rid == "probe" => return false,
-                _ => {}
-            }
-        }
-        true
-    };
-    tokio::time::timeout(std::time::Duration::from_secs(2), answer)
-        .await
-        .unwrap_or(false)
-}
-
 /// `novacode agents`: live sessions on this machine.
 pub fn agents(paths: &Paths) -> std::process::ExitCode {
     let all = live_sessions(paths);
@@ -689,13 +657,6 @@ pub async fn attach(
     let id = state.session.clone();
     let (etx, erx) = mpsc::unbounded_channel();
     let (ui_tx, ui_rx) = mpsc::unbounded_channel();
-    // "New since you last looked" (L10.9): when this user's windows last saw the session.
-    let seen = seen_file(paths, &id);
-    if let Some(ms) = read_seen(&seen) {
-        let _ = ui_tx.send(UiEvent::Seen { ms });
-    }
-    let focused = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let (seen_at_end, focused_at_end) = (seen.clone(), focused.clone());
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Cmd>();
     let (req_tx, mut req_rx) = mpsc::unbounded_channel::<Request>();
     tokio::spawn(async move {
@@ -708,8 +669,6 @@ pub async fn attach(
     let approvals = req_tx.clone();
     let killed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let killed_tx = killed.clone();
-    #[cfg(feature = "super")]
-    let (home, kill_id) = (paths.home().to_path_buf(), id.clone());
     let mut last = state.clone();
     let bye: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
     let bye_seen = bye.clone();
@@ -888,13 +847,8 @@ pub async fn attach(
                     height,
                 },
                 // The session-swapping commands are refused by the attached TUI itself.
-                // Focus moving in or out: the user saw the session until now.
-                Cmd::Focus(f) => {
-                    focused.store(f, std::sync::atomic::Ordering::Relaxed);
-                    write_seen(&seen);
-                    continue;
-                }
-                Cmd::ListSessions
+                Cmd::Focus(_)
+                | Cmd::ListSessions
                 | Cmd::ListPrompts(_)
                 | Cmd::Background
                 | Cmd::Processes
@@ -906,11 +860,9 @@ pub async fn attach(
                 | Cmd::LoginCancel
                 | Cmd::FileStats(_)
                 | Cmd::OpenFile(_) => continue,
-                // `/kill` (L9): end the session like `novacode stop`; a super's next start is a new session.
+                // `/kill` (L9): end the session like `novacode stop`.
                 Cmd::Kill => {
                     killed_tx.store(true, std::sync::atomic::Ordering::Relaxed);
-                    #[cfg(feature = "super")]
-                    crate::superagent::entry::mark_fresh(&home, &kill_id);
                     ClientCmd::Shutdown
                 }
                 Cmd::Quit => break,
@@ -950,9 +902,6 @@ pub async fn attach(
         procs: Vec::new(),
     };
     let ran = novacode_tui::run(init, erx, ui_rx, cmd_tx).await;
-    if focused_at_end.load(std::sync::atomic::Ordering::Relaxed) {
-        write_seen(&seen_at_end);
-    }
     // Closing the feed ends the sinks, which clear the pane options.
     reader.abort();
     if let Some(s) = sinks {
@@ -972,23 +921,6 @@ pub async fn attach(
         ),
     }
     Ok(Some(std::process::ExitCode::SUCCESS))
-}
-
-/// `<home>/seen/<session>`: Unix ms an attach window of this user last saw the session
-/// (it lost focus or closed). Read on attach for the "new since you last looked" divider.
-fn seen_file(paths: &Paths, session: &str) -> PathBuf {
-    paths.home().join("seen").join(session)
-}
-
-fn read_seen(f: &Path) -> Option<u64> {
-    std::fs::read_to_string(f).ok()?.trim().parse().ok()
-}
-
-fn write_seen(f: &Path) {
-    if let Some(dir) = f.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(f, novacode_core::session::now_ms().to_string());
 }
 
 /// `attach`/`panel`, reconnecting while the owner rebuilds the same session.
@@ -1024,8 +956,7 @@ pub async fn attach_loop(
     }
 }
 
-/// How long a window waits for a reloading session (a super restarting on its upgraded
-/// binary loads its board and tasks first).
+/// How long a window waits for a reloading session.
 const RELOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A connect error that means the session's socket isn't listening yet (or is gone).
@@ -1092,7 +1023,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ST11 (L10.9): `set_goal` over the socket starts an active goal with the given
+    /// `set_goal` over the socket starts an active goal with the given
     /// criteria, already approved: the model is told so, and no ask card opens.
     #[tokio::test]
     async fn set_goal_starts_an_approved_goal_without_asking() {

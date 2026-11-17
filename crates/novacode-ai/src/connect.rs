@@ -372,7 +372,7 @@ impl Providers {
     }
 }
 
-/// The hidden scripted provider (`faux/script`, L10.9): no profile, so no picker lists it.
+/// The hidden scripted provider (`faux/script`): no profile, so no picker lists it.
 const FAUX: &str = "faux";
 
 /// `*` matches any run of characters (`/` too), `?` one character.

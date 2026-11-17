@@ -647,7 +647,7 @@ impl Goals {
         self.update(|g| *g = Some(Goal::new(objective, vec![], false, audit)));
     }
 
-    /// `set_goal` (L10.9): start a goal whose criteria the user already approved
+    /// `set_goal`: start a goal whose criteria the user already approved
     /// elsewhere. Returns the hidden note that tells the model so.
     pub fn start_approved(&self, objective: String, criteria: Vec<String>) -> String {
         self.recent.lock().unwrap().clear();

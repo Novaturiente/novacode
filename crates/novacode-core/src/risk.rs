@@ -2641,12 +2641,12 @@ mod tests {
         }
     }
 
-    /// Novahome findings (L5): in `~/.novacode` only the secrets are refused; run state,
-    /// super's folders and review scratch follow the normal rules.
+    /// Novahome findings (L5): in `~/.novacode` only the secrets are refused; run state
+    /// and scratch folders follow the normal rules.
     #[test]
     fn novacode_folder_protects_only_its_secrets() {
         let protected = vec![];
-        let work = Path::new("/home/u/.novacode/super/h1/review/T2-ab/work");
+        let work = Path::new("/home/u/.novacode/scratch/work");
         let ctx = Ctx {
             cwd: work,
             home: Path::new("/home/u"),
@@ -2657,7 +2657,7 @@ mod tests {
             "rm ~/.novacode/run/claims/a1b2.json",
             "rm -f /home/u/.novacode/run/claims/a1b2.json.bak",
             "ln -s /home/u/proj/node_modules node_modules",
-            "mv /tmp/x ~/.novacode/super/h1/diff.patch",
+            "mv /tmp/x ~/.novacode/scratch/diff.patch",
             "cp -a node_modules ./node_modules",
             "rm -rf ~/.novacode/sessions/old",
             "mkdir scratch",

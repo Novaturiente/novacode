@@ -30,7 +30,7 @@ Shared foundations (layer L0) used by the rest of novacode: home and project pat
 ## Side Effects
 - Disk: atomic writes, `.bak` files, `.lock` files, JSONL appends, chmod (`set_mode`), dir symlinks/junctions (`link_dir`).
 - Logging: daily-rotated files in `<home>/logs`; level from `NOVACODE_LOG` (EnvFilter syntax) when set; otherwise `info`, or `debug` when `trace` is on.
-- Processes: builds `git`, `bash`, `sh` `Command`s; `own_group` puts children in their own process group; `drop_task_vars` strips `NOVACODE_TASK`, `NOVACODE_TASK_TOKEN`, `NOVACODE_SUPER_DIR`.
+- Processes: builds `git`, `bash`, `sh` `Command`s; `own_group` puts children in their own process group.
 - Global state: the git pin table (`static PINS: Mutex<Vec<(root, common_dir)>>`) is process-wide.
 - Reads environment: `NOVACODE_HOME`, `HOME`, `NOVACODE_LOG`; on Windows also `USERPROFILE`, `NOVACODE_BASH` and `PATH` (to find Git Bash).
 

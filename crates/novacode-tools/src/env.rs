@@ -12,8 +12,6 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-pub use novacode_base::platform::TASK_VARS;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileMeta {
     pub len: u64,

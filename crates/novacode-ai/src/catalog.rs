@@ -36,7 +36,7 @@ pub enum Api {
     /// A program on stdio (L7.6, `process.rs`): `command`, `args`, `env` in the profile.
     #[serde(rename = "process")]
     Process,
-    /// The hidden `faux/script` model (L10.9, `faux.rs`): no profile can choose it.
+    /// The hidden `faux/script` model (`faux.rs`): no profile can choose it.
     #[serde(skip)]
     Faux,
 }

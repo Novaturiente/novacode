@@ -14,8 +14,6 @@ default = ["images", "highlight"]
 images = ["novacode-tools/images", "novacode-tui/images"]
 # Syntax highlighting in code blocks.
 highlight = ["novacode-tui/highlight"]
-# Super mode (L10.9): not ready for production, so off in release builds.
-super = []
 
 [dependencies]
 novacode-base.workspace = true

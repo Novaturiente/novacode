@@ -689,17 +689,6 @@ async fn prompt_changes_are_appended_deltas() {
 /// reported once, with its cause, in the transcript and in logs/cache-misses.jsonl.
 #[tokio::test]
 async fn cache_miss_is_named_and_logged() {
-    cache_miss_run(false).await;
-}
-
-/// S2 (live test): a window whose context is rebuilt on every request (super) misses the
-/// cache by design; the miss is logged but shows no notice there.
-#[tokio::test]
-async fn cache_miss_shows_no_notice_with_a_context_builder() {
-    cache_miss_run(true).await;
-}
-
-async fn cache_miss_run(rebuilt: bool) {
     let work = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let reply = |read, write| FauxReply::Message {
@@ -715,21 +704,13 @@ async fn cache_miss_run(rebuilt: bool) {
     // Turn 2 reads the whole cached prompt; turn 3 reads nothing.
     let faux = Faux::new([reply(0, 20_000), reply(20_010, 50), reply(0, 20_100)]);
     let store = Store::create(&Paths::new(home.path()), work.path(), false);
-    let mut agent = Agent::new(
+    let agent = Agent::new(
         Arc::new(faux),
         vec![],
         store,
         cfg(work.path(), home.path()),
         Arc::new(LocalEnv),
     );
-    if rebuilt {
-        agent = agent.with_context_builder(novacode_core::context_window::Builder {
-            budget: 6000,
-            state: Arc::new(|_: &Store| "BOARD".to_string()),
-            quiet: None,
-            plain: None,
-        });
-    }
     let (_agent, events) = drive(agent, &["one", "two", "three"]).await;
     let log = std::fs::read_to_string(home.path().join("logs/cache-misses.jsonl")).unwrap();
     assert!(log.contains("\"lost\":"), "{log}");
@@ -740,10 +721,6 @@ async fn cache_miss_run(rebuilt: bool) {
             _ => None,
         })
         .collect();
-    if rebuilt {
-        assert!(notices.is_empty(), "{notices:?}");
-        return;
-    }
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(
         notices[0].starts_with("cache miss: 20060 prompt tokens")
@@ -954,69 +931,6 @@ async fn session_is_named_by_the_small_model_unless_pinned() {
     assert_eq!(asked, 0);
 }
 
-/// Super names replace old conversation names on resume and cannot be changed.
-#[tokio::test]
-async fn fixed_super_name_survives_resume_and_refuses_renaming() {
-    use novacode_core::memory::{Settings, Worker};
-    use novacode_core::session::EntryKind;
-    for old in [None, Some(("conversation title", true)), Some(("custom title", false))] {
-        let work = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let mut store = Store::create(&Paths::new(home.path()), work.path(), false);
-        if let Some((name, auto)) = old {
-            store
-                .append(EntryKind::SessionInfo {
-                    name: name.into(),
-                    auto,
-                })
-                .unwrap();
-            store.flush().unwrap();
-            let path = store.path().unwrap().to_path_buf();
-            drop(store);
-            store = Store::open(&path).unwrap();
-        }
-        let namer = Faux::new([FauxReply::text("wrong title")]);
-        let asked = namer.requests.clone();
-        let agent = Agent::new(
-            Arc::new(Faux::new([FauxReply::text("hello")])),
-            vec![],
-            store,
-            cfg(work.path(), home.path()),
-            Arc::new(LocalEnv),
-        )
-        .with_fixed_name("Super · EEC-Learning".into())
-        .with_memory(
-            Worker {
-                adapter: Arc::new(namer),
-                provider: "faux".into(),
-                model: "small".into(),
-            },
-            Settings::for_window(200_000),
-        )
-        .with_auto_name();
-        assert_eq!(agent.store.name(), Some(("Super · EEC-Learning".into(), false)));
-        let (h, task) = agent::spawn(agent);
-        let mut rx = h.subscribe();
-        h.rename("replace the super name");
-        h.prompt("hello");
-        let mut refused = false;
-        loop {
-            match rx.recv().await.unwrap() {
-                AgentEvent::Stream(novacode_types::StreamEvent::Notice { text }) => {
-                    refused |= text.contains("fixed") && text.contains("Super · EEC-Learning");
-                }
-                AgentEvent::Settled => break,
-                _ => {}
-            }
-        }
-        h.shutdown();
-        let agent = task.await.unwrap();
-        assert!(refused, "manual rename must explain the fixed name");
-        assert_eq!(agent.store.name(), Some(("Super · EEC-Learning".into(), false)));
-        assert!(asked.lock().unwrap().is_empty(), "fixed names never call the namer");
-    }
-}
-
 /// M7 check: a long session compacts with no LLM call for the summary. The
 /// observer runs in the background as the session grows, catches up to the cut,
 /// and the next request carries the rendered notes plus the kept tail.
@@ -1220,455 +1134,6 @@ async fn context_that_cannot_shrink_compacts_once() {
     assert_eq!(n, 1, "compactions");
 }
 
-/// L10.9 super health checks: a reply of exactly `OK` right after a marked wake is hidden
-/// from the windows (rolled back, no message event), left out of later requests with its
-/// wake, and reported to the builder's callback. Other `OK`s and other check replies stay.
-#[tokio::test]
-async fn an_ok_reply_to_a_marked_check_is_hidden_and_left_out_of_the_context() {
-    use novacode_core::context_window::{Builder, Quiet};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let work = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
-    let main = Faux::new([
-        FauxReply::text("OK"),
-        FauxReply::text("OK"),
-        FauxReply::text("T1 looks stuck"),
-        FauxReply::text("done"),
-    ]);
-    let reqs = main.requests.clone();
-    let store = Store::create(&Paths::new(home.path()), work.path(), false);
-    let oks = Arc::new(AtomicUsize::new(0));
-    let o = oks.clone();
-    let agent = Agent::new(
-        Arc::new(main),
-        novacode_tools::builtins(false),
-        store,
-        cfg(work.path(), home.path()),
-        Arc::new(LocalEnv),
-    )
-    .with_context_builder(Builder {
-        budget: 6000,
-        state: Arc::new(|_: &Store| "BOARD".to_string()),
-        quiet: Some(Quiet {
-            marker: "[health check]".into(),
-            on_ok: Arc::new(move || {
-                o.fetch_add(1, Ordering::SeqCst);
-            }),
-        }),
-        plain: None,
-    });
-    let (h, task) = agent::spawn(agent);
-    let mut rx = h.subscribe();
-    async fn settled(rx: &mut tokio::sync::broadcast::Receiver<AgentEvent>) -> Vec<AgentEvent> {
-        let mut evs = Vec::new();
-        loop {
-            let ev = rx.recv().await.unwrap();
-            let done = matches!(ev, AgentEvent::Settled);
-            evs.push(ev);
-            if done {
-                return evs;
-            }
-        }
-    }
-    let wake = |text: &str| h.remind_as("super", text, true);
-    let replies = |evs: &[AgentEvent]| {
-        evs.iter()
-            .filter_map(|e| match e {
-                AgentEvent::Message(Message::Assistant(a)) => Some(a.text()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-    };
-    wake("[health check] first");
-    let evs = settled(&mut rx).await;
-    assert!(replies(&evs).is_empty(), "{evs:?}");
-    assert!(
-        evs.iter()
-            .any(|e| matches!(e, AgentEvent::Stream(novacode_types::StreamEvent::RetryRollback)))
-    );
-    assert_eq!(oks.load(Ordering::SeqCst), 1);
-    // An `OK` to another wake is a normal reply.
-    wake("T2 reported done");
-    let evs = settled(&mut rx).await;
-    assert_eq!(replies(&evs), ["OK"]);
-    // A check that finds a problem is shown.
-    wake("[health check] second");
-    let evs = settled(&mut rx).await;
-    assert_eq!(replies(&evs), ["T1 looks stuck"]);
-    assert_eq!(oks.load(Ordering::SeqCst), 1);
-    h.prompt("next");
-    settled(&mut rx).await;
-    h.shutdown();
-    let agent = task.await.unwrap();
-    let sent = format!("{:?}", reqs.lock().unwrap().last().unwrap().messages);
-    assert!(!sent.contains("first"), "{sent}");
-    assert!(
-        sent.contains("T2 reported done") && sent.contains("T1 looks stuck"),
-        "{sent}"
-    );
-    let oks_kept = agent
-        .store
-        .transcript()
-        .iter()
-        .filter(|m| matches!(m, Message::Assistant(a) if a.text() == "OK"))
-        .count();
-    assert_eq!(oks_kept, 1, "the hidden OK stays out of a reattached window");
-    // The session file keeps both.
-    assert_eq!(
-        agent
-            .store
-            .entries()
-            .iter()
-            .filter(|e| matches!(&e.kind, novacode_core::session::EntryKind::Message {
-                message: Message::Assistant(a)
-            } if a.text() == "OK"))
-            .count(),
-        2
-    );
-}
-
-/// L10.9 super's `say`: a run ending in plain text gets one nudge; plain text again is sent
-/// through the tool by code (thinking kept). A check's `OK` stays hidden and un-nudged, and
-/// an empty reply after a tool call gets no nudge.
-#[tokio::test]
-async fn plain_text_is_nudged_once_then_sent_as_a_note_and_a_check_ok_stays_quiet() {
-    use novacode_core::context_window::{Builder, Plain, Quiet};
-    use std::sync::Mutex;
-    struct Rec(Arc<Mutex<Vec<Value>>>);
-    impl novacode_tools::Tool for Rec {
-        fn name(&self) -> &str {
-            "say"
-        }
-        fn description(&self) -> &str {
-            "say"
-        }
-        fn schema(&self) -> Value {
-            json!({"type": "object"})
-        }
-        fn read_only(&self) -> bool {
-            true
-        }
-        fn execute<'a>(
-            &'a self,
-            args: Value,
-            _: &'a novacode_tools::ToolCtx,
-        ) -> futures_util::future::BoxFuture<'a, novacode_tools::ToolOutput> {
-            self.0.lock().unwrap().push(args);
-            Box::pin(async { novacode_tools::ToolOutput::text("shown") })
-        }
-    }
-    let work = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
-    let said = Arc::new(Mutex::new(Vec::new()));
-    let msg = |blocks: Vec<Block>| FauxReply::Message {
-        blocks,
-        stop: StopReason::Stop,
-        usage: Usage::default(),
-    };
-    let say_call = Block::ToolCall(ToolCall {
-        id: "c1".into(),
-        name: "say".into(),
-        arguments: json!({"kind": "update", "body": "x"}),
-        arguments_error: None,
-        replay: None,
-    });
-    let main = Faux::new([
-        msg(vec![Block::text("plain one")]),
-        msg(vec![
-            Block::Thinking {
-                text: "hmm".into(),
-                replay: None,
-            },
-            Block::text("plain two"),
-        ]),
-        FauxReply::text("OK"),
-        msg(vec![say_call]),
-        FauxReply::text(""),
-    ]);
-    let reqs = main.requests.clone();
-    let mut tools = novacode_tools::builtins(false);
-    tools.push(Arc::new(Rec(said.clone())));
-    let agent = Agent::new(
-        Arc::new(main),
-        tools,
-        Store::create(&Paths::new(home.path()), work.path(), false),
-        cfg(work.path(), home.path()),
-        Arc::new(LocalEnv),
-    )
-    .with_context_builder(Builder {
-        budget: 6000,
-        state: Arc::new(|_: &Store| "BOARD".to_string()),
-        quiet: Some(Quiet {
-            marker: "[health check]".into(),
-            on_ok: Arc::new(|| {}),
-        }),
-        plain: Some(Plain {
-            tool: "say".into(),
-            nudge: "[say] resend it with say".into(),
-            args: Arc::new(|t: &str| json!({"kind": "note", "body": t})),
-        }),
-    });
-    let (h, task) = agent::spawn(agent);
-    let mut rx = h.subscribe();
-    let settled = async |rx: &mut tokio::sync::broadcast::Receiver<AgentEvent>| loop {
-        if matches!(rx.recv().await.unwrap(), AgentEvent::Settled) {
-            break;
-        }
-    };
-    h.prompt("status?");
-    settled(&mut rx).await;
-    assert_eq!(*said.lock().unwrap(), [json!({"kind": "note", "body": "plain two"})]);
-    assert_eq!(reqs.lock().unwrap().len(), 2, "one nudge, then code sends it");
-    let nudged = format!("{:?}", reqs.lock().unwrap()[1].messages);
-    assert!(nudged.contains("[say] resend it with say"), "{nudged}");
-    h.remind_as("super", "[health check] go", true);
-    settled(&mut rx).await;
-    h.remind_as("super", "T1 reported done", true);
-    settled(&mut rx).await;
-    h.shutdown();
-    let agent = task.await.unwrap();
-    assert_eq!(
-        reqs.lock().unwrap().len(),
-        5,
-        "no nudge after the OK or the empty reply"
-    );
-    assert_eq!(said.lock().unwrap().len(), 2);
-    // The note's message keeps its thinking and carries the call instead of the text.
-    let note = agent
-        .store
-        .transcript()
-        .into_iter()
-        .find_map(|m| match m {
-            Message::Assistant(a) if a.tool_calls().any(|c| c.id.starts_with("say-plain-")) => Some(a),
-            _ => None,
-        })
-        .unwrap();
-    assert!(matches!(&note.content[0], Block::Thinking { text, .. } if text == "hmm"));
-    assert!(note.text().is_empty());
-    let results = agent
-        .store
-        .transcript()
-        .iter()
-        .filter(|m| matches!(m, Message::ToolResult { tool_name, .. } if tool_name == "say"))
-        .count();
-    assert_eq!(results, 2);
-}
-
-/// L10.9 super's `say`: plain text is never shown raw in a window. Text with no `say` in the
-/// run is held back (no message event) while its nudge is pending, then hidden; text after a
-/// `say` in the same run is a redundant recap: hidden, no nudge. The session file keeps both.
-#[tokio::test]
-async fn plain_text_is_never_shown_raw_and_a_recap_after_say_gets_no_nudge() {
-    use novacode_core::context_window::{Builder, Plain};
-    struct Rec;
-    impl novacode_tools::Tool for Rec {
-        fn name(&self) -> &str {
-            "say"
-        }
-        fn description(&self) -> &str {
-            "say"
-        }
-        fn schema(&self) -> Value {
-            json!({"type": "object"})
-        }
-        fn read_only(&self) -> bool {
-            true
-        }
-        fn execute<'a>(
-            &'a self,
-            _: Value,
-            _: &'a novacode_tools::ToolCtx,
-        ) -> futures_util::future::BoxFuture<'a, novacode_tools::ToolOutput> {
-            Box::pin(async { novacode_tools::ToolOutput::text("shown") })
-        }
-    }
-    let work = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
-    let say_call = Block::ToolCall(ToolCall {
-        id: "c1".into(),
-        name: "say".into(),
-        arguments: json!({"kind": "update", "body": "x"}),
-        arguments_error: None,
-        replay: None,
-    });
-    let main = Faux::new([
-        FauxReply::text("plain one"),
-        FauxReply::Message {
-            blocks: vec![say_call],
-            stop: StopReason::Stop,
-            usage: Usage::default(),
-        },
-        FauxReply::text("recap of what I said"),
-    ]);
-    let reqs = main.requests.clone();
-    let mut tools = novacode_tools::builtins(false);
-    tools.push(Arc::new(Rec));
-    let agent = Agent::new(
-        Arc::new(main),
-        tools,
-        Store::create(&Paths::new(home.path()), work.path(), false),
-        cfg(work.path(), home.path()),
-        Arc::new(LocalEnv),
-    )
-    .with_context_builder(Builder {
-        budget: 6000,
-        state: Arc::new(|_: &Store| "BOARD".to_string()),
-        quiet: None,
-        plain: Some(Plain {
-            tool: "say".into(),
-            nudge: "[say] resend it with say".into(),
-            args: Arc::new(|t: &str| json!({"kind": "note", "body": t})),
-        }),
-    });
-    let (h, task) = agent::spawn(agent);
-    let mut rx = h.subscribe();
-    h.prompt("status?");
-    let mut evs = Vec::new();
-    loop {
-        let ev = rx.recv().await.unwrap();
-        let done = matches!(ev, AgentEvent::Settled);
-        evs.push(ev);
-        if done {
-            break;
-        }
-    }
-    h.shutdown();
-    let agent = task.await.unwrap();
-    let shown: Vec<String> = evs
-        .iter()
-        .filter_map(|e| match e {
-            AgentEvent::Message(Message::Assistant(a)) if !a.text().is_empty() => Some(a.text()),
-            _ => None,
-        })
-        .collect();
-    assert!(shown.is_empty(), "no raw text reaches a window: {shown:?}");
-    let rollbacks = evs
-        .iter()
-        .filter(|e| matches!(e, AgentEvent::Stream(novacode_types::StreamEvent::RetryRollback)))
-        .count();
-    assert_eq!(rollbacks, 2, "both streamed texts are dropped");
-    let reqs = reqs.lock().unwrap();
-    assert_eq!(reqs.len(), 3, "one nudge; the recap gets none");
-    let nudged = format!("{:?}", reqs[1].messages);
-    assert!(
-        nudged.contains("plain one") && nudged.contains("[say] resend it with say"),
-        "the model sees what it wrote: {nudged}"
-    );
-    let texts: Vec<String> = agent
-        .store
-        .transcript()
-        .iter()
-        .filter_map(|m| match m {
-            Message::Assistant(a) if !a.text().is_empty() => Some(a.text()),
-            _ => None,
-        })
-        .collect();
-    assert!(texts.is_empty(), "a reattached window shows neither: {texts:?}");
-    let kept = agent
-        .store
-        .entries()
-        .iter()
-        .filter(|e| {
-            matches!(&e.kind, novacode_core::session::EntryKind::Message {
-            message: Message::Assistant(a)
-        } if !a.text().is_empty())
-        })
-        .count();
-    assert_eq!(kept, 2, "the session file keeps both");
-}
-
-/// L10.9 super: a context builder rebuilds every request (state block + newest chat in
-/// budget); the session file keeps everything, and auto-compaction never fires. Without
-/// a builder, the request is the projection, unchanged.
-#[tokio::test]
-async fn a_context_builder_rebuilds_requests_and_keeps_the_session_whole() {
-    use novacode_core::memory::{Settings, Worker};
-    use novacode_core::session::EntryKind;
-    let run = |builder: bool| async move {
-        let work = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let long = "y".repeat(3500);
-        let main = Faux::new((0..8).map(|i| FauxReply::text(&format!("r{i} {long}"))));
-        let reqs = main.requests.clone();
-        let store = Store::create(&Paths::new(home.path()), work.path(), false);
-        let mut agent = Agent::new(
-            Arc::new(main),
-            novacode_tools::builtins(false),
-            store,
-            cfg(work.path(), home.path()),
-            Arc::new(LocalEnv),
-        )
-        .with_memory(
-            Worker {
-                adapter: Arc::new(Faux::new((0..40).map(notes_reply))),
-                provider: "faux".into(),
-                model: "small".into(),
-            },
-            Settings {
-                observe_after: u64::MAX,
-                keep_recent: 1000,
-                compact_at: 3000,
-                chunk_tokens: 3000,
-                reflect_after: u64::MAX,
-                pool_target: u64::MAX,
-                idle_compact: 0,
-            },
-        );
-        if builder {
-            agent = agent.with_context_builder(novacode_core::context_window::Builder {
-                budget: 2500,
-                state: Arc::new(|_: &Store| "BOARD ROWS".to_string()),
-                quiet: None,
-                plain: None,
-            });
-        }
-        // Distinct markers: a bare "p0" also matches a random temp folder name like /tmp/.tmp0EK.
-        let prompts: Vec<String> = (0..8).map(|i| format!("prompt-{i}-marker")).collect();
-        let prompts: Vec<&str> = prompts.iter().map(String::as_str).collect();
-        let (agent, _) = drive(agent, &prompts).await;
-        let reqs = reqs.lock().unwrap().clone();
-        (agent, reqs, home, work)
-    };
-    let (agent, reqs, _h, _w) = run(true).await;
-    let entries = agent.store.entries();
-    assert!(
-        !entries.iter().any(|e| matches!(e.kind, EntryKind::Compaction { .. })),
-        "super never auto-compacts"
-    );
-    assert_eq!(
-        agent
-            .store
-            .projection()
-            .iter()
-            .filter(|m| matches!(m, Message::User { .. }))
-            .count(),
-        8
-    );
-    let last = reqs.last().unwrap();
-    let text = format!("{:?}", last.messages);
-    assert!(
-        text.contains("BOARD ROWS") && text.contains("prompt-7-marker") && !text.contains("prompt-0-marker"),
-        "{text}"
-    );
-    let chat: u64 = last
-        .messages
-        .iter()
-        .skip(2)
-        .map(novacode_types::estimate::message)
-        .sum();
-    assert!(chat <= 2500, "{chat}");
-
-    // Without a builder: what is sent is the stored projection, byte for byte.
-    let (agent, reqs, _h, _w) = run(false).await;
-    let live = agent.store.projection();
-    let mut sent = reqs.last().unwrap().messages.clone();
-    sent.push(live.last().unwrap().clone());
-    assert_eq!(
-        serde_json::to_string(&live).unwrap(),
-        serde_json::to_string(&sent).unwrap()
-    );
-}
-
 /// When the observer can't run, the session model summarises the gap instead.
 #[tokio::test]
 async fn compaction_without_notes_falls_back() {
@@ -1790,66 +1255,6 @@ async fn compaction_without_the_observer() {
     assert!(observer.requests.lock().unwrap().is_empty(), "the observer never ran");
     let p = format!("{:?}", agent.store.projection());
     assert!(p.contains("Summary of the earlier conversation"), "{p}");
-}
-
-/// L10.9: a session's own compaction instructions (super's) reach the summary model and
-/// are repeated after the summary, so the model acts on them once the chat is gone.
-#[tokio::test]
-async fn compaction_guide_reaches_the_summary_and_follows_it() {
-    use novacode_core::memory::{Settings, Worker};
-    let work = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
-    let big = "lorem ipsum ".repeat(300);
-    let main = Faux::new((0..8).map(|i| FauxReply::text(&format!("answer {i} {big}"))));
-    let board = Arc::new(std::sync::Mutex::new(String::from("empty")));
-    let agent = Agent::new(
-        Arc::new(main.clone()),
-        vec![],
-        Store::create(&Paths::new(home.path()), work.path(), false),
-        cfg(work.path(), home.path()),
-        Arc::new(LocalEnv),
-    )
-    .with_memory(
-        Worker {
-            adapter: Arc::new(Faux::new([])),
-            provider: "faux".into(),
-            model: "small".into(),
-        },
-        Settings {
-            observe_after: 1000,
-            keep_recent: 2500,
-            compact_at: 6000,
-            chunk_tokens: 3000,
-            reflect_after: u64::MAX,
-            pool_target: u64::MAX,
-            idle_compact: 0,
-        },
-    )
-    .without_observer()
-    .with_compaction_guide_fn({
-        // Made at compaction time (super's holds the board as it is then).
-        let board = board.clone();
-        Arc::new(move || {
-            format!(
-                "GUIDE: keep the board ({}); call task list after",
-                board.lock().unwrap()
-            )
-        })
-    });
-    *board.lock().unwrap() = "T1 running".into();
-    let prompts: Vec<String> = (0..5).map(|i| format!("task {i} {big}")).collect();
-    let refs: Vec<&str> = prompts.iter().map(String::as_str).collect();
-    let (agent, events) = drive(agent, &refs).await;
-    assert!(events.iter().any(|e| matches!(e, AgentEvent::Compacted { .. })));
-    let asked = format!("{:?}", main.requests.lock().unwrap());
-    assert!(
-        asked.contains("Summarise this part") && asked.contains("GUIDE: keep the board"),
-        "the summary request carries the guide"
-    );
-    let p = format!("{:?}", agent.store.projection());
-    let summary = p.find("Summary of the earlier conversation").expect("compacted");
-    assert!(p[summary..].contains("GUIDE: keep the board (T1 running)"), "{p}");
-    assert!(asked.contains("GUIDE: keep the board (T1 running)"));
 }
 
 /// A model switch moves background calls too: the observer to the switch's helper,
@@ -3004,7 +2409,7 @@ async fn take_follow_ups_drops_queued_prompts() {
     task.await.unwrap();
 }
 
-/// The prompt ids each `agent_end` carries, in order (L10.9 "No false blocks").
+/// The prompt ids each `agent_end` carries, in order.
 async fn ends(rx: &mut tokio::sync::broadcast::Receiver<AgentEvent>) -> Vec<Option<String>> {
     loop {
         if let AgentEvent::AgentEnd { prompts, .. } = rx.recv().await.unwrap() {
@@ -3071,7 +2476,7 @@ async fn agent_end_marks_idless_prompts_and_lists_none_for_wakes() {
     task.await.unwrap();
 }
 
-/// Prompt, then a follow-up (or a steer), abort: how many runs start before the session settles (L10.9 Stop).
+/// Prompt, then a follow-up (or a steer), abort: how many runs start before the session settles.
 async fn runs_after_abort(drop_queued: bool, steer: bool) -> usize {
     let work = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -3121,11 +2526,10 @@ async fn plain_abort_keeps_the_queued_prompt() {
     assert_eq!(runs_after_abort(false, false).await, 2);
 }
 
-/// An open todo list left alone for many replies is shown again (L5.12), but never in a
-/// session built `without_todo_notes` (super, L10.9).
+/// An open todo list left alone for many replies is shown again (L5.12).
 #[tokio::test]
-async fn todo_notes_come_back_unless_turned_off() {
-    async fn notes(off: bool) -> bool {
+async fn todo_notes_come_back() {
+    async fn notes() -> bool {
         let work = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let mut replies = vec![
@@ -3137,16 +2541,13 @@ async fn todo_notes_come_back_unless_turned_off() {
         let store = Store::create(&Paths::new(home.path()), work.path(), false);
         let mut tools = novacode_tools::builtins(false);
         tools.push(Arc::new(novacode_tools::todo::Todo::new(vec![])));
-        let mut agent = Agent::new(
+        let agent = Agent::new(
             Arc::new(faux.clone()),
             tools,
             store,
             cfg(work.path(), home.path()),
             Arc::new(LocalEnv),
         );
-        if off {
-            agent = agent.without_todo_notes();
-        }
         let prompts: Vec<String> = (0..15).map(|i| format!("p{i}")).collect();
         let prompts: Vec<&str> = prompts.iter().map(String::as_str).collect();
         drive(agent, &prompts).await;
@@ -3156,8 +2557,7 @@ async fn todo_notes_come_back_unless_turned_off() {
             r.messages.iter().any(|m| matches!(m, Message::User { content } if content.iter().any(|b| matches!(b, Block::Text { text, .. } if text.contains("todo list was last updated")))))
         })
     }
-    assert!(notes(false).await, "the note comes back by default");
-    assert!(!notes(true).await, "no note when turned off");
+    assert!(notes().await, "the note comes back");
 }
 
 /// L10.4: a prompt brings matching saved memories in after it, once per session.

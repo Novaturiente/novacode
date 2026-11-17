@@ -337,7 +337,7 @@ After 10 seconds novacode kills the shell; processes the command started may kee
 
 ### tmux agent state
 
-Inside tmux, a session in its own window sets these options on its pane, and so does every attach window (the super window, Tasks-tab and `/watch` panes, `novacode attach`) on its own pane, so your status line or scripts can read them (`tmux show -p -v @agent_state`):
+Inside tmux, a session in its own window sets these options on its pane, and so does every attach window (`novacode attach`) on its own pane, so your status line or scripts can read them (`tmux show -p -v @agent_state`):
 
 | Option | Value |
 |---|---|
@@ -354,7 +354,7 @@ These need `$TMUX_PANE`. Turn it off with `tmux.agentState: false`. When a turn 
 
 ### herdr
 
-If novacode runs inside herdr (a terminal workspace manager for agents), it reports its state there too. It does this when `HERDR_ENV=1` and `HERDR_SOCKET_PATH` and `HERDR_PANE_ID` are set. Attach windows (the super window, Tasks-tab and `/watch` panes, `novacode attach`) report the session's state for their own pane too; `--bg` and `--rpc` sessions with no window attached don't. You don't configure anything.
+If novacode runs inside herdr (a terminal workspace manager for agents), it reports its state there too. It does this when `HERDR_ENV=1` and `HERDR_SOCKET_PATH` and `HERDR_PANE_ID` are set. Attach windows (`novacode attach`) report the session's state for their own pane too; `--bg` and `--rpc` sessions with no window attached don't. You don't configure anything.
 
 ### Command hooks
 

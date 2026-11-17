@@ -57,10 +57,6 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/export", "write this branch to a file (/export html for a web page)"),
     ("/copy", "copy the last reply"),
     ("/btw", "side chat: /btw [question], not kept in the conversation"),
-    (
-        "/watch",
-        "super window: open the live tasks in a tmux grid, 6 panes a window",
-    ),
     ("/name", "name this session: /name <text>"),
     (
         "/worktree",
@@ -80,10 +76,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "re-read settings, keys, theme, skills, extensions, MCP servers and context files",
     ),
     ("/restart", "restart novacode (a new build) and resume this session"),
-    (
-        "/kill",
-        "attached window: end the session it shows, after a card (super: tasks keep running)",
-    ),
+    ("/kill", "attached window: end the session it shows, after a card"),
     ("/quit", "quit"),
 ];
 
@@ -296,19 +289,6 @@ pub enum UiEvent {
     },
     /// Files tab: (path, +added, -removed) since the session started.
     FileStats(Vec<(String, u64, u64)>),
-    /// Super's board snapshot (L10.9): every task not archived, for the Tasks tab, and
-    /// the open questions and warnings (Needs you).
-    /// Sent on connect and on change; older clients skip the unknown kind.
-    Board {
-        tasks: Vec<crate::panel::TaskRow>,
-        #[serde(default)]
-        needs: Vec<crate::panel::NeedRow>,
-    },
-    /// When this user's window last saw the session (an attach window, L10.9): the
-    /// "new since you last looked" divider goes before the first newer `say` block.
-    Seen {
-        ms: u64,
-    },
     /// Open `path` in the editor; `base` holds its content from the session start, for a diff.
     OpenFile {
         path: std::path::PathBuf,
@@ -580,8 +560,6 @@ pub struct App {
     pub compacting: bool,
     /// `/reload` during a turn: done when the turn ends, so the turn isn't cut off.
     reload_after: bool,
-    /// Super's last board snapshot (L10.9); `None` outside a super window. For `/watch`.
-    board: Option<Vec<crate::panel::TaskRow>>,
     /// Running processes in the manager (L5.11), for the status line.
     procs: std::collections::BTreeSet<String>,
     activity: String,
@@ -647,11 +625,6 @@ pub struct App {
     /// reply streaming now). `None` until the first usage arrives (G1).
     task_tokens: Option<(u64, u64)>,
     started: Instant,
-    /// The terminal lost focus (L10.9): the first `say` block after that gets the
-    /// "new since you last looked" divider (`away.1`: placed already). A terminal reports
-    /// focus only when it changes, so a new window counts as away until focus in, a key,
-    /// a click or a paste shows the user is there.
-    away: (bool, bool),
     #[cfg(feature = "images")]
     images: Option<crate::images::Images>,
 }
@@ -737,7 +710,6 @@ impl App {
             busy: false,
             compacting: false,
             reload_after: false,
-            board: None,
             procs,
             activity: String::new(),
             spinner: 0,
@@ -783,7 +755,6 @@ impl App {
             task_started: None,
             task_tokens: None,
             started: clock::now(),
-            away: (true, false),
             #[cfg(feature = "images")]
             images: None,
         }
@@ -937,14 +908,6 @@ impl App {
             UiEvent::Dequeued { ok: false } => self.flash("too late: it already reached the model"),
             UiEvent::Procs { items } => self.panel.set_procs(items),
             UiEvent::FileStats(v) => self.panel.set_diffstat(v),
-            UiEvent::Board { tasks, needs } => {
-                self.board = Some(tasks.clone());
-                self.panel.set_tasks(tasks);
-                self.panel.set_needs(needs);
-            }
-            UiEvent::Seen { ms } => {
-                self.tr.mark_new_after(ms);
-            }
             UiEvent::OpenFile { path, base } => self.open_file = Some((path, base)),
             UiEvent::Page { title, text } => {
                 if !self.busy {
@@ -1072,9 +1035,6 @@ impl App {
                     }
                 }
                 self.tr.on_message(&m);
-                if let Message::ToolResult { call_id, .. } = &m {
-                    self.mark_if_away(call_id);
-                }
             }
             AgentEvent::ToolStart { call } => {
                 self.tr.tool_start(&call.id);
@@ -1082,7 +1042,6 @@ impl App {
             }
             AgentEvent::ToolUpdate { call_id, text } => {
                 self.tr.tool_update(&call_id, &text);
-                self.mark_if_away(&call_id);
             }
             AgentEvent::ToolEnd {
                 call_id,
@@ -1206,22 +1165,6 @@ impl App {
         }
     }
 
-    /// A `say` block arrived while the terminal was unfocused: the divider goes before
-    /// the first one of this time away.
-    fn mark_if_away(&mut self, call_id: &str) {
-        if self.away != (true, false) {
-            return;
-        }
-        let is_say =
-            self.tr.turns.iter().rev().flat_map(|t| t.items.iter().rev()).any(
-                |i| matches!(i, crate::transcript::Item::Tool(t) if t.id == call_id && t.is_say() && t.say.is_some()),
-            );
-        if is_say {
-            self.tr.mark_new(call_id);
-            self.away.1 = true;
-        }
-    }
-
     /// An extension's UI op (L9 UI API).
     fn ui_op(&mut self, ext: &str, op: novacode_types::ui::UiOp) {
         use novacode_types::ui::UiOp;
@@ -1276,37 +1219,6 @@ impl App {
         }
     }
 
-    /// `/watch` (L10.9): super's live tasks in a tmux grid, or the shell command that opens one.
-    fn watch(&mut self) {
-        let Some(rows) = &self.board else {
-            self.tr
-                .notice("/watch works in a super window (novacode --super)", false);
-            return;
-        };
-        let home = std::env::var("NOVACODE_HOME").ok().filter(|h| !h.is_empty());
-        let exe = std::env::current_exe().map_or("novacode".into(), |p| p.display().to_string());
-        let cmds = watch_cmds(rows, &exe, home.as_deref());
-        if cmds.is_empty() {
-            self.tr.notice("no live tasks to watch", false);
-            return;
-        }
-        if std::env::var_os("TMUX").is_none() {
-            self.tr
-                .notice(format!("run in a terminal: {}", watch_shell(&cmds)), false);
-            return;
-        }
-        let out = std::process::Command::new("tmux")
-            .args(tmux_chain(&cmds))
-            .stdin(std::process::Stdio::null())
-            .output();
-        let err = match out {
-            Ok(o) if o.status.success() => return,
-            Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
-            Err(e) => e.to_string(),
-        };
-        self.tr.notice(format!("/watch: tmux failed ({err})"), true);
-    }
-
     /// The `/ps` popup on process `id` (else the first), with a fresh list from the host.
     fn open_procs(&mut self, id: Option<String>) {
         self.overlay = Some(Overlay::Procs(crate::procs::ProcPopup::new(id)));
@@ -1316,32 +1228,9 @@ impl App {
     fn panel_action(&mut self, a: crate::panel::PanelAction) {
         use crate::panel::PanelAction;
         match a {
-            // Needs you (L10.9): super's host takes it off the board; never a prompt.
-            PanelAction::Command(c) if c.starts_with("/dismiss ") => self.send(Cmd::Prompt(c)),
             PanelAction::Command(c) => self.submit(c, self.busy),
             PanelAction::OpenFile(p) => self.send(Cmd::OpenFile(p)),
             PanelAction::OpenProc(id) => self.open_procs(Some(id)),
-            PanelAction::Attach { label, session } => {
-                let home = std::env::var("NOVACODE_HOME").ok().filter(|h| !h.is_empty());
-                let cmd = attach_cmd(&session, home.as_deref());
-                if std::env::var_os("TMUX").is_none() {
-                    self.tr
-                        .notice(format!("{label}: run `{cmd}` in another terminal"), false);
-                    return;
-                }
-                let exe = std::env::current_exe().map_or("novacode".into(), |p| p.display().to_string());
-                let out = std::process::Command::new("tmux")
-                    .args(tmux_attach_args(&label, &session, &exe, home.as_deref()))
-                    .stdin(std::process::Stdio::null())
-                    .output();
-                let err = match out {
-                    Ok(o) if o.status.success() => return,
-                    Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
-                    Err(e) => e.to_string(),
-                };
-                self.tr
-                    .notice(format!("{label}: tmux failed ({err}); run `{cmd}`"), true);
-            }
             PanelAction::Leave => self.set_focus(Focus::Input),
             PanelAction::Ext { ext, tab, node, action } => {
                 let (width, height) = self.panel.size;
@@ -1394,9 +1283,6 @@ impl App {
 
     pub fn on_event(&mut self, ev: Event) {
         self.dirty = true;
-        if matches!(ev, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)) {
-            self.away.0 = false;
-        }
         // Motion ends on real input only: any-motion mouse tracking reports every move,
         // and key releases follow every press.
         let input = match &ev {
@@ -1467,14 +1353,8 @@ impl App {
             }
             Event::Mouse(m) if self.overlay.is_none() => self.on_mouse(m),
             Event::Mouse(m) => self.on_overlay_mouse(m),
-            Event::FocusGained => {
-                self.away.0 = false;
-                self.send(Cmd::Focus(true))
-            }
-            Event::FocusLost => {
-                self.away = (true, false);
-                self.send(Cmd::Focus(false))
-            }
+            Event::FocusGained => self.send(Cmd::Focus(true)),
+            Event::FocusLost => self.send(Cmd::Focus(false)),
             _ => {}
         }
     }
@@ -2013,10 +1893,7 @@ impl App {
             );
             return;
         };
-        let question = match self.board {
-            Some(_) => format!("End super for {}? Tasks keep running.", self.init.cwd),
-            None => format!("End session {}?", &id[..id.len().min(12)]),
-        };
+        let question = format!("End session {}?", &id[..id.len().min(12)]);
         let choice = |label: &str| novacode_types::Choice {
             label: label.into(),
             description: None,
@@ -2118,7 +1995,6 @@ impl App {
                     self.overlay = Some(Overlay::Pager(Pager::keys_help(&self.keymap, &self.theme)));
                 }
                 "/copy" => self.copy_reply(),
-                "/watch" => self.watch(),
                 "/btw" => {
                     let mut c = crate::btw::BtwChat::default();
                     if !arg.is_empty() {
@@ -3135,92 +3011,6 @@ fn screen_text(buf: &ratatui::buffer::Buffer, a: (u16, u16), b: (u16, u16)) -> S
     rows.join("\n").trim().to_string()
 }
 
-/// `tmux new-window` running `exe attach session`. A new window gets tmux's
-/// environment, not ours: the home goes along so the session is found.
-fn tmux_attach_args(label: &str, session: &str, exe: &str, home: Option<&str>) -> Vec<String> {
-    let mut a: Vec<String> = vec!["new-window".into(), "-n".into(), label.into()];
-    if let Some(h) = home {
-        a.extend(["-e".into(), format!("NOVACODE_HOME={h}")]);
-    }
-    a.extend([exe.into(), "attach".into(), session.into()]);
-    a
-}
-
-/// The tmux commands of `/watch` (L10.9): one pane per live work task, attached to
-/// its session, in tiled windows of at most 6 panes (`watch`, else `watch 1`, `watch 2`, …).
-/// Review rows and tasks archived, failed or interrupted are left out. Empty when none is left.
-fn watch_cmds(rows: &[crate::panel::TaskRow], exe: &str, home: Option<&str>) -> Vec<Vec<String>> {
-    let live: Vec<(&str, &str)> = rows
-        .iter()
-        .filter(|r| !r.review)
-        .filter(|r| {
-            let word = r.state.split([':', ' ']).next().unwrap_or_default();
-            !matches!(word, "archived" | "failed" | "interrupted")
-        })
-        .filter_map(|r| Some((r.label.as_str(), r.session.as_deref()?)))
-        .collect();
-    let pages = live.len().div_ceil(6);
-    let mut cmds = Vec::new();
-    for (i, page) in live.chunks(6).enumerate() {
-        for (j, (label, session)) in page.iter().enumerate() {
-            let mut c: Vec<String> = if j == 0 {
-                let name = if pages == 1 {
-                    "watch".into()
-                } else {
-                    format!("watch {}", i + 1)
-                };
-                vec!["new-window".into(), "-n".into(), name]
-            } else {
-                vec!["split-window".into()]
-            };
-            if let Some(h) = home {
-                c.extend(["-e".into(), format!("NOVACODE_HOME={h}")]);
-            }
-            c.extend([exe.into(), "attach".into(), (*session).into()]);
-            cmds.push(c);
-            if j > 0 {
-                // Re-tile after each split, so the next one has room.
-                cmds.push(vec!["select-layout".into(), "tiled".into()]);
-            }
-            cmds.push(vec!["select-pane".into(), "-T".into(), (*label).into()]);
-        }
-    }
-    cmds
-}
-
-/// `cmds` as one tmux invocation's arguments, chained with `;`.
-fn tmux_chain(cmds: &[Vec<String>]) -> Vec<String> {
-    cmds.join(&";".to_string())
-}
-
-/// Outside tmux: one shell command that opens `cmds` in a new session, then attaches.
-fn watch_shell(cmds: &[Vec<String>]) -> String {
-    let quote = |s: &str| {
-        if s == ";" {
-            "\\;".to_string()
-        } else if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "_./=:@%+,-".contains(c)) {
-            s.to_string()
-        } else {
-            format!("'{}'", s.replace('\'', "'\\''"))
-        }
-    };
-    let mut cmds = cmds.to_vec();
-    // An attached new-session runs the chained commands in itself; no fixed name to clash with.
-    if let Some(first) = cmds.first_mut() {
-        first.splice(0..1, ["new-session".to_string()]);
-    }
-    let args: Vec<String> = tmux_chain(&cmds).iter().map(|a| quote(a)).collect();
-    format!("tmux {}", args.join(" "))
-}
-
-/// The attach command to run by hand, with this window's home when it isn't the default.
-fn attach_cmd(session: &str, home: Option<&str>) -> String {
-    match home {
-        Some(h) => format!("NOVACODE_HOME={h} novacode attach {session}"),
-        None => format!("novacode attach {session}"),
-    }
-}
-
 #[cfg(test)]
 mod screen_tests {
     #[test]
@@ -3233,108 +3023,5 @@ mod screen_tests {
         buf.set_string(0, 2, "╰─────────────────╯", ratatui::style::Style::default());
         assert_eq!(super::screen_text(&buf, (0, 1), (19, 1)), "Pick 数据 one");
         assert_eq!(super::screen_text(&buf, (9, 1), (2, 0)), "Question\nPick 数据");
-    }
-
-    /// R9 (L10.9): a tmux window gets tmux's environment, not ours, so the attach
-    /// window is told this window's home; else it finds no live session and closes at once.
-    #[test]
-    fn the_attach_hint_names_the_home() {
-        assert_eq!(super::attach_cmd("01a1", None), "novacode attach 01a1");
-        assert_eq!(
-            super::attach_cmd("01a1", Some("/h/home")),
-            "NOVACODE_HOME=/h/home novacode attach 01a1"
-        );
-    }
-
-    #[test]
-    fn tmux_attach_passes_the_home_along() {
-        let args = super::tmux_attach_args("T1", "01a1", "/bin/nc", Some("/h/home")).join(" ");
-        assert_eq!(args, "new-window -n T1 -e NOVACODE_HOME=/h/home /bin/nc attach 01a1");
-        let args = super::tmux_attach_args("T1", "01a1", "/bin/nc", None);
-        assert_eq!(args, ["new-window", "-n", "T1", "/bin/nc", "attach", "01a1"]);
-    }
-
-    fn task(n: usize, state: &str) -> crate::panel::TaskRow {
-        crate::panel::TaskRow {
-            label: format!("T{n}"),
-            state: state.into(),
-            session: Some(format!("s{n}")),
-            ..Default::default()
-        }
-    }
-
-    fn joined(cmds: &[Vec<String>]) -> Vec<String> {
-        cmds.iter().map(|c| c.join(" ")).collect()
-    }
-
-    /// `/watch` (L10.9): one task is one window named `watch`, its pane titled with the label.
-    #[test]
-    fn watch_one_task_is_one_window() {
-        let cmds = super::watch_cmds(&[task(1, "running")], "/bin/nc", None);
-        assert_eq!(
-            joined(&cmds),
-            ["new-window -n watch /bin/nc attach s1", "select-pane -T T1"]
-        );
-    }
-
-    #[test]
-    fn watch_six_tasks_fill_one_tiled_window() {
-        let rows: Vec<_> = (1..=6).map(|n| task(n, "running")).collect();
-        let cmds = joined(&super::watch_cmds(&rows, "/bin/nc", Some("/h")));
-        assert_eq!(cmds.iter().filter(|c| c.starts_with("new-window")).count(), 1);
-        assert_eq!(cmds.iter().filter(|c| c.starts_with("split-window")).count(), 5);
-        assert_eq!(cmds[0], "new-window -n watch -e NOVACODE_HOME=/h /bin/nc attach s1");
-        assert_eq!(cmds[2], "split-window -e NOVACODE_HOME=/h /bin/nc attach s2");
-        assert_eq!(cmds[3], "select-layout tiled");
-        assert_eq!(cmds[4], "select-pane -T T2");
-    }
-
-    #[test]
-    fn watch_seven_tasks_open_two_windows() {
-        let rows: Vec<_> = (1..=7).map(|n| task(n, "running")).collect();
-        let cmds = joined(&super::watch_cmds(&rows, "/bin/nc", None));
-        let windows: Vec<_> = cmds.iter().filter(|c| c.starts_with("new-window")).collect();
-        assert_eq!(
-            windows,
-            [
-                "new-window -n watch 1 /bin/nc attach s1",
-                "new-window -n watch 2 /bin/nc attach s7"
-            ]
-        );
-        assert_eq!(cmds.iter().filter(|c| c.starts_with("split-window")).count(), 5);
-    }
-
-    /// Review rows, and tasks archived, failed or interrupted (their process may be gone), stay out.
-    #[test]
-    fn watch_leaves_out_review_and_dead_rows() {
-        let mut review = task(1, "running");
-        review.review = true;
-        let rows = [
-            review,
-            task(2, "archived"),
-            task(3, "failed: tests"),
-            task(4, "interrupted"),
-            task(5, "blocked: quota"),
-            crate::panel::TaskRow {
-                session: None,
-                ..task(6, "queued")
-            },
-        ];
-        let cmds = joined(&super::watch_cmds(&rows, "/bin/nc", None));
-        assert_eq!(cmds, ["new-window -n watch /bin/nc attach s5", "select-pane -T T5"]);
-        assert!(super::watch_cmds(&rows[..4], "/bin/nc", None).is_empty());
-    }
-
-    /// Outside tmux: one shell command that opens the grid in a new session and attaches.
-    #[test]
-    fn watch_shell_command_outside_tmux() {
-        let rows = [task(1, "running"), task(2, "running")];
-        let cmds = super::watch_cmds(&rows, "/my apps/nc", Some("/h"));
-        assert_eq!(
-            super::watch_shell(&cmds),
-            "tmux new-session -n watch -e NOVACODE_HOME=/h '/my apps/nc' attach s1 \\; \
-             select-pane -T T1 \\; split-window -e NOVACODE_HOME=/h '/my apps/nc' attach s2 \\; \
-             select-layout tiled \\; select-pane -T T2"
-        );
     }
 }

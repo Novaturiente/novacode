@@ -369,7 +369,7 @@ pub enum AgentEvent {
         /// Request ids of the wire prompts this run gave the model, queued ones it took
         /// mid-run included; `None` = sent without an id. Prompts dropped before a run took
         /// them (`Abort { drop_queued }`, taken back) never appear. Empty for a run started
-        /// inside the session (L10.9).
+        /// inside the session.
         #[serde(default)]
         prompts: Vec<Option<String>>,
     },
@@ -799,116 +799,6 @@ pub struct Choice {
     /// Your recommendation (at most one per question).
     #[serde(default)]
     pub recommended: bool,
-}
-
-/// One message super sent the user with its `say` tool (L10.9 "Structured messages"):
-/// everything the window draws, saved in the tool result's `details.say` so a
-/// reattached window draws it the same. Code fills the frame (time, trigger, task lines).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Say {
-    /// update, question, warning, done, note or reply.
-    pub kind: String,
-    /// normal or high.
-    pub priority: String,
-    /// Unix ms it was sent.
-    pub at_ms: u64,
-    /// Local `HH:MM` it was sent.
-    pub time: String,
-    /// What started the run that sent it: `after T2 reported blocked`, `health check`, `reply to you`.
-    pub trigger: String,
-    /// Task-scoped content; empty for legacy persisted blocks.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub sections: Vec<SaySection>,
-    /// Task labels it is about (also used by Needs you).
-    pub tasks: Vec<String>,
-    /// One board status line per task, written by code.
-    pub lines: Vec<String>,
-    /// Where things stand.
-    pub status: String,
-    /// Markdown.
-    pub body: String,
-    pub choices: Vec<Choice>,
-    /// The user's answer on the question's card.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub answer: Option<String>,
-}
-
-/// A task subtitle and its facts within a super message.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SaySection {
-    /// Board task label, or `General` for unrelated content.
-    pub task: String,
-    /// Board status supplied by code; empty for General.
-    pub line: String,
-    /// Older messages only: where things stand.
-    pub status: String,
-    /// Optional extra Markdown (older messages: the whole content).
-    pub body: String,
-    /// What finished.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub done: String,
-    /// What happens next, and who does it.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub next: String,
-    /// The one thing the user must do; empty when nothing.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub needs_you: String,
-    /// What super decided itself (L10.9), short points the user can undo.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub decided: Vec<String>,
-    /// Required for new questions; absent in older persisted sections.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub question: Option<SayQuestion>,
-}
-
-/// The facts and permission boundary needed to answer a super question.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SayQuestion {
-    pub requested: String,
-    pub verified_result: String,
-    pub blockers: Vec<SayBlocker>,
-    pub input_needed: String,
-    pub recommendation: String,
-    pub risk: String,
-    pub unchanged: String,
-    pub decision: String,
-}
-
-/// One distinct blocker; unknowns and explained non-applicability are valid facts.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SayBlocker {
-    pub issue: String,
-    pub evidence: String,
-    pub impact: String,
-}
-
-impl SayQuestion {
-    /// The same readable headings in the transcript and the answer card.
-    pub fn paragraphs(&self) -> Vec<(String, &str)> {
-        let mut parts = vec![
-            ("What you requested".into(), self.requested.as_str()),
-            ("Verified result".into(), self.verified_result.as_str()),
-        ];
-        for (i, b) in self.blockers.iter().enumerate() {
-            parts.extend([
-                (format!("Blocker {}", i + 1), b.issue.as_str()),
-                ("Evidence".into(), b.evidence.as_str()),
-                ("Impact".into(), b.impact.as_str()),
-            ]);
-        }
-        parts.extend([
-            ("Why your input is needed".into(), self.input_needed.as_str()),
-            ("Recommendation".into(), self.recommendation.as_str()),
-            ("Risk".into(), self.risk.as_str()),
-            ("What stays unchanged".into(), self.unchanged.as_str()),
-            ("Decision".into(), self.decision.as_str()),
-        ]);
-        parts
-    }
 }
 
 /// The user's answer to one [`Question`].

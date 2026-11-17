@@ -20,4 +20,4 @@ The Cargo workspace members of novacode: six library crates and one binary crate
 - novacode-script: [./novacode-script/EGM.md](./novacode-script/EGM.md) - QuickJS runtime for codemode and script extensions, TypeScript stripping and pre-run checks.
 - novacode-core: [./novacode-core/EGM.md](./novacode-core/EGM.md) - Agent loop, single tool pipeline, policy/risk gate/judge/trust, append-only JSONL sessions, checkpoints, memory, hooks, extensions, MCP, packages, Claude Code plugins.
 - novacode-tui: [./novacode-tui/EGM.md](./novacode-tui/EGM.md) - Fullscreen ratatui terminal UI: event loop, transcript, editor, dialogs, side panel, themes.
-- novacode: [./novacode/EGM.md](./novacode/EGM.md) - The binary: CLI and run modes, live-session host/hub, wire protocol, subagents, goals, schedules, super mode.
+- novacode: [./novacode/EGM.md](./novacode/EGM.md) - The binary: CLI and run modes, live-session host/hub, wire protocol, subagents, goals, schedules.

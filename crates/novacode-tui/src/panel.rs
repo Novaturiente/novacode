@@ -46,45 +46,6 @@ impl HostInfo {
     }
 }
 
-/// An open question or warning of super's (L10.9 Needs you), until answered, resolved
-/// or dismissed (`d` in the Tasks tab sends `/dismiss <id>`).
-#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct NeedRow {
-    pub id: String,
-    /// question or warning.
-    pub kind: String,
-    pub tasks: Vec<String>,
-    pub status: String,
-    pub at_ms: u64,
-}
-
-/// One task of super's board for the Tasks tab (L10.9 dashboard); the board
-/// snapshot is a list of these. Board fields plus live data from the task's run file.
-#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct TaskRow {
-    pub label: String,
-    /// The repo's folder name, else the task's folder.
-    pub repo: String,
-    /// The board state with its block reason or landing mark (`blocked: quota`).
-    pub state: String,
-    /// The model the task runs now (its run file), else the one at spawn.
-    pub model: String,
-    /// Session tokens so far; the last seen once its process is gone.
-    pub tokens: u64,
-    /// Unix ms the task was spawned: its age.
-    pub started_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-    /// The task's session, once its process started: Enter attaches to it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session: Option<String>,
-    /// A review task, not a work one: `/watch` leaves it out.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub review: bool,
-}
-
 #[derive(Debug, Clone)]
 pub struct Source {
     pub id: String,
@@ -168,8 +129,6 @@ pub enum PanelAction {
     OpenFile(String),
     /// Show a process's output in the `/ps` popup.
     OpenProc(String),
-    /// Open a super task's session (Tasks tab): `novacode attach <session>`.
-    Attach { label: String, session: String },
     /// Tell the owning extension: (ext, tab, node id, action or key).
     Ext {
         ext: String,
@@ -209,8 +168,6 @@ pub struct Panel {
     agent_set: BTreeMap<String, u32>,
     /// Files tab: (+added, -removed) lines since the session started, from the host.
     diffstat: BTreeMap<String, (u64, u64)>,
-    /// Tasks tab: label → the task's session, for Enter.
-    task_sessions: BTreeMap<String, String>,
     /// Where the last draw put things, for the mouse: tab labels (x from, x to, name),
     /// the body, and which row each body line shows.
     tab_spans: Vec<(u16, u16, u16, String)>,
@@ -247,9 +204,6 @@ struct Task {
 }
 
 use crate::clock::now_ms;
-
-/// Node ids of Needs you rows start with this.
-const NEED: &str = "need:";
 
 fn node(id: &str, label: impl Into<String>) -> Node {
     Node {
@@ -292,7 +246,6 @@ impl Default for Panel {
         Panel {
             tabs: vec![
                 agent,
-                Tab::new("tasks", "Tasks", 25),
                 Tab::new("processes", "Processes", 15),
                 Tab {
                     stats: true,
@@ -319,7 +272,6 @@ impl Default for Panel {
             run: 0,
             agent_set: BTreeMap::new(),
             diffstat: BTreeMap::new(),
-            task_sessions: BTreeMap::new(),
             tab_spans: Vec::new(),
             tab_row: 0,
             body: Rect::default(),
@@ -428,87 +380,6 @@ impl Panel {
             .filter(|(_, k)| **k == "edited")
             .map(|(p, _)| p.clone())
             .collect()
-    }
-
-    /// A board snapshot from super (L10.9): the Tasks tab shows exactly these rows.
-    pub fn set_tasks(&mut self, rows: Vec<TaskRow>) {
-        let mut sessions = BTreeMap::new();
-        let nodes = rows
-            .into_iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let mut n = node(&r.label, r.label.clone());
-                n.tag = Some(r.repo);
-                let word = r.state.split([':', ' ']).next().unwrap_or_default();
-                n.status = Some(
-                    match word {
-                        "running" | "reviewing" | "merging" => "running",
-                        "waiting-you" | "blocked" => "waiting",
-                        "ready" => "done",
-                        "failed" => "failed",
-                        "stopped" | "interrupted" => "stopped",
-                        _ => "queued",
-                    }
-                    .into(),
-                );
-                n.order = Some(i as f64);
-                n.time = Some(novacode_types::ui::Time {
-                    ms: None,
-                    since: Some(r.started_ms),
-                });
-                n.detail = vec![format!(
-                    "{} · {} · {}",
-                    r.state,
-                    short_model(&r.model),
-                    tokens(r.tokens)
-                )];
-                if let Some(s) = r.summary {
-                    n.detail.push(format!("› {s}"));
-                }
-                if let Some(s) = r.session {
-                    n.actions.insert("enter".into(), "attach".into());
-                    sessions.insert(r.label, s);
-                }
-                n
-            })
-            .collect();
-        self.task_sessions = sessions;
-        let had = self.tabs.iter().any(|t| t.name == "tasks" && !t.empty());
-        self.set_nodes("tasks", "board", nodes);
-        // The first rows put the tab on show (an empty Agent tab would show "(empty)").
-        if !had {
-            self.offer("tasks");
-        }
-    }
-
-    /// Super's open questions and warnings: the Needs you section on top of the Tasks tab.
-    pub fn set_needs(&mut self, rows: Vec<NeedRow>) {
-        let nodes = rows
-            .into_iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let who = match r.tasks.is_empty() {
-                    true => String::new(),
-                    false => format!(" · {}", r.tasks.join(", ")),
-                };
-                let mut n = node(&format!("{NEED}{}", r.id), format!("{}{who}", r.kind));
-                n.status = Some(if r.kind == "warning" { "failed" } else { "waiting" }.into());
-                n.order = Some(i as f64);
-                n.time = Some(novacode_types::ui::Time {
-                    ms: None,
-                    since: Some(r.at_ms),
-                });
-                n.detail = vec![r.status, "d dismisses".into()];
-                n.actions.insert("d".into(), format!("/dismiss {}", r.id));
-                n
-            })
-            .collect();
-        if let Some(t) = self.tab("tasks") {
-            let s = t.source("needs");
-            s.title = Some("Needs you".into());
-            s.order = -1.0;
-            s.nodes = nodes;
-        }
     }
 
     pub fn set_diffstat(&mut self, v: Vec<(String, u64, u64)>) {
@@ -983,21 +854,15 @@ impl Panel {
     }
 
     /// Auto show/hide (L9.16): the Agent tab opens the panel by itself while a todo
-    /// or subagent is unfinished, the Tasks tab while one of super's tasks runs
-    /// (L10.9); it closes 5 s after they all finish.
+    /// or subagent is unfinished; it closes 5 s after they all finish.
     /// Every other tab is opened by hand (Ctrl+Alt+P). A `focused` panel stays up.
     pub fn tick(&mut self, focused: bool) {
-        let any = |name: &str, live: fn(Option<&str>) -> bool| {
-            self.tabs.iter().find(|t| t.name == name).is_some_and(|t| {
-                t.sources
-                    .iter()
-                    .flat_map(|s| &s.nodes)
-                    .any(|n| live(n.status.as_deref()))
-            })
-        };
-        let agent = any("agent", |s| !matches!(s, Some("done" | "stopped" | "failed")));
-        let tasks = any("tasks", |s| s == Some("running"));
-        let pending = agent || tasks;
+        let pending = self.tabs.iter().find(|t| t.name == "agent").is_some_and(|t| {
+            t.sources
+                .iter()
+                .flat_map(|s| &s.nodes)
+                .any(|n| !matches!(n.status.as_deref(), Some("done" | "stopped" | "failed")))
+        });
         // Closed by hand: stays closed for this batch of work, opens again for the next.
         if pending && !self.was_pending && self.pinned == Some(false) && !self.never_auto {
             self.pinned = None;
@@ -1009,7 +874,7 @@ impl Panel {
         }
         if pending {
             if !self.visible {
-                self.shown = Some(if agent { "agent" } else { "tasks" }.into());
+                self.shown = Some("agent".into());
             }
             self.idle_since = None;
             self.visible = true;
@@ -1188,8 +1053,6 @@ impl Panel {
             // Without a selection this scrolls; render clamps it to the text.
             "down" | "j" if !self.interactive() => self.sel += 1,
             "down" | "j" => self.sel = (self.sel + 1).min(n.saturating_sub(1)),
-            // Enter on a Needs you row does nothing: only `d` dismisses it.
-            "enter" if sel_id.as_deref().is_some_and(|i| i.starts_with(NEED)) => {}
             k => {
                 let act = if k == "enter" {
                     sel_actions.get("enter").or(sel_actions.values().next())
@@ -1202,12 +1065,6 @@ impl Panel {
                     }
                     if a == "output" && tab.name == "processes" && tab.owner.is_none() {
                         return Some(sel_id.map(PanelAction::OpenProc));
-                    }
-                    if a == "attach" && tab.name == "tasks" && tab.owner.is_none() {
-                        return Some(sel_id.and_then(|label| {
-                            let session = self.task_sessions.get(&label)?.clone();
-                            Some(PanelAction::Attach { label, session })
-                        }));
                     }
                     return Some(Some(if a.starts_with('/') {
                         PanelAction::Command(a.clone())
@@ -1257,7 +1114,6 @@ impl Panel {
             let icon = match (self.nerd, t.name.as_str()) {
                 (true, "agent") => "\u{f06a9} ",
                 (true, "processes") => "\u{f013} ",
-                (true, "tasks") => "\u{f0ae} ",
                 (true, "usage") => "\u{f080} ",
                 (true, "timing") => "\u{f017} ",
                 (true, "files") => "\u{f15b} ",
@@ -1714,15 +1570,6 @@ fn footer_line<K: AsRef<str>, V: AsRef<str>>(first: &[(K, V)], w: usize, t: &The
     l
 }
 
-/// A model's short name for a task row: `claude/claude-sonnet-5-5` -> `sonnet-5-5`,
-/// `openai/gpt-6` -> `gpt-6`.
-fn short_model(m: &str) -> &str {
-    match m.split_once('/') {
-        Some((p, rest)) => rest.strip_prefix(p).and_then(|r| r.strip_prefix('-')).unwrap_or(rest),
-        None => m,
-    }
-}
-
 /// A detail text under `lead`, at most two lines; the second is cut with `…` when more
 /// is left. A text of ` · `-separated parts wraps only between parts, and a part longer
 /// than the line is cut; other text word-wraps.
@@ -1989,102 +1836,6 @@ mod tests {
         assert!(y > p.tab_row, "wrapped to a second row");
         p.click(x + 1, y);
         assert_eq!(p.shown.as_deref(), Some(name.as_str()));
-    }
-
-    /// Snapshot of the Tasks tab (L10.9 dashboard): one row per board task, Enter attaches.
-    #[test]
-    fn tasks_tab_snapshot() {
-        let mut p = Panel {
-            nerd: false,
-            ..Panel::default()
-        };
-        // Ages of 2h and 1h; the clock shows minutes there, so a slow test still matches.
-        let ago = |s: u64| now_ms() - s * 1000 - 20_000;
-        p.set_tasks(vec![
-            TaskRow {
-                label: "T3-fix-parser".into(),
-                repo: "novacode".into(),
-                state: "running".into(),
-                model: "claude/claude-sonnet-5-5".into(),
-                tokens: 41_200,
-                started_ms: ago(7200),
-                summary: Some("parser fixed; tests pass".into()),
-                session: Some("01def".into()),
-                review: false,
-            },
-            TaskRow {
-                label: "T4-docs".into(),
-                repo: "site".into(),
-                state: "blocked: quota".into(),
-                model: "claude/claude-haiku-5-5".into(),
-                tokens: 900,
-                started_ms: ago(3600),
-                summary: None,
-                session: None,
-                review: false,
-            },
-        ]);
-        p.show_tab("tasks");
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(50, 10)).unwrap();
-        term.draw(|f| p.render(f, f.area(), &Theme::default(), true)).unwrap();
-        let buf = term.backend().buffer();
-        let lines: Vec<String> = (0..buf.area.height)
-            .map(|y| {
-                let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
-                row.trim_end().to_string()
-            })
-            .collect();
-        let want = [
-            "│  Tasks",
-            "│ ━━━━━━━",
-            "│   ├─▸◐ T3-fix-parser             novacode  2h00m",
-            "│   │    running · sonnet-5-5 · 41.2k",
-            "│   │    › parser fixed; tests pass",
-            "│   └──⏸ T4-docs                       site  1h00m",
-            "│        blocked: quota · haiku-5-5 · 900",
-            "│",
-            "│",
-            "│  enter attach · ↑↓ move · esc back · ←→ tab",
-        ];
-        assert_eq!(lines, want, "\n{}", lines.join("\n"));
-        // Enter on a row with a session attaches to it; a queued row has none.
-        assert_eq!(
-            p.key("enter"),
-            Some(Some(PanelAction::Attach {
-                label: "T3-fix-parser".into(),
-                session: "01def".into()
-            }))
-        );
-        p.key("down");
-        assert_eq!(p.key("enter"), None);
-        // A later snapshot replaces the rows.
-        p.set_tasks(vec![]);
-        assert!(p.rows().is_empty());
-    }
-
-    /// R7 (L10.9): a running task opens the panel on the Tasks tab, like a running
-    /// subagent opens it on Agent; it closes once no task runs.
-    #[test]
-    fn running_task_opens_the_panel_on_tasks() {
-        let mut p = Panel::default();
-        let row = |state: &str| TaskRow {
-            label: "T1".into(),
-            state: state.into(),
-            ..Default::default()
-        };
-        p.set_tasks(vec![row("queued")]);
-        p.tick(false);
-        assert!(!p.visible, "a queued task alone does not open it");
-        assert_eq!(p.shown.as_deref(), Some("tasks"), "the only non-empty tab is shown");
-        p.shown = Some("agent".into());
-        p.set_tasks(vec![row("running")]);
-        p.tick(false);
-        assert!(p.visible, "a running task opens the panel");
-        assert_eq!(p.shown.as_deref(), Some("tasks"));
-        assert_eq!(p.rows().len(), 1);
-        p.set_tasks(vec![row("ready")]);
-        p.tick(false);
-        assert!(p.idle_since.is_some(), "no task runs: the close timer starts");
     }
 
     #[test]

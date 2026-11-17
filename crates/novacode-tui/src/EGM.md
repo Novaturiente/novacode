@@ -6,12 +6,12 @@ Fullscreen terminal UI (layer L9) built on `ratatui` and `crossterm`. It speaks 
 ## Interface
 - `lib.rs`: `async run(init, events, ui, cmds) -> io::Result<Exit>` (enters and restores the terminal); `async run_in(&mut Term, ...)` (keeps the terminal between sessions); re-exports `App`, `Cmd`, `Exit`, `Init`, `UiEvent`.
 - `app.rs`: `App` (`new`, `on_agent`, `on_ui`, `on_event`, `on_key`, `tick`, `pace`, `draw`, `finish_frame`, `editor_text`, `set_editor_text`, ...), `Init`, `Cmd`, `UiEvent`, `Exit` (`Quit`, `Resume`, `New`, `Branch`, `Rewind`, `Reload`, `Restart`), `BranchAction`, `COMMANDS` (slash commands).
-- `transcript.rs` (L9.1, L9.7, L9.8): `Transcript`, `Turn`, `Item`, `Tool`, `Img`, `View`, `Thinking`, `SPINNER`, `NEW_SINCE`, `summary(name, args)`, `lay_say`.
+- `transcript.rs` (L9.1, L9.7, L9.8): `Transcript`, `Turn`, `Item`, `Tool`, `Img`, `View`, `Thinking`, `SPINNER`, `summary(name, args)`.
 - `editor.rs` (L9.5): `Editor` (history, kill ring, undo, paste markers, history search), `Action`.
 - `keys.rs` (L9.10): `A` (actions), `Scope`, `Def`/`DEFS`, `Combo`, `parse`, `combo`, `name`, `is`, `Binding`, `Keymap` (`new(overrides)`, `lookup`, `keys`, `conflicts`).
 - `dialog.rs` (L9.13, L6.1): `Picker`, `PickItem`, `Picked`, `fuzzy`, `ApprovalCard`, `ApproveReq`, `Answer`, `Pager` (incl. `keys_help`), `frame`, `centered`.
 - `ask.rs` (L5.21): `AskForm`, `AskReq`, `Done`. `btw.rs`: `BtwChat`, `BtwKey`. `login.rs`: `LoginView`, `LoginStep`, `LoginKey`. `procs.rs` (L5.11): `ProcView`, `ProcPopup`, `order`, `plain`, `output_lines`, `header`.
-- `panel.rs` (L9.16): `Panel` (`on_agent`, `apply(ext, &UiOp)`, `click`, `wheel`, `tick`, `toggle`, `set_procs`, `set_tasks`, `set_needs`, `set_diffstat`, `quota`, ...), `Tab`, `Source`, `HostInfo`, `NeedRow`, `TaskRow`, `PanelAction`, `MIN_WIDTH = 40`, `MIN_SCREEN = 100`, `now_ms`, `secs_pub`, `status_glyph`, `clock`, `spans`.
+- `panel.rs` (L9.16): `Panel` (`on_agent`, `apply(ext, &UiOp)`, `click`, `wheel`, `tick`, `toggle`, `set_procs`, `set_diffstat`, `quota`, ...), `Tab`, `Source`, `HostInfo`, `PanelAction`, `MIN_WIDTH = 40`, `MIN_SCREEN = 100`, `now_ms`, `secs_pub`, `status_glyph`, `clock`, `spans`.
 - `statusline.rs` (L9.12): `Config::parse` (`ui.statusline` setting), `SEGMENTS`, `Seg`, `Row`, `Value_`, `render`, `compactions`.
 - `markdown.rs`: `render(md, width, theme, highlight)`. `highlight.rs` (feature `highlight`): `lines(code, lang, theme, ansi256)`. `images.rs` (L9.14): `dimensions`, `Images` (feature `images`: `detect`, `halfblocks`, `render`). `wrap.rs`: `sanitize`, `width`, `wrap`, `truncate`, `plain`.
 - `theme.rs` (L9.11): `Theme` (`load(name, dir, dark_bg)`, `token`, `apply_user_message`), `UserBox`, `to_256`, `dark_from_osc11`.

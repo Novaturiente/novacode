@@ -2,6 +2,12 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [Unreleased]
+
+### Removed
+
+- Super mode (`--super`, only in `--features super` builds) and everything built only for it: the `super.*` settings, the Tasks tab, `/watch`, `/dismiss`, `say` message blocks, the task edit fence (`NOVACODE_EDIT_RULE`) and the task variables (`NOVACODE_TASK*`, `NOVACODE_SUPER_DIR`). `faux/script` reads only `NOVACODE_FAUX_SCRIPT` now (`NOVACODE_FAUX_SCRIPT_DIR` is gone).
+
 ## [0.10.0] - 2026-11-15
 
 ### Added

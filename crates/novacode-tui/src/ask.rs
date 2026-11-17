@@ -384,7 +384,7 @@ impl AskForm {
             }
         };
         // The question on its own, then each choice: label on one line, its description under it.
-        // Line by line: a question's own line breaks (super's status lines) are kept.
+        // Line by line: a question's own line breaks are kept.
         for l in q.question.lines() {
             out.extend(wrap::wrap(
                 vec![Span::styled(l.to_string(), t.text.add_modifier(Modifier::BOLD))],

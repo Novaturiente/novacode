@@ -204,7 +204,6 @@ impl ExtHost for Host {
                         .stdin(std::process::Stdio::null())
                         .env(crate::hooks::DISABLED_ENV, "1")
                         .kill_on_drop(true);
-                    novacode_base::platform::drop_task_vars(run.as_std_mut());
                     let run = run.output();
                     let o = tokio::time::timeout(Duration::from_secs(secs), run)
                         .await

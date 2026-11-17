@@ -5,7 +5,6 @@ pub mod cache;
 pub mod checkpoint;
 pub mod classifier;
 pub mod codemode;
-pub mod context_window;
 pub mod export;
 pub mod extensions;
 pub mod hooks;

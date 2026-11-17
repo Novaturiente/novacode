@@ -8,7 +8,7 @@ novacode runs full screen in your terminal's alternate screen. The mouse is on: 
 
 From top to bottom:
 
-- **Transcript.** Your messages (in a box), the model's replies, tool calls and their output. Finished turns fold their steps (tool calls, notes, thinking) by default: each run of steps between two messages becomes one dim line such as `▸ 13 tool calls · 1 failed`, and the prompt and every message with text stay (`Alt+O` toggles, `ui.turnCollapse`). `Ctrl+O` shows every tool's output in full or short again. `Ctrl+T` shows or folds thinking (`ui.thinking`: `collapsed`, `full` or `hidden`). When the context is compacted, a coloured line runs across the transcript: `━━ context compacted · 182k → 41k tokens · 37 notes ━━`. It never folds away. If no notes were available, it says `no notes, earlier messages were dropped` and shows in the error colour. In a [super mode](super.md) window, the super agent's messages are framed blocks with a coloured kind badge, the time, what triggered them and a status line per task; they never fold. A `━━ new since you last looked ━━` line marks the first one that came while the terminal was unfocused or detached.
+- **Transcript.** Your messages (in a box), the model's replies, tool calls and their output. Finished turns fold their steps (tool calls, notes, thinking) by default: each run of steps between two messages becomes one dim line such as `▸ 13 tool calls · 1 failed`, and the prompt and every message with text stay (`Alt+O` toggles, `ui.turnCollapse`). `Ctrl+O` shows every tool's output in full or short again. `Ctrl+T` shows or folds thinking (`ui.thinking`: `collapsed`, `full` or `hidden`). When the context is compacted, a coloured line runs across the transcript: `━━ context compacted · 182k → 41k tokens · 37 notes ━━`. It never folds away. If no notes were available, it says `no notes, earlier messages were dropped` and shows in the error colour.
 - **Editor.** The input box. It grows up to 10 rows.
 - **Status line.** One row under the editor with the activity (`ready`, a spinner, or what novacode waits for) on the left and details on the right. While a compaction runs, the activity says `compacting context`. See [Status line](#status-line).
 - **Side panel.** An optional column on the right. See [Side panel](#side-panel).
@@ -22,7 +22,6 @@ The panel has tabs. Switch tabs with `Tab` and `Shift+Tab` or the number keys `1
 | Tab | Shows |
 |---|---|
 | Agent | The goal, the todo list and subagents. Subagents show from the oldest prompt that still has one running up to the newest prompt that started any; older finished ones are hidden (the title counts them). |
-| Tasks | Super mode only ([super mode](super.md)), shown while the board has tasks: one row per task on the super agent's board, not archived ones: label, repo, state, model, tokens, age and last summary, refreshed every 2 seconds. It becomes the shown tab when the first tasks appear. Above the tasks, **Needs you** lists the super agent's open questions and warnings until they are answered or resolved; `d` on one dismisses it. `Enter` opens the task in a new tmux window (`novacode attach <session>`, with your `NOVACODE_HOME` passed along), or prints that command outside tmux; when tmux fails, a notice shows its error and the command. |
 | Processes | A list of processes, running ones first: status, run time, command and the last output line. `Enter` or a click opens the process popup. |
 | Usage stats | Bars for context use (and a split into system prompt, tools and messages), cache hits (last request and session) and subscription windows; sparklines of cache hit and cost (or output tokens) per request; token totals and cost; MCP servers with connected or failed state and tool counts; how many skills, prompts, agents, extensions, packages and context files loaded, and running processes and subagents. `Ctrl+Alt+U` opens it. |
 | Timing | Where the time of each task went, with a sparkline of task times. |
@@ -36,13 +35,12 @@ Extensions can add tabs too (see [extensions](extensions.md)).
 | `Ctrl+Alt+U` | Open the panel on Usage stats with focus. Again closes it. |
 | `Ctrl+Alt+F` | Give the panel the keys. `Esc` or `q` gives them back. |
 | `Up`/`Down` (or `k`/`j`) | Move in the focused panel. |
-| `Enter` | Run the action of the selected row (Files: open it; Processes: show its output; Tasks: open the task; extension tabs: their action). |
-| `d` | Tasks tab, on a Needs you row: dismiss it. |
+| `Enter` | Run the action of the selected row (Files: open it; Processes: show its output; extension tabs: their action). |
 | Mouse | Wheel scrolls the panel, a click picks a tab or a row, a drag copies text. |
 
 The panel needs a terminal at least 100 columns wide. On a narrower screen it stays hidden and open todos show as a short block above the editor instead. Its width is a quarter of the screen, at least 40 columns and at most half.
 
-By default the panel opens by itself while todos or subagents are running (on the Agent tab), or while a super mode task is running (on the Tasks tab), and hides a few seconds after the work ends (`ui.panel.auto`).
+By default the panel opens by itself while todos or subagents are running (on the Agent tab), and hides a few seconds after the work ends (`ui.panel.auto`).
 
 ### Panel in a tmux pane
 
@@ -155,7 +153,6 @@ Type `/` to see the list. A line that is only `/something` unknown to novacode i
 | `/export [html]` | Write this branch to a file. |
 | `/copy` | Copy the last reply (also `Ctrl+X`). |
 | `/btw [question]` | Side chat. See [below](#side-questions-with-btw). |
-| `/watch` | Super window only: open super's live tasks in a tmux grid, 6 panes per window (outside tmux, print the command). See [super](super.md). |
 | `/context` | Where the context window goes. |
 | `/docs [question]` | Add a hidden note telling the model where novacode's own docs (`~/.novacode/docs/`) and your config files are, then ask the question if you gave one. Use it to have the session set up or customise novacode. |
 | `/usage` | Tokens and cost per route, cache warming, memory workers and subscription windows. |
@@ -168,7 +165,7 @@ Type `/` to see the list. A line that is only `/something` unknown to novacode i
 | `/keys` (or `/help`) | Show the key bindings. |
 | `/reload` | Re-read settings, keys, theme, skills, extensions, MCP servers and context files. During a turn it waits for the turn to end (`Esc` ends it sooner); the same goes for `Alt+Shift+R`. The session stays as it is: its folder (a worktree too), background processes, running subagents, the mode (plan mode…), "allow for this session" answers and which files were read. |
 | `/restart` | Restart novacode (for example after a rebuild) and resume this session. |
-| `/kill` | Attached windows only (`novacode attach`, super's window, task panes): after a confirmation card, end the session the window shows, like `novacode stop`, and close the window. In super's window it ends super only; tasks keep running, and the next `novacode --super` starts a new super session. In a session's own window use `/quit`. |
+| `/kill` | Attached windows only (`novacode attach`): after a confirmation card, end the session the window shows, like `novacode stop`, and close the window. In a session's own window use `/quit`. |
 | `/quit` (or `/exit`) | Quit. In an attached window it only closes the window; the session keeps running. |
 
 Session commands are explained in [sessions](sessions.md).

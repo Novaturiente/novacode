@@ -25,8 +25,6 @@ pub struct Run {
     pub touched: Vec<PathBuf>,
     /// The folder the call ran in.
     pub cwd: PathBuf,
-    /// Why `touched` misses a `bash` call's changes (a folder too big to walk).
-    pub note: Option<String>,
 }
 
 impl Run {
@@ -69,13 +67,9 @@ impl After {
 /// Taken before a call runs; finished by [`Hooks::after_tool`].
 pub struct Started {
     t0: Instant,
-    /// The snapshot, and whether it came from the walk (not git).
-    snap: Option<(Snap, bool)>,
-    note: Option<String>,
+    /// The git snapshot taken before a `bash` call.
+    snap: Option<Snap>,
 }
-
-/// The most files the walk outside git looks at; a bigger folder isn't tracked.
-pub const WALK_CAP: usize = 20_000;
 
 /// Changed files under a folder (modified, untracked, deleted) → (mtime, len).
 type Snap = HashMap<PathBuf, Option<(SystemTime, u64)>>;
@@ -103,51 +97,6 @@ async fn snapshot(cwd: &Path) -> Option<Snap> {
             })
             .collect(),
     )
-}
-
-/// Outside git: every file under `cwd` (no `.git`, `node_modules`, `target`, `__pycache__`
-/// or dot-folders, no `*.pyc` files), or `None` past [`WALK_CAP`] files. shortcut: a full walk before
-/// and after each `bash` call; only a super task's proof log asks for it.
-fn walk(cwd: &Path) -> Option<Snap> {
-    let mut snap = Snap::new();
-    let mut dirs = vec![cwd.to_path_buf()];
-    while let Some(dir) = dirs.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for e in rd.flatten() {
-            let Ok(t) = e.file_type() else { continue };
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            if t.is_dir() {
-                if !name.starts_with('.') && !["node_modules", "target", "__pycache__"].contains(&&*name) {
-                    dirs.push(e.path());
-                }
-                continue;
-            }
-            if name.ends_with(".pyc") {
-                continue;
-            }
-            if snap.len() == WALK_CAP {
-                return None;
-            }
-            let meta = e.metadata().ok().and_then(|m| Some((m.modified().ok()?, m.len())));
-            snap.insert(e.path(), meta);
-        }
-    }
-    Some(snap)
-}
-
-/// What a walk over the cap leaves untracked.
-fn over_cap() -> String {
-    format!("bash edits not tracked in this folder (over {WALK_CAP} files)")
-}
-
-/// The walk, off the async threads; `Err` = over the cap.
-async fn walked(cwd: &Path) -> Result<Snap, String> {
-    let dir = cwd.to_path_buf();
-    match tokio::task::spawn_blocking(move || walk(&dir)).await {
-        Ok(Some(s)) => Ok(s),
-        _ => Err(over_cap()),
-    }
 }
 
 /// Files whose state differs between two snapshots.
@@ -219,11 +168,6 @@ pub trait Handler: Send + Sync {
     fn wants_touched(&self) -> bool {
         false
     }
-    /// With [`Handler::wants_touched`]: outside git, find a `bash` call's changes
-    /// by walking the folder (costly; capped at [`WALK_CAP`] files).
-    fn walks_folders(&self) -> bool {
-        false
-    }
 }
 
 #[derive(Default, Clone)]
@@ -260,23 +204,13 @@ impl Hooks {
     /// Before a call runs: start its clock, and snapshot the tree around `bash`
     /// when a handler reads touched files.
     pub async fn start(&self, tool: &str, cwd: &Path) -> Started {
-        let (snap, note) = if tool == "bash" && self.handlers.iter().any(|h| h.wants_touched()) {
-            let walk_ok = self.handlers.iter().any(|h| h.wants_touched() && h.walks_folders());
-            match snapshot(cwd).await {
-                Some(s) => (Some((s, false)), None),
-                None if walk_ok => match walked(cwd).await {
-                    Ok(s) => (Some((s, true)), None),
-                    Err(note) => (None, Some(note)),
-                },
-                None => (None, None),
-            }
-        } else {
-            (None, None)
+        let snap = match tool == "bash" && self.handlers.iter().any(|h| h.wants_touched()) {
+            true => snapshot(cwd).await,
+            false => None,
         };
         Started {
             t0: Instant::now(),
             snap,
-            note,
         }
     }
 
@@ -294,25 +228,16 @@ impl Hooks {
             return;
         }
         let mut touched = named(tool, args, cwd);
-        let mut note = started.note.clone();
-        if let Some((before, walk)) = &started.snap {
-            // The same kind of snapshot as before the call (git, or the walk).
-            let after = match walk {
-                true => walked(cwd).await.map(Some),
-                false => Ok(snapshot(cwd).await),
-            };
-            match after {
-                Ok(Some(after)) => touched.extend(diff(before, &after)),
-                Ok(None) => {}
-                Err(n) => note = Some(n),
-            }
+        if let Some(before) = &started.snap
+            && let Some(after) = snapshot(cwd).await
+        {
+            touched.extend(diff(before, &after));
         }
         let run = Run {
             call_id: call_id.into(),
             duration_ms: started.t0.elapsed().as_millis() as u64,
             touched,
             cwd: cwd.to_path_buf(),
-            note,
         };
         for h in &self.handlers {
             let Some(a) = h.after_tool(tool, args, out, &run).await else {
@@ -326,7 +251,7 @@ impl Hooks {
             }
             if let Some(text) = a.append.filter(|t| !t.trim().is_empty()) {
                 let text: String = text.trim().chars().take(8000).collect();
-                // An empty label appends the text as is (the proof log's `[proof #N]`).
+                // An empty label appends the text as is.
                 let text = match h.label() {
                     "" => text,
                     label => format!("[{label}] {text}"),
@@ -415,7 +340,6 @@ async fn run(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     novacode_base::platform::own_group(c.as_std_mut());
-    novacode_base::platform::drop_task_vars(c.as_std_mut());
     if let Some(t) = input["tool"].as_str() {
         c.env("NOVACODE_TOOL", t);
     }
@@ -721,17 +645,6 @@ mod tests {
     }
 
     #[test]
-    fn the_walk_skips_python_bytecode() {
-        let d = tempfile::tempdir().unwrap();
-        std::fs::create_dir(d.path().join("__pycache__")).unwrap();
-        std::fs::write(d.path().join("__pycache__/a.cpython-312.pyc"), "x").unwrap();
-        std::fs::write(d.path().join("b.pyc"), "x").unwrap();
-        std::fs::write(d.path().join("a.py"), "x").unwrap();
-        let snap = super::walk(d.path()).unwrap();
-        assert_eq!(snap.keys().collect::<Vec<_>>(), [&d.path().join("a.py")]);
-    }
-
-    #[test]
     fn spots_bash_file_writes() {
         for c in [
             "cat > src/main.rs <<'EOF'\nfn main(){}\nEOF",
@@ -764,31 +677,6 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    /// C3 (L10.9): a super task's identity never reaches its hooks. Runs
-    /// [`task_env_case`] in a child test process that has the variables set.
-    #[test]
-    fn task_env_is_removed() {
-        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-        cmd.args(["--exact", "hooks::tests::task_env_case", "--ignored"]);
-        for v in ["NOVACODE_TASK", "NOVACODE_TASK_TOKEN", "NOVACODE_SUPER_DIR"] {
-            cmd.env(v, "secret");
-        }
-        let out = cmd.output().unwrap();
-        let text = String::from_utf8_lossy(&out.stdout);
-        assert!(out.status.success() && text.contains("1 passed"), "{text}");
-    }
-
-    #[tokio::test]
-    #[ignore = "run by task_env_is_removed"]
-    async fn task_env_case() {
-        let d = tempfile::tempdir().unwrap();
-        let cmd = "echo task=$NOVACODE_TASK token=$NOVACODE_TASK_TOKEN dir=$NOVACODE_SUPER_DIR";
-        let (_, out, _) = run(cmd, "afterTool", d.path(), "s", &json!({}), Duration::from_secs(5))
-            .await
-            .unwrap();
-        assert_eq!(out.trim(), "task= token= dir=");
     }
 
     fn commands(config: Value, dir: &Path) -> Commands {

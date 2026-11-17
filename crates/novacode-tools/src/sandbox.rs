@@ -432,8 +432,8 @@ impl Sandbox {
         let mut ro: Vec<PathBuf> = cands.iter().filter_map(|p| std::fs::canonicalize(p).ok()).collect();
         ro.sort();
         ro.dedup();
-        // Extra writable places inside the novacode folder (a review's scratch), opened again
-        // after the lock; never one holding its secrets (L10.9).
+        // Extra writable places inside the novacode folder (`sandbox.allowWrite`), opened again
+        // after the lock; never one holding its secrets.
         let nova = std::fs::canonicalize(&c.novacode_home).unwrap_or_else(|_| c.novacode_home.clone());
         let mut write: Vec<PathBuf> = c
             .allow_write
@@ -721,7 +721,6 @@ pub fn command(sandbox: Option<&Sandbox>, cmd: &str, cwd: &Path) -> io::Result<t
         }
     };
     c.arg("-c").arg(cmd).current_dir(cwd);
-    novacode_base::platform::drop_task_vars(c.as_std_mut());
     Ok(c)
 }
 

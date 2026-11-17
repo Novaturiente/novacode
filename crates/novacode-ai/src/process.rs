@@ -86,7 +86,6 @@ impl Inner {
     async fn start(&self) -> Result<Conn, String> {
         let c = &self.config;
         let mut cmd = tokio::process::Command::new(&c.command);
-        novacode_base::platform::drop_task_vars(cmd.as_std_mut());
         let mut child = cmd
             .args(&c.args)
             .envs(&c.env)
@@ -374,31 +373,6 @@ for line in sys.stdin:
             e.stop
         );
         assert_eq!(e.error_message.as_deref(), Some("slow down"));
-    }
-
-    /// Run by `auth::tests::task_env_is_removed` with the task variables set.
-    #[tokio::test]
-    #[ignore = "run by auth::tests::task_env_is_removed"]
-    async fn task_env_case() {
-        let d = tempfile::tempdir().unwrap();
-        let f = d.path().join("p.py");
-        std::fs::write(
-            &f,
-            FAKE.replace(
-                r#"["small", "big"]"#,
-                r#"[__import__("os").environ.get(v, "") for v in ("NOVACODE_TASK", "NOVACODE_TASK_TOKEN", "NOVACODE_SUPER_DIR")]"#,
-            ),
-        )
-        .unwrap();
-        let p = Process::new(
-            "mine",
-            Config {
-                command: "python3".into(),
-                args: vec![f.display().to_string()],
-                env: Default::default(),
-            },
-        );
-        assert_eq!(p.list_models().await.unwrap(), ["", "", ""]);
     }
 
     #[tokio::test]

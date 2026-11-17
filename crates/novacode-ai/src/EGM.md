@@ -89,8 +89,7 @@ classifier models and request tracing.
   `<home>/cache/usage/<provider>-<account>.json` (shared quota cache),
   `<home>/cache/usage/<provider>.json` (legacy copy of the last-used
   account), and `--trace` JSONL files.
-- Reads the `faux/script` reply file: `$NOVACODE_FAUX_SCRIPT_DIR/<label>.jsonl`,
-  else `$NOVACODE_FAUX_SCRIPT`.
+- Reads the `faux/script` reply file `$NOVACODE_FAUX_SCRIPT`.
 - Processes: `process::Process` spawns a custom provider program once per
   session and speaks JSON-RPC 2.0 over its stdio.
 

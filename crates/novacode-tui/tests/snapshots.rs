@@ -91,67 +91,30 @@ fn goldens(name: &str, h: u16, setup: impl Fn(&mut App)) {
     }
 }
 
-/// TP2 baseline: the Tasks tab with a long title, a project tag, a 3-hour age, several
-/// running rows and the second row selected. Below 100 columns the panel is hidden.
-#[test]
-fn golden_tasks_tab() {
-    let ago = |s: u64| novacode_tui::clock::now_ms() - s * 1000 - 20_000;
-    let row = |label: &str, repo: &str, secs: u64| novacode_tui::panel::TaskRow {
-        label: label.into(),
-        repo: repo.into(),
-        state: "running".into(),
-        model: "claude/claude-sonnet-5-5".into(),
-        tokens: 41_200,
-        started_ms: ago(secs),
-        session: Some(format!("01{label}")),
-        ..Default::default()
-    };
-    goldens("tasks_tab", 24, |a| {
-        a.on_ui(UiEvent::Board {
-            tasks: vec![
-                row("T3-fix-the-parser-for-nested-generic-arguments", "novacode", 3 * 3600),
-                row("T4-docs-site-search", "site", 2 * 3600),
-                row("T5-api-retry-backoff", "api", 3600),
-            ],
-            needs: vec![],
-        });
-        a.panel.visible = true;
-        a.panel.show_tab("tasks");
-        a.set_focus(Focus::Panel);
-        key(a, KeyCode::Down, KeyModifiers::NONE);
-    });
-}
-
 /// TP10 after-capture bugs at 120 columns: a title takes the room a short tag leaves
-/// (tags stay aligned on their right edge), and a task's detail shows the model's short
-/// name, so it fits on one line. Detail lines wrap only at ` · `; a part longer than
-/// the line is cut with `…`.
+/// (tags stay aligned on their right edge), and a short detail fits on one line.
+/// Detail lines wrap only at ` · `; a part longer than the line is cut with `…`.
 #[test]
 fn panel_rows_fill_title_and_detail_room() {
-    let ago = |s: u64| novacode_tui::clock::now_ms() - s * 1000 - 20_000;
-    let row = |label: &str, repo: &str, model: &str| novacode_tui::panel::TaskRow {
-        label: label.into(),
-        repo: repo.into(),
-        state: "running".into(),
-        model: model.into(),
-        tokens: 41_200,
-        started_ms: ago(3600),
-        ..Default::default()
+    let ago = novacode_tui::clock::now_ms() - 3600 * 1000 - 20_000;
+    let row = |label: &str, repo: &str, model: &str| {
+        json!({
+            "id": label, "label": label, "tag": repo, "status": "running",
+            "time": {"since": ago}, "detail": [format!("running · {model} · 41.2k")],
+        })
     };
-    let sonnet = "claude/claude-sonnet-5-5";
+    let sonnet = "sonnet-5-5";
     let (mut a, _rx) = app(vec![]);
-    a.on_ui(UiEvent::Board {
-        tasks: vec![
+    rows_tab(
+        &mut a,
+        vec![
             row("T3-fix-the-parser-for-nested-generic-arguments", "novacode", sonnet),
             row("T4-docs-site-search", "site", sonnet),
             row("T5-api-retry-backoff", "api", sonnet),
-            row("T6-wide", "api", "openai/gpt-6-codex-max-preview"),
-            row("T7-long", "api", "x/averyveryverylongmodelnamewithoutbreaks-preview"),
+            row("T6-wide", "api", "gpt-6-codex-max-preview"),
+            row("T7-long", "api", "averyveryverylongmodelnamewithoutbreaks-preview"),
         ],
-        needs: vec![],
-    });
-    a.panel.visible = true;
-    a.panel.show_tab("tasks");
+    );
     let s = screen(&mut a, 120, 30);
     let lines: Vec<&str> = s.lines().collect();
     let at = |id: &str| {
@@ -222,29 +185,40 @@ fn text(buf: &ratatui::buffer::Buffer) -> String {
         .join("\n")
 }
 
-/// Three running tasks: a long title, a long project name, and short ones.
+/// An extension tab `rows` with these nodes in order, shown in a visible panel.
+fn rows_tab(a: &mut App, nodes: Vec<serde_json::Value>) {
+    let mut op = |v: serde_json::Value| {
+        a.on_agent(AgentEvent::Ui {
+            ext: "x".into(),
+            op: serde_json::from_value(v).unwrap(),
+        })
+    };
+    op(json!({"op": "open_tab", "name": "rows", "title": "Rows"}));
+    for (i, mut n) in nodes.into_iter().enumerate() {
+        n["order"] = json!(i);
+        op(json!({"op": "publish", "tab": "rows", "source": "s", "node": n}));
+    }
+    a.panel.visible = true;
+    a.panel.show_tab("rows");
+}
+
+/// Three running rows: a long title, a long tag, and short ones.
 fn board(a: &mut App) {
     let ago = |s: u64| novacode_tui::clock::now_ms() - s * 1000 - 20_000;
-    let row = |label: &str, repo: &str, secs: u64| novacode_tui::panel::TaskRow {
-        label: label.into(),
-        repo: repo.into(),
-        state: "running".into(),
-        model: "claude/claude-sonnet-5-5".into(),
-        tokens: 41_200,
-        started_ms: ago(secs),
-        session: Some(format!("01{label}")),
-        ..Default::default()
+    let row = |label: &str, repo: &str, secs: u64| {
+        json!({
+            "id": label, "label": label, "tag": repo, "status": "running",
+            "time": {"since": ago(secs)}, "detail": ["running · sonnet-5-5 · 41.2k"],
+        })
     };
-    a.on_ui(UiEvent::Board {
-        tasks: vec![
+    rows_tab(
+        a,
+        vec![
             row("T3-fix-the-parser-for-nested-generic-arguments", "novacode", 3 * 3600),
             row("T4-docs", "a-very-long-project-name", 2 * 3600),
             row("T5-api", "api", 3600),
         ],
-        needs: vec![],
-    });
-    a.panel.visible = true;
-    a.panel.show_tab("tasks");
+    );
 }
 
 /// TP4: title, tag and age sit in fixed columns with a 2-cell gap before the age, on a
@@ -600,20 +574,6 @@ fn kill_asks_then_ends_the_attached_session() {
     assert_eq!(rx.try_recv().unwrap(), Cmd::Kill);
 }
 
-/// L9 `/kill` in super's window (a board came in) names super's root and says tasks keep running.
-#[test]
-fn kill_in_supers_window_names_the_root() {
-    let (mut a, _rx) = app_at(vec![], Some("01abcdef0123456789"));
-    a.on_ui(UiEvent::Board {
-        tasks: vec![],
-        needs: vec![],
-    });
-    typ(&mut a, "/kill");
-    key(&mut a, KeyCode::Enter, KeyModifiers::NONE);
-    let s = screen(&mut a, 120, 16);
-    assert!(s.contains("End super for /home/u/proj? Tasks keep running."), "{s}");
-}
-
 /// L9.19: an idle compaction shows in the activity line while it runs, then
 /// leaves a full-width divider and the `compacted ×N` status segment.
 #[test]
@@ -644,156 +604,6 @@ fn compaction_shows_while_running_then_leaves_a_divider() {
         "{line}"
     );
     assert!(line.chars().count() >= 97 && line.ends_with('━'), "{line}");
-}
-
-fn say_msgs(id: &str, kind: &str, at_ms: u64) -> [Message; 2] {
-    let say = Say {
-        kind: kind.into(),
-        priority: "normal".into(),
-        at_ms,
-        time: "14:05".into(),
-        trigger: "health check".into(),
-        body: format!("body {id}"),
-        ..Default::default()
-    };
-    [
-        Message::Assistant(AssistantMessage {
-            content: vec![Block::ToolCall(ToolCall {
-                id: id.into(),
-                name: "say".into(),
-                arguments: json!({"kind": kind, "body": format!("body {id}")}),
-                arguments_error: None,
-                replay: None,
-            })],
-            stop: StopReason::ToolUse,
-            usage: Default::default(),
-            provider: "f".into(),
-            model: "m".into(),
-            response_id: None,
-            error_message: None,
-            thinking_level: None,
-        }),
-        Message::ToolResult {
-            call_id: id.into(),
-            tool_name: "say".into(),
-            content: vec![Block::text("Shown to the user.")],
-            is_error: false,
-            details: Some(json!({ "say": say })),
-        },
-    ]
-}
-
-/// L10.9: the "new since you last looked" divider goes before the first `say` block that
-/// came while the terminal was unfocused, and on attach before the first one newer than
-/// the last time this user's window saw the session. There is only one.
-#[test]
-fn the_new_since_divider_marks_the_first_unseen_message() {
-    let order = |s: &str| {
-        let at = |p: &str| s.find(p).unwrap_or_else(|| panic!("{p} missing:\n{s}"));
-        (
-            at("body c1"),
-            at("new since you last looked"),
-            at("body c2"),
-            at("body c3"),
-        )
-    };
-    // Reattach: c1 seen, c2 and c3 are new.
-    let mut history = vec![Message::user("go")];
-    history.extend(say_msgs("c1", "update", 1000));
-    history.extend(say_msgs("c2", "warning", 3000));
-    history.extend(say_msgs("c3", "done", 4000));
-    let (mut a, _rx) = app(history);
-    a.on_ui(UiEvent::Seen { ms: 2000 });
-    let s = screen(&mut a, 100, 40);
-    let (c1, div, c2, c3) = order(&s);
-    assert!(c1 < div && div < c2 && c2 < c3, "{s}");
-    // Live: focused, no divider; unfocused, before the first block of that time away.
-    let (mut a, _rx) = app(vec![Message::user("go")]);
-    a.on_event(Event::FocusGained);
-    for m in say_msgs("c1", "update", 1) {
-        a.on_agent(AgentEvent::Message(m));
-    }
-    assert!(!screen(&mut a, 100, 40).contains("new since"));
-    a.on_event(Event::FocusLost);
-    for m in say_msgs("c2", "update", 2).into_iter().chain(say_msgs("c3", "note", 3)) {
-        a.on_agent(AgentEvent::Message(m));
-    }
-    a.on_event(Event::FocusGained);
-    let s = screen(&mut a, 100, 40);
-    let (c1, div, c2, c3) = order(&s);
-    assert!(c1 < div && div < c2 && c2 < c3, "{s}");
-    assert_eq!(s.matches("new since you last looked").count(), 1);
-    // Away again: the divider moves to the new first unseen block.
-    a.on_event(Event::FocusLost);
-    for m in say_msgs("c4", "update", 4) {
-        a.on_agent(AgentEvent::Message(m));
-    }
-    let s = screen(&mut a, 100, 40);
-    assert_eq!(s.matches("new since you last looked").count(), 1);
-    assert!(s.find("new since").unwrap() > s.find("body c3").unwrap(), "{s}");
-}
-
-/// S1 (live test): a terminal never reports focus until it changes, so a window opened or
-/// reconnected in an unfocused tmux window got no FocusLost and never drew the divider.
-/// Until the user shows they are there (focus in, a key, a click), the window counts as away.
-#[test]
-fn a_window_counts_as_away_until_the_user_shows_up() {
-    let (mut a, _rx) = app(vec![Message::user("go")]);
-    for m in say_msgs("c1", "update", 1) {
-        a.on_agent(AgentEvent::Message(m));
-    }
-    let s = screen(&mut a, 100, 40);
-    assert!(
-        s.find("new since").is_some_and(|d| d < s.find("body c1").unwrap()),
-        "{s}"
-    );
-    // A key press shows the user is looking: no divider for what comes next.
-    let (mut a, _rx) = app(vec![Message::user("go")]);
-    a.on_event(Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
-    for m in say_msgs("c1", "update", 1) {
-        a.on_agent(AgentEvent::Message(m));
-    }
-    assert!(!screen(&mut a, 100, 40).contains("new since"));
-}
-
-/// L10.9: open questions and warnings head the Tasks tab as Needs you; `d` dismisses one
-/// through the host (`/dismiss <id>`), Enter does nothing there.
-#[test]
-fn needs_you_heads_the_tasks_tab_and_d_dismisses() {
-    let (mut a, mut rx) = app(vec![]);
-    a.on_ui(UiEvent::Board {
-        tasks: vec![novacode_tui::panel::TaskRow {
-            label: "T2-api".into(),
-            state: "blocked".into(),
-            ..Default::default()
-        }],
-        needs: vec![novacode_tui::panel::NeedRow {
-            id: "say-1".into(),
-            kind: "warning".into(),
-            tasks: vec!["T2-api".into()],
-            status: "T2-api is stuck on the db url".into(),
-            at_ms: 1,
-        }],
-    });
-    a.panel.visible = true;
-    a.panel.show_tab("tasks");
-    a.set_focus(Focus::Panel);
-    let s = screen(&mut a, 120, 30);
-    let (needs, warn, task) = (
-        s.find("NEEDS YOU").unwrap_or_else(|| panic!("{s}")),
-        s.find("warning · T2-api").unwrap_or_else(|| panic!("{s}")),
-        s.rfind("T2-api").unwrap(),
-    );
-    assert!(needs < warn && warn < task, "{s}");
-    while rx.try_recv().is_ok() {}
-    a.on_event(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
-    assert!(rx.try_recv().is_err(), "Enter dismisses nothing");
-    a.on_event(Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)));
-    let mut sent = vec![];
-    while let Ok(c) = rx.try_recv() {
-        sent.push(c);
-    }
-    assert!(sent.contains(&Cmd::Prompt("/dismiss say-1".into())), "{sent:?}");
 }
 
 fn screen(app: &mut App, w: u16, h: u16) -> String {
@@ -1646,22 +1456,6 @@ fn only_the_focused_frame_is_coloured() {
     assert_eq!(frames(&mut a), (grey, accent, vec![]), "panel focused");
     open_ask(&mut a);
     assert_eq!(frames(&mut a), (grey, grey, vec![accent]), "dialog focused");
-}
-
-/// R7 (L10.9): a board snapshot as the wire carries it (`ui` `board`) reaches an
-/// attached window's Tasks tab, which Ctrl+Alt+P then shows with its row.
-#[test]
-fn board_snapshot_from_the_wire_fills_the_tasks_tab() {
-    let (mut a, _rx) = app(vec![Message::user("go")]);
-    let started = novacode_tui::clock::now_ms() - 65_000;
-    let wire = format!(
-        r#"{{"kind":"board","tasks":[{{"label":"T1-cli-input-errors","repo":"calc","state":"running","model":"claude/claude-haiku-5-5","tokens":0,"started_ms":{started},"session":"01a1a760"}}]}}"#
-    );
-    a.on_ui(serde_json::from_str::<UiEvent>(&wire).unwrap());
-    a.tick();
-    key(&mut a, KeyCode::Char('p'), KeyModifiers::CONTROL | KeyModifiers::ALT);
-    let s = screen(&mut a, 120, 16);
-    assert!(s.contains("Tasks") && s.contains("T1-cli-input-errors"), "{s}");
 }
 
 #[test]
@@ -3079,23 +2873,17 @@ fn focused_panel_lets_app_keys_through() {
 fn task_icons_are_coloured_by_state() {
     let t = novacode_tui::theme::Theme::default();
     let (mut a, _rx) = app(vec![]);
-    let row = |label: &str, state: &str| novacode_tui::panel::TaskRow {
-        label: label.into(),
-        state: state.into(),
-        ..Default::default()
-    };
-    a.on_ui(UiEvent::Board {
-        // The first row is selected, so its text is drawn dim; the others keep their colours.
-        tasks: vec![
+    let row = |label: &str, status: &str| json!({"id": label, "label": label, "status": status});
+    // The first row is selected, so its text is drawn dim; the others keep their colours.
+    rows_tab(
+        &mut a,
+        vec![
             row("T0-sel", "queued"),
             row("T1-run", "running"),
-            row("T2-ok", "ready"),
+            row("T2-ok", "done"),
             row("T3-bad", "failed"),
         ],
-        needs: vec![],
-    });
-    a.panel.visible = true;
-    a.panel.show_tab("tasks");
+    );
     let buf = draw(&mut a, 120, 24);
     let x0 = 120 - a.panel.width(120);
     for (label, glyph, colour) in [("T1-run", "◐", t.warn), ("T2-ok", "✓", t.ok), ("T3-bad", "✗", t.error)] {

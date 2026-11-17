@@ -883,8 +883,7 @@ fn lock_session(path: &Path) -> io::Result<Option<storage::FileLock>> {
 }
 
 /// Retention (L4): delete subagent sessions (first prompt starts with
-/// [`SUBAGENT_TASK_PREFIX`]) and super review sessions (cwd under `<home>/super/*/review/`)
-/// untouched for `days` days, with their `.lock`/`.bak` files; a live one stays.
+/// [`SUBAGENT_TASK_PREFIX`]) untouched for `days` days, with their `.lock`/`.bak` files; a live one stays.
 /// `days` 0 keeps all. Returns (sessions removed, bytes freed).
 pub fn cleanup_old(paths: &Paths, days: u64) -> (usize, u64) {
     let Some(cutoff) = (days > 0)
@@ -908,7 +907,7 @@ pub fn cleanup_old(paths: &Paths, days: u64) -> (usize, u64) {
             let Some(id) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
                 continue;
             };
-            if home.join("run").join(format!("{id}.json")).exists() || !disposable(home, &path) {
+            if home.join("run").join(format!("{id}.json")).exists() || !disposable(&path) {
                 continue;
             }
             // Held while deleting, so the session can't be opened meanwhile.
@@ -932,21 +931,14 @@ pub fn cleanup_old(paths: &Paths, days: u64) -> (usize, u64) {
     (n, bytes)
 }
 
-/// A subagent's session (its first prompt is the parent's task) or a super review's.
-fn disposable(home: &Path, path: &Path) -> bool {
+/// A subagent's session (its first prompt is the parent's task).
+fn disposable(path: &Path) -> bool {
     use std::io::BufRead;
     let Ok(f) = std::fs::File::open(path) else { return false };
     let mut lines = io::BufReader::new(f).lines().map_while(Result::ok);
-    let Some(header) = lines.next().and_then(|l| serde_json::from_str::<Header>(&l).ok()) else {
+    let Some(_) = lines.next().and_then(|l| serde_json::from_str::<Header>(&l).ok()) else {
         return false;
     };
-    if header
-        .cwd
-        .strip_prefix(home.join("super"))
-        .is_ok_and(|rest| rest.components().nth(1).is_some_and(|c| c.as_os_str() == "review"))
-    {
-        return true;
-    }
     lines
         .filter(|l| l.contains("\"role\":\"user\""))
         .find_map(|l| match serde_json::from_str::<Entry>(&l).ok()?.kind {
@@ -1348,15 +1340,13 @@ mod tests {
         assert_eq!(recent_prompts(&paths, cwd, None, 10), ["a", "b", "c", "d"]);
     }
 
-    /// Novahome: 1102 sessions in 4 days and no retention. Old subagent and super review
-    /// sessions go; user, super task and live sessions stay.
+    /// Novahome: 1102 sessions in 4 days and no retention. Old subagent sessions go;
+    /// user and live sessions stay.
     #[test]
-    fn old_subagent_and_review_sessions_are_cleaned_up() {
+    fn old_subagent_sessions_are_cleaned_up() {
         let home = tempfile::tempdir().unwrap();
         let paths = Paths::new(home.path());
         let child = format!("{SUBAGENT_TASK_PREFIX}\"scout\" task");
-        let review = home.path().join("super/-w/review/T3-ab12");
-        let task = home.path().join("super/-w/wt/T1");
         let write = |cwd: &Path, first: &str| {
             let mut s = Store::create(&paths, cwd, false);
             s.append(msg(first)).unwrap();
@@ -1376,16 +1366,13 @@ mod tests {
             p.to_path_buf()
         };
         let old_child = write(Path::new("/w"), &child);
-        let old_review = write(&review, "review T1");
         let old_user = write(Path::new("/w"), "fix the bug");
-        let old_task = write(&task, "Task T1");
         let new_child = write(Path::new("/w"), &child);
         let live_child = write(Path::new("/w2"), &child);
         let ran_child = write(Path::new("/w2"), &child);
-        let gone = [age(&old_child, 20), age(&old_review, 20)];
+        let gone = [age(&old_child, 20)];
         let kept = [
             age(&old_user, 20),
-            age(&old_task, 20),
             age(&new_child, 3),
             age(&live_child, 20),
             age(&ran_child, 20),
@@ -1393,19 +1380,17 @@ mod tests {
         std::fs::write(gone[0].with_extension("jsonl.bak"), "x").unwrap();
         std::fs::create_dir_all(home.path().join("run")).unwrap();
         std::fs::write(home.path().join("run").join(format!("{}.json", ran_child.id())), "{}").unwrap();
-        let review_dir = gone[1].parent().unwrap().to_path_buf();
-        drop((old_child, old_review, old_user, old_task, new_child, ran_child));
+        drop((old_child, old_user, new_child, ran_child));
         // Setting 0: nothing goes.
         assert_eq!(cleanup_old(&paths, 0), (0, 0));
         assert!(gone.iter().chain(&kept).all(|p| p.exists()));
         let (n, bytes) = cleanup_old(&paths, 14);
-        assert_eq!(n, 2);
+        assert_eq!(n, 1);
         assert!(bytes > 0);
         for p in &gone {
             assert!(!p.exists(), "{}", p.display());
             assert!(!p.with_extension("jsonl.lock").exists() && !p.with_extension("jsonl.bak").exists());
         }
-        assert!(!review_dir.exists(), "empty folder removed");
         for p in &kept {
             assert!(p.exists(), "{}", p.display());
         }
@@ -1413,7 +1398,7 @@ mod tests {
         // At most once a day.
         assert!(cleanup_daily(&paths, 14).is_some());
         assert!(cleanup_daily(&paths, 14).is_none());
-        assert!(!kept[3].exists(), "no longer live");
+        assert!(!kept[2].exists(), "no longer live");
     }
 
     #[test]

@@ -35,14 +35,8 @@ const PAGES: &[(&str, &str)] = pages![
     "tui-style.md",
     "tui.md",
 ];
-/// Pages only for builds with super mode (L10.9).
-#[cfg(feature = "super")]
-const SUPER_PAGES: &[(&str, &str)] = pages!["super.md"];
-#[cfg(not(feature = "super"))]
-const SUPER_PAGES: &[(&str, &str)] = &[];
-
 fn pages() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
-    PAGES.iter().chain(SUPER_PAGES)
+    PAGES.iter()
 }
 const README: &str = include_str!("../../../README.md");
 
@@ -142,8 +136,6 @@ pub fn brief(paths: &Paths, cwd: &Path) -> String {
 mod tests {
     use super::*;
 
-    const SUPER_ONLY: &[&str] = &["super.md"];
-
     #[test]
     fn every_page_ships_and_installs_once_per_version() {
         let dir_pages: std::collections::BTreeSet<String> =
@@ -151,7 +143,6 @@ mod tests {
                 .unwrap()
                 .filter_map(|e| e.ok()?.file_name().into_string().ok())
                 .filter(|n| n.ends_with(".md"))
-                .filter(|n| cfg!(feature = "super") || !SUPER_ONLY.contains(&n.as_str()))
                 .collect();
         let shipped: std::collections::BTreeSet<String> = pages().map(|(n, _)| n.to_string()).collect();
         assert_eq!(dir_pages, shipped, "add new docs pages to PAGES");

@@ -1,8 +1,7 @@
-//! Relaying a child session's cards (L10.1 subagents, L10.9 super tasks): an
+//! Relaying a child session's cards (L10.1 subagents): an
 //! `ask_user` form or an approval that arrived on a child's wire is re-opened
 //! in the parent's windows with a label in front, and the user's answer goes
-//! back as the wire command that answers it. Shared by `agents.rs` and
-//! `superagent/link.rs`, so there is one relay.
+//! back as the wire command that answers it. Used by `agents.rs`.
 
 use crate::wire::{ClientCmd, ServerMsg};
 use novacode_core::policy::{Approval, ApprovalRequest, Approver};
@@ -51,27 +50,6 @@ impl Card {
                 risky: *risky,
             }),
             _ => None,
-        }
-    }
-
-    /// The child's card id.
-    #[cfg(feature = "super")]
-    pub fn id(&self) -> u64 {
-        match self {
-            Card::Ask { id, .. } | Card::Approve { id, .. } => *id,
-        }
-    }
-
-    /// What it asks, in a few words.
-    #[cfg(feature = "super")]
-    pub fn what(&self) -> String {
-        match self {
-            Card::Ask { questions, .. } => questions
-                .iter()
-                .map(|q| q.question.as_str())
-                .collect::<Vec<_>>()
-                .join(" / "),
-            Card::Approve { tool, detail, .. } => format!("to run {tool} {detail}"),
         }
     }
 }
