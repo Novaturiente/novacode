@@ -111,6 +111,45 @@ pub fn wrap(
     out
 }
 
+/// Cut `content` into rows of `width` cells at any character, keeping every
+/// space so copy can rejoin the rows (code). Only the last row is trimmed.
+pub fn hard_wrap(
+    content: Vec<Span<'static>>,
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+) -> Vec<Line<'static>> {
+    let mut cells: Vec<(&str, Style)> = Vec::new();
+    for s in &content {
+        for g in s.content.graphemes(true) {
+            cells.push((g, s.style));
+        }
+    }
+    let mut out: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut i = 0;
+    loop {
+        let prefix = if out.is_empty() { first } else { rest };
+        let avail = width.saturating_sub(self::width(prefix)).max(1);
+        let mut w = 0;
+        let mut end = i;
+        while end < cells.len() && (end == i || w + cells[end].0.width() <= avail) {
+            w += cells[end].0.width();
+            end += 1;
+        }
+        let mut line = prefix.to_vec();
+        push_run(&mut line, &cells[i..end]);
+        out.push(line);
+        i = end;
+        if i >= cells.len() {
+            break;
+        }
+    }
+    if let Some(last) = out.last_mut() {
+        trim_end(last);
+    }
+    out.into_iter().map(Line::from).collect()
+}
+
 fn push_run(line: &mut Vec<Span<'static>>, cells: &[(&str, Style)]) {
     let mut cur = String::new();
     let mut style = None;

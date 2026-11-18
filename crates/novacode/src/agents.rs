@@ -2251,11 +2251,16 @@ mod tests {
         assert!(!sup.on_event(&n, AgentEvent::Settled, &mut p), "held");
         assert_eq!(status(&n), Status::Running);
         assert!(sup.with(&n, |c| c.held && c.nudged).unwrap());
-        sup.with(&n, |c| c.last_activity = Instant::now().checked_sub(Duration::from_secs(3600)).unwrap());
+        sup.with(&n, |c| {
+            c.last_activity = Instant::now().checked_sub(Duration::from_secs(3600)).unwrap()
+        });
         assert!(sup.overdue().is_empty(), "a held child is no stall");
         sup.on_event(&n, ended("proc_1"), &mut p);
         sup.on_event(&n, AgentEvent::AgentStart, &mut p);
-        assert!(sup.on_event(&n, AgentEvent::Settled, &mut p), "reports once its processes ended");
+        assert!(
+            sup.on_event(&n, AgentEvent::Settled, &mut p),
+            "reports once its processes ended"
+        );
         assert_eq!(status(&n), Status::Done);
 
         // An end that wakes nothing (notices off): reported after the grace period.

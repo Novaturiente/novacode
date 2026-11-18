@@ -2336,11 +2336,13 @@ impl App {
 
     fn selected_text(&self, a: Pos, b: Pos) -> String {
         let Some(s) = &self.shown else { return String::new() };
-        let mut out = Vec::new();
+        let mut out: Vec<String> = Vec::new();
         for n in a.line..=b.line.min(s.view.len().saturating_sub(1)) {
             let Some(line) = s.view.line(n) else { break };
+            // Code and tool gutters stay out of the copy; wrapped code rows rejoin.
+            let (gutter, cont) = crate::markdown::gutter(line);
             let text = wrap::plain(line);
-            let from = if n == a.line { a.col } else { 0 };
+            let from = (if n == a.line { a.col } else { 0 }).max(gutter);
             let to = if n == b.line { b.col + 1 } else { usize::MAX };
             let mut w = 0;
             let mut line = String::new();
@@ -2350,7 +2352,12 @@ impl App {
                 }
                 w += g.width();
             }
-            out.push(line.trim_end().to_string());
+            match out.last_mut() {
+                Some(prev) if cont && n != a.line => prev.push_str(&line),
+                // Code rows keep trailing spaces: the next row may continue them.
+                _ if gutter > 0 => out.push(line),
+                _ => out.push(line.trim_end().to_string()),
+            }
         }
         out.join("\n")
     }

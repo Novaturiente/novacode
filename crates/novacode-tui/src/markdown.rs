@@ -327,6 +327,10 @@ impl<'a> R<'a> {
                     let (_, rest) = self.prefixes();
                     let mut bar = rest.clone();
                     bar.push(Span::styled("▏ ", t.border));
+                    // A wrapped row's bar also removes HIDDEN: no change on screen, but
+                    // copy (`gutter`) can tell the row continues the one above.
+                    let mut cont = rest.clone();
+                    cont.push(Span::styled("▏ ", t.border.remove_modifier(Modifier::HIDDEN)));
                     let colored = self.colored(code);
                     let plain = || {
                         code.split('\n')
@@ -335,7 +339,7 @@ impl<'a> R<'a> {
                     };
                     let lines: Vec<Vec<Span<'static>>> = colored.unwrap_or_else(plain);
                     for spans in lines {
-                        self.out.extend(wrap::wrap(spans, self.width, &bar, &bar));
+                        self.out.extend(wrap::hard_wrap(spans, self.width, &bar, &cont));
                     }
                 }
                 TagEnd::List(_) => {
@@ -504,9 +508,52 @@ impl<'a> R<'a> {
     }
 }
 
+/// For copy: the cells a `▏` gutter (with any indent or quote bars before it)
+/// takes at the start of `line`, and whether the line continues a wrapped code row.
+/// `(0, false)` when the line has no gutter.
+pub fn gutter(line: &Line) -> (usize, bool) {
+    let mut w = 0;
+    for s in &line.spans {
+        w += s.content.width();
+        match s.content.trim_end() {
+            "▏" => return (w, s.style.sub_modifier.contains(Modifier::HIDDEN)),
+            "" | "│" => {}
+            _ => break,
+        }
+    }
+    (0, false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_drops_the_code_gutter_and_rejoins_wrapped_rows() {
+        let code = "echo  a b c d e f";
+        let lines = render(
+            &format!("- item\n\n  ```\n  {code}\n\n  x\n  ```\n"),
+            12,
+            &Theme::default(),
+            true,
+        );
+        let mut out: Vec<String> = Vec::new();
+        for l in &lines {
+            let (skip, cont) = gutter(l);
+            let text: String = wrap::plain(l).chars().skip(skip).collect();
+            match out.last_mut() {
+                Some(prev) if cont => prev.push_str(&text),
+                _ if skip > 0 => out.push(text),
+                _ => {}
+            }
+        }
+        assert!(
+            lines.len() > 5,
+            "the long line wraps: {:?}",
+            lines.iter().map(wrap::plain).collect::<Vec<_>>()
+        );
+        assert_eq!(out, [code, "", "x"]);
+    }
 
     fn md(s: &str, w: usize) -> Vec<String> {
         render(s, w, &Theme::default(), true).iter().map(wrap::plain).collect()
