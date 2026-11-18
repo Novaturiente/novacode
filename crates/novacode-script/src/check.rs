@@ -425,7 +425,19 @@ impl Checker<'_> {
     fn unknown<'t>(&mut self, at: u32, what: &str, name: &str, tools: impl Iterator<Item = &'t ToolInfo>) {
         let named: Vec<(String, &str)> = tools.map(|t| (js_name(t), short(t))).collect();
         let near = nearest(name, named.iter().map(|(js, s)| (js.as_str(), *s)));
-        self.push_at(at, unknown_msg(what, "tool", &near));
+        let mut msg = unknown_msg(what, "tool", &near);
+        // Nothing close (often a tool this agent lacks, like `tools.bash` in a read-only one): name what it has.
+        if near.is_empty() && !what.starts_with("mcp.") {
+            let own: Vec<&str> = named
+                .iter()
+                .map(|(js, _)| js.as_str())
+                .filter(|js| js.starts_with("tools."))
+                .collect();
+            if !own.is_empty() {
+                msg.push_str(&format!("; this agent has: {}", own.join(", ")));
+            }
+        }
+        self.push_at(at, msg);
     }
 
     fn args(&mut self, at: u32, t: &ToolInfo, keys: &[&str]) {

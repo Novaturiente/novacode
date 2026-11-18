@@ -985,7 +985,7 @@ mod tests {
             "line 2: `mcp.ctx8` is not a MCP server (nearest: mcp.ctx7)",
             "line 3: `mcp.ctx7.serch` is not a tool (nearest: mcp.ctx7.search)",
             "line 4: `callTool(\"bassh\")` is not a tool (nearest: tools.bash)",
-            "line 5: `tools.zzzzzzzz` is not a tool; find tools with searchTools",
+            "line 5: `tools.zzzzzzzz` is not a tool; find tools with searchTools(\"…\"); this agent has: tools.",
         ] {
             assert!(e.contains(want), "{want}\n{e}");
         }

@@ -60,6 +60,8 @@ fn child_model(
 /// Reports are written short (see the task preamble), so most arrive whole; only
 /// a runaway one is cut, saving the parent an `agent read` call per child.
 const REPORT_CUT: usize = 6000;
+/// A held child whose last process ended reports after this, unless the exit woke it.
+const HOLD_GRACE: Duration = Duration::from_secs(5);
 
 /// This process's place in an agent tree, from the environment its parent set.
 #[derive(Debug, Clone, Default)]
@@ -643,6 +645,12 @@ struct Child {
     max_turns: Option<u32>,
     /// Model turns in the current run.
     turns: u32,
+    /// Its background processes still running: its exit would kill them.
+    procs: Vec<String>,
+    /// Settled while `procs` run: the report waits for them (their exit wakes it).
+    held: bool,
+    /// Told once per run that its processes hold the report.
+    nudged: bool,
 }
 
 pub struct Supervisor {
@@ -778,8 +786,8 @@ impl Supervisor {
         let mut stop = Vec::new();
         for c in self.children.lock().unwrap().iter() {
             if matches!(c.status, Status::Running | Status::Starting) {
-                // Waiting on its own children is not a stall; the overall timeout still applies.
-                if c.waits.is_empty() && c.last_activity.elapsed() > cfg.stall {
+                // Waiting on its own children or processes is not a stall; the overall timeout still applies.
+                if c.waits.is_empty() && !c.held && c.last_activity.elapsed() > cfg.stall {
                     stop.push((c.n.clone(), "stalled: no activity"));
                 } else if c.started.is_some_and(|t| t.elapsed() > cfg.timeout) {
                     stop.push((c.n.clone(), "timed out"));
@@ -1083,6 +1091,9 @@ impl Supervisor {
             tool_calls: 0,
             delivered: false,
             resume: None,
+            procs: Vec::new(),
+            held: false,
+            nudged: false,
         });
         drop(g);
         self.start_ready();
@@ -1161,6 +1172,9 @@ impl Supervisor {
             c.delivered = false;
             c.last_activity = Instant::now();
             c.waits.clear();
+            c.procs.clear();
+            c.held = false;
+            c.nudged = false;
             (
                 c.model.clone(),
                 c.agent.clone(),
@@ -1304,8 +1318,32 @@ impl Supervisor {
                 *prompted = true;
                 self.with(n, |c| {
                     c.status = Status::Running;
+                    c.held = false;
                     c.last_activity = Instant::now();
                 });
+            }
+            AgentEvent::ProcessStarted { id, .. } => {
+                self.with(n, |c| c.procs.push(id));
+            }
+            AgentEvent::ProcessEnded { id, .. } => {
+                let held = self
+                    .with(n, |c| {
+                        c.procs.retain(|p| *p != id);
+                        c.last_activity = Instant::now();
+                        c.held && c.procs.is_empty()
+                    })
+                    .unwrap_or(false);
+                if held {
+                    // Its exit notice usually wakes the child (AgentStart, then Settled reports);
+                    // a process with notices off wakes nothing, so report after a grace period.
+                    let (me, n) = (self.clone(), n.to_string());
+                    tokio::spawn(async move {
+                        tokio::time::sleep(HOLD_GRACE).await;
+                        if me.with(&n, |c| c.held && c.procs.is_empty()).unwrap_or(false) {
+                            me.report_settled(&n);
+                        }
+                    });
+                }
             }
             AgentEvent::ToolStart { call } => {
                 let (id, name, args) = (call.id, call.name, call.arguments);
@@ -1357,14 +1395,28 @@ impl Supervisor {
                 });
             }
             AgentEvent::Settled if *prompted => {
-                let report = self.with(n, |c| c.last_text.clone()).unwrap_or_default();
-                let status = if report.trim().is_empty() {
-                    Status::Failed
-                } else {
-                    Status::Done
+                // Ending now would kill its processes (the child exits): hold the report until they end.
+                let hold = self
+                    .with(n, |c| {
+                        if c.procs.is_empty() {
+                            return None;
+                        }
+                        c.held = true;
+                        c.last_activity = Instant::now();
+                        let first = !std::mem::replace(&mut c.nudged, true);
+                        Some((first, c.procs.join(", "), c.tx.clone()))
+                    })
+                    .flatten();
+                let Some((first, procs, tx)) = hold else {
+                    self.report_settled(n);
+                    return true;
                 };
-                self.finish(n, status, Some(report));
-                return true;
+                if first && let Some(tx) = tx {
+                    let text = format!(
+                        "[novacode] {procs} still running. Your report is held until they end, because your session ends with the report and that kills them. Stop the ones you no longer need with `process stop`. To wait for the others, end your turn: their exit wakes you."
+                    );
+                    let _ = tx.send(json!({"type": "prompt", "text": text, "raw": true}).to_string());
+                }
             }
             _ => {}
         }
@@ -1408,6 +1460,17 @@ impl Supervisor {
         if let Some(tx) = self.with(n, |c| c.tx.clone()).flatten() {
             let _ = tx.send(v.to_string());
         }
+    }
+
+    /// The child settled for good: its last text is the report.
+    fn report_settled(self: &Arc<Self>, n: &str) {
+        let report = self.with(n, |c| c.last_text.clone()).unwrap_or_default();
+        let status = if report.trim().is_empty() {
+            Status::Failed
+        } else {
+            Status::Done
+        };
+        self.finish(n, status, Some(report));
     }
 
     fn finish(self: &Arc<Self>, n: &str, status: Status, report: Option<String>) {
@@ -2148,6 +2211,66 @@ mod tests {
                 None,
             )),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn running_processes_hold_the_report() {
+        let tmp = std::env::temp_dir().join(format!("nc-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let exe = tmp.join("idle.py");
+        std::fs::write(&exe, "#!/usr/bin/env python3\nimport sys\nfor _ in sys.stdin: pass\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sup = Supervisor::new(test_setup(&tmp, exe));
+        let spawn = || {
+            sup.spawn(serde_json::from_value(json!({"task": "t", "model": "p/m"})).unwrap())
+                .unwrap()
+                .0
+        };
+        let started = |id: &str| AgentEvent::ProcessStarted {
+            id: id.into(),
+            name: "x".into(),
+        };
+        let ended = |id: &str| AgentEvent::ProcessEnded {
+            id: id.into(),
+            name: "x".into(),
+            code: Some(0),
+            stopped: false,
+        };
+        let status = |n: &str| sup.with(n, |c| c.status).unwrap();
+
+        // Settled with a process running: held, nudged, and no stall; its exit wakes it and the next settle reports.
+        let n = spawn();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut p = false;
+        sup.on_event(&n, AgentEvent::AgentStart, &mut p);
+        sup.on_event(&n, started("proc_1"), &mut p);
+        sup.with(&n, |c| c.last_text = "report".into());
+        assert!(!sup.on_event(&n, AgentEvent::Settled, &mut p), "held");
+        assert_eq!(status(&n), Status::Running);
+        assert!(sup.with(&n, |c| c.held && c.nudged).unwrap());
+        sup.with(&n, |c| c.last_activity = Instant::now().checked_sub(Duration::from_secs(3600)).unwrap());
+        assert!(sup.overdue().is_empty(), "a held child is no stall");
+        sup.on_event(&n, ended("proc_1"), &mut p);
+        sup.on_event(&n, AgentEvent::AgentStart, &mut p);
+        assert!(sup.on_event(&n, AgentEvent::Settled, &mut p), "reports once its processes ended");
+        assert_eq!(status(&n), Status::Done);
+
+        // An end that wakes nothing (notices off): reported after the grace period.
+        let n = spawn();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut p = false;
+        sup.on_event(&n, AgentEvent::AgentStart, &mut p);
+        sup.on_event(&n, started("proc_1"), &mut p);
+        sup.with(&n, |c| c.last_text = "report".into());
+        assert!(!sup.on_event(&n, AgentEvent::Settled, &mut p));
+        sup.on_event(&n, ended("proc_1"), &mut p);
+        assert_eq!(status(&n), Status::Running);
+        tokio::time::sleep(HOLD_GRACE + Duration::from_millis(500)).await;
+        assert_eq!(status(&n), Status::Done);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[cfg(unix)]

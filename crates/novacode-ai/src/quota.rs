@@ -234,6 +234,13 @@ async fn fetch(auth: &AuthStore, provider: &str, account: &str) -> Result<Value,
 
 /// Quota for one login of `provider`, from the shared cache, refetched with that
 /// account's token when older than [`MAX_AGE`]. `None` for providers without quota windows.
+/// A cache that sessions rewrite at once: no `.bak` (its hard link races between processes).
+fn save(file: &Path, c: &Cache) {
+    if let Ok(b) = serde_json::to_vec(c) {
+        let _ = novacode_base::storage::write_atomic_no_backup(file, &b, novacode_base::storage::Durability::Fast);
+    }
+}
+
 pub async fn cached(home: &Path, auth: &AuthStore, provider: &str, account: &str, model: &str) -> Option<Quota> {
     if !supported(provider) {
         return None;
@@ -249,7 +256,7 @@ pub async fn cached(home: &Path, auth: &AuthStore, provider: &str, account: &str
         // Claim the fetch so other processes don't fetch at the same moment.
         c.backoff_until_ms = now + 15_000;
         let _ = std::fs::create_dir_all(file.parent().unwrap_or(home));
-        let _ = novacode_base::storage::write_json(&file, &c, novacode_base::storage::Durability::Fast);
+        save(&file, &c);
         match fetch(auth, provider, account).await {
             Ok(d) => {
                 c.data = Some(d);
@@ -266,14 +273,10 @@ pub async fn cached(home: &Path, auth: &AuthStore, provider: &str, account: &str
                 c.error = Some(e);
             }
         }
-        let _ = novacode_base::storage::write_json(&file, &c, novacode_base::storage::Durability::Fast);
+        save(&file, &c);
     }
     // The account in use is the one `<provider>.json` readers mean.
-    let _ = novacode_base::storage::write_json(
-        &path(home, provider, None),
-        &c,
-        novacode_base::storage::Durability::Fast,
-    );
+    save(&path(home, provider, None), &c);
     let (five_hour, weekly, monthly) = c.data.as_ref().map(|d| windows(provider, model, d)).unwrap_or_default();
     Some(Quota {
         provider: provider.into(),
