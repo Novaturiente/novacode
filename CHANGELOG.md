@@ -2,6 +2,19 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.11.1] - 2026-11-18
+
+### Changed
+
+- Long code lines in replies wrap at the exact column instead of at spaces, so a copied line keeps its spacing.
+
+### Fixed
+
+- Selecting text with the mouse no longer copies the `▏` gutter of code blocks and tool output, and a wrapped code line is copied as one line. Terminal-native selection (Shift+drag) and tmux copy mode still include the gutter.
+- A subagent with running processes holds its report until they end (or 5 seconds after its last turn) instead of reporting early; it gets one nudge and is not flagged as stalled meanwhile.
+- In codemode, an unknown tool name with no close match now lists the agent's tools.
+- The quota cache is written without a `.bak` file, which fixes a race between novacode processes.
+
 ## [0.11.0] - 2026-11-17
 
 ### Removed
