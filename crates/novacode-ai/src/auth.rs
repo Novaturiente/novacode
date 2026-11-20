@@ -220,6 +220,18 @@ impl AuthStore {
         }
     }
 
+    /// Forget an account's saved rate-limit window: it answered, or the user picked it.
+    // shortcut: same unlocked read-modify-write as `mark_exhausted`.
+    pub fn clear_exhausted(&self, provider: &str, account: &str) {
+        let mut m = self.exhausted();
+        if m.remove(&format!("{provider}/{account}")).is_none() {
+            return;
+        }
+        if let Ok(t) = serde_json::to_string_pretty(&m) {
+            let _ = storage::write_atomic(&self.exhausted_path(), t.as_bytes(), storage::Durability::Durable);
+        }
+    }
+
     /// Remove one account, or every account of the provider when `account` is None.
     pub async fn remove(&self, provider: &str, account: Option<&str>) -> Result<bool, AuthError> {
         let _lock = self.locked().await?;

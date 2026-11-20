@@ -3,7 +3,9 @@
 //! adapter while the token is unchanged. When an account is exhausted
 //! (quota, or a rate limit longer than the retry policy waits) before any
 //! output, it moves on to the provider's next logged-in account and stays
-//! there. `/account` switches by hand; rotation still applies afterwards.
+//! there. An account that answers loses its saved exhaustion mark; one whose
+//! login failed is not rotated into again until `/account` picks it.
+//! `/account` switches by hand; rotation still applies afterwards.
 //! It never falls back to a metered API key.
 
 use crate::adapter::{Adapter, Builder, EVENT_BUFFER, Request};
@@ -13,7 +15,7 @@ use crate::retry;
 use crate::trace::Trace;
 use futures_util::future::BoxFuture;
 use novacode_types::{ErrorKind, HEADLINE, StopReason, StreamEvent};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -28,6 +30,8 @@ struct Inner {
     provider: String,
     accounts: Vec<String>,
     current: AtomicUsize,
+    /// Accounts whose login failed (e.g. a revoked refresh token): skipped by rotation.
+    broken: Vec<AtomicBool>,
     /// The current account's name, for the tmux pane and status (L8.14, L8.15).
     named: tokio::sync::watch::Sender<String>,
     trace: Option<Trace>,
@@ -75,6 +79,7 @@ impl Live {
             inner: Arc::new(Inner {
                 provider: provider.into(),
                 named: tokio::sync::watch::Sender::new(accounts[0].clone()),
+                broken: accounts.iter().map(|_| AtomicBool::new(false)).collect(),
                 accounts,
                 current: AtomicUsize::new(0),
                 trace,
@@ -191,14 +196,16 @@ impl Inner {
         self.named.send_replace(self.accounts[i].clone());
     }
 
-    /// The first account after `i` not inside a saved rate-limit window.
+    /// The first account after `i` with a working login, not inside a saved rate-limit window.
     fn next_free(&self, i: usize) -> Option<usize> {
         let n = self.accounts.len();
         (1..n).map(|k| (i + k) % n).find(|&j| {
-            self.providers
-                .auth
-                .exhausted_until(&self.provider, &self.accounts[j])
-                .is_none()
+            !self.broken[j].load(Ordering::Relaxed)
+                && self
+                    .providers
+                    .auth
+                    .exhausted_until(&self.provider, &self.accounts[j])
+                    .is_none()
         })
     }
 
@@ -249,6 +256,9 @@ impl Inner {
                 Ok(a) => a,
                 Err((kind, rotate, e)) => {
                     let msg = format!("{} account `{}`: {e}", self.provider, self.accounts[i]);
+                    if rotate {
+                        self.broken[i].store(true, Ordering::Relaxed);
+                    }
                     // A broken login (e.g. a revoked refresh token) shouldn't block a working account.
                     if rotate && tried + 1 < n {
                         let next = (i + 1) % n;
@@ -330,6 +340,10 @@ impl Inner {
                         m.error_message.as_deref().unwrap_or("rate limited"),
                     )));
                 }
+                // It answered: a saved exhaustion mark is stale (e.g. an early limit reset).
+                if matches!(ev, StreamEvent::Done(_)) {
+                    self.providers.auth.clear_exhausted(&self.provider, &self.accounts[i]);
+                }
                 forwarded = true;
                 if tx.send(ev).await.is_err() {
                     return;
@@ -367,6 +381,9 @@ impl Adapter for Live {
                 self.inner.accounts.join(", ")
             )
         })?;
+        // The user's pick wins over a saved mark; the next limit error marks it again.
+        self.inner.broken[i].store(false, Ordering::Relaxed);
+        self.inner.providers.auth.clear_exhausted(&self.inner.provider, name);
         self.inner.set_current(i);
         self.inner.providers.auth.select(&self.inner.provider, name);
         Ok(())
@@ -473,6 +490,71 @@ mod tests {
             "{:?}",
             m.error_message
         );
+    }
+
+    #[tokio::test]
+    async fn a_broken_login_is_not_tried_again_and_an_answer_clears_the_mark() {
+        let ok = http(
+            "200 OK",
+            "text/event-stream",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        );
+        let url = server(vec![ok.clone(), ok]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let sub = format!(
+            r#"{{ "providers": {{ "sub": {{ "name": "Sub", "api": "openai-chat", "auth": "oauth", "baseUrl": "{url}" }} }} }}"#
+        );
+        std::fs::write(&path, sub).unwrap();
+        let p = Arc::new(Providers::load(dir.path(), &Settings::load(&path, None, false)));
+        let cred = OAuthCredential {
+            access: "b".into(),
+            refresh: "r".into(),
+            expires_ms: u64::MAX / 2,
+            project: None,
+        };
+        p.auth.put("sub", "work", cred).await.unwrap();
+        // `work` carries a stale mark (its limit reset early); `gone` has no usable login.
+        p.auth.mark_exhausted("sub", "work", now_ms() + 3_600_000);
+        let (first, _) = p.adapter_for("sub", "work", None).await.unwrap();
+        let a = Live::new(p.clone(), "sub", vec!["work".into(), "gone".into()], None, first);
+        let req = Request {
+            stop: Vec::new(),
+            tail: Vec::new(),
+            model: "m".into(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 10,
+            cache: CacheRetention::Short,
+            thinking: None,
+            images: false,
+            session: None,
+        };
+        // First request: detours through `gone`, back to `work`, which answers.
+        let mut rx = a.stream(req.clone(), CancellationToken::new());
+        let first = rx.recv().await.unwrap();
+        assert!(
+            matches!(&first, StreamEvent::Notice { text: n } if n.contains("account `gone`")),
+            "{first:?}"
+        );
+        assert_eq!(collect(rx).await.stop, StopReason::Stop);
+        assert!(
+            p.auth.exhausted_until("sub", "work").is_none(),
+            "an answer clears the mark"
+        );
+        // Marked again (another process): `gone` stays skipped, so no detour and no notice.
+        p.auth.mark_exhausted("sub", "work", now_ms() + 3_600_000);
+        let mut rx = a.stream(req, CancellationToken::new());
+        let first = rx.recv().await.unwrap();
+        assert!(!matches!(first, StreamEvent::Notice { .. }), "{first:?}");
+        assert_eq!(
+            (collect(rx).await.stop, a.account()),
+            (StopReason::Stop, "work".to_string())
+        );
+        // `/account` overrides a saved mark.
+        p.auth.mark_exhausted("sub", "work", now_ms() + 3_600_000);
+        a.switch_account("work").unwrap();
+        assert!(p.auth.exhausted_until("sub", "work").is_none());
     }
 
     #[tokio::test]
