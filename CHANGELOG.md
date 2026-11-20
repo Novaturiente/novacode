@@ -2,6 +2,13 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.11.2] - 2026-11-21
+
+### Fixed
+
+- Account rotation no longer detours through an account whose login failed on every request, which printed a "switched to account" notice each time. A failed login is skipped until `/account` picks it again.
+- An account that answers loses its saved "exhausted" mark, so an early limit reset takes effect at once. `/account` also clears the picked account's mark.
+
 ## [0.11.1] - 2026-11-18
 
 ### Changed
