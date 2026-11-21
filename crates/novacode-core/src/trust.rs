@@ -37,8 +37,9 @@ const PROJECT_CONFIG: &[&str] = &[
 const MAX_PATHS: usize = 4096;
 /// File bytes hashed per fingerprint at most.
 const MAX_BYTES: u64 = 256 << 20;
-/// The change reported when a cap is hit: the config can't be checked, so it counts as changed.
-const TOO_MANY: &str = "too many files to check";
+/// Folders never hashed: nothing loads config from them, and tools rewrite them
+/// on their own (git, Python venvs and bytecode, npm).
+const SKIP: &[&str] = &[".git", ".venv", "node_modules", "__pycache__"];
 /// The change reported for config a trusted entry never saw from this folder.
 const NEW: &str = "new project config";
 
@@ -130,17 +131,18 @@ impl TrustStore {
     /// A trusted entry with no fingerprint for `dir` yet takes the current one silently
     /// when the entry has none at all (old format) or every config file `dir` reads is
     /// one the entry already saw unchanged; otherwise `dir` counts as changed.
+    /// The folder holding novacode's own home (`~`) is always trusted: its config is the global config.
     pub fn check(&self, dir: &Path) -> (State, Fingerprint) {
-        let (now, complete) = scan(dir);
+        if self.path.parent().is_some_and(|h| h == dir.join(".novacode")) {
+            return (State::Trusted, Fingerprint::new());
+        }
+        let now = fingerprint(dir);
         let map = self.read();
         let Some((at, d)) = dir.ancestors().find_map(|a| map.get(a).map(|d| (a, d))) else {
             return (State::Unknown, now);
         };
         if !d.trusted {
             return (State::Untrusted, now);
-        }
-        if !complete {
-            return (State::Changed(vec![TOO_MANY.into()]), now);
         }
         let key = rel_key(at, dir);
         let state = match d.fingerprints.get(&key) {
@@ -308,6 +310,7 @@ pub fn fingerprint(dir: &Path) -> Fingerprint {
 
 /// [`fingerprint`], and false when a cap was hit (the fingerprint doesn't cover
 /// everything): `MAX_PATHS` paths per entry or `MAX_BYTES` file bytes in total.
+/// shortcut: past a cap the fingerprint is partial, so a change there isn't seen; hash by mtime if that matters.
 fn scan(dir: &Path) -> (Fingerprint, bool) {
     scan_capped(dir, MAX_BYTES)
 }
@@ -328,7 +331,7 @@ fn scan_capped(dir: &Path, max_bytes: u64) -> (Fingerprint, bool) {
 }
 
 /// Hash `path` (relative to `root`) and everything below it; false when a budget ran out.
-/// `.git` folders are skipped: nothing loads from them, and git rewrites them on its own.
+/// [`SKIP`] folders are left out.
 fn hash_path(h: &mut Fnv, root: &Path, path: &Path, paths: &mut usize, bytes: &mut u64) -> bool {
     if *paths == 0 {
         return false;
@@ -347,7 +350,7 @@ fn hash_path(h: &mut Fnv, root: &Path, path: &Path, paths: &mut usize, bytes: &m
             .map(|rd| {
                 rd.flatten()
                     .map(|e| e.path())
-                    .filter(|p| !p.ends_with(".git"))
+                    .filter(|p| !p.file_name().is_some_and(|n| SKIP.iter().any(|s| n == *s)))
                     .collect()
             })
             .unwrap_or_default();
@@ -516,9 +519,23 @@ mod tests {
             assert_eq!(s.state(dir), State::Changed(vec![change.into()]), "{file}");
             s.set(dir, true).unwrap();
         }
-        // A package's git metadata isn't loaded, so it doesn't count.
+        // A package's git metadata isn't loaded, so it doesn't count; nor do venvs and caches.
         write(&dir.join(".novacode/packages/evil/.git/FETCH_HEAD"), "x");
+        write(&dir.join(".novacode/packages/evil/.venv/bin/python"), "x");
+        write(&dir.join(".novacode/packages/evil/node_modules/a/index.js"), "x");
+        write(&dir.join(".novacode/packages/evil/__pycache__/a.pyc"), "x");
         assert_eq!(s.state(dir), State::Trusted);
+    }
+
+    #[test]
+    fn the_home_folder_is_always_trusted() {
+        let home = tempfile::tempdir().unwrap();
+        let nova = home.path().join(".novacode");
+        write(&nova.join("settings.json"), "{}");
+        let s = TrustStore::new(nova.join("trust.json"));
+        assert_eq!(s.state(home.path()), State::Trusted);
+        write(&home.path().join(".mcp.json"), "{}");
+        assert_eq!(s.state(home.path()), State::Trusted);
     }
 
     #[test]
@@ -566,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn caps_fail_closed_and_large_files_hash_by_content() {
+    fn trust_holds_past_the_caps_and_large_files_hash_by_content() {
         let home = tempfile::tempdir().unwrap();
         let w = tempfile::tempdir().unwrap();
         let dir = w.path();
@@ -580,10 +597,12 @@ mod tests {
         let before = fingerprint(dir);
         write(&dir.join(".mcp.json"), "{\"x\":1}");
         assert_eq!(changes(&before, &fingerprint(dir)), ["changed .mcp.json"]);
-        // But the state fails closed, even right after trusting.
+        // Trust over a cap persists: the partial fingerprint is stable.
         let s = TrustStore::new(home.path().join("trust.json"));
         s.set(dir, true).unwrap();
-        assert_eq!(s.state(dir), State::Changed(vec![TOO_MANY.into()]));
+        assert_eq!(s.state(dir), State::Trusted);
+        write(&dir.join(".mcp.json"), "{}");
+        assert_eq!(s.state(dir), State::Changed(vec!["changed .mcp.json".into()]));
         std::fs::remove_dir_all(&skills).unwrap();
         s.set(dir, true).unwrap();
         assert_eq!(s.state(dir), State::Trusted);

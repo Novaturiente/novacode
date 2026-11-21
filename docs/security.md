@@ -342,13 +342,13 @@ novacode --trust               # trust this folder for this run only
 
 ### When project config changes
 
-Trust covers the project config as it was when you said yes, like direnv's `allow`. novacode keeps a fingerprint of it in `trust.json`: the names and full contents of every file in the gated entries listed above, the `.mcp.json` of each parent folder up to the git top level included. Creating one that wasn't there (say a new `.mcp.json`) changes it too. Other files, `.git` folders inside packages, `AGENTS.md`, `CLAUDE.md` and `.novacode/prompts` don't count.
+Trust covers the project config as it was when you said yes, like direnv's `allow`. novacode keeps a fingerprint of it in `trust.json`: the names and full contents of every file in the gated entries listed above, the `.mcp.json` of each parent folder up to the git top level included. Creating one that wasn't there (say a new `.mcp.json`) changes it too. Other files, `.git`, `.venv`, `node_modules` and `__pycache__` folders, `AGENTS.md`, `CLAUDE.md` and `.novacode/prompts` don't count.
 
 The fingerprint is kept per folder you work in. A folder below a trusted folder that you open for the first time asks too when it has project config the trusted folder's fingerprints never covered, for example its own `.novacode/extensions` (the prompt says `new project config`). It loads without asking when it has no project config, or only config already trusted unchanged, such as the top folder's `.mcp.json`. Entries written by older versions, which have no fingerprint yet, take the current one without asking.
 
 Installing a trusted project's declared packages (the start-up question or `novacode packages install`) changes `.novacode/packages`; novacode stores the new fingerprint then, so that install doesn't ask again.
 
-novacode checks at most 4096 paths per gated entry and reads at most 256 MiB of files in total. Config bigger than that can't be checked, so it always counts as changed (`too many files to check`).
+novacode checks at most 4096 paths per gated entry and reads at most 256 MiB of files in total. Past those caps the fingerprint covers only what was read, so trusting still holds, but a change past the cap isn't noticed. Your home folder never asks: its `.novacode` folder is the global config.
 
 The config can change after you trusted it: through `git pull`, a command the agent ran, the agent's own edits, or you. The next start or `/reload` then asks again. The prompt lists what changed (for example `added .mcp.json, changed .novacode/extensions`) and offers the same choices. Saying yes stores the fingerprint of the config the prompt showed, so a change made while the prompt was open asks again next time.
 
