@@ -2,6 +2,12 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.11.3] - 2026-11-21
+
+### Fixed
+
+- The trust prompt no longer comes back on every start. `.venv`, `node_modules` and `__pycache__` folders are left out of the project config fingerprint, like `.git`. Config past the size caps keeps its trust instead of always counting as changed. The home folder never asks, since its `.novacode` is the global config.
+
 ## [0.11.2] - 2026-11-21
 
 ### Fixed
