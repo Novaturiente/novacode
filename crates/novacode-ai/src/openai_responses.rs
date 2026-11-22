@@ -100,6 +100,10 @@ impl OpenAiResponses {
     }
 
     async fn models(&self) -> Result<Vec<String>, String> {
+        Ok(model_ids(&self.fetch_models().await?))
+    }
+
+    async fn fetch_models(&self) -> Result<Value, String> {
         let url = match self.auth {
             // The backend hides models newer than the client; a high version lists them all.
             Auth::Codex { .. } => format!("{}/models?client_version=99.0.0", self.base_url),
@@ -118,26 +122,29 @@ impl OpenAiResponses {
                 http::classify_openai(status.as_u16(), &Default::default(), &String::from_utf8_lossy(&bytes)).1,
             );
         }
-        let v: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        // API: {data: [{id}]}; Codex: {models: [{slug, visibility}]}.
-        let mut ids: Vec<String> = v["data"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|m| m["id"].as_str().map(String::from))
-            .chain(
-                v["models"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|m| m["visibility"].as_str().is_none_or(|s| s == "list"))
-                    .filter_map(|m| m["slug"].as_str().or(m["id"].as_str()).map(String::from)),
-            )
-            .collect();
-        ids.sort();
-        ids.dedup();
-        Ok(ids)
+        serde_json::from_slice(&bytes).map_err(|e| e.to_string())
     }
+}
+
+/// API: {data: [{id}]}; Codex: {models: [{slug, visibility}]}.
+fn model_ids(v: &Value) -> Vec<String> {
+    let mut ids: Vec<String> = v["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["id"].as_str().map(String::from))
+        .chain(
+            v["models"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|m| m["visibility"].as_str().is_none_or(|s| s == "list"))
+                .filter_map(|m| m["slug"].as_str().or(m["id"].as_str()).map(String::from)),
+        )
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 impl Adapter for OpenAiResponses {
@@ -169,6 +176,25 @@ impl Adapter for OpenAiResponses {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, String>> {
         Box::pin(self.models())
     }
+
+    fn context_windows(&self) -> BoxFuture<'_, Result<Vec<(String, u64)>, String>> {
+        Box::pin(async move {
+            match self.auth {
+                Auth::Codex { .. } => Ok(codex_windows(&self.fetch_models().await?)),
+                Auth::ApiKey(_) => Ok(Vec::new()),
+            }
+        })
+    }
+}
+
+/// Codex lists `context_window` per model; the catalog (shared with the API) can say more.
+fn codex_windows(v: &Value) -> Vec<(String, u64)> {
+    v["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| Some((m["slug"].as_str()?.to_string(), m["context_window"].as_u64()?)))
+        .collect()
 }
 
 // ---------- request ----------
@@ -184,27 +210,11 @@ pub fn build_body(req: &Request, c: &Compat, ns: &str) -> Value {
             normalize_id: Some(transform::safe_id),
         },
     );
-    // The leading system prompt is `instructions`; later system deltas are developer items (L1.1).
-    let lead = history.iter().take_while(|m| matches!(m, Message::System { .. }));
-    let instructions: Vec<&str> = lead
-        .filter_map(|m| match m {
-            Message::System { text } if !text.is_empty() => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
-    let skip = history
-        .iter()
-        .take_while(|m| matches!(m, Message::System { .. }))
-        .count();
-    let input = convert(&history[skip..], ns, &req.model);
+    // The system prompt is a leading developer item, not `instructions`: from GPT-6.2 on the
+    // backend puts `instructions` after `input`, so it never hit the prompt cache (L2.6).
+    let input = convert(&history, ns, &req.model);
     let mut body = Map::new();
     body.insert("model".into(), json!(req.model));
-    let instructions = if instructions.is_empty() {
-        "You are a helpful assistant.".to_string()
-    } else {
-        instructions.join("\n\n")
-    };
-    body.insert("instructions".into(), json!(instructions));
     body.insert("input".into(), Value::Array(input));
     if !req.tools.is_empty() {
         let tools: Vec<Value> = req
@@ -501,6 +511,23 @@ mod tests {
     use crate::adapter::{CacheRetention, collect};
     use novacode_types::{AssistantMessage, Replay, ToolCall, ToolDef};
 
+    #[test]
+    fn codex_lists_ids_and_windows() {
+        let v = json!({"models": [
+            {"slug": "gpt-6.2-sol", "context_window": 500000, "visibility": "list"},
+            {"slug": "hidden", "visibility": "hide"},
+            {"slug": "gpt-6.2-astra", "context_window": 272000}
+        ]});
+        assert_eq!(model_ids(&v), ["gpt-6.2-astra", "gpt-6.2-sol"]);
+        assert_eq!(
+            codex_windows(&v),
+            [
+                ("gpt-6.2-sol".to_string(), 500_000),
+                ("gpt-6.2-astra".to_string(), 272_000)
+            ]
+        );
+    }
+
     fn req(messages: Vec<Message>) -> Request {
         Request {
             stop: Vec::new(),
@@ -602,8 +629,10 @@ mod tests {
             ..Default::default()
         };
         let b = build_body(&req(history("codex")), &codex, "codex");
-        assert_eq!(b["instructions"], "be brief");
+        assert!(b.get("instructions").is_none());
         let input = b["input"].as_array().unwrap();
+        assert_eq!(input[0], json!({ "role": "developer", "content": "be brief" }));
+        let input = &input[1..];
         assert_eq!(
             input[0],
             json!({ "role": "user", "content": [{ "type": "input_text", "text": "hi" }] })
@@ -627,7 +656,7 @@ mod tests {
         );
         // From another namespace: no reasoning item, no ids.
         let b = build_body(&req(history("openai")), &Compat::default(), "codex");
-        let input = b["input"].as_array().unwrap();
+        let input = &b["input"].as_array().unwrap()[1..];
         assert_eq!(input[1]["type"], "message");
         assert!(input[1].get("id").is_none() && input[2].get("id").is_none());
         assert_eq!(b["max_output_tokens"], 100);

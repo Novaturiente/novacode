@@ -406,6 +406,17 @@ impl Adapter for Live {
             a.list_models().await
         })
     }
+
+    fn context_windows(&self) -> BoxFuture<'_, Result<Vec<(String, u64)>, String>> {
+        Box::pin(async move {
+            let a = self
+                .inner
+                .adapter(self.inner.current.load(Ordering::Relaxed))
+                .await
+                .map_err(|e| e.2)?;
+            a.context_windows().await
+        })
+    }
 }
 
 #[cfg(test)]

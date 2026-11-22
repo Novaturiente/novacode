@@ -160,9 +160,14 @@ impl Providers {
             .catalog
             .resolve_alias(p.catalog_id(), model, None)
             .unwrap_or_else(|| model.to_string());
+        let mut info = self.catalog.info(p.catalog_id(), &model);
+        // A backend serving less than the catalog says (Codex) wins, so compaction starts in time.
+        if let Some(n) = self.catalog.window(provider, &model) {
+            info.context = if info.known { info.context.min(n) } else { n };
+        }
         Ok(Route {
             provider: provider.into(),
-            info: self.catalog.info(p.catalog_id(), &model),
+            info,
             model,
             level,
             api: p.api,
@@ -430,6 +435,24 @@ mod tests {
         let s = Settings::load(&path, None, false);
         let p = Arc::new(Providers::load(dir.path(), &s));
         (dir, p)
+    }
+
+    #[test]
+    fn backend_windows_cap_the_catalog() {
+        let (d, _) = providers("{}");
+        let cache = cache_path(d.path());
+        let w = vec![("gpt-6.1-sol".to_string(), 272_000), ("brand-new".to_string(), 400_000)];
+        catalog::save_windows(&cache, "codex", w).unwrap();
+        let s = Settings::load(&d.path().join("settings.json"), None, false);
+        let p = Providers::load(d.path(), &s);
+        assert_eq!(p.resolve("codex/gpt-6.1-sol").unwrap().info.context, 272_000);
+        assert_eq!(
+            p.resolve("codex/brand-new").unwrap().info.context,
+            400_000,
+            "unknown model"
+        );
+        // The API route keeps the catalog's window.
+        assert_eq!(p.resolve("openai/gpt-6.1-sol").unwrap().info.context, 1_050_000);
     }
 
     #[test]

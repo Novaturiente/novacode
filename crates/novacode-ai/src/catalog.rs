@@ -255,6 +255,8 @@ impl RawModel {
 #[derive(Debug, Default)]
 pub struct Catalog {
     providers: BTreeMap<String, BTreeMap<String, ModelInfo>>,
+    /// Context windows a backend reports, by profile id then model id ([`windows_path`]).
+    windows: BTreeMap<String, BTreeMap<String, u64>>,
 }
 
 #[derive(Deserialize)]
@@ -276,12 +278,24 @@ impl Catalog {
                 )
             })
             .collect();
-        Self { providers }
+        Self {
+            providers,
+            windows: BTreeMap::new(),
+        }
+    }
+
+    /// The window `profile`'s backend reported for `id`, when it did.
+    pub fn window(&self, profile: &str, id: &str) -> Option<u64> {
+        self.windows.get(profile)?.get(id).copied()
     }
 
     /// Bundled data, then the refreshed cache (if any), then settings `models`.
     pub fn load(cache: &Path, overrides: Option<&Value>) -> Self {
         let mut c = Self::parse(BUNDLED_MODELS);
+        c.windows = std::fs::read_to_string(windows_path(cache))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
         if let Ok(text) = std::fs::read_to_string(cache) {
             let fresh = Self::parse(&text);
             // Only providers the bundle knows; a refresh never drops models (some vanish upstream).
@@ -444,6 +458,27 @@ pub async fn refresh(cache: &Path) -> Result<bool, String> {
         let _ = std::fs::write(&etag_path, t);
     }
     Ok(true)
+}
+
+/// Backend-reported context windows, beside the models.dev cache.
+pub fn windows_path(cache: &Path) -> std::path::PathBuf {
+    cache.with_file_name("context-windows.json")
+}
+
+/// Store `profile`'s reported windows, keeping other profiles'.
+pub fn save_windows(cache: &Path, profile: &str, list: Vec<(String, u64)>) -> Result<(), String> {
+    let path = windows_path(cache);
+    let mut all: BTreeMap<String, BTreeMap<String, u64>> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    all.insert(profile.into(), list.into_iter().collect());
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let bytes = serde_json::to_vec(&all).map_err(|e| e.to_string())?;
+    novacode_base::storage::write_atomic(&path, &bytes, novacode_base::storage::Durability::Fast)
+        .map_err(|e| e.to_string())
 }
 
 /// Older than a day (or missing)?

@@ -426,6 +426,11 @@ impl Store {
     /// A new session holding the root→`at` path of this one (L4.3 fork and
     /// clone), written at once. Entry ids are kept, so notes and recall still work.
     pub fn fork(&self, paths: &Paths, at: &str) -> Result<Store, StoreError> {
+        self.fork_into(paths, at, &self.header.cwd)
+    }
+
+    /// [`Self::fork`] filed under `cwd`: resuming a session whose folder is gone (L4.4).
+    pub fn fork_into(&self, paths: &Paths, at: &str, cwd: &Path) -> Result<Store, StoreError> {
         let mut path: Vec<Entry> = Vec::new();
         let mut cur = Some(at);
         while let Some(id) = cur {
@@ -434,7 +439,7 @@ impl Store {
             cur = self.entries[i].parent.as_deref();
         }
         path.reverse();
-        let mut s = Store::create(paths, &self.header.cwd, self.path.is_none());
+        let mut s = Store::create(paths, cwd, self.path.is_none());
         for e in path {
             s.push(e);
         }
@@ -928,17 +933,28 @@ pub fn cleanup_old(paths: &Paths, days: u64) -> (usize, u64) {
         // Only succeeds when empty.
         let _ = std::fs::remove_dir(&dir);
     }
+    // Spill files (full tool output, L5.3) of old sessions: 419 MB on novahome, never read again.
+    for f in std::fs::read_dir(home.join("spill")).into_iter().flatten().flatten() {
+        let Ok(m) = f.metadata() else { continue };
+        if m.is_file() && m.modified().is_ok_and(|t| t <= cutoff) && std::fs::remove_file(f.path()).is_ok() {
+            bytes += m.len();
+        }
+    }
     (n, bytes)
 }
 
-/// A subagent's session (its first prompt is the parent's task).
+/// A subagent's session (its first prompt is the parent's task), or one run in the
+/// temp folder (scripts and probes: 2,139 of 4,001 sessions on novahome).
 fn disposable(path: &Path) -> bool {
     use std::io::BufRead;
     let Ok(f) = std::fs::File::open(path) else { return false };
     let mut lines = io::BufReader::new(f).lines().map_while(Result::ok);
-    let Some(_) = lines.next().and_then(|l| serde_json::from_str::<Header>(&l).ok()) else {
+    let Some(header) = lines.next().and_then(|l| serde_json::from_str::<Header>(&l).ok()) else {
         return false;
     };
+    if header.cwd.starts_with(std::env::temp_dir()) {
+        return true;
+    }
     lines
         .filter(|l| l.contains("\"role\":\"user\""))
         .find_map(|l| match serde_json::from_str::<Entry>(&l).ok()?.kind {
@@ -973,7 +989,7 @@ pub fn cleanup_daily(paths: &Paths, days: u64) -> Option<(usize, u64)> {
         sessions = n,
         bytes,
         days,
-        "session cleanup: removed old subagent and review sessions"
+        "session cleanup: removed old subagent and temp-folder sessions and spill files"
     );
     Some((n, bytes))
 }
@@ -1138,6 +1154,24 @@ mod tests {
         let s = Store::open(&file).unwrap();
         // A removed worktree is skipped for the newest folder that still exists.
         assert_eq!(s.last_cwd(), wt.path());
+    }
+
+    #[test]
+    fn fork_into_files_a_copy_under_another_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let here = tempfile::tempdir().unwrap();
+        let paths = Paths::new(home.path());
+        let mut s = Store::create(&paths, Path::new("/gone/project"), false);
+        s.append(msg("hi")).unwrap();
+        s.append(reply("hello")).unwrap();
+        let leaf = s.branch().last().unwrap().id.clone();
+        let f = s.fork_into(&paths, &leaf, here.path()).unwrap();
+        assert_eq!(f.last_cwd(), here.path());
+        assert_ne!(f.header.id, s.header.id);
+        assert_eq!(f.branch().len(), 2);
+        let listed = list(&paths, here.path());
+        assert_eq!(listed, [f.path().unwrap().to_path_buf()], "resumable from here");
+        assert!(s.path().unwrap().exists(), "original kept");
     }
 
     /// L4.16: a failed write keeps entries in memory and the next one writes them in
@@ -1366,12 +1400,24 @@ mod tests {
             p.to_path_buf()
         };
         let old_child = write(Path::new("/w"), &child);
+        let old_tmp = write(&std::env::temp_dir().join("probe"), "reply hi");
         let old_user = write(Path::new("/w"), "fix the bug");
         let new_child = write(Path::new("/w"), &child);
         let live_child = write(Path::new("/w2"), &child);
         let ran_child = write(Path::new("/w2"), &child);
-        let gone = [age(&old_child, 20)];
+        let spill = home.path().join("spill");
+        std::fs::create_dir_all(&spill).unwrap();
+        let spill_at = |name: &str, days: u64| {
+            let p = spill.join(name);
+            std::fs::write(&p, "out").unwrap();
+            let f = std::fs::File::options().write(true).open(&p).unwrap();
+            f.set_modified(SystemTime::now() - std::time::Duration::from_secs(days * 86_400))
+                .unwrap();
+            p
+        };
+        let gone = [age(&old_child, 20), age(&old_tmp, 20), spill_at("old.txt", 20)];
         let kept = [
+            spill_at("new.txt", 3),
             age(&old_user, 20),
             age(&new_child, 3),
             age(&live_child, 20),
@@ -1380,12 +1426,12 @@ mod tests {
         std::fs::write(gone[0].with_extension("jsonl.bak"), "x").unwrap();
         std::fs::create_dir_all(home.path().join("run")).unwrap();
         std::fs::write(home.path().join("run").join(format!("{}.json", ran_child.id())), "{}").unwrap();
-        drop((old_child, old_user, new_child, ran_child));
+        drop((old_child, old_tmp, old_user, new_child, ran_child));
         // Setting 0: nothing goes.
         assert_eq!(cleanup_old(&paths, 0), (0, 0));
         assert!(gone.iter().chain(&kept).all(|p| p.exists()));
         let (n, bytes) = cleanup_old(&paths, 14);
-        assert_eq!(n, 1);
+        assert_eq!(n, 2);
         assert!(bytes > 0);
         for p in &gone {
             assert!(!p.exists(), "{}", p.display());
@@ -1398,7 +1444,7 @@ mod tests {
         // At most once a day.
         assert!(cleanup_daily(&paths, 14).is_some());
         assert!(cleanup_daily(&paths, 14).is_none());
-        assert!(!kept[2].exists(), "no longer live");
+        assert!(!kept[3].exists(), "no longer live");
     }
 
     #[test]

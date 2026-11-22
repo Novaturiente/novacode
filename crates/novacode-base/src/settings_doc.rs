@@ -231,7 +231,7 @@ pub const KEYS: &[(&str, &str, &str, &str)] = &[
         "sessions.cleanupDays",
         "number",
         "14",
-        "At start (at most once a day), delete subagent sessions untouched this many days. User sessions are kept. 0 keeps all.",
+        "At start (at most once a day), delete subagent sessions, sessions run in the temp folder and spill files untouched this many days. Other user sessions are kept. 0 keeps all.",
     ),
     (
         "agents.stallMinutes",

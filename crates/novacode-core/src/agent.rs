@@ -2274,6 +2274,23 @@ impl Agent {
         {
             base.nested = Some(self.runner(budget));
         }
+        // A read of a missing file waits for its sibling calls: the model often reads a
+        // screenshot in the message whose bash call makes it (323 failed reads on novahome).
+        let mut later = vec![false; prepared.len()];
+        if prepared
+            .iter()
+            .any(|(_, p)| matches!(p, Prepared::Ready(t, ..) if !t.read_only()))
+        {
+            for (i, (_, p)) in prepared.iter().enumerate() {
+                if let Prepared::Ready(t, a, _) = p
+                    && t.name() == "read"
+                    && let Some(path) = a["path"].as_str()
+                    && matches!(base.env.stat(&base.path(path)).await, Ok(None))
+                {
+                    later[i] = true;
+                }
+            }
+        }
         let one = |call: &ToolCall, p: &Prepared| {
             let events = self.events.clone();
             let hooks = self.hooks.clone();
@@ -2332,7 +2349,17 @@ impl Agent {
             }
             v
         } else {
-            futures_util::future::join_all(prepared.iter().map(|(c, p)| one(c, p))).await
+            let group = |wait: bool| {
+                let batch = prepared.iter().zip(&later).filter(move |(_, l)| **l == wait);
+                futures_util::future::join_all(batch.map(|((c, p), _)| one(c, p)))
+            };
+            let mut first = group(false).await.into_iter();
+            let mut rest = group(true).await.into_iter();
+            // Back in source order.
+            later
+                .iter()
+                .filter_map(|l| if *l { rest.next() } else { first.next() })
+                .collect()
         };
         let mut found: Vec<String> = Vec::new();
         for (call, out) in results {

@@ -885,14 +885,15 @@ impl Tool for McpTool {
             };
             match r {
                 Err(e) => ToolOutput::error(format!("{}: {e}", self.name)),
-                Ok(v) => to_output(&v),
+                Ok(v) => to_output(&v, &self.hub.home.join("spill"), &ctx.session_id),
             }
         })
     }
 }
 
 /// MCP content → tool output; structured content goes to details for codemode.
-fn to_output(v: &Value) -> ToolOutput {
+/// Binary blobs and audio are saved under `spill` instead of going inline as base64 (L7.4).
+fn to_output(v: &Value, spill: &Path, session: &str) -> ToolOutput {
     let mut content = Vec::new();
     for c in v["content"].as_array().into_iter().flatten() {
         match c["type"].as_str() {
@@ -901,12 +902,28 @@ fn to_output(v: &Value) -> ToolOutput {
                 data: c["data"].as_str().unwrap_or_default().to_string(),
                 mime_type: c["mimeType"].as_str().unwrap_or("image/png").to_string(),
             }),
-            Some("resource") => content.push(Block::text(
-                c["resource"]["text"]
-                    .as_str()
-                    .map(String::from)
-                    .unwrap_or_else(|| c["resource"].to_string()),
-            )),
+            Some("resource") => {
+                let r = &c["resource"];
+                let text = match (r["text"].as_str(), r["blob"].as_str()) {
+                    (Some(t), _) => t.to_string(),
+                    (None, Some(b)) => blob(b, r["mimeType"].as_str(), r["uri"].as_str(), spill, session),
+                    (None, None) => r.to_string(),
+                };
+                content.push(Block::text(text));
+            }
+            Some("audio") => content.push(Block::text(blob(
+                c["data"].as_str().unwrap_or_default(),
+                c["mimeType"].as_str(),
+                None,
+                spill,
+                session,
+            ))),
+            Some("resource_link") => content.push(Block::text(format!(
+                "[resource link: {}{}{}]",
+                c["uri"].as_str().unwrap_or_default(),
+                c["name"].as_str().map(|n| format!(" ({n})")).unwrap_or_default(),
+                c["mimeType"].as_str().map(|m| format!(", {m}")).unwrap_or_default(),
+            ))),
             _ => content.push(Block::text(c.to_string())),
         }
     }
@@ -923,6 +940,34 @@ fn to_output(v: &Value) -> ToolOutput {
         content,
         is_error: v["isError"].as_bool().unwrap_or(false),
         details: structured.map(|s| json!({ "structured": s })),
+    }
+}
+
+/// A base64 blob as text when its type is text, else a note with the file it was saved to.
+fn blob(b64: &str, mime: Option<&str>, uri: Option<&str>, spill: &Path, session: &str) -> String {
+    use base64::Engine;
+    let mime = mime.unwrap_or("application/octet-stream");
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+        return format!("[{mime} content that is not valid base64]");
+    };
+    let texty =
+        mime.starts_with("text/") || mime == "application/json" || mime.ends_with("+json") || mime.ends_with("+xml");
+    if texty && let Ok(t) = String::from_utf8(bytes.clone()) {
+        return t;
+    }
+    let what = uri.map_or(String::new(), |u| format!(" {u}"));
+    let ext: String = mime
+        .rsplit('/')
+        .next()
+        .unwrap_or("bin")
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    let path = spill.join(format!("{session}-mcp-{}.{ext}", novacode_base::new_id()));
+    let saved = std::fs::create_dir_all(spill).and_then(|_| std::fs::write(&path, &bytes));
+    match saved {
+        Ok(()) => format!("[{mime}{what}, {} bytes, saved to {}]", bytes.len(), path.display()),
+        Err(e) => format!("[{mime}{what}, {} bytes, not shown: {e}]", bytes.len()),
     }
 }
 
@@ -953,6 +998,47 @@ pub fn edit_global(home: &Path, name: &str, server: Option<Value>) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blobs_are_decoded_or_saved_not_inlined() {
+        use base64::Engine;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let dir = tempfile::tempdir().unwrap();
+        let v = json!({"content": [
+            {"type": "resource", "resource": {"uri": "file:///a.json", "mimeType": "application/json", "blob": b64(b"{\"a\":1}")}},
+            {"type": "resource", "resource": {"uri": "file:///p.pdf", "mimeType": "application/pdf", "blob": b64(&[0, 159, 146, 150])}},
+            {"type": "audio", "mimeType": "audio/wav", "data": b64(b"RIFF")},
+            {"type": "resource_link", "uri": "file:///big.log", "name": "big.log", "mimeType": "text/plain"}
+        ]});
+        let out = to_output(&v, dir.path(), "s1");
+        let t: Vec<String> = out
+            .content
+            .iter()
+            .map(|b| match b {
+                Block::Text { text, .. } => text.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(t[0], "{\"a\":1}");
+        assert!(
+            t[1].starts_with("[application/pdf file:///p.pdf, 4 bytes, saved to "),
+            "{}",
+            t[1]
+        );
+        assert!(t[2].starts_with("[audio/wav, 4 bytes, saved to "), "{}", t[2]);
+        assert_eq!(t[3], "[resource link: file:///big.log (big.log), text/plain]");
+        let saved: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(saved.len(), 2);
+        assert!(
+            saved
+                .iter()
+                .any(|p| p.extension().is_some_and(|e| e == "pdf") && std::fs::read(p).unwrap() == [0, 159, 146, 150])
+        );
+    }
 
     /// A tiny stdio MCP server written in Python.
     const SERVER: &str = r#"

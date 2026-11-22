@@ -94,6 +94,11 @@ pub trait Adapter: Send + Sync {
     fn list_models(&self) -> futures_util::future::BoxFuture<'_, Result<Vec<String>, String>> {
         Box::pin(async { Err("this provider has no model list".to_string()) })
     }
+    /// (model id, context window) the backend itself reports, where it serves less than
+    /// the catalog says (Codex, L2.9). Empty = trust the catalog.
+    fn context_windows(&self) -> futures_util::future::BoxFuture<'_, Result<Vec<(String, u64)>, String>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 /// Bound on queued events: a slow consumer back-pressures the adapter (principle 5).

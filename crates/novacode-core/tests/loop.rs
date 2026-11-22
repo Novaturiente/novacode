@@ -211,6 +211,47 @@ async fn tools_session_and_cache_prefix() {
 }
 
 #[tokio::test]
+async fn read_of_missing_file_waits_for_sibling_calls() {
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let faux = Faux::new([
+        tools_reply(vec![
+            call("c1", "read", json!({"path": "shot.txt"})),
+            call("c2", "bash", json!({"command": "sleep 0.2; echo made > shot.txt"})),
+            call("c3", "read", json!({"path": "gone.txt"})),
+        ]),
+        FauxReply::text("ok"),
+    ]);
+    let store = Store::create(&Paths::new(home.path()), work.path(), true);
+    let agent = Agent::new(
+        Arc::new(faux.clone()),
+        novacode_tools::builtins(false),
+        store,
+        cfg(work.path(), home.path()),
+        Arc::new(LocalEnv),
+    );
+    drive(agent, &["look"]).await;
+    let reqs = faux.requests.lock().unwrap().clone();
+    let results: Vec<(String, bool, String)> = reqs[1]
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::ToolResult {
+                call_id,
+                is_error,
+                content,
+                ..
+            } => Some((call_id.clone(), *is_error, format!("{content:?}"))),
+            _ => None,
+        })
+        .collect();
+    let ids: Vec<&str> = results.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(ids, ["c1", "c2", "c3"], "source order kept");
+    assert!(!results[0].1 && results[0].2.contains("made"), "{:?}", results[0]);
+    assert!(results[2].1 && results[2].2.contains("does not exist"));
+}
+
+#[tokio::test]
 async fn retry_is_hidden_and_errors_end_the_run() {
     let work = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();

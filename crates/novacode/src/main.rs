@@ -1006,7 +1006,7 @@ async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     // A resumed session continues in the folder it was last in (worktree moves
     // included), so trust, settings and the shell wrapper follow it.
     let here = std::env::current_dir()?;
-    let resumed = if let Some(prefix) = &cli.resume {
+    let mut resumed = if let Some(prefix) = &cli.resume {
         Some(Store::open(&session::find(&paths, &here, prefix)?)?)
     } else if cli.r#continue {
         let last = session::list(&paths, &here)
@@ -1017,6 +1017,47 @@ async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     } else {
         None
     };
+    // The session's folder is gone (moved or deleted): continue here, or fork into here (L4.4).
+    let gone = resumed.as_ref().map(Store::last_cwd).filter(|d| !d.is_dir());
+    if let (Some(dir), Some(s)) = (gone, resumed.as_ref()) {
+        if interactive {
+            let pick = |label: String, detail: &str, value: &str| novacode_tui::dialog::PickItem {
+                label,
+                detail: detail.into(),
+                value: value.into(),
+            };
+            let items = vec![
+                pick(
+                    "Continue here".into(),
+                    "keep this session; it stays filed under the old folder",
+                    "continue",
+                ),
+                pick(
+                    format!("Fork into {}", here.display()),
+                    "new session id, original kept",
+                    "fork",
+                ),
+                pick("Cancel".into(), "", "cancel"),
+            ];
+            let body = [format!("This session's folder {} no longer exists.", dir.display())];
+            match novacode_tui::prompt::select("Resume", &body, items)?.as_deref() {
+                Some("continue") => {}
+                Some("fork") => {
+                    if let Some(leaf) = s.branch().last().map(|e| e.id.clone()) {
+                        let forked = s.fork_into(&paths, &leaf, &here)?;
+                        resumed = Some(forked);
+                    }
+                }
+                _ => bail!("resume cancelled"),
+            }
+        } else {
+            eprintln!(
+                "warning: this session's folder {} no longer exists; running in {}",
+                dir.display(),
+                here.display()
+            );
+        }
+    }
     if let Some(dir) = resumed.as_ref().map(Store::last_cwd)
         && dir != here
         && dir.is_dir()
@@ -1076,6 +1117,27 @@ async fn run(mut cli: Cli, paths: Paths) -> anyhow::Result<ExitCode> {
     };
     // L2.10: refresh model metadata in the background; used from the next start.
     let cache = novacode_ai::connect::cache_path(paths.home());
+    if interactive && novacode_ai::catalog::stale(&novacode_ai::catalog::windows_path(&cache)) {
+        // Subscription backends that report their own context windows (Codex, L2.9).
+        let p = providers.clone();
+        let cache = cache.clone();
+        tokio::spawn(async move {
+            let subs = p
+                .profiles
+                .values()
+                .filter(|pr| pr.oauth() && pr.api == novacode_ai::catalog::Api::OpenAiResponses && p.connected(pr));
+            for pr in subs {
+                let got = match p.adapter(&pr.id, None).await {
+                    Ok((a, _)) => a.context_windows().await,
+                    Err(e) => Err(e.to_string()),
+                };
+                match got.and_then(|w| novacode_ai::catalog::save_windows(&cache, &pr.id, w)) {
+                    Ok(()) => {}
+                    Err(e) => tracing::warn!(provider = %pr.id, error = %e, "context window refresh failed"),
+                }
+            }
+        });
+    }
     if interactive && novacode_ai::catalog::stale(&cache) {
         tokio::spawn(async move {
             if let Err(e) = novacode_ai::catalog::refresh(&cache).await {
@@ -1943,6 +2005,11 @@ impl Ctx {
                 _ if def.is_some() => agent = agent.with_memory(session_worker, m).without_observer(),
                 Some(w) => {
                     agent = agent.with_memory(w, m);
+                    // A `-p` run ends before compacting, so its notes went unused
+                    // (4,455 observer calls in 2,133 one-shot runs on novahome).
+                    if self.cli.print.is_some() {
+                        agent = agent.without_observer();
+                    }
                     // Not in a temp folder: its reflections would fill a store no
                     // later session reads (2,158 such stores on novahome).
                     if let Some(m) = memories.filter(|_| !self.cwd.starts_with(std::env::temp_dir())) {
