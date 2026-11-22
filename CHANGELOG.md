@@ -2,6 +2,25 @@
 
 All notable changes to novacode. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change default behaviour. Releases before 0.3.0 have generated notes on the [releases page](https://github.com/Novaturiente/novacode/releases).
 
+## [0.12.0] - 2026-11-22
+
+### Added
+
+- GPT-6.2 Sol and GPT-6.2 Astra in the model catalog (refreshed from models.dev). Thinking `off` moves to `low` on them, since they reject it.
+- Resuming a session whose folder was moved or deleted asks whether to continue here, fork it into the current folder (new id, original kept), or cancel. Headless runs print a warning and continue.
+- Codex context windows come from the backend's own model list (fetched in the background, at most daily) instead of the API catalog, which said 1.05M for models Codex serves with less. Compaction now starts in time on Codex.
+
+### Changed
+
+- OpenAI Responses and Codex requests send the system prompt as the first `developer` message instead of `instructions`. GPT-6.2 puts `instructions` after the conversation, so the system prompt never hit the prompt cache.
+- MCP results: binary blobs and audio are saved under `~/.novacode/spill` and the model gets the path, instead of inline base64; text blobs are decoded; resource links become one line.
+- `-p` runs no longer run the memory observer, so they add no reflections to project memory.
+- `sessions.cleanupDays` (default 14) now also deletes sessions run in the temp folder and old files in `~/.novacode/spill`. Real work done in `/tmp` is deleted after the cutoff.
+
+### Fixed
+
+- A `read` of a file that a sibling call in the same message creates (for example a screenshot) no longer fails with "does not exist": it runs after that message's other calls.
+
 ## [0.11.3] - 2026-11-21
 
 ### Fixed
